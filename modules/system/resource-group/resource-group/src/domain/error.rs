@@ -238,6 +238,12 @@ impl From<sea_orm::DbErr> for DomainError {
     }
 }
 
+// TODO(DE1302): the non-`Sea` arm collapses `modkit_db::DbError` into a
+// `Custom(String)` via `.to_string()`, dropping the source chain. Refactor
+// `DomainError::Database` (or add a `Box<dyn Error + Send + Sync>` variant)
+// so non-Sea variants can be wrapped without stringification, then remove
+// this allow.
+#[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<modkit_db::DbError> for DomainError {
     fn from(e: modkit_db::DbError) -> Self {
         // Preserve the typed `DbErr` when present (so retry detection via

@@ -236,10 +236,11 @@ fn is_to_string_path<'tcx>(cx: &LateContext<'tcx>, callee: &Expr<'tcx>) -> bool 
     let ExprKind::Path(qpath) = &callee.kind else {
         return false;
     };
+    // `QPath::LangItem` was removed in nightly-2026-01-22 (lang-item paths are
+    // expressed via `QPath::Resolved` with `Res::Def(DefKind::*, _)`).
     let res = match qpath {
         QPath::Resolved(_, path) => path.res,
         QPath::TypeRelative(..) => cx.qpath_res(qpath, callee.hir_id),
-        QPath::LangItem(..) => return false,
     };
     let Res::Def(DefKind::AssocFn, def_id) = res else {
         return false;
@@ -271,10 +272,9 @@ impl<'tcx> LateLintPass<'tcx> for De1302ErrorFromToString {
         // `TryFrom` shares the same arg layout (the associated `Error` type lives in
         // the impl, not in the trait substs).
         let impl_def_id = item.owner_id.def_id;
-        let Some(impl_trait_ref) = cx.tcx.impl_trait_ref(impl_def_id) else {
-            return;
-        };
-        let impl_trait_ref = impl_trait_ref.instantiate_identity();
+        // `tcx.impl_trait_ref` returns `EarlyBinder<...>` directly in
+        // nightly-2026-01-22 (no longer wrapped in `Option`).
+        let impl_trait_ref = cx.tcx.impl_trait_ref(impl_def_id).instantiate_identity();
         let source_ty = impl_trait_ref.args.type_at(1); // X
         let target_ty = impl_trait_ref.args.type_at(0); // Y = Self
 
