@@ -86,7 +86,7 @@ graph LR
 | `cpt-cf-account-management-fr-tenant-soft-delete` | `TenantService::delete_tenant` validates the target tenant is non-root, has no non-deleted children, and has no remaining tenant-owned resource associations in the Resource Group ownership graph before soft delete; schedules hard deletion after retention period. |
 | `cpt-cf-account-management-fr-children-query` | Paginated direct-children query with status filtering via OData `$filter` on `parent_id` index. |
 | `cpt-cf-account-management-fr-tenant-read` | `TenantService::get_tenant` returns tenant details by identifier within the caller's authorized scope. |
-| `cpt-cf-account-management-fr-tenant-update` | `TenantService::update_tenant` mutates only `name` and `status` (`active` ↔ `suspended`); immutable hierarchy-defining fields are rejected; `status=deleted` is rejected with `422` — use `DELETE` endpoint. |
+| `cpt-cf-account-management-fr-tenant-update` | `TenantService::update_tenant` mutates only `name` and `status` (`active` ↔ `suspended`); immutable hierarchy-defining fields are rejected with `CanonicalError::InvalidArgument` (HTTP 400); `status=deleted` is rejected with `CanonicalError::FailedPrecondition` (HTTP 400) — use `DELETE` endpoint. |
 | `cpt-cf-account-management-fr-tenant-type-enforcement` | `TenantService` queries `TypesRegistryClient` for type constraints at child creation time. |
 | `cpt-cf-account-management-fr-tenant-type-nesting` | Same-type nesting permitted when GTS type definition allows it; acyclicity guaranteed by tree structure. |
 | `cpt-cf-account-management-fr-managed-tenant-creation` | Tenant created with `self_managed=false`; no barrier flag set. |
@@ -98,8 +98,8 @@ graph LR
 | `cpt-cf-account-management-fr-mode-conversion-consistent-apply` | Approval updates both conversion status and tenant barrier state as one consistent transaction outcome. |
 | `cpt-cf-account-management-fr-conversion-creation-time-self-managed` | `TenantService::create_tenant` accepts `self_managed=true` directly at creation time and stores the flag without a `ConversionRequest`; the parent's explicit creation call is the consent. Only post-creation toggles are routed through `ConversionService`. |
 | `cpt-cf-account-management-fr-child-conversions-query` | `ConversionService::list_inbound_for_parent` joins `conversion_requests` with `tenants` on `parent_id`. Operates within parent tenant AuthZ scope; no barrier bypass required. Exposes only conversion-request metadata (conversion `id`, `child_tenant_id`, `child_tenant_name`, `initiator_side`, `target_mode`, `status`, `requested_by`, terminal-actor fields as applicable, timestamps), not full child tenant data. |
-| `cpt-cf-account-management-fr-conversion-cancel` | `ConversionService::cancel` transitions a pending `ConversionRequest` to `cancelled` only when `caller_side == initiator_side`. Exposed via `PATCH .../conversions/{r}` (child scope) and `PATCH .../child-conversions/{r}` (parent scope) with body `{"status": "cancelled"}`. Role-check failures return `409 conflict` with sub-code `invalid_actor_for_transition`. |
-| `cpt-cf-account-management-fr-conversion-reject` | `ConversionService::reject` transitions a pending `ConversionRequest` to `rejected` only when `caller_side != initiator_side`. Exposed via the same `PATCH` endpoints with body `{"status": "rejected"}`. Role-check failures return `409 conflict` with sub-code `invalid_actor_for_transition`. |
+| `cpt-cf-account-management-fr-conversion-cancel` | `ConversionService::cancel` transitions a pending `ConversionRequest` to `cancelled` only when `caller_side == initiator_side`. Exposed via `PATCH .../conversions/{r}` (child scope) and `PATCH .../child-conversions/{r}` (parent scope) with body `{"status": "cancelled"}`. Role-check failures return `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=INVALID_ACTOR_FOR_TRANSITION`. |
+| `cpt-cf-account-management-fr-conversion-reject` | `ConversionService::reject` transitions a pending `ConversionRequest` to `rejected` only when `caller_side != initiator_side`. Exposed via the same `PATCH` endpoints with body `{"status": "rejected"}`. Role-check failures return `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=INVALID_ACTOR_FOR_TRANSITION`. |
 | `cpt-cf-account-management-fr-conversion-retention` | Background job `ConversionService::soft_delete_resolved` stamps `deleted_at` on resolved rows older than `resolved_retention` (default 30d); default queries filter `deleted_at IS NULL`. Hard-delete follows AM's existing retention cadence. |
 | `cpt-cf-account-management-fr-idp-tenant-provision` | Tenant creation uses a saga pattern: (1) short TX inserts the tenant with `status=provisioning`, (2) `IdpProviderPluginClient::provision_tenant` is called outside any transaction, (3) a second short TX persists provider-returned metadata and transitions the tenant to `active`. If the IdP call returns a clean compensable failure proving no provider state was retained, a compensating TX deletes the `provisioning` row. If the IdP outcome is ambiguous, or if the finalization TX fails after IdP success, AM does not retry the DB completion step; the tenant remains in `provisioning` state until the background reaper compensates (see Reliability Architecture — Data Consistency). `POST /tenants` remains intentionally non-idempotent. |
 | `cpt-cf-account-management-fr-idp-tenant-provision-failure` | The tenant-creation saga distinguishes clean compensation from ambiguous external outcomes and maps both paths into deterministic public failure behavior plus reaper-backed reconciliation. |
@@ -107,7 +107,7 @@ graph LR
 | `cpt-cf-account-management-fr-idp-user-provision` | `IdpProviderPluginClient::create_user` with tenant scope binding and resolved tenant metadata (for IdP context resolution, e.g., effective Keycloak realm). |
 | `cpt-cf-account-management-fr-idp-user-deprovision` | `IdpProviderPluginClient::delete_user` with session revocation; an already-absent IdP user is treated as a successful no-op so `DELETE /tenants/{id}/users/{user_id}` remains idempotent. |
 | `cpt-cf-account-management-fr-idp-user-query` | `IdpProviderPluginClient::list_users` with tenant filter; supports optional user-ID filter for single-user lookups. |
-| `cpt-cf-account-management-fr-user-group-rg-type` | `AccountManagementModule` idempotently registers the user-group Resource Group type `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` during module initialization, with `allowed_memberships` including the platform user resource type (`gts.x.core.am.user.v1~`). |
+| `cpt-cf-account-management-fr-user-group-rg-type` | `AccountManagementModule` idempotently registers the user-group Resource Group type `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` during module initialization, with `allowed_memberships` including the platform user resource type (`gts.cf.core.am.user.v1~`). |
 | `cpt-cf-account-management-fr-user-group-lifecycle` | Consumers call `ResourceGroupClient` directly for group create/update/delete. AM does not proxy these operations. |
 | `cpt-cf-account-management-fr-user-group-membership` | Consumers call `ResourceGroupClient` directly for membership add/remove. Callers verify user existence via AM's user-list endpoint; RG treats `resource_id` as opaque. |
 | `cpt-cf-account-management-fr-nested-user-groups` | Nested groups via Resource Group parent-child hierarchy; cycle detection enforced by Resource Group forest invariants. No AM involvement at runtime. |
@@ -116,7 +116,7 @@ graph LR
 | `cpt-cf-account-management-fr-tenant-metadata-api` | `MetadataService::resolve` walks the hierarchy when the schema's `inheritance_policy` trait is `inherit`; returns the tenant's own value (or empty) when `override_only`. |
 | `cpt-cf-account-management-fr-tenant-metadata-list` | `MetadataService::list_for_tenant` returns paginated own-entries for a tenant; REST endpoint `GET /api/account-management/v1/tenants/{id}/metadata` is tenant-scope-filtered by the platform layer, so self-managed barriers apply without AM-specific logic. |
 | `cpt-cf-account-management-fr-tenant-metadata-permissions` | REST handlers pass `schema_id` into `PolicyEnforcer::enforce` as a resource attribute (`SCHEMA_ID`) on `Metadata.read`, `Metadata.write`, `Metadata.delete`, and `Metadata.list` actions, so external AuthZ policy can express per-`schema_id` grants without AM evaluating policy itself. |
-| `cpt-cf-account-management-fr-deterministic-errors` | Unified error mapper translates domain and infrastructure failures to stable public categories; the authoritative HTTP/sub-code mapping is published in the OpenAPI contract. |
+| `cpt-cf-account-management-fr-deterministic-errors` | Unified error mapper translates domain and infrastructure failures to stable public categories; the authoritative HTTP/code mapping is published in the OpenAPI contract. |
 | `cpt-cf-account-management-fr-observability-metrics` | OpenTelemetry metrics for domain-internal latencies (IdP calls, GTS validation, metadata resolution, bootstrap), background job throughput, error rates, closure-maintenance counters, and security counters. Per-endpoint CRUD counts and children-query latency are captured by platform HTTP middleware; capacity gauges (active tenants) are derivable from DB queries. |
 
 #### NFR Allocation
@@ -134,8 +134,8 @@ graph LR
 | `cpt-cf-account-management-nfr-reliability` | Reads stay available during IdP outages; retry contract is explicit | Saga-based tenant creation + degraded-mode reads + reaper compensation | Non-IdP-dependent reads and admin operations continue during IdP outages. Tenant creation uses the three-step provisioning saga; clean step-2 compensation returns `idp_unavailable` and is retryable, while transport failure, timeout, or finalization failure after IdP-side success leave `POST /tenants` in an ambiguous, non-idempotent state that callers must reconcile before retry. | Integration tests for clean compensation, ambiguous finalization failure, provisioning reaper cleanup, and degraded reads during IdP outage |
 | `cpt-cf-account-management-nfr-data-lifecycle` | Tenant deprovisioning cascades cleanup | `TenantService::delete_tenant` + background hard-delete job | Soft delete transitions to `deleted` status; background job hard-deletes after retention period; cascade triggers IdP `deprovision_tenant` (with retry on failure), Resource Group cleanup for tenant-scoped user groups (via `ResourceGroupClient`), and metadata entry deletion. | Integration tests verifying cascaded cleanup |
 | `cpt-cf-account-management-nfr-authentication-context` | Authenticated requests via platform SecurityContext; MFA for admin ops deferred to platform AuthN policy | `SecurityContext` requirement on all REST handlers via framework middleware | AM does not validate tokens or enforce MFA directly. All REST endpoints require a valid `SecurityContext` provided by the framework AuthN pipeline. MFA enforcement for administrative operations such as tenant creation and mode conversion is a platform AuthN policy concern — AM relies on the framework to reject requests that do not meet the configured authentication strength. | API tests: every endpoint returns 401 without valid `SecurityContext`; E2E: admin operations succeed only with authenticated requests |
-| `cpt-cf-account-management-nfr-data-quality` | Transactional consistency across `tenants` and `tenant_closure`; hierarchy integrity checks | Transactional DB writes spanning `tenants` and `tenant_closure` + diagnostic integrity query | AM commits hierarchy changes and the corresponding `tenant_closure` updates in a single transaction, so a committed write is observable as one consistent `(tenants, tenant_closure)` state across every reader. Schema stability per `cpt-cf-account-management-nfr-compatibility` ensures the database-level data contract remains intact. AM provides a hierarchy integrity check (orphaned children, broken parent references, depth mismatches, missing or stale closure rows, `descendant_status` divergence) as a diagnostic capability. | Integration: hierarchy integrity check detects seeded anomalies (orphaned child, depth mismatch, missing closure row); Integration: committed writes are immediately visible across both tables via direct query |
-| `cpt-cf-account-management-nfr-data-integrity-diagnostics` | Diagnostic checks for observable hierarchy anomalies | `TenantService::check_hierarchy_integrity()` + observability surface | AM exposes explicit integrity diagnostics for orphaned children, broken parent links, root-count anomalies, and depth mismatches. | Integration tests seed anomalies and verify diagnostic output plus metric surfacing |
+| `cpt-cf-account-management-nfr-data-quality` | Transactional consistency across `tenants` and `tenant_closure`; hierarchy integrity checks | Transactional DB writes spanning `tenants` and `tenant_closure` + Rust-side integrity audit over a SecureSelect snapshot | AM commits hierarchy changes and the corresponding `tenant_closure` updates in a single transaction, so a committed write is observable as one consistent `(tenants, tenant_closure)` state across every reader. Schema stability per `cpt-cf-account-management-nfr-compatibility` ensures the database-level data contract remains intact. AM provides a hierarchy integrity audit (8 pure-Rust classifiers — `orphan`, `cycle`, `depth`, `self_row`, `strict_ancestor`, `extra_edge`, `root`, `barrier` — running over a `(tenants, tenant_closure)` snapshot loaded via SecureSelect inside one write-capable transaction (isolation `REPEATABLE READ` on PostgreSQL; transparently `SERIALIZABLE` on SQLite per `modkit-db`'s `TxIsolationLevel` backend-notes mapping; default access mode, **not** `ReadOnly`, since the same tx hosts the `running_audits` PK gate INSERT/DELETE); see §3.2 *Diagnostic Capabilities*) as a diagnostic capability. Memory footprint is bounded by the audited subtree size plus the violation count; the trade-off is explicit avoidance of a raw-SQL escape hatch in the production runtime. | Unit: per-classifier in-source tests over hand-built `Snapshot` fixtures; Integration: end-to-end audit over both backends detects seeded anomalies (orphan, missing self-row, missing strict-ancestor edge); Integration: committed writes are immediately visible across both tables via direct query |
+| `cpt-cf-account-management-nfr-data-integrity-diagnostics` | Diagnostic checks for observable hierarchy anomalies | `TenantService::check_hierarchy_integrity(scope)` (8 pure-Rust classifiers over a SecureSelect snapshot with uniform per-scope single-flight) + observability surface | AM exposes explicit integrity diagnostics via 8 pure-Rust classifiers that run over a `(tenants, tenant_closure)` snapshot loaded via SecureSelect inside one write-capable transaction (isolation `REPEATABLE READ` on PostgreSQL; transparently `SERIALIZABLE` on SQLite per `modkit-db`'s `TxIsolationLevel` backend-notes mapping; default access mode, **not** `ReadOnly`, since the same tx hosts the `running_audits` PK gate INSERT/DELETE); per-scope single-flight is uniform across PostgreSQL and SQLite via the `running_audits` PK gate, bounding concurrent audits and surfacing contention as HTTP `429 Too Many Requests` (`DomainError::AuditAlreadyRunning { scope }` → `CanonicalError::ResourceExhausted`). | Unit tests cover each classifier in isolation over fixture snapshots; integration tests seed each of the 8 anomaly categories on both backends and verify the corresponding `Vec<Violation>` output plus per-category metric surfacing; a separate test exercises the single-flight `429` path |
 | `cpt-cf-account-management-nfr-data-remediation` | Operator-visible remediation path for AM-owned integrity anomalies | Observability + runbook-owned lifecycle handling | Compensation failures and integrity anomalies emit telemetry quickly, remain visible until addressed, and map to runbook-driven triage owned by platform operations. | Alert simulation and operational review |
 | `cpt-cf-account-management-nfr-ops-metrics-treatment` | Minimum operational treatment for AM domain metrics | Shared dashboards + alert routing | AM publishes the minimum metric set required for operator treatment: IdP failures, bootstrap not-ready, provisioning reaper activity, integrity violations, and cleanup failures. | Dashboard/alert review plus smoke checks in staging |
 
@@ -345,7 +345,7 @@ Legacy system integration is handled through the pluggable IdP provider contract
 
 Tenant types are **not a compile-time enum**. They are registered at runtime through the [GTS (Global Type System)](https://github.com/GlobalTypeSystem/gts-spec) types registry, enabling deployments to define their own business hierarchy topology without code changes. The type topology is deployment-specific (see PRD §5.3 for examples: flat, cloud hosting, education, enterprise).
 
-**Base Type Schema:** `gts.x.core.am.tenant_type.v1~` — [tenant_type.v1.schema.json](./schemas/tenant_type.v1.schema.json)
+**Base Type Schema:** `gts.cf.core.am.tenant_type.v1~` — [tenant_type.v1.schema.json](./schemas/tenant_type.v1.schema.json)
 
 The base type defines behavioral traits via standard [GTS Schema Traits](https://github.com/GlobalTypeSystem/gts-spec?tab=readme-ov-file#97---schema-traits-x-gts-traits-schema--x-gts-traits) (`x-gts-traits-schema`). Derived tenant type schemas resolve trait values via `x-gts-traits`. Traits are not part of the tenant instance data model — they configure system behavior for processing tenants of each type.
 
@@ -362,30 +362,34 @@ Derived type schemas resolve their behavioral traits via `x-gts-traits` (per [GT
 
 | GTS Schema ID (chained, public) | Description | `x-gts-traits` |
 |---------------------------------|-------------|----------------|
-| `gts.x.core.am.tenant_type.v1~x.core.am.provider.v1~` | Platform operator; root tenant | `allowed_parent_types: []`, `idp_provisioning: true` |
-| `gts.x.core.am.tenant_type.v1~x.core.am.reseller.v1~` | Reseller; nestable under provider or other resellers | `allowed_parent_types: [x.core.am.provider.v1~, x.core.am.reseller.v1~]`, `idp_provisioning: true` |
-| `gts.x.core.am.tenant_type.v1~x.core.am.customer.v1~` | End customer; leaf tenant | `allowed_parent_types: [x.core.am.provider.v1~, x.core.am.reseller.v1~]` |
+| `gts.cf.core.am.tenant_type.v1~x.core.am.provider.v1~` | Platform operator; root tenant | `allowed_parent_types: []`, `idp_provisioning: true` |
+| `gts.cf.core.am.tenant_type.v1~x.core.am.reseller.v1~` | Reseller; nestable under provider or other resellers | `allowed_parent_types: [x.core.am.provider.v1~, x.core.am.reseller.v1~]`, `idp_provisioning: true` |
+| `gts.cf.core.am.tenant_type.v1~x.core.am.customer.v1~` | End customer; leaf tenant | `allowed_parent_types: [x.core.am.provider.v1~, x.core.am.reseller.v1~]` |
 
-**Runtime Registration:** New tenant types are registered via the GTS REST API (`POST /schemas`) or programmatically via `GtsStore.register_schema()`. AM validates the chained schema identifier against the GTS registry at tenant creation time and rejects unregistered types with `invalid_tenant_type` (422).
+**Runtime Registration:** New tenant types are registered via the GTS REST API (`POST /schemas`) or programmatically via `GtsStore.register_schema()`.
 
-**Input and storage format:** The API accepts the **full chained `GtsSchemaId`** (e.g., `gts.x.core.am.tenant_type.v1~x.core.am.reseller.v1~`). Short-name aliases are not supported — GTS identifiers can contain multiple chained segments (up to 1024 characters per `GTS_MAX_LENGTH`), making short-name derivation ambiguous. AM validates the chained schema identifier against the GTS registry and derives a deterministic UUIDv5 `tenant_type_uuid` from that GTS identifier using the shared GTS namespace convention. The `tenants` table stores `tenant_type_uuid`; the public chained `tenant_type` is re-hydrated from Types Registry when AM needs to emit tenant projections back through the API or operator-facing diagnostics. The `allowed_parent_types` trait values in `x-gts-traits` use GTS instance identifiers (per GTS spec); AM resolves them to chained schema IDs for comparison against the requested public tenant type before persisting the derived UUID key.
+**Enforcement scope (PR1 vs strict mode):** AM's `GtsTenantTypeChecker` is gated on the `strict_barriers` config flag. The checker is consulted **only by flows that examine tenant types** — tenant creation (`createTenant`), root-bootstrap preflight, and any future type-changing API. Ordinary `update_tenant` PATCH is name/status-only by §3.1 contract and does **not** consult the checker. When `strict_barriers = false` (default for PR1), the checker still performs a Types Registry reachability probe (a list probe) on each consulting call; if the registry is reachable it stub-admits every `(parent_type, child_type)` pair without per-pair compatibility evaluation, and if the registry is unreachable it surfaces `CanonicalError::ServiceUnavailable` (HTTP 503) — the unconditional per-pair rejection language below describes the **target behavior** that activates only when `strict_barriers = true` and the UUID-keyed Types Registry lookup pipeline lands. The unavailability surface (GTS unreachable → `CanonicalError::ServiceUnavailable`, HTTP 503) is fully wired today in either mode per [feature-tenant-type-enforcement §6 staging note](features/feature-tenant-type-enforcement.md). Until strict mode is enabled, `INVALID_TENANT_TYPE` and `TYPE_NOT_ALLOWED` rejections are emitted only by the bootstrap-owned root-type preflight (which runs unconditionally) and by deployments that flipped `strict_barriers = true`.
 
-**Trait-driven validation at tenant creation:**
+When strict-mode enforcement is active, AM validates the chained schema identifier against the GTS registry at tenant creation time and rejects unregistered types with `CanonicalError::InvalidArgument` (HTTP 400, `reason=INVALID_TENANT_TYPE`).
 
-1. Validate `tenant_type` (full chained `GtsSchemaId`) against the GTS registry — reject unregistered identifiers with `invalid_tenant_type` (422)
+**Input and storage format:** The API accepts the **full chained `GtsSchemaId`** (e.g., `gts.cf.core.am.tenant_type.v1~x.core.am.reseller.v1~`). Short-name aliases are not supported — GTS identifiers can contain multiple chained segments (up to 1024 characters per `GTS_MAX_LENGTH`), making short-name derivation ambiguous. AM validates the chained schema identifier against the GTS registry and derives a deterministic UUIDv5 `tenant_type_uuid` from that GTS identifier using the shared GTS namespace convention. The `tenants` table stores `tenant_type_uuid`; the public chained `tenant_type` is re-hydrated from Types Registry when AM needs to emit tenant projections back through the API or operator-facing diagnostics. The `allowed_parent_types` trait values in `x-gts-traits` use GTS instance identifiers (per GTS spec); AM resolves them to chained schema IDs for comparison against the requested public tenant type before persisting the derived UUID key.
+
+**Trait-driven validation at tenant creation (active only under `strict_barriers = true`; PR1 default stub-admits):**
+
+1. Validate `tenant_type` (full chained `GtsSchemaId`) against the GTS registry — reject unregistered identifiers with `CanonicalError::InvalidArgument` (HTTP 400, `reason=INVALID_TENANT_TYPE`)
 2. Build effective traits by merging `x-gts-traits` values along the schema chain with defaults from `x-gts-traits-schema`
-3. Validate the requested parent-child type relationship against the GTS `allowed_parent_types` rules — reject with `type_not_allowed` (409) if not permitted
-4. Call `IdpProviderPluginClient::provision_tenant`; provider implementations create tenant-scoped resources or reuse shared ones based on deployment-specific behavior and tenant traits such as `idp_provisioning`. Providers **MUST NOT** silently no-op — unsupported operations **MUST** fail with `idp_unsupported_operation`
+3. Validate the requested parent-child type relationship against the GTS `allowed_parent_types` rules — reject with `CanonicalError::FailedPrecondition` (HTTP 400, `reason=TYPE_NOT_ALLOWED`) if not permitted
+4. Call `IdpProviderPluginClient::provision_tenant`; provider implementations create tenant-scoped resources or reuse shared ones based on deployment-specific behavior and tenant traits such as `idp_provisioning`. Providers **MUST NOT** silently no-op — unsupported operations **MUST** fail with `CanonicalError::Unimplemented` (HTTP 501)
 
 **User-group Resource Group type schema:** AM registers the chained RG type `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). It lives in the flat AM docs schema list, reuses the RG base contract, and defines no AM-specific `metadata` fields in v1. The `user_group` schema uses a chained GTS `$id` (`gts://gts.x.core.rg.type.v1~x.core.am.user_group.v1~`) because user groups are delegated to Resource Group per the Delegation-to-RG principle; the chain expresses that AM's user-group type extends the RG base resource-group type.
 
-**Referenced user resource schema:** The user-group type's `allowed_memberships` points at the platform user resource type `gts.x.core.am.user.v1~` — [user.v1.schema.json](./schemas/user.v1.schema.json).
+**Referenced user resource schema:** The user-group type's `allowed_memberships` points at the platform user resource type `gts.cf.core.am.user.v1~` — [user.v1.schema.json](./schemas/user.v1.schema.json).
 
 | Trait | Value | Meaning |
 |-------|-------|---------|
 | `can_be_root` | `true` | Allows top-level user groups inside a tenant's RG subtree. |
 | `allowed_parents` | [`gts.x.core.rg.type.v1~x.core.am.user_group.v1~`] | Allows nested user groups, but only under the same user-group type. |
-| `allowed_memberships` | [`gts.x.core.am.user.v1~`] | Restricts direct memberships to platform users. |
+| `allowed_memberships` | [`gts.cf.core.am.user.v1~`] | Restricts direct memberships to platform users. |
 
 Tenant-scoped placement is intentionally **not** encoded as a GTS trait on this schema. Resource Group's ownership-graph profile enforces tenant compatibility and scope isolation at write time, while the schema is responsible only for type topology and membership type constraints.
 
@@ -393,7 +397,7 @@ Tenant-scoped placement is intentionally **not** encoded as a GTS trait on this 
 
 Tenant metadata schemas are registered at runtime through the GTS types registry, the same way tenant types are. Each derived schema declares its validation rules (JSON Schema body) and its behavioral traits via `x-gts-traits`; MetadataService resolves those traits from the registered schema with no side configuration.
 
-**Base Type Schema:** `gts.x.core.am.tenant_metadata.v1~` — [tenant_metadata.v1.schema.json](./schemas/tenant_metadata.v1.schema.json)
+**Base Type Schema:** `gts.cf.core.am.tenant_metadata.v1~` — [tenant_metadata.v1.schema.json](./schemas/tenant_metadata.v1.schema.json)
 
 The base schema defines behavioral traits via `x-gts-traits-schema`. Derived metadata schemas resolve trait values via `x-gts-traits`; properties not specified fall back to the base defaults.
 
@@ -407,11 +411,11 @@ The base schema defines behavioral traits via `x-gts-traits-schema`. Derived met
 
 | GTS Schema ID (chained, public) | Description | `x-gts-traits` |
 |---------------------------------|-------------|----------------|
-| `gts.x.core.am.tenant_metadata.v1~z.cf.metadata.branding.v1~` | Tenant branding payload (logo, colors) inherited by descendants unless overridden | `inheritance_policy: inherit` |
+| `gts.cf.core.am.tenant_metadata.v1~z.cf.metadata.branding.v1~` | Tenant branding payload (logo, colors) inherited by descendants unless overridden | `inheritance_policy: inherit` |
 
 MetadataService resolves the policy from the registered schema's traits via the same GTS traits resolution path tenant-type traits already use for `idp_provisioning` — no side configuration, no service-local policy table.
 
-**Input and storage format:** The API accepts the **full chained `GtsSchemaId`** as the `schema_id` path parameter (e.g. `gts.x.core.am.tenant_metadata.v1~z.cf.metadata.branding.v1~`). AM validates the identifier against the GTS registry and derives a deterministic UUIDv5 `schema_uuid` from that GTS identifier using the shared GTS namespace convention. `tenant_metadata` stores only `schema_uuid`; the public chained `schema_id` is re-hydrated from Types Registry when AM needs to emit it in list/read responses, audit payload enrichment, or diagnostics. All public API responses and policy inputs continue to use the full chained `GtsSchemaId`.
+**Input and storage format:** The API accepts the **full chained `GtsSchemaId`** as the `schema_id` path parameter (e.g. `gts.cf.core.am.tenant_metadata.v1~z.cf.metadata.branding.v1~`). AM validates the identifier against the GTS registry and derives a deterministic UUIDv5 `schema_uuid` from that GTS identifier using the shared GTS namespace convention. `tenant_metadata` stores only `schema_uuid`; the public chained `schema_id` is re-hydrated from Types Registry when AM needs to emit it in list/read responses, audit payload enrichment, or diagnostics. All public API responses and policy inputs continue to use the full chained `GtsSchemaId`.
 
 **Trait roadmap (non-v1, informational):**
 
@@ -538,22 +542,44 @@ Does not evaluate authorization policies — relies on `PolicyEnforcer` PEP in t
 
 ##### Diagnostic Capabilities
 
-**Hierarchy integrity check mechanism**: Exposed as an internal SDK method `TenantService::check_hierarchy_integrity()`. Implementation uses a recursive CTE over `tenants` plus a set of `tenants ⋈ tenant_closure` joining queries, and returns a structured report grouped by category. The closure-shape categories are what enforce the **Closure self-row invariant** and **Closure coverage invariant** recorded in the `TenantService` invariants table earlier in this DESIGN; provisioning exclusion (`tenant_closure` never contains rows for tenants in `provisioning` status) is enforced per [AM ADR-0007](ADR/0007-cpt-cf-account-management-adr-provisioning-excluded-from-closure.md) and the DB-level guard `CHECK (descendant_status IN (1, 2, 3))` in [migration.sql](migration.sql), so stale/provisioning rows in `tenant_closure` are a check target rather than a normal state.
+**Hierarchy integrity check mechanism**: Exposed as an internal SDK method `TenantService::check_hierarchy_integrity(scope)`. Implementation is Rust-side: 8 pure-Rust classifier functions run synchronously over a `(tenants, tenant_closure)` snapshot loaded via SecureSelect (`secure().scope_with(...).all(tx)`) inside one write-capable transaction (isolation `REPEATABLE READ` on PostgreSQL; transparently `SERIALIZABLE` on SQLite per `modkit-db`'s `TxIsolationLevel` backend-notes mapping; default access mode, **not** `ReadOnly`, since the same tx hosts the `running_audits` PK gate INSERT/DELETE). Per-scope single-flight is enforced uniformly on both PostgreSQL and SQLite via the `running_audits` PK gate using SecureORM `secure_insert`. Each classifier returns a `Vec<Violation>` directly; the audit's memory footprint is `O(tenants_in_scope + closure_rows_in_scope + violations)` — bounded by the audited subtree's tenant rows, the strict-ancestor closure rows, and the violation count. Closure-row count grows with hierarchy depth (a tenant at depth `d` contributes `d + 1` closure rows), so on deep or dense trees the snapshot is dominated by `closure_rows_in_scope`, not `tenants_in_scope` — operator sizing guidance MUST account for the closure side. The trade-off is explicit avoidance of a raw-SQL escape hatch in the production runtime (no `query_raw_all` consumers in production source). The repository contract is `TenantRepo::audit_integrity_for_scope(scope) -> Result<IntegrityReport>`; the trait surface intentionally hides the loader and lock so callers see only the pure report. The closure-shape categories below are what enforce the **Closure self-row invariant** and **Closure coverage invariant** recorded in the `TenantService` invariants table earlier in this DESIGN; provisioning exclusion (`tenant_closure` never contains rows for tenants in `provisioning` status) is enforced per [AM ADR-0007](ADR/0007-cpt-cf-account-management-adr-provisioning-excluded-from-closure.md) and the DB-level guard `CHECK (descendant_status IN (1, 2, 3))` in [migration.sql](migration.sql), so stale/provisioning rows in `tenant_closure` are a check target rather than a normal state.
 
-*Tree-shape anomalies* (over `tenants` alone):
-- **Orphaned child** — `parent_id` references a non-existent tenant row. Offending fields: `tenant_id`, `parent_id`.
-- **Broken parent reference** — dangling `parent_id` surfaced separately when the target is a hard-deleted row visible to a concurrent read.
-- **Depth mismatch** — stored `tenants.depth` disagrees with the depth computed by walking `parent_id` to the root. Offending fields: `tenant_id`, `stored_depth`, `computed_depth`.
-- **Root-count anomaly** — zero or multiple rows with `parent_id IS NULL`. Offending fields: `root_count`, `root_tenant_ids[]`.
+*Rust-side classifiers — 8 categories* (each is a synchronous, DB-free function over the loaded `Snapshot`; results assembled into a structured report):
 
-*Closure-shape anomalies* (join `tenants` ⋈ `tenant_closure`):
-- **Missing closure self-row** — a tenant with SDK-visible status (`active` / `suspended` / `deleted`) has no `(id, id)` row in `tenant_closure`, or the self-row carries `barrier ≠ 0`. Offending fields: `tenant_id`, `observed_self_row_present`, `observed_barrier`.
-- **Coverage gap (missing strict-ancestor row)** — a tenant with SDK-visible status is missing one or more `(ancestor_id, descendant_id = tenant_id)` rows along its `parent_id` chain. Offending fields: `descendant_tenant_id`, `missing_ancestor_tenant_ids[]`.
-- **Stale closure row** — `tenant_closure` contains a row whose `descendant_id` references a `tenants` row in `provisioning` status or that is absent from `tenants`. Offending fields: `ancestor_id`, `descendant_id`, `closure_descendant_status`, `tenants_status` (or `"missing"`).
-- **Barrier-column divergence** — the materialized `tenant_closure.barrier` disagrees with the canonical rule "`barrier = 1` iff some tenant on `(ancestor, descendant]` has `self_managed = true`" (self-rows always `barrier = 0`). Offending fields: `ancestor_id`, `descendant_id`, `observed_barrier`, `expected_barrier`, `self_managed_tenants_on_path[]`.
-- **`descendant_status` denormalization divergence** — `tenant_closure.descendant_status` disagrees with the mapped `tenants.status` for the same `descendant_id` (domain `{1=active, 2=suspended, 3=deleted}`). Offending fields: `ancestor_id`, `descendant_id`, `closure_descendant_status`, `tenants_status`.
+- **Orphan child** (`orphan`) — single classifier that walks `tenants[].parent_id` once and emits **two** distinct metric labels based on the parent-row state in the snapshot:
+  - `orphaned_child` — `parent_id` references a tenant **absent** from the snapshot (typically a dangling reference left by a concurrent hard-delete that beat the closure cleanup).
+  - `broken_parent_reference` — `parent_id` references a tenant that **exists** in the snapshot but is in `provisioning` status (per ADR-0007 the closure excludes provisioning rows, so the child sees its parent through the `parent_id` column but cannot reach it through `tenant_closure`; this is an internal-only-parent state that the integrity audit must surface).
+  - Offending fields (both labels): `tenant_id`, `parent_id`.
+- **Parent-id cycle** (`cycle`) — DFS with seen-set over `tenants[].parent_id`; surfaces tenants reachable from themselves via the `parent_id` chain. Offending fields: `tenant_id`, `cycle_path[]`.
+- **Depth mismatch** (`depth`) — `tenants.depth` rows whose stored value disagrees with the depth derived by walking `parent_id` from the row up to the root in the snapshot (a non-negative count of strict ancestors). The `tenant_closure` table has no persistent depth column (its shape is `(ancestor_id, descendant_id, barrier, descendant_status)`), so the check is exclusively against `tenants.depth`. Offending fields: `tenant_id`, `stored_depth` (the value read from `tenants.depth`), `expected_depth` (the value derived by the parent-id walk).
+- **Missing self-row** (`self_row`) — an SDK-visible tenant that has no `(id, id)` row in `tenant_closure`. Offending fields: `tenant_id`, `tenants_status`.
+- **Missing strict-ancestor row** (`strict_ancestor`) — strict `(ancestor, descendant)` pairs (with `ancestor_id <> descendant_id`) present in the `parent_id` walk but absent from `tenant_closure`. Offending fields: `descendant_tenant_id`, `missing_ancestor_tenant_ids[]`.
+- **Extra closure edge** (`extra_edge`) — closure rows whose `(ancestor, descendant)` pair is not produced by the `parent_id` walk (closure EXCEPT parent-walk); includes orphan closure rows whose endpoints are absent from `tenants` (or whose descendant is in `provisioning` status, which is excluded from closure by construction). Offending fields: `ancestor_id`, `descendant_id`, `closure_descendant_status`, `tenants_status` (or `"missing"`).
+- **Root anomaly** (`root`) — scope-aware violations of the single-root invariant. The classifier consults the audit `IntegrityScope` (whole-tree vs `Subtree(anchor_tenant_id)`):
+  - For `IntegrityScope::Whole`: a violation is **zero** `parent_id IS NULL` rows in scope (no root) or **two or more** such rows (multi-root).
+  - For `IntegrityScope::Subtree(anchor)`: the expected count of `parent_id IS NULL` rows is **zero** unless the anchor IS the global root (in which case exactly one is expected); any other count is a violation. Offending fields: `tenant_ids[]`.
+- **Barrier + descendant-status coverage** (`barrier`) — single classifier that performs two walks over the same `(ancestor_id, descendant_id)` closure rows in one pass and emits **two** distinct metric labels:
+  - `barrier_column_divergence` — the materialized `tenant_closure.barrier` flag disagrees with the parent-walk-derived barrier coverage (`tenants[].self_managed` propagated along the ancestor chain). Offending fields: `ancestor_id`, `descendant_id`, `stored_barrier` (value in `tenant_closure.barrier`), `expected_barrier` (value derived from the parent-walk).
+  - `descendant_status_divergence` — the materialized `tenant_closure.descendant_status` denormalization column disagrees with the descendant tenant's current `tenants.status`. Offending fields: `ancestor_id`, `descendant_id`, `stored_status` (value in `tenant_closure.descendant_status`), `expected_status` (value in `tenants.status`).
 
-Results are returned as structured diagnostic output — per-category arrays carrying the offending-row fields listed above — and aggregated into the `am_hierarchy_integrity_violations` gauge metric with a `category` label (`orphaned_child`, `broken_parent_reference`, `depth_mismatch`, `root_count_anomaly`, `missing_closure_self_row`, `closure_coverage_gap`, `stale_closure_row`, `barrier_column_divergence`, `descendant_status_divergence`) so closure anomalies can be alerted and dashboarded distinctly from tree-shape anomalies.
+Results are returned as structured diagnostic output — per-category `Vec<Violation>` arrays carrying the offending-row fields listed above — and aggregated into the `am.hierarchy_integrity_violations` gauge metric with a `category` label drawn from the 10 fixed-shape categories emitted by the 8 classifiers. Two of the eight classifiers emit two categories each (the others emit one), so 8 functions produce 10 metric labels. The mapping is:
+
+| Classifier | Emitted `category` label(s) |
+|---|---|
+| `orphan` | `orphaned_child`, `broken_parent_reference` |
+| `cycle` | `cycle_detected` |
+| `depth` | `depth_mismatch` |
+| `self_row` | `missing_closure_self_row` |
+| `strict_ancestor` | `closure_coverage_gap` |
+| `extra_edge` | `stale_closure_row` |
+| `root` | `root_count_anomaly` |
+| `barrier` | `barrier_column_divergence`, `descendant_status_divergence` |
+
+Each category is alerted and dashboarded distinctly. Zero-value emissions occur on clean runs so alert rules see a known baseline.
+
+**Single-flight per scope**: AM enforces at-most-one concurrent audit per scope (whole-tree sentinel or subtree anchor `tenant_id`) so a long-running whole-tree audit cannot pile up against itself. The mechanism is uniform across PostgreSQL and SQLite: the audit transaction `INSERT`s a row into `running_audits` keyed by the canonical `scope_key` (`"whole"` or `"subtree:<uuid>"`) at the start of the snapshot transaction and `DELETE`s it before commit; the PRIMARY KEY on `scope_key` is the atomic claim primitive, and concurrent callers receive a unique-violation that maps to `DomainError::AuditAlreadyRunning { scope: String }` (boundary-converted to `CanonicalError::ResourceExhausted`, HTTP 429). On rollback the uncommitted INSERT row never landed in the first place, so no separate failure-path unlock is required. The legacy `pg_try_advisory_xact_lock` path is intentionally not used — uniform single-flight semantics across both backends is the whole point of the gate. Contention surfaces are translated by the REST and SDK error-mapping layers to HTTP `429 Too Many Requests` per `errors-observability`; callers retry with backoff, AM does not queue.
+
+**Test strategy**: a single feature-gated integration test file (`tests/integrity_integration.rs`) hosts two `#[cfg(feature = "postgres")] mod pg` and `#[cfg(feature = "sqlite")] mod sqlite` blocks plus a shared seed/assertion `common` module. Each backend exercises a positive and a negative case per category plus a single-flight contention test asserting the `429` path. Postgres coverage uses a testcontainers Postgres image (workspace pattern via `cf-modkit-db` dev-dependencies); SQLite coverage uses `:memory:` databases (portable across SQLite >= 3.8.3). The Rust-side cycle detector (DFS with seen-set, bounded by `tenants.len()`) is unit-tested in `audit/classifiers/cycle.rs` against both true cycles and deep linear chains to guard against false positives.
 
 #### ConversionService
 
@@ -567,16 +593,16 @@ Owns the `ConversionRequest` state machine for post-creation toggles of `tenants
 
 The ConversionService owns everything about pending and resolved conversion requests, while `TenantService` continues to own `tenants` CRUD.
 
-- `initiate(caller_side, tenant_id, actor)`: validates preconditions (tenant is non-root, is `active`, caller's side has a valid scope for `tenant_id`, no pending row exists), derives `target_mode = NOT tenants.self_managed`, inserts a `pending` row with `initiator_side = caller_side` and `expires_at = now() + approval_ttl`. Partial unique index `UNIQUE (tenant_id) WHERE status='pending' AND deleted_at IS NULL` guarantees the at-most-one invariant at the DB level; service layer translates the conflict into `409 conflict` with sub-code `pending_exists` and the existing `request_id`.
+- `initiate(caller_side, tenant_id, actor)`: validates preconditions (tenant is non-root, is `active`, caller's side has a valid scope for `tenant_id`, no pending row exists), derives `target_mode = NOT tenants.self_managed`, inserts a `pending` row with `initiator_side = caller_side` and `expires_at = now() + approval_ttl`. Partial unique index `UNIQUE (tenant_id) WHERE status='pending' AND deleted_at IS NULL` guarantees the at-most-one invariant at the DB level; service layer translates the conflict into `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=PENDING_EXISTS` and the existing `request_id` carried in the precondition-violation entry.
 - `approve(caller_side, request_id, actor)`: valid only when `status = pending` and `caller_side != initiator_side`. In a single transaction: sets `status = approved`, `approved_by = actor`, toggles `tenants.self_managed` to `target_mode`, recomputes `tenant_closure.barrier` for every `(ancestor_id, descendant_id)` pair where the converted tenant lies on the strict `ancestor → descendant` path (excluding the ancestor itself, including the converted tenant as descendant) — the new barrier is derived from the canonical invariant (`barrier = 1` iff any tenant on `(ancestor, descendant]` *still* has `self_managed = true` after the flip), not copied from the converted tenant's flag, so nested self-managed boundaries on the same path remain correctly enforced when one of them converts back — and writes the audit entry. Atomicity across the request status, the tenant flag, and the closure barrier columns is what removes the "crash between approval and barrier removal" hazard. Write amplification is bounded by `O(strict_ancestors × (1 + descendants))` on the converted tenant, which is the ADR-001 envelope.
 - `cancel(caller_side, request_id, actor)`: valid only when `status = pending` and `caller_side == initiator_side`. Sets `status = cancelled`, `cancelled_by = actor`. Does **not** touch `tenants.self_managed`.
 - `reject(caller_side, request_id, actor)`: valid only when `status = pending` and `caller_side != initiator_side`. Sets `status = rejected`, `rejected_by = actor`. Does **not** touch `tenants.self_managed`.
 - `list_own_for_tenant(tenant_id, status_filter, pagination)`: tenant-scoped list for the child-scope collection. Default `status_filter = pending`; `any` returns all non-soft-deleted rows.
-- `list_inbound_for_parent(parent_id, status_filter, pagination)`: joins `conversion_requests` with `tenants` on `parent_id`. Projects the conversion-request row — `request_id`, `tenant_id`, `child_name`, `initiator_side`, `target_mode`, `status`, the actor uuids (`requested_by`, `approved_by`, `cancelled_by`, `rejected_by`), and timestamps — and nothing from the child's tenant record beyond its name. **Trade-off — dual-consent vs. barrier purity:** the actor uuids cross the self-managed barrier deliberately, because the parent admin has to know which counterparty in the child tenant initiated the request and who later cancelled / rejected / approved it in order to act on it within the dual-consent workflow. The fields exposed are opaque IdP uuids with no profile data attached — AM stores none per `cpt-cf-account-management-nfr-data-classification` — and resolving any uuid to a human identity still requires separate authorization against IdP, governed by platform AuthZ. The child's full tenant record, its metadata, and its subtree remain behind the barrier. "Minimal conversion-request metadata" elsewhere in this DESIGN and in the PRD means *"only the conversion-request row, not the child tenant record"*; it does not mean stripping the request's own audit-actor fields.
+- `list_inbound_for_parent(parent_id, status_filter, pagination)`: joins `conversion_requests` with `tenants` on `parent_id`. Projects the conversion-request row — `request_id`, `tenant_id`, `child_tenant_name`, `initiator_side`, `target_mode`, `status`, the actor uuids (`requested_by`, `approved_by`, `cancelled_by`, `rejected_by`), and timestamps — and nothing from the child's tenant record beyond its name. **Trade-off — dual-consent vs. barrier purity:** the actor uuids cross the self-managed barrier deliberately, because the parent admin has to know which counterparty in the child tenant initiated the request and who later cancelled / rejected / approved it in order to act on it within the dual-consent workflow. The fields exposed are opaque IdP uuids with no profile data attached — AM stores none per `cpt-cf-account-management-nfr-data-classification` — and resolving any uuid to a human identity still requires separate authorization against IdP, governed by platform AuthZ. The child's full tenant record, its metadata, and its subtree remain behind the barrier. "Minimal conversion-request metadata" elsewhere in this DESIGN and in the PRD means *"only the conversion-request row, not the child tenant record"*; it does not mean stripping the request's own audit-actor fields.
 - `expire` (background): scans `status = 'pending' AND expires_at < now() AND deleted_at IS NULL`, transitions matching rows to `expired`, emits an audit record with `system` actor and the `am_conversion_expired_total` counter.
 - `soft_delete_resolved` (background): scans resolved rows (`status IN ('approved','cancelled','rejected','expired')`) whose `updated_at + resolved_retention < now() AND deleted_at IS NULL`, stamps `deleted_at = now()`, and emits the `am_conversion_soft_deleted_total` counter. Hard deletion follows AM's existing retention cadence on `deleted_at`-tombstoned rows.
 
-Role-per-transition validation (initiator vs. counterparty) lives in the service layer, not in the REST dispatcher and not in AuthZ. The single PEP action on `ConversionRequest` is `write`; the service is what distinguishes legal transitions per caller side, so the rules apply uniformly to both URL collections. Role-check failures surface as `409 conflict` with sub-code `invalid_actor_for_transition` plus `attempted_status` and `caller_side` in the response body; operations on already-resolved rows surface as `409 conflict` with sub-code `already_resolved`.
+Role-per-transition validation (initiator vs. counterparty) lives in the service layer, not in the REST dispatcher and not in AuthZ. The single PEP action on `ConversionRequest` is `write`; the service is what distinguishes legal transitions per caller side, so the rules apply uniformly to both URL collections. Role-check failures surface as `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=INVALID_ACTOR_FOR_TRANSITION` plus `attempted_status` and `caller_side` carried in the precondition-violation entry; operations on already-resolved rows surface as `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=ALREADY_RESOLVED`.
 
 ##### Responsibility boundaries
 
@@ -632,10 +658,10 @@ Metadata CRUD (create, read, update, delete), per-tenant listing, and hierarchy-
 
 **Per-operation flow:**
 
-1. Fetch the schema by `schema_id` from the GTS registry → `404 not_found` with sub-code `metadata_schema_not_registered` if unregistered. Validate the schema body/traits and derive `schema_uuid` deterministically from the same `schema_id`.
+1. Fetch the schema by `schema_id` from the GTS registry → if unregistered, surface `CanonicalError::NotFound` (HTTP 404) qualified with `resource_type = gts.cf.core.am.tenant_metadata.v1~` and `resource_name` carrying the missing `schema_id`. Per the Section 3.8 canonical-category contract, callers distinguish "unknown metadata schema" from "schema known but no entry on this tenant" by the resource-typed shape of the NotFound, not by a separate AM-private code. Validate the schema body/traits and derive `schema_uuid` deterministically from the same `schema_id`.
 2. Resolve the schema's `inheritance_policy` trait (from `x-gts-traits`, falling back to the base schema default `override_only`).
 3. On writes, validate the request body against the schema and upsert `(tenant_id, schema_uuid, value)`.
-4. On reads of a specific entry, select the tenant's row by `(tenant_id, schema_uuid)`; if none exists (yet the schema is registered), return `404 not_found` with sub-code `metadata_entry_not_found` so clients distinguish unregistered schemas from unset entries.
+4. On reads of a specific entry, select the tenant's row by `(tenant_id, schema_uuid)`; if none exists (with the schema already resolved), surface `CanonicalError::NotFound` (HTTP 404) qualified with `resource_type = gts.cf.core.am.tenant_metadata.v1~` and `resource_name` carrying the unset `(tenant_id, schema_id)` pair so clients can tell schema absence from entry absence by the resource identifiers alone.
 5. On listing (`list_for_tenant`), return all rows from `tenant_metadata` for `tenant_id`, paginated, and reverse-hydrate each distinct `schema_uuid` to its public chained `schema_id` through Types Registry before building the response payload. `list_for_tenant` does **not** walk the ancestor chain — inherited values are observable only through `/resolved`.
 6. On `/resolved`, apply the `inheritance_policy` trait: `override_only` returns the tenant's own value or empty; `inherit` walks the ancestor chain via `parent_id`, querying metadata rows by `schema_uuid` and stopping at self-managed boundaries. Empty resolution is **not** a `not_found` — it is the normal terminal state of the walk. Cascade deletion of all metadata entries happens via `ON DELETE CASCADE` when the tenant row is removed.
 
@@ -660,7 +686,7 @@ Handles one-time platform initialization: creating the initial root tenant and l
 
 ##### Responsibility scope
 
-Acquires a distributed lock to prevent concurrent bootstrap from parallel service starts. Checks whether the initial root tenant already exists (idempotency). Waits for IdP availability via `IdpProviderPluginClient::check_availability()` with configurable retry/backoff and timeout. Preflights `root_tenant_type` through GTS effective-trait resolution before writing any tenant row, requiring a registered chained tenant type whose effective `allowed_parent_types` is `[]`. Creates the initial root tenant through the same internal provisioning saga used for API-created tenants: internal `provisioning` state first, then finalization to visible `active` status once bootstrap completes successfully. Calls `provision_tenant` with deployer-configured `root_tenant_metadata` (same contract as all tenants) so the IdP provider plugin can establish the tenant-to-IdP binding. Any provider-returned `ProvisionResult` metadata is persisted as tenant metadata; if the provider returns no metadata, bootstrap proceeds normally. Bootstrap completion emits a platform audit event with `actor=system`. Releases the lock.
+Checks whether the initial root tenant already exists (idempotency). Waits for IdP availability via `IdpProviderPluginClient::check_availability()` with configurable retry/backoff and timeout. Preflights `root_tenant_type` through GTS effective-trait resolution before writing any tenant row, requiring a registered chained tenant type whose effective `allowed_parent_types` is `[]`. Creates the initial root tenant through the same internal provisioning saga used for API-created tenants: internal `provisioning` state first, then finalization to visible `active` status once bootstrap completes successfully. Calls `provision_tenant` with deployer-configured `root_tenant_metadata` (same contract as all tenants) so the IdP provider plugin can establish the tenant-to-IdP binding. Any provider-returned `ProvisionResult` metadata is persisted as tenant metadata; if the provider returns no metadata, bootstrap proceeds normally. Bootstrap completion emits a platform audit event with `actor=system`. Concurrent-replica safety is provided by the `ux_tenants_single_root` unique partial index: if two replicas race on a fresh deployment, the second insert fails the constraint and falls through to the idempotency path on its next classification attempt.
 
 ##### Responsibility boundaries
 
@@ -883,11 +909,9 @@ sequenceDiagram
     participant PR as Provisioning Reaper
 
     AM->>BS: lifecycle entry (bootstrap phase)
-    BS->>BS: Acquire distributed lock (bootstrap)
     BS->>DB: Check existing root tenant
     alt Root tenant exists in active status
         DB-->>BS: Found
-        BS->>BS: Release lock
         BS-->>AM: Bootstrap skipped (idempotent)
     else No root tenant
         DB-->>BS: Not found
@@ -916,13 +940,11 @@ sequenceDiagram
                 TS->>DB: COMMIT
             end
             TS-->>BS: Root tenant created
-            BS->>BS: Release lock
             BS-->>AM: Bootstrap complete
         else Finalization fails
             DB-->>TS: Finalization error
             TS-->>BS: Bootstrap failed, root remains in provisioning
             BS->>BS: Do not create a second root while stale row exists
-            BS->>BS: Release lock
             BS-->>AM: Bootstrap not complete
             PR->>DB: Scan stale provisioning tenants
             DB-->>PR: root tenant still provisioning
@@ -939,7 +961,7 @@ sequenceDiagram
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `root_tenant_type` | string (chained `GtsSchemaId`) | Yes | Full chained GTS schema identifier for the initial root tenant type. Must be registered in GTS. Deployment-specific — e.g., `gts.x.core.am.tenant_type.v1~x.core.am.provider.v1~` for cloud hosting, `gts.x.core.am.tenant_type.v1~x.core.am.root.v1~` for flat deployments. |
+| `root_tenant_type` | string (chained `GtsSchemaId`) | Yes | Full chained GTS schema identifier for the initial root tenant type. Must be registered in GTS. Deployment-specific — e.g., `gts.cf.core.am.tenant_type.v1~x.core.am.provider.v1~` for cloud hosting, `gts.cf.core.am.tenant_type.v1~x.core.am.root.v1~` for flat deployments. |
 | `root_tenant_name` | string | Yes | Human-readable name for the initial root tenant. |
 | `root_tenant_metadata` | object | No (default: `null`) | Provider-specific metadata forwarded as-is to `provision_tenant` during bootstrap. Guides the IdP provider plugin's behavior — e.g., a Keycloak provider may expect `{ "adopt_realm": "master" }` to adopt an existing realm, while omitting it or providing different metadata may trigger fresh resource creation. The choice is entirely provider-specific. AM does not interpret this value; the content contract is between the deployer and the provider plugin. When omitted, `provision_tenant` receives `null` metadata and the provider proceeds with its default behavior. |
 | _(deployment prerequisite)_ | — | — | All metadata schemas that the IdP provider may return in `ProvisionResult` entries must be pre-registered in GTS before bootstrap runs. AM validates all persisted metadata against GTS schemas; unregistered `schema_id`s are rejected with `not_found`, causing the saga finalization step to fail and the provisioning reaper to compensate. (`root_tenant_metadata` itself is opaque to AM — it is forwarded as-is to the provider plugin and is not validated against GTS schemas. The prerequisite applies only to provider-produced output that AM persists.) |
@@ -947,7 +969,7 @@ sequenceDiagram
 | `idp_retry_backoff_max` | duration | No (default: 30s) | Maximum backoff for IdP availability retry. |
 | `idp_retry_timeout` | duration | No (default: 5min) | Total timeout for IdP availability wait. Bootstrap fails if exceeded. |
 
-**Description**: On first platform start, AM acquires a distributed lock to prevent concurrent bootstrap from parallel service starts, waits for IdP readiness through `IdpProviderPluginClient::check_availability()`, then creates the initial root tenant using the configured `root_tenant_type`. Bootstrap preflights the type through GTS effective-trait resolution before writing any row: it must be a registered chained tenant type under `gts.x.core.am.tenant_type.v1~`, and its effective `allowed_parent_types` must be `[]` so it is root-eligible. GTS unavailability, an unregistered type, or a non-root-eligible type fails bootstrap without DB or IdP side effects. Tenant creation follows the same saga pattern as API-created tenants: (1) a short transaction inserts the `tenants` row with `status=provisioning` — no `tenant_closure` rows are written yet, because provisioning tenants are absent from the closure by contract; (2) `provision_tenant` is called outside any transaction with the deployer-configured `root_tenant_metadata`; (3) a second short transaction persists any provider-returned metadata, transitions the tenant to visible `active` status, and inserts the root's self-row into `tenant_closure` (`ancestor_id = descendant_id = root_id`, `barrier = 0`, `descendant_status = active`) — the root has no strict ancestors, so only the self-row is created. The metadata is opaque to AM — it flows through to the IdP provider plugin, which uses it to determine deployment-specific behavior (e.g., a Keycloak provider receiving `{ "adopt_realm": "master" }` may adopt an existing realm, while other metadata may trigger fresh resource creation). If the provider returns no metadata (binding established through external configuration or convention), bootstrap proceeds normally. On subsequent starts, bootstrap detects the existing root (in `active` status) and is a no-op. A root tenant stuck in `provisioning` status from an ambiguous provider outcome or finalization failure is left for provisioning-reaper compensation; bootstrap does not create a second root while that stale row exists. Successful bootstrap emits a platform audit event with `actor=system`. If IdP is unavailable, bootstrap retries with backoff until timeout before any row is written. The lock ensures that even with multiple replicas starting simultaneously, only one performs the bootstrap sequence. The lock implementation is infrastructure-specific (e.g., database advisory lock, distributed lock service) and not prescribed by this design.
+**Description**: On first platform start, AM waits for IdP readiness through `IdpProviderPluginClient::check_availability()`, then creates the initial root tenant using the configured `root_tenant_type`. Bootstrap preflights the type through GTS effective-trait resolution before writing any row: it must be a registered chained tenant type under `gts.cf.core.am.tenant_type.v1~`, and its effective `allowed_parent_types` must be `[]` so it is root-eligible. GTS unavailability, an unregistered type, or a non-root-eligible type fails bootstrap without DB or IdP side effects. Tenant creation follows the same saga pattern as API-created tenants: (1) a short transaction inserts the `tenants` row with `status=provisioning` — no `tenant_closure` rows are written yet, because provisioning tenants are absent from the closure by contract; (2) `provision_tenant` is called outside any transaction with the deployer-configured `root_tenant_metadata`; (3) a second short transaction persists any provider-returned metadata, transitions the tenant to visible `active` status, and inserts the root's self-row into `tenant_closure` (`ancestor_id = descendant_id = root_id`, `barrier = 0`, `descendant_status = active`) — the root has no strict ancestors, so only the self-row is created. The metadata is opaque to AM — it flows through to the IdP provider plugin, which uses it to determine deployment-specific behavior (e.g., a Keycloak provider receiving `{ "adopt_realm": "master" }` may adopt an existing realm, while other metadata may trigger fresh resource creation). If the provider returns no metadata (binding established through external configuration or convention), bootstrap proceeds normally. On subsequent starts, bootstrap detects the existing root (in `active` status) and is a no-op. A root tenant stuck in `provisioning` status from an ambiguous provider outcome or finalization failure is left for provisioning-reaper compensation; bootstrap does not create a second root while that stale row exists. Successful bootstrap emits a platform audit event with `actor=system`. If IdP is unavailable, bootstrap retries with backoff until timeout before any row is written. Concurrent-replica safety is provided by the `ux_tenants_single_root` unique partial index: if two replicas race on a fresh deployment, the second insert fails the constraint and falls through to the idempotency path on its next classification attempt.
 
 #### Create Child Tenant with Type Validation
 
@@ -1156,8 +1178,8 @@ sequenceDiagram
     else Wrong side for the attempted status
         I->>API: PATCH .../{request_id} {"status":"approved"}   %% initiator tries to approve
         API->>CS: approve(caller_side=initiator_side, request_id)
-        CS-->>API: 409 conflict {sub_code=invalid_actor_for_transition, attempted_status, caller_side}
-        API-->>I: 409
+        CS-->>API: FailedPrecondition (HTTP 400) {reason=INVALID_ACTOR_FOR_TRANSITION, attempted_status, caller_side}
+        API-->>I: 400
     end
 ```
 
@@ -1296,27 +1318,52 @@ The physical schema in [migration.sql](./migration.sql) must preserve these inva
 
 ### 3.8 Error Codes Reference
 
-All errors follow the platform RFC 9457 Problem Details format. The authoritative public `sub_code` values are the exact identifiers enumerated in the OpenAPI `Problem` schema. `sub_code` is required and non-null; broad categories use the category name (for example `service_unavailable` or `internal`) when no finer discriminator applies.
+All errors follow the platform RFC 9457 Problem Details format and the
+Google AIP-193 canonical error model implemented by
+[`modkit-canonical-errors`](../../../../libs/modkit-canonical-errors/). AM
+does not invent a private HTTP-status table — the status code is a
+property of the canonical category, fixed by AIP-193, and the AM SDK
+re-exports `CanonicalError` (as `AccountManagementError`) verbatim.
 
-| Error Code | HTTP Status | Category | Description |
-|------------|-------------|----------|-------------|
-| `invalid_tenant_type` | 422 | `validation` | Tenant type not registered in GTS registry |
-| `type_not_allowed` | 409 | `conflict` | Child tenant type is not allowed under the selected parent type |
-| `tenant_depth_exceeded` | 409 | `conflict` | Hierarchy depth exceeds the configured hard limit (strict mode) |
-| `tenant_has_children` | 409 | `conflict` | Cannot delete tenant with non-deleted child tenants |
-| `tenant_has_resources` | 409 | `conflict` | Cannot delete tenant with remaining resource ownership links in the Resource Group ownership graph |
-| `root_tenant_cannot_delete` | 422 | `validation` | Attempt to delete the root tenant |
-| `cross_tenant_denied` | 403 | `cross_tenant_denied` | Barrier violation or unauthorized cross-tenant access |
-| `pending_exists` | 409 | `conflict` | A pending conversion request already exists for this tenant; response body carries the existing `request_id` |
-| `invalid_actor_for_transition` | 409 | `conflict` | Caller's side is not authorized to drive the attempted `status` transition on the request; response body carries `attempted_status` and `caller_side` |
-| `already_resolved` | 409 | `conflict` | Conversion request is no longer pending (any non-`pending` status) |
-| `root_tenant_cannot_convert` | 422 | `validation` | Attempt to initiate a mode conversion on a root tenant |
-| `idp_unavailable` | 503 | `idp_unavailable` | IdP contract call failed or timed out |
-| `idp_unsupported_operation` | 501 | `idp_unsupported_operation` | IdP implementation does not support the requested operation |
-| `not_found` | 404 | `not_found` | Tenant, group, user, or metadata schema/entry not found; stable sub-codes distinguish metadata-schema and metadata-entry cases |
-| `validation` | 422 | `validation` | Invalid input, missing required fields, or schema validation failure |
-| `service_unavailable` | 503 | `service_unavailable` | Service is temporarily unavailable |
-| `internal` | 500 | `internal` | Unexpected internal error |
+The Problem envelope carries (fields required by the OpenAPI schema +
+populated unconditionally by `am_error_to_problem`):
+
+- `status` — HTTP status, fixed by the canonical category below
+- `type` — GTS resource-type tag
+  (`gts.cf.core.am.{tenant|tenant_metadata|conversion_request}.v1~`,
+  exported as `account_management_sdk::gts::{TENANT_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, CONVERSION_REQUEST_RESOURCE_TYPE}`)
+  identifying the resource the failure pertains to
+- `title` — canonical category title (`Invalid Argument`, `Failed
+  Precondition`, `Aborted`, `Service Unavailable`, …)
+- `code` — stable category snake_case token (`invalid_argument`,
+  `failed_precondition`, `aborted`, `service_unavailable`, …) —
+  required by the OpenAPI schema and populated unconditionally for
+  backwards compatibility with existing clients; kept in lockstep
+  with the canonical category and **not** an AM-private taxonomy
+- `detail` — human-readable, non-leaky summary
+- `errors[]` (where applicable) — structured violations list:
+  field violations on `InvalidArgument`, precondition violations on
+  `FailedPrecondition`, quota violations on `ResourceExhausted`. Each
+  carries a stable `reason` token (e.g. `INVALID_TENANT_TYPE`,
+  `TENANT_HAS_CHILDREN`, `SERIALIZATION_CONFLICT`) — that is the
+  fine-grained discriminator clients switch on for sub-category
+  routing; the `code` field disambiguates by category, the
+  `errors[].reason` field disambiguates within a category
+
+| Canonical category | HTTP | When AM emits it |
+|--------------------|------|------------------|
+| `InvalidArgument` | 400 | Validation failures: schema validation, name length, invalid tenant type, root-tenant-cannot-delete, root-tenant-cannot-convert. `errors[]` carries field-level violations with `reason` tokens (`INVALID_TENANT_TYPE`, `ROOT_TENANT_CANNOT_DELETE`, `ROOT_TENANT_CANNOT_CONVERT`, …). |
+| `NotFound` | 404 | Tenant, conversion request, metadata schema, or metadata entry not found. `type` selects the specific resource (`tenant.v1~` / `tenant_metadata.v1~` / `conversion_request.v1~`), `resource_name` carries the missing identifier. |
+| `FailedPrecondition` | 400 | State precondition violations: `TENANT_HAS_CHILDREN`, `TENANT_HAS_RESOURCES`, `TYPE_NOT_ALLOWED`, `TENANT_DEPTH_EXCEEDED`, `PENDING_EXISTS`, `INVALID_ACTOR_FOR_TRANSITION`, `ALREADY_RESOLVED`, generic precondition. The `errors[]` precondition-violation list carries the discriminating `reason`. |
+| `Aborted` | 409 | Concurrency conflict — currently emitted only when SERIALIZABLE retry budget is exhausted on a hierarchy-mutating transaction (`reason = "SERIALIZATION_CONFLICT"`). The losing concurrent writer receives a deterministic 409 envelope per `feature-tenant-hierarchy-management §6 / AC line 711`. Always safe to retry from the client. |
+| `AlreadyExists` | 409 | Unique-constraint violation on a tenant write (Postgres `23505` / SQLite `2067`). Currently funnels through `From<DbErr>` classification at the boundary — direct domain emission is reserved for future flows. |
+| `PermissionDenied` | 403 | Barrier violation or unauthorized cross-tenant access (`reason = "CROSS_TENANT_DENIED"`). Cross-tenant denials originating from the PEP/PDP chain land here. |
+| `ResourceExhausted` | 429 | Integrity audit single-flight refusal (`AUDIT_ALREADY_RUNNING`) — the `running_audits` PK gate enforces single-flight per scope, and concurrent callers receive this category. Safe to retry with backoff. |
+| `ServiceUnavailable` | 503 | Transient infrastructure outage: IdP contract call failed/timed out, AuthZ PDP transport failure, DB connectivity loss. `retry_after_seconds` populated when the caller has a defensible retry-budget hint (e.g. IdP-supplied `Retry-After`); absent for DB outages where no SLA hint is available. |
+| `Unimplemented` | 501 | IdP plugin does not support the requested administrative operation. |
+| `Internal` | 500 | Unexpected internal failure. The audit-only `diagnostic` field is recorded server-side; the public `detail` is generic. |
+
+Renaming the canonical-error mapping above requires a contract-version bump (per `dod-errors-observability-versioning-discipline`).
 
 ## 4. Additional Context
 
@@ -1353,17 +1400,17 @@ AM uses `PolicyEnforcer` as the PEP boundary. AuthZ decisions are delegated to t
 
 | Resource Type | GTS Schema ID | PEP Properties |
 |--------------|---------------|----------------|
-| Tenant | `gts.x.core.am.tenant.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
-| User (IdP proxy) | `gts.x.core.am.user.v1~` | `OWNER_TENANT_ID` |
-| Metadata | `gts.x.core.am.metadata.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID`, `SCHEMA_ID` |
-| ConversionRequest | `gts.x.core.am.conversion_request.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
+| Tenant | `gts.cf.core.am.tenant.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
+| User (IdP proxy) | `gts.cf.core.am.user.v1~` | `OWNER_TENANT_ID` |
+| TenantMetadata | `gts.cf.core.am.tenant_metadata.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID`, `SCHEMA_ID` |
+| ConversionRequest | `gts.cf.core.am.conversion_request.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
 
 | Action | Resource Type | Purpose |
 |--------|---------------|---------|
 | `create`, `read`, `update`, `delete`, `list_children` | Tenant | Tenant lifecycle and direct-child discovery |
 | `read`, `write` | ConversionRequest | Create, discover, and resolve dual-consent conversion requests |
 | `create`, `delete`, `list` | User | IdP-backed user lifecycle operations exposed through the AM user proxy surface |
-| `read`, `write`, `delete`, `list` | Metadata | Schema-scoped metadata CRUD and listing |
+| `read`, `write`, `delete`, `list` | TenantMetadata | Schema-scoped metadata CRUD and listing |
 
 `Tenant.list_children` remains separate from `Tenant.read` because hierarchy enumeration exposes collection-level structure and barrier-sensitive topology, not just one tenant object.
 
@@ -1401,7 +1448,7 @@ AM is the foundational multi-tenancy module handling tenant hierarchy, barrier s
 | Threat | Attack Vector | Mitigation | Status |
 |--------|--------------|------------|--------|
 | Tenant isolation bypass | Crafted API request targeting another tenant's resources | SecureConn enforces tenant-scoped queries via `AccessScope` from PolicyEnforcer | Mitigated |
-| Unauthorized root tenant creation | A misconfigured deployment attempts bootstrap unexpectedly | Root tenant creation is exclusively a bootstrap operation — no API endpoint creates root tenants; bootstrap is a trusted startup path guarded by deployment control, distributed locking, and idempotent root detection | Mitigated |
+| Unauthorized root tenant creation | A misconfigured deployment attempts bootstrap unexpectedly | Root tenant creation is exclusively a bootstrap operation — no API endpoint creates root tenants; bootstrap is a trusted startup path guarded by deployment control and the `ux_tenants_single_root` unique partial index, which prevents duplicate roots even under concurrent replica starts | Mitigated |
 | IdP plugin trust boundary violation | Malicious IdP plugin returns fabricated metadata | IdP plugins are trusted in-process code discovered via GTS; plugin registration is a platform-level operation | Accepted risk (trust boundary) |
 | Conversion request manipulation | Tampered approval of mode conversion | Dual-scope authorization: either side may initiate from its own scope, only the counterparty may approve, and conversion requests expire after 72h | Mitigated |
 | Metadata inheritance poisoning | Injecting malicious metadata values via inherited chain | GTS schema validation at write time; barrier-aware walk-up resolution stops at self-managed boundaries | Mitigated |
@@ -1431,7 +1478,7 @@ AM is the foundational multi-tenancy module handling tenant hierarchy, barrier s
 #### Replica and Background-Job Coordination
 
 - AM HTTP handlers are stateless across replicas. Any replica may serve a request once the module has reached ready state.
-- Bootstrap is a singleton workflow. Exactly one replica must hold the bootstrap lease at a time; other replicas wait or observe the completed result.
+- Bootstrap is a singleton workflow, but coordination is provided by the `ux_tenants_single_root` unique partial index rather than a runtime lease (see §3.2 Bootstrap Service). Replicas may race on a fresh deployment; the index lets exactly one root insert win, and the losing replica falls through to the idempotency path on its next classification attempt.
 - Recurring jobs such as provisioning reaper, conversion expiry, integrity diagnostics, and retention cleanup require single-run coordination per cycle. The implementation may use a database-backed lease or platform scheduler, but the design requires idempotent work units rather than a specific primitive.
 - A repeated or delayed job execution may slow cleanup, but it must not corrupt tenant state, duplicate mode changes, or create additional roots.
 
@@ -1490,7 +1537,7 @@ Error-budget interpretation:
 
 AM-owned data quality expectations:
 
-- integrity diagnostics cover anomalies AM can observe directly: orphaned parent references, root-count violations, and depth inconsistencies
+- integrity diagnostics cover anomalies AM can observe directly via the 8 pure-Rust classifiers detailed in §3.2 *Diagnostic Capabilities* — `orphan`, `cycle`, `depth`, `self_row`, `strict_ancestor`, `extra_edge`, `root`, and `barrier` — each surfacing as a `Vec<Violation>` from a synchronous Rust function over a `(tenants, tenant_closure)` snapshot loaded via SecureSelect inside one write-capable transaction (isolation `REPEATABLE READ` on PostgreSQL; transparently `SERIALIZABLE` on SQLite per `modkit-db`'s `TxIsolationLevel` backend-notes mapping; default access mode, **not** `ReadOnly`, since the same tx hosts the `running_audits` PK gate INSERT/DELETE)
 - AM-owned anomalies and compensation failures must become operator-visible within 15 minutes of detection and have a documented remediation path triaged within one business day
 - cross-module inconsistencies that AM cannot safely repair, such as orphaned RG memberships or post-restore IdP drift, remain explicit telemetry and debt items rather than silent fixes
 

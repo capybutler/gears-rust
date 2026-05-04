@@ -50,6 +50,8 @@ members = [
     "modules/credstore/credstore",
     "modules/credstore/plugins/static-credstore-plugin",
     "modules/file-parser",
+    "modules/system/account-management/account-management",
+    "modules/system/account-management/account-management-sdk",
     "modules/system/api-gateway",
     "modules/system/grpc-hub",
     "modules/system/nodes-registry/nodes-registry",
@@ -241,6 +243,7 @@ cf-system-sdks = { version = "0.1.34", path = "libs/system-sdks" }
 cf-system-sdk-directory = { version = "0.1.34", path = "libs/system-sdks/sdks/directory" }
 
 # system modules SDKs
+account-management-sdk = { package = "cf-account-management-sdk", version = "0.1.0", path = "modules/system/account-management/account-management-sdk" }
 types-registry-sdk = { package = "cf-types-registry-sdk", version = "0.2.1", path = "modules/system/types-registry/types-registry-sdk" }
 tenant-resolver-sdk = { package = "cf-tenant-resolver-sdk", version = "0.3.4", path = "modules/system/tenant-resolver/tenant-resolver-sdk" }
 authz-resolver-sdk = { package = "cf-authz-resolver-sdk", version = "0.3.4", path = "modules/system/authz-resolver/authz-resolver-sdk" }
@@ -279,6 +282,13 @@ async-stream = { version = "0.3" }
 # High-performance data structures
 dashmap = "6.1"
 arc-swap = "1.7"
+
+# Stable, deterministic hasher for non-cryptographic correlation
+# digests (operator-log forensics). Unlike `std::hash::DefaultHasher`,
+# the FNV-1a output is pinned to a specification — digests stay stable
+# across Rust toolchain upgrades, so audit records emitted by older
+# binaries still correlate with newer ones.
+fnv = "1.0"
 
 # Security
 zeroize = { version = "1", features = ["derive"] }

@@ -7,7 +7,6 @@
   - [Decomposition strategy](#decomposition-strategy)
   - [Mutual exclusivity rationale](#mutual-exclusivity-rationale)
   - [Traceability promise](#traceability-promise)
-  - [Implementation phasing](#implementation-phasing)
 - [2. Entries](#2-entries)
   - [2.1 Platform Bootstrap - HIGH](#21-platform-bootstrap---high)
   - [2.2 Tenant Hierarchy Management - HIGH](#22-tenant-hierarchy-management---high)
@@ -139,39 +138,6 @@ and `cpt-cf-tr-plugin-*` ID referenced below is either defined in this
 DECOMPOSITION (feature IDs + status-overall ID) or resolves to an
 upstream PRD/DESIGN definition, with no broken references.
 
-### Implementation phasing
-
-The `plan.toml [[pr_strategy_bundles]]` table locks **Strategy C** —
-three sequenced PRs that group features by functional and storage
-affinity to keep each PR within the ~3k-to-5k change-line review
-target (change-lines = additions + deletions + modifications;
-estimates are pre-implementation forecasts, not hard contracts).
-
-- **PR1 — Foundation + Core + Types** (~3,350 change-lines).
-  Features: `errors-observability`, `platform-bootstrap`,
-  `tenant-hierarchy-management`, `tenant-type-enforcement`. Ships the
-  cross-cutting error taxonomy / metrics / policy surfaces, the root
-  tenant bootstrap, the `tenants` + `tenant_closure` schema, and the
-  GTS-backed parent/child type barrier. Depends on no earlier PR.
-- **PR2 — Modes + IdP + User-Groups + Metadata** (~4,050 change-lines).
-  Features: `managed-self-managed-modes`, `idp-user-operations-contract`,
-  `user-groups`, `tenant-metadata`. Ships the dual-consent
-  `ConversionRequest` state machine, the pluggable IdP user-operations
-  contract, the Resource-Group delegation path for user groups, and
-  the extensible tenant-metadata subsystem. Depends on PR1.
-- **PR3 — Tenant Resolver Plugin** (~1,950 change-lines).
-  Feature: `tenant-resolver-plugin`. Ships the read-only in-process
-  SDK over `tenants` + `tenant_closure` with barrier-mode semantics
-  and provisioning-row invisibility. Depends on PR1 (reads the
-  hierarchy tables) and consumes barrier semantics defined in PR2,
-  but is review-independent of PR2's write paths.
-
-These are **change-line estimates for PR sizing**, not
-implementation-order constraints beyond what the dependency DAG in §3
-already dictates. A downstream sequencing decision could split PR2
-further (e.g., metadata into its own PR) if actual change-line counts
-exceed the 5k rejection threshold during implementation.
-
 ## 2. Entries
 
 ### 2.1 [Platform Bootstrap](./features/feature-platform-bootstrap.md) - HIGH
@@ -187,7 +153,7 @@ exceed the 5k rejection threshold during implementation.
   - Invocation of the tenant-provisioning operation for the root tenant via the shared IdP integration contract, forwarding deployer-configured metadata so the IdP provider plugin can establish the tenant-to-IdP binding, and persisting any provisioning metadata the provider returns.
   - Idempotent behaviour across platform upgrade and AM restart: detect an existing root tenant and preserve it without duplication (bootstrap MUST be a no-op when the root already exists).
   - Ordering guarantee: wait for the IdP to be available before completing bootstrap, retry with backoff, and fail after a configurable timeout if the IdP is not ready.
-  - Module-lifecycle plumbing for bootstrap orchestration: `AccountManagementModule` owns the ModKit `lifecycle(entry = ...)` entry point that invokes `BootstrapService` before the module signals ready; `BootstrapService` owns distributed-lock root creation and the IdP-wait loop.
+  - Module-lifecycle plumbing for bootstrap orchestration: `AccountManagementModule` owns the ModKit `lifecycle(entry = ...)` entry point that invokes `BootstrapService` before the module signals ready; `BootstrapService` owns idempotent root creation and the IdP-wait loop.
 
 - **Out of scope**:
   - Creation of the initial Platform Administrator user identity — the Platform Admin is pre-provisioned in the IdP during infrastructure setup; AM does not create this user (covered by the `idp-user-operations-contract` feature for all other user operations).
@@ -245,13 +211,13 @@ exceed the 5k rejection threshold during implementation.
   - Create child tenant: authenticated parent-tenant administrator creates a new child with an explicit `parent_id`, establishing the relationship immediately and finalising the tenant in `status = active` once the creation saga (insert-provisioning, IdP provision, finalise) completes successfully.
   - Read tenant detail by identifier within the caller's authorized scope.
   - List direct children of a tenant, paginated and status-filterable.
-  - Update mutable tenant fields only (`name` and `active ↔ suspended` status transitions); immutable hierarchy-defining fields (`id`, `parent_id`, `tenant_type`, `self_managed`, `depth`) are rejected; `status=deleted` is rejected with `422` — soft-delete goes through the dedicated DELETE endpoint.
+  - Update mutable tenant fields only (`name` and `active ↔ suspended` status transitions); immutable hierarchy-defining fields (`id`, `parent_id`, `tenant_type`, `self_managed`, `depth`) are rejected with `CanonicalError::InvalidArgument` (HTTP 400); `status=deleted` is rejected with `CanonicalError::FailedPrecondition` (HTTP 400) — soft-delete goes through the dedicated DELETE endpoint.
   - Tenant status change: administrator transitions between `active` and `suspended` without cascading to children; transition to `deleted` is not permitted via status change.
   - Soft-delete: non-root-only, requires zero non-deleted children and no remaining tenant-owned Resource Group associations; schedules hard-deletion after retention period; hard-delete runs leaf-first (`depth DESC`) and invokes IdP tenant-deprovisioning.
   - Configurable advisory hierarchy-depth threshold (default 10) with operator-visible warning signal (metric + structured log) when exceeded, plus an opt-in strict mode that rejects creation above the threshold with `tenant_depth_exceeded`.
   - Tenant closure ownership: AM owns the `tenant_closure` table with shape `(ancestor_id, descendant_id, barrier, descendant_status)`; closure rows exist only for SDK-visible statuses (`active`, `suspended`, `deleted`), never for transient `provisioning`; self-rows carry `barrier = 0`; all closure writes are transactional with the owning `tenants` write (activation, status change, hard-delete).
   - IdP tenant-side lifecycle hooks: `fr-idp-tenant-provision` invoked during tenant creation, `fr-idp-tenant-provision-failure` handling on provider errors, `fr-idp-tenant-deprovision` invoked during hard-delete — all through `IdpProviderPluginClient`; providers MUST NOT silently no-op on mutating operations.
-  - Hierarchy integrity diagnostics: `TenantService::check_hierarchy_integrity()` internal SDK method + `am_hierarchy_integrity_violations` metric surface; remediation expectations for detected anomalies.
+  - Hierarchy integrity diagnostics: `TenantService::check_hierarchy_integrity()` internal SDK method + `am.hierarchy_integrity_violations` metric surface; remediation expectations for detected anomalies.
   - Production-scale operating envelope: closure-table sizing, depth threshold, and benchmark-backed deployment profiles for supported hierarchies.
 
 - **Out of scope**:
@@ -329,7 +295,7 @@ exceed the 5k rejection threshold during implementation.
 - **Scope**:
   - Evaluation of the GTS-registered type-compatibility matrix (`allowed_parent_types`) at the child-tenant create path.
   - Same-type nesting admitted when and only when the GTS type definition permits it, with acyclicity preserved by hierarchy invariants.
-  - Pre-write barrier check that rejects illegal parent/child type pairings with a deterministic `validation` error before any `tenants` or `tenant_closure` row is written.
+  - Pre-write barrier check that, **when strict validation is active** (`strict_barriers=true` and UUID-keyed Types Registry lookup support), rejects illegal parent/child type pairings with a deterministic `CanonicalError::FailedPrecondition` (HTTP 400, `reason=TYPE_NOT_ALLOWED`) — or `CanonicalError::InvalidArgument` (HTTP 400, `reason=INVALID_TENANT_TYPE`) for unregistered chained identifiers — before any `tenants` or `tenant_closure` row is written. Default runtime (`strict_barriers=false`) operates in stub-admit mode until UUID-keyed lookup support lands.
   - Re-evaluation of the type matrix prior to mode-conversion approval so that approval cannot persist an illegal topology that was already rejected at creation time.
   - Tenant-type definition envelope governed by the GTS `tenant_type.v1` schema.
 
@@ -369,7 +335,7 @@ exceed the 5k rejection threshold during implementation.
 
 - **Data**:
 
-  - [ ] `p1` - `gts://gts.x.core.am.tenant_type.v1~`
+  - [ ] `p1` - `gts://gts.cf.core.am.tenant_type.v1~`
 
 ### 2.4 [Managed / Self-Managed Modes](./features/feature-managed-self-managed-modes.md) - HIGH
 
@@ -383,7 +349,7 @@ exceed the 5k rejection threshold during implementation.
   - Mode selection at tenant creation — managed child creation and self-managed child creation — with creation-time self-managed declaration skipping the dual-consent workflow because the parent's explicit create call is the consent.
   - Post-creation managed/self-managed conversion workflow, including request initiation, counterparty decision, cancellation, rejection, expiry, and resolved-request retention; the detailed state machine is owned by the FEATURE artifact.
   - Parent-side inbound-discovery contract (`/tenants/{id}/child-conversions`) exposing only minimal conversion-request metadata across the self-managed barrier so the dual-consent workflow remains actionable without surfacing child tenant data.
-  - Single-pending-request invariant for mode-conversion requests, surfaced as `409 conflict (pending_exists)` at the service layer.
+  - Single-pending-request invariant for mode-conversion requests, surfaced as `CanonicalError::FailedPrecondition` (HTTP 400, `reason=PENDING_EXISTS`) at the service layer.
   - Source-of-truth barrier-state update after approved mode changes so downstream isolation consumers observe the updated managed/self-managed topology.
   - Resolved-request retention window that keeps conversion history queryable on the default API surface before the tenant-retention cadence takes over.
   - Mixed-mode tenant trees — both modes coexisting in one hierarchy with `BarrierMode` enabling selective downstream barrier bypass for billing and administrative operations.
@@ -464,7 +430,7 @@ exceed the 5k rejection threshold during implementation.
   - Tenant-scoped user query: list users in a tenant and point-existence checks used by other features (e.g. callers combine this with Resource Group membership operations).
   - IdP unavailability contract: user operations fail with `idp_unavailable` rather than serving stale data — AM holds no local user table, projection, or membership cache.
   - Three REST user operations layered on top of the contract (listed under API below).
-  - User-identity schema reference (`gts://gts.x.core.am.user.v1~`) published for downstream consumers that need the user projection shape at tenant boundary.
+  - User-identity schema reference (`gts://gts.cf.core.am.user.v1~`) published for downstream consumers that need the user projection shape at tenant boundary.
 
 - **Out of scope**:
   - Conforming IdP plugin implementations (e.g. Keycloak adapter, Zitadel adapter, Dex adapter) — these live in separate crates and are delivered outside this feature and this module.
@@ -493,7 +459,7 @@ exceed the 5k rejection threshold during implementation.
   - [ ] `p1` - `cpt-cf-account-management-constraint-legacy-integration`
 
 - **Domain Model Entities**:
-  - `User` (IdP-owned projection referenced via the published `gts://gts.x.core.am.user.v1~` schema — AM never persists this entity locally)
+  - `User` (IdP-owned projection referenced via the published `gts://gts.cf.core.am.user.v1~` schema — AM never persists this entity locally)
   - `UserTenantBinding` (logical relationship owned by the IdP — AM stores no local binding table; the binding is verified via the contract at operation time)
   - `TenantId` (value object consumed at the contract boundary to scope every user operation to a tenant)
 
@@ -512,7 +478,7 @@ exceed the 5k rejection threshold during implementation.
 
 - **Data**:
 
-  - None. Per `cpt-cf-account-management-constraint-no-user-storage`, this feature owns no AM-side tables — user identity state lives in the IdP; the published user projection schema is `gts://gts.x.core.am.user.v1~`.
+  - None. Per `cpt-cf-account-management-constraint-no-user-storage`, this feature owns no AM-side tables — user identity state lives in the IdP; the published user projection schema is `gts://gts.cf.core.am.user.v1~`.
 
 ### 2.6 [User Groups (via Resource Group delegation)](./features/feature-user-groups.md) - HIGH
 
@@ -523,7 +489,7 @@ exceed the 5k rejection threshold during implementation.
 - **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-idp-user-operations-contract`, `cpt-cf-account-management-feature-errors-observability`
 
 - **Scope**:
-  - Chained RG type-schema registration during AM module init for `gts.x.core.rg.type.v1~x.core.am.user_group.v1~`, with `allowed_memberships = [gts.x.core.am.user.v1~]` and `allowed_parents` permitting self-nesting for nested user groups.
+  - Chained RG type-schema registration during AM module init for `gts.x.core.rg.type.v1~x.core.am.user_group.v1~`, with `allowed_memberships = [gts.cf.core.am.user.v1~]` and `allowed_parents` permitting self-nesting for nested user groups.
   - Account-Management-side cascade cleanup trigger during tenant hard-deletion so Resource Group can remove the tenant's user-group subtree before the tenant row is deleted.
   - Exposure of AM's tenant-scoped user-query capability (from feature 5) as the valid user set that callers combine with Resource Group membership operations.
   - Documented delegation contract: consumers call `ResourceGroupClient` directly for group and membership operations; AM does not proxy.
@@ -579,7 +545,7 @@ exceed the 5k rejection threshold during implementation.
 - **Depends On**:
   - `cpt-cf-account-management-feature-tenant-hierarchy-management` (owns `tenants` + `tenant_closure`, `parent_id` walk-up primitives, and the paginated children surface; tenant removal triggers the tenant-metadata cascade-delete contract).
   - `cpt-cf-account-management-feature-managed-self-managed-modes` (owns the `self_managed` flag / barrier column whose value is the stop condition for the inheritance walk-up).
-  - `cpt-cf-account-management-feature-errors-observability` (consumes the Problem Details taxonomy — `metadata_schema_not_registered`, `metadata_entry_not_found`, `validation`, `cross_tenant_denied` — and the `metadata resolution` metric family).
+  - `cpt-cf-account-management-feature-errors-observability` (consumes the canonical-error envelope — `CanonicalError::NotFound` distinguishing missing schema vs. missing entry by `resource_type`/`resource_name`, `CanonicalError::InvalidArgument` for validation, `CanonicalError::PermissionDenied` for cross-tenant denial — and the `metadata resolution` metric family).
 
 - **Scope**:
   - `MetadataService` component: metadata CRUD keyed by `(tenant_id, schema_uuid)`, direct-on-tenant listing (`list_for_tenant`), and hierarchy-aware effective-value resolution (`resolve`).
@@ -588,7 +554,7 @@ exceed the 5k rejection threshold during implementation.
   - Hierarchy walk-up resolution via `parent_id` that stops at the nearest self-managed ancestor (barrier-stop) and skips `suspended` tenants without stopping; empty resolution is the normal terminal state of the walk (not a `not_found`).
   - REST surface `/api/account-management/v1/tenants/{tenant_id}/metadata` (list + per-schema GET/PUT/DELETE + `/resolved` read) with tenant-scope filtering applied by the platform layer, so self-managed barriers apply without AM-specific logic on list.
   - Per-schema AuthZ: `schema_id` is carried in the AuthZ request so policy authors can scope metadata permissions by category.
-  - Distinct 404 sub-codes for unregistered schema vs. missing tenant entry (`metadata_schema_not_registered` vs. `metadata_entry_not_found`).
+  - Distinct `CanonicalError::NotFound` envelopes for unregistered schema vs. missing tenant entry, disambiguated by `resource_type` (`gts.cf.core.am.tenant_metadata.v1~`) and `resource_name` (the chained `schema_id` for missing-schema, the `(tenant_id, schema_id)` for missing-entry).
   - Cascade deletion of all tenant metadata entries when the tenant row is removed.
 
 - **Out of scope**:
@@ -626,7 +592,7 @@ exceed the 5k rejection threshold during implementation.
 
 - **API**:
   - `GET /api/account-management/v1/tenants/{tenant_id}/metadata` (`listTenantMetadata`) — paginated list of direct-on-tenant metadata entries (does not walk ancestors).
-  - `GET /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` (`getTenantMetadata`) — read a single direct entry; 404 distinguishes `metadata_schema_not_registered` vs. `metadata_entry_not_found`.
+  - `GET /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` (`getTenantMetadata`) — read a single direct entry; `CanonicalError::NotFound` distinguishes missing-schema vs. missing-entry by `resource_type`/`resource_name`.
   - `PUT /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` (`putTenantMetadata`) — upsert validated against the registered GTS schema.
   - `DELETE /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` (`deleteTenantMetadata`) — remove a direct entry (does not affect ancestor values).
   - `GET /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}/resolved` (`resolveTenantMetadata`) — effective-value resolution; applies the schema's `inheritance_policy` trait with barrier-stop at self-managed ancestors.
@@ -638,7 +604,7 @@ exceed the 5k rejection threshold during implementation.
 - **Data**:
 
   - `cpt-cf-account-management-dbtable-tenant-metadata` (tenant-scoped metadata storage; the table stores only directly-written values, per ADR-0002).
-  - [ ] `p2` - `gts://gts.x.core.am.tenant_metadata.v1~` (base envelope schema with `x-gts-traits-schema.inheritance_policy`; derived metadata schemas are GTS-registered at runtime).
+  - [ ] `p2` - `gts://gts.cf.core.am.tenant_metadata.v1~` (base envelope schema with `x-gts-traits-schema.inheritance_policy`; derived metadata schemas are GTS-registered at runtime).
 
 ### 2.8 [Errors & Observability](./features/feature-errors-observability.md) - HIGH
 
@@ -649,16 +615,16 @@ exceed the 5k rejection threshold during implementation.
 - **Depends On**: None (foundation feature — every other feature depends on this one transitively; it has no feature-level upstream).
 
 - **Scope**:
-  - Stable public error categories per PRD §5.8: `validation`, `not_found`, `conflict`, `cross_tenant_denied`, `idp_unavailable`, `idp_unsupported_operation`, `service_unavailable`, `internal` (8 public categories; ≥ 6 required by acceptance).
-  - Authoritative HTTP mapping and public `sub_code` identifiers per DESIGN §3.8 (e.g., `invalid_tenant_type`, `type_not_allowed`, `tenant_depth_exceeded`, `tenant_has_children`, `tenant_has_resources`, `root_tenant_cannot_delete`, `pending_exists`, `invalid_actor_for_transition`, `already_resolved`, `root_tenant_cannot_convert`, `metadata_schema_not_registered`, `metadata_entry_not_found`).
+  - AIP-193 canonical error categories per PRD §5.8 / DESIGN §3.8 (`InvalidArgument`, `NotFound`, `FailedPrecondition`, `Aborted`, `AlreadyExists`, `PermissionDenied`, `ResourceExhausted`, `ServiceUnavailable`, `Unimplemented`, `Internal`) provided by `modkit-canonical-errors`. Runtime/SDK mapping: `DomainError::AuditAlreadyRunning → CanonicalError::ResourceExhausted` (HTTP 429); a `sea_orm::DbErr` carrying SQLSTATE 40001 that survives `with_serializable_retry`'s budget is translated by `infra::canonical_mapping::classify_db_err_to_domain` into `DomainError::Aborted { reason: "SERIALIZATION_CONFLICT" }` and then mapped to `CanonicalError::Aborted` (HTTP 409) at the boundary.
+  - Authoritative HTTP mapping per DESIGN §3.8 — codes are properties of the canonical category, not AM-private. Fine-grained discriminators ride inside the envelope as `reason` tokens on field/precondition/quota violations: `INVALID_TENANT_TYPE`, `TYPE_NOT_ALLOWED`, `TENANT_DEPTH_EXCEEDED`, `TENANT_HAS_CHILDREN`, `TENANT_HAS_RESOURCES`, `ROOT_TENANT_CANNOT_DELETE`, `PENDING_EXISTS`, `INVALID_ACTOR_FOR_TRANSITION`, `ALREADY_RESOLVED`, `ROOT_TENANT_CANNOT_CONVERT`, `SERIALIZATION_CONFLICT`, `CROSS_TENANT_DENIED`. Resource-not-found cases use the `resource_type` / `resource_name` fields (`gts.cf.core.am.{tenant|tenant_metadata|conversion_request}.v1~`, exported as `account_management_sdk::gts::{TENANT_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, CONVERSION_REQUEST_RESOURCE_TYPE}`) instead of a dedicated reason token.
   - RFC 9457 Problem Details envelope: OpenAPI `Problem` schema defines the authoritative response shape consumed by every feature.
-  - Observability metric families (7 required): dependency health, metadata resolution, bootstrap lifecycle, tenant-retention, conversion lifecycle, hierarchy-depth threshold exceedance, cross-tenant denials.
+  - Observability metric families (8 required): dependency health, metadata resolution, bootstrap lifecycle, tenant-retention, conversion lifecycle, hierarchy-depth threshold exceedance, cross-tenant denials, `serializable_retry` (operational family added by `errors-observability` for `with_serializable_retry`'s exhausted-retry signal — see [feature-errors-observability §5.2](features/feature-errors-observability.md) catalog table).
   - Platform-aligned metric naming and exposure conventions; boundary between platform-provided and module-internal metrics kept implementation-side.
   - Ops-metrics treatment: dashboard / alerting integration policy covering which domain metrics back SLO/alert rules, naming alignment with the platform metric catalog, and the contract for on-call escalation paths sourced from this feature's metric families (see footnote [a]).
   - Cross-cutting policy surfaces: audit-trail completeness (`actor=system` for bootstrap completion, conversion expiry, provisioning-reaper, hard-delete/tenant-deprovision cleanup), SecurityContext requirement at every entry point, no in-module AuthZ evaluation, path-based API versioning + SDK/IdP contract-stability discipline, data-classification baseline (Internal/Confidential for hierarchy/mode data; PII-adjacent for opaque identity refs; per-schema for metadata), platform reliability SLA (99.9% uptime, RPO ≤ 1h, RTO ≤ 15m; IdP-outage degradation rules), and vendor/licensing hygiene.
 
 - **Out of scope**:
-  - Feature-specific error emission — each owning feature maps its own failure modes onto the taxonomy defined here (e.g., tenant-hierarchy emits `tenant_has_children`, modes emits `pending_exists`, metadata emits `metadata_schema_not_registered`).
+  - Feature-specific error emission — each owning feature maps its own failure modes onto the taxonomy defined here (e.g., tenant-hierarchy emits `CanonicalError::FailedPrecondition` with `reason=TENANT_HAS_CHILDREN`, modes emits `CanonicalError::FailedPrecondition` with `reason=PENDING_EXISTS`, metadata emits `CanonicalError::NotFound` for missing schemas).
   - Metric consumption, dashboards, alert-rule authoring — downstream of this feature.
   - Audit storage, retention, tamper resistance, and security-monitoring integration — inherited platform controls; this feature only emits and classifies events.
   - Token validation, session renewal, federation, MFA — inherited from platform AuthN; AM only requires that every entry point carry a validated `SecurityContext`.
@@ -782,8 +748,20 @@ cpt-cf-account-management-feature-tenant-hierarchy-management (deps: platform-bo
 - `cpt-cf-account-management-feature-tenant-type-enforcement` requires
   `tenant-hierarchy-management` (the type barrier is invoked inline by
   `TenantService` before any `tenants` or `tenant_closure` row is
-  written) and `errors-observability` (emits deterministic `validation`
-  errors with `invalid_tenant_type` / `type_not_allowed` sub-codes).
+  written) and `errors-observability`. The deterministic per-pair
+  rejections — `CanonicalError::InvalidArgument` (HTTP 400) with
+  `reason=INVALID_TENANT_TYPE` for unregistered chained type
+  identifiers, and `CanonicalError::FailedPrecondition` (HTTP 400)
+  with `reason=TYPE_NOT_ALLOWED` for incompatible parent/child
+  pairings — are the **target** semantics under `strict_barriers=true`,
+  gated on the Types Registry UUID lookup API. Until that API ships,
+  `GtsTenantTypeChecker` runs in the default `strict_barriers=false`
+  mode where parent/child pairs are stub-admitted (no per-pair error
+  is surfaced); under the operator-opt-in `strict_barriers=true` mode
+  the fail-closed disposition for an unreachable / unresolvable Types
+  Registry is `CanonicalError::ServiceUnavailable` (HTTP 503) per the
+  `dod-gts-availability-surface` DoD, not the per-pair rejection
+  reasons above.
 
 - `cpt-cf-account-management-feature-managed-self-managed-modes`
   requires `tenant-hierarchy-management` (writes the `barrier` column
@@ -817,9 +795,9 @@ cpt-cf-account-management-feature-tenant-hierarchy-management (deps: platform-bo
   `parent_id`), `managed-self-managed-modes` (the inheritance walk-up
   terminates at self-managed barriers — the stop condition reads the
   `self_managed` flag written by the modes feature), and
-  `errors-observability` (emits
-  `metadata_schema_not_registered` vs `metadata_entry_not_found` 404
-  sub-codes and the metadata-resolution metric family). Note:
+  `errors-observability` (emits canonical `NotFound` envelopes
+  distinguishing missing schema vs. missing entry by `resource_type`/
+  `resource_name` and the metadata-resolution metric family). Note:
   `tenant-type-enforcement` is mentioned only as informational context
   in the §2.7 scope because metadata reuses the same GTS-traits
   resolution pattern; the Phase-2 feature-map authoritative edge set

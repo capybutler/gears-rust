@@ -597,6 +597,7 @@ impl CanonicalError {
     pub fn service_unavailable() -> ServiceUnavailableBuilder {
         ServiceUnavailableBuilder {
             retry_after_seconds: None,
+            detail: None,
         }
     }
 
@@ -696,6 +697,7 @@ where
 
 pub struct ServiceUnavailableBuilder {
     retry_after_seconds: Option<u64>,
+    detail: Option<String>,
 }
 
 impl ServiceUnavailableBuilder {
@@ -705,9 +707,32 @@ impl ServiceUnavailableBuilder {
         self
     }
 
+    /// Override the default `"Service temporarily unavailable"`
+    /// `Problem.detail` text. Callers that already curated a safe,
+    /// non-secret detail string upstream (e.g. `"authorization
+    /// evaluation failed"`, `"IdP plugin unreachable"`) pass it
+    /// here so the canonical envelope preserves the precise reason
+    /// for the outage rather than collapsing every 503 into the
+    /// same opaque message.
+    ///
+    /// **Caller contract:** the string MUST be safe for the public
+    /// `Problem` body — no DSN fragments, no driver text, no
+    /// hostnames, no operator-supplied config strings. Sources that
+    /// can carry such fragments (raw `DbErr`, vendor SDK error
+    /// `Display`) MUST pass through a redaction step (e.g.
+    /// `redacted_db_diagnostic`) before calling this builder.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
     #[must_use]
     pub fn create(self) -> CanonicalError {
+        let detail = self
+            .detail
+            .unwrap_or_else(|| "Service temporarily unavailable".to_owned());
         CanonicalError::__service_unavailable(ServiceUnavailable::new(self.retry_after_seconds))
-            .with_detail("Service temporarily unavailable")
+            .with_detail(detail)
     }
 }

@@ -22,7 +22,7 @@
           "gts.x.core.rg.type.v1~x.core.am.user_group.v1~"
         ],
         "allowed_memberships": [
-          "gts.x.core.am.user.v1~"
+          "gts.cf.core.am.user.v1~"
         ]
       }
     }

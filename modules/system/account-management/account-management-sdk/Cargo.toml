@@ -1,0 +1,23 @@
+[package]
+name = "cf-account-management-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Account Management SDK — public inter-module error contract (canonical-errors re-export)"
+repository.workspace = true
+keywords = ["cyberfabric", "cyberfabric-system"]
+categories = ["web-programming"]
+
+[lib]
+name = "account_management_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+# AM's public inter-module error surface is the AIP-193 `CanonicalError`
+# from `modkit-canonical-errors`. The SDK re-exports it as
+# `AccountManagementError` for naming continuity with the
+# `resource-group-sdk` / `tenant-resolver-sdk` pattern.
+modkit-canonical-errors = { workspace = true }

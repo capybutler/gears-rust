@@ -413,7 +413,7 @@ The system **MUST** allow an administrator to change a tenant's status between `
 
 **Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-platform-admin`
 
-The system **MUST** allow deletion of a **non-root** tenant only when it has no non-deleted child tenants and no remaining tenant-owned resource associations in the Resource Group ownership graph, transitioning the tenant to `deleted` status (soft delete). Attempts to delete the root tenant **MUST** be rejected with `code=validation` and `sub_code=root_tenant_cannot_delete`. If non-deleted children exist, deletion **MUST** be rejected with `code=conflict` and `sub_code=tenant_has_children`. If resource associations remain under the tenant's ownership scope, deletion **MUST** be rejected with `code=conflict` and `sub_code=tenant_has_resources`. Hard deletion **MUST** occur after a configurable retention period (default: 90 days). The hard-deletion process **MUST NOT** leave orphaned child tenant records. When a parent and child tenant share the same retention window, the hard-deletion background job **MUST** process leaf tenants before their parents (leaf-first ordering).
+The system **MUST** allow deletion of a **non-root** tenant only when it has no non-deleted child tenants and no remaining tenant-owned resource associations in the Resource Group ownership graph, transitioning the tenant to `deleted` status (soft delete). Attempts to delete the root tenant **MUST** be rejected as `InvalidArgument` (HTTP 400) with `reason=ROOT_TENANT_CANNOT_DELETE`. If non-deleted children exist, deletion **MUST** be rejected as `FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_CHILDREN`. If resource associations remain under the tenant's ownership scope, deletion **MUST** be rejected as `FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_RESOURCES`. Hard deletion **MUST** occur after a configurable retention period (default: 90 days). The hard-deletion process **MUST NOT** leave orphaned child tenant records. When a parent and child tenant share the same retention window, the hard-deletion background job **MUST** process leaf tenants before their parents (leaf-first ordering).
 
 - **Rationale**: Preventing deletion of tenants with active children or remaining resource ownership links protects organizational integrity and prevents orphaned ownership mappings. The root tenant is undeletable so the deployment always retains exactly one hierarchy root. Soft delete with retention enables recovery and compliance. Ensuring no orphaned child records prevents referential integrity violations during retention cleanup.
 
@@ -676,7 +676,7 @@ User groups are implemented as [Resource Group](../../resource-group/docs/PRD.md
 
 **Actors**: `cpt-cf-account-management-actor-platform-admin`
 
-AM **MUST** register (or require via seeding) the chained Resource Group type schema `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` for user groups. Its `allowed_memberships` **MUST** include the platform user resource type `gts.x.core.am.user.v1~`, and its `allowed_parents` **MUST** include itself to support nested groups. Tenant-scoped placement is enforced by Resource Group's ownership-graph rules rather than encoded as a schema trait. Registration happens during AM module initialization.
+AM **MUST** register (or require via seeding) the chained Resource Group type schema `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` for user groups. Its `allowed_memberships` **MUST** include the platform user resource type `gts.cf.core.am.user.v1~`, and its `allowed_parents` **MUST** include itself to support nested groups. Tenant-scoped placement is enforced by Resource Group's ownership-graph rules rather than encoded as a schema trait. Registration happens during AM module initialization.
 
 - **Rationale**: A dedicated Resource Group type ensures user group operations are governed by the same typed hierarchy, forest invariants, and tenant isolation rules as all other Resource Group entities, without reimplementing group infrastructure in AM.
 
@@ -768,20 +768,28 @@ The metadata permission model **MUST** allow authorization policies to restrict 
 
 **Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-platform-admin`
 
-The module **MUST** map failures to stable public categories:
+The module **MUST** map every failure to one of the AIP-193 canonical
+categories surfaced by [`modkit-canonical-errors`](../../../../libs/modkit-canonical-errors/).
+AM does not maintain a private error taxonomy — the SDK re-exports
+`CanonicalError` (as `AccountManagementError`) verbatim, and the HTTP
+status of every response is a property of the canonical category.
 
-- `validation`
-- `not_found`
-- `conflict`
-- `cross_tenant_denied` (barrier violation, unauthorized cross-tenant access, non-platform-admin attempting root-tenant-scoped operations)
-- `idp_unavailable` (IdP contract call failed or timed out)
-- `idp_unsupported_operation` (IdP implementation does not support the requested administrative operation)
-- `service_unavailable`
-- `internal`
+Categories AM uses today:
 
-- **Rationale**: Stable failure categories let clients and operators react consistently across tenant models and IdP providers.
+- `InvalidArgument` (HTTP 400) — input or precondition-on-input violations (`VALIDATION`, `ROOT_TENANT_CANNOT_DELETE`, `ROOT_TENANT_CANNOT_CONVERT`; `INVALID_TENANT_TYPE` is emitted unconditionally by the bootstrap-owned root-type preflight, and additionally by the **tenant-type checker path** (`GtsTenantTypeChecker` invoked on child create / mode conversion) only when `strict_barriers = true` and the UUID-keyed Types Registry lookup pipeline lands — see DESIGN §3.1, "Enforcement scope (PR1 vs strict mode)")
+- `NotFound` (HTTP 404) — tenant, conversion request, metadata schema, or metadata entry missing
+- `FailedPrecondition` (HTTP 400) — state precondition violations (`TENANT_HAS_CHILDREN`, `TENANT_HAS_RESOURCES`, `TENANT_DEPTH_EXCEEDED`, `PENDING_EXISTS`, `INVALID_ACTOR_FOR_TRANSITION`, `ALREADY_RESOLVED`; `TYPE_NOT_ALLOWED` is emitted unconditionally by the bootstrap-owned root-type preflight, and additionally by the tenant-type checker path on child create / mode conversion only when `strict_barriers = true` — outside that gate the per-pair compatibility check stub-admits)
+- `PermissionDenied` (HTTP 403) — PDP-denied cross-tenant access (also fail-closed for unreachable PDP / unsupported constraint-compile per the ModKit AuthZ invariant), non-platform-admin attempting root-tenant-scoped operations
+- `Aborted` (HTTP 409) — concurrency conflict (currently only retry-exhausted SERIALIZABLE failures, with `reason = "SERIALIZATION_CONFLICT"`)
+- `AlreadyExists` (HTTP 409) — unique-constraint violation on a tenant write
+- `ResourceExhausted` (HTTP 429) — integrity-audit single-flight refusal (`AUDIT_ALREADY_RUNNING`)
+- `ServiceUnavailable` (HTTP 503) — transient infrastructure outage; covers IdP outages (former `idp_unavailable`), DB outages, AuthZ PDP transport failure, and Types Registry reachability failure during a tenant-type-consulting flow. Carries `retry_after_seconds` when a defensible hint is available.
+- `Unimplemented` (HTTP 501) — IdP plugin does not support the requested operation
+- `Internal` (HTTP 500) — unclassified internal failure
 
-The authoritative HTTP mapping, response fields, and stable sub-codes are defined in the OpenAPI contract. Provider-specific diagnostics may appear in audit trails or problem details without changing the public `code`.
+Rationale: anchoring AM's error contract to the AIP-193 canonical model means clients and operators react consistently across CyberFabric modules — every module that adopts `modkit-canonical-errors` shares the same envelope shape, the same HTTP semantics, and the same `errors[]` discriminator vocabulary. Fine-grained discriminators (`INVALID_TENANT_TYPE`, `TENANT_HAS_CHILDREN`, `PENDING_EXISTS`, `SERIALIZATION_CONFLICT`, …) live inside the canonical envelope as `reason` tokens on field/precondition/quota violations rather than as a private AM-side `code` field.
+
+The authoritative HTTP mapping, the `errors[]` violation vocabulary, and the GTS resource-type tags are documented in [DESIGN §3.8](./DESIGN.md#38-error-codes-reference). Provider-specific diagnostics appear in audit trails or in the audit-only `diagnostic` field without changing the public envelope.
 
 ### 5.9 Observability Metrics
 
@@ -1000,7 +1008,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - **Direction**: required from client (schema/type resolution consumed by AM)
 - **Protocol/Format**: SDK trait or equivalent registry API
 - **Consumed / Provided Data**: tenant type definitions, allowed-parent rules, metadata-schema validation material, and metadata inheritance traits.
-- **Availability / Fallback**: Existing AM reads that do not require fresh schema/type projection remain available if GTS is unavailable. Reads that must reverse-hydrate public chained identifiers from stored `tenant_type_uuid` / `schema_uuid` keys depend on Types Registry availability or a bounded local cache and fail deterministically on cache miss rather than returning opaque UUIDs. Type-validating writes and metadata writes that require fresh schema lookup fail with `service_unavailable`; AM does not invent or cache unverified schema changes locally.
+- **Availability / Fallback**: Existing AM reads that do not require fresh schema/type projection remain available if GTS is unavailable. Reverse-hydration of `tenant_type_uuid` / `schema_uuid` to chained identifiers depends on the planned UUID-keyed Types Registry lookup API (`get_by_uuid` / `resolve_traits_by_uuid`); until that ships, AM consumes the existing chained-identifier list endpoints via `TypesRegistryClient` and the reverse-hydration surface is **dependency-gated** on the SDK addition. `TypesRegistryClient` owns its own bounded TTL-aware cache; AM does not maintain a parallel cache and fails deterministically on registry-side cache miss rather than returning opaque UUIDs. Type-validating writes and metadata writes that require fresh schema lookup fail with `CanonicalError::ServiceUnavailable` (HTTP 503) when the registry is unreachable; per-pair tenant-type compatibility rejections (`INVALID_TENANT_TYPE` / `TYPE_NOT_ALLOWED`) are enforced only under `strict_barriers = true` once the UUID-keyed lookup lands — outside that gate the checker stub-admits after a registry reachability probe. AM does not invent or cache unverified schema changes locally.
 - **Compatibility**: Registered schema identifiers remain the stable keys by which AM references tenant types and metadata kinds.
 
 #### Tenant Resolver Plugin Data Contract
@@ -1102,7 +1110,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - Bootstrap resumes only after IdP availability is confirmed, or stops at the timeout boundary
 
 **Alternative Flows**:
-- **Timeout expires**: Bootstrap fails with `idp_unavailable`
+- **Timeout expires**: Bootstrap fails with `CanonicalError::ServiceUnavailable` (HTTP 503)
 
 ### 8.2 Tenant Lifecycle
 
@@ -1326,7 +1334,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 
 **Postconditions**:
 - `T0` remains unchanged
-- Caller receives `validation` with sub-code `root_tenant_cannot_delete`
+- Caller receives `InvalidArgument` (HTTP 400) with `reason=ROOT_TENANT_CANNOT_DELETE`
 
 **Alternative Flows**:
 - **None**: No additional alternative flows beyond the root-invariant check
@@ -1519,7 +1527,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - Caller can disambiguate which role/status combination was rejected from the deterministic error details
 
 **Alternative Flows**:
-- **Request is already resolved (approved/cancelled/rejected/expired)**: System returns `409 conflict` with sub-code `already_resolved` instead of `invalid_actor_for_transition`
+- **Request is already resolved (approved/cancelled/rejected/expired)**: System returns `FailedPrecondition` (HTTP 400) with `reason=ALREADY_RESOLVED` instead of `INVALID_ACTOR_FOR_TRANSITION`
 
 #### Scenario: Retention of Resolved Conversion Requests
 
@@ -1555,7 +1563,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 
 **Preconditions**:
 - Tenant `T1` exists with status `active`
-- User-group Resource Group type `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` is registered with `allowed_memberships` including `gts.x.core.am.user.v1~`
+- User-group Resource Group type `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` is registered with `allowed_memberships` including `gts.cf.core.am.user.v1~`
 
 **Main Flow**:
 1. Tenant admin calls the Resource Group API directly to create a Resource Group entity of the user-group type within tenant scope `T1`.
@@ -1630,7 +1638,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - User `U1` is bound to tenant `T1` via the tenant identity attribute
 
 **Alternative Flows**:
-- **IdP unavailable**: IdP contract call fails or times out. AM returns `idp_unavailable` error to the caller. No user record is created or modified. (See `cpt-cf-account-management-fr-deterministic-errors`.)
+- **IdP unavailable**: IdP contract call fails or times out. AM returns `CanonicalError::ServiceUnavailable` (HTTP 503) to the caller. No user record is created or modified. (See `cpt-cf-account-management-fr-deterministic-errors`.)
 
 #### Scenario: Deprovision User
 
@@ -1651,7 +1659,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - Active sessions for `U1` are revoked
 
 **Alternative Flows**:
-- **IdP unavailable**: IdP contract call fails or times out. AM returns `idp_unavailable` error to the caller. User `U1` remains in its current state. (See `cpt-cf-account-management-fr-deterministic-errors`.)
+- **IdP unavailable**: IdP contract call fails or times out. AM returns `CanonicalError::ServiceUnavailable` (HTTP 503) to the caller. User `U1` remains in its current state. (See `cpt-cf-account-management-fr-deterministic-errors`.)
 
 #### Scenario: Query Users by Tenant
 
@@ -1672,7 +1680,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - Returned users are scoped to tenant `T1`
 
 **Alternative Flows**:
-- **IdP unavailable**: IdP contract call fails or times out. AM returns `idp_unavailable` error to the caller. (See `cpt-cf-account-management-fr-deterministic-errors`.)
+- **IdP unavailable**: IdP contract call fails or times out. AM returns `CanonicalError::ServiceUnavailable` (HTTP 503) to the caller. (See `cpt-cf-account-management-fr-deterministic-errors`.)
 
 ### 8.6 Extensible Tenant Metadata
 
@@ -1697,7 +1705,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 
 **Alternative Flows**:
 - **Schema validation fails**: Write is rejected with `validation` error
-- **Metadata schema not registered**: Write is rejected with `code=not_found` and `sub_code=metadata_schema_not_registered`
+- **Metadata schema not registered**: Write is rejected as `NotFound` (HTTP 404) with `resource_type=gts.cf.core.am.tenant_metadata.v1~` and `resource_name` carrying the missing `schema_id`
 
 #### Scenario: Resolve Inherited Metadata
 
@@ -1807,15 +1815,15 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 
 **Main Flow**:
 1. Client requests a metadata entry using the misspelled schema identifier.
-2. System returns `not_found` with `sub_code=metadata_schema_not_registered`.
+2. System returns `NotFound` with `resource_type=gts.cf.core.am.tenant_metadata.v1~` and the missing `schema_id` as `resource_name`.
 3. Client corrects the identifier to the registered branding schema and retries the same lookup.
-4. System returns `not_found` with `sub_code=metadata_entry_not_found`.
+4. System returns `NotFound` with `resource_type=gts.cf.core.am.tenant_metadata.v1~` and the missing `(tenant_id, schema_id)` pair as `resource_name`.
 
 **Postconditions**:
-- Client can branch on the sub-code: the typo case is a client/configuration bug; the second case is a normal "unset" state and triggers a write to populate the entry.
+- Both paths return the same canonical category (`CanonicalError::NotFound`); clients branch on the `resource_name` payload (and request context) to distinguish them — the typo case is a client/configuration bug surfaced with the unregistered `schema_id` in `resource_name`, while the second case is a normal "unset" state surfaced with the `(tenant_id, schema_id)` pair and triggers a write to populate the entry.
 
 **Alternative Flows**:
-- **Client uses the resolution capability**: The same sub-code distinction applies there as well — typos return `metadata_schema_not_registered`, while a registered but empty chain returns the standard empty-resolution response, not `not_found`.
+- **Client uses the resolution capability**: The same distinction applies there as well — an unregistered schema returns `CanonicalError::NotFound` (HTTP 404) with `resource_type=gts.cf.core.am.tenant_metadata.v1~` and `resource_name` identifying the missing schema, while a registered but empty chain returns the standard empty-resolution response, not `NotFound`.
 
 #### Scenario: Per-Schema Permission Denial
 
@@ -1849,16 +1857,16 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - [ ] Managed tenants do not create visibility barriers and remain eligible for delegated parent administration under platform authorization policy; self-managed tenants block default parent access via visibility barriers.
 - [ ] Any post-creation toggle of a tenant's `self_managed` flag (in either direction) goes through a dual-consent `ConversionRequest`: one side initiates from its own authorized scope, the counterparty resolves from its own scope within the configured approval window (default 72h). The target mode is always derived by AM from current tenant state.
 - [ ] Creation-time declaration of self-managed mode does not require a `ConversionRequest`; the parent actor's explicit act of creating the tenant in that mode is the required consent.
-- [ ] Tenant creation is intentionally non-idempotent: a clean compensated `idp_unavailable` failure may be retried, while ambiguous transport failures, timeouts, and generic platform faults require reconciliation before retry.
+- [ ] Tenant creation is intentionally non-idempotent: a clean compensated IdP-availability failure (`CanonicalError::ServiceUnavailable`) may be retried, while ambiguous transport failures, timeouts, and generic platform faults require reconciliation before retry.
 - [ ] Direct children queries return paginated results with status filtering.
 - [ ] IdP user operations (provision, deprovision, query) work through pluggable IdP integration contract.
 - [ ] User deprovisioning is idempotent: deleting an already-absent IdP user returns success while a missing tenant still returns `not_found`.
-- [ ] AM module initialization registers or verifies the chained Resource Group user-group type schema `gts.x.core.rg.type.v1~x.core.am.user_group.v1~`, including `allowed_memberships = [gts.x.core.am.user.v1~]` and self-referential `allowed_parents`, before user-group operations are relied upon.
+- [ ] AM module initialization registers or verifies the chained Resource Group user-group type schema `gts.x.core.rg.type.v1~x.core.am.user_group.v1~`, including `allowed_memberships = [gts.cf.core.am.user.v1~]` and self-referential `allowed_parents`, before user-group operations are relied upon.
 - [ ] User groups (delegated to Resource Group) support creation, membership management, and nested groups with cycle detection via Resource Group forest invariants.
 - [ ] Extensible tenant metadata (e.g., branding, contacts, billing-address) is configurable per tenant via GTS-registered schemas, with per-schema inheritance policy, exposed via tenant metadata resolution API.
 - [ ] Tenant metadata entries written directly on a tenant are discoverable via a dedicated listing endpoint with pagination; listing honors self-managed barriers the same way other tenant-scoped reads do.
 - [ ] Authorization policy can restrict `read`, `write`, `delete`, and `list` actions on resource type `Metadata` at `schema_id` granularity; `PolicyEnforcer` receives `schema_id` as a resource attribute on every metadata operation.
-- [ ] `not_found` errors on metadata endpoints carry the stable sub-codes `metadata_schema_not_registered` and `metadata_entry_not_found`.
+- [ ] `CanonicalError::NotFound` errors on metadata endpoints use canonical envelope semantics with stable `resource_type` (`gts.cf.core.am.tenant_metadata.v1~`) and `resource_name` identifiers that distinguish a missing schema (the chained `schema_id`) from a missing entry (the `(tenant_id, schema_id)` pair).
 - [ ] Tenant isolation is verified by automated security tests: Tenant A cannot access Tenant B data through any path.
 - [ ] Tenant context validation completes in p95 ≤ 5ms (hot path, served by Tenant Resolver Plugin over AM-owned storage).
 - [ ] Control-plane (administrative) endpoints meet the following latency targets on the §13 approved deployment profile (1K rps peak). These are admin-plane targets, not request-path enforcement; the hot-path budget above is the binding p95 for read-path tenant context:
@@ -1872,7 +1880,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
     | `DELETE` (soft-delete, with child/resource precondition checks) | ≤ 150 ms | ≤ 500 ms |
     | Mode conversion request create / resolve | ≤ 200 ms | ≤ 500 ms |
 
-    IdP-dependent endpoints (tenant create, user provisioning, user deprovisioning) inherit IdP latency and may exceed these p99 bounds when the IdP itself is slow; in that case the AM-side error contract (`idp_unavailable`) applies rather than a latency-violation SLO.
+    IdP-dependent endpoints (tenant create, user provisioning, user deprovisioning) inherit IdP latency and may exceed these p99 bounds when the IdP itself is slow; in that case the AM-side error contract (`CanonicalError::ServiceUnavailable`, HTTP 503) applies rather than a latency-violation SLO.
 - [ ] All tenant configuration changes are recorded in the platform append-only audit infrastructure with actor and tenant identity, including `actor=system` events for AM-owned background transitions.
 - [ ] All failures map to deterministic error categories.
 - [ ] AM exports the documented domain-specific metrics for dependency health, metadata resolution, bootstrap lifecycle, tenant-retention work, conversion lifecycle, hierarchy-depth threshold exceedance, and cross-tenant denials.
@@ -1882,7 +1890,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - [ ] Resolved conversion requests (`approved`/`cancelled`/`rejected`/`expired`) are retained for the configured window (default 30 days) and then soft-deleted; default queries exclude soft-deleted rows.
 - [ ] Metadata resolution returns the correct value when multiple self-managed boundaries exist in the ancestor chain.
 - [ ] Hard-deletion background job correctly processes leaf-first ordering when parent and child share the same retention window.
-- [ ] IdP timeout during user provisioning results in deterministic rollback with `idp_unavailable` error.
+- [ ] IdP timeout during user provisioning results in deterministic rollback with `CanonicalError::ServiceUnavailable` (HTTP 503).
 - [ ] Parent Tenant Administrator can list conversion requests for direct children through the dedicated parent-scope discovery capability without barrier bypass; only conversion-request metadata needed for review and resolution is exposed.
 - [ ] Initiator can withdraw a pending conversion request from their own scope, counterparty can decline it from their own scope, and neither side can drive the other's transition.
 
@@ -1923,7 +1931,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 | Cross-tenant data leak due to query-level isolation bypass | Low | High | Tenant data exposure, contractual and legal liability | Automated security test suite with cross-tenant access attempts; barrier enforcement at query level; continuous monitoring |
 | Tenant hierarchy depth exceeding practical limits at scale | Low | Medium | Performance degradation of hierarchy queries and projections | Configurable advisory threshold (default: 10) with opt-in strict mode; monitoring of hierarchy depth distribution; closure-table sizing and indexing anchored to the §13 approved deployment profile (100K tenants, 1K rps) per §6.8 |
 | Circular nesting in user groups | Low | Low | Infinite loops in permission resolution | Enforced by Resource Group forest invariants — cycle detection at group move/create time; consumers receive `CycleDetected` directly from Resource Group before persistence. AM is not in the call path. |
-| IdP provider unavailability during operations | Medium | High | Tenant creation and user lifecycle operations become temporarily unavailable | Clear deterministic error mapping (`idp_unavailable`), bootstrap retry/backoff, and operator alerting via observability metrics |
+| IdP provider unavailability during operations | Medium | High | Tenant creation and user lifecycle operations become temporarily unavailable | Clear deterministic error mapping (`CanonicalError::ServiceUnavailable`, HTTP 503), bootstrap retry/backoff, and operator alerting via observability metrics |
 | Ambiguous retry after tenant-create timeout or generic platform fault | Medium | Medium | Blind retry of tenant creation can trigger duplicate tenant or IdP-side provisioning attempts because the initial outcome may already have crossed the IdP boundary | Document tenant creation as intentionally non-idempotent; require reconciliation before retry; use platform audit records, compensation metrics, and reaper cleanup for investigation |
 
 ## 13. Review Baseline Decisions

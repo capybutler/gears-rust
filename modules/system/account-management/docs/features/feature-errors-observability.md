@@ -76,14 +76,14 @@ One generic flow models how a domain failure surfaces from any AM feature's code
 
 **Success Scenarios**:
 
-- Domain failure classified, mapped to an RFC 9457 Problem envelope, and returned to the client with the correct HTTP status plus stable non-null `code` and `sub_code` fields.
-- Cross-tenant denial surfaces as `cross_tenant_denied` (HTTP 403) without leaking the existence or attributes of the target resource beyond the stable sub-code.
-- IdP contract failure surfaces as `idp_unavailable` (HTTP 503) with deterministic retry semantics per PRD §6.10.
+- Domain failure classified, mapped to an RFC 9457 Problem envelope, and returned to the client with the correct HTTP status and a stable non-null `code` field.
+- Cross-tenant denial surfaces as `CanonicalError::PermissionDenied` (HTTP 403, `reason=CROSS_TENANT_DENIED`) without leaking the existence or attributes of the target resource beyond the canonical envelope.
+- IdP contract failure surfaces as `CanonicalError::ServiceUnavailable` (HTTP 503) with deterministic retry semantics per PRD §6.10; the canonical category covers both IdP outages and other transient infrastructure outages, and `retry_after_seconds` is populated when a defensible hint is available.
 
 **Error Scenarios**:
 
 - Entry point reached without a valid `SecurityContext`: request is rejected by the SecurityContext gate before any domain logic runs, short-circuiting with a platform-standard auth error (not re-classified by this feature).
-- Unexpected (unclassified) domain error: falls through to `internal` (HTTP 500) with a generic public body while the detailed diagnostic goes only to the audit trail.
+- Unexpected (unclassified) domain error: falls through to `CanonicalError::Internal` (HTTP 500) with a generic public body while the detailed diagnostic goes only to the audit trail.
 
 **Steps**:
 
@@ -95,7 +95,7 @@ One generic flow models how a domain failure surfaces from any AM feature's code
 4. [ ] - `p1` - Emit domain metric via `algo-metric-emission` using the appropriate metric family for the failure mode (e.g., `dependency_health`, `hierarchy_depth_exceedance`, `cross_tenant_denial`) - `inst-flow-errsurf-metric-emit`
 5. [ ] - `p1` - **IF** the failure is a state-changing or `actor=system`-eligible condition (per `nfr-audit-completeness`) - `inst-flow-errsurf-audit-branch`
    1. [ ] - `p1` - Emit audit event via `algo-audit-emission` with correct actor attribution (tenant identity or `actor=system`) - `inst-flow-errsurf-audit-emit`
-6. [ ] - `p1` - **RETURN** Problem envelope with HTTP status from the category→status mapping and stable non-null `code` + `sub_code` fields - `inst-flow-errsurf-return`
+6. [ ] - `p1` - **RETURN** Problem envelope with HTTP status from the category→status mapping and a stable non-null `code` field - `inst-flow-errsurf-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -103,38 +103,43 @@ One generic flow models how a domain failure surfaces from any AM feature's code
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-algo-errors-observability-error-to-problem-mapping`
 
-**Input**: Domain error instance (class or kind, plus feature-specific diagnostic fields)
+**Input**: `DomainError` instance (variant plus feature-specific diagnostic fields).
 
-**Output**: RFC 9457 Problem Details envelope — `{ type, title, status, code, sub_code, detail?, instance? }` — where `code` is one of the 8 public categories and `sub_code` is a non-null stable public discriminator from DESIGN §3.8 / OpenAPI. When no finer feature-specific discriminator applies, `sub_code` uses the matching category discriminator (`validation`, `not_found`, `service_unavailable`, `internal`, etc.).
+**Output**: An AIP-193 [`CanonicalError`](../../../../../libs/modkit-canonical-errors/) which the SDK re-exports as `AccountManagementError` and which the platform converts into the RFC 9457 `Problem` envelope at the REST boundary. AM does not invent a private HTTP-status table; the status code is a property of the canonical category. Fine-grained discriminators (`INVALID_TENANT_TYPE`, `TENANT_HAS_CHILDREN`, `SERIALIZATION_CONFLICT`, …) ride inside the envelope as `reason` tokens on field/precondition/quota violations, not as a private AM-side `code` field.
 
 **Steps**:
 
-> This algorithm enumerates the 8 public categories from PRD §5.8 exhaustively. Any domain error not matched by steps 2–8 **MUST** fall through to `internal` via step 9 to preserve public-contract stability; the unmatched diagnostic detail is preserved in the audit trail, not the public Problem body.
+> This algorithm enumerates the canonical categories AM uses today. Any domain error not matched by steps 2–9 **MUST** fall through to `Internal` (HTTP 500) via step 10 to preserve public-contract stability; the unmatched diagnostic detail is preserved in the audit trail, not the public Problem body. The mapping is implemented by [`From<DomainError> for CanonicalError`](../../account-management/account-management/src/domain/error.rs).
 
-1. [ ] - `p1` - Identify the domain error's kind from its type or diagnostic tag - `inst-algo-etp-identify-kind`
-2. [ ] - `p1` - **IF** kind maps to `validation` (invalid input, schema validation failure, missing required field, `invalid_tenant_type`, `root_tenant_cannot_delete`, `root_tenant_cannot_convert`) - `inst-algo-etp-validation`
-   1. [ ] - `p1` - **RETURN** Problem with `code=validation`, HTTP 422, populated `sub_code` per DESIGN §3.8 - `inst-algo-etp-validation-return`
-3. [ ] - `p1` - **IF** kind maps to `not_found` (tenant, group, user, metadata schema or entry not found; distinguished by `metadata_schema_not_registered` vs `metadata_entry_not_found` sub-codes) - `inst-algo-etp-not-found`
-   1. [ ] - `p1` - **RETURN** Problem with `code=not_found`, HTTP 404, populated `sub_code` per DESIGN §3.8 - `inst-algo-etp-not-found-return`
-4. [ ] - `p1` - **IF** kind maps to `conflict` (`type_not_allowed`, `tenant_depth_exceeded`, `tenant_has_children`, `tenant_has_resources`, `pending_exists`, `invalid_actor_for_transition`, `already_resolved`) - `inst-algo-etp-conflict`
-   1. [ ] - `p1` - **RETURN** Problem with `code=conflict`, HTTP 409, populated `sub_code` per DESIGN §3.8 - `inst-algo-etp-conflict-return`
-5. [ ] - `p1` - **IF** kind maps to `cross_tenant_denied` (barrier violation, unauthorized cross-tenant access, non-platform-admin attempting root-tenant-scoped operations) - `inst-algo-etp-xtd`
-   1. [ ] - `p1` - **RETURN** Problem with `code=cross_tenant_denied`, HTTP 403; body **MUST NOT** leak target-resource attributes beyond the stable sub-code - `inst-algo-etp-xtd-return`
-6. [ ] - `p1` - **IF** kind maps to `idp_unavailable` (IdP contract call failed or timed out) - `inst-algo-etp-idp-unavail`
-   1. [ ] - `p1` - **RETURN** Problem with `code=idp_unavailable`, HTTP 503, `sub_code=idp_unavailable` - `inst-algo-etp-idp-unavail-return`
-7. [ ] - `p1` - **IF** kind maps to `idp_unsupported_operation` (IdP implementation does not support the requested administrative operation) - `inst-algo-etp-idp-unsup`
-   1. [ ] - `p1` - **RETURN** Problem with `code=idp_unsupported_operation`, HTTP 501, `sub_code=idp_unsupported_operation` - `inst-algo-etp-idp-unsup-return`
-8. [ ] - `p1` - **IF** kind maps to `service_unavailable` (AM DB unavailable, Resource Group unavailable during deletion validation/cleanup, GTS unavailable where the caller delegates classification here, AuthZ/PEP unavailable, or AM itself temporarily unavailable) - `inst-algo-etp-svc-unavail`
-   1. [ ] - `p1` - **RETURN** Problem with `code=service_unavailable`, HTTP 503, `sub_code=service_unavailable` - `inst-algo-etp-svc-unavail-return`
-9. [ ] - `p1` - **ELSE** unclassified domain error (fallthrough to preserve contract stability) - `inst-algo-etp-fallthrough`
-   1. [ ] - `p1` - Record the full diagnostic detail in the audit trail (not the public Problem body) via `algo-audit-emission` - `inst-algo-etp-fallthrough-audit`
-   2. [ ] - `p1` - **RETURN** Problem with `code=internal`, HTTP 500, generic `sub_code=internal`; public body **MUST NOT** disclose diagnostic internals - `inst-algo-etp-fallthrough-return`
+1. [ ] - `p1` - Identify the `DomainError` variant - `inst-algo-etp-identify-kind`
+2. [ ] - `p1` - **IF** variant is `Validation` / `InvalidTenantType` / `RootTenantCannotDelete` / `RootTenantCannotConvert` - `inst-algo-etp-invalid-argument`
+   1. [ ] - `p1` - **RETURN** `CanonicalError::InvalidArgument` (HTTP 400) populated with the matching `reason` token (`VALIDATION` / `INVALID_TENANT_TYPE` / `ROOT_TENANT_CANNOT_DELETE` / `ROOT_TENANT_CANNOT_CONVERT`) on a field-violation entry - `inst-algo-etp-invalid-argument-return`
+3. [ ] - `p1` - **IF** variant is `NotFound` / `MetadataSchemaNotRegistered` / `MetadataEntryNotFound` - `inst-algo-etp-not-found`
+   1. [ ] - `p1` - **RETURN** `CanonicalError::NotFound` (HTTP 404) with `resource_type` set to the matching GTS tag (`gts.cf.core.am.{tenant|tenant_metadata|conversion_request}.v1~`) and `resource_name` carrying the missing identifier - `inst-algo-etp-not-found-return`
+4. [ ] - `p1` - **IF** variant is `TypeNotAllowed` / `TenantDepthExceeded` / `TenantHasChildren` / `TenantHasResources` / `PendingExists` / `InvalidActorForTransition` / `AlreadyResolved` / `Conflict` - `inst-algo-etp-failed-precondition`
+   1. [ ] - `p1` - **RETURN** `CanonicalError::FailedPrecondition` (HTTP 400) with a precondition-violation entry whose `reason` token discriminates the specific cause (`TENANT_HAS_CHILDREN`, `TENANT_HAS_RESOURCES`, `TYPE_NOT_ALLOWED`, `PENDING_EXISTS`, `INVALID_ACTOR_FOR_TRANSITION`, `ALREADY_RESOLVED`, `PRECONDITION_FAILED`, …) - `inst-algo-etp-failed-precondition-return`
+5. [ ] - `p1` - **IF** variant is `CrossTenantDenied` (barrier violation, unauthorized cross-tenant access, non-platform-admin attempting root-tenant-scoped operations) - `inst-algo-etp-permission-denied`
+   1. [ ] - `p1` - **RETURN** `CanonicalError::PermissionDenied` (HTTP 403) with `reason=CROSS_TENANT_DENIED`; body **MUST NOT** leak target-resource attributes beyond the canonical envelope - `inst-algo-etp-permission-denied-return`
+6. [ ] - `p1` - **IF** variant is `ServiceUnavailable` (covers IdP outages, AuthZ PDP transport failure, DB outages, generic transient infra outages) - `inst-algo-etp-service-unavailable`
+   1. [ ] - `p1` - **RETURN** `CanonicalError::ServiceUnavailable` (HTTP 503), populating `retry_after_seconds` from `DomainError::ServiceUnavailable::retry_after` when the caller has a defensible hint - `inst-algo-etp-service-unavailable-return`
+7. [ ] - `p1` - **IF** variant is `UnsupportedOperation` (IdP plugin does not support the requested administrative operation) - `inst-algo-etp-unimplemented`
+   1. [ ] - `p1` - **RETURN** `CanonicalError::Unimplemented` (HTTP 501) - `inst-algo-etp-unimplemented-return`
+8. [ ] - `p1` - **IF** variant is `AuditAlreadyRunning { scope }` (single-flight contention; per-scope hierarchy-integrity audit gate per DESIGN §3.2 — at most one concurrent audit per scope, concurrent callers receive a retry-after refusal) - `inst-algo-etp-resource-exhausted`
+   1. [ ] - `p1` - **RETURN** `CanonicalError::ResourceExhausted` (HTTP 429) with a quota-violation entry keyed by `integrity_audit:<scope>` - `inst-algo-etp-resource-exhausted-return`
+9. [ ] - `p1` - **DB-error classification happens upstream of this mapping**, at retry exit in `infra::canonical_mapping::classify_db_err_to_domain`. The raw `sea_orm::DbErr` is carried through `with_serializable_retry` by the infra-internal `TxError::Db` enum (never inside `DomainError`); on retry exhaustion the surviving `DbErr` is translated into a typed `DomainError` variant (`Aborted`, `AlreadyExists`, `ServiceUnavailable`, or `Internal`) using the SQLSTATE / availability ladder below. The `From<DomainError> for CanonicalError` boundary then forwards each typed variant to its canonical category — no DB-aware code needs to live inside `domain/`. - `inst-algo-etp-db-classify`
+   1. [ ] - `p1` - Serialization failure (Postgres SQLSTATE 40001 / SQLite `BUSY` / `BUSY_SNAPSHOT`) with retry budget exhausted → `DomainError::Aborted { reason: "SERIALIZATION_CONFLICT" }` → `CanonicalError::Aborted` (HTTP 409) - `inst-algo-etp-db-aborted`
+   2. [ ] - `p1` - Unique-constraint violation (Postgres `23505` / SQLite `2067`) → `DomainError::AlreadyExists` → `CanonicalError::AlreadyExists` (HTTP 409) - `inst-algo-etp-db-already-exists`
+   3. [ ] - `p1` - Typed availability signal (`ConnectionAcquire` timeout/closed, `Conn`, `DbError::Io`) → `DomainError::ServiceUnavailable` → `CanonicalError::ServiceUnavailable` (HTTP 503), no `retry_after_seconds` (the database itself is down) - `inst-algo-etp-db-unavailable`
+   4. [ ] - `p1` - Anything else → `DomainError::Internal` → `CanonicalError::Internal` (HTTP 500); a redacted (no DSN / driver text) diagnostic is recorded in the audit-only `diagnostic` field, never in the public envelope - `inst-algo-etp-db-internal`
+10. [ ] - `p1` - **ELSE** unclassified `DomainError` variant (fallthrough to preserve contract stability) - `inst-algo-etp-fallthrough`
+    1. [ ] - `p1` - Record the full diagnostic detail in the audit trail (not the public Problem body) via `algo-audit-emission` - `inst-algo-etp-fallthrough-audit`
+    2. [ ] - `p1` - **RETURN** `CanonicalError::Internal` (HTTP 500); public body **MUST NOT** disclose diagnostic internals - `inst-algo-etp-fallthrough-return`
 
 ### Metric Emission
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-algo-errors-observability-metric-emission`
 
-**Input**: Metric family identifier (one of the 7 AM metric families from PRD §5.9), metric kind (counter, gauge, histogram), and labeled dimension set
+**Input**: Metric family identifier (one of the 7 PRD §5.9 AM metric families plus the `serializable_retry` operational family this FEATURE adds — 8 families total in the catalog below), metric kind (counter, gauge, histogram), and labeled dimension set
 
 **Output**: Metric sample emitted through the platform observability plumbing; no return value to the caller
 
@@ -165,8 +170,8 @@ One generic flow models how a domain failure surfaces from any AM feature's code
    1. [ ] - `p1` - **RETURN** — short-circuit to the platform-standard authentication-error path (`algo-security-context-gate` step 2.1); do **not** emit an audit record under `actor=system`, and do **not** fabricate a tenant-scoped identity - `inst-algo-audit-actor-short-circuit`
 4. [ ] - `p1` - **IF** kind is a state-changing AM-owned transition (tenant create / status change / mode conversion / metadata write / hard-delete) - `inst-algo-audit-state-changing`
    1. [ ] - `p1` - Construct the audit record with `actor`, tenant identity, change details, and event kind per platform audit schema - `inst-algo-audit-construct-state`
-5. [ ] - `p1` - **IF** kind is a `cross_tenant_denied` or `idp_unavailable` failure surfaced through the error-surface flow - `inst-algo-audit-failure`
-   1. [ ] - `p1` - Construct the audit record carrying the full diagnostic detail suppressed from the public Problem body - `inst-algo-audit-construct-failure`
+5. [ ] - `p1` - **IF** kind is a `CanonicalError::PermissionDenied` (cross-tenant denial), `CanonicalError::ServiceUnavailable` (IdP / DB outage), or `CanonicalError::Internal` (unclassified fallthrough from `algo-error-to-problem-mapping` step 10) failure surfaced through the error-surface flow — every such envelope MUST also write its diagnostic to the audit trail so operators retain a forensics record beyond the public Problem body, **subject to source-specific redaction**: DB-internal `Internal` diagnostics travel through `redacted_db_diagnostic` (no DSN / driver text), and IdP `Internal` diagnostics carry only the digest+length pair from `redact_provider_detail` (no vendor SDK strings, no token-bearing fragments). The audit record therefore contains the most-detailed safe diagnostic available at the source, not necessarily the raw producer text - `inst-algo-audit-failure`
+   1. [ ] - `p1` - Construct the audit record carrying the source-redacted diagnostic detail (suppressed from the public Problem body but governed by the same redaction contracts that protect operator logs) - `inst-algo-audit-construct-failure`
 6. [ ] - `p1` - Emit through the platform audit sink; AM does **not** own storage, retention, tamper resistance, or security-monitoring integration (those are inherited platform controls per DESIGN §4.1) - `inst-algo-audit-emit`
 7. [ ] - `p1` - **RETURN** — audit emission is fire-and-forget from the caller's perspective; delivery durability is a platform SLA - `inst-algo-audit-return`
 
@@ -193,9 +198,17 @@ One generic flow models how a domain failure surfaces from any AM feature's code
 
 ### Error Taxonomy and RFC 9457 Envelope
 
-- [ ] `p1` - **ID**: `cpt-cf-account-management-dod-errors-observability-error-taxonomy-and-envelope`
+- [x] `p1` - **ID**: `cpt-cf-account-management-dod-errors-observability-error-taxonomy-and-envelope`
 
-The module **MUST** expose exactly the 8 stable public error categories from PRD §5.8 (`validation`, `not_found`, `conflict`, `cross_tenant_denied`, `idp_unavailable`, `idp_unsupported_operation`, `service_unavailable`, `internal`) and the stable public `sub_code` identifiers enumerated in DESIGN §3.8. Every failure response **MUST** carry the RFC 9457 Problem Details envelope with `code`, non-null `sub_code`, and the HTTP status mandated by the category→status mapping. Unclassified domain errors **MUST** fall through to `code=internal` and `sub_code=internal` rather than leaking new public codes.
+**PR1 scope**: `DomainError` enum + `From<DomainError> for CanonicalError` (AIP-193 boundary mapping) ship in `domain/error.rs`. The RFC 9457 `Problem` envelope rendering at the REST handler boundary uses [`modkit_canonical_errors::Problem`](../../../../../libs/modkit-canonical-errors/) directly and arrives with the REST surface in a later PR.
+
+The module **MUST** map every domain failure to one of the AIP-193 canonical categories enumerated in PRD §5.8 / DESIGN §3.8 — `InvalidArgument`, `NotFound`, `FailedPrecondition`, `Aborted`, `AlreadyExists`, `PermissionDenied`, `ResourceExhausted`, `ServiceUnavailable`, `Unimplemented`, `Internal` — and **MUST NOT** mint AM-private categories or override the AIP-193 HTTP-status table. Fine-grained discriminators ride inside the canonical envelope as `reason` tokens on field/precondition/quota violations or in `resource_type` / `resource_name`. Unclassified domain errors **MUST** fall through to `CanonicalError::Internal` rather than leaking new public categories.
+
+The authoritative AIP-193 mapping is documented in [DESIGN.md §3.8 Error Codes Reference](../DESIGN.md#38-error-codes-reference); the table below records only the discriminators added or refined by this feature. Discriminators contributed by sibling features (tenant-hierarchy-management, mode-conversion, tenant-metadata, etc.) are documented in their own feature files.
+
+| `reason` token | Canonical category (HTTP) | Domain source |
+|----------------|---------------------------|---------------|
+| `SERIALIZATION_CONFLICT` | `Aborted` (409) | `DomainError::Aborted { reason: "SERIALIZATION_CONFLICT" }` produced by `infra::canonical_mapping::classify_db_err_to_domain` after the SERIALIZABLE retry budget is exhausted on a `DbErr` carrying SQLSTATE 40001 (or the SQLite analogue) |
 
 **Implements**:
 
@@ -209,9 +222,11 @@ The module **MUST** expose exactly the 8 stable public error categories from PRD
 
 ### Observability Metric Catalog
 
-- [ ] `p1` - **ID**: `cpt-cf-account-management-dod-errors-observability-metric-catalog`
+- [x] `p1` - **ID**: `cpt-cf-account-management-dod-errors-observability-metric-catalog`
 
-The module **MUST** export the 7 domain-specific metric families required by PRD §5.9 (dependency health, metadata resolution, bootstrap lifecycle, tenant-retention, conversion lifecycle, hierarchy-depth threshold exceedance, cross-tenant denials). Metric names **MUST** align with platform observability naming conventions; label sets **MUST** be documented and cardinality-guarded so no metric exposes unbounded per-tenant or per-user dimensions without an explicit hashing policy.
+**PR1 scope**: metric-name constants (`AM_DEPENDENCY_HEALTH`, …, 11 total) live in `domain/metrics.rs` with no-op `emit_metric` shells; the cardinality guards and OTel meter-provider plumbing land alongside the observability port wiring in a later PR.
+
+The module **MUST** export the 7 domain-specific metric families required by PRD §5.9 (dependency health, metadata resolution, bootstrap lifecycle, tenant-retention, conversion lifecycle, hierarchy-depth threshold exceedance, cross-tenant denials) plus the `serializable_retry` operational family added by this FEATURE (8 families total in the catalog table below). Metric names **MUST** align with platform observability naming conventions; label sets **MUST** be documented and cardinality-guarded so no metric exposes unbounded per-tenant or per-user dimensions without an explicit hashing policy.
 
 | Family ID | Canonical family name | Kind(s) | Allowed labels | Cardinality guard | SLO / alert class | Runbook linkage |
 |-----------|-----------------------|---------|----------------|-------------------|-------------------|-----------------|
@@ -222,6 +237,7 @@ The module **MUST** export the 7 domain-specific metric families required by PRD
 | `conversion_lifecycle` | `am.conversion_lifecycle` | counter, histogram | `transition`, `initiator_side`, `outcome` | no request ID, tenant ID, or user ID labels | Informational by default; alert on stuck/expired backlog if platform policy enables | Platform on-call runbook: `account-management/conversions` |
 | `hierarchy_depth_exceedance` | `am.hierarchy_depth_exceedance` | counter, gauge | `mode`, `threshold`, `outcome` | threshold values bucketed; no tenant/parent IDs | Alerting: integrity-check violations and repeated hard-limit rejects | Platform on-call runbook: `account-management/hierarchy-integrity` |
 | `cross_tenant_denial` | `am.cross_tenant_denial` | counter | `operation`, `barrier_mode`, `reason` | no subject or target tenant/user IDs | Security alert candidate; routed through platform security/on-call policy | Platform on-call runbook: `account-management/cross-tenant-denials` |
+| `serializable_retry` | `am.serializable_retry` | counter | `outcome` (`recovered`/`exhausted`), `attempts` | `attempts` bounded by `MAX_SERIALIZABLE_ATTEMPTS`; no tenant/user labels | Alerting: sustained `outcome=exhausted` rate (DB contention); informational `recovered` rate for retry-budget tuning | Platform on-call runbook: `account-management/serializable-retry` |
 
 **Implements**:
 
@@ -233,7 +249,9 @@ The module **MUST** export the 7 domain-specific metric families required by PRD
 
 ### Audit Contract and `actor=system` Emission
 
-- [ ] `p1` - **ID**: `cpt-cf-account-management-dod-errors-observability-audit-contract`
+- [x] `p1` - **ID**: `cpt-cf-account-management-dod-errors-observability-audit-contract`
+
+**PR1 scope**: `AuditActor` / `AuditEvent` / `AuditEventKind` shapes ship in the impl crate at `cf-account-management::domain::audit` with `serde` `camelCase` wire format. The downstream public surface for these shapes is the `cf-account-management-sdk` SDK crate (`account_management_sdk::audit`, exported once consumers stabilize); module-internal callers may import from the impl-crate path until the SDK re-exports land. The `AuditEmitter` runtime, sinks, and the per-call-site `emit_audit` invocations land with the audit-classifier set in a later PR.
 
 The module **MUST** emit platform audit records for every AM-owned state-changing operation with actor identity and tenant identity preserved, and **MUST** emit `actor=system` records for the AM-owned background transitions enumerated in `nfr-audit-completeness` (bootstrap completion, conversion expiry, provisioning-reaper compensation, hard-delete / tenant-deprovision cleanup). Audit storage, retention, and tamper resistance are inherited platform controls and are **not** owned by AM.
 
@@ -298,7 +316,7 @@ AM persistence **MUST** classify tenant hierarchy and tenant-mode data as Intern
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-errors-observability-reliability-inheritance`
 
-AM **MUST** inherit the platform core infrastructure SLA (target 99.9% uptime). During IdP outages, AM **MUST** continue serving tenant reads, child listing, status reads, and metadata resolution from AM-owned data while failing only the IdP-dependent operations with `idp_unavailable`. Platform recovery targets RPO ≤ 1 hour and RTO ≤ 15 minutes are inherited. Tenant creation remains intentionally non-idempotent across ambiguous external failures per PRD §6.10.
+AM **MUST** inherit the platform core infrastructure SLA (target 99.9% uptime). During IdP outages, AM **MUST** continue serving tenant reads, child listing, status reads, and metadata resolution from AM-owned data while failing only the IdP-dependent operations with `CanonicalError::ServiceUnavailable` (HTTP 503). Platform recovery targets RPO ≤ 1 hour and RTO ≤ 15 minutes are inherited. Tenant creation remains intentionally non-idempotent across ambiguous external failures per PRD §6.10.
 
 **Implements**:
 
@@ -313,7 +331,7 @@ AM **MUST** inherit the platform core infrastructure SLA (target 99.9% uptime). 
 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-dod-errors-observability-ops-metrics-treatment`
 
-The module **MUST** define which of the 7 domain-specific metric families back SLO / alert rules and on-call escalation paths, and **MUST** provide the naming alignment contract with the platform metric catalog so downstream dashboards and alert-rule authoring can consume the families without renaming. The metric-catalog table in §5.2 is the authoritative source for the canonical metric-family names consumed by `algo-metric-emission`; sibling features' concrete emit instances (e.g., `bootstrap.attempts`, `bootstrap.outcome`) MUST reconcile against the name-alignment entries registered here. Specific alert rules, dashboard panels, and threshold values are deployment-specific and live outside this FEATURE; this DoD defines the integration surface, not the deployed alerts.
+The module **MUST** define which of the 8 documented metric families (the 7 PRD §5.9 domain-specific families plus `serializable_retry`) back SLO / alert rules and on-call escalation paths, and **MUST** provide the naming alignment contract with the platform metric catalog so downstream dashboards and alert-rule authoring can consume the families without renaming. The metric-catalog table in §5.2 is the authoritative source for the canonical metric-family names consumed by `algo-metric-emission`; sibling features' concrete emit instances (e.g., `bootstrap.attempts`, `bootstrap.outcome`) MUST reconcile against the name-alignment entries registered here. Specific alert rules, dashboard panels, and threshold values are deployment-specific and live outside this FEATURE; this DoD defines the integration surface, not the deployed alerts.
 
 **Implements**:
 
@@ -341,16 +359,17 @@ AM **MUST** depend only on platform-approved open-source libraries reached throu
 
 ## 6. Acceptance Criteria
 
-- [ ] All 8 PRD §5.8 error categories are reachable from at least one test scenario across the AM test suite; every category returns the documented HTTP status and a Problem body with the expected `code` and a populated `sub_code`.
-- [ ] Every stable public `sub_code` from DESIGN §3.8 appears as an exactly-matching string constant in the module's error enumeration and is covered by at least one test.
-- [ ] Public Problem responses never contain domain-diagnostic internals beyond the stable `sub_code`; unclassified errors return `code=internal` with a generic body while the full diagnostic is recoverable through the audit trail.
-- [ ] All 7 PRD §5.9 metric families are emitted by AM at runtime; each family's label set is documented and cardinality-guarded; dashboards and alert rules can subscribe to them by platform-aligned canonical names.
+- [ ] Every AIP-193 canonical category AM uses (`InvalidArgument`, `NotFound`, `FailedPrecondition`, `Aborted`, `AlreadyExists`, `PermissionDenied`, `ResourceExhausted`, `ServiceUnavailable`, `Unimplemented`, `Internal`) is reachable from at least one test scenario across the AM test suite; every category returns the documented HTTP status (per DESIGN §3.8) and a `Problem` body with the canonical `type` / `title` / `errors[]` shape.
+- [ ] At least one test scenario exercises the `ResourceExhausted` mapping end-to-end: it triggers the single-flight gate, receives an HTTP 429 response, and asserts the canonical envelope carries `quota_violations[0].subject` matching `integrity_audit:<scope>`. The runtime/SDK chain `DomainError::AuditAlreadyRunning → CanonicalError::ResourceExhausted → Public Problem(429)` is locked by this test.
+- [ ] Every documented `reason` token (`SERIALIZATION_CONFLICT`, `TENANT_HAS_CHILDREN`, `TENANT_HAS_RESOURCES`, `TYPE_NOT_ALLOWED`, `TENANT_DEPTH_EXCEEDED`, `PENDING_EXISTS`, `INVALID_ACTOR_FOR_TRANSITION`, `ALREADY_RESOLVED`, `INVALID_TENANT_TYPE`, `ROOT_TENANT_CANNOT_DELETE`, `ROOT_TENANT_CANNOT_CONVERT`, `CROSS_TENANT_DENIED`) appears as an exactly-matching string constant in the boundary-mapping code and is covered by at least one test.
+- [ ] Public `Problem` responses never contain domain-diagnostic internals beyond the canonical envelope; unclassified errors return `CanonicalError::Internal` (HTTP 500) with a generic body while the full diagnostic is recoverable through the audit trail.
+- [ ] All 8 documented metric families (7 PRD §5.9 + `serializable_retry`) are emitted by AM at runtime; each family's label set is documented and cardinality-guarded; dashboards and alert rules can subscribe to them by platform-aligned canonical names.
 - [ ] `actor=system` audit records are emitted for bootstrap completion, conversion expiry, provisioning-reaper compensation, and hard-delete / tenant-deprovision cleanup; tenant-scoped audit records carry the caller's `SecurityContext` identity and tenant identity.
 - [ ] Every REST handler, SDK boundary, and inter-module ClientHub contract rejects or refuses to dispatch invocations without a valid `SecurityContext` before invoking domain logic; bootstrap and background jobs attach `actor=system` explicitly and are the only caller-less exemptions.
 - [ ] Breaking changes to the OpenAPI `Problem` schema, SDK contract, or IdP integration trait are blocked by contract-version review; path-based versioning is enforced on published REST endpoints. A SemVer-check CI job diffs `account-management-v1.yaml`, the SDK contract crate, and the IdP integration trait file between tagged versions and fails the build if any existing field is removed or retyped, or any required field is added, without a new contract version header.
-- [ ] During a synthetic IdP outage, AM tenant reads, children listing, status reads, and metadata resolution continue to succeed while IdP-dependent operations fail cleanly with `code=idp_unavailable`.
+- [ ] During a synthetic IdP outage, AM tenant reads, children listing, status reads, and metadata resolution continue to succeed while IdP-dependent operations fail cleanly with `CanonicalError::ServiceUnavailable` (HTTP 503).
 - [ ] A classification-mapping artifact enumerates every AM-persisted data category (tenant hierarchy, tenant mode, conversion-request state, opaque identity references, per-schema metadata) with its classification tier (Internal / Confidential / PII-adjacent / per-GTS-schema). A schema-migration lint fails if any AM-owned table gains a column that holds IdP-issued credentials or IdP-sourced profile PII.
-- [ ] The metric-catalog table in this FEATURE lists each of the 7 domain-specific metric families with (a) its canonical platform-aligned name, (b) metric kind, (c) allowed labels, (d) cardinality guard, (e) SLO / alert class or explicit `informational only` marker, and (f) the on-call runbook link it backs. At minimum, the PRD §6.12 operator-treatment topics (IdP failure rate, bootstrap not-ready state, provisioning reaper activity, integrity-check violations, background cleanup failures) each map to a family with a non-`informational only` classification.
+- [ ] The metric-catalog table in this FEATURE lists each of the 8 documented metric families (7 PRD §5.9 domain-specific families + `serializable_retry`) with (a) its canonical platform-aligned name, (b) metric kind, (c) allowed labels, (d) cardinality guard, (e) SLO / alert class or explicit `informational only` marker, and (f) the on-call runbook link it backs. At minimum, the PRD §6.12 operator-treatment topics (IdP failure rate, bootstrap not-ready state, provisioning reaper activity, integrity-check violations, background cleanup failures) each map to a family with a non-`informational only` classification.
 - [ ] A CI license-allowlist job scans the AM `Cargo.toml` runtime-dependency closure and fails the build if any dependency license is not on the platform allowlist; an SBOM artifact is produced by the AM build and published with every release.
 
 ## 7. Deliberate Omissions

@@ -72,8 +72,8 @@ C. **Sibling approval endpoint** — `POST /tenants/{id}/conversions` to create 
   * Child-scope: `GET/POST /tenants/{id}/conversions`, `GET/PATCH /tenants/{id}/conversions/{request_id}`.
   * Parent-scope: `GET /tenants/{id}/child-conversions`, `GET/PATCH /tenants/{id}/child-conversions/{request_id}`.
   * `POST` always creates a new request (`initiator_side` derived from the URL collection). `PATCH` drives status only — body whitelist `{"status": "approved" | "cancelled" | "rejected"}`. `caller_side` is derived from the URL collection.
-* **AuthZ vocabulary: ConversionRequest is a distinct GTS ResourceType** (`gts.x.core.am.conversion_request.v1~`, identifier-only — no validation body) with two actions: `read` and `write`, as defined in [DESIGN.md](../DESIGN.md#authorization-model). `write` covers both `POST` (create) and `PATCH` (drive lifecycle); the `caller_side` / `initiator_side` role check that distinguishes legal transitions lives in `ConversionService`, not in the AuthZ action.
-* **Role-per-transition (enforced by `ConversionService`, not by AuthZ):** `cancelled` requires `caller_side == initiator_side`; `approved` and `rejected` require `caller_side != initiator_side`. Mismatches surface as `409 conflict` with sub-code `invalid_actor_for_transition`.
+* **AuthZ vocabulary: ConversionRequest is a distinct GTS ResourceType** (`gts.cf.core.am.conversion_request.v1~`, identifier-only — no validation body) with two actions: `read` and `write`, as defined in [DESIGN.md](../DESIGN.md#authorization-model). `write` covers both `POST` (create) and `PATCH` (drive lifecycle); the `caller_side` / `initiator_side` role check that distinguishes legal transitions lives in `ConversionService`, not in the AuthZ action.
+* **Role-per-transition (enforced by `ConversionService`, not by AuthZ):** `cancelled` requires `caller_side == initiator_side`; `approved` and `rejected` require `caller_side != initiator_side`. Mismatches surface as `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=INVALID_ACTOR_FOR_TRANSITION`.
 * **Configurable lifecycle windows (AM module config, validated at `AccountManagementModule::init`):** `approval_ttl` (default 72h, range `[1h, 30d]`), `resolved_retention` (default 30d, range `[1d, 365d]`), `cleanup_interval` (default 60s, range `[10s, 10m]`). The module fails fast on out-of-range values.
 
 ### Consequences
@@ -89,7 +89,7 @@ C. **Sibling approval endpoint** — `POST /tenants/{id}/conversions` to create 
 
 ### Confirmation
 
-* Integration tests cover: create (`POST`) in both child-scope and parent-scope; `PATCH` transitions to `approved`, `cancelled`, `rejected`; the `409 conflict` + `invalid_actor_for_transition` pair for each invalid `(caller_side, attempted_status)` pair; `409 conflict` + `pending_exists` on concurrent `POST` collisions; `422 validation` + `root_tenant_cannot_convert` for the root tenant; URL-smuggling guards (mismatched `{id}` / `{request_id}`) returning `404`.
+* Integration tests cover: create (`POST`) in both child-scope and parent-scope; `PATCH` transitions to `approved`, `cancelled`, `rejected`; the `FailedPrecondition` + `reason=INVALID_ACTOR_FOR_TRANSITION` pair for each invalid `(caller_side, attempted_status)` pair; `FailedPrecondition` + `reason=PENDING_EXISTS` on concurrent `POST` collisions; `InvalidArgument` + `reason=ROOT_TENANT_CANNOT_CONVERT` for the root tenant; URL-smuggling guards (mismatched `{id}` / `{request_id}`) returning `NotFound`.
 * DB-integrity tests cover the partial unique index, the actor-column `CHECK` constraint (each terminal status requires exactly one actor column populated), and the retention soft-delete job (soft-deleted rows are excluded from default list queries and from the partial unique index).
 * Approval flip atomicity is verified by a transaction-boundary test that asserts `tenants.self_managed` and `conversion_requests.status = 'approved'` either both commit or both roll back.
 * Metric sanity tests verify that each terminal transition increments the corresponding counter exactly once per transition.
@@ -173,7 +173,7 @@ This decision directly addresses the following requirements:
 * `cpt-cf-account-management-usecase-discover-child-conversions` — Parent admin discovers pending inbound requests on direct children.
 * `cpt-cf-account-management-usecase-cancel-conversion-by-initiator` — Initiator withdraws their own pending request.
 * `cpt-cf-account-management-usecase-reject-conversion-by-counterparty` — Counterparty declines a pending request.
-* `cpt-cf-account-management-usecase-invalid-actor-for-transition` — Role-per-transition mismatch surfaces as `409 conflict` with sub-code `invalid_actor_for_transition`.
+* `cpt-cf-account-management-usecase-invalid-actor-for-transition` — Role-per-transition mismatch surfaces as `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=INVALID_ACTOR_FOR_TRANSITION`.
 * `cpt-cf-account-management-usecase-retention-of-resolved-conversion` — Resolved rows are soft-deleted after the retention window.
 * `cpt-cf-account-management-nfr-audit-completeness` — Initiation, approval, cancellation, rejection, and expiry are all recorded in the platform audit log.
 * `cpt-cf-account-management-interface-tenant-mgmt-rest` — The tenant management API surface exposes the `/conversions` and `/child-conversions` collections and no action-verb or singular-sub-resource routes.

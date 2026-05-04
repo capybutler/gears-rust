@@ -43,7 +43,7 @@ Created: 2026-04-21 by Diffora
 
 ### 1.1 Architectural Vision
 
-The Tenant Resolver Plugin is a **query facade** over the tenant hierarchy owned by [Account Management](../DESIGN.md). It implements the CyberFabric [`TenantResolverPluginClient`](../../../tenant-resolver/tenant-resolver-sdk/src/plugin_api.rs) trait (`get_tenant`, `get_root_tenant`, `get_tenants`, `get_ancestors`, `get_descendants`, `is_ancestor`) by reading AM-owned `tenants` and `tenant_closure` tables directly through a dedicated read-only database role. The plugin owns no data, no schema, and no sync loop. Every SDK call is a single indexed read against AM-owned storage for hierarchy state; the only process-local state is a bounded lazy cache that reverse-resolves `tenant_type_uuid` to the public chained `tenant_type` string.
+The Tenant Resolver Plugin is a **query facade** over the tenant hierarchy owned by [Account Management](../DESIGN.md). It implements the CyberFabric [`TenantResolverPluginClient`](../../../tenant-resolver/tenant-resolver-sdk/src/plugin_api.rs) trait (`get_tenant`, `get_root_tenant`, `get_tenants`, `get_ancestors`, `get_descendants`, `is_ancestor`) by reading AM-owned `tenants` and `tenant_closure` tables directly through a dedicated read-only database role. The plugin owns no data, no schema, no sync loop, and no plugin-local cache. Every SDK call is a single indexed read against AM-owned storage for hierarchy state; reverse-resolution of `tenant_type_uuid` to the public chained `tenant_type` string is delegated to `TypesRegistryClient`, which owns the cache for that mapping.
 
 Hierarchy state lives in exactly one place and in exactly one transaction scope. AM maintains `tenant_closure` transactionally with tenant writes ([`cpt-cf-account-management-fr-tenant-closure`](../PRD.md)), so the plugin never observes partial, lagged, or drifting hierarchy state. Barrier and status enforcement reduce to filter predicates on the canonical closure shape `(ancestor_id, descendant_id, barrier, descendant_status)` from [TENANT_MODEL.md](../../../../../docs/arch/authorization/TENANT_MODEL.md); the plugin applies `BarrierMode`, status filters, and SDK ordering guarantees at query time over those columns.
 
@@ -88,7 +88,7 @@ graph LR
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-tr-plugin-nfr-query-latency` | `get_tenant` / `get_root_tenant` / `get_ancestors` / `is_ancestor` p95 ≤ 5ms on indexed read; `get_tenants` p95 ≤ 10ms at batch size ≤ 128 | SecureConn pool + AM closure indexes + bounded `tenant_type` cache | `get_tenant` / `get_root_tenant` are a single indexed read with the provisioning exclusion applied on the row; `get_tenants` is a single bulk-by-ids lookup bounded by batch size; `get_ancestors` / `is_ancestor` are at most two indexed reads per call (existence probe on `tenants` by id + closure read by descendant or by ancestor/descendant pair). Ancestor ordering is driven by AM's stable `tenants.depth` column, direct parent first and root last with `tenants.id` as tie-break — no application-layer walk. Connection pool sized against the gateway's concurrency profile; AM owns the index coverage documented in [§3.7 Database schemas & tables](#37-database-schemas--tables). | Microbenchmarks on 10K and 200K tenant fixtures with warm connection pool and warm `tenant_type` cache; separate cold-start/cache-miss verification; batch microbenchmarks at sizes 1, 16, 128. |
+| `cpt-cf-tr-plugin-nfr-query-latency` | `get_tenant` / `get_root_tenant` / `get_ancestors` / `is_ancestor` p95 ≤ 5ms on indexed read; `get_tenants` p95 ≤ 10ms at batch size ≤ 128 | SecureConn pool + AM closure indexes + `TypesRegistryClient` resolution (cache owned by registry client) | `get_tenant` / `get_root_tenant` are a single indexed read with the provisioning exclusion applied on the row; `get_tenants` is a single bulk-by-ids lookup bounded by batch size; `get_ancestors` / `is_ancestor` are at most two indexed reads per call (existence probe on `tenants` by id + closure read by descendant or by ancestor/descendant pair). Ancestor ordering is driven by AM's stable `tenants.depth` column, direct parent first and root last with `tenants.id` as tie-break — no application-layer walk. Connection pool sized against the gateway's concurrency profile; AM owns the index coverage documented in [§3.7 Database schemas & tables](#37-database-schemas--tables). | Microbenchmarks on 10K and 200K tenant fixtures with warm connection pool and warm `TypesRegistryClient` cache; separate cold-start verification; batch microbenchmarks at sizes 1, 16, 128. |
 | `cpt-cf-tr-plugin-nfr-subtree-latency` | `get_descendants` p99 ≤ 20ms for result sets ≤ 1 000 rows | AM closure indexes + `tenants(parent_id, status)` + `max_depth` + existence probe | Two-step plan: an existence probe on `tenants` by id, then a single bounded recursive read rooted at the starting tenant that walks `tenants.parent_id` (leveraging `idx_tenants_parent_status`) and joins `tenant_closure` on `(ancestor = starting_tenant, descendant)` (leveraging the closure primary key) to apply `barrier` and `descendant_status` as filter predicates. Provisioning exclusion is structural (closure contains no provisioning rows), so no additional filter predicate is needed on the join. `max_depth` is applied as the recursion bound; for an N-row result set the walk does O(N) work on `tenants(parent_id, status)` plus O(N) primary-key lookups on `tenant_closure`. Unbounded subtrees (`max_depth = None` on a large ancestor) are outside this NFR — governed by `query_timeout` and gateway rate limiting. | Load test with representative subtree shapes at the 1 000-row boundary. |
 | `cpt-cf-tr-plugin-nfr-closure-consistency` | Every SDK read observes a transactionally consistent `(tenants, tenant_closure)` pair | AM transactional closure maintenance | AM commits tree and closure mutations in one transaction (see [`cpt-cf-account-management-fr-tenant-closure`](../PRD.md)); the plugin performs no caching or replication. | Integration test: concurrent tenant writes and plugin reads verify no partial-state window. |
 | `cpt-cf-tr-plugin-nfr-tenant-isolation` | Queries never cross a respected barrier | Closure `barrier` column (integer bitmask) + SDK options | Every operation with `BarrierMode::Respect` applies the barrier-clear filter against AM's `(ancestor, descendant]` barrier encoding (v1 single-bit form of the wider bitmask); `BarrierMode::Ignore` is reserved for operator/billing flows authorized by the caller. | Barrier matrix integration tests covering every operation × mode combination, including self-managed starting-tenant and descendant-endpoint cases. |
@@ -120,7 +120,7 @@ graph LR
 
 - [ ] `p1` - **ID**: `cpt-cf-tr-plugin-principle-query-facade`
 
-The plugin owns no data and no schema. Every SDK call resolves to a read against AM's `tenants` and `tenant_closure` tables under the plugin's read-only database role. There is no derived projection and no sync path; hierarchy state is authoritative at the moment of the read. The plugin may maintain a bounded in-process cache only for `tenant_type_uuid -> tenant_type` reverse lookups backed by Types Registry.
+The plugin owns no data and no schema. Every SDK call resolves to a read against AM's `tenants` and `tenant_closure` tables under the plugin's read-only database role. There is no derived projection and no sync path; hierarchy state is authoritative at the moment of the read. The plugin maintains no plugin-local cache; `tenant_type_uuid → tenant_type` reverse lookups are issued against `TypesRegistryClient`, which owns the cache for that mapping.
 
 #### SDK Is the Public Contract
 
@@ -203,7 +203,7 @@ The plugin reuses SDK types (see [`models.rs`](../../../tenant-resolver/tenant-r
 | `TenantStatus` | *SDK* | `Active` / `Suspended` / `Deleted` | `tenant-resolver-sdk` |
 | `BarrierMode` | *SDK* | `Respect` (default) / `Ignore` | `tenant-resolver-sdk` |
 
-At the SDK boundary, the plugin exposes `tenant_type` as an opaque public chained GTS schema identifier (for example, `gts.x.core.am.tenant_type.v1~x.core.am.customer.v1~`). Internally, AM stores the `tenant_type_uuid` UUIDv5 surrogate on `tenants`; the plugin reads that UUID, reverse-resolves the public `tenant_type` through Types Registry, and keeps the mapping in a bounded lazy process-local cache. The plugin does not parse or interpret tenant-type traits.
+At the SDK boundary, the plugin exposes `tenant_type` as an opaque public chained GTS schema identifier (for example, `gts.cf.core.am.tenant_type.v1~x.core.am.customer.v1~`). Internally, AM stores the `tenant_type_uuid` UUIDv5 surrogate on `tenants`; the plugin reads that UUID and reverse-resolves the public `tenant_type` through `TypesRegistryClient`, which owns its own bounded TTL-aware cache for that mapping. The plugin does not parse or interpret tenant-type traits and does not maintain a parallel cache.
 
 AM's physical `tenants.status` domain includes an internal provisioning value used during bootstrap and the tenant-create saga. Provisioning tenants are kept out of the SDK surface by construction: they are absent from `tenant_closure` entirely (AM inserts closure rows only on the `provisioning → active` transition per [`cpt-cf-account-management-fr-tenant-closure`](../PRD.md)), so `tenant_closure.descendant_status` domain is `{active, suspended, deleted}` and closure-driven reads cannot surface provisioning tenants at all. Direct reads of `tenants` (existence probes, bulk-by-ids, ancestor hydration JOINs) additionally drop provisioning rows as a defense-in-depth filter, so the SDK-visible `TenantStatus` domain is strictly `Active` / `Suspended` / `Deleted` (see [`cpt-cf-tr-plugin-fr-provisioning-invisibility`](PRD.md#provisioning-row-invisibility)).
 
@@ -234,14 +234,13 @@ graph TD
 - Translates SDK options (`BarrierMode`, status filter, `max_depth`) into filter predicates on the closure row.
 - Normalizes result ordering: ancestors by `tenants.depth` descending with `tenants.id` as tie-break (direct parent first, root last, given AM's root-depth-0 convention); descendants by a deterministic pre-order traversal derived from the joined `tenants` rows.
 - Applies the SDK's barrier semantics per method: `get_ancestors` includes the nearest self-managed ancestor and stops there under `BarrierMode::Respect`; `get_descendants` excludes self-managed children and their subtrees under `Respect`; `is_ancestor` returns `false` when a respected barrier lies on the path.
-- Reverse-resolves `tenant_type_uuid` to the public chained `tenant_type` identifier via Types Registry.
-- Maintains a bounded lazy cache for `tenant_type_uuid -> tenant_type` mappings so repeated reads do not require a Types Registry lookup on every call.
+- Reverse-resolves `tenant_type_uuid` to the public chained `tenant_type` identifier via `TypesRegistryClient` (the registry client owns the cache for that mapping; the plugin does not maintain a parallel cache).
 - Projects AM column values onto SDK types (`TenantInfo`, `TenantRef`) at the API boundary.
 - Preserves `SecurityContext` and emits database spans / structured logs with OpenTelemetry `trace_id` / `span_id`, plus `request_id` when the gateway provides one.
 
 **Responsibility boundaries**
 
-Does not cache hierarchy rows, ancestor chains, descendant sets, or closure state. Does not write to storage. Does not validate `SecurityContext` (the SDK contract delegates that to the plugin, but the plugin trusts the gateway's AuthN projection; any authorization enforcement the gateway needs is added at the gateway layer). Does not interpret closure semantics beyond applying SDK-documented filter predicates. The sole cacheable surface is the bounded `tenant_type_uuid -> tenant_type` reverse lookup; barrier materialization, status denormalization, and pre-order stability remain AM's contract on the shared schema.
+Holds no plugin-owned cache of any kind — no cache of hierarchy rows, ancestor chains, descendant sets, closure state, or `tenant_type_uuid → tenant_type` mappings (the latter is delegated to `TypesRegistryClient`'s built-in cache). Does not write to storage. Does not validate `SecurityContext` (the SDK contract delegates that to the plugin, but the plugin trusts the gateway's AuthN projection; any authorization enforcement the gateway needs is added at the gateway layer). Does not interpret closure semantics beyond applying SDK-documented filter predicates. Barrier materialization, status denormalization, and pre-order stability remain AM's contract on the shared schema.
 
 **Configuration**
 
@@ -250,7 +249,6 @@ Does not cache hierarchy rows, ancestor chains, descendant sets, or closure stat
 | `db_url` | operator-provided | SecureConn target for the read-only database role. |
 | `pool_max_connections` | implementation-defined | Connection-pool upper bound; sized against the gateway's concurrency profile. |
 | `query_timeout` | `5s` | Per-statement timeout enforced at the DB driver level. |
-| `tenant_type_cache_max_entries` | implementation-defined bounded default | Maximum number of cached `tenant_type_uuid -> tenant_type` mappings retained in process. |
 
 ### 3.3 API Contracts
 
@@ -316,9 +314,9 @@ Any rename, removal, or type change to these columns requires a coordinated AM +
 | Aspect | Detail |
 |--------|--------|
 | Direction | Plugin → Types Registry, read-only. |
-| Transport | In-process ClientHub client or equivalent module boundary used for schema/type lookup. |
+| Transport | In-process `TypesRegistryClient` (ClientHub) used for schema/type lookup. |
 | Purpose | Resolve `tenant_type_uuid` from AM storage back to the public chained `tenant_type` identifier required by SDK responses. |
-| Cache behavior | The plugin uses a bounded lazy process-local cache keyed by `tenant_type_uuid`; cache miss triggers a Types Registry lookup and successful results are memoized until evicted. |
+| Cache behavior | The plugin holds no cache of these mappings. `TypesRegistryClient` owns a bounded TTL-aware local cache; the plugin issues a (batched) lookup on every call and lets the registry client absorb repeated reads. |
 | Failure handling | If the mapping cannot be resolved, the plugin fails the request deterministically with `TenantResolverError::Internal`; it must not return raw UUIDs in place of public `tenant_type`. |
 
 #### Account Management (in-process module)
@@ -342,10 +340,8 @@ sequenceDiagram
     PI->>DB: read tenants by id (non-provisioning)
     DB-->>PI: row | ∅
     alt row returned
-        opt tenant_type_uuid cache miss
-            PI->>TR: resolve(tenant_type_uuid)
-            TR-->>PI: chained tenant_type | error
-        end
+        PI->>TR: resolve(tenant_type_uuid)
+        TR-->>PI: chained tenant_type | error
         PI-->>GW: TenantInfo
     else no row (absent or provisioning)
         PI-->>GW: TenantResolverError::TenantNotFound
@@ -367,10 +363,8 @@ sequenceDiagram
     PI->>DB: read root tenant (no parent, non-provisioning)
     DB-->>PI: unique row | none | multiple
     alt unique row returned
-        opt tenant_type_uuid cache miss
-            PI->>TR: resolve(tenant_type_uuid)
-            TR-->>PI: chained tenant_type | error
-        end
+        PI->>TR: resolve(tenant_type_uuid)
+        TR-->>PI: chained tenant_type | error
         PI-->>GW: TenantInfo
     else no row (incl. bootstrap provisioning) or multiple rows
         PI-->>GW: TenantResolverError::Internal
@@ -394,10 +388,8 @@ sequenceDiagram
     alt tenant exists (non-provisioning)
         PI->>DB: read strict ancestors via closure (barrier applied), ordered by depth descending
         DB-->>PI: rows
-        opt any uncached tenant_type_uuid values
-            PI->>TR: resolve_many(tenant_type_uuid[])
-            TR-->>PI: chained tenant_type mappings | error
-        end
+        PI->>TR: resolve_many(tenant_type_uuid[])
+        TR-->>PI: chained tenant_type mappings | error
         PI-->>GW: GetAncestorsResponse { tenant, ancestors }
     else tenant missing or provisioning
         PI-->>GW: TenantResolverError::TenantNotFound
@@ -425,10 +417,8 @@ sequenceDiagram
     alt tenant exists (non-provisioning)
         PI->>DB: recursive subtree CTE (barrier/status/max_depth applied)
         DB-->>PI: rows (pre-order)
-        opt any uncached tenant_type_uuid values
-            PI->>TR: resolve_many(tenant_type_uuid[])
-            TR-->>PI: chained tenant_type mappings | error
-        end
+        PI->>TR: resolve_many(tenant_type_uuid[])
+        TR-->>PI: chained tenant_type mappings | error
         PI-->>GW: GetDescendantsResponse { tenant, descendants }
     else tenant missing or provisioning
         PI-->>GW: TenantResolverError::TenantNotFound
@@ -445,7 +435,7 @@ When the starting tenant exists, the plugin issues a single subtree read rooted 
 
 Provisioning invisibility is structural: `tenant_closure` contains no rows for provisioning tenants by AM's closure contract, so the descendant side of the join can never surface a provisioning row regardless of the caller-supplied `status` filter. The existence probe on the starting tenant additionally excludes provisioning rows on the `tenants` table, so a provisioning starting tenant returns `TenantNotFound` before any closure read.
 
-Results are returned in pre-order (parent before children, siblings in `tenants.id` order) so the SDK contract is deterministic. The starting tenant itself is returned separately as `response.tenant` and never appears in `descendants`. Any uncached `tenant_type_uuid` values observed in the returned rows are resolved in a single batch call to Types Registry before the response is assembled.
+Results are returned in pre-order (parent before children, siblings in `tenants.id` order) so the SDK contract is deterministic. The starting tenant itself is returned separately as `response.tenant` and never appears in `descendants`. The `tenant_type_uuid` values observed in the returned rows are resolved in a single batch call to `TypesRegistryClient` (which absorbs repeated reads via its own bounded TTL-aware cache) before the response is assembled.
 
 Because `tenant_closure.barrier` is defined over `(ancestor, descendant]`, a `Respect` query that starts from within a self-managed tenant's own subtree is not blocked — the barrier predicate only fires on paths that cross a self-managed boundary between the starting tenant and the descendant.
 
@@ -523,7 +513,7 @@ The plugin returns SDK errors through `Result<_, TenantResolverError>`. Error su
 | Tenant CRUD, mode change, status change | No | AM — see [`cpt-cf-account-management-component-tenant-service`](../DESIGN.md#tenantservice). |
 | Tenant hierarchy closure maintenance | No | AM — see [`cpt-cf-account-management-fr-tenant-closure`](../PRD.md). |
 | Tenant type validation | No | GTS Types Registry via AM. |
-| Tenant type reverse hydration | Yes | Plugin resolves `tenant_type_uuid` through Types Registry and caches successful mappings lazily. |
+| Tenant type reverse hydration | Yes | Plugin resolves `tenant_type_uuid` through `TypesRegistryClient`; caching for that mapping lives inside the registry client (the plugin holds no parallel cache). |
 | Authorization decisions | No | AuthZ Resolver Plugin. |
 | Subtree-membership integration for consuming policy modules | No | Deployment-specific integration owned by the consuming stack; AM's `tenant_closure` is the canonical surface. |
 | Resource Group / User Group hierarchy | No | Resource Group module. |
@@ -587,8 +577,8 @@ Per-query observability is emitted via structured logs and OpenTelemetry spans c
 | Fault | Behaviour |
 |-------|-----------|
 | AM-owned database unavailable for reads | Plugin returns a transient error on every SDK call; gateway decides retry semantics. No independent degraded mode — without the database the plugin has no state to serve from. |
-| Plugin process restart | Cold-start requires no hierarchy rebuild and no projection repopulation. The plugin pre-warms the `tenant_type_uuid → tenant_type` cache at readiness by enumerating registered tenant-type schemas from Types Registry (a small, bounded set), so Types Registry sits off the hot path once readiness succeeds. New tenant-type registrations arriving after readiness are filled lazily on cache miss. |
-| Types Registry unavailable on cache miss | Calls that need public `tenant_type` hydration fail with `TenantResolverError::Internal`; hierarchy reads remain DB-backed, but the plugin must not substitute raw UUIDs for public chained identifiers. |
+| Plugin process restart | Cold-start requires no hierarchy rebuild and no projection repopulation. The plugin holds no warm-up state of its own; tenant-type reverse-hydration goes through `TypesRegistryClient`, which warms its own cache on first lookup (and absorbs subsequent reads). |
+| Types Registry unavailable | Calls that need public `tenant_type` hydration fail with `TenantResolverError::Internal`; hierarchy reads remain DB-backed, but the plugin must not substitute raw UUIDs for public chained identifiers. |
 | AM writer unavailable while reads continue | Plugin remains fully available — reads are against the committed database state and are not coupled to AM's writer health. |
 | Connection-pool exhaustion under burst | New calls queue up to the pool's backpressure limit; queued waiters beyond the limit receive `TenantResolverError::Internal`. `tenant_resolver_db_pool_waiters` alerts when sustained. |
 
@@ -610,7 +600,7 @@ Per-query observability is emitted via structured logs and OpenTelemetry spans c
 #### Cost and Budget Allocation
 
 - **Per-call cost**: hot-path SDK calls resolve to 1–2 indexed reads (existence probe on AM's tenant primary key + optional closure lookup) plus, for `get_descendants`, a bounded recursive walk whose cost scales with the returned subtree rather than with the total tenant count. The plugin adds no storage, no egress, and no process-local state beyond the pool and per-call working set ([§4.3 Performance and Cost Budget](#performance-and-cost-budget)), so incremental infra cost over AM's baseline is IOPS + CPU on the AM-owned database.
-- **Types Registry amortization**: the `tenant_type_uuid → tenant_type` cache is pre-warmed at plugin readiness from the small enumerable set of registered tenant-type schemas ([§4.3 Fault Domains](#fault-domains-and-redundancy) — plugin-process-restart row), so steady-state reads do not pull Types Registry into the response path. Cache-miss bursts are observed via `tenant_resolver_tenant_type_cache_miss_total` ([§4.3 Feature Telemetry](#feature-telemetry)).
+- **Types Registry amortization**: caching for the `tenant_type_uuid → tenant_type` mapping lives inside `TypesRegistryClient` (bounded TTL-aware LRU per `cpt-cf-tr-plugin-contract-types-registry-reverse-lookup`), so steady-state reads do not pull Types Registry into the response path. The plugin maintains no parallel cache and emits no plugin-side cache-miss metric — observability for the registry-client cache is owned by Types Registry.
 - **Budget delegation**: infrastructure and database cost are owned by AM's capacity budget under `cpt-cf-account-management-nfr-production-scale`. The plugin's local cost surface is the SecureConn pool size, which is tuned against the gateway's concurrency profile rather than owned as an independent budget line.
 - **Cost-optimization patterns**: Not applicable as plugin-local patterns — the plugin holds no storage, no caches for hierarchy data, and no egress surface. The deliberate absence of a plugin-side hierarchy cache (see [§4.3 Known Limitations & Technical Debt](#known-limitations--technical-debt)) is an architectural choice anchored in `cpt-cf-tr-plugin-principle-single-store`; caching would be introduced only if measured DB load forced it and an invalidation contract from AM were available.
 - **Time-to-market**: the plugin is pre-GA; go-live is gated on the PRD's Success criteria table ([PRD §1.3](PRD.md#13-goals-business-outcomes) — Module GA + Pre-GA soak / security / scale gates), not on an independent delivery timeline.
@@ -621,7 +611,6 @@ Per-query observability is emitted via structured logs and OpenTelemetry spans c
 |--------|--------|---------|-----------|
 | Performance | `tenant_resolver_query_duration_seconds{op}` | Hot-path latency per operation | p95 ≤ 5 ms; p99 ≤ 20 ms for `get_descendants` |
 | Performance | `tenant_resolver_closure_query_duration_seconds` | DB read latency on `tenant_closure` | p95 ≤ 10 ms |
-| Performance | `tenant_resolver_tenant_type_cache_miss_total` | Visibility into cache-miss bursts that pull Types Registry into the response path | — |
 | Performance | `tenant_resolver_db_pool_utilization` | Connection-pool saturation | ≤ 80% sustained |
 | Reliability | `tenant_resolver_query_errors_total{op,kind}` | Error budget by operation and cause | alert on sustained non-zero |
 | Reliability | `tenant_resolver_db_pool_waiters` | Connection-pool contention | alert on sustained queueing |
