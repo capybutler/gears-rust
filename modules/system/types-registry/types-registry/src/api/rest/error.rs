@@ -1,7 +1,6 @@
 //! REST error mapping for the Types Registry module.
 
-use modkit::api::canonical_prelude::CanonicalProblemMigrationExt;
-use modkit_canonical_errors::{CanonicalError, Problem, resource_error};
+use modkit_canonical_errors::{CanonicalError, resource_error};
 
 use crate::domain::error::DomainError;
 
@@ -55,27 +54,25 @@ impl From<DomainError> for CanonicalError {
     }
 }
 
-// TODO(cpt-cf-errors-component-error-middleware): drop this impl once
-// middleware injects trace_id/instance from request context. The
-// `From<DomainError> for CanonicalError` impl above is the long-lived
-// mapping; this wrapper exists only to keep handler signatures returning
-// `Problem` until middleware lands.
-impl From<DomainError> for Problem {
-    fn from(e: DomainError) -> Self {
-        Problem::from(CanonicalError::from(e)).with_temporary_request_context("/")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use modkit_canonical_errors::Problem;
+
+    fn problem_from(err: DomainError) -> Problem {
+        // Construct the wire `Problem` the same way the canonical error
+        // middleware does — minus the post-response `instance` / `trace_id`
+        // injection, which has no request context at the unit-test level.
+        Problem::from(CanonicalError::from(err))
+    }
 
     #[test]
     fn test_domain_error_to_problem_not_found_by_id() {
-        let err = DomainError::not_found_by_id("gts.cf.core.events.test.v1~");
-        let problem: Problem = err.into();
+        let problem = problem_from(DomainError::not_found_by_id("gts.cf.core.events.test.v1~"));
         assert_eq!(problem.status, 404);
-        assert_eq!(problem.instance.as_deref(), Some("/"));
+        // `instance` is filled by the canonical error middleware on the way
+        // out — at the unit-test level no middleware is in scope.
+        assert!(problem.instance.is_none());
         assert!(
             problem
                 .detail
@@ -87,8 +84,7 @@ mod tests {
 
     #[test]
     fn test_domain_error_to_problem_not_found_by_uuid() {
-        let err = DomainError::not_found_by_uuid(uuid::Uuid::nil());
-        let problem: Problem = err.into();
+        let problem = problem_from(DomainError::not_found_by_uuid(uuid::Uuid::nil()));
         assert_eq!(problem.status, 404);
         assert!(
             problem
@@ -101,41 +97,36 @@ mod tests {
 
     #[test]
     fn test_domain_error_to_problem_already_exists() {
-        let err = DomainError::already_exists("gts.cf.core.events.test.v1~");
-        let problem: Problem = err.into();
+        let problem = problem_from(DomainError::already_exists("gts.cf.core.events.test.v1~"));
         assert_eq!(problem.status, 409);
     }
 
     #[test]
     fn test_domain_error_to_problem_invalid_gts_id() {
-        let err = DomainError::invalid_gts_id("bad format");
-        let problem: Problem = err.into();
+        let problem = problem_from(DomainError::invalid_gts_id("bad format"));
         assert_eq!(problem.status, 400);
     }
 
     #[test]
     fn test_domain_error_to_problem_validation_failed() {
-        let err = DomainError::validation_failed("schema invalid");
-        let problem: Problem = err.into();
+        let problem = problem_from(DomainError::validation_failed("schema invalid"));
         assert_eq!(problem.status, 400);
     }
 
     #[test]
     fn test_domain_error_to_problem_not_in_ready_mode() {
-        let err = DomainError::NotInReadyMode;
-        let problem: Problem = err.into();
+        let problem = problem_from(DomainError::NotInReadyMode);
         assert_eq!(problem.status, 503);
     }
 
     #[test]
     fn test_domain_error_to_problem_ready_commit_failed() {
         use crate::domain::error::ValidationError;
-        let err = DomainError::ReadyCommitFailed(vec![
+        let problem = problem_from(DomainError::ReadyCommitFailed(vec![
             ValidationError::new("gts.test1~", "error1"),
             ValidationError::new("gts.test2~", "error2"),
             ValidationError::new("gts.test3~", "error3"),
-        ]);
-        let problem: Problem = err.into();
+        ]));
         // ReadyCommitFailed is only produced by post_init lifecycle and
         // never reaches a REST response; map opaquely to internal.
         assert_eq!(problem.status, 500);
@@ -143,15 +134,13 @@ mod tests {
 
     #[test]
     fn test_domain_error_to_problem_internal() {
-        let err = DomainError::Internal(anyhow::anyhow!("test error"));
-        let problem: Problem = err.into();
+        let problem = problem_from(DomainError::Internal(anyhow::anyhow!("test error")));
         assert_eq!(problem.status, 500);
     }
 
     #[test]
     fn test_domain_error_to_problem_invalid_query() {
-        let err = DomainError::invalid_query("bad pattern");
-        let problem: Problem = err.into();
+        let problem = problem_from(DomainError::invalid_query("bad pattern"));
         assert_eq!(problem.status, 400);
     }
 }

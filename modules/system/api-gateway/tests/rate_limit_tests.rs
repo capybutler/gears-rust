@@ -4,18 +4,32 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use axum::{Router, extract::Json, routing::get};
+use axum::{
+    Router,
+    body::Body,
+    extract::Json,
+    http::{Request, StatusCode, header},
+    routing::get,
+};
 use modkit::{
     Module, ModuleCtx, RestApiCapability,
     api::OperationBuilder,
     config::ConfigProvider,
     contracts::{ApiGatewayCapability, OpenApiRegistry},
 };
+use modkit_canonical_errors::Problem;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
+use tower::ServiceExt;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+const RESOURCE_EXHAUSTED_TYPE: &str =
+    "gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~";
+const SERVICE_UNAVAILABLE_TYPE: &str =
+    "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~";
+const PROBLEM_JSON: &str = "application/problem+json";
 
 /// Helper to create a test `ModuleCtx`
 struct TestConfigProvider {
@@ -247,4 +261,178 @@ async fn test_rate_limit_metadata_stored() {
     // Path is /tests/v1/test, JSON pointer escapes / as ~1
     let test_op = json.pointer("/paths/~1tests~1v1~1test/get");
     assert!(test_op.is_some(), "Test endpoint should be in OpenAPI");
+}
+
+#[tokio::test]
+async fn test_rate_limit_returns_canonical_problem_with_headers() {
+    // Configure a strict rate limit so the second request is rejected.
+    let config = serde_json::json!({
+        "bind_addr": "127.0.0.1:0",
+        "cors_enabled": false,
+        "auth_disabled": true,
+        "defaults": {
+            "rate_limit": {
+                "rps": 1,
+                "burst": 1,
+                "in_flight": 64
+            }
+        }
+    });
+
+    let api_gateway = api_gateway::ApiGateway::default();
+    let ctx = create_test_module_ctx_with_config(&config);
+    api_gateway.init(&ctx).await.expect("Failed to init");
+
+    let module = RateLimitedModule;
+    let router = Router::new();
+    let router = module
+        .register_rest(&ctx, router, &api_gateway)
+        .expect("Failed to register routes");
+
+    let app = api_gateway
+        .rest_finalize(&ctx, router)
+        .expect("Failed to finalize router");
+
+    // First request consumes the only token.
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tests/v1/limited")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+    assert_eq!(res1.status(), StatusCode::OK);
+
+    // Second request should be rejected with canonical resource_exhausted Problem.
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/tests/v1/limited")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Request failed");
+
+    assert_eq!(res2.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        res2.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        PROBLEM_JSON
+    );
+
+    // Preserve existing rate-limit metadata headers + Retry-After
+    assert!(
+        res2.headers().get("RateLimit-Policy").is_some(),
+        "RateLimit-Policy header must be present on 429"
+    );
+    assert!(
+        res2.headers().get("RateLimit-Limit").is_some(),
+        "RateLimit-Limit header must be present on 429"
+    );
+    assert!(
+        res2.headers().get("X-RateLimit-Limit").is_some(),
+        "X-RateLimit-Limit header must be present on 429"
+    );
+    assert!(
+        res2.headers().get(header::RETRY_AFTER).is_some(),
+        "Retry-After header must be present on 429"
+    );
+
+    let body = axum::body::to_bytes(res2.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let problem: Problem = serde_json::from_slice(&body).expect("parse Problem JSON");
+    assert_eq!(problem.problem_type, RESOURCE_EXHAUSTED_TYPE);
+    let violations = problem
+        .context
+        .get("violations")
+        .and_then(|v| v.as_array())
+        .expect("violations must be present");
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0]["subject"], "rate_limit");
+}
+
+#[tokio::test]
+async fn test_in_flight_limit_returns_canonical_service_unavailable() {
+    // Configure a tiny in-flight cap (1) so the second concurrent request hits 503.
+    let config = serde_json::json!({
+        "bind_addr": "127.0.0.1:0",
+        "cors_enabled": false,
+        "auth_disabled": true,
+        "defaults": {
+            "rate_limit": {
+                "rps": 1000,
+                "burst": 1000,
+                "in_flight": 1
+            }
+        }
+    });
+
+    let api_gateway = api_gateway::ApiGateway::default();
+    let ctx = create_test_module_ctx_with_config(&config);
+    api_gateway.init(&ctx).await.expect("Failed to init");
+
+    // Register a route that uses the gateway defaults (no per-route override).
+    let router = OperationBuilder::get("/tests/v1/inflight")
+        .operation_id("test:inflight")
+        .summary("In-flight cap test endpoint")
+        .public()
+        .json_response(http::StatusCode::OK, "Success")
+        .handler(get(slow_handler))
+        .register(Router::new(), &api_gateway);
+
+    let app = api_gateway
+        .rest_finalize(&ctx, router)
+        .expect("Failed to finalize router");
+
+    // Start one slow request and immediately fire a second one while the first holds the only permit.
+    let app_clone = app.clone();
+    let first = tokio::spawn(async move {
+        app_clone
+            .oneshot(
+                Request::builder()
+                    .uri("/tests/v1/inflight")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("first request failed")
+    });
+
+    // Yield once to let the first request acquire the permit before we send the second.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/tests/v1/inflight")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("second request failed");
+
+    let _ = first.await.expect("first task panicked");
+
+    assert_eq!(res2.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        res2.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        PROBLEM_JSON
+    );
+
+    let body = axum::body::to_bytes(res2.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let problem: Problem = serde_json::from_slice(&body).expect("parse Problem JSON");
+    assert_eq!(problem.problem_type, SERVICE_UNAVAILABLE_TYPE);
+    assert_eq!(problem.context["retry_after_seconds"], 5);
 }

@@ -180,7 +180,16 @@ impl axum::response::IntoResponse for Problem {
 #[cfg(feature = "axum")]
 impl axum::response::IntoResponse for CanonicalError {
     fn into_response(self) -> axum::response::Response {
-        Problem::from(self).into_response()
+        // Stash a clone of self into the response extensions so the canonical
+        // error middleware (DESIGN.md §3.6) can recover `diagnostic()` and log
+        // the unredacted description server-side without putting it on the
+        // wire. The `description` fields on `Internal` / `Unknown` are
+        // `#[serde(skip)]`, so the bytes-roundtrip path alone cannot surface
+        // them.
+        let for_extension = self.clone();
+        let mut response = Problem::from(self).into_response();
+        response.extensions_mut().insert(for_extension);
+        response
     }
 }
 

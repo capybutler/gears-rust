@@ -115,18 +115,20 @@ fn from_io_error_produces_internal() {
 }
 
 #[test]
-fn from_serde_json_error_produces_internal() {
+fn from_serde_json_error_produces_invalid_argument() {
+    // DESIGN.md §1.1 maps `serde_json::Error` to `InvalidArgument` (400):
+    // a malformed JSON body is a client fault, not a server one.
     let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
     let raw_msg = json_err.to_string();
     let err = CanonicalError::from(json_err);
-    assert_eq!(err.status_code(), 500);
-    assert_eq!(err.title(), "Internal");
-    assert_eq!(err.detail(), "Malformed JSON request body");
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(err.title(), "Invalid Argument");
+    assert_eq!(err.detail(), raw_msg);
     assert_eq!(
         err.gts_type(),
-        "gts.cf.core.errors.err.v1~cf.core.err.internal.v1~"
+        "gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
     );
-    assert_eq!(err.diagnostic(), Some(raw_msg.as_str()));
+    assert_eq!(err.diagnostic(), None);
 }
 
 #[test]
@@ -148,9 +150,11 @@ fn question_mark_propagation_serde_json() {
         Ok(serde_json::from_str("{invalid")?)
     }
     let err = inner().unwrap_err();
-    assert_eq!(err.status_code(), 500);
-    assert_eq!(err.detail(), "Malformed JSON request body");
-    assert!(err.diagnostic().is_some());
+    assert_eq!(err.status_code(), 400);
+    assert_eq!(
+        err.gts_type(),
+        "gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
+    );
 }
 
 // =========================================================================

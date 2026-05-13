@@ -48,3 +48,21 @@ fn invalid_argument_maps_to_400() {
     let response = err.into_response();
     assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
 }
+
+#[test]
+fn canonical_error_into_response_attaches_self_to_extensions() {
+    // Middleware reads the `CanonicalError` extension to surface
+    // `diagnostic()` server-side without leaking it on the wire.
+    let err = CanonicalError::internal("db connection refused: secret-host:5432").create();
+    let response = err.into_response();
+
+    let recovered = response
+        .extensions()
+        .get::<CanonicalError>()
+        .expect("CanonicalError must be attached to response extensions");
+    assert_eq!(
+        recovered.diagnostic(),
+        Some("db connection refused: secret-host:5432")
+    );
+    assert_eq!(recovered.status_code(), 500);
+}

@@ -1,16 +1,19 @@
 use modkit_canonical_errors::Problem;
 use uuid::Uuid;
 
+use crate::api::rest::error::domain_error_to_problem;
 use crate::domain::error::DomainError;
 use crate::domain::gts_helpers;
 use crate::domain::model::ListQuery;
 
 /// Parse a GTS identifier, verifying that its schema prefix matches
 /// `expected_schema` (e.g. `UPSTREAM_SCHEMA`). Returns a validation
-/// `Problem` if the prefix does not match.
+/// `Problem` (with `instance` pre-populated from the supplied request
+/// URI) if the prefix does not match.
 #[allow(clippy::result_large_err)]
 pub fn parse_gts_id(gts_str: &str, expected_schema: &str, instance: &str) -> Result<Uuid, Problem> {
-    let (schema, uuid) = gts_helpers::parse_resource_gts(gts_str).map_err(Problem::from)?;
+    let (schema, uuid) = gts_helpers::parse_resource_gts(gts_str)
+        .map_err(|e| domain_error_to_problem(e, instance))?;
     let expected_prefix = expected_schema.trim_end_matches('~');
     if schema != expected_prefix {
         let err = DomainError::Validation {
@@ -19,7 +22,7 @@ pub fn parse_gts_id(gts_str: &str, expected_schema: &str, instance: &str) -> Res
             detail: format!("expected GTS schema '{expected_schema}' but got '{schema}~'"),
             instance: instance.to_string(),
         };
-        return Err(err.into());
+        return Err(domain_error_to_problem(err, instance));
     }
     Ok(uuid)
 }

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
     response::IntoResponse,
 };
 use modkit::{
@@ -16,10 +16,15 @@ use modkit::{
     context::ModuleCtx,
     contracts::{ApiGatewayCapability, OpenApiRegistry, RestApiCapability},
 };
+use modkit_canonical_errors::Problem;
 use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+const PERMISSION_DENIED_TYPE: &str =
+    "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~";
+const PROBLEM_JSON: &str = "application/problem+json";
 
 struct TestConfigProvider {
     config: serde_json::Value,
@@ -165,6 +170,20 @@ async fn rejects_non_base_feature_requirement() {
         .expect("Request failed");
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        PROBLEM_JSON
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let problem: Problem = serde_json::from_slice(&body).expect("parse Problem JSON");
+    assert_eq!(problem.problem_type, PERMISSION_DENIED_TYPE);
+    assert_eq!(problem.context["reason"], "LICENSE_FEATURE_REQUIRED");
 }
 
 #[tokio::test]

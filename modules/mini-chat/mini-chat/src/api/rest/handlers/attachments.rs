@@ -114,15 +114,13 @@ pub(crate) async fn upload_attachment(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let boundary = multer::parse_boundary(content_type).map_err(|_| {
-        Problem::from(
-            MiniChatAttachmentError::invalid_argument()
-                .with_field_violation(
-                    "content_type",
-                    "Content-Type must be multipart/form-data with a boundary",
-                    "BOUNDARY_REQUIRED",
-                )
-                .create(),
-        )
+        MiniChatAttachmentError::invalid_argument()
+            .with_field_violation(
+                "content_type",
+                "Content-Type must be multipart/form-data with a boundary",
+                "BOUNDARY_REQUIRED",
+            )
+            .create()
     })?;
 
     // 3. Create multer::Multipart with per-field size constraint.
@@ -144,28 +142,24 @@ pub(crate) async fn upload_attachment(
     // 4. Find the "file" field.
     let field = loop {
         match multipart.next_field().await.map_err(|e| {
-            Problem::from(
-                MiniChatAttachmentError::invalid_argument()
-                    .with_field_violation(
-                        "multipart",
-                        format!("Failed to read multipart field: {e}"),
-                        "MULTIPART_ERROR",
-                    )
-                    .create(),
-            )
+            MiniChatAttachmentError::invalid_argument()
+                .with_field_violation(
+                    "multipart",
+                    format!("Failed to read multipart field: {e}"),
+                    "MULTIPART_ERROR",
+                )
+                .create()
         })? {
             Some(f) if f.name() == Some("file") => break f,
             Some(_) => {}
             None => {
-                return Err(Problem::from(
-                    MiniChatAttachmentError::invalid_argument()
-                        .with_field_violation(
-                            "file",
-                            "missing file field in multipart request",
-                            "MISSING_FILE",
-                        )
-                        .create(),
-                ));
+                return Err(MiniChatAttachmentError::invalid_argument()
+                    .with_field_violation(
+                        "file",
+                        "missing file field in multipart request",
+                        "MISSING_FILE",
+                    )
+                    .create());
             }
         }
     };
@@ -181,15 +175,13 @@ pub(crate) async fn upload_attachment(
         .content_type()
         .map(ToString::to_string)
         .ok_or_else(|| {
-            Problem::from(
-                MiniChatAttachmentError::invalid_argument()
-                    .with_field_violation(
-                        "content_type",
-                        "file field has no content type",
-                        "MISSING_CONTENT_TYPE",
-                    )
-                    .create(),
-            )
+            MiniChatAttachmentError::invalid_argument()
+                .with_field_violation(
+                    "content_type",
+                    "file field has no content type",
+                    "MISSING_CONTENT_TYPE",
+                )
+                .create()
         })?;
 
     // 6. MIME validation (from field headers, before reading body bytes).
@@ -235,17 +227,15 @@ pub(crate) async fn upload_attachment(
         let estimated_file_bytes = cl.saturating_sub(MULTIPART_OVERHEAD);
         if estimated_file_bytes > max_bytes {
             let kind = if is_document { "document" } else { "image" };
-            return Err(Problem::from(
-                MiniChatAttachmentError::out_of_range(format!(
-                    "uploaded {kind} (~{estimated_file_bytes} bytes) exceeds limit of {max_bytes} bytes"
-                ))
-                .with_field_violation(
-                    "content_length",
-                    format!("{estimated_file_bytes}>{max_bytes}"),
-                    "FILE_TOO_LARGE",
-                )
-                .create(),
-            ));
+            return Err(MiniChatAttachmentError::out_of_range(format!(
+                "uploaded {kind} (~{estimated_file_bytes} bytes) exceeds limit of {max_bytes} bytes"
+            ))
+            .with_field_violation(
+                "content_length",
+                format!("{estimated_file_bytes}>{max_bytes}"),
+                "FILE_TOO_LARGE",
+            )
+            .create());
         }
     }
 

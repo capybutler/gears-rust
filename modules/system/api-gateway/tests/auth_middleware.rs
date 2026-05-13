@@ -17,6 +17,7 @@ use axum::{
     Extension, Json, Router,
     body::Body,
     http::{Method, Request, StatusCode, header},
+    response::Response,
 };
 use modkit::{
     ClientHub, Module,
@@ -25,11 +26,34 @@ use modkit::{
     context::ModuleCtx,
     contracts::{ApiGatewayCapability, OpenApiRegistry, RestApiCapability},
 };
+use modkit_canonical_errors::Problem;
 use modkit_security::SecurityContext;
 use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+const UNAUTHENTICATED_TYPE: &str =
+    "gts://gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~";
+const SERVICE_UNAVAILABLE_TYPE: &str =
+    "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~";
+const INTERNAL_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~";
+const PROBLEM_JSON: &str = "application/problem+json";
+
+async fn problem_from(response: Response) -> Problem {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    serde_json::from_slice(&body).expect("parse Problem JSON")
+}
+
+fn content_type(response: &Response) -> &str {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 /// Test configuration provider
 struct TestConfigProvider {
@@ -853,6 +877,10 @@ async fn test_missing_token_returns_401() {
         StatusCode::UNAUTHORIZED,
         "Missing token should yield 401"
     );
+    assert_eq!(content_type(&response), PROBLEM_JSON);
+    let problem = problem_from(response).await;
+    assert_eq!(problem.problem_type, UNAUTHENTICATED_TYPE);
+    assert_eq!(problem.context["reason"], "MISSING_BEARER");
 }
 
 #[tokio::test]
@@ -876,6 +904,10 @@ async fn test_invalid_token_returns_401() {
         StatusCode::UNAUTHORIZED,
         "Invalid token should yield 401"
     );
+    assert_eq!(content_type(&response), PROBLEM_JSON);
+    let problem = problem_from(response).await;
+    assert_eq!(problem.problem_type, UNAUTHENTICATED_TYPE);
+    assert_eq!(problem.context["reason"], "AUTHN_FAILED");
 }
 
 #[tokio::test]
@@ -899,6 +931,10 @@ async fn test_no_plugin_available_returns_503() {
         StatusCode::SERVICE_UNAVAILABLE,
         "NoPluginAvailable should yield 503"
     );
+    assert_eq!(content_type(&response), PROBLEM_JSON);
+    let problem = problem_from(response).await;
+    assert_eq!(problem.problem_type, SERVICE_UNAVAILABLE_TYPE);
+    assert_eq!(problem.context["retry_after_seconds"], 5);
 }
 
 #[tokio::test]
@@ -923,6 +959,10 @@ async fn test_service_unavailable_returns_503() {
         StatusCode::SERVICE_UNAVAILABLE,
         "ServiceUnavailable should yield 503"
     );
+    assert_eq!(content_type(&response), PROBLEM_JSON);
+    let problem = problem_from(response).await;
+    assert_eq!(problem.problem_type, SERVICE_UNAVAILABLE_TYPE);
+    assert_eq!(problem.context["retry_after_seconds"], 5);
 }
 
 #[tokio::test]
@@ -946,6 +986,9 @@ async fn test_internal_error_returns_500() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Internal error should yield 500"
     );
+    assert_eq!(content_type(&response), PROBLEM_JSON);
+    let problem = problem_from(response).await;
+    assert_eq!(problem.problem_type, INTERNAL_TYPE);
 }
 
 #[tokio::test]

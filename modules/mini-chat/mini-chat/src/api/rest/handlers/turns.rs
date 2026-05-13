@@ -55,7 +55,7 @@ pub(crate) async fn get_turn(
         .turns
         .get(&ctx, chat_id, request_id)
         .await
-        .map_err(Problem::from)?;
+        .map_err(CanonicalError::from)?;
 
     Ok(Json(TurnStatusResponse {
         request_id: turn.request_id,
@@ -80,7 +80,7 @@ pub(crate) async fn delete_turn(
     svc.turns
         .delete(&ctx, chat_id, request_id)
         .await
-        .map_err(Problem::from)?;
+        .map_err(CanonicalError::from)?;
 
     Ok(no_content().into_response())
 }
@@ -98,7 +98,7 @@ pub(crate) async fn retry_turn(
 ) -> Response {
     let mutation = match svc.turns.retry(&ctx, chat_id, request_id).await {
         Ok(m) => m,
-        Err(e) => return Problem::from(e).into_response(),
+        Err(e) => return CanonicalError::from(e).into_response(),
     };
 
     start_mutation_stream(&svc, ctx, chat_id, mutation).await
@@ -136,7 +136,7 @@ pub(crate) async fn edit_turn(
         .await
     {
         Ok(m) => m,
-        Err(e) => return Problem::from(e).into_response(),
+        Err(e) => return CanonicalError::from(e).into_response(),
     };
 
     start_mutation_stream(&svc, ctx, chat_id, mutation).await
@@ -162,7 +162,7 @@ async fn start_mutation_stream(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, model = %chat_model, "model resolution failed for mutation stream");
-            return Problem::from(e).into_response();
+            return CanonicalError::from(e).into_response();
         }
     };
 

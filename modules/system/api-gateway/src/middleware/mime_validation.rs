@@ -1,15 +1,15 @@
 //! MIME type validation middleware for enforcing per-operation allowed Content-Type headers
 use axum::extract::Request;
-use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use http::Method;
 use std::sync::Arc;
 
-use modkit::api::{OperationSpec, Problem};
+use modkit::api::OperationSpec;
 
 use crate::middleware::common;
+use crate::middleware::errors::ApiGatewayGatewayError;
 
 /// Map from (method, path) to allowed content types
 pub type MimeValidationMap = Arc<DashMap<(Method, String), Vec<&'static str>>>;
@@ -41,14 +41,15 @@ fn extract_content_type(req: &Request) -> Option<String> {
     Some(ct_main.to_owned())
 }
 
-/// Create an Unsupported Media Type error response.
-fn create_unsupported_media_type_error(detail: String) -> Response {
-    Problem::new(
-        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "Unsupported Media Type",
-        detail,
-    )
-    .into_response()
+/// Create a canonical `invalid_argument` Problem response for an unsupported
+/// or missing Content-Type. Routed through the gateway umbrella scope
+/// because `invalid_argument` is only available on `#[resource_error]`
+/// scopes (no top-level `CanonicalError::*` constructor for this category).
+fn create_unsupported_media_type_error(detail: String, reason: &str) -> Response {
+    let err = ApiGatewayGatewayError::invalid_argument()
+        .with_field_violation("content-type", detail, reason)
+        .create();
+    err.into_response()
 }
 
 /// Validate that the content type is in the allowed list.
@@ -78,13 +79,18 @@ fn validate_content_type(
         allowed_types.join(", ")
     );
 
-    Err(Box::new(create_unsupported_media_type_error(detail)))
+    Err(Box::new(create_unsupported_media_type_error(
+        detail,
+        "UNSUPPORTED_MEDIA_TYPE",
+    )))
 }
 
 /// MIME validation middleware
 ///
 /// Checks the Content-Type header against the allowed types configured
-/// for the operation. Returns 415 Unsupported Media Type if the content
+/// for the operation. Returns 400 Bad Request with a canonical
+/// `invalid_argument` Problem (`field_violations[0].reason` =
+/// `UNSUPPORTED_MEDIA_TYPE` or `MISSING_CONTENT_TYPE`) if the content
 /// type is not allowed.
 pub async fn mime_validation_middleware(
     validation_map: MimeValidationMap,
@@ -119,7 +125,7 @@ pub async fn mime_validation_middleware(
             "Missing Content-Type header. Allowed types: {}",
             allowed_types.join(", ")
         );
-        return create_unsupported_media_type_error(detail);
+        return create_unsupported_media_type_error(detail, "MISSING_CONTENT_TYPE");
     };
 
     // Validate the content type

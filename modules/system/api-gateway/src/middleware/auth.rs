@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::middleware::common;
 
 use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError};
-use modkit::api::Problem;
+use modkit_canonical_errors::CanonicalError;
 use modkit_security::SecurityContext;
 
 /// Route matcher for a specific HTTP method (authenticated routes).
@@ -230,12 +230,13 @@ pub async fn authn_middleware(
         }
         AuthRequirement::Required => {
             let Some(token) = extract_bearer_token(req.headers()) else {
-                return Problem::new(
-                    axum::http::StatusCode::UNAUTHORIZED,
-                    "Unauthorized",
-                    "Missing or invalid Authorization header",
-                )
-                .into_response();
+                let err = CanonicalError::unauthenticated()
+                    .with_reason("MISSING_BEARER")
+                    .create();
+                // `instance` / `trace_id` are filled by the canonical
+                // error middleware (`modkit::api::canonical_error_middleware`)
+                // on the way out — this middleware sits inside its layer.
+                return err.into_response();
             };
 
             match state.authn_client.authenticate(token).await {
@@ -249,27 +250,27 @@ pub async fn authn_middleware(
     }
 }
 
-/// Convert `AuthNResolverError` to an RFC-9457 Problem Details response.
+/// Convert `AuthNResolverError` to a canonical Problem Details response.
+///
+/// `instance` / `trace_id` are filled by the canonical error middleware
+/// (`modkit::api::canonical_error_middleware`) on the way out — this
+/// middleware sits inside its layer.
 fn authn_error_to_response(err: &AuthNResolverError) -> axum::response::Response {
     log_authn_error(err);
-    let (status, title, detail) = match err {
-        AuthNResolverError::Unauthorized(_) => (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Unauthorized",
-            "Authentication failed",
-        ),
-        AuthNResolverError::NoPluginAvailable | AuthNResolverError::ServiceUnavailable(_) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Service Unavailable",
-            "Authentication service unavailable",
-        ),
-        AuthNResolverError::TokenAcquisitionFailed(_) | AuthNResolverError::Internal(_) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-            "Internal authentication error",
-        ),
+    let canonical = match err {
+        AuthNResolverError::Unauthorized(_) => CanonicalError::unauthenticated()
+            .with_reason("AUTHN_FAILED")
+            .create(),
+        AuthNResolverError::NoPluginAvailable | AuthNResolverError::ServiceUnavailable(_) => {
+            CanonicalError::service_unavailable()
+                .with_retry_after_seconds(5)
+                .create()
+        }
+        AuthNResolverError::TokenAcquisitionFailed(_) | AuthNResolverError::Internal(_) => {
+            CanonicalError::internal("authentication infrastructure failure").create()
+        }
     };
-    Problem::new(status, title, detail).into_response()
+    canonical.into_response()
 }
 
 /// Log authentication errors at appropriate levels.

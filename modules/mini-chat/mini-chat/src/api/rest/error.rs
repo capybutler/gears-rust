@@ -2,16 +2,13 @@
 //!
 //! Maps domain-layer errors (`DomainError`, `MutationError`, `StreamError`)
 //! to canonical errors (`modkit-canonical-errors`) following the same pattern
-//! used in `oagw` and `file-parser`. Provides:
-//!
-//! * `From<DomainError>` / `From<MutationError>` / `From<StreamError>` for
-//!   `CanonicalError` — long-lived mappings.
-//! * `From<*>` for `Problem` — temporary shims that fill `instance` /
-//!   `trace_id` until the canonical error middleware lands. Phase 4 of the
-//!   migration plan removes them.
+//! used in `oagw` and `file-parser`. Provides `From<*>` for `CanonicalError`
+//! — the long-lived mappings. Handlers return `ApiResult<T>`
+//! (`= Result<T, CanonicalError>`); the canonical error middleware
+//! (`modkit::api::canonical_error_middleware`) converts `CanonicalError` to
+//! a wire `Problem` and fills `instance` / `trace_id` post-response.
 
-use modkit::api::canonical_prelude::CanonicalProblemMigrationExt;
-use modkit_canonical_errors::{CanonicalError, Problem, resource_error};
+use modkit_canonical_errors::{CanonicalError, resource_error};
 
 use crate::domain::error::DomainError;
 use crate::domain::service::{MutationError, StreamError};
@@ -349,39 +346,30 @@ impl From<StreamError> for CanonicalError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Temporary shims (DomainError / MutationError / StreamError → Problem)
-// ---------------------------------------------------------------------------
-
-// TODO(cpt-cf-errors-component-error-middleware): drop these impls once the
-// canonical error middleware injects `trace_id` / `instance` from request
-// context. The `From<*> for CanonicalError` impls above are the long-lived
-// mappings; these wrappers exist only so handlers keep returning `Problem`
-// until the middleware lands (Phase 3 → Phase 4).
-
-impl From<DomainError> for Problem {
-    fn from(err: DomainError) -> Self {
-        Problem::from(CanonicalError::from(err)).with_temporary_request_context("/")
-    }
-}
-
-impl From<MutationError> for Problem {
-    fn from(err: MutationError) -> Self {
-        Problem::from(CanonicalError::from(err)).with_temporary_request_context("/")
-    }
-}
-
-impl From<StreamError> for Problem {
-    fn from(err: StreamError) -> Self {
-        Problem::from(CanonicalError::from(err)).with_temporary_request_context("/")
-    }
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use modkit_canonical_errors::Problem;
     use uuid::Uuid;
+
+    /// Build the wire `Problem` the canonical error middleware would emit
+    /// for a given domain-layer error. Tests run without the middleware in
+    /// scope, so `instance` / `trace_id` are never populated here — that
+    /// injection is exercised by the integration tests that drive the full
+    /// router.
+    trait IntoTestProblem {
+        fn into_test_problem(self) -> Problem;
+    }
+
+    impl<E> IntoTestProblem for E
+    where
+        CanonicalError: From<E>,
+    {
+        fn into_test_problem(self) -> Problem {
+            Problem::from(CanonicalError::from(self))
+        }
+    }
 
     const NOT_FOUND_TYPE: &str = "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~";
     const INVALID_ARGUMENT_TYPE: &str =
@@ -408,7 +396,7 @@ mod tests {
     #[test]
     fn chat_not_found_uses_chat_resource_scope() {
         let id = Uuid::new_v4();
-        let p: Problem = DomainError::ChatNotFound { id }.into();
+        let p: Problem = DomainError::ChatNotFound { id }.into_test_problem();
         assert_eq!(p.status, 404);
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], CHAT_GTS);
@@ -418,7 +406,7 @@ mod tests {
     #[test]
     fn message_not_found_uses_message_resource_scope() {
         let id = Uuid::new_v4();
-        let p: Problem = DomainError::MessageNotFound { id }.into();
+        let p: Problem = DomainError::MessageNotFound { id }.into_test_problem();
         assert_eq!(p.status, 404);
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], MESSAGE_GTS);
@@ -433,7 +421,7 @@ mod tests {
             chat_id,
             request_id,
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 404);
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], TURN_GTS);
@@ -447,7 +435,7 @@ mod tests {
             entity: "attachment".into(),
             id,
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 404);
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], ATTACHMENT_GTS);
@@ -459,7 +447,7 @@ mod tests {
         let p: Problem = DomainError::ModelNotFound {
             model_id: "gpt-fake".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 404);
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], MODEL_GTS);
@@ -474,7 +462,7 @@ mod tests {
         let p: Problem = DomainError::UnsupportedFileType {
             mime: "application/x-msdownload".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         assert_eq!(p.context["resource_type"], ATTACHMENT_GTS);
@@ -490,7 +478,7 @@ mod tests {
     #[test]
     fn unsupported_media_now_maps_to_400() {
         // ⚠ wire change accepted in the migration plan: 415 → 400.
-        let p: Problem = StreamError::UnsupportedMedia.into();
+        let p: Problem = StreamError::UnsupportedMedia.into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         let v = p
@@ -508,7 +496,7 @@ mod tests {
         let p: Problem = DomainError::FileTooLarge {
             message: "file exceeds 10MB".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, OUT_OF_RANGE_TYPE);
         let v = p
@@ -527,7 +515,7 @@ mod tests {
             code: "openai_error".into(),
             sanitized_message: "provider failure".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 503);
         assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
         assert_eq!(p.context["retry_after_seconds"].as_u64(), Some(10));
@@ -540,7 +528,7 @@ mod tests {
             required_tokens: 5000,
             available_tokens: 4000,
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, OUT_OF_RANGE_TYPE);
         let v = p
@@ -559,7 +547,7 @@ mod tests {
             estimated_tokens: 9000,
             max_input_tokens: 8000,
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, OUT_OF_RANGE_TYPE);
         let v = p
@@ -577,7 +565,7 @@ mod tests {
         let p: Problem = DomainError::DocumentLimitExceeded {
             message: "max 50 documents per chat".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 429);
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
         let v = p
@@ -594,7 +582,7 @@ mod tests {
         let p: Problem = DomainError::StorageLimitExceeded {
             message: "tenant storage quota reached".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 429);
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
         let v = p
@@ -609,7 +597,7 @@ mod tests {
 
     #[test]
     fn forbidden_carries_authz_denied_reason() {
-        let p: Problem = DomainError::Forbidden.into();
+        let p: Problem = DomainError::Forbidden.into_test_problem();
         assert_eq!(p.status, 403);
         assert_eq!(p.problem_type, PERMISSION_DENIED_TYPE);
         assert_eq!(p.context["reason"], "AUTHZ_DENIED");
@@ -620,7 +608,7 @@ mod tests {
         let p: Problem = DomainError::Validation {
             message: "request is missing the required `content` field".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         // Format variant — no field_violations array, message surfaces in `format`.
@@ -641,7 +629,7 @@ mod tests {
 
     #[test]
     fn web_search_calls_exceeded_emits_quota_violation() {
-        let p: Problem = DomainError::WebSearchCallsExceeded.into();
+        let p: Problem = DomainError::WebSearchCallsExceeded.into_test_problem();
         assert_eq!(p.status, 429);
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
         let v = p
@@ -655,7 +643,7 @@ mod tests {
     #[test]
     fn invalid_reaction_target_emits_precondition_violation() {
         let id = Uuid::new_v4();
-        let p: Problem = DomainError::InvalidReactionTarget { id }.into();
+        let p: Problem = DomainError::InvalidReactionTarget { id }.into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, FAILED_PRECONDITION_TYPE);
         let v = p
@@ -673,7 +661,7 @@ mod tests {
 
     #[test]
     fn web_search_disabled_emits_precondition_violation() {
-        let p: Problem = DomainError::WebSearchDisabled.into();
+        let p: Problem = DomainError::WebSearchDisabled.into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, FAILED_PRECONDITION_TYPE);
         let v = p
@@ -690,7 +678,7 @@ mod tests {
         let p: Problem = DomainError::ServiceUnavailable {
             message: "downstream timeout".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 503);
         assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
         assert_eq!(p.context["retry_after_seconds"].as_u64(), Some(5));
@@ -701,7 +689,7 @@ mod tests {
         let p: Problem = DomainError::InvalidModel {
             model: "gpt-fake".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE);
         let v = p
@@ -719,7 +707,7 @@ mod tests {
             code: "unique_violation".into(),
             message: "alias already exists".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 409);
         assert_eq!(p.context["resource_name"], "unique_violation");
     }
@@ -728,7 +716,7 @@ mod tests {
 
     #[test]
     fn mutation_not_latest_turn_emits_aborted_with_reason() {
-        let p: Problem = MutationError::NotLatestTurn.into();
+        let p: Problem = MutationError::NotLatestTurn.into_test_problem();
         assert_eq!(p.status, 409);
         assert_eq!(p.problem_type, ABORTED_TYPE);
         assert_eq!(p.context["reason"], "NOT_LATEST_TURN");
@@ -736,7 +724,7 @@ mod tests {
 
     #[test]
     fn mutation_generation_in_progress_emits_aborted_with_reason() {
-        let p: Problem = MutationError::GenerationInProgress.into();
+        let p: Problem = MutationError::GenerationInProgress.into_test_problem();
         assert_eq!(p.status, 409);
         assert_eq!(p.problem_type, ABORTED_TYPE);
         assert_eq!(p.context["reason"], "GENERATION_IN_PROGRESS");
@@ -744,7 +732,7 @@ mod tests {
 
     #[test]
     fn mutation_forbidden_emits_permission_denied_with_authz_reason() {
-        let p: Problem = MutationError::Forbidden.into();
+        let p: Problem = MutationError::Forbidden.into_test_problem();
         assert_eq!(p.status, 403);
         assert_eq!(p.problem_type, PERMISSION_DENIED_TYPE);
         assert_eq!(p.context["resource_type"], TURN_GTS);
@@ -759,7 +747,7 @@ mod tests {
             http_status: 503,
             quota_scope: "tokens".into(),
         }
-        .into();
+        .into_test_problem();
         assert_eq!(p.status, 429);
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
         let v = p
@@ -773,7 +761,7 @@ mod tests {
 
     #[test]
     fn stream_too_many_images_emits_out_of_range_field_violation() {
-        let p: Problem = StreamError::TooManyImages { count: 5, max: 3 }.into();
+        let p: Problem = StreamError::TooManyImages { count: 5, max: 3 }.into_test_problem();
         assert_eq!(p.status, 400);
         assert_eq!(p.problem_type, OUT_OF_RANGE_TYPE);
         let v = p
@@ -786,9 +774,12 @@ mod tests {
     }
 
     #[test]
-    fn problem_shim_populates_instance_placeholder() {
-        // The temporary shim sets `instance` to "/" until middleware lands.
-        let p: Problem = DomainError::ChatNotFound { id: Uuid::nil() }.into();
-        assert_eq!(p.instance.as_deref(), Some("/"));
+    fn instance_is_unset_at_canonical_layer() {
+        // `instance` is filled by the canonical error middleware on the way
+        // out — at the conversion layer (`From<DomainError> for
+        // CanonicalError` → `Problem::from(canonical)`) it stays `None`
+        // because no request URI is in scope.
+        let p: Problem = DomainError::ChatNotFound { id: Uuid::nil() }.into_test_problem();
+        assert!(p.instance.is_none());
     }
 }

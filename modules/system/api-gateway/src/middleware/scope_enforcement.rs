@@ -12,7 +12,8 @@ use glob::{MatchOptions, Pattern};
 
 use crate::config::RoutePoliciesConfig;
 use crate::middleware::common;
-use modkit::api::Problem;
+use crate::middleware::errors::ApiGatewayRouteError;
+use modkit_canonical_errors::CanonicalError;
 use modkit_security::SecurityContext;
 
 /// Compiled scope enforcement rules for efficient runtime matching.
@@ -110,9 +111,14 @@ impl ScopeEnforcementRules {
 
     /// Check if the given path, method, and token scopes satisfy the scope requirements.
     ///
-    /// Returns `Ok(())` if access is allowed, or `Err(problem)` if denied.
+    /// Returns `Ok(())` if access is allowed, or `Err(canonical)` if denied.
     #[allow(clippy::result_large_err)]
-    fn check(&self, path: &str, method: &str, token_scopes: &[String]) -> Result<(), Problem> {
+    fn check(
+        &self,
+        path: &str,
+        method: &str,
+        token_scopes: &[String],
+    ) -> Result<(), CanonicalError> {
         if !self.enabled {
             return Ok(());
         }
@@ -159,11 +165,9 @@ impl ScopeEnforcementRules {
                     "Route policy enforcement denied: insufficient scopes"
                 );
 
-                return Err(Problem::new(
-                    axum::http::StatusCode::FORBIDDEN,
-                    "Forbidden",
-                    "Insufficient token scopes for this resource",
-                ));
+                return Err(ApiGatewayRouteError::permission_denied()
+                    .with_reason("INSUFFICIENT_SCOPES")
+                    .create());
             }
         }
 
@@ -211,22 +215,26 @@ pub async fn scope_enforcement_middleware(
                 method = %method,
                 "Route policy enforcement denied: no SecurityContext for protected route"
             );
-            return Problem::new(
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized",
-                "Authentication required for this resource",
-            )
-            .into_response();
+            // `instance` / `trace_id` are filled by the canonical error
+            // middleware (`modkit::api::canonical_error_middleware`) on the
+            // way out — this middleware sits inside its layer.
+            return CanonicalError::unauthenticated()
+                .with_reason("AUTH_REQUIRED")
+                .create()
+                .into_response();
         }
         return next.run(req).await;
     };
 
     // Check scopes
-    if let Err(problem) = state
+    if let Err(canonical) = state
         .rules
         .check(&path, method, security_context.token_scopes())
     {
-        return problem.into_response();
+        // `instance` / `trace_id` are filled by the canonical error
+        // middleware (`modkit::api::canonical_error_middleware`) on the
+        // way out — this middleware sits inside its layer.
+        return canonical.into_response();
     }
 
     next.run(req).await
@@ -237,6 +245,7 @@ pub async fn scope_enforcement_middleware(
 mod tests {
     use super::*;
     use crate::config::RoutePolicyRule;
+    use modkit_canonical_errors::Problem;
 
     fn build_config(enabled: bool, routes: Vec<(&str, Vec<&str>)>) -> RoutePoliciesConfig {
         build_config_with_methods(
@@ -314,8 +323,14 @@ mod tests {
         let result = rules.check("/admin/users", "GET", &scopes);
         assert!(result.is_err());
 
-        let problem = result.unwrap_err();
-        assert_eq!(problem.status, axum::http::StatusCode::FORBIDDEN);
+        let canonical = result.unwrap_err();
+        let problem: Problem = canonical.into();
+        assert_eq!(problem.status, 403);
+        assert_eq!(
+            problem.problem_type,
+            "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+        );
+        assert_eq!(problem.context["reason"], "INSUFFICIENT_SCOPES");
     }
 
     #[test]
@@ -327,8 +342,13 @@ mod tests {
         let result = rules.check("/admin/users", "GET", &[]);
         assert!(result.is_err());
 
-        let problem = result.unwrap_err();
-        assert_eq!(problem.status, axum::http::StatusCode::FORBIDDEN);
+        let canonical = result.unwrap_err();
+        let problem: Problem = canonical.into();
+        assert_eq!(problem.status, 403);
+        assert_eq!(
+            problem.problem_type,
+            "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~"
+        );
     }
 
     #[test]

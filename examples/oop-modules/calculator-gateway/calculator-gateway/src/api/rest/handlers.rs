@@ -22,7 +22,7 @@ pub async fn handle_add(
 ) -> ApiResult<Json<AddResponse>> {
     let sum = service.add(&ctx, req.a, req.b).await.map_err(|e| {
         tracing::error!(error = %e, "addition failed");
-        Problem::from(CanonicalError::internal(format!("Addition failed: {e}")).create())
+        CanonicalError::internal(format!("Addition failed: {e}")).create()
     })?;
 
     Ok(Json(AddResponse { sum }))

@@ -207,7 +207,7 @@ pub async fn upload_and_parse_markdown(
     let mut file_bytes: Option<bytes::Bytes> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
-        Problem::from(DomainError::invalid_request(format!(
+        CanonicalError::from(DomainError::invalid_request(format!(
             "Multipart error: {e}"
         )))
     })? {
@@ -215,20 +215,20 @@ pub async fn upload_and_parse_markdown(
         if field_name == "file" {
             file_name = field.file_name().map(str::to_owned);
             file_bytes = Some(field.bytes().await.map_err(|e| {
-                Problem::from(DomainError::io_error(format!("Failed to read file: {e}")))
+                CanonicalError::from(DomainError::io_error(format!("Failed to read file: {e}")))
             })?);
             break;
         }
     }
 
     let file_name = file_name.ok_or_else(|| {
-        Problem::from(DomainError::invalid_request(
+        CanonicalError::from(DomainError::invalid_request(
             "No file field found in multipart request",
         ))
     })?;
 
     let file_bytes = file_bytes.ok_or_else(|| {
-        Problem::from(DomainError::invalid_request(
+        CanonicalError::from(DomainError::invalid_request(
             "No file data found in multipart request",
         ))
     })?;

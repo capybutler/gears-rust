@@ -87,7 +87,7 @@ async fn real_middlewares_observe_documented_order() -> Result<()> {
     let app = api.rest_finalize(&ctx, router)?;
 
     // --------------------
-    // Req1: invalid Content-Type -> should be rejected by MIME validation (415),
+    // Req1: invalid Content-Type -> should be rejected by MIME validation (BAD_REQUEST / 400),
     // but MUST still have CORS headers (CORS wraps MIME).
     // Also: x-request-id must be echoed (request-id is outermost).
     // --------------------
@@ -103,7 +103,7 @@ async fn real_middlewares_observe_documented_order() -> Result<()> {
                 .body(Body::from("hi"))?,
         )
         .await?;
-    assert_eq!(res1.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(res1.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         res1.headers()
             .get("x-request-id")
@@ -112,7 +112,7 @@ async fn real_middlewares_observe_documented_order() -> Result<()> {
     );
     assert!(
         res1.headers().get("access-control-allow-origin").is_some(),
-        "CORS header must be present on 415 => CORS wraps MIME validation"
+        "CORS header must be present on 400 => CORS wraps MIME validation"
     );
 
     // --------------------
@@ -206,7 +206,7 @@ async fn real_middlewares_observe_documented_order_with_prefix() -> Result<()> {
     let app = api.rest_finalize(&ctx, router)?;
 
     // --------------------
-    // Req1: invalid Content-Type -> should be rejected by MIME validation (415),
+    // Req1: invalid Content-Type -> should be rejected by MIME validation (BAD_REQUEST / 400),
     // but MUST still have CORS headers (CORS wraps MIME).
     // Also: x-request-id must be echoed (request-id is outermost).
     // --------------------
@@ -222,7 +222,7 @@ async fn real_middlewares_observe_documented_order_with_prefix() -> Result<()> {
                 .body(Body::from("hi"))?,
         )
         .await?;
-    assert_eq!(res1.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(res1.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         res1.headers()
             .get("x-request-id")
@@ -231,7 +231,7 @@ async fn real_middlewares_observe_documented_order_with_prefix() -> Result<()> {
     );
     assert!(
         res1.headers().get("access-control-allow-origin").is_some(),
-        "CORS header must be present on 415 => CORS wraps MIME validation"
+        "CORS header must be present on 400 => CORS wraps MIME validation"
     );
 
     // --------------------

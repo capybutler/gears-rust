@@ -1,6 +1,5 @@
 use crate::domain::error::DomainError;
-use modkit::api::canonical_prelude::CanonicalProblemMigrationExt;
-use modkit_canonical_errors::{CanonicalError, Problem, resource_error};
+use modkit_canonical_errors::{CanonicalError, resource_error};
 
 #[resource_error("gts.cf.nodes_registry.registry.node.v1~")]
 pub struct NodeError;
@@ -43,16 +42,5 @@ impl From<DomainError> for CanonicalError {
                 .with_field_violation("input", msg, "VALIDATION_ERROR")
                 .create(),
         }
-    }
-}
-
-// TODO(cpt-cf-errors-component-error-middleware): drop this impl once
-// middleware injects trace_id/instance from request context. The
-// `From<DomainError> for CanonicalError` impl above is the long-lived
-// mapping; this wrapper exists only to keep handler signatures returning
-// `Problem` until middleware lands.
-impl From<DomainError> for Problem {
-    fn from(err: DomainError) -> Self {
-        Problem::from(CanonicalError::from(err)).with_temporary_request_context("/")
     }
 }

@@ -2,14 +2,20 @@
 
 //! Tests for error handling and conversions.
 //!
-//! These tests verify domain error conversions including HTTP Problem mapping
-//! and anyhow integration. `instance` is currently always `Some("/")` because
-//! the per-module `From<DomainError> for Problem` does not have request URI
-//! context — middleware will set it to the real request path once
-//! `cpt-cf-errors-component-error-middleware` lands.
+//! These tests verify the long-lived `From<DomainError> for CanonicalError`
+//! mapping by building the wire `Problem` the canonical error middleware
+//! would emit. `instance` / `trace_id` stay `None` here because no
+//! middleware is in scope at the unit-test level — the end-to-end wire
+//! values are exercised by integration tests that drive the full router.
 
-use modkit_canonical_errors::Problem;
+use modkit_canonical_errors::{CanonicalError, Problem};
 use nodes_registry::domain::error::DomainError;
+
+/// Build the wire `Problem` the canonical error middleware would emit
+/// for a given `DomainError`.
+fn wire(err: DomainError) -> Problem {
+    Problem::from(CanonicalError::from(err))
+}
 
 // (error, expected_status, expected_detail_substring, expected_problem_type)
 type TestCase = (DomainError, u16, Option<String>, &'static str);
@@ -54,7 +60,7 @@ fn test_error_conversion_mapping() {
     ];
 
     for (error, expected_status, expected_detail, expected_problem_type) in test_cases {
-        let problem: Problem = error.into();
+        let problem = wire(error);
 
         assert_eq!(problem.status, expected_status, "Status code should match");
         if let Some(expected_detail_content) = expected_detail {
@@ -69,10 +75,10 @@ fn test_error_conversion_mapping() {
             problem.problem_type, expected_problem_type,
             "Problem type should match"
         );
-        assert_eq!(
-            problem.instance.as_deref(),
-            Some("/"),
-            "Instance is always \"/\" until middleware lands"
+        assert!(
+            problem.instance.is_none(),
+            "Instance is filled by the canonical error middleware on the way out; \
+             at the conversion layer it stays None"
         );
         assert!(
             problem.problem_type.starts_with("gts://"),
@@ -84,7 +90,7 @@ fn test_error_conversion_mapping() {
 #[test]
 fn test_node_not_found_sets_resource_type() {
     let test_id = uuid::Uuid::new_v4();
-    let problem: Problem = DomainError::NodeNotFound(test_id).into();
+    let problem = wire(DomainError::NodeNotFound(test_id));
     let rt = problem
         .context
         .get("resource_type")
@@ -101,8 +107,9 @@ fn test_node_not_found_sets_resource_type() {
 
 #[test]
 fn test_invalid_input_sets_field_violation() {
-    let problem: Problem =
-        DomainError::InvalidInput("Invalid capability key format".to_owned()).into();
+    let problem = wire(DomainError::InvalidInput(
+        "Invalid capability key format".to_owned(),
+    ));
     let violation = problem
         .context
         .get("field_violations")
@@ -123,11 +130,13 @@ fn test_invalid_input_sets_field_violation() {
 #[test]
 fn test_error_into_problem_trait() {
     let node_id = uuid::Uuid::new_v4();
-    let problem: Problem = DomainError::NodeNotFound(node_id).into();
+    let problem = wire(DomainError::NodeNotFound(node_id));
 
     assert_eq!(problem.status, 404);
     assert!(problem.detail.contains(&node_id.to_string()));
-    assert_eq!(problem.instance.as_deref(), Some("/"));
+    // `instance` is filled by the canonical error middleware on the way
+    // out; at the conversion layer it stays None.
+    assert!(problem.instance.is_none());
 }
 
 #[test]

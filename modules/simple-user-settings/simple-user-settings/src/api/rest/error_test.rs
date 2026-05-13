@@ -1,14 +1,22 @@
 #[cfg(test)]
 mod tests {
     use crate::domain::error::DomainError;
-    use modkit_canonical_errors::Problem;
+    use modkit_canonical_errors::{CanonicalError, Problem};
+
+    /// Build the wire `Problem` the canonical error middleware would emit
+    /// for a given `DomainError`. Tests run without the middleware in
+    /// scope, so `instance` / `trace_id` stay `None` here — that injection
+    /// is exercised by integration tests that drive the full router.
+    fn wire(err: DomainError) -> Problem {
+        Problem::from(CanonicalError::from(err))
+    }
 
     #[test]
     fn test_not_found_error_to_problem() {
-        let problem: Problem = DomainError::NotFound.into();
+        let problem = wire(DomainError::NotFound);
 
         assert_eq!(problem.status, 404);
-        assert_eq!(problem.instance.as_deref(), Some("/"));
+        assert!(problem.instance.is_none());
         assert!(problem.detail.contains("Settings not found"));
         assert_eq!(
             problem
@@ -21,15 +29,14 @@ mod tests {
 
     #[test]
     fn test_validation_error_to_problem() {
-        let problem: Problem = DomainError::Validation {
+        let problem = wire(DomainError::Validation {
             field: "theme".to_owned(),
             message: "exceeds max length".to_owned(),
-        }
-        .into();
+        });
 
         // InvalidArgument is 400 in canonical (decision C).
         assert_eq!(problem.status, 400);
-        assert_eq!(problem.instance.as_deref(), Some("/"));
+        assert!(problem.instance.is_none());
 
         // Caller-supplied field + message live in context.field_violations[0].
         let violation = problem
@@ -53,13 +60,12 @@ mod tests {
 
     #[test]
     fn test_database_arm_maps_to_500() {
-        let problem: Problem = DomainError::Database(modkit_db::DbError::InvalidConfig(
+        let problem = wire(DomainError::Database(modkit_db::DbError::InvalidConfig(
             "connection failed".to_owned(),
-        ))
-        .into();
+        )));
 
         assert_eq!(problem.status, 500);
-        assert_eq!(problem.instance.as_deref(), Some("/"));
+        assert!(problem.instance.is_none());
     }
 
     #[test]
@@ -68,7 +74,7 @@ mod tests {
         // as 404 with no leak of the original forbidden message, otherwise
         // the response would tell the caller that the resource exists.
         let raw = "user 42 lacks scope settings:write";
-        let problem: Problem = DomainError::Forbidden(raw.to_owned()).into();
+        let problem = wire(DomainError::Forbidden(raw.to_owned()));
 
         assert_eq!(problem.status, 404);
         assert!(!problem.detail.contains("scope settings:write"));
@@ -87,7 +93,7 @@ mod tests {
         // The canonical internal mapping replaces caller-supplied diagnostic
         // text with an opaque public detail; assert the raw msg never reaches
         // the wire.
-        let problem: Problem = DomainError::Internal("db pool exhausted".to_owned()).into();
+        let problem = wire(DomainError::Internal("db pool exhausted".to_owned()));
 
         assert_eq!(problem.status, 500);
         assert!(!problem.detail.contains("db pool exhausted"));

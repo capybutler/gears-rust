@@ -9,6 +9,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
 use anyhow::Result;
+use axum::error_handling::HandleErrorLayer;
 use axum::http::Method;
 use axum::middleware::from_fn_with_state;
 use axum::{Router, extract::DefaultBodyLimit, middleware::from_fn, routing::get};
@@ -18,13 +19,32 @@ use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tower::{BoxError, ServiceBuilder};
 use tower_http::{
     catch_panic::CatchPanicLayer,
     limit::RequestBodyLimitLayer,
     request_id::{PropagateRequestIdLayer, SetRequestIdLayer},
-    timeout::TimeoutLayer,
 };
 use tracing::debug;
+
+use crate::middleware::errors::ApiGatewayGatewayError;
+
+/// Map a `tower::timeout` `Elapsed` (or any other unexpected `BoxError`)
+/// into a canonical `application/problem+json` response.
+async fn timeout_to_canonical(err: BoxError) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if err.is::<tower::timeout::error::Elapsed>() {
+        let canonical =
+            ApiGatewayGatewayError::deadline_exceeded("Request exceeded 30s timeout").create();
+        return canonical.into_response();
+    }
+
+    let canonical =
+        modkit_canonical_errors::CanonicalError::internal(format!("request pipeline error: {err}"))
+            .create();
+    canonical.into_response()
+}
 
 use authn_resolver_sdk::AuthNResolverClient;
 
@@ -344,14 +364,25 @@ impl ApiGateway {
         router = router.layer(RequestBodyLimitLayer::new(config.defaults.body_limit_bytes));
         router = router.layer(DefaultBodyLimit::max(config.defaults.body_limit_bytes));
 
-        // 6) Timeout
-        router = router.layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::GATEWAY_TIMEOUT,
-            Duration::from_secs(30),
-        ));
+        // 6) Timeout — emits canonical `deadline_exceeded` Problem with
+        //    `application/problem+json` body when the inner service exceeds
+        //    the deadline. Layer position is unchanged (between BodyLimit
+        //    and CatchPanic).
+        router = router.layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(timeout_to_canonical))
+                .timeout(Duration::from_secs(30)),
+        );
 
         // 5) CatchPanic (converts panics to 500 before metrics sees them)
         router = router.layer(CatchPanicLayer::new());
+
+        // 4.5) Canonical error middleware — fills trace_id / instance on
+        // application/problem+json bodies and logs WARN/ERROR. Sits inside
+        // http_metrics so metrics observe the canonical-final body, and
+        // outside CatchPanicLayer so panics still reach the panic handler
+        // before this middleware tries to rewrite them.
+        router = router.layer(from_fn(modkit::api::canonical_error_middleware));
 
         // 4) HTTP metrics (layer — captures all middleware responses including auth/rate-limit/timeout)
         let http_metrics = Arc::new(middleware::http_metrics::HttpMetrics::new(

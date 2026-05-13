@@ -1,6 +1,6 @@
 use crate::config::ApiGatewayConfig;
 use anyhow::{Context, Result, anyhow};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderValue, Method, header};
 use axum::{
     extract::Request,
     middleware::Next,
@@ -9,12 +9,14 @@ use axum::{
 use governor::clock::Clock;
 use governor::middleware::StateInformationMiddleware;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use modkit_canonical_errors::CanonicalError;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::middleware::common;
+use crate::middleware::errors::ApiGatewayGatewayError;
 
 type RateLimitKey = (Method, String);
 type BucketMap = Arc<HashMap<RateLimitKey, Arc<BucketMapEntry>>>;
@@ -117,22 +119,34 @@ pub async fn rate_limit_middleware(map: RateLimiterMap, mut req: Request, next: 
             }
             Err(not_until) => {
                 let wait = not_until.wait_time_from(bucker_map_entry.bucket.clock().now());
-                headers.insert(header::RETRY_AFTER, wait.as_secs().into());
-                return StatusCode::TOO_MANY_REQUESTS.into_response();
+                let wait_secs = wait.as_secs();
+                let policy = bucker_map_entry.policy.clone();
+                let burst = bucker_map_entry.burst.clone();
+                let err = ApiGatewayGatewayError::resource_exhausted("rate limit exceeded")
+                    .with_quota_violation("rate_limit", format!("retry_after_seconds={wait_secs}"))
+                    .create();
+                let mut response = err.into_response();
+                let response_headers = response.headers_mut();
+                response_headers.insert("RateLimit-Policy", policy);
+                response_headers.insert("RateLimit-Limit", burst.clone());
+                response_headers.insert("X-RateLimit-Limit", burst);
+                if let Ok(retry_after) = HeaderValue::from_str(&wait_secs.to_string()) {
+                    response_headers.insert(header::RETRY_AFTER, retry_after);
+                }
+                return response;
             }
         }
     }
 
     if let Some(sem) = map.inflight.get(&key) {
-        match sem.clone().try_acquire_owned() {
-            Ok(_permit) => {
-                // Allow request; permit is dropped when response future completes
-                return next.run(req).await;
-            }
-            Err(_) => {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
+        if let Ok(_permit) = sem.clone().try_acquire_owned() {
+            // Allow request; permit is dropped when response future completes
+            return next.run(req).await;
         }
+        let err = CanonicalError::service_unavailable()
+            .with_retry_after_seconds(5)
+            .create();
+        return err.into_response();
     }
 
     next.run(req).await

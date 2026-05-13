@@ -72,7 +72,7 @@ pub async fn list_entities(
 
     let list_query = query.to_list_query();
 
-    let entities = service.list(&list_query).map_err(Problem::from)?;
+    let entities = service.list(&list_query).map_err(CanonicalError::from)?;
 
     let entity_dtos: Vec<GtsEntityDto> = entities.into_iter().map(Into::into).collect();
     let count = entity_dtos.len();
@@ -94,7 +94,7 @@ pub async fn get_entity(
         return Err(DomainError::NotInReadyMode.into());
     }
 
-    let entity = service.get(&gts_id).map_err(Problem::from)?;
+    let entity = service.get(&gts_id).map_err(CanonicalError::from)?;
 
     Ok(Json(entity.into()))
 }

@@ -21,6 +21,7 @@ workspace = true
 modkit = { workspace = true }
 modkit-http = { workspace = true }
 modkit-security = { workspace = true }
+modkit-canonical-errors = { workspace = true, features = ["axum"] }
 authn-resolver-sdk = { package = "cyberware-authn-resolver-sdk", version = "0.3.16", path = "../authn-resolver/authn-resolver-sdk" }
 modkit-macros = { workspace = true }
 inventory = { workspace = true }
@@ -62,7 +63,6 @@ tracing-subscriber = { workspace = true }
 
 [features]
 grpc = []
-debug-errors = []
 embed_elements = []
 otel = []
 

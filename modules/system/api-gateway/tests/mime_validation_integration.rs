@@ -13,7 +13,8 @@ use axum::{
     routing::post,
 };
 use http::Method;
-use modkit::api::{OperationSpec, Problem};
+use modkit::api::OperationSpec;
+use modkit_canonical_errors::Problem;
 use serde_json::json;
 use tower::ServiceExt; // for oneshot
 
@@ -22,12 +23,24 @@ use api_gateway::middleware::mime_validation::{
 };
 use modkit::api::operation_builder::VendorExtensions;
 
+const INVALID_ARGUMENT_TYPE: &str =
+    "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~";
+const PROBLEM_JSON: &str = "application/problem+json";
+
 /// Helper to extract Problem from response
 async fn extract_problem(response: axum::response::Response) -> Problem {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("Failed to read body");
     serde_json::from_slice(&body).expect("Failed to parse Problem JSON")
+}
+
+fn content_type(response: &axum::response::Response) -> &str {
+    response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
 /// Test handler that just returns OK
@@ -166,14 +179,24 @@ async fn test_middleware_rejects_disallowed_content_type() {
 
     let response = app.oneshot(request).await.unwrap();
 
-    // Should reject with 415
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    // Should reject with 400 (canonical invalid_argument)
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(content_type(&response), PROBLEM_JSON);
 
     let problem = extract_problem(response).await;
-    assert_eq!(problem.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert_eq!(problem.title, "Unsupported Media Type");
-    assert!(problem.detail.contains("text/plain"));
-    assert!(problem.detail.contains("application/json"));
+    assert_eq!(problem.status, 400);
+    assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
+    let violations = problem
+        .context
+        .get("field_violations")
+        .and_then(|v| v.as_array())
+        .expect("field_violations must be present");
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0]["field"], "content-type");
+    assert_eq!(violations[0]["reason"], "UNSUPPORTED_MEDIA_TYPE");
+    let description = violations[0]["description"].as_str().unwrap_or("");
+    assert!(description.contains("text/plain"));
+    assert!(description.contains("application/json"));
 }
 
 #[tokio::test]
@@ -215,12 +238,27 @@ async fn test_middleware_rejects_missing_content_type() {
 
     let response = app.oneshot(request).await.unwrap();
 
-    // Should reject with 415
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    // Should reject with 400 (canonical invalid_argument)
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(content_type(&response), PROBLEM_JSON);
 
     let problem = extract_problem(response).await;
-    assert_eq!(problem.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert!(problem.detail.contains("Missing Content-Type"));
+    assert_eq!(problem.status, 400);
+    assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
+    let violations = problem
+        .context
+        .get("field_violations")
+        .and_then(|v| v.as_array())
+        .expect("field_violations must be present");
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0]["field"], "content-type");
+    assert_eq!(violations[0]["reason"], "MISSING_CONTENT_TYPE");
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Missing Content-Type")
+    );
 }
 
 #[tokio::test]
@@ -312,5 +350,8 @@ async fn test_middleware_allows_multiple_content_types() {
         .unwrap();
 
     let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(content_type(&response), PROBLEM_JSON);
+    let problem = extract_problem(response).await;
+    assert_eq!(problem.problem_type, INVALID_ARGUMENT_TYPE);
 }

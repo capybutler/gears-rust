@@ -24,6 +24,8 @@ use crate::domain::model::{Endpoint, Scheme};
 use crate::domain::services::{EndpointSelector, SelectedEndpoint};
 use modkit_canonical_errors::Problem;
 
+use crate::api::rest::error::domain_error_to_problem;
+
 // ---------------------------------------------------------------------------
 // Internal header names (D9)
 // ---------------------------------------------------------------------------
@@ -697,6 +699,7 @@ impl ProxyHttp for PingoraProxy {
         ctx: &mut Self::CTX,
     ) -> pingora_proxy::FailToProxy {
         let instance = ctx.instance_uri.clone();
+        let instance_for_problem = instance.clone();
         let domain_err = match &e.etype {
             pingora_core::ErrorType::ConnectTimedout => DomainError::ConnectionTimeout {
                 detail: "upstream connection timed out".into(),
@@ -769,7 +772,10 @@ impl ProxyHttp for PingoraProxy {
             },
         };
 
-        let problem: Problem = domain_err.into();
+        // Pingora's response path is outside the axum router stack, so the
+        // canonical error middleware does not reach it. Pre-populate
+        // `instance` here so the wire body still carries the request URI.
+        let problem: Problem = domain_error_to_problem(domain_err, &instance_for_problem);
         let status = problem.status;
         let body_bytes = Bytes::from(serde_json::to_vec(&problem).unwrap_or_default());
 

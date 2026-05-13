@@ -12,7 +12,6 @@ pub use module::ApiGateway;
 mod assets;
 mod config;
 mod cors;
-pub mod error;
 pub mod middleware;
 mod router_cache;
 mod web;

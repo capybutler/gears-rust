@@ -223,23 +223,23 @@ async fn metrics_capture_mime_rejection() -> Result<()> {
                 .body(Body::from("hi"))?,
         )
         .await?;
-    assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
     provider.force_flush().unwrap();
 
     let count = histogram_count(&exporter, "http.server.request.duration");
     assert!(
         count >= 1,
-        "MIME rejection (415) must be captured by metrics, got {count} data points"
+        "MIME rejection (400) must be captured by metrics, got {count} data points"
     );
 
     assert!(
         histogram_has_attributes(
             &exporter,
             "http.server.request.duration",
-            &[("http.response.status_code", "415"),]
+            &[("http.response.status_code", "400"),]
         ),
-        "duration histogram should record 415 status from MIME rejection"
+        "duration histogram should record 400 status from MIME rejection"
     );
 
     Ok(())

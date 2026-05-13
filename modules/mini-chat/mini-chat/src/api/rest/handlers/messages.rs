@@ -70,7 +70,7 @@ pub(crate) async fn stream_message(
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "failed to fetch chat for stream");
-            return Problem::from(e).into_response();
+            return CanonicalError::from(e).into_response();
         }
     };
 
@@ -83,7 +83,7 @@ pub(crate) async fn stream_message(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, model = %selected_model, "model resolution failed");
-            return Problem::from(e).into_response();
+            return CanonicalError::from(e).into_response();
         }
     };
 

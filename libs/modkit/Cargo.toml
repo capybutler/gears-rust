@@ -134,4 +134,5 @@ tempfile = { workspace = true }
 temp-env = { workspace = true }
 modkit-db = { workspace = true, features = ["sqlite"] }
 tracing-subscriber = { workspace = true }
+tracing-test = { workspace = true, features = ["no-env-filter"] }
 tokio-metrics = { workspace = true }

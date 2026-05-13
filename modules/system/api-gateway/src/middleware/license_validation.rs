@@ -1,13 +1,13 @@
 use axum::extract::Request;
-use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use http::Method;
-use modkit::api::{OperationSpec, Problem};
+use modkit::api::OperationSpec;
 use std::sync::Arc;
 
 use crate::middleware::common;
+use crate::middleware::errors::ApiGatewayRouteError;
 
 const BASE_FEATURE: &str = "gts.cf.core.lic.feat.v1~cf.core.global.base.v1";
 
@@ -65,14 +65,13 @@ pub async fn license_validation_middleware(
     // We need first to implement plugin and get its client from client_hub
     // Plugin should provide an interface to get a list of global features (features that are not scoped to particular resource)
     if required.iter().any(|r| r != BASE_FEATURE) {
-        return Problem::new(
-            StatusCode::FORBIDDEN,
-            "Forbidden",
-            format!(
-                "Endpoint requires unsupported license features '{required:?}'; only '{BASE_FEATURE}' is allowed",
-            ),
-        )
-        .into_response();
+        // `instance` / `trace_id` are filled by the canonical error
+        // middleware (`modkit::api::canonical_error_middleware`) on the way
+        // out — this middleware sits inside its layer.
+        return ApiGatewayRouteError::permission_denied()
+            .with_reason("LICENSE_FEATURE_REQUIRED")
+            .create()
+            .into_response();
     }
 
     next.run(req).await
