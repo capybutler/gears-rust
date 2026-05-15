@@ -11,7 +11,9 @@ Converts various document formats into a unified structured representation. Extr
 - Upload files directly
 - Parse from local file paths (restricted to `allowed_local_base_dir`; paths with `..` are always rejected)
 
-Full API documentation: <http://127.0.0.1:8087/docs>
+Full API documentation: <http://127.0.0.1:8087/cw/docs>
+
+The example server uses the gateway prefix `/cw`. This comes from `modules.api-gateway.config.prefix_path` and is configurable.
 
 ## Configuration
 
@@ -32,7 +34,7 @@ Only files under this directory (after symlink resolution) are accessible via th
 ### List Supported File Types
 
 ```bash
-curl -s http://127.0.0.1:8087/file-parser/v1/info | python3 -m json.tool
+curl -s http://127.0.0.1:8087/cw/file-parser/v1/info | python3 -m json.tool
 ```
 
 **Output:**
@@ -53,7 +55,7 @@ curl -s http://127.0.0.1:8087/file-parser/v1/info | python3 -m json.tool
 
 ```bash
 echo "Hello, Cyber Ware!" > /tmp/test.txt
-curl -s -X POST "http://127.0.0.1:8087/file-parser/v1/upload?filename=test.txt" \
+curl -s -X POST "http://127.0.0.1:8087/cw/file-parser/v1/upload?filename=test.txt" \
   -H "Content-Type: application/octet-stream" \
   --data-binary @/tmp/test.txt | python3 -m json.tool
 ```
@@ -83,7 +85,7 @@ curl -s -X POST "http://127.0.0.1:8087/file-parser/v1/upload?filename=test.txt" 
 Assumes `allowed_local_base_dir` is set to `/data/documents` and the file exists there.
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8087/file-parser/v1/parse-local?render_markdown=true" \
+curl -s -X POST "http://127.0.0.1:8087/cw/file-parser/v1/parse-local?render_markdown=true" \
   -H "Content-Type: application/json" \
   -d '{"file_path": "/data/documents/report.txt"}' | python3 -m json.tool
 ```
@@ -114,7 +116,7 @@ curl -s -X POST "http://127.0.0.1:8087/file-parser/v1/parse-local?render_markdow
 **Path with `..` component** — always rejected before any filesystem access:
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8087/file-parser/v1/parse-local" \
+curl -s -X POST "http://127.0.0.1:8087/cw/file-parser/v1/parse-local" \
   -H "Content-Type: application/json" \
   -d '{"file_path": "/data/documents/../etc/passwd"}'
 ```
@@ -131,7 +133,7 @@ Response: **403 Forbidden**
 **Path outside `allowed_local_base_dir`** — rejected after canonicalization:
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8087/file-parser/v1/parse-local" \
+curl -s -X POST "http://127.0.0.1:8087/cw/file-parser/v1/parse-local" \
   -H "Content-Type: application/json" \
   -d '{"file_path": "/etc/hostname"}'
 ```
@@ -145,4 +147,4 @@ Response: **403 Forbidden**
 }
 ```
 
-For additional endpoints, see <http://127.0.0.1:8087/docs>.
+For additional endpoints, see <http://127.0.0.1:8087/cw/docs>.

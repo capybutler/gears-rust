@@ -21,6 +21,7 @@ use utoipa::openapi::{
     response::{ResponseBuilder, ResponsesBuilder},
     schema::{ComponentsBuilder, ObjectBuilder, Schema, SchemaFormat, SchemaType},
     security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
+    server::Server,
 };
 
 use crate::api::{operation_builder, problem};
@@ -34,6 +35,7 @@ pub struct OpenApiInfo {
     pub title: String,
     pub version: String,
     pub description: Option<String>,
+    pub servers: Vec<String>,
 }
 
 impl Default for OpenApiInfo {
@@ -42,6 +44,7 @@ impl Default for OpenApiInfo {
             title: "API Documentation".to_owned(),
             version: "0.1.0".to_owned(),
             description: None,
+            servers: Vec::new(),
         }
     }
 }
@@ -192,53 +195,7 @@ impl OpenApiRegistryImpl {
 
             // Request body
             if let Some(rb) = &spec.request_body {
-                let content = match &rb.schema {
-                    operation_builder::RequestBodySchema::Ref { schema_name } => {
-                        ContentBuilder::new()
-                            .schema(Some(RefOr::Ref(Ref::from_schema_name(schema_name.clone()))))
-                            .build()
-                    }
-                    operation_builder::RequestBodySchema::MultipartFile { field_name } => {
-                        // Build multipart/form-data schema with a single binary file field
-                        // type: object
-                        // properties:
-                        //   {field_name}: { type: string, format: binary }
-                        // required: [ field_name ]
-                        let file_schema = Schema::Object(
-                            ObjectBuilder::new()
-                                .schema_type(SchemaType::Type(
-                                    utoipa::openapi::schema::Type::String,
-                                ))
-                                .format(Some(SchemaFormat::Custom("binary".into())))
-                                .build(),
-                        );
-                        let obj = ObjectBuilder::new()
-                            .property(field_name.clone(), file_schema)
-                            .required(field_name.clone());
-                        let schema = Schema::Object(obj.build());
-                        ContentBuilder::new().schema(Some(schema)).build()
-                    }
-                    operation_builder::RequestBodySchema::Binary => {
-                        // Represent raw binary body as type string, format binary.
-                        // This is used for application/octet-stream and similar raw binary content.
-                        let schema = Schema::Object(
-                            ObjectBuilder::new()
-                                .schema_type(SchemaType::Type(
-                                    utoipa::openapi::schema::Type::String,
-                                ))
-                                .format(Some(SchemaFormat::Custom("binary".into())))
-                                .build(),
-                        );
-
-                        ContentBuilder::new().schema(Some(schema)).build()
-                    }
-                    operation_builder::RequestBodySchema::InlineObject => {
-                        // Preserve previous behavior for inline object bodies
-                        ContentBuilder::new()
-                            .schema(Some(Schema::Object(ObjectBuilder::new().build())))
-                            .build()
-                    }
-                };
+                let content = build_request_body_content(&rb.schema);
                 let mut rbld = RequestBodyBuilder::new()
                     .description(rb.description.clone())
                     .content(rb.content_type.to_owned(), content);
@@ -349,8 +306,17 @@ impl OpenApiRegistryImpl {
             .description(info.description.clone())
             .build();
 
+        let servers = (!info.servers.is_empty()).then(|| {
+            info.servers
+                .iter()
+                .cloned()
+                .map(Server::new)
+                .collect::<Vec<_>>()
+        });
+
         let openapi = OpenApiBuilder::new()
             .info(openapi_info)
+            .servers(servers)
             .paths(paths.build())
             .components(Some(components.build()))
             .build();
@@ -407,6 +373,53 @@ impl OpenApiRegistry for OpenApiRegistryImpl {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// Build the `OpenAPI` content object for a request body schema variant.
+fn build_request_body_content(
+    schema: &operation_builder::RequestBodySchema,
+) -> utoipa::openapi::content::Content {
+    match schema {
+        operation_builder::RequestBodySchema::Ref { schema_name } => ContentBuilder::new()
+            .schema(Some(RefOr::Ref(Ref::from_schema_name(schema_name.clone()))))
+            .build(),
+        operation_builder::RequestBodySchema::MultipartFile { field_name } => {
+            // Build multipart/form-data schema with a single binary file field
+            // type: object
+            // properties:
+            //   {field_name}: { type: string, format: binary }
+            // required: [ field_name ]
+            let file_schema = Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(utoipa::openapi::schema::Type::String))
+                    .format(Some(SchemaFormat::Custom("binary".into())))
+                    .build(),
+            );
+            let obj = ObjectBuilder::new()
+                .property(field_name.clone(), file_schema)
+                .required(field_name.clone());
+            ContentBuilder::new()
+                .schema(Some(Schema::Object(obj.build())))
+                .build()
+        }
+        operation_builder::RequestBodySchema::Binary => {
+            // Represent raw binary body as type string, format binary.
+            // This is used for application/octet-stream and similar raw binary content.
+            let schema = Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(utoipa::openapi::schema::Type::String))
+                    .format(Some(SchemaFormat::Custom("binary".into())))
+                    .build(),
+            );
+            ContentBuilder::new().schema(Some(schema)).build()
+        }
+        operation_builder::RequestBodySchema::InlineObject => {
+            // Preserve previous behavior for inline object bodies
+            ContentBuilder::new()
+                .schema(Some(Schema::Object(ObjectBuilder::new().build())))
+                .build()
+        }
     }
 }
 
@@ -529,6 +542,7 @@ mod tests {
             title: "Test API".to_owned(),
             version: "1.0.0".to_owned(),
             description: Some("Test API Description".to_owned()),
+            servers: Vec::new(),
         };
         let doc = registry.build_openapi(&info).unwrap();
         let json = serde_json::to_value(&doc).unwrap();

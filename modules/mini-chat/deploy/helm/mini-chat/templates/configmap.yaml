@@ -54,7 +54,7 @@ data:
           bind_addr: "0.0.0.0:{{ .Values.service.port }}"
           enable_docs: true
           cors_enabled: false
-          prefix_path: "/cf"
+          prefix_path: "/cw"
           openapi:
             title: "Mini-Chat API"
             version: "0.1.0"

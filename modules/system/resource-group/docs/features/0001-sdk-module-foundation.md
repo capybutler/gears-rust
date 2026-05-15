@@ -512,11 +512,11 @@ Helper `assert_group_shape(data)` verifies the JSON wire shape of a group respon
 **Why not in unit tests**: TC-REST-* call handlers via `Router::oneshot` in-process. If a handler is not registered in `module.rs`, or mounted on the wrong path, all unit tests pass but the API is broken. The real `module.rs` wiring is only exercised on a live server.
 
 ```
-HEAD /cf/resource-group/v1/groups               → not 404/405
-HEAD /cf/resource-group/v1/groups/{uuid}        → not 405 (404 ok — group doesn't exist)
-HEAD /cf/resource-group/v1/groups/{uuid}/hierarchy  → not 405
-HEAD /cf/resource-group/v1/memberships          → not 405
-POST /cf/types-registry/v1/types (empty body)   → not 404/405 (400 ok — validation)
+HEAD /cw/resource-group/v1/groups               → not 404/405
+HEAD /cw/resource-group/v1/groups/{uuid}        → not 405 (404 ok — group doesn't exist)
+HEAD /cw/resource-group/v1/groups/{uuid}/hierarchy  → not 405
+HEAD /cw/resource-group/v1/memberships          → not 405
+POST /cw/types-registry/v1/types (empty body)   → not 404/405 (400 ok — validation)
 
 Verify: each returns a status code, meaning the route exists and the handler runs.
 No data setup needed. Fastest possible test.

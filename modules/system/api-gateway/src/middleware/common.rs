@@ -20,7 +20,7 @@ fn strip_path_prefix(path: &str, prefix: &str) -> Option<String> {
         // clean segment boundary  →  keep the slash
         Some(rest.to_owned())
     } else {
-        // partial segment overlap (e.g. prefix="/cf", path="/cfish")  →  no match
+        // partial segment overlap (e.g. prefix="/cw", path="/cwish")  →  no match
         None
     }
 }
@@ -32,25 +32,25 @@ mod tests {
 
     #[test]
     fn exact_match_returns_root() {
-        assert_eq!(strip_path_prefix("/cf", "/cf"), Some("/".to_owned()));
+        assert_eq!(strip_path_prefix("/cw", "/cw"), Some("/".to_owned()));
     }
 
     #[test]
     fn segment_boundary_strips_correctly() {
         assert_eq!(
-            strip_path_prefix("/cf/users", "/cf"),
+            strip_path_prefix("/cw/users", "/cw"),
             Some("/users".to_owned())
         );
     }
 
     #[test]
     fn partial_segment_overlap_rejected() {
-        assert_eq!(strip_path_prefix("/cfish", "/cf"), None);
+        assert_eq!(strip_path_prefix("/cwish", "/cw"), None);
     }
 
     #[test]
     fn no_prefix_match_returns_none() {
-        assert_eq!(strip_path_prefix("/other/path", "/cf"), None);
+        assert_eq!(strip_path_prefix("/other/path", "/cw"), None);
     }
 
     #[test]
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn path_with_params_strips_correctly() {
         assert_eq!(
-            strip_path_prefix("/cf/users/{id}", "/cf"),
+            strip_path_prefix("/cw/users/{id}", "/cw"),
             Some("/users/{id}".to_owned())
         );
     }

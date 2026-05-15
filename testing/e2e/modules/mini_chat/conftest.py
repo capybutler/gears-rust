@@ -20,7 +20,7 @@ from .mock_provider.server import MockProviderServer, DummyMockProvider
 # ── Constants ─────────────────────────────────────────────────────────────
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8087")
-API_PREFIX = f"{BASE_URL}/cf/mini-chat/v1"
+API_PREFIX = f"{BASE_URL}/cw/mini-chat/v1"
 
 # NOTE: model_id is unique across providers in this test catalog by convention,
 # not by system design. The production model policy plugin could map the same
@@ -434,7 +434,7 @@ def module_test_env(request):
         config_path=MODULE_DIR / "config" / "base.yaml",
         config_patch=_patch_mini_chat_config,
         port=8087,
-        health_path="/cf/openapi.json",
+        health_path="/cw/openapi.json",
         health_timeout=90,
         env={"RUST_LOG": rust_log},
         sidecars=[mock],

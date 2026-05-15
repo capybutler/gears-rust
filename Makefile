@@ -1,6 +1,6 @@
 CI := 1
 
-OPENAPI_URL ?= http://127.0.0.1:8087/cf/openapi.json
+OPENAPI_URL ?= http://127.0.0.1:8087/cw/openapi.json
 OPENAPI_OUT ?= docs/api/api.json
 
 # E2E feature set (single source of truth: config/e2e-features.txt)
@@ -653,7 +653,7 @@ mini-chat-up:
 	@echo ""
 	@echo "mini-chat is running. In a separate terminal run:"
 	@echo "  make mini-chat-port-forward"
-	@echo "Then access: http://localhost:8087/cf/mini-chat"
+	@echo "Then access: http://localhost:8087/cw/mini-chat"
 
 ## Persistent port-forward with auto-reconnect (run in a separate terminal)
 mini-chat-port-forward:

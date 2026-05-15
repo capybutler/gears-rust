@@ -135,13 +135,13 @@ Research on large-scale test suites shows the distribution of flake root causes:
 ```python
 # BAD — depends on data from another test or a shared fixture
 async def test_list_returns_entities(client):
-    r = await client.get("/cf/<module>/v1/entities")
+    r = await client.get("/cw/<module>/v1/entities")
     assert len(r.json()["items"]) > 0  # relies on someone else creating data
 
 # GOOD — test creates its own data, asserts on it specifically
 async def test_list_returns_entities(client, create_entity):
     entity = await create_entity(name=f"test-{uuid.uuid4()}")
-    r = await client.get("/cf/<module>/v1/entities")
+    r = await client.get("/cw/<module>/v1/entities")
     ids = [i["id"] for i in r.json()["items"]]
     assert entity["id"] in ids
 ```
@@ -158,7 +158,7 @@ Rules:
 ```python
 # BAD
 await asyncio.sleep(0.5)  # hope the server has processed it by now
-r = await client.get(f"/cf/.../entities/{entity_id}")
+r = await client.get(f"/cw/.../entities/{entity_id}")
 
 # GOOD — if you genuinely need to wait for async state, poll with a timeout
 async def wait_for_status(client, url, expected_status, timeout=5.0):
@@ -240,7 +240,7 @@ Factory fixtures must be safe to call multiple times and must not fail if the en
 def make_entity(client):
     async def _create(**kwargs):
         kwargs.setdefault("name", f"test-{uuid.uuid4()}")
-        r = await client.post("/cf/.../entities", json=kwargs)
+        r = await client.post("/cw/.../entities", json=kwargs)
         assert r.status_code == 201, r.text
         return r.json()
     return _create
@@ -422,8 +422,8 @@ async def test_route_smoke_all_endpoints(client):
     """
     # Each path returns something other than 404/405
     responses = await asyncio.gather(
-        client.head("/cf/<module>/v1/entities"),
-        client.options("/cf/<module>/v1/entities"),
+        client.head("/cw/<module>/v1/entities"),
+        client.options("/cw/<module>/v1/entities"),
     )
     for r in responses:
         assert r.status_code not in (404, 405), f"Endpoint not registered: {r.url}"
@@ -438,7 +438,7 @@ async def test_route_smoke_all_endpoints(client):
 ```python
 async def test_dto_roundtrip_json_shape(client, create_entity):
     entity = await create_entity(name="Shape Test")
-    r = await client.get(f"/cf/<module>/v1/entities/{entity['id']}")
+    r = await client.get(f"/cw/<module>/v1/entities/{entity['id']}")
     assert r.status_code == 200
     data = r.json()
     # Assert exact field names, not just "response is 200"
@@ -460,11 +460,11 @@ async def test_authz_tenant_filter_applied(client):
     """
     Seam: AuthZ → SecureORM full chain — own data visible, scoped correctly.
     """
-    r = await client.post("/cf/<module>/v1/entities", json={"name": "AuthZ Test"})
+    r = await client.post("/cw/<module>/v1/entities", json={"name": "AuthZ Test"})
     assert r.status_code == 201
     entity_id = r.json()["id"]
 
-    r = await client.get("/cf/<module>/v1/entities")
+    r = await client.get("/cw/<module>/v1/entities")
     assert r.status_code == 200
     ids = [item["id"] for item in r.json()["items"]]
     assert entity_id in ids
@@ -482,7 +482,7 @@ async def test_error_response_rfc9457(client):
     Seam: Error middleware — DomainError → HTTP status + Content-Type + no internal leaks.
     """
     import uuid
-    r = await client.get(f"/cf/<module>/v1/entities/{uuid.uuid4()}")
+    r = await client.get(f"/cw/<module>/v1/entities/{uuid.uuid4()}")
     assert r.status_code == 404
     assert "application/problem+json" in r.headers.get("content-type", "")
     body = r.json()
@@ -508,7 +508,7 @@ async def test_pagination_cursor_roundtrip(client, create_entities):
         params = {"$top": 2}
         if cursor:
             params["$skiptoken"] = cursor
-        r = await client.get("/cf/<module>/v1/entities", params=params)
+        r = await client.get("/cw/<module>/v1/entities", params=params)
         assert r.status_code == 200
         page = r.json()
         all_ids.extend(item["id"] for item in page["items"])

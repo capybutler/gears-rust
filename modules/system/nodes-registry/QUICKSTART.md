@@ -13,14 +13,16 @@ Tracks and reports information about all Cyber Ware server instances in your dep
 - Load balancing and resource allocation
 - Health checks and diagnostics
 
-Full API documentation: <http://127.0.0.1:8087/docs>
+Full API documentation: <http://127.0.0.1:8087/cw/docs>
+
+The example server uses the gateway prefix `/cw`. This comes from `modules.api-gateway.config.prefix_path` and is configurable.
 
 ## Examples
 
 ### List All Nodes
 
 ```bash
-curl -s http://127.0.0.1:8087/nodes-registry/v1/nodes | python3 -m json.tool
+curl -s http://127.0.0.1:8087/cw/nodes-registry/v1/nodes | python3 -m json.tool
 ```
 
 **Output:**
@@ -36,4 +38,4 @@ curl -s http://127.0.0.1:8087/nodes-registry/v1/nodes | python3 -m json.tool
 ]
 ```
 
-For additional endpoints, see <http://127.0.0.1:8087/docs>.
+For additional endpoints, see <http://127.0.0.1:8087/cw/docs>.

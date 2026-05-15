@@ -26,6 +26,7 @@ make mini-chat
 ```
 
 This starts the server at `http://127.0.0.1:8087` with SQLite, mock auth, and single-tenant mode.
+The example configuration serves the API behind the gateway prefix `/cw`, configured via `modules.api-gateway.config.prefix_path`.
 
 ### Configuration
 
@@ -48,7 +49,7 @@ Each provider entry in `mini-chat.config.providers` can include a `tenant_overri
 
 ## API
 
-Base URL: `http://127.0.0.1:8087/mini-chat/v1`
+Base URL: `http://127.0.0.1:8087/cw/mini-chat/v1`
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -68,7 +69,7 @@ Base URL: `http://127.0.0.1:8087/mini-chat/v1`
 | PATCH | `/mini-chat/v1/chats/{id}/turns/{rid}` | Edit turn (SSE) |
 | DELETE | `/mini-chat/v1/chats/{id}/turns/{rid}` | Delete a turn |
 
-OpenAPI docs (when server is running): http://127.0.0.1:8087/docs
+OpenAPI docs (when server is running): http://127.0.0.1:8087/cw/docs
 
 ## Smoke Test
 

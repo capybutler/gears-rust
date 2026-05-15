@@ -91,7 +91,7 @@ modules:
       bind_addr: "127.0.0.1:8087"
       enable_docs: true
       cors_enabled: false
-      prefix_path: "/cf"
+      prefix_path: "/cw"
       # OpenAPI Documentation Configuration
       openapi:
         title: "Cyber Ware Example Server API"

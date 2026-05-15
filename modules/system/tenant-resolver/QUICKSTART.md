@@ -15,14 +15,16 @@ Manages multi-tenant hierarchies for data isolation and access control. Tenants 
 
 > **Note:** Requires `make example` (includes `--features tenant-resolver-example`)
 
-Full API documentation: <http://127.0.0.1:8087/docs>
+Full API documentation: <http://127.0.0.1:8087/cw/docs>
+
+The example server uses the gateway prefix `/cw`. This comes from `modules.api-gateway.config.prefix_path` and is configurable.
 
 ## Examples
 
 ### List All Tenants
 
 ```bash
-curl -s http://127.0.0.1:8087/tenant-resolver/v1/tenants | python3 -m json.tool
+curl -s http://127.0.0.1:8087/cw/tenant-resolver/v1/tenants | python3 -m json.tool
 ```
 
 **Output:**
@@ -36,4 +38,4 @@ curl -s http://127.0.0.1:8087/tenant-resolver/v1/tenants | python3 -m json.tool
 }
 ```
 
-For additional endpoints, see <http://127.0.0.1:8087/docs>.
+For additional endpoints, see <http://127.0.0.1:8087/cw/docs>.

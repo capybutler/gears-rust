@@ -23,18 +23,18 @@ Each node contains:
 
 ## API Endpoints
 
-All endpoints are registered under `/nodes-registry/v1/nodes`.
+All endpoints are registered under `/nodes-registry/v1/nodes`. When the API gateway is configured with `prefix_path: "/cw"`, these endpoints are served under `/cw/nodes-registry/v1/nodes` instead. The prefix is configurable via `modules.api-gateway.config.prefix_path`.
 
 ### List Nodes
 ```bash
 # Basic list (node metadata only)
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes"
 
 # With details (includes cached sysinfo and syscap)
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes?details=true"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes?details=true"
 
 # With details + force refresh (ignores cache)
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes?details=true&force_refresh=true"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes?details=true&force_refresh=true"
 ```
 
 **Response:**
@@ -55,18 +55,18 @@ curl -X GET "http://localhost:8080/nodes-registry/v1/nodes?details=true&force_re
 ### Get Node by ID
 ```bash
 # Basic node info
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes/{id}"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes/{id}"
 
 # With details (includes cached sysinfo and syscap)
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes/{id}?details=true"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes/{id}?details=true"
 
 # With details + force refresh
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes/{id}?details=true&force_refresh=true"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes/{id}?details=true&force_refresh=true"
 ```
 
 ### Get Node System Information
 ```bash
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes/{id}/sysinfo"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes/{id}/sysinfo"
 ```
 
 **Response:**
@@ -113,10 +113,10 @@ curl -X GET "http://localhost:8080/nodes-registry/v1/nodes/{id}/sysinfo"
 ### Get Node System Capabilities
 ```bash
 # Uses cached data (auto-refreshes expired capabilities)
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes/{id}/syscap"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes/{id}/syscap"
 
 # Force refresh all capabilities (ignores cache)
-curl -X GET "http://localhost:8080/nodes-registry/v1/nodes/{id}/syscap?force_refresh=true"
+curl -X GET "http://localhost:8080/cw/nodes-registry/v1/nodes/{id}/syscap?force_refresh=true"
 ```
 
 **Response:**

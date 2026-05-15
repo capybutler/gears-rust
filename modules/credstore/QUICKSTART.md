@@ -13,7 +13,9 @@ Stores, retrieves, and deletes secrets scoped to tenants and owners. Secrets are
 - Inheriting organization-wide secrets in child tenants without duplication
 - Sharing secrets across tenant boundaries via `shared` mode
 
-Full API documentation: <http://127.0.0.1:8087/docs>
+Full API documentation: <http://127.0.0.1:8087/cw/docs>
+
+The example server uses the gateway prefix `/cw`. This comes from `modules.api-gateway.config.prefix_path` and is configurable.
 
 ## Configuration
 
@@ -28,7 +30,7 @@ modules:
 ### Store a Secret
 
 ```bash
-curl -s -X PUT "http://127.0.0.1:8087/credstore/v1/secrets/partner-openai-key" \
+curl -s -X PUT "http://127.0.0.1:8087/cw/credstore/v1/secrets/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"value": "sk-abc123", "sharing": "tenant"}'
@@ -39,7 +41,7 @@ Response: **204 No Content**
 ### Retrieve a Secret
 
 ```bash
-curl -s "http://127.0.0.1:8087/credstore/v1/secrets/partner-openai-key" \
+curl -s "http://127.0.0.1:8087/cw/credstore/v1/secrets/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
@@ -58,10 +60,10 @@ curl -s "http://127.0.0.1:8087/credstore/v1/secrets/partner-openai-key" \
 ### Delete a Secret
 
 ```bash
-curl -s -X DELETE "http://127.0.0.1:8087/credstore/v1/secrets/partner-openai-key" \
+curl -s -X DELETE "http://127.0.0.1:8087/cw/credstore/v1/secrets/partner-openai-key" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 Response: **204 No Content**
 
-For additional endpoints, see <http://127.0.0.1:8087/docs>.
+For additional endpoints, see <http://127.0.0.1:8087/cw/docs>.

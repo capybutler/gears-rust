@@ -44,7 +44,7 @@ Chosen option: **Option A — Single-root tree**, because it gives us a single c
 **Interpretation by deployment shape:**
 
 - **Multi-tenant deployment.** Independent organizations are modelled as *sub-roots* directly under the root. The root itself holds no business objects; it acts as a structural anchor.
-- **Single-user / consumer deployment of a Cyber-Fabric-based product.** The root *is* the tenant that owns all business objects. No sub-roots are created.
+- **Single-user / consumer deployment of a Cyber Ware -based product.** The root *is* the tenant that owns all business objects. No sub-roots are created.
 
 Both shapes satisfy the same topology invariant: the hierarchy has exactly one tenant with `parent_id = NULL`. What differs is whether business objects live on the root or only below it.
 

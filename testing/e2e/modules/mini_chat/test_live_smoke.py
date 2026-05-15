@@ -19,7 +19,7 @@ import httpx
 import pytest
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8087")
-API = f"{BASE_URL}/cf/mini-chat/v1"
+API = f"{BASE_URL}/cw/mini-chat/v1"
 TIMEOUT = 90
 
 # Model IDs must match the e2e model catalog (testing/e2e/modules/mini_chat/config/base.yaml)
@@ -140,7 +140,7 @@ def poll_attachment_ready(chat_id: str, att_id: str, timeout_secs: int = 30) -> 
 def _check_live():
     """Skip if backend is not reachable."""
     try:
-        resp = httpx.get(f"{BASE_URL}/cf/openapi.json", timeout=5)
+        resp = httpx.get(f"{BASE_URL}/cw/openapi.json", timeout=5)
         if resp.status_code != 200:
             pytest.skip(f"Backend not healthy: {resp.status_code}")
     except httpx.ConnectError:
@@ -164,7 +164,7 @@ class TestLiveSmoke:
     """Basic live smoke tests against real LLM."""
 
     def test_health(self, _check_live):
-        resp = httpx.get(f"{BASE_URL}/cf/openapi.json", timeout=10)
+        resp = httpx.get(f"{BASE_URL}/cw/openapi.json", timeout=10)
         assert resp.status_code == 200
 
     def test_list_models(self, _check_live):

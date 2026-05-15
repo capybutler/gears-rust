@@ -275,22 +275,22 @@ Configure API Gateway to forward client certificate CN header to RG module for M
 ```bash
 # MTLS request to allowed endpoint (descendants) — AuthZ bypassed
 curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
-  https://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/descendants
+  https://127.0.0.1:8087/cw/resource-group/v1/groups/{group_id}/descendants
 # Expected: 200 OK with descendants data
 
 # MTLS request to allowed endpoint (ancestors) — AuthZ bypassed
 curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
-  https://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/ancestors
+  https://127.0.0.1:8087/cw/resource-group/v1/groups/{group_id}/ancestors
 # Expected: 200 OK with ancestors data
 
 # MTLS request to disallowed endpoint (POST groups) — rejected
 curl --cert plugin.pem --key plugin-key.pem --cacert ca.pem \
-  -X POST https://127.0.0.1:8087/cf/resource-group/v1/groups
+  -X POST https://127.0.0.1:8087/cw/resource-group/v1/groups
 # Expected: 403 Forbidden
 
 # JWT request to descendants endpoint — full AuthZ applied
 curl -H "Authorization: Bearer test" \
-  http://127.0.0.1:8087/cf/resource-group/v1/groups/{group_id}/descendants
+  http://127.0.0.1:8087/cw/resource-group/v1/groups/{group_id}/descendants
 # Expected: 200 OK with AuthZ-scoped results
 ```
 

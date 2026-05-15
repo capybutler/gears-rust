@@ -42,7 +42,7 @@ pub struct ApiGatewayConfig {
     #[serde(default = "default_require_auth_by_default")]
     pub require_auth_by_default: bool,
 
-    /// Optional URL path prefix prepended to every route (e.g. `"/cf"` → `/cf/users`).
+    /// Optional URL path prefix prepended to every route (e.g. `"/cw"` → `/cw/users`).
     /// Must start with a leading slash; trailing slashes are stripped automatically.
     /// Empty string (the default) means no prefix.
     #[serde(default)]

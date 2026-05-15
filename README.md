@@ -61,15 +61,15 @@ make example    # Run modkit example module
 Cyber Ware repository comes with an example server illustrating the modules APIs:
 
 ```bash
-# Run an example server, see the API docs @ http://127.0.0.1:8087/cf/docs
+# Run an example server, see the API docs @ http://127.0.0.1:8087/cw/docs
 make exammple
 
 # See API documentation:
 # $ make example
-# visit: http://127.0.0.1:8087/cf/docs
+# visit: http://127.0.0.1:8087/cw/docs
 
 # Check if server is ready (detailed JSON response)
-curl http://127.0.0.1:8087/cf/health
+curl http://127.0.0.1:8087/cw/health
 
 # Kubernetes-style liveness probe (simple "ok" response)
 curl http://127.0.0.1:8087/healthz

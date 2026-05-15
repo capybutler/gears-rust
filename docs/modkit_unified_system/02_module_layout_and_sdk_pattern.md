@@ -475,7 +475,8 @@ use your_module as _;  // ensures inventory discovers the module at link time
 - Without importing the module, it won't be linked into the binary
 - This results in missing API endpoints and the module won't be initialized
 
-After registration, rebuild and verify at `http://127.0.0.1:8087/docs`.
+After registration, rebuild and verify at `http://127.0.0.1:8087/cw/docs` in the example setup.
+The `/cw` prefix comes from `modules.api-gateway.config.prefix_path` and is configurable.
 
 ## Module Documentation: QUICKSTART.md
 
@@ -497,17 +498,17 @@ Every module with REST endpoints SHOULD include a `QUICKSTART.md` file with:
 - Key capability 1
 - Key capability 2
 
-Full API documentation: <http://127.0.0.1:8087/docs>
+Full API documentation: <http://127.0.0.1:8087/cw/docs>
 
 ## Examples
 
 ### List Resources
 
 ```bash
-curl -s http://127.0.0.1:8087/<module>/v1/resource | python3 -m json.tool
+curl -s http://127.0.0.1:8087/cw/<module>/v1/resource | python3 -m json.tool
 ```
 
-For additional endpoints, see <http://127.0.0.1:8087/docs>.
+For additional endpoints, see <http://127.0.0.1:8087/cw/docs>.
 ````
 
 **Key principles:**

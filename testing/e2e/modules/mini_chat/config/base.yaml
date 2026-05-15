@@ -44,7 +44,7 @@ modules:
   api-gateway:
     config:
       bind_addr: "127.0.0.1:8087"
-      prefix_path: "/cf"
+      prefix_path: "/cw"
       enable_docs: true
       cors_enabled: false
       openapi:

@@ -64,7 +64,7 @@ The tenant structure is a **single-root tree** — every tenant except the root 
 - **One OAuth client is enough** for S2S tenant-scoped flows that need to act as the root — no per-root credential fan-out at the vendor IdP.
 - **Unambiguous "act as root" semantics** — platform-level tenant-scoped operations always address the same tenant.
 - **Organizational autonomy is preserved via sub-roots** — in multi-tenant deployments each independent organization is modelled as its own sub-root directly under the root; barriers continue to provide isolation between sub-trees.
-- **Works naturally for single-user / consumer deployments** of Cyber-Fabric-based products — the root *is* the tenant that owns all business objects, and no sub-roots are created.
+- **Works naturally for single-user / consumer deployments** of Cyber Ware -based products — the root *is* the tenant that owns all business objects, and no sub-roots are created.
 - **Avoids the accidental complexity of DAGs** — closure-table rows, barriers, and ancestry queries stay tree-shaped.
 
 **Deployment shapes:**
