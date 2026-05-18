@@ -1285,6 +1285,7 @@ def render_html(
   }}
 
   #panel input {{
+    width: 100%;
     flex: 1;
     border: 1px solid #ccc;
     border-radius: 8px;
@@ -1673,6 +1674,21 @@ def render_html(
     border-radius: 2px;
     padding: 0 1px;
   }}
+
+  #searchForm {{
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }}
+
+  #searchInput {{
+    min-width: 0;
+  }}
+
+  #filterDepthField {{
+    flex: none;
+    width: 84px;
+  }}
 </style>
 </head>
 <body>
@@ -1691,12 +1707,15 @@ def render_html(
           <select id="viewSelect" aria-label="Select file view"></select>
         </div>
         <div class="controlField" id="viewDepthField">
-          <div class="controlHeader" id="viewDepthHeader">Depth</div>
+          <div class="controlHeader" id="viewDepthHeader">Link Depth</div>
           <input id="viewDepth" type="number" min="0" step="1" value="5" aria-label="Reference depth" />
         </div>
       </div>
       <form id="searchForm">
         <input id="searchInput" type="search" placeholder="Filter files..." autocomplete="off" spellcheck="false" />
+        <div class="controlField hidden" id="filterDepthField">
+          <input id="filterDepth" type="number" min="0" step="1" value="1" aria-label="Filter depth" />
+        </div>
       </form>
     </div>
     <div id="filterStats"><span id="filterCount" class="filter-stat-link">0</span> files found,&nbsp;<span id="filterLOC" class="filter-stat-link">0</span> total LOC</div>
@@ -1751,6 +1770,7 @@ const nodeById = new Map(rawNodes.map(node => [node.id, node]));
 const edgeById = new Map(rawEdges.map((edge, index) => [edge.id ?? index, {{ ...edge, id: edge.id ?? index }}]));
 const adjacency = new Map();
 const outboundAdjacency = new Map();
+const inboundAdjacency = new Map();
 
 rawEdges.forEach((edge, index) => {{
   const edgeId = edge.id ?? index;
@@ -1760,6 +1780,8 @@ rawEdges.forEach((edge, index) => {{
   adjacency.get(edge.to).add(edge.from);
   if (!outboundAdjacency.has(edge.from)) outboundAdjacency.set(edge.from, []);
   outboundAdjacency.get(edge.from).push({{ to: edge.to, edgeId }});
+  if (!inboundAdjacency.has(edge.to)) inboundAdjacency.set(edge.to, []);
+  inboundAdjacency.get(edge.to).push({{ from: edge.from, edgeId }});
 }});
 
 const inLinkCount = new Map();
@@ -1877,7 +1899,7 @@ let activeGroupIds = new Set();
 const allCategoryIds = new Set(rawNodes.map(node => node.category).filter(Boolean));
 const allBucketIds = new Set(rawNodes.map(node => node.bucket).filter(Boolean));
 const allGroupIds = new Set(rawNodes.map(node => node.group).filter(Boolean));
-
+let filterFromNodeSelection = false;
 function normalized(text) {{
   return (text || "").trim().toLowerCase();
 }}
@@ -1899,8 +1921,14 @@ const compiledViewsById = new Map(compiledViews.map(view => [view.id, view]));
 
 function fitCurrentView() {{
   const query = normalized(searchInput.value);
-  const viewId = viewSelect.value || "all";
-  const ids = viewId === "all" && query ? [...matchingNodeIds(query)] : [...activeViewNodeIds];
+  let ids;
+  if (query) {{
+    const directMatches = matchingNodeIds(query);
+    const depth = Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "1", 10) || 0);
+    ids = [...computeFilterExpansion(directMatches, depth)];
+  }} else {{
+    ids = [...activeViewNodeIds];
+  }}
   if (!ids.length) return;
   network.fit({{ nodes: ids, animation: {{ duration: 250, easingFunction: "easeInOutQuad" }} }});
 }}
@@ -1960,6 +1988,37 @@ function computeActiveSubgraph(viewId, depth) {{
   return {{ nodeIds, edgeIds }};
 }}
 
+function computeFilterExpansion(matchingIds, depth) {{
+  if (!depth || depth <= 0) return new Set(matchingIds);
+  const result = new Set(matchingIds);
+  const queue = [...matchingIds].map(id => [id, 0]);
+  const seen = new Map([...matchingIds].map(id => [id, 0]));
+  while (queue.length) {{
+    const [cur, d] = queue.shift();
+    if (d >= depth) continue;
+    for (const link of (outboundAdjacency.get(cur) || [])) {{
+      const nd = d + 1;
+      if (seen.has(link.to) && seen.get(link.to) <= nd) continue;
+      seen.set(link.to, nd);
+      result.add(link.to);
+      queue.push([link.to, nd]);
+    }}
+    for (const link of (inboundAdjacency.get(cur) || [])) {{
+      const nd = d + 1;
+      if (seen.has(link.from) && seen.get(link.from) <= nd) continue;
+      seen.set(link.from, nd);
+      result.add(link.from);
+      queue.push([link.from, nd]);
+    }}
+  }}
+  return result;
+}}
+
+function syncFilterDepthVisibility() {{
+  const hasQuery = normalized(searchInput.value).length > 0;
+  document.getElementById("filterDepthField").classList.toggle("hidden", !hasQuery);
+}}
+
 function populateViewControls() {{
   viewSelect.innerHTML = "";
   const allOption = document.createElement("option");
@@ -2001,13 +2060,20 @@ function applyViewState({{ fit = false }} = {{}}) {{
 
 function matchingNodeIds(query) {{
   if (!query) return new Set(activeViewNodeIds);
+  const isPrefix = query.startsWith("./");
+  const searchTerm = isPrefix ? query.slice(2) : query;
+  if (!searchTerm) return new Set(activeViewNodeIds);
 
   const matches = new Set();
   for (const nodeId of activeViewNodeIds) {{
     const node = nodeById.get(nodeId);
     if (!node) continue;
-    const haystack = [node.id, node.label].filter(Boolean).join("\\n").toLowerCase();
-    if (haystack.includes(query)) matches.add(node.id);
+    if (isPrefix) {{
+      if (node.id.toLowerCase().startsWith(searchTerm)) matches.add(node.id);
+    }} else {{
+      const haystack = [node.id, node.label].filter(Boolean).join(" ").toLowerCase();
+      if (haystack.includes(searchTerm)) matches.add(node.id);
+    }}
   }}
   return matches;
 }}
@@ -2070,22 +2136,32 @@ function setDetails(nodeId) {{
 
 function updateStyles() {{
   const query = normalized(searchInput.value);
-  const matches = matchingNodeIds(query);
+  const directMatches = matchingNodeIds(query);
+  const filterActive = query.length > 0;
+  const depth = filterActive ? Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "1", 10) || 0) : 0;
+  const visibleSet = filterActive ? computeFilterExpansion(directMatches, depth) : directMatches;
   const viewModeActive = (viewSelect.value || "all") !== "all";
   let totalLOC = 0;
-  for (const id of matches) {{
+  for (const id of visibleSet) {{
     const node = nodeById.get(id);
     if (node && node.loc) totalLOC += node.loc;
   }}
-  document.getElementById("filterCount").textContent = matches.size;
+  document.getElementById("filterCount").textContent = visibleSet.size;
   document.getElementById("filterLOC").textContent = totalLOC;
-  const selection = selectedNode ? connectedSet(selectedNode) : null;
+  const selection = selectedNode && !filterActive ? connectedSet(selectedNode) : null;
 
   nodes.update(rawNodes.map(node => {{
     const inView = activeViewNodeIds.has(node.id);
-    const isMatch = matches.has(node.id);
+    const isInVisible = visibleSet.has(node.id);
     const isSelected = selection ? selection.connectedNodes.has(node.id) : true;
-    let opacity = query ? (isMatch ? 1 : 0.12) : (selection ? (isSelected ? 1 : 0.15) : 1);
+    let opacity;
+    if (filterActive) {{
+      opacity = isInVisible ? 1 : 0.12;
+    }} else if (selection) {{
+      opacity = isSelected ? 1 : 0.15;
+    }} else {{
+      opacity = 1;
+    }}
     if (viewModeActive && !inView) opacity = Math.min(opacity, 0.12);
     return {{ id: node.id, hidden: false, opacity }};
   }}));
@@ -2093,10 +2169,17 @@ function updateStyles() {{
   edges.update(rawEdges.map((edge, index) => {{
     const edgeId = edge.id ?? index;
     const inView = activeViewEdgeIds.has(edgeId) && activeViewNodeIds.has(edge.from) && activeViewNodeIds.has(edge.to);
-    const sourceMatch = matches.has(edge.from) || matches.has(edge.to);
-    const sourceSelected = selection ? selection.connectedEdges.has(edgeId) : true;
-    const active = inView && sourceMatch && sourceSelected;
-    const inactiveOpacity = viewModeActive && !inView ? 0.12 : (query ? 0.1 : (sourceSelected ? 1 : 0.12));
+    let active, inactiveOpacity;
+    if (filterActive) {{
+      const bothVisible = visibleSet.has(edge.from) && visibleSet.has(edge.to);
+      active = bothVisible && (!viewModeActive || inView);
+      inactiveOpacity = viewModeActive && !inView ? 0.12 : (bothVisible ? 0.3 : 0.1);
+    }} else {{
+      const sourceMatch = directMatches.has(edge.from) || directMatches.has(edge.to);
+      const sourceSelected = selection ? selection.connectedEdges.has(edgeId) : true;
+      active = inView && sourceMatch && sourceSelected;
+      inactiveOpacity = viewModeActive && !inView ? 0.12 : (sourceSelected ? 1 : 0.12);
+    }}
     return {{
       id: edgeId,
       hidden: false,
@@ -2232,6 +2315,9 @@ function selectNodeById(nodeId) {{
   selectedNode = nodeId;
   selectedEdge = null;
   setDetails(nodeId);
+  searchInput.value = "./" + nodeId;
+  filterFromNodeSelection = true;
+  syncFilterDepthVisibility();
   updateStyles();
   network.selectNodes([nodeId], false);
 }}
@@ -2245,7 +2331,9 @@ function directionalCandidate(anchor, candidate, direction) {{
   if (direction === "up" && dy >= 0) return null;
   const primary = direction === "right" || direction === "left" ? Math.abs(dx) : Math.abs(dy);
   const secondary = direction === "right" || direction === "left" ? Math.abs(dy) : Math.abs(dx);
-  return [primary, secondary, dx * dx + dy * dy];
+  const angle = Math.atan2(secondary, primary);
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  return [angle, dist];
 }}
 
 function wraparoundCandidate(anchor, candidate, direction) {{
@@ -2289,7 +2377,12 @@ function findBestDirectionalTarget(anchorId, direction, candidateIds, wrap = fal
 }}
 
 function filteredNodeIds() {{
-  return [...matchingNodeIds(normalized(searchInput.value))];
+  if (filterFromNodeSelection) return [...activeViewNodeIds];
+  const query = normalized(searchInput.value);
+  const direct = matchingNodeIds(query);
+  if (!query) return [...direct];
+  const depth = Math.max(0, Number.parseInt(document.getElementById("filterDepth").value || "1", 10) || 0);
+  return [...computeFilterExpansion(direct, depth)];
 }}
 
 function nodeMeta(nodeId) {{
@@ -2437,13 +2530,7 @@ function moveNodeFocus(direction) {{
   const anchorMeta = nodeMeta(anchorId);
   if (!anchorMeta) return false;
 
-  let nextId = findBestDirectionalTarget(anchorId, direction, filteredByBucket(anchorMeta.bucket || ""));
-  if (!nextId) {{
-    nextId = findBestDirectionalTarget(anchorId, direction, filteredByCategory(anchorMeta.category || ""));
-  }}
-  if (!nextId) {{
-    nextId = findBestExternalDirectionalTarget(anchorId, anchorMeta, direction);
-  }}
+  let nextId = findBestDirectionalTarget(anchorId, direction, filteredNodeIds());
   if (!nextId) {{
     nextId = wraparoundNode(anchorId, direction);
   }}
@@ -2618,6 +2705,9 @@ function clearHighlight() {{
   selectedNode = null;
   selectedEdge = null;
   hoveredNode = null;
+  searchInput.value = "";
+  filterFromNodeSelection = false;
+  syncFilterDepthVisibility();
   hideTooltip();
   updateStyles();
   network.unselectAll();
@@ -2675,7 +2765,13 @@ function zoomBy(multiplier) {{
 }}
 
 searchInput.addEventListener("input", () => {{
-  updateStyles();
+  filterFromNodeSelection = false;
+  if (!normalized(searchInput.value)) {{
+    clearHighlight();
+  }} else {{
+    syncFilterDepthVisibility();
+    updateStyles();
+  }}
   if (document.getElementById("searchResultsToast").style.display === "flex") {{
     syncSRTWithFilter();
   }}
@@ -2845,7 +2941,7 @@ attachControlTooltip(
 suppressControlTooltipOnInteract(viewSelect);
 attachControlTooltip(
   viewDepthField,
-  "Reference depth",
+  "Link Depth",
   `Set how many **outbound markdown references** to follow from the selected view's entry files.
 
 - **0** keeps only the starting files emphasized.
@@ -2864,6 +2960,9 @@ viewSelect.addEventListener("change", () => {{
 viewDepth.addEventListener("input", () => {{
   if (viewSelect.value === "all") return;
   applyViewState();
+}});
+document.getElementById("filterDepth").addEventListener("input", () => {{
+  updateStyles();
 }});
 applyViewState({{ fit: true }});
 
