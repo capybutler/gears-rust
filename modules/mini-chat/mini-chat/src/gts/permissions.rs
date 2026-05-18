@@ -331,11 +331,15 @@ mod tests {
         }
 
         for (wildcard, concrete, label) in [
-            (CHAT_RESOURCE_TYPE_WILDCARD, resources::CHAT.name, "CHAT"),
-            (MODEL_RESOURCE_TYPE_WILDCARD, resources::MODEL.name, "MODEL"),
+            (CHAT_RESOURCE_TYPE_WILDCARD, resources::CHAT.name(), "CHAT"),
+            (
+                MODEL_RESOURCE_TYPE_WILDCARD,
+                resources::MODEL.name(),
+                "MODEL",
+            ),
             (
                 USER_QUOTA_RESOURCE_TYPE_WILDCARD,
-                resources::USER_QUOTA.name,
+                resources::USER_QUOTA.name(),
                 "USER_QUOTA",
             ),
         ] {

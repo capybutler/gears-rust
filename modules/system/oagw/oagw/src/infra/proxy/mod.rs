@@ -26,10 +26,10 @@ pub(crate) mod resources {
     use modkit_security::pep_properties;
 
     /// Resource type identifying a proxied upstream target.
-    pub const PROXY: ResourceType = ResourceType {
-        name: "gts.cf.core.oagw.proxy.v1~",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID],
-    };
+    pub const PROXY: ResourceType = ResourceType::from_static(
+        "gts.cf.core.oagw.proxy.v1~",
+        &[pep_properties::OWNER_TENANT_ID],
+    );
 }
 
 pub(crate) mod actions {

@@ -20,10 +20,8 @@ use tenant_resolver_sdk::TenantResolverClient;
 use uuid::Uuid;
 
 /// Resource type for upstream binding permission checks.
-const UPSTREAM_RESOURCE: ResourceType = ResourceType {
-    name: "gts.cf.core.oagw.upstream.v1~",
-    supported_properties: &["owner_tenant_id"],
-};
+const UPSTREAM_RESOURCE: ResourceType =
+    ResourceType::from_static("gts.cf.core.oagw.upstream.v1~", &["owner_tenant_id"]);
 
 /// Permission action names for ancestor bind checks.
 mod bind_actions {

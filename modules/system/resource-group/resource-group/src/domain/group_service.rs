@@ -32,10 +32,10 @@ use crate::domain::repo::{GroupRepositoryTrait, TypeRepositoryTrait};
 use crate::domain::validation;
 
 /// `AuthZ` resource type descriptor for resource groups.
-pub const RG_GROUP_RESOURCE: ResourceType = ResourceType {
-    name: "gts.cf.core.rg.group.v1~",
-    supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-};
+pub const RG_GROUP_RESOURCE: ResourceType = ResourceType::from_static(
+    "gts.cf.core.rg.group.v1~",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
 
 /// Query profile configuration for depth/width limits.
 #[allow(unknown_lints, de0309_must_have_domain_model)]

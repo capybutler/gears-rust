@@ -19,10 +19,10 @@ pub(crate) type DbProvider = DBProvider<modkit_db::DbError>;
 ///
 /// Settings are scoped by tenant + user (resource). The PDP uses
 /// `supported_properties` to decide which predicates it can return.
-pub(crate) const SETTINGS_RESOURCE: ResourceType = ResourceType {
-    name: "simple_user_settings.settings",
-    supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-};
+pub(crate) const SETTINGS_RESOURCE: ResourceType = ResourceType::from_static(
+    "simple_user_settings.settings",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
 
 pub(crate) mod actions {
     pub const GET: &str = "get";

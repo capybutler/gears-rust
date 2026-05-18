@@ -76,24 +76,24 @@ pub(crate) mod resources {
     use super::ResourceType;
     use modkit_security::pep_properties;
 
-    pub const CHAT: ResourceType = ResourceType {
-        name: "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.v1~",
-        supported_properties: &[
+    pub const CHAT: ResourceType = ResourceType::from_static(
+        "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.v1~",
+        &[
             pep_properties::OWNER_TENANT_ID,
             pep_properties::OWNER_ID,
             pep_properties::RESOURCE_ID,
         ],
-    };
+    );
 
-    pub const MODEL: ResourceType = ResourceType {
-        name: "gts.cf.core.ai_chat.model.v1~cf.core.mini_chat.model.v1~",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID],
-    };
+    pub const MODEL: ResourceType = ResourceType::from_static(
+        "gts.cf.core.ai_chat.model.v1~cf.core.mini_chat.model.v1~",
+        &[pep_properties::OWNER_TENANT_ID],
+    );
 
-    pub const USER_QUOTA: ResourceType = ResourceType {
-        name: "gts.cf.core.ai_chat.user_quota.v1~cf.core.mini_chat.user_quota.v1~",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::OWNER_ID],
-    };
+    pub const USER_QUOTA: ResourceType = ResourceType::from_static(
+        "gts.cf.core.ai_chat.user_quota.v1~cf.core.mini_chat.user_quota.v1~",
+        &[pep_properties::OWNER_TENANT_ID, pep_properties::OWNER_ID],
+    );
 }
 
 #[allow(dead_code)]

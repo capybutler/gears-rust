@@ -127,10 +127,10 @@ fn test_ctx() -> SecurityContext {
         .unwrap()
 }
 
-const TEST_RESOURCE: ResourceType = ResourceType {
-    name: "gts.cf.core.users.user.v1~",
-    supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-};
+const TEST_RESOURCE: ResourceType = ResourceType::from_static(
+    "gts.cf.core.users.user.v1~",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
 
 fn enforcer(mock: impl AuthZResolverClient + 'static) -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(mock))
@@ -507,10 +507,10 @@ async fn access_scope_with_resource_properties() {
 
 #[test]
 fn builds_request_with_all_fields() {
-    const USERS_RESOURCE: ResourceType = ResourceType {
-        name: "gts.cf.core.users.user.v1~",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID],
-    };
+    const USERS_RESOURCE: ResourceType = ResourceType::from_static(
+        "gts.cf.core.users.user.v1~",
+        &[pep_properties::OWNER_TENANT_ID],
+    );
 
     let context_tenant_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
     let subject_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();

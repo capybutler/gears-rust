@@ -18,10 +18,10 @@
 //!     pep::{AccessRequest, PolicyEnforcer, ResourceType},
 //! };
 //!
-//! const USER: ResourceType = ResourceType {
-//!     name: "gts.cf.core.users.user.v1~",
-//!     supported_properties: &["owner_tenant_id", "id"],
-//! };
+//! const USER: ResourceType = ResourceType::from_static(
+//!     "gts.cf.core.users.user.v1~",
+//!     &["owner_tenant_id", "id"],
+//! );
 //!
 //! // Get the client from ClientHub
 //! let authz = hub.get::<dyn AuthZResolverClient>()?;

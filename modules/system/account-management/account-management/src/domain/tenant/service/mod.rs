@@ -54,10 +54,10 @@ pub(crate) mod pep {
     /// argument (the tenant id itself for `read` / `update` / `delete`,
     /// absent for `create` / `list_children` which have no single
     /// target tenant).
-    pub const TENANT: ResourceType = ResourceType {
-        name: "gts.cf.core.am.tenant.v1~",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-    };
+    pub const TENANT: ResourceType = ResourceType::from_static(
+        "gts.cf.core.am.tenant.v1~",
+        &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    );
 
     /// Action vocabulary mirroring DESIGN §4.2 line 1363.
     pub mod actions {

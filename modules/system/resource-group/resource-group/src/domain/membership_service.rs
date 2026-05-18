@@ -21,10 +21,10 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeRepositoryTrait};
 
 /// `AuthZ` resource type descriptor for group memberships.
-pub const RG_MEMBERSHIP_RESOURCE: ResourceType = ResourceType {
-    name: "gts.cf.core.rg.group_membership.v1~",
-    supported_properties: &[pep_properties::OWNER_TENANT_ID],
-};
+pub const RG_MEMBERSHIP_RESOURCE: ResourceType = ResourceType::from_static(
+    "gts.cf.core.rg.group_membership.v1~",
+    &[pep_properties::OWNER_TENANT_ID],
+);
 
 // @cpt-flow:cpt-cf-resource-group-flow-membership-add:p1
 // @cpt-flow:cpt-cf-resource-group-flow-membership-remove:p1

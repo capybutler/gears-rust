@@ -24,10 +24,10 @@ use modkit_security::{SecurityContext, pep_properties};
 
 // ── Resource type descriptor (mirrors what RG handlers will declare) ────
 
-const RG_GROUP: ResourceType = ResourceType {
-    name: "gts.cf.core.rg.group.v1~",
-    supported_properties: &[pep_properties::OWNER_TENANT_ID],
-};
+const RG_GROUP: ResourceType = ResourceType::from_static(
+    "gts.cf.core.rg.group.v1~",
+    &[pep_properties::OWNER_TENANT_ID],
+);
 
 // ── Mock AuthZ resolvers ────────────────────────────────────────────────
 
@@ -301,7 +301,7 @@ async fn enforcer_passes_resource_id_to_pdp() {
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].resource.id, Some(resource_id));
     assert_eq!(captured[0].action.name, "get");
-    assert_eq!(captured[0].resource.resource_type, RG_GROUP.name);
+    assert_eq!(captured[0].resource.resource_type, RG_GROUP.name());
 }
 
 /// Enforcer works for all CRUD actions: create, list, get, update, delete.
@@ -400,7 +400,8 @@ async fn full_chain_list_groups_calls_enforcer_with_correct_params() {
     let requests = mock.requests.lock().unwrap();
     assert_eq!(requests.len(), 1, "exactly one PDP call");
     assert_eq!(
-        requests[0].resource.resource_type, RG_GROUP_RESOURCE.name,
+        requests[0].resource.resource_type,
+        RG_GROUP_RESOURCE.name(),
         "PDP should receive the RG_GROUP resource type"
     );
     assert_eq!(requests[0].action.name, "list");

@@ -113,25 +113,25 @@ pub(crate) mod resources {
         pub const CITY_ID: &str = "city_id";
     }
 
-    pub const USER: ResourceType = ResourceType {
-        name: "users_info.user",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-    };
+    pub const USER: ResourceType = ResourceType::from_static(
+        "users_info.user",
+        &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    );
 
-    pub const CITY: ResourceType = ResourceType {
-        name: "users_info.city",
-        supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-    };
+    pub const CITY: ResourceType = ResourceType::from_static(
+        "users_info.city",
+        &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+    );
 
-    pub const ADDRESS: ResourceType = ResourceType {
-        name: "users_info.address",
-        supported_properties: &[
+    pub const ADDRESS: ResourceType = ResourceType::from_static(
+        "users_info.address",
+        &[
             pep_properties::OWNER_TENANT_ID,
             pep_properties::RESOURCE_ID,
             pep_properties::OWNER_ID,
             properties::CITY_ID,
         ],
-    };
+    );
 }
 
 pub(crate) mod actions {
