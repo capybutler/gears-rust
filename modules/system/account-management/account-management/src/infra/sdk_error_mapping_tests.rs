@@ -67,6 +67,24 @@ fn validation_maps_to_invalid_argument_with_tenant_resource() {
 }
 
 #[test]
+fn metadata_validation_maps_to_invalid_argument_with_metadata_resource() {
+    // Pins the split introduced for the REST surface: metadata-content
+    // failures (malformed `schema_id`, null body, GTS body validation
+    // failure) MUST carry the metadata GTS resource type on the
+    // canonical envelope. The tenant-state guards keep `Validation`
+    // (and `TenantResource`) — see `validation_maps_to_invalid_argument_with_tenant_resource`
+    // above for the sibling pin.
+    let canonical = round_trip(DomainError::MetadataValidation {
+        detail: "metadata value must not be null".to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 400);
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::TENANT_METADATA_RESOURCE_TYPE)
+    );
+}
+
+#[test]
 fn root_tenant_cannot_delete_maps_to_400() {
     let canonical = round_trip(DomainError::RootTenantCannotDelete);
     assert_eq!(canonical.status_code(), 400);
@@ -105,27 +123,70 @@ fn not_found_carries_resource_name_and_tenant_type() {
 }
 
 #[test]
-fn metadata_schema_not_registered_uses_metadata_resource_type() {
-    let canonical = round_trip(DomainError::MetadataSchemaNotRegistered {
-        detail: "schema billing.v1 missing".to_owned(),
-        schema: "billing.v1".to_owned(),
+fn user_not_found_maps_to_not_found_404_with_user_resource() {
+    // Pins the per-resource NotFound for `delete_user` / `list_users`
+    // user-id lookups: 404 + `USER_RESOURCE_TYPE` + the supplied id
+    // surfaces as `resource_name`. Without this, a future drift in
+    // the mapper (e.g. routing through `TenantResource::not_found`
+    // because the variant lives under tenant scope) would silently
+    // change the resource type on the wire.
+    let user_id = "00000000-0000-0000-0000-000000000077";
+    let canonical = round_trip(DomainError::UserNotFound {
+        detail: format!("user {user_id} not found"),
+        resource: user_id.to_owned(),
     });
     assert_eq!(canonical.status_code(), 404);
-    assert_eq!(canonical.resource_name(), Some("billing.v1"));
+    assert_eq!(canonical.resource_name(), Some(user_id));
     assert_eq!(
         canonical.resource_type(),
-        Some(account_management_sdk::gts::TENANT_METADATA_RESOURCE_TYPE)
+        Some(account_management_sdk::gts::USER_RESOURCE_TYPE)
+    );
+    assert!(
+        matches!(canonical, CanonicalError::NotFound { .. }),
+        "UserNotFound MUST surface as the NotFound variant"
     );
 }
 
 #[test]
-fn metadata_entry_not_found_uses_metadata_resource_type() {
-    let canonical = round_trip(DomainError::MetadataEntryNotFound {
-        detail: "entry z missing".to_owned(),
-        entry: "z".to_owned(),
+fn conversion_request_not_found_maps_to_not_found_404() {
+    // Pins the wire shape for conversion-request lookups that miss
+    // their target (`cancel` / `reject` / `approve` / `get`).
+    // Distinct from `PendingExists` (covered separately at line 250):
+    // 404 instead of 409, NotFound variant instead of AlreadyExists,
+    // request-id carried as `resource_name` so the caller can show
+    // the missing id without parsing `detail`.
+    let req_id = "11111111-2222-3333-4444-555555555555";
+    let canonical = round_trip(DomainError::ConversionRequestNotFound {
+        detail: format!("conversion request {req_id} not found"),
+        resource: req_id.to_owned(),
     });
     assert_eq!(canonical.status_code(), 404);
-    assert_eq!(canonical.resource_name(), Some("z"));
+    assert_eq!(canonical.resource_name(), Some(req_id));
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::CONVERSION_REQUEST_RESOURCE_TYPE)
+    );
+    assert!(
+        matches!(canonical, CanonicalError::NotFound { .. }),
+        "ConversionRequestNotFound MUST surface as the NotFound variant"
+    );
+}
+
+#[test]
+fn metadata_entry_not_found_uses_metadata_resource_type_with_chained_schema_id_as_name() {
+    // Unified metadata 404: both "schema unknown to registry" and
+    // "entry missing for tenant" collapse to
+    // `MetadataEntryNotFound` and surface as
+    // `TENANT_METADATA_RESOURCE_TYPE` (`gts.cf.core.am.tenant_metadata.v1~`)
+    // with the chained `schema_id` the caller supplied as
+    // `resource_name`.
+    let chain = "gts.cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~";
+    let canonical = round_trip(DomainError::MetadataEntryNotFound {
+        detail: "entry missing".to_owned(),
+        entry: chain.to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 404);
+    assert_eq!(canonical.resource_name(), Some(chain));
     assert_eq!(
         canonical.resource_type(),
         Some(account_management_sdk::gts::TENANT_METADATA_RESOURCE_TYPE)
@@ -164,6 +225,36 @@ fn aborted_maps_to_409_with_reason() {
         panic!("expected Aborted variant");
     };
     assert_eq!(ctx.reason, "SERIALIZATION_CONFLICT");
+}
+
+#[test]
+fn metadata_version_mismatch_maps_to_aborted_409_with_reason() {
+    // `upsert_metadata` with `expected_version` not matching the stored
+    // row surfaces as the Aborted variant (HTTP 409) tagged with the
+    // `METADATA_VERSION_MISMATCH` reason. The reason token is the
+    // contract callers branch on to distinguish a stale-version
+    // conflict from a generic 409, and a future mapper drift that
+    // dropped `with_reason` would change the wire envelope in a way
+    // unit-tested ONLY here.
+    let chain = "gts.cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~";
+    let canonical = round_trip(DomainError::MetadataVersionMismatch {
+        entry: chain.to_owned(),
+        expected: 4,
+        current: 7,
+    });
+    assert_eq!(canonical.status_code(), 409);
+    assert_eq!(canonical.resource_name(), Some(chain));
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::TENANT_METADATA_RESOURCE_TYPE)
+    );
+    let CanonicalError::Aborted { ctx, .. } = canonical else {
+        panic!("MetadataVersionMismatch MUST surface as the Aborted variant");
+    };
+    assert_eq!(
+        ctx.reason, "METADATA_VERSION_MISMATCH",
+        "envelope MUST pin the `METADATA_VERSION_MISMATCH` reason token"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -236,20 +327,26 @@ fn tenant_has_resources_maps_to_failed_precondition() {
 }
 
 #[test]
-fn pending_exists_maps_to_failed_precondition_on_conversion_request() {
+fn pending_exists_maps_to_already_exists_409_on_conversion_request() {
+    // Duplicate-on-create per AIP-193: the at-most-one-pending invariant
+    // surfaces as `code=pending_exists` (HTTP 409). The OpenAPI spec
+    // (`docs/account-management-v1.yaml`) documents the 409, so this
+    // test pins both the wire status and the resource_name carrying
+    // the existing `request_id`.
     let canonical = round_trip(DomainError::PendingExists {
         request_id: "req-1".to_owned(),
     });
-    assert_eq!(canonical.status_code(), 400);
+    assert_eq!(canonical.status_code(), 409);
+    assert_eq!(canonical.resource_name(), Some("req-1"));
     assert_eq!(
         canonical.resource_type(),
         Some(account_management_sdk::gts::CONVERSION_REQUEST_RESOURCE_TYPE)
     );
-    let CanonicalError::FailedPrecondition { ctx, .. } = canonical else {
-        panic!("expected FailedPrecondition variant");
-    };
-    assert_eq!(ctx.violations[0].subject, "conversion_request");
-    assert_eq!(ctx.violations[0].type_, "PENDING_EXISTS");
+    assert!(
+        matches!(canonical, CanonicalError::AlreadyExists { .. }),
+        "expected AlreadyExists variant for pending_exists; the duplicate-on-create \
+         contract is HTTP 409, not 400 failed_precondition",
+    );
 }
 
 #[test]
@@ -396,6 +493,26 @@ fn integrity_check_in_progress_maps_to_429_with_quota_violation() {
     };
     assert_eq!(ctx.violations.len(), 1);
     assert_eq!(ctx.violations[0].subject, "integrity_check");
+}
+
+#[test]
+fn integrity_check_in_progress_via_sdk_boundary_does_not_panic() {
+    // Defensive coverage for the pre-fix `unreachable!()` on
+    // `From<DomainError> for AccountManagementError`. The canonical
+    // path short-circuits `IntegrityCheckInProgress` before the SDK
+    // hop, but a direct caller (tooling that bubbles typed SDK
+    // errors) used to crash the process. The mapping now produces
+    // an `Internal` SDK variant, and the SDK→canonical hop renders
+    // it as a generic 500 — distinct from the 429 quota envelope on
+    // the canonical bypass above, by design (the SDK boundary is
+    // not where `IntegrityCheckInProgress` is supposed to surface).
+    let sdk: AccountManagementError = DomainError::IntegrityCheckInProgress.into();
+    assert!(
+        matches!(sdk, AccountManagementError::Internal { .. }),
+        "SDK boundary must map IntegrityCheckInProgress defensively, got {sdk:?}",
+    );
+    let canonical = account_management_error_to_canonical(sdk);
+    assert_eq!(canonical.status_code(), 500);
 }
 
 // ---------------------------------------------------------------------------

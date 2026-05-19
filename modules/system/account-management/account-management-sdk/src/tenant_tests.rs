@@ -30,7 +30,7 @@ fn tenant_update_with_name_is_not_empty() {
 // delete_tenant}` methods; the patch shape carries only `name`.
 
 #[test]
-fn tenant_info_filter_fields_are_pinned() {
+fn tenant_filter_fields_are_pinned() {
     // Pinned: the `$filter` / `$orderby` allow-list is part of the
     // public SDK contract. A new column (e.g. `name`) is a SemVer
     // minor bump for AM SDK and SHOULD show up here; an accidental

@@ -135,33 +135,15 @@ pub(super) async fn insert_provisioning(
                     claimed_at: ActiveValue::Set(None),
                     terminal_failure_at: ActiveValue::Set(None),
                 };
-                // scope_unchecked: `tenants` is declared `no_tenant, no_resource`
-                // (see entity doc), so `scope_with` here would compile to a
-                // no-op for the contract-required `allow_all` scope and to
-                // `ScopeError::Denied` for any narrowed scope (since `Scopable`
-                // resolves no properties on a no-* entity). `scope_unchecked`
-                // makes the bypass explicit at the call site and keeps the
-                // INSERT path safe regardless of what the caller passes —
-                // authorization for the operation as a whole is enforced
-                // upstream at the PDP gate in the service layer.
-                // [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
-                // clamps AM reads via `tenant_closure` JOIN; INSERTs
-                // stay scope-unchecked at this seam.
-                // Unique-violation handling: do NOT fold the duplicate-id case
-                // into `DomainError::Conflict` here — `map_scope_to_tx` carries
-                // the raw DB error through the retry helper and then through the
-                // infra-side classifier, which routes unique violations to
-                // `DomainError::AlreadyExists`.
+                // scope_unchecked: INSERT cannot subtree-clamp on a row
+                // that does not exist yet; auth runs upstream at the PDP
+                // gate. scope_with would compile to ScopeError::Denied for
+                // any narrowed scope.
+                //
+                // Do NOT fold unique-violation into Conflict here: the
+                // infra-side classifier routes UV → AlreadyExists downstream.
                 let model: tenants::Model = tenants::Entity::insert(am)
                     .secure()
-                    // `scope_unchecked` because INSERT on `tenants` is a
-                    // saga-step that owns the parent-existence check
-                    // upstream (`provisioning` row is the saga's claim
-                    // marker); the closure-subquery clamp `InTenantSubtree`
-                    // builds would have no row to compare against on an
-                    // insert. Authorization is enforced at the service
-                    // layer via the caller-supplied parent-id and the
-                    // RG-side `allowed_parent_types` trait.
                     .scope_unchecked(&scope)
                     .map_err(map_scope_to_tx)?
                     .exec_with_returning(tx)
@@ -215,20 +197,10 @@ pub(super) async fn activate_tenant(
                     .into());
                 }
 
-                // Fence against the provisioning reaper. If
-                // `provisioning_timeout_secs` elapsed while the saga's
-                // IdP call was in flight, the reaper may have claimed
-                // this row (`claimed_by` set) and may already have
-                // started — or even completed — `deprovision_tenant`
-                // on the vendor side. Activating now would publish an
-                // `Active` AM row whose IdP-side state has been torn
-                // down. Same rationale for `terminal_failure_at`: a
-                // peer reaper that classified the in-flight provision
-                // as `Terminal` parks the row out of the retry loop;
-                // the saga must not resurrect it. Both are read-only
-                // checks here for a clean error message; the WHERE
-                // clause on the status-flip UPDATE re-asserts them as
-                // the authoritative atomic guard.
+                // Refuse activation if the reaper has claimed the row
+                // or stamped it terminal — IdP-side state may already
+                // be torn down. The status-flip WHERE clause re-asserts
+                // this atomically.
                 if existing.claimed_by.is_some() {
                     return Err(DomainError::Conflict {
                         detail: format!(
@@ -248,18 +220,10 @@ pub(super) async fn activate_tenant(
                     .into());
                 }
 
-                // Defense-in-depth: validate the closure-row slice
-                // matches the contract documented on
-                // `TenantRepo::activate_tenant`. The slice is supposed
-                // to come from `build_activation_rows` (which has its
-                // own release-mode asserts), but flipping
-                // `status -> Active` before the closure insert means a
-                // malformed slice would persist a half-active tenant
-                // — DB-level CHECKs catch some shapes, but only AFTER
-                // the status flip has committed, leaving a window the
-                // integrity classifier would only flag retroactively.
-                // Fail fast on every documented invariant so saga
-                // compensation can run cleanly.
+                // Validate closure-slice invariants before flipping
+                // status: DB CHECKs catch malformed shapes only after
+                // the status commits, leaving a half-active window the
+                // integrity classifier flags only retroactively.
                 let active_status = TenantStatus::Active.as_smallint();
                 if rows.is_empty() {
                     return Err(DomainError::Internal {
@@ -544,9 +508,7 @@ pub(super) async fn activate_tenant(
                 // entity is declared with `no_tenant, no_resource,
                 // no_owner, no_type` — closure rows are
                 // cross-tenant by definition — so `scope_unchecked`
-                // is the appropriate scope mode (matches the
-                // single-row insert path immediately above the
-                // refactor).
+                // is the appropriate scope mode.
                 if !rows.is_empty() {
                     // @cpt-begin:cpt-cf-account-management-algo-tenant-hierarchy-management-closure-maintenance:p1:inst-algo-closmnt-repo-activation-insert
                     let active_models = rows.iter().map(|row| tenant_closure::ActiveModel {
@@ -718,19 +680,9 @@ pub(super) async fn mark_retention_terminal_failure(
     .await
 }
 
-/// Shared body for the two parking variants
-/// (`mark_provisioning_terminal_failure` /
-/// `mark_retention_terminal_failure`). The only difference between
-/// them is the `status` fence — the reaper parks `Provisioning`
-/// rows the `IdP` classified as terminal; the retention pipeline
-/// parks `Deleted` rows whose cleanup hooks or `IdP` deprovision were
-/// classified as terminal — and centralising the body here keeps
-/// the SERIALIZABLE-equivalent fence, idempotency, and claim posture
-/// identical for both. The status enum is a closed set, so this is
-/// not a "match-anything" generalization that a future caller could
-/// abuse to park an `Active` tenant: callers must spell out which
-/// pipeline path they sit on, and the two trait methods are the
-/// only public entry-points.
+/// Shared body keeps SERIALIZABLE fence + idempotency + claim posture
+/// identical across both parking variants; `TenantStatus` is closed so
+/// this cannot be abused to park `Active`.
 async fn mark_terminal_failure_with_status(
     repo: &TenantRepoImpl,
     scope: &AccessScope,
@@ -1126,7 +1078,6 @@ pub(super) async fn hard_delete_one(
                 tenant_idp_metadata::Entity::delete_many()
                     .filter(Condition::all().add(tenant_idp_metadata::Column::TenantId.eq(id)))
                     .secure()
-                    // TODO(InTenantSubtree): idp-metadata cleanup; system-actor.
                     .scope_with(&AccessScope::allow_all())
                     .exec(tx)
                     .await

@@ -105,13 +105,9 @@ impl RepairPlan {
     }
 }
 
-/// Normalize a sparse per-category count vector to the full
-/// [`IntegrityCategory::all`] enum set. Categories absent from the
-/// input get a zero count, in fixed enum order. Without this,
-/// "category X had no events" looks identical to "category X was
-/// never emitted" -- dashboards keyed on the per-category gauge then
-/// show holes instead of zeros, breaking alerting on flat-zero
-/// signals.
+/// Densify counts to the full [`IntegrityCategory::all`] set with
+/// zeros for absent categories — dashboards keyed on the per-category
+/// gauge need "no events" to render as 0, not as a missing sample.
 fn normalize_per_category(
     counts: Vec<(IntegrityCategory, usize)>,
 ) -> Vec<(IntegrityCategory, usize)> {

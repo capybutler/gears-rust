@@ -13,8 +13,9 @@ use resource_group_sdk::{ResourceGroupClient, ResourceGroupError};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use super::{USER_GROUP_TYPE_CODE, am_system_context};
+use super::USER_GROUP_TYPE_CODE;
 use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, MetricKind, emit_metric};
+use crate::domain::system_actor::for_user_groups_cascade;
 use crate::domain::tenant::hooks::{HookError, TenantHardDeleteHook};
 
 /// Default timeout for a single RG round-trip.
@@ -46,10 +47,7 @@ const CASCADE_BUDGET: Duration = Duration::from_secs(120);
 ///    [`ResourceGroupClient::delete_group_cascade`] (RG's `force=true`
 ///    variant), which atomically tears down the group + its subtree +
 ///    every membership row + every closure-table row anchored at it,
-///    in a single SERIALIZABLE transaction on the RG side. AM does
-///    **not** drain memberships separately, and does **not** run the
-///    multi-pass leaf-first retry loop that older revisions of this
-///    hook implemented -- both responsibilities now live in RG.
+///    in a single SERIALIZABLE transaction on the RG side.
 /// 3. Per-call `NotFound` is treated as idempotent success (a parent's
 ///    cascade may already have eaten the descendant, or a peer cleanup
 ///    tick may have raced this run).
@@ -99,9 +97,7 @@ pub fn build_cascade_cleanup_hook(
 /// [`ResourceGroupClient::delete_group_cascade`] (the SDK's
 /// `force=true` variant), which atomically tears down the group + its
 /// subtree + every membership row + every closure row in a single
-/// SERIALIZABLE transaction on the RG side. AM no longer drains
-/// memberships or replays multi-pass deletes -- both responsibilities
-/// move to RG where the SQL-level cascade is already implemented.
+/// SERIALIZABLE transaction on the RG side.
 ///
 /// `NotFound` per call is treated as idempotent success: a parent's
 /// cascade may have already removed a descendant before we reach it,
@@ -117,17 +113,14 @@ async fn cascade_inner(
     // RG-side authz tightening that rejects `SecurityContext::anonymous`
     // would not regress this hook because the subject is a stable
     // platform-root UUID.
-    let ctx = am_system_context(Some(tenant_id));
+    let ctx = for_user_groups_cascade(tenant_id);
 
     let groups = fetch_tenant_groups(client, &ctx, tenant_id).await?;
 
     if groups.is_empty() {
-        // Emit the success metric on the empty-tenant path too so the
-        // counter "tenant cleanup completed without error" stays
-        // symmetric with the non-empty path below — the success
-        // counter must fire on both terminal branches of
-        // `cascade_inner` so operators charting cleanup-success rate
-        // get a single unified signal.
+        // Emit success on the empty-tenant path too so the metric fires on both
+        // terminal branches — operators charting cleanup-success rate see a
+        // unified signal.
         emit_metric(
             AM_DEPENDENCY_HEALTH,
             MetricKind::Counter,

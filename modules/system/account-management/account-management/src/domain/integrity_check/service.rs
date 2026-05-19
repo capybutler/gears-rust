@@ -124,9 +124,8 @@ async fn run_one_tick(checker: &dyn IntegrityChecker, auto_repair: bool) {
                 MetricKind::Counter,
                 &[("outcome", "completed")],
             );
-            // Histogram value in milliseconds — stable unit across
-            // backends. Truncate u128 → f64; integrity ticks complete
-            // in seconds-to-minutes range, so f64 mantissa is plenty.
+            // ms unit is stable across backends; f64 mantissa handles
+            // seconds-to-minutes range exactly.
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "millisecond duration <= a few minutes fits f64 mantissa exactly"

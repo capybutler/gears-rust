@@ -115,12 +115,12 @@ pub struct TenantModel {
     pub deleted_at: Option<OffsetDateTime>,
 }
 
-// NOTE: Phase 3 adds the `retention_window_secs` column to the
-// `tenants` entity — see `src/infra/storage/entity/tenants.rs`. It
-// stays off `TenantModel`: it is an operator-set per-tenant override
-// of the module-default retention window, used by the sweep planner,
-// and is surfaced through the [`retention::TenantRetentionRow`]
-// selection row rather than the happy-path read shape.
+// `retention_window_secs` lives on the `tenants` entity (see
+// `src/infra/storage/entity/tenants.rs`) but stays off `TenantModel`:
+// it is an operator-set per-tenant override of the module-default
+// retention window, used by the sweep planner, and is surfaced
+// through the [`retention::TenantRetentionRow`] selection row rather
+// than the happy-path read shape.
 
 /// Validated fields used to create a tenant's initial row (before the
 /// `IdP` provisioning step of the create-tenant saga).
@@ -141,18 +141,6 @@ pub struct NewTenant {
     pub tenant_type_uuid: Uuid,
     pub depth: u32,
 }
-
-// `validate_tenant_name` was a synchronous, hardcoded `[1, 255]`
-// length check that duplicated the published `gts.cf.core.am.tenant.v1~`
-// schema. The runtime validation has moved to
-// [`crate::domain::gts_validation::validate_tenant_name_via_gts`],
-// which fetches the schema from the Types Registry at the call site
-// and runs `jsonschema::validator_for` (mirroring the
-// `cf-resource-group::validate_metadata_via_gts` pattern). Per
-// `validate_metadata_via_gts` semantics, a missing schema short-
-// circuits to `Ok(())` and the database `CHECK (length(name) BETWEEN
-// 1 AND 255)` constraint serves as the last-line guard for the
-// underlying column.
 
 /// Lift a SDK [`account_management_sdk::TenantStatus`] (3-variant,
 /// public surface) into the AM-internal 4-variant
@@ -199,9 +187,8 @@ impl core::error::Error for ProvisioningNotPublic {}
 /// Returns [`ProvisioningNotPublic`] on [`TenantStatus::Provisioning`].
 /// The Rust convention is that `From` is infallible; expressing the
 /// public-vs-internal-vocabulary split via `TryFrom` makes the
-/// invariant type-safe and replaces the previous `unreachable!()`
-/// panic with a propagatable error if the upstream `is_sdk_visible`
-/// filter is ever bypassed.
+/// invariant type-safe and surfaces a propagatable error if the
+/// upstream `is_sdk_visible` filter is ever bypassed.
 impl TryFrom<TenantStatus> for account_management_sdk::TenantStatus {
     type Error = ProvisioningNotPublic;
 

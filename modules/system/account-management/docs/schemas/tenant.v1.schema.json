@@ -25,7 +25,7 @@
     "tenant_type": {
       "type": "string",
       "format": "gts-identifier",
-      "description": "Chained GTS schema identifier of the registered tenant type (e.g. `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~`). Resolved at read time via the Types Registry; absent from the projection when the registry lookup fails (transport blip) or no registry is wired (dev/test deployments) — see `TenantContext::tenant_type` for the same fallback semantics on the IdP-plugin boundary. The trailing `~` is the GTS terminator and is part of the identifier.",
+      "description": "Chained GTS schema identifier of the registered tenant type (e.g. `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~`). Resolved at read time via the Types Registry; absent from the projection when the registry lookup fails (transport blip) or no registry is wired (dev/test deployments) - see `TenantContext::tenant_type` for the same fallback semantics on the IdP-plugin boundary. The trailing `~` is the GTS terminator and is part of the identifier.",
       "examples": [
         "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~",
         "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"

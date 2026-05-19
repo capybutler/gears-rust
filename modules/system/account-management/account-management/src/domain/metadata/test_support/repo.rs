@@ -10,9 +10,9 @@
 //! * `created_at` is stamped only on insert. `updated_at` is stamped on
 //!   every upsert (insert or update). On insert both timestamps are
 //!   equal to the supplied `now`.
-//! * `delete_for_tenant` is non-idempotent on missing rows: returns
-//!   [`DomainError::MetadataEntryNotFound`] when the `(tenant_id,
-//!   schema_uuid)` pair does not exist, mirroring the SQL impl
+//! * `delete_for_tenant` is idempotent on missing rows: returns
+//!   `Ok(())` whether the `(tenant_id, schema_uuid)` pair existed and
+//!   was removed or was already absent, mirroring the SQL impl
 //!   contract.
 //! * `delete_all_for_tenant` removes every row for `tenant_id` and
 //!   returns the count, matching the cascade-hook seam used by the
@@ -195,7 +195,7 @@ impl MetadataRepo for FakeMetadataRepo {
                 && existing.version != expected
             {
                 return Err(DomainError::MetadataVersionMismatch {
-                    entry: format!("({tenant_id}, {schema_uuid})"),
+                    entry: schema_uuid.to_string(),
                     expected,
                     current: existing.version,
                 });
@@ -214,7 +214,7 @@ impl MetadataRepo for FakeMetadataRepo {
                 && expected != 0
             {
                 return Err(DomainError::MetadataVersionMismatch {
-                    entry: format!("({tenant_id}, {schema_uuid})"),
+                    entry: schema_uuid.to_string(),
                     expected,
                     current: 0,
                 });
@@ -241,14 +241,7 @@ impl MetadataRepo for FakeMetadataRepo {
         schema_uuid: Uuid,
     ) -> Result<(), DomainError> {
         let mut state = self.inner.lock().expect("lock");
-        let key = (tenant_id, schema_uuid);
-        if state.rows.remove(&key).is_some() {
-            Ok(())
-        } else {
-            Err(DomainError::MetadataEntryNotFound {
-                detail: format!("no metadata entry for tenant {tenant_id} at schema {schema_uuid}"),
-                entry: format!("({tenant_id}, {schema_uuid})"),
-            })
-        }
+        state.rows.remove(&(tenant_id, schema_uuid));
+        Ok(())
     }
 }

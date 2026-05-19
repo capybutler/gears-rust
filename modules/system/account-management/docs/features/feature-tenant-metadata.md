@@ -21,7 +21,7 @@
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Schema Registration + UUIDv5 Derivation](#schema-registration--uuidv5-derivation)
   - [CRUD Contract](#crud-contract)
-  - [Distinct 404 Codes](#distinct-404-codes)
+  - [Unified 404 Contract](#unified-404-contract)
   - [Inheritance Resolution Contract](#inheritance-resolution-contract)
   - [Application-Only Enforcement](#application-only-enforcement)
   - [Cascade-Delete on Tenant Removal](#cascade-delete-on-tenant-removal)
@@ -44,7 +44,7 @@ Owns the extensible **public** tenant-metadata subsystem: GTS-registered metadat
 
 ### 1.2 Purpose
 
-Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata category a GTS-registered schema that carries its own `inheritance_policy` trait (`override_only` default, or `inherit`) rather than a hard-coded AM table. `MetadataService` persists only directly-written values and derives inheritance on every read via ancestor walk-up stopping at self-managed barriers — so a self-managed tenant never inherits metadata from ancestors above its barrier, and suspension of an intermediate tenant does NOT stop the walk (suspension is a lifecycle state, not a barrier). The feature threads public `schema_id` (full chained `GtsSchemaId`) through the REST URL, the AuthZ resource attribute, the audit payload, and the SDK, while internally deriving a deterministic UUIDv5 `schema_uuid` for the `UNIQUE (tenant_id, schema_uuid)` storage key and reverse-hydrating to `schema_id` on every read response. Distinct 404 codes — `metadata_schema_not_registered` vs `metadata_entry_not_found` — let clients separate "unknown schema" from "schema known but no value on this tenant". `MetadataService` persists rows under the `UNIQUE (tenant_id, schema_uuid)` storage key, and on **PostgreSQL** (production) all metadata rows cascade-delete via the FK's `ON DELETE CASCADE` clause when the tenant row is removed. The in-tree **SQLite** migration variant intentionally omits FK clauses because `modkit-db` does not enable `PRAGMA foreign_keys`, so DB-level cascade is **not** enforced on SQLite — `TenantRepoImpl::hard_delete_one` therefore issues an explicit `delete_many` against `tenant_metadata` in the same transaction as the tenant-row delete to guarantee dialect-portable cleanup.
+Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata category a GTS-registered schema that carries its own `inheritance_policy` trait (`override_only` default, or `inherit`) rather than a hard-coded AM table. `MetadataService` persists only directly-written values and derives inheritance on every read via ancestor walk-up stopping at self-managed barriers — so a self-managed tenant never inherits metadata from ancestors above its barrier, and suspension of an intermediate tenant does NOT stop the walk (suspension is a lifecycle state, not a barrier). The feature threads public `schema_id` (full chained `GtsSchemaId`) through the REST URL, the AuthZ resource attribute, the audit payload, and the SDK, while internally deriving a deterministic UUIDv5 `schema_uuid` for the `UNIQUE (tenant_id, schema_uuid)` storage key and reverse-hydrating to `schema_id` on every read response. A single unified 404 covers both "schema unknown to the types-registry" and "schema known but no direct entry on this tenant" — both surface as `code=not_found` with `resource_type=gts.cf.core.am.tenant_metadata.v1~` and the chained `schema_id` as `resource_name`. `MetadataService` persists rows under the `UNIQUE (tenant_id, schema_uuid)` storage key, and on **PostgreSQL** (production) all metadata rows cascade-delete via the FK's `ON DELETE CASCADE` clause when the tenant row is removed. The in-tree **SQLite** migration variant intentionally omits FK clauses because `modkit-db` does not enable `PRAGMA foreign_keys`, so DB-level cascade is **not** enforced on SQLite — `TenantRepoImpl::hard_delete_one` therefore issues an explicit `delete_many` against `tenant_metadata` in the same transaction as the tenant-row delete to guarantee dialect-portable cleanup.
 
 **Requirements**: `cpt-cf-account-management-fr-tenant-metadata-schema`, `cpt-cf-account-management-fr-tenant-metadata-crud`, `cpt-cf-account-management-fr-tenant-metadata-api`, `cpt-cf-account-management-fr-tenant-metadata-list`, `cpt-cf-account-management-fr-tenant-metadata-permissions`
 
@@ -60,13 +60,13 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 ### 1.4 References
 
 - **PRD**: [PRD.md](../PRD.md) §5.7 Extensible Tenant Metadata (`fr-tenant-metadata-schema`, `fr-tenant-metadata-crud`, `fr-tenant-metadata-api`, `fr-tenant-metadata-list`, `fr-tenant-metadata-permissions`); §5.8 Deterministic Error Semantics (code taxonomy consumed here).
-- **Design**: [DESIGN.md](../DESIGN.md) §3.1 Domain Model — Tenant Metadata Schemas with Traits (base envelope `gts.cf.core.am.tenant_metadata.v1~`, `inheritance_policy` trait); §3.2 Component Model — `MetadataService` (`cpt-cf-account-management-component-metadata-service`); §3.6 Sequences — `cpt-cf-account-management-seq-resolve-metadata`; §3.7 `dbtable-tenant-metadata` storage contract (UNIQUE `(tenant_id, schema_uuid)`, `ON DELETE CASCADE` to `tenants`, index on `schema_uuid`); §3.8 Error Codes Reference (`metadata_schema_not_registered`, `metadata_entry_not_found`); [ADR-0002](../ADR/0002-cpt-cf-account-management-adr-metadata-inheritance.md) (`adr-metadata-inheritance` — application-only enforcement, no DB trigger / materialized column).
+- **Design**: [DESIGN.md](../DESIGN.md) §3.1 Domain Model — Tenant Metadata Schemas with Traits (base envelope `gts.cf.core.am.tenant_metadata.v1~`, `inheritance_policy` trait); §3.2 Component Model — `MetadataService` (`cpt-cf-account-management-component-metadata-service`); §3.6 Sequences — `cpt-cf-account-management-seq-resolve-metadata`; §3.7 `dbtable-tenant-metadata` storage contract (UNIQUE `(tenant_id, schema_uuid)`, `ON DELETE CASCADE` to `tenants`, index on `schema_uuid`); §3.8 Error Codes Reference (unified `not_found` with `resource_type=gts.cf.core.am.tenant_metadata.v1~`); [ADR-0002](../ADR/0002-cpt-cf-account-management-adr-metadata-inheritance.md) (`adr-metadata-inheritance` — application-only enforcement, no DB trigger / materialized column).
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) §2.7 Tenant Metadata.
 - **Dependencies**:
   - `cpt-cf-account-management-feature-tenant-hierarchy-management` — owns `tenants` + `tenant_closure`, the `parent_id` walk-up primitive, and the `ON DELETE CASCADE` cascade on `tenant_metadata.tenant_id`.
   - `cpt-cf-account-management-feature-tenant-type-enforcement` — owns the GTS types-registry integration path reused by `MetadataService` for metadata-schema resolution and `x-gts-traits` lookup.
   - `cpt-cf-account-management-feature-managed-self-managed-modes` — owns the `tenants.self_managed` flag whose value is the stop condition for the inheritance walk-up.
-  - `cpt-cf-account-management-feature-errors-observability` — owns the RFC 9457 envelope and the authoritative code catalog (`metadata_schema_not_registered`, `metadata_entry_not_found`, `validation`, `cross_tenant_denied`).
+  - `cpt-cf-account-management-feature-errors-observability` — owns the RFC 9457 envelope and the authoritative code catalog (`not_found`, `validation`, `cross_tenant_denied`).
 
 ## 2. Actor Flows (CDSL)
 
@@ -104,8 +104,8 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 **Error Scenarios**:
 
-- `{schema_id}` is not registered in the GTS types registry — rejected with 404 `code=metadata_schema_not_registered` per DESIGN §3.2.3 and §3.8; the caller distinguishes "unknown schema" from "schema known but no value".
-- `{schema_id}` is registered but the tenant has no direct entry at `(tenant_id, schema_uuid)` — rejected with 404 `code=metadata_entry_not_found`; clients reading this single-entry endpoint see the distinction clearly (the `/resolved` endpoint has different empty-value semantics).
+- `{schema_id}` is not registered in the GTS types registry — rejected with 404 `code=not_found` per DESIGN §3.2.3 and §3.8; the caller distinguishes "unknown schema" from "schema known but no value".
+- `{schema_id}` is registered but the tenant has no direct entry at `(tenant_id, schema_uuid)` — rejected with the same unified 404 (`code=not_found`, `resource_type=gts.cf.core.am.tenant_metadata.v1~`); the `/resolved` endpoint has different empty-value semantics (empty walk = HTTP 200, not 404).
 - `{tenant_id}` does not resolve to a visible tenant — rejected with `not_found` / `cross_tenant_denied` via the envelope.
 
 **Steps**:
@@ -113,11 +113,11 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::enforce` for `Metadata.read` with `schema_id` as resource attribute - `inst-flow-mdget-authz`
 2. [ ] - `p2` - Resolve `{tenant_id}` via `TenantService` and `{schema_id}` via GTS types registry - `inst-flow-mdget-resolve`
 3. [ ] - `p2` - **IF** schema is not registered in GTS - `inst-flow-mdget-schema-unknown`
-   1. [ ] - `p2` - **RETURN** `(reject, code=metadata_schema_not_registered)` via the envelope (HTTP 404) - `inst-flow-mdget-schema-return`
+   1. [ ] - `p2` - **RETURN** `(reject, code=not_found)` via the envelope (HTTP 404) - `inst-flow-mdget-schema-return`
 4. [ ] - `p2` - Derive `schema_uuid` via `algo-schema-uuid-derivation` with the resolved chained `schema_id` - `inst-flow-mdget-derive-uuid`
 5. [ ] - `p2` - Query the tenant's direct entry by `(tenant_id, schema_uuid)` via MetadataRepository - `inst-flow-mdget-query`
 6. [ ] - `p2` - **IF** no row exists - `inst-flow-mdget-entry-missing`
-   1. [ ] - `p2` - **RETURN** `(reject, code=metadata_entry_not_found)` via the envelope (HTTP 404) so the caller distinguishes unregistered schemas from unset entries - `inst-flow-mdget-entry-return`
+   1. [ ] - `p2` - **RETURN** `(reject, code=not_found)` via the envelope (HTTP 404) so the caller distinguishes unregistered schemas from unset entries - `inst-flow-mdget-entry-return`
 7. [ ] - `p2` - **RETURN** 200 OK with `{schema_id, value, updated_at}` — `schema_id` is the public chained form re-hydrated from Types Registry - `inst-flow-mdget-success-return`
 
 ### Put Tenant Metadata Entry
@@ -132,7 +132,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 **Error Scenarios**:
 
-- `{schema_id}` is not registered — rejected with `metadata_schema_not_registered`; no row written.
+- `{schema_id}` is not registered — rejected with the unified metadata `not_found`; no row written.
 - Payload fails GTS schema validation — rejected with `validation`; no row written.
 - `{tenant_id}` does not resolve to a visible `active` or `suspended` tenant — rejected via the envelope.
 
@@ -141,7 +141,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::enforce` for `Metadata.write` with `schema_id` as resource attribute - `inst-flow-mdput-authz`
 2. [ ] - `p2` - Resolve `{tenant_id}` via `TenantService` and `{schema_id}` via GTS types registry - `inst-flow-mdput-resolve`
 3. [ ] - `p2` - **IF** schema is not registered - `inst-flow-mdput-schema-unknown`
-   1. [ ] - `p2` - **RETURN** `(reject, code=metadata_schema_not_registered)` - `inst-flow-mdput-schema-return`
+   1. [ ] - `p2` - **RETURN** `(reject, code=not_found)` - `inst-flow-mdput-schema-return`
 4. [ ] - `p2` - Validate the request body against the registered GTS schema body per `fr-tenant-metadata-schema`; reject with `validation` on failure - `inst-flow-mdput-validate-body`
 5. [ ] - `p2` - Derive `schema_uuid` via `algo-schema-uuid-derivation` - `inst-flow-mdput-derive-uuid`
 6. [ ] - `p2` - Upsert `(tenant_id, schema_uuid, value, updated_at=now())` via MetadataRepository on `dbtable-tenant-metadata`; the `UNIQUE (tenant_id, schema_uuid)` constraint is the authoritative at-most-one-entry-per-pair guard - `inst-flow-mdput-upsert`
@@ -156,21 +156,19 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 **Success Scenarios**:
 
 - Authenticated tenant-admin DELETEs `/api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}`; `MetadataService` removes the direct entry at `(tenant_id, schema_uuid)`; ancestor values are NOT affected; returns 204 No Content.
+- DELETE is **idempotent** on missing rows: a registered `{schema_id}` with no direct entry at `(tenant_id, schema_uuid)` also returns 204 No Content (mirrors `delete_user` deprovision idempotency). The audit emit still fires unconditionally per `cpt-cf-account-management-flow-tenant-metadata-delete` so observers see the attempt.
 
 **Error Scenarios**:
 
-- `{schema_id}` is not registered — rejected with `metadata_schema_not_registered` before the DB write is issued.
-- `{schema_id}` is registered but no direct entry exists at `(tenant_id, schema_uuid)` — rejected with `metadata_entry_not_found` (HTTP 404); DELETE is NOT idempotent-success on missing rows because `/resolved` semantics make the distinction observable to clients.
+- `{schema_id}` is not registered — rejected with the unified metadata `not_found` before the DB write is issued.
 
 **Steps**:
 
 1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::enforce` for `Metadata.delete` with `schema_id` as resource attribute - `inst-flow-mddel-authz`
-2. [ ] - `p2` - Resolve `{tenant_id}` and `{schema_id}`; reject unregistered schemas with `metadata_schema_not_registered` - `inst-flow-mddel-resolve`
+2. [ ] - `p2` - Resolve `{tenant_id}` and `{schema_id}`; reject unregistered schemas with the unified metadata `not_found` - `inst-flow-mddel-resolve`
 3. [ ] - `p2` - Derive `schema_uuid` via `algo-schema-uuid-derivation` - `inst-flow-mddel-derive-uuid`
 4. [ ] - `p2` - Delete the row at `(tenant_id, schema_uuid)` via MetadataRepository - `inst-flow-mddel-delete`
-5. [ ] - `p2` - **IF** zero rows were deleted - `inst-flow-mddel-missing-branch`
-   1. [ ] - `p2` - **RETURN** `(reject, code=metadata_entry_not_found)` via the envelope (HTTP 404) - `inst-flow-mddel-missing-return`
-6. [ ] - `p2` - **RETURN** 204 No Content on successful removal; ancestor entries are untouched - `inst-flow-mddel-success-return`
+5. [ ] - `p2` - **RETURN** 204 No Content whether a row was removed or none matched (idempotent on missing); ancestor entries are untouched - `inst-flow-mddel-success-return`
 
 ### Resolve Tenant Metadata
 
@@ -181,17 +179,17 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 **Success Scenarios**:
 
 - Authenticated tenant-admin GETs `/api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}/resolved`; `MetadataService::resolve` applies the schema's `inheritance_policy` trait per `algo-metadata-resolve-walk-up` — `override_only` returns the tenant's own entry or empty, `inherit` walks the `parent_id` chain stopping at the nearest self-managed ancestor; returns 200 OK with the effective value OR an empty value (the normal terminal state of the walk when nothing is found).
-- Empty resolution is NOT `metadata_entry_not_found` — it is the expected terminal state of an inheritance walk; clients treat empty as "no effective value" rather than "error" per DESIGN §3.2.3.
+- Empty resolution is NOT a 404 — it is the expected terminal state of an inheritance walk; clients treat empty as "no effective value" rather than "error" per DESIGN §3.2.3.
 
 **Error Scenarios**:
 
-- `{schema_id}` is not registered — rejected with `metadata_schema_not_registered` (HTTP 404).
+- `{schema_id}` is not registered — rejected with the unified metadata `not_found` (HTTP 404).
 - `{tenant_id}` does not resolve to a visible tenant — rejected via the envelope.
 
 **Steps**:
 
 1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::enforce` for `Metadata.resolve` with `schema_id` as resource attribute - `inst-flow-mdres-authz`
-2. [ ] - `p2` - Resolve `{tenant_id}` and `{schema_id}`; reject unregistered schemas with `metadata_schema_not_registered` - `inst-flow-mdres-resolve`
+2. [ ] - `p2` - Resolve `{tenant_id}` and `{schema_id}`; reject unregistered schemas with the unified metadata `not_found` - `inst-flow-mdres-resolve`
 3. [ ] - `p2` - Resolve the schema's `inheritance_policy` trait from its `x-gts-traits` (falling back to the base schema default `override_only`) via Types Registry - `inst-flow-mdres-policy`
 4. [ ] - `p2` - Invoke `algo-metadata-resolve-walk-up` with `(tenant_id, schema_uuid, policy)` — returns effective value or empty - `inst-flow-mdres-invoke-algo`
 5. [ ] - `p2` - **RETURN** 200 OK with the effective value or empty; empty is a valid terminal outcome, NOT a 404 - `inst-flow-mdres-success-return`
@@ -257,7 +255,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 - [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-schema-registration-and-uuid-derivation`
 
-The system **MUST** accept the full chained `GtsSchemaId` as the `schema_id` path parameter on every REST operation and **MUST** validate that the schema is registered in the GTS types registry before any DB read or write; unregistered schemas **MUST** be refused with `code=metadata_schema_not_registered`. `MetadataService` **MUST** derive `schema_uuid` as a deterministic UUIDv5 from `schema_id` using the shared GTS namespace; the derivation **MUST** be a pure computation so `(tenant_id, schema_uuid)` remains stable across restarts, deployments, and replicas. `dbtable-tenant-metadata` **MUST NOT** retain the public `schema_id`; responses re-hydrate `schema_id` from Types Registry on every read.
+The system **MUST** accept the full chained `GtsSchemaId` as the `schema_id` path parameter on every REST operation and **MUST** validate that the schema is registered in the GTS types registry before any DB read or write; unregistered schemas **MUST** be refused with `code=not_found`. `MetadataService` **MUST** derive `schema_uuid` as a deterministic UUIDv5 from `schema_id` using the shared GTS namespace; the derivation **MUST** be a pure computation so `(tenant_id, schema_uuid)` remains stable across restarts, deployments, and replicas. `dbtable-tenant-metadata` **MUST NOT** retain the public `schema_id`; responses re-hydrate `schema_id` from Types Registry on every read.
 
 **Implements**:
 
@@ -272,7 +270,7 @@ The system **MUST** accept the full chained `GtsSchemaId` as the `schema_id` pat
 - Entities: `TenantMetadataEntry`, `MetadataSchema`
 - Data: `cpt-cf-account-management-dbtable-tenant-metadata`, `gts://gts.cf.core.am.tenant_metadata.v1~`
 - Sibling integration: Types Registry (`feature-tenant-type-enforcement` integration path)
-- Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `metadata_schema_not_registered` referenced by name only.
+- Error taxonomy: delegated to `feature-errors-observability` (catalog owner); the unified metadata `not_found` referenced by name only.
 
 ### CRUD Contract
 
@@ -293,11 +291,11 @@ The system **MUST** support tenant-scoped CRUD on `dbtable-tenant-metadata` keye
 - Data: `cpt-cf-account-management-dbtable-tenant-metadata`
 - Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `validation` referenced by name only.
 
-### Distinct 404 Codes
+### Unified 404 Contract
 
-- [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes`
+- [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-unified-404`
 
-The system **MUST** distinguish "unknown metadata schema" from "schema known but no direct entry on this tenant" on the `GET` and `DELETE` per-schema endpoints via two distinct codes — `metadata_schema_not_registered` and `metadata_entry_not_found` — both surfaced as HTTP 404 through the `feature-errors-observability` envelope. The `/resolved` endpoint **MUST NOT** return `metadata_entry_not_found` for empty resolution — empty is a valid terminal state of the walk per DESIGN §3.2.3 — but **MUST** return `metadata_schema_not_registered` when the schema itself is unknown.
+Both "unknown metadata schema" and "schema known but no direct entry on this tenant" surface as a single 404 with `code=not_found` and `resource_type=gts.cf.core.am.tenant_metadata.v1~` through the `feature-errors-observability` envelope; `resource_name` carries the chained `schema_id` the caller supplied. The `DELETE` per-schema endpoint is **idempotent** on missing rows and returns 204 whether the direct entry was removed or already absent (mirrors `delete_user` deprovision idempotency). The `/resolved` endpoint **MUST NOT** return the unified 404 for empty resolution — empty is a valid terminal state of the walk per DESIGN §3.2.3 — but **MUST** return it when the schema itself is unknown.
 
 **Implements**:
 
@@ -307,13 +305,13 @@ The system **MUST** distinguish "unknown metadata schema" from "schema known but
 
 **Touches**:
 
-- Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `metadata_schema_not_registered` and `metadata_entry_not_found` codes referenced by name only.
+- Error taxonomy: delegated to `feature-errors-observability` (catalog owner); the unified `not_found` envelope is referenced by name only.
 
 ### Inheritance Resolution Contract
 
 - [x] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-inheritance-resolution-contract`
 
-`MetadataService::resolve` **MUST** apply each schema's `inheritance_policy` trait — resolved from `x-gts-traits` with default `override_only` — as the sole controller of the walk: `override_only` returns the tenant's own entry or empty; `inherit` walks `parent_id` ancestors. The walk **MUST** stop at the nearest self-managed ancestor (barrier-stop per `principle-barrier-as-data`), so a self-managed tenant never inherits metadata from above its barrier. The walk **MUST** skip (traverse through) ancestors whose `status == suspended` and continue to their parents — suspension is a lifecycle state, not a barrier. Empty resolution **MUST** be returned as an empty success response, NOT `metadata_entry_not_found`. There **MUST NOT** be any service-local `inheritance_policy` table, side configuration, or policy override — the trait is authoritative.
+`MetadataService::resolve` **MUST** apply each schema's `inheritance_policy` trait — resolved from `x-gts-traits` with default `override_only` — as the sole controller of the walk: `override_only` returns the tenant's own entry or empty; `inherit` walks `parent_id` ancestors. The walk **MUST** stop at the nearest self-managed ancestor (barrier-stop per `principle-barrier-as-data`), so a self-managed tenant never inherits metadata from above its barrier. The walk **MUST** skip (traverse through) ancestors whose `status == suspended` and continue to their parents — suspension is a lifecycle state, not a barrier. Empty resolution **MUST** be returned as an empty success response, NOT a 404. There **MUST NOT** be any service-local `inheritance_policy` table, side configuration, or policy override — the trait is authoritative.
 
 **Implements**:
 
@@ -389,9 +387,9 @@ Per-schema handlers in the `/tenants/{tenant_id}/metadata` family **MUST** pass 
 ## 6. Acceptance Criteria
 
 - [ ] A `GET /api/account-management/v1/tenants/{tenant_id}/metadata` for an authorized tenant returns a paginated list of direct-on-tenant entries from `dbtable-tenant-metadata` filtered by `tenant_id` only (NO ancestor walk); each response entry carries the public chained `schema_id` re-hydrated from Types Registry, and no `schema_uuid` appears in the response body. Fingerprints `dod-tenant-metadata-crud-contract`, `dod-tenant-metadata-schema-registration-and-uuid-derivation`.
-- [ ] A `GET /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` against an unregistered `schema_id` returns HTTP 404 with `code=metadata_schema_not_registered` via the `feature-errors-observability` envelope; the same endpoint against a registered `schema_id` for which no direct entry exists at `(tenant_id, schema_uuid)` returns HTTP 404 with `code=metadata_entry_not_found` — the two codes are distinct so clients can separate "unknown schema" from "schema known but no value". Fingerprints `dod-tenant-metadata-distinct-404-codes`.
+- [ ] A `GET /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` against an unregistered `schema_id` AND against a registered `schema_id` for which no direct entry exists at `(tenant_id, schema_uuid)` BOTH return HTTP 404 with `code=not_found`, `resource_type=gts.cf.core.am.tenant_metadata.v1~`, and the chained `schema_id` as `resource_name` via the `feature-errors-observability` envelope. The two cases are deliberately indistinguishable on the wire. Fingerprints `dod-tenant-metadata-unified-404`.
 - [ ] A `PUT /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` with a payload that fails the registered GTS schema's body validation returns `code=validation` without writing any row; a payload that validates successfully upserts at `(tenant_id, schema_uuid)` — insert returns HTTP 201, update returns HTTP 200 — and the `UNIQUE (tenant_id, schema_uuid)` constraint rejects any concurrent duplicate at the DB layer. Fingerprints `dod-tenant-metadata-crud-contract`, `dod-tenant-metadata-schema-registration-and-uuid-derivation`.
-- [ ] A `DELETE /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` on an existing direct entry returns HTTP 204 and removes only that `(tenant_id, schema_uuid)` row — ancestor entries for the same `schema_id` remain untouched; a DELETE on a registered schema with no direct entry returns HTTP 404 with `code=metadata_entry_not_found` (DELETE is NOT idempotent-success on missing rows here because the distinct-404 contract makes the signal observable). Fingerprints `dod-tenant-metadata-crud-contract`, `dod-tenant-metadata-distinct-404-codes`.
+- [ ] A `DELETE /api/account-management/v1/tenants/{tenant_id}/metadata/{schema_id}` on an existing direct entry returns HTTP 204 and removes only that `(tenant_id, schema_uuid)` row — ancestor entries for the same `schema_id` remain untouched; a DELETE on a registered schema with no direct entry **also** returns HTTP 204 (idempotent-success on missing rows, mirroring `delete_user` deprovision idempotency). The tenant-existence and schema-registration gates still raise their own 404 codes (`tenant_not_found`, the unified metadata `not_found`). Fingerprints `dod-tenant-metadata-crud-contract`.
 - [ ] A `GET /resolved` for a schema whose `inheritance_policy` is `override_only` returns the tenant's own value if present or HTTP 200 with an empty response if absent; for a schema whose `inheritance_policy` is `inherit`, the walk-up traverses `parent_id` ancestors, returns the first ancestor value found, stops at the nearest self-managed ancestor (barrier-stop) returning empty, and skips (continues past) ancestors whose `status == suspended`. An empty terminal state is HTTP 200 with an empty response, NOT HTTP 404. Fingerprints `dod-tenant-metadata-inheritance-resolution-contract`.
 - [ ] A direct `SELECT ... FROM tenant_metadata WHERE tenant_id = X` bypassing `MetadataService` returns only the rows directly written on tenant X — inherited values from ancestors are NOT visible through this path, confirming application-only enforcement. The schema-migration ddl for `tenant_metadata` contains no DB-level CHECK, trigger, or materialized-inheritance column, and no reconciliation job ships with this feature. Fingerprints `dod-tenant-metadata-application-only-enforcement`.
 - [ ] Deleting a tenant row from `dbtable-tenants` atomically removes all its `dbtable-tenant-metadata` rows in the same transaction. On PostgreSQL the removal is performed by `ON DELETE CASCADE` on `tenant_metadata.tenant_id → tenants.id`; on SQLite (where `PRAGMA foreign_keys` is intentionally disabled) the removal is performed by an explicit `delete_many` issued by `TenantRepoImpl::hard_delete_one` inside the tenant-hard-delete transaction. No out-of-band sweep / application-layer cleanup job is issued, and the cascade contract is preserved across schema migrations (PostgreSQL FK clause + SQLite explicit-delete branch). Fingerprints `dod-tenant-metadata-cascade-delete`.
@@ -403,7 +401,7 @@ Per-schema handlers in the `/tenants/{tenant_id}/metadata` family **MUST** pass 
 - **Tenant-hierarchy traversal primitives and ownership of `dbtable-tenants` / `dbtable-tenant-closure`** — *Owned by `cpt-cf-account-management-feature-tenant-hierarchy-management`* (DECOMPOSITION §2.2). This feature consumes the `parent_id` walk-up primitive for inheritance resolution but does not own tenant CRUD, closure maintenance, or status transitions.
 - **Barrier state and `self_managed` flag writes / mode-conversion workflow** — *Owned by `cpt-cf-account-management-feature-managed-self-managed-modes`* (DECOMPOSITION §2.4). This feature reads `tenants.self_managed` as the stop condition for the inheritance walk but does not own the flag's lifecycle.
 - **GTS types-registry availability and tenant-type / metadata-schema registration workflows** — *Owned by `cpt-cf-account-management-feature-tenant-type-enforcement`* (DECOMPOSITION §2.3). This feature consumes the registry to resolve metadata schemas and `x-gts-traits` but does not own the registration path or the availability contract.
-- **Problem Details envelope shape, RFC 9457 formatting, HTTP status mapping, and the authoritative error-code taxonomy** — *Owned by `cpt-cf-account-management-feature-errors-observability`* (DECOMPOSITION §2.8). Sub-codes (`metadata_schema_not_registered`, `metadata_entry_not_found`, `validation`, `cross_tenant_denied`) are catalogued authoritatively there; this feature emits them by name and defers envelope formatting, HTTP status mapping, audit emission, and metric sample naming to that feature.
+- **Problem Details envelope shape, RFC 9457 formatting, HTTP status mapping, and the authoritative error-code taxonomy** — *Owned by `cpt-cf-account-management-feature-errors-observability`* (DECOMPOSITION §2.8). Sub-codes (`not_found`, `validation`, `cross_tenant_denied`) are catalogued authoritatively there; this feature emits them by name and defers envelope formatting, HTTP status mapping, audit emission, and metric sample naming to that feature.
 - **Metadata-schema authoring, JSON Schema body design, `inheritance_policy` trait values, and semantic interpretation of metadata content** — *GTS-registry authoring concern.* Schemas are registered by deployment owners; `MetadataService` treats values as opaque GTS-validated payloads and does not inspect or normalize their semantics.
 - **Materialized inheritance views, DB-level CHECK/trigger enforcement, materialized-inheritance columns, and reconciliation jobs** — *Forbidden by `cpt-cf-account-management-adr-metadata-inheritance`* (ADR-0002). Inheritance is derived on every read inside `MetadataService::resolve`; no write-side materialization exists.
 - **Authentication, session, token issuance, and user lifecycle** — *Inherited from the platform AuthN layer and `feature-idp-user-operations-contract`* (DESIGN §4.2). `SecurityContext` validation is a platform-layer precondition; AuthZ policy evaluation for `Metadata.*` actions is delegated to `PolicyEnforcer` at the REST layer.

@@ -30,6 +30,7 @@ use account_management_sdk::{
 use async_trait::async_trait;
 use modkit_macros::domain_model;
 use modkit_odata::{Page, PageInfo};
+use modkit_security::SecurityContext;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -190,6 +191,7 @@ impl Default for FakeIdpUserProvisioner {
 impl IdpPluginClient for FakeIdpUserProvisioner {
     async fn provision_user(
         &self,
+        _ctx: &SecurityContext,
         req: &IdpProvisionUserRequest,
     ) -> Result<IdpUser, IdpUserOperationFailure> {
         self.create_calls
@@ -229,6 +231,7 @@ impl IdpPluginClient for FakeIdpUserProvisioner {
 
     async fn deprovision_user(
         &self,
+        _ctx: &SecurityContext,
         req: &IdpDeprovisionUserRequest,
     ) -> Result<(), IdpUserOperationFailure> {
         self.delete_calls
@@ -256,6 +259,7 @@ impl IdpPluginClient for FakeIdpUserProvisioner {
 
     async fn list_users(
         &self,
+        _ctx: &SecurityContext,
         req: &IdpListUsersRequest,
     ) -> Result<Page<IdpUser>, IdpUserOperationFailure> {
         self.list_calls

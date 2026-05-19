@@ -47,33 +47,14 @@ pub(super) async fn scan_retention_due(
     limit: usize,
 ) -> Result<Vec<TenantRetentionRow>, DomainError> {
     // Push the per-row due-check into SQL so the `LIMIT` applies to
-    // *due* rows only. The earlier implementation over-fetched
-    // `4 × batch` rows ordered by `deleted_at ASC` and applied
-    // `is_due` in Rust afterwards — but a backlog of older
-    // not-yet-due rows (typical case: NULL `retention_window_secs`
-    // → default 90 days) could fill the over-fetch window and
-    // starve newer due rows (e.g. soft-deleted with explicit
-    // `retention_window_secs = 0`). The reviewer flagged this as
-    // an indefinite-delay class of bug; by filtering at the DB the
-    // due-set is exact and starvation is impossible.
+    // *due* rows only.
     //
-    // The effective due predicate is
-    //   `deleted_at + (retention_window_secs if non-negative else default) seconds <= now`.
-    // `deleted_at` doubles as the retention-timer start: it is stamped
-    // by `schedule_deletion` together with the `status = Deleted` flip
-    // and is unique to soft-deleted rows. The `CASE WHEN >= 0` clamp
-    // mirrors the Rust `is_due` fallback (`Some(secs) if secs >= 0 =>
-    // secs else default`) byte-for-byte: NULL and negative
-    // `retention_window_secs` both fall through to `default_secs`,
-    // while a meaningful admin-set `0` (immediate hard-delete on next
-    // tick) is preserved. Without the clamp a negative window would
-    // compute `deleted_at + negative` and mark the row instantly due —
-    // the Rust defense-in-depth check catches it but emits warn-spam
-    // every tick. Both supported backends express the comparison
-    // without engine-specific INTERVAL arithmetic exposed to Rust. The
-    // MySQL backend is unsupported by AM migrations (see
-    // `m0001_initial_schema`) so it errors here for symmetry with the
-    // migration-set rejection.
+    // Clamp negative retention_window_secs to default at SQL: preserves
+    // admin-set 0 (immediate hard-delete), but prevents accidental-negative
+    // from marking rows instantly due (which would spam the Rust
+    // defense-in-depth log every tick). The MySQL backend is
+    // unsupported by AM migrations (see `m0001_initial_schema`) so it
+    // errors here for symmetry with the migration-set rejection.
     let engine = repo.db.db().db_engine();
     // Fail fast on overflow — clamping to `i64::MAX` would silently
     // make rows almost-never due and mask the misconfiguration.
@@ -119,11 +100,8 @@ pub(super) async fn scan_retention_due(
 
     let cap = u64::try_from(limit).unwrap_or(u64::MAX);
     let worker_id = Uuid::new_v4();
-    // Stale-claim cutoff: a row claimed before this instant whose
-    // `clear_retention_claim` evidently never landed (else
-    // `claimed_by` would be NULL) is up for re-claim by another
-    // worker. Computed in Rust so the SQL stays portable across
-    // the two supported engines.
+    // Compute stale-claim cutoff in Rust to keep SQL portable across
+    // engines (no engine-specific interval arithmetic).
     let stale_cutoff = match time::Duration::try_from(RETENTION_CLAIM_TTL) {
         Ok(d) => now - d,
         Err(_) => now,
@@ -150,18 +128,11 @@ pub(super) async fn scan_retention_due(
                     let claimable = Condition::any()
                         .add(tenants::Column::ClaimedBy.is_null())
                         .add(tenants::Column::ClaimedAt.lte(stale_cutoff));
-                    // `due_check` is also re-asserted in the claim
-                    // UPDATE below, so a peer transaction that
-                    // extends `retention_window_secs` (or, in a
-                    // hypothetical un-delete-then-re-delete flow,
-                    // moves `deleted_at` forward) between this SELECT
-                    // and the UPDATE cannot leave the row
-                    // claim-eligible against the new (later) due
-                    // instant. The clone is cheap (FNV-style byte
-                    // duplication of the bound parameters); it
-                    // avoids running the predicate-construction
-                    // ladder twice while keeping both filter sites
-                    // semantically identical.
+                    // Re-assert `due_check` on the UPDATE so a peer
+                    // that extends `retention_window_secs` (or moves
+                    // `deleted_at` forward) between SELECT and UPDATE
+                    // cannot leave the row claim-eligible against the
+                    // new due instant.
                     // Filter out retention-pipeline-parked rows.
                     // `mark_retention_terminal_failure` stamps
                     // `terminal_failure_at` on rows whose

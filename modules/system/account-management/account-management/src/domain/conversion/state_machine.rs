@@ -53,9 +53,8 @@ pub fn validate_transition(
     caller_side: Option<ConversionSide>,
     initiator_side: ConversionSide,
 ) -> Result<(), DomainError> {
-    // State check precedes role check. A request that already resolved
-    // (or that the caller is somehow asking to re-pending) is rejected
-    // here regardless of whether the role rule would otherwise pass.
+    // State check precedes role check. A request that has already
+    // resolved is rejected here regardless of role rule.
     if !matches!(current, ConversionStatus::Pending) {
         return Err(DomainError::AlreadyResolved);
     }

@@ -8,7 +8,7 @@
 //!
 //! * Full insert / update / get / list / delete lifecycle round-trip
 //!   (one combined test rather than one assertion per method).
-//! * `delete_for_tenant` distinct-404 contract on a missing row.
+//! * `delete_for_tenant` idempotency on a missing row.
 
 use modkit_security::AccessScope;
 use serde_json::json;
@@ -17,7 +17,6 @@ use uuid::Uuid;
 
 use modkit_odata::ODataQuery;
 
-use crate::domain::error::DomainError;
 use crate::domain::metadata::UpsertOutcome;
 use crate::domain::metadata::repo::MetadataRepo;
 use crate::domain::metadata::test_support::repo::FakeMetadataRepo;
@@ -119,23 +118,18 @@ async fn fake_repo_full_lifecycle_round_trip() {
 }
 
 #[tokio::test]
-async fn delete_for_tenant_returns_metadata_entry_not_found_on_missing() {
-    // Pin the distinct-404 contract — `DomainError::MetadataEntryNotFound`
-    // (not a generic NotFound) so the REST layer can produce
-    // `code=metadata_entry_not_found` distinct from
-    // `metadata_schema_not_registered`.
+async fn delete_for_tenant_is_idempotent_on_missing() {
+    // Pin the idempotency contract — `delete_for_tenant` on a
+    // `(tenant_id, schema_uuid)` pair with no row returns `Ok(())`,
+    // mirroring `delete_user` deprovision idempotency.
     let repo = FakeMetadataRepo::new();
     let tenant = Uuid::from_u128(0x11);
     let schema = Uuid::from_u128(0xAA);
-    let err = repo
-        .delete_for_tenant(&scope(), tenant, schema)
+    repo.delete_for_tenant(&scope(), tenant, schema)
         .await
-        .expect_err("delete must fail on missing row");
-    match err {
-        DomainError::MetadataEntryNotFound { entry, .. } => {
-            assert!(entry.contains(&tenant.to_string()));
-            assert!(entry.contains(&schema.to_string()));
-        }
-        other => panic!("expected MetadataEntryNotFound, got {other:?}"),
-    }
+        .expect("idempotent delete must succeed on missing row");
+    // A repeat call is still Ok.
+    repo.delete_for_tenant(&scope(), tenant, schema)
+        .await
+        .expect("idempotent delete must remain Ok on repeat");
 }

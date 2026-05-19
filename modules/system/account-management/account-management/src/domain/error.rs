@@ -48,6 +48,24 @@ pub enum DomainError {
     #[error("validation failed: {detail}")]
     Validation { detail: String },
 
+    /// Distinct from [`Self::Validation`] so the SDK boundary can
+    /// route the canonical envelope to `gts.cf.core.am.tenant_metadata.v1~`
+    /// instead of the tenant default. Used by metadata-content
+    /// rejections (malformed chained `schema_id`, null body, GTS
+    /// body validation failure) — anything that describes the
+    /// metadata payload rather than the owning tenant's state.
+    ///
+    /// `field` granularity in the canonical envelope is currently
+    /// coarse — the SDK-boundary mapping in
+    /// [`crate::infra::sdk_error_mapping`] hardcodes `field: "metadata"`
+    /// for every raise of this variant. If a future caller needs finer
+    /// `field_violation` attribution (e.g. `schema_id` from
+    /// `ParsedSchemaId::parse`, `value` from the null-body guard),
+    /// widen this variant to `{ detail, field: Option<String> }` and
+    /// forward the field through the mapping.
+    #[error("metadata validation failed: {detail}")]
+    MetadataValidation { detail: String },
+
     #[error("root tenant cannot be deleted")]
     RootTenantCannotDelete,
 
@@ -55,31 +73,30 @@ pub enum DomainError {
     RootTenantCannotConvert,
 
     // ---- NotFound (HTTP 404) ----
-    /// Tenant lookup miss. `resource` is the stable tenant identifier
-    /// (typically a UUID rendered as a string) surfaced through the
-    /// AIP-193 `NotFound` envelope's `with_resource`. `detail` is the
-    /// human-readable summary populated at the call site (where the
-    /// id is in scope) so the boundary mapping does not have to parse
-    /// it back out of the message.
+    // For every variant in this group, `resource` is the stable id
+    // surfaced through the AIP-193 `NotFound` envelope's `with_resource`,
+    // and `detail` is the human-readable summary populated at the call
+    // site so the boundary mapping does not parse it back out.
+    /// Tenant lookup miss.
     #[error("tenant not found: {detail}")]
     NotFound { detail: String, resource: String },
 
-    /// `IdP` user lookup miss within a specific tenant scope.
-    /// `resource` is the user id (stable across `IdP` providers per
-    /// the AM identity model). `detail` carries the human-readable
-    /// summary.
+    /// `IdP` user lookup miss within a tenant scope.
     #[error("user not found: {detail}")]
     UserNotFound { detail: String, resource: String },
 
-    /// Conversion-request lookup miss. `resource` is the conversion
-    /// request id (UUID-as-string). `detail` is the human-readable
-    /// summary.
+    /// Conversion-request lookup miss.
     #[error("conversion request not found: {detail}")]
     ConversionRequestNotFound { detail: String, resource: String },
 
-    #[error("metadata schema not registered: {detail}")]
-    MetadataSchemaNotRegistered { detail: String, schema: String },
-
+    /// Metadata lookup miss. Covers both "`schema_id` unknown to the
+    /// types-registry" and "schema known but no row exists at
+    /// `(tenant_id, schema_uuid)`" — the two cases collapse to a
+    /// single 404 per the unified-not-found contract.
+    /// `entry` carries the chained `schema_id` string the caller
+    /// supplied so the canonical envelope can surface it as
+    /// `resource_name` without exposing AM-internal compound keys
+    /// like `(tenant_uuid, schema_uuid)`.
     #[error("metadata entry not found: {detail}")]
     MetadataEntryNotFound { detail: String, entry: String },
 
@@ -144,13 +161,6 @@ pub enum DomainError {
         caller_side: String,
     },
 
-    // TODO(cyberfabric-core#1813-followup): when the conversion REST
-    // surface lands, extend `AlreadyResolved` with an optional
-    // terminal-status payload (`current_status: Option<String>`,
-    // matching the lowercase ASCII `ConversionStatus::as_str` labels)
-    // so the canonical-error envelope can surface the resolved state
-    // to the API caller without a follow-up GET. Deferred here because
-    // the payload only has a consumer once the REST handlers exist.
     #[error("conversion request already resolved")]
     AlreadyResolved,
 

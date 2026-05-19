@@ -117,7 +117,35 @@ modules:
 
   # --- Tenant Resolver example (gateway + plugins) ---
   types-registry:
-    config: {}
+    config:
+      # The AM envelope type schemas (`gts.cf.core.am.tenant_type.v1~`
+      # and `gts.cf.core.am.tenant_metadata.v1~`) are auto-seeded at
+      # link time via `inventory::submit!` declarations in the AM SDK
+      # (see `account-management-sdk/src/gts_envelopes.rs`). The only
+      # per-deployment seed left is the concrete platform-root tenant
+      # type below, because its identity is operator-controlled.
+      entities:
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+          $schema: "gts://gts.cf.core.am.tenant_type.v1~"
+          description: "Platform-root tenant type (no parents)."
+          type: "object"
+          x-gts-traits:
+            allowed_parent_types: []
+            idp_provisioning: false
+        # Customer tenant type used by the AM E2E suite for child
+        # tenants under the platform root. Allows nesting under either
+        # the platform root or another customer so the suite can build
+        # multi-level hierarchies (parent + child + grandchild for the
+        # metadata-inheritance walk-up test).
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+          $schema: "gts://gts.cf.core.am.tenant_type.v1~"
+          description: "Customer tenant under the platform root (E2E)."
+          type: "object"
+          x-gts-traits:
+            allowed_parent_types:
+              - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+              - "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+            idp_provisioning: false
 
   static-tr-plugin:
     config:
@@ -286,6 +314,42 @@ modules:
       server: "sqlite_users"
       file: "resource_group.db"
     config: {}
+
+  static-idp-plugin:
+    config:
+      vendor: "cyberfabric"
+      priority: 100
+
+  account-management:
+    database:
+      server: "sqlite_users"
+      file: "account_management.db"
+    config:
+      bootstrap:
+        # Matches static-tr-plugin's `e2e-root` so AM's tenants table
+        # ends up holding the same root id the platform middleware
+        # already knows about, letting E2E callers POST child tenants
+        # under it without a separate seeding step.
+        root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+        root_name: "e2e-root"
+        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        idp_wait_timeout: "5m"
+        idp_retry_backoff_initial: "2s"
+        idp_retry_backoff_max: "30s"
+        strict: false
+      idp:
+        # Fail-closed on missing IdP client: `static-idp-plugin` is
+        # enabled in this E2E config so the user-management surface
+        # (`/tenants/{id}/users`) MUST resolve to a live plugin, not
+        # the silent `NoopIdpProvider` fallback that returns 501. AM's
+        # `deps = [...]` does not name `static-idp-plugin` directly (AM
+        # is plugin-impl-agnostic), so without `idp.required=true` the
+        # ModKit topo-sort could initialise AM before the plugin and
+        # leave it serving 501s for the lifetime of the process. With
+        # `required=true` AM aborts startup loud and fast if it can't
+        # see the plugin — the operator then knows to investigate
+        # rather than silently shipping a half-wired stack.
+        required: true
 
   simple-user-settings:
     # Module-specific database configuration

@@ -129,15 +129,8 @@ pub(super) async fn update_tenant_mutable(
 /// surface as `Conflict` — only the dedicated soft-delete /
 /// provisioning flows are allowed to move the row in or out of those
 /// states.
-// Note on `now`: the wall-clock is captured once by the caller and
-// reused across every SERIALIZABLE retry. On a highly contended row
-// the committed `updated_at` may therefore lag the actual commit
-// time by however long the retry loop took. This mirrors the
-// established pattern in `schedule_deletion` and is acceptable
-// because (1) `updated_at` is informational, not load-bearing for any
-// invariant, and (2) re-stamping `now` per retry would defeat the
-// `was_no_op` heuristic in the service layer (caller compares
-// pre/post `updated_at` to suppress audit on same-to-same calls).
+// Wall-clock captured once and reused across retries; mirrors
+// `schedule_deletion` so the service-layer `was_no_op` heuristic stays valid.
 pub(super) async fn set_status(
     repo: &TenantRepoImpl,
     scope: &AccessScope,
@@ -306,17 +299,9 @@ pub(super) async fn load_ancestor_chain_through_parent(
         .map_err(map_scope_err)?;
 
     if closure_rows.is_empty() {
-        // Defensive fallback: parent has no closure rows yet (e.g.
-        // diagnostic call against an in-flight provisioning parent).
-        // Walk via `parent_id` like the legacy implementation; this
-        // path is rare and bounded by the depth invariant.
-        //
-        // The walk is hard-capped at `MAX_ANCESTOR_WALK_HOPS` so a
-        // corrupt `parent_id` cycle (or a depth value that disagrees
-        // with the actual chain length) can't loop indefinitely
-        // issuing one DB round-trip per hop. The cap is well above
-        // any realistic depth_threshold; overrun returns
-        // `DomainError::Internal` so ops sees the corruption.
+        // Defensive fallback for parents without closure rows (diagnostic
+        // against a `Provisioning` parent). Hard-capped to
+        // `MAX_ANCESTOR_WALK_HOPS` to bound corrupt-`parent_id` cycles.
         const MAX_ANCESTOR_WALK_HOPS: usize = 64;
         // Emit a WARN whenever we land here so a closure-table gap
         // developing in production (the only non-bootstrap reason

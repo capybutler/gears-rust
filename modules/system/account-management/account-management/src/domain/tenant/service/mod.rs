@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use authz_resolver_sdk::PolicyEnforcer;
-use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use authz_resolver_sdk::pep::ResourceType;
 use modkit_macros::domain_model;
 use modkit_security::{AccessScope, SecurityContext, pep_properties};
 use parking_lot::Mutex as PlMutex;
@@ -196,6 +196,7 @@ pub struct TenantService<R: TenantRepo> {
 
 pub(super) mod reaper;
 pub(super) mod retention;
+mod scope_util;
 
 impl<R: TenantRepo> TenantService<R> {
     /// Construct a fully-wired service. Production wiring lives in the
@@ -568,24 +569,21 @@ impl<R: TenantRepo> TenantService<R> {
         owner_tenant_id: Uuid,
         resource_id: Option<Uuid>,
     ) -> Result<AccessScope, DomainError> {
-        // Pass both `OWNER_TENANT_ID` (the parent / acted-on tenant,
-        // consumed by ownership-style policies) AND `RESOURCE_ID`
-        // (the target tenant id, consumed by the `InTenantSubtree`
-        // predicate on `tenants.id`). `require_constraints(true)`
-        // turns missing-policy / unsupported-constraint shapes into
-        // `CrossTenantDenied` (HTTP 403, fail-closed) rather than a
-        // silent `allow_all`.
-        let mut request = AccessRequest::new()
-            .resource_property(pep_properties::OWNER_TENANT_ID, owner_tenant_id)
-            .require_constraints(true);
-        if let Some(rid) = resource_id {
-            request = request.resource_property(pep_properties::RESOURCE_ID, rid);
-        }
-        let scope = self
-            .enforcer
-            .access_scope_with(ctx, &pep::TENANT, action, resource_id, &request)
-            .await?;
-        Ok(scope)
+        // Delegates to [`crate::domain::authz::authz_scope`] so the
+        // PEP gate stays uniform across `TenantService` /
+        // `UserService` / `MetadataService` / `ConversionService`.
+        // `Tenant` is the one resource type whose `resource_id` is
+        // optional (`create` / `list_children` have no single target).
+        crate::domain::authz::authz_scope(
+            &self.enforcer,
+            ctx,
+            &pep::TENANT,
+            action,
+            owner_tenant_id,
+            resource_id,
+            |req| req,
+        )
+        .await
     }
 
     // -----------------------------------------------------------------
@@ -626,9 +624,8 @@ impl<R: TenantRepo> TenantService<R> {
         ctx: &SecurityContext,
         input: CreateTenantRequest,
     ) -> Result<Tenant, DomainError> {
-        // PEP gate (DESIGN §4.2). For `Tenant.create` the resource
-        // owner is the parent tenant; the child id is not yet a
-        // committed resource so `resource_id` is `None`.
+        // PEP gate (DESIGN §4.2). resource_id=None — child not committed
+        // yet; ownership PEP keys on parent_id.
         let _scope = self
             .authorize(ctx, pep::actions::CREATE, input.parent_id, None)
             .await?;
@@ -638,12 +635,10 @@ impl<R: TenantRepo> TenantService<R> {
         // shape; `to_uuid()` is the same algorithm Types Registry
         // uses internally (`types-registry-sdk/src/models.rs:152`),
         // so the derived uuid is the lookup key the registry stores
-        // under. This replaces the older `tenant_type_uuid` field on
-        // `CreateTenantRequest`, removing the AM/IdP state-divergence
-        // class where the two could drift. Runs ahead of any
-        // registry-backed validation so a malformed `tenant_type`
-        // string fails fast as `InvalidTenantType` rather than after
-        // a wasted Types Registry round-trip.
+        // under. Runs ahead of any registry-backed validation so a
+        // malformed `tenant_type` string fails fast as
+        // `InvalidTenantType` rather than after a wasted Types
+        // Registry round-trip.
         let tenant_type_uuid = gts::GtsID::new(input.tenant_type.as_ref())
             .map_err(|e| DomainError::InvalidTenantType {
                 detail: format!("invalid tenant_type chain `{}`: {e}", input.tenant_type),
@@ -817,7 +812,7 @@ impl<R: TenantRepo> TenantService<R> {
         if let Some(meta) = input.provisioning_metadata.clone() {
             req = req.with_metadata(meta);
         }
-        let provision_result = match self.idp.provision_tenant(&req).await {
+        let provision_result = match self.idp.provision_tenant(ctx, &req).await {
             Ok(result) => {
                 emit_metric(
                     AM_DEPENDENCY_HEALTH,
@@ -997,6 +992,7 @@ impl<R: TenantRepo> TenantService<R> {
                  IdP compensation so the vendor-side tenant does not orphan"
             );
             self.compensate_failed_activation(
+                ctx,
                 &parent,
                 provisioning_row.id,
                 input.tenant_type.clone(),
@@ -1006,33 +1002,16 @@ impl<R: TenantRepo> TenantService<R> {
             .await;
             return Err(size_err);
         }
-        // Persist the plugin-private metadata BEFORE
-        // `finalize_provisioning` opens its SERIALIZABLE TX. If the
-        // activation TX then fails AND the best-effort
-        // `compensate_failed_activation` cannot confirm vendor-side
-        // teardown (Retryable / Terminal / UnsupportedOperation
-        // under `idp.required=true`), the row is left for the reaper
-        // — and the reaper rebuilds `IdpDeprovisionTenantRequest`
-        // exclusively from `tenant_idp_metadata`. Without this
-        // up-front upsert, the only copy of the blob would die in
-        // this stack frame, the reaper would forward an empty
-        // `TenantContext::metadata`, and any plugin that keys
-        // vendor-side state off the blob would silently leak the
-        // tenant. On a successful activation the in-TX write inside
-        // `activate_tenant` overwrites this row with the same value
+        // Persist plugin-private metadata BEFORE `finalize_provisioning`
+        // opens its SERIALIZABLE TX: the reaper rebuilds
+        // `IdpDeprovisionTenantRequest` exclusively from
+        // `tenant_idp_metadata`, so without this up-front upsert any
+        // post-activation failure would leak vendor-side state with no
+        // local record. Successful activation overwrites this row
         // atomically with the status flip (idempotent).
-        //
-        // # Upsert failure → `?` would orphan IdP state
-        //
-        // A naked `?` here would bypass `compensate_failed_activation`
-        // entirely on a transient DB blip (pool exhaustion,
-        // serialization conflict, fatal-but-retryable disconnect), so
-        // `provision_tenant` would leave vendor-side state with no
-        // local record. Route the upsert failure through the same
-        // compensation rung the activation-failure branch uses below
-        // — the saga MUST attempt IdP teardown for every post-
-        // provision failure, not only the ones that surface from
-        // `finalize_provisioning`.
+        // Route through compensate_failed_activation: a bare ? on the
+        // upsert leaks vendor-side state when the DB blip beats the
+        // next reaper tick.
         if let Err(upsert_err) = self
             .repo
             .upsert_idp_metadata(
@@ -1050,6 +1029,7 @@ impl<R: TenantRepo> TenantService<R> {
                  IdP compensation so the vendor-side tenant does not orphan"
             );
             self.compensate_failed_activation(
+                ctx,
                 &parent,
                 provisioning_row.id,
                 input.tenant_type.clone(),
@@ -1074,6 +1054,7 @@ impl<R: TenantRepo> TenantService<R> {
                 // compensation path so `deprovision_tenant` sees the
                 // plugin's own per-tenant state when tearing down.
                 self.compensate_failed_activation(
+                    ctx,
                     &parent,
                     provisioning_row.id,
                     input.tenant_type.clone(),
@@ -1106,10 +1087,9 @@ impl<R: TenantRepo> TenantService<R> {
         );
 
         // Saga step 3 returns an `Active` row, so lowering through the
-        // `is_sdk_visible` invariant is safe. We forward the
-        // caller-supplied `tenant_type` string verbatim — saga step 3
-        // already proved the registry chain is valid (and resolved its
-        // schema) so we don't need a registry RTT here.
+        // `is_sdk_visible` invariant is safe.
+        // tenant_type forwarded verbatim — chain already validated
+        // upstream, no need for a registry RTT.
         let mut info = self.lower_to_tenant(activated).await?;
         if info.tenant_type.is_none() {
             // `Tenant.tenant_type` is `Option<String>` per the
@@ -1140,7 +1120,11 @@ impl<R: TenantRepo> TenantService<R> {
         // isolation contract. Whatever the plugin produced is
         // persisted verbatim in `tenant_idp_metadata` and replayed
         // through `TenantContext::metadata` on every subsequent
-        // IdP call for this tenant.
+        // IdP call for this tenant. The `MAX_IDP_METADATA_BYTES`
+        // size cap IS enforced upstream in `create_tenant` against
+        // both the caller-supplied input and the plugin-returned
+        // blob before we reach this finalizer (see
+        // `check_idp_metadata_size` call site upstream).
         let ancestors = self
             .repo
             .load_ancestor_chain_through_parent(&AccessScope::allow_all(), parent.id)
@@ -1181,13 +1165,14 @@ impl<R: TenantRepo> TenantService<R> {
     )]
     async fn compensate_failed_activation(
         &self,
+        ctx: &SecurityContext,
         parent: &TenantModel,
         provisioning_id: Uuid,
         tenant_type: gts::GtsSchemaId,
         tenant_name: String,
         idp_metadata: Option<&Value>,
     ) {
-        let _ = parent; // reserved for future caller-context logging
+        let _ = parent;
         // Step 1 — vendor-side cleanup. We only run the row delete
         // when the IdP confirms there is nothing left to orphan
         // (`Ok` / `NotFound` / `UnsupportedOperation` under
@@ -1215,9 +1200,10 @@ impl<R: TenantRepo> TenantService<R> {
         );
         let idp_clean = match self
             .idp
-            .deprovision_tenant(&IdpDeprovisionTenantRequest::new(IdpTenantContext::from(
-                &tenant_context,
-            )))
+            .deprovision_tenant(
+                ctx,
+                &IdpDeprovisionTenantRequest::new(IdpTenantContext::from(&tenant_context)),
+            )
             .await
         {
             Ok(()) | Err(IdpDeprovisionFailure::NotFound { .. }) => true,
@@ -1328,24 +1314,57 @@ impl<R: TenantRepo> TenantService<R> {
     // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-tenant-read-scope:p1:inst-dod-read-scope-service
     pub async fn get_tenant(&self, ctx: &SecurityContext, id: Uuid) -> Result<Tenant, DomainError> {
         // PEP gate (DESIGN §4.2) + DB-level subtree clamp (cyberware-rust#1813).
-        // The `tenants` entity now declares `resource_col = "id"`, so
-        // the compiled `AccessScope` materialises a subtree-clamp
-        // JOIN against `tenant_closure` at the database — a caller
-        // whose PDP-narrowed scope clamps to a subtree NOT containing
-        // `id` collapses to `NotFound` even though `authorize`
-        // returned a permit. Defence-in-depth: the gate authorizes
-        // the operation, the SQL JOIN clamps the row.
+        // scope flows into the read so an out-of-subtree caller
+        // collapses to NotFound at the DB JOIN, not just at the PEP gate.
         let scope = self
             .authorize(ctx, pep::actions::READ, id, Some(id))
             .await?;
+        // Direct-child carve-out across self-managed barriers. When
+        // the standard Respect-scope read collapses to `None`, the
+        // target may still be a *direct* child of a Respect-reachable
+        // tenant (the canonical case: `P` reads its self-managed
+        // direct child `S`; `(P, S).barrier = 1` hides `S` from the
+        // standard read, but the identity-level contract opens it).
+        // We retry under a barrier-relaxed clone of the same scope,
+        // then re-check that the candidate's `parent_id` is reachable
+        // under the original (barrier-respecting) scope. This bounds
+        // the carve-out to "identity of a direct child of any
+        // Respect-visible tenant" and never leaks anything below a
+        // barrier — `(S, GC)` rows stay barrier-clamped because `S`
+        // itself is not Respect-reachable, so the parent re-check on
+        // `GC.parent = S` fails.
         let tenant =
-            self.repo
-                .find_by_id(&scope, id)
-                .await?
-                .ok_or_else(|| DomainError::NotFound {
+            if let Some(t) = self.repo.find_by_id(&scope, id).await? {
+                t
+            } else {
+                let relaxed = scope_util::relax_barriers(&scope);
+                let candidate = self.repo.find_by_id(&relaxed, id).await?.ok_or_else(|| {
+                    DomainError::NotFound {
+                        detail: format!("tenant {id} not found"),
+                        resource: id.to_string(),
+                    }
+                })?;
+                // Root tenants have no parent — carve-out can never apply
+                // (the root is its own scope-root and the standard read
+                // above would have already succeeded if the caller is
+                // permitted at all).
+                let parent_id = candidate.parent_id.ok_or_else(|| DomainError::NotFound {
                     detail: format!("tenant {id} not found"),
                     resource: id.to_string(),
                 })?;
+                // Parent reachability re-check under the ORIGINAL
+                // (Respect) scope: if the candidate's parent is not
+                // Respect-visible to the caller, the candidate sits
+                // strictly below an unreachable boundary and must
+                // collapse to `NotFound`.
+                if self.repo.find_by_id(&scope, parent_id).await?.is_none() {
+                    return Err(DomainError::NotFound {
+                        detail: format!("tenant {id} not found"),
+                        resource: id.to_string(),
+                    });
+                }
+                candidate
+            };
         // `Provisioning` is AM-internal and has no SDK representation.
         // `Deleted` rows are public tombstones (the `Tenant` projection
         // carries `deleted_at`), so they are returned as-is —
@@ -1384,16 +1403,10 @@ impl<R: TenantRepo> TenantService<R> {
         parent_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<Tenant>, DomainError> {
-        // PEP gate (DESIGN §4.2) + DB-level subtree clamp
-        // (cyberware-rust#1813). Authorization for the parent tenant
-        // runs through `authorize`; the compiled scope is forwarded
-        // verbatim into the parent existence check AND the children
-        // listing so a caller whose subtree does not contain
-        // `parent_id` collapses to `NotFound`, and a caller whose
-        // subtree does contain `parent_id` but excludes some
-        // self-managed children sees the listing clamped to their
-        // own subtree at the database. `resource_id` is `None` for
-        // listings because the call returns a collection.
+        // PEP gate (DESIGN §4.2) + DB-level subtree clamp (cyberware-rust#1813).
+        // scope flows into the read so an out-of-subtree caller
+        // collapses to NotFound at the DB JOIN, not just at the PEP gate.
+        // resource_id=None — listings return a collection, not a single row.
         let scope = self
             .authorize(ctx, pep::actions::LIST_CHILDREN, parent_id, None)
             .await?;
@@ -1411,7 +1424,19 @@ impl<R: TenantRepo> TenantService<R> {
                 resource: parent_id.to_string(),
             });
         }
-        let mut page = self.repo.list_children(&scope, parent_id, query).await?;
+        // Direct-child carve-out: the parent-existence gate above
+        // stays under the PDP-emitted barrier-respecting scope, so any
+        // `parent_id` past a self-managed barrier already collapses to
+        // `NotFound`. For the listing call itself we relax barriers so
+        // a Respect-visible parent's *direct* self-managed children
+        // surface in the identity-level enumeration. The depth-1 SQL
+        // pin `tenants.parent_id = $parent_id` (applied inside
+        // `TenantRepo::list_children`) bounds the relaxed scope to
+        // direct children only — nothing below a barrier is exposed.
+        // See `scope_util` for the broader invariant table and why
+        // this cannot be expressed as a PDP-side `BarrierMode::Ignore`.
+        let relaxed = scope_util::relax_barriers(&scope);
+        let mut page = self.repo.list_children(&relaxed, parent_id, query).await?;
         // Defense-in-depth: drop any `Provisioning` row that slips
         // through the repo filter before we lower the page to the
         // public shape (where `Provisioning` is unrepresentable).
@@ -1456,14 +1481,10 @@ impl<R: TenantRepo> TenantService<R> {
                 detail: "update patch is empty; at least one field required".into(),
             });
         }
-        // PEP gate (DESIGN §4.2) + DB-level subtree clamp
-        // (cyberware-rust#1813). The compiled scope flows into the
-        // pre-update load AND the mutating write below; the
-        // secure-extension materialises a `tenants.id IN subtree(...)`
-        // JOIN against `tenant_closure` so a caller scoped to a
-        // subtree that does NOT contain `id` collapses to `NotFound`
-        // on the load (and the write fences inside the SERIALIZABLE
-        // retry catch the same clamp on the UPDATE).
+        // PEP gate (DESIGN §4.2) + DB-level subtree clamp (cyberware-rust#1813).
+        // scope flows into the read so an out-of-subtree caller
+        // collapses to NotFound at the DB JOIN, not just at the PEP gate.
+        // The same clamp re-fires inside the SERIALIZABLE update below.
         let scope = self
             .authorize(ctx, pep::actions::UPDATE, id, Some(id))
             .await?;
@@ -1514,10 +1535,9 @@ impl<R: TenantRepo> TenantService<R> {
         }
         let updated = self.repo.update_tenant_mutable(&scope, id, &patch).await?;
 
-        // Suppress the lifecycle event log on an idempotent no-op
-        // (option A — true HTTP PATCH idempotency). The repo skips the
-        // DB write when `name` is unchanged, so `updated.updated_at`
-        // stays equal to `current.updated_at`.
+        // Suppress the lifecycle event log on an idempotent no-op.
+        // The repo skips the DB write when `name` is unchanged, so
+        // `updated.updated_at` stays equal to `current.updated_at`.
         let was_no_op = updated.updated_at == current.updated_at;
         if !was_no_op {
             // TODO(events): emit AM event when platform event-bus lands.
@@ -1641,7 +1661,7 @@ impl<R: TenantRepo> TenantService<R> {
     }
 
     // -----------------------------------------------------------------
-    // Phase 3 — soft delete + hard-delete batch + reaper + integrity
+    // Soft delete + hard-delete batch + reaper + integrity
     // -----------------------------------------------------------------
 
     /// Implements FEATURE `Soft-Delete Tenant`.
@@ -1667,16 +1687,10 @@ impl<R: TenantRepo> TenantService<R> {
         ctx: &SecurityContext,
         tenant_id: Uuid,
     ) -> Result<Tenant, DomainError> {
-        // PEP gate (DESIGN §4.2) + DB-level subtree clamp
-        // (cyberware-rust#1813). The compiled scope flows into the
-        // disclosure read AND the mutating `schedule_deletion` write
-        // so a caller scoped to a subtree that does NOT contain
-        // `tenant_id` collapses to `NotFound` at the database.
-        // Structural precondition checks (`count_children`,
-        // `count_ownership_links`) stay at `allow_all` — those are
-        // saga-internal guard counts asserting "this row has no
-        // descendants / no resources", not data disclosure of the
-        // tenant being acted on.
+        // PEP gate (DESIGN §4.2) + DB-level subtree clamp (cyberware-rust#1813).
+        // scope flows into the row read + schedule_deletion write;
+        // structural counts (count_children, count_ownership_links)
+        // stay allow_all — they are saga guards, not data disclosure.
         let scope = self
             .authorize(ctx, pep::actions::DELETE, tenant_id, Some(tenant_id))
             .await?;

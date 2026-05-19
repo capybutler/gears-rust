@@ -33,18 +33,10 @@
 //! Visibility: `pub(super)` — only the trait `impl` in [`super`]
 //! dispatches here.
 //!
-//! TODO(integrity-sqlite-busy): on `SQLite` the `RepeatableRead`
-//! request maps to `Serializable` (only level the engine exposes — see
-//! `modkit_db::secure::tx_config`). Two concurrent integrity checks
-//! can therefore collide at `BEGIN IMMEDIATE` and surface as
-//! `SQLITE_BUSY`, which the current path through
-//! `transaction_with_config` (no retry helper) lifts into
-//! [`DomainError::Internal`] rather than the user-meaningful
-//! [`DomainError::IntegrityCheckInProgress`]. Production runs on
-//! Postgres so this is dev / test only; a follow-up should either wrap
-//! this entry point in a bounded retry helper or document the
-//! conditional `BUSY → IntegrityCheckInProgress` mapping for `SQLite`
-//! operators.
+//! `NOTE` (`integrity-sqlite-busy`): on `SQLite` the `RepeatableRead`
+//! request maps to `Serializable`; `SQLITE_BUSY` →
+//! `IntegrityCheckInProgress` so the integrity tick stays observable
+//! without spurious failures. PG path is unaffected.
 //!
 //! NOTE(modkit-coord-migration): the lock acquired here via
 //! `integrity::lock::acquire_committed` is an interim singleton-lock
@@ -78,22 +70,10 @@ pub(super) async fn run_integrity_check(
     repo: &TenantRepoImpl,
     scope: &AccessScope,
 ) -> Result<Vec<(IntegrityCategory, Violation)>, DomainError> {
-    // 3-transaction lifecycle (see `integrity::lock` module docs):
-    //
-    // 1. Acquire (committed): sweep stale locks + INSERT row → row is
-    //    visible to concurrent contenders so they surface
-    //    `IntegrityCheckInProgress` instead of queueing.
-    // 2. Snapshot + classify (REPEATABLE READ, read-only): MVCC view
-    //    held for the duration; no writes inside this tx so a
-    //    long-running check cannot be aborted by SI conflicts on the
-    //    `tenants` / `tenant_closure` tables.
-    // 3. Release (committed): DELETE the lock row.
-    //
-    // The release call uses a separate match arm rather than a Drop
-    // guard because async destructors cannot run DB I/O. We always
-    // attempt release on both happy and error paths so a transient
-    // snapshot-tx failure does not leave the gate held until the
-    // stale-lock TTL expires.
+    // 3-transaction lifecycle (acquire / snapshot+classify / release);
+    // see integrity::lock module docs. Release runs on both happy and
+    // error paths so a snapshot-tx failure does not block on
+    // MAX_LOCK_AGE.
     let worker_id = Uuid::new_v4();
 
     integrity::lock::acquire_committed(&repo.db, worker_id).await?;

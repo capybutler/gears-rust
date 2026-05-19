@@ -32,20 +32,12 @@
 //! `account_management_sdk::idp_user::UserTenantContext::tenant_type`,
 //! `account_management_sdk::tenant::CreateTenantInput::tenant_type`).
 //! Serde sees it as a plain string (the upstream impls forward to
-//! `String`-shaped serialize / deserialize), so the wire shape is
-//! identical to the old `String`-typed field — only the Rust API
-//! gains a type-level discriminator over arbitrary strings.
-//!
-//! Earlier revisions briefly exposed an AM-local `MetadataSchemaId`
-//! newtype paired with a `MetadataValidationError` enum and a
-//! `derive_schema_uuid` helper. That surface forced every SDK
-//! consumer to learn an AM-specific type and duplicated the `GTS_NS`
-//! namespace constant the `gts` crate already owns. The current
-//! design moves all validation + UUID derivation inside AM impl
-//! (see `crate::domain::metadata::schema_id::ParsedSchemaId`) while
-//! the SDK ships only the platform-standard `GtsSchemaId` marker —
-//! identical type discipline across modules, zero AM-specific
-//! coupling on the contract surface.
+//! `String`-shaped serialize / deserialize), so the wire shape is a
+//! plain string and the Rust API gains a type-level discriminator
+//! over arbitrary strings. All validation + UUID derivation runs
+//! inside AM impl (see
+//! `crate::domain::metadata::schema_id::ParsedSchemaId`), keeping the
+//! SDK free of AM-specific types.
 
 use gts::GtsSchemaId;
 use modkit_odata_macros::ODataFilterable;
@@ -133,7 +125,7 @@ pub struct UpsertMetadataRequest {
     /// registered JSON Schema; both checks run server-side.
     pub value: Value,
     /// Optimistic-lock precondition. **Opt-in** — `None` retains the
-    /// historical last-write-wins behaviour; `Some(v)` requires the
+    /// last-write-wins behaviour; `Some(v)` requires the
     /// stored row's [`MetadataEntry::version`] to equal `v`, and
     /// surfaces [`AccountManagementError::MetadataVersionMismatch`](crate::AccountManagementError::MetadataVersionMismatch)
     /// (HTTP 409) when the stored version drifted between the
@@ -150,8 +142,8 @@ pub struct UpsertMetadataRequest {
 
 impl UpsertMetadataRequest {
     /// Build a request with the two required fields and no version
-    /// precondition (`expected_version = None`). Equivalent to the
-    /// historical wire shape — last-write-wins.
+    /// precondition (`expected_version = None`) — last-write-wins
+    /// semantics.
     #[must_use]
     pub const fn new(schema_id: GtsSchemaId, value: Value) -> Self {
         Self {
@@ -172,28 +164,10 @@ impl UpsertMetadataRequest {
     }
 }
 
-/// `OData` filter schema for [`crate::AccountManagementClient::list_metadata`].
-///
-/// Declares the columns of [`MetadataEntry`] that callers may use in
-/// `$filter` predicates. The derive expands into the
-/// [`MetadataEntryFilterField`] enum the impl-crate's repo layer
-/// references when invoking `modkit_db::odata::paginate_odata` —
-/// keeping the field set in the SDK keeps the public contract a
-/// single source of truth.
-///
-/// V1 exposes `updated_at` + `schema_uuid` (the deterministic `UUIDv5`
-/// derived from `schema_id`, used as the stable cursor tiebreaker).
-/// The chained `schema_id` itself is NOT a filter field — exact-schema
-/// lookups go through
-/// [`crate::AccountManagementClient::get_metadata`] (a single round
-/// trip beats `$filter=schema_id eq ...` here, and the chained
-/// `schema_id` would otherwise require server-side
-/// `schema_id → schema_uuid` rewriting before reaching the SQL layer).
-/// Future filterable columns extend this struct in a minor SDK bump.
-///
-/// The struct is **never** constructed; its only role is to drive the
-/// derive macro. The `dead_code` allow keeps clippy quiet on the
-/// unused fields — the derive consumes them at compile time.
+/// Drives [`ODataFilterable`] derive. Never constructed (struct +
+/// `dead_code` allow). Exposes `updated_at` + `schema_uuid`; chained
+/// `schema_id` is not filterable — exact lookups go through
+/// [`crate::AccountManagementClient::get_metadata`].
 #[derive(ODataFilterable)]
 #[allow(dead_code)]
 pub struct MetadataEntryQuery {

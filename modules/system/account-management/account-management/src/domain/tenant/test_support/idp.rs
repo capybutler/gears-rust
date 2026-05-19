@@ -19,6 +19,7 @@ use account_management_sdk::{
 };
 use async_trait::async_trait;
 use modkit_macros::domain_model;
+use modkit_security::SecurityContext;
 use serde_json::Value;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -116,6 +117,7 @@ impl FakeIdpProvisioner {
 impl IdpPluginClient for FakeIdpProvisioner {
     async fn provision_tenant(
         &self,
+        _ctx: &SecurityContext,
         req: &IdpProvisionTenantRequest,
     ) -> Result<IdpProvisionResult, IdpProvisionFailure> {
         self.calls.lock().expect("lock").push(req.tenant_id);
@@ -147,6 +149,7 @@ impl IdpPluginClient for FakeIdpProvisioner {
 
     async fn deprovision_tenant(
         &self,
+        _ctx: &SecurityContext,
         req: &IdpDeprovisionTenantRequest,
     ) -> Result<(), IdpDeprovisionFailure> {
         self.deprovision_calls

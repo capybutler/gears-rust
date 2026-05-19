@@ -100,22 +100,12 @@ impl GtsTenantTypeChecker {
     }
 
     /// Extract `allowed_parent_types` from an effective trait map.
-    /// Returns `None` if the key is missing, `null`, not an array,
-    /// contains a non-string item, or contains a string that does
-    /// not parse as a tenant-type-shaped GTS identifier (per
-    /// `is_type_schema_id` — `gts.…~`). Every malformed shape
-    /// collapses to `InvalidTenantType` at the call site.
-    ///
-    /// The shape check is structural — it does not lookup the
-    /// registry to confirm each entry descends from
-    /// [`TENANT_TYPE_BASE_GTS_ID`] (per-entry round-trip would
-    /// inflate cost on every `check_parent_child` call). The
-    /// envelope check still runs against the actual `parent_type`
-    /// schema below; here we simply refuse to fold a malformed
-    /// trait list into a valid same-type-nesting / membership
-    /// admission, because a single non-tenant-type-shaped entry
-    /// alongside legitimate ones would otherwise silently slip
-    /// past validation by virtue of its siblings.
+    /// Returns `None` on any malformed shape (missing key, non-array,
+    /// non-string entry, or string that fails `is_type_schema_id`) so
+    /// callers refuse the whole trait list — one malformed entry must
+    /// not slip through under cover of legitimate siblings. Per-entry
+    /// registry probes are skipped on cost grounds; the envelope check
+    /// still runs against the actual `parent_type` below.
     fn extract_allowed_parents(traits: &Value) -> Option<Vec<String>> {
         let arr = traits.get(ALLOWED_PARENT_TYPES_TRAIT)?.as_array()?;
         let mut out = Vec::with_capacity(arr.len());

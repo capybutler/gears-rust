@@ -1,0 +1,56 @@
+[package]
+name = "cyberware-static-idp-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Permissive echo IdP plugin for Account Management dev and E2E stacks"
+repository.workspace = true
+keywords = ["cyberfabric", "cyberware", "cyberfabric-system"]
+categories = ["authentication"]
+
+[lib]
+name = "static_idp_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+account-management-sdk = { package = "cyberware-account-management-sdk", version = "0.1.1", path = "../../account-management-sdk" }
+types-registry-sdk = { package = "cyberware-types-registry-sdk", version = "0.2.2", path = "../../../types-registry/types-registry-sdk" }
+
+# ModKit dependencies
+modkit = { workspace = true }
+modkit-macros = { workspace = true }
+modkit-odata = { workspace = true }
+modkit-security = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Data structures
+uuid = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Sync primitives for the in-memory user store
+parking_lot = { workspace = true }
+
+# Required by modkit::module macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+# `IdpTenantContext::new` requires a `GtsSchemaId`; the test scaffolding
+# in `domain::client::pagination_tests` builds a sample context per
+# request. Dev-only so the runtime crate stays free of the dependency.
+gts = { workspace = true }

@@ -25,15 +25,14 @@
 //!   tolerate empty result sets.
 
 use async_trait::async_trait;
+use modkit_odata::{ODataQuery, Page};
 use modkit_security::AccessScope;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use modkit_macros::domain_model;
 
-use crate::domain::conversion::model::{
-    ConversionPagination, ConversionRequest, ConversionStatus, NewConversionRequest, TargetMode,
-};
+use crate::domain::conversion::model::{ConversionRequest, NewConversionRequest, TargetMode};
 use crate::domain::error::DomainError;
 
 // @cpt-begin:cpt-cf-account-management-algo-managed-self-managed-modes-dual-consent-apply:p1:inst-algo-dual-consent-apply-input
@@ -59,7 +58,7 @@ use crate::domain::error::DomainError;
 /// [`DomainError::Validation`] otherwise. The single seam is
 /// documented on the trait method itself.
 #[domain_model]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ApplyConversionApprovalInput {
     pub request_id: Uuid,
     pub target_tenant_id: Uuid,
@@ -69,17 +68,14 @@ pub struct ApplyConversionApprovalInput {
     /// [`crate::domain::tenant_type::TenantTypeChecker::check_parent_child`]
     /// barrier. The repo MUST verify the reloaded
     /// `tenants.tenant_type_uuid` still matches this value inside the
-    /// apply TX and abort with [`DomainError::Validation`] otherwise.
-    /// A peer that flipped this tenant's type between the service's
-    /// check and the TX would otherwise leave the apply running
-    /// against a stale pairing; surfacing the race as `Validation`
-    /// keeps the conversion request recoverable instead of approving
-    /// a now-incompatible parent / child pairing.
+    /// apply TX and abort with [`DomainError::Validation`] otherwise —
+    /// a peer flipping the type between the service's check and the
+    /// TX would otherwise let the apply approve a now-incompatible
+    /// parent / child pairing; surfacing as `Validation` keeps the
+    /// request recoverable.
     pub expected_tenant_type_uuid: Uuid,
-    /// `tenant_type_uuid` of the parent tenant as observed by the
-    /// service. Same TOCTOU guard semantics as
-    /// `expected_tenant_type_uuid` — both endpoints' types must be
-    /// stable between the service's check and the apply TX.
+    /// `tenant_type_uuid` of the parent tenant. Same TOCTOU guard
+    /// semantics as [`Self::expected_tenant_type_uuid`].
     pub expected_parent_tenant_type_uuid: Uuid,
     /// Counterparty actor UUID stamped on the approved row.
     ///
@@ -95,6 +91,12 @@ pub struct ApplyConversionApprovalInput {
     /// supplies after the dual-consent role guard runs.
     pub approver_uuid: Uuid,
     pub resolved_at: OffsetDateTime,
+    /// Optional approver rationale stamped on
+    /// `conversion_requests.approved_comment` inside the apply
+    /// transaction. The service layer enforces `1..=1000` chars
+    /// before invoking this seam; the DB-side `m0006` CHECK is
+    /// defence-in-depth.
+    pub approval_comment: Option<String>,
 }
 // @cpt-end:cpt-cf-account-management-algo-managed-self-managed-modes-dual-consent-apply:p1:inst-algo-dual-consent-apply-input
 
@@ -178,7 +180,8 @@ pub trait ConversionRepo: Send + Sync {
     // ---- Atomic guarded transitions ------------------------------------
 
     /// **Test-only** atomic guarded `UPDATE`: stamp `status =
-    /// approved`, `approved_by`, and `resolved_at`. Filter is
+    /// approved`, `approved_by`, `resolved_at`, and (when supplied)
+    /// `approved_comment`. Filter is
     /// `WHERE id = :request_id AND status = 0 AND deleted_at IS NULL`.
     ///
     /// # Why this method is dangerous outside tests
@@ -212,6 +215,7 @@ pub trait ConversionRepo: Send + Sync {
         request_id: Uuid,
         approved_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError>;
 
     // @cpt-begin:cpt-cf-account-management-algo-managed-self-managed-modes-dual-consent-apply:p1:inst-algo-dual-consent-apply-trait
@@ -268,8 +272,9 @@ pub trait ConversionRepo: Send + Sync {
     // @cpt-end:cpt-cf-account-management-algo-managed-self-managed-modes-dual-consent-apply:p1:inst-algo-dual-consent-apply-trait
 
     /// Atomic guarded `UPDATE`: stamp `status = cancelled`,
-    /// `cancelled_by`, and `resolved_at`. Same fence and same
-    /// re-read-on-zero-rows behaviour as
+    /// `cancelled_by`, `resolved_at`, and (when supplied)
+    /// `cancelled_comment`. Same fence and same re-read-on-zero-rows
+    /// behaviour as
     /// [`Self::__transition_pending_to_approved_test_only`].
     async fn transition_pending_to_cancelled(
         &self,
@@ -277,11 +282,13 @@ pub trait ConversionRepo: Send + Sync {
         request_id: Uuid,
         cancelled_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError>;
 
     /// Atomic guarded `UPDATE`: stamp `status = rejected`,
-    /// `rejected_by`, and `resolved_at`. Same fence and same
-    /// re-read-on-zero-rows behaviour as
+    /// `rejected_by`, `resolved_at`, and (when supplied)
+    /// `rejected_comment`. Same fence and same re-read-on-zero-rows
+    /// behaviour as
     /// [`Self::__transition_pending_to_approved_test_only`].
     async fn transition_pending_to_rejected(
         &self,
@@ -289,6 +296,7 @@ pub trait ConversionRepo: Send + Sync {
         request_id: Uuid,
         rejected_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError>;
 
     /// Atomic guarded `UPDATE`: stamp `status = expired` and
@@ -303,56 +311,67 @@ pub trait ConversionRepo: Send + Sync {
         resolved_at: OffsetDateTime,
     ) -> Result<ConversionRequest, DomainError>;
 
-    // ---- Listings ------------------------------------------------------
+    // ---- Listings + point reads ----------------------------------------
 
     /// List conversion requests owned by `tenant_id` (the converting
-    /// tenant itself). When `status_filter` is `Some`, only rows with
-    /// the matching status are returned; soft-deleted rows are always
-    /// excluded.
+    /// tenant itself). Soft-deleted rows are always excluded; status
+    /// filtering is explicit via the `OData` `$filter` surface
+    /// declared by
+    /// [`ConversionRequestFilterField`](crate::domain::conversion::query::ConversionRequestFilterField).
     ///
-    /// Order is stable (newest-first by `(requested_at, id)`) so cursor
-    /// re-reads are deterministic.
+    /// When the caller supplies no `$orderby`, the impl injects
+    /// `created_at DESC` so recent rows surface first; `id ASC` is
+    /// appended as the unique tiebreaker by `paginate_odata`'s
+    /// `ensure_tiebreaker` helper, yielding effective order
+    /// `(created_at DESC, id ASC)` so cursor re-reads are deterministic
+    /// across page boundaries.
     async fn list_own_for_tenant(
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-        pagination: ConversionPagination,
-    ) -> Result<Vec<ConversionRequest>, DomainError>;
+        query: &ODataQuery,
+    ) -> Result<Page<ConversionRequest>, DomainError>;
 
     /// List conversion requests inbound to `parent_id` (the parent of
-    /// the converting tenant). When `status_filter` is `Some`, only
-    /// rows with the matching status are returned; soft-deleted rows
-    /// are always excluded.
+    /// the converting tenant). Same `OData` posture and same
+    /// soft-delete exclusion as [`Self::list_own_for_tenant`]; the
+    /// service layer projects the rows down to the cross-barrier
+    /// minimal surface
+    /// ([`ConversionRequestParentProjection`](crate::domain::conversion::service::ConversionRequestParentProjection))
+    /// before returning them to REST callers.
     async fn list_inbound_for_parent(
         &self,
         scope: &AccessScope,
         parent_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-        pagination: ConversionPagination,
-    ) -> Result<Vec<ConversionRequest>, DomainError>;
+        query: &ODataQuery,
+    ) -> Result<Page<ConversionRequest>, DomainError>;
 
-    /// Count of rows that would be returned by
-    /// [`Self::list_own_for_tenant`] under the same `(tenant_id,
-    /// status_filter)` filter, ignoring pagination. Used by the
-    /// service-layer pagination contract so `OffsetPage.total`
-    /// reflects the underlying row count and not the current page
-    /// size. Soft-deleted rows are excluded by the same predicate.
-    async fn count_own_for_tenant(
+    /// Point read of a single conversion-request row owned by
+    /// `tenant_id` (the converting tenant). Returns `Ok(None)` when no
+    /// row exists with the supplied `request_id`, when the row's
+    /// `tenant_id` does not match, when it is soft-deleted, or when it
+    /// is outside the supplied `scope` — every miss collapses through
+    /// the same `None` so callers cannot distinguish "exists but
+    /// outside scope" from "does not exist" through the existence
+    /// channel.
+    async fn get_own_for_tenant(
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-    ) -> Result<u64, DomainError>;
+        request_id: Uuid,
+    ) -> Result<Option<ConversionRequest>, DomainError>;
 
-    /// Count sibling for [`Self::list_inbound_for_parent`]. Same
-    /// predicate, no pagination.
-    async fn count_inbound_for_parent(
+    /// Point read of a single conversion-request row inbound to
+    /// `parent_id` (the parent of the converting tenant). Same miss-
+    /// collapse semantics as [`Self::get_own_for_tenant`]; the service
+    /// layer projects the row down to the cross-barrier minimal
+    /// surface before returning to REST callers.
+    async fn get_inbound_for_parent(
         &self,
         scope: &AccessScope,
         parent_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-    ) -> Result<u64, DomainError>;
+        request_id: Uuid,
+    ) -> Result<Option<ConversionRequest>, DomainError>;
 
     // ---- Background reaper / retention ---------------------------------
 

@@ -64,13 +64,6 @@ fn not_found_variants_map_to_404() {
         404
     );
     assert_eq!(
-        status_of(DomainError::MetadataSchemaNotRegistered {
-            detail: "schema y missing".into(),
-            schema: "y".into(),
-        }),
-        404
-    );
-    assert_eq!(
         status_of(DomainError::MetadataEntryNotFound {
             detail: "entry z missing".into(),
             entry: "z".into(),
@@ -209,16 +202,19 @@ fn not_found_carries_resource_id() {
 }
 
 #[test]
-fn metadata_schema_not_registered_carries_schema_id() {
-    let ame: AccountManagementError = DomainError::MetadataSchemaNotRegistered {
+fn metadata_entry_not_found_carries_chained_schema_id() {
+    // `MetadataEntryNotFound` carries the chained `schema_id` the
+    // caller supplied so the canonical envelope surfaces it as
+    // `resource_name`.
+    let ame: AccountManagementError = DomainError::MetadataEntryNotFound {
         detail: "schema billing.v1 missing".into(),
-        schema: "billing.v1".into(),
+        entry: "gts.cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~".into(),
     }
     .into();
-    let AccountManagementError::MetadataSchemaNotRegistered { schema, .. } = &ame else {
-        panic!("expected MetadataSchemaNotRegistered variant");
+    let AccountManagementError::MetadataEntryNotFound { entry, .. } = &ame else {
+        panic!("expected MetadataEntryNotFound variant");
     };
-    assert_eq!(schema, "billing.v1");
+    assert_eq!(entry, "gts.cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~");
     assert!(ame.is_not_found());
 }
 
@@ -269,12 +265,12 @@ impl DomainError {
         match self {
             Self::InvalidTenantType { .. } => "invalid_tenant_type",
             Self::Validation { .. } => "validation",
+            Self::MetadataValidation { .. } => "metadata_validation",
             Self::RootTenantCannotDelete => "root_tenant_cannot_delete",
             Self::RootTenantCannotConvert => "root_tenant_cannot_convert",
             Self::NotFound { .. } => "not_found",
             Self::UserNotFound { .. } => "user_not_found",
             Self::ConversionRequestNotFound { .. } => "conversion_request_not_found",
-            Self::MetadataSchemaNotRegistered { .. } => "metadata_schema_not_registered",
             Self::MetadataEntryNotFound { .. } => "metadata_entry_not_found",
             Self::MetadataVersionMismatch { .. } => "metadata_version_mismatch",
             Self::AlreadyExists { .. } => "already_exists",
@@ -313,6 +309,7 @@ impl DomainError {
         match self {
             Self::InvalidTenantType { .. }
             | Self::Validation { .. }
+            | Self::MetadataValidation { .. }
             | Self::RootTenantCannotDelete
             | Self::RootTenantCannotConvert
             | Self::InvalidActorForTransition { .. }
@@ -327,7 +324,6 @@ impl DomainError {
             Self::NotFound { .. }
             | Self::UserNotFound { .. }
             | Self::ConversionRequestNotFound { .. }
-            | Self::MetadataSchemaNotRegistered { .. }
             | Self::MetadataEntryNotFound { .. } => 404,
             Self::AlreadyExists { .. }
             | Self::Aborted { .. }

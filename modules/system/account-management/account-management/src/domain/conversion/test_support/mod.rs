@@ -11,10 +11,6 @@
 
 pub mod repo;
 
-#[allow(
-    unused_imports,
-    reason = "FakeConversionRepo re-export anchors the public surface for later-phase service-level tests; phase 2 uses only the in-module test paths"
-)]
 pub use repo::FakeConversionRepo;
 
 #[cfg(test)]

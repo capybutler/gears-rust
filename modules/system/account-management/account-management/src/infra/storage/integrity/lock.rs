@@ -39,47 +39,11 @@
 //! `DbTx<'_>` and remain available for tests; production code paths
 //! use [`acquire_committed`] / [`release_committed`].
 //!
-//! ## Interim implementation -- multi-replica safety gap (tracked)
+//! ## Interim implementation
 //!
-//! This module is an **interim** singleton-lock primitive. It is
-//! sufficient to keep one worker at a time on a single-replica
-//! deployment and to short-circuit a peer that is already running,
-//! but it is NOT sufficient to keep multi-replica AM safe under the
-//! full failure model the integrity reconciler must survive:
-//!
-//! * **No fence token / fence-in-tx.** A VM-suspended replica whose
-//!   lock row's TTL expires can be superseded by a peer that takes
-//!   over the gate; when the suspended replica thaws, its in-flight
-//!   repair transaction can still commit because the repair tx and
-//!   the lock row are validated independently. Two replicas can then
-//!   end up writing to `tenants` / `tenant_closure` against
-//!   different snapshots, which is exactly the "double-correction"
-//!   class of bug the integrity reconciler exists to prevent.
-//! * **No renewal heartbeat with explicit lease-loss signal.** Long
-//!   classify-then-repair cycles ([`MAX_LOCK_AGE`] is the only
-//!   safety net) cannot extend the lease, and the worker has no
-//!   in-band way to learn that it has been replaced.
-//! * **No forensic `attempts` counter.** Crash-takeover patterns
-//!   ("the same hierarchy keeps killing the worker") are invisible
-//!   to operators because every takeover looks like a fresh run.
-//!
-//! The chosen replacement is the `modkit-coord` library
-//! (`LeaseManager::acquire` + `Guard::spawn_renewal` +
-//! `Guard::with_ack_in_tx`), which co-locates lease validation and
-//! repair writes in the same SQL transaction and therefore makes
-//! "I lost the lease while writing" an atomic rollback rather than
-//! a silent data corruption. The fence-in-tx pattern is correct
-//! only when the lease and the repair targets share a transaction
-//! boundary, which is why `modkit-coord` mandates same-DB lease
-//! storage.
-//!
-//! Migration is tracked in
-//! <https://github.com/cyberfabric/cyberware-rust/issues/1873>.
-//! Until that lands, AM ships single-replica or warns operators on
-//! multi-replica deployments via the loop's
-//! `RUNS{outcome=skipped_in_progress}` metric -- which today fires
-//! on the contender path but does NOT discriminate "peer is
-//! healthy" from "peer is wedged with a still-valid TTL".
+//! Single-replica safe. Multi-replica gap: no fence-in-tx, no renewal
+//! heartbeat, no attempts counter. Migration to modkit-coord tracked
+//! at <https://github.com/cyberfabric/cyberware-rust/issues/1873>.
 
 use std::time::Duration;
 
@@ -167,25 +131,10 @@ pub async fn release(tx: &DbTx<'_>, worker_id: Uuid) -> Result<(), DomainError> 
         .await
         .map_err(map_scope_err)?;
     if result.rows_affected == 0 {
-        // Zero affected rows means the row this worker inserted is
-        // gone. The only way that happens is the stale-lock sweep on
-        // a contender's [`acquire_committed`] reclaiming the slot
-        // before this release ran — i.e. the check or repair took
-        // longer than [`MAX_LOCK_AGE`] AND a contender raced in. The
-        // contender is now running concurrently against the gate;
-        // surface the anomaly so operators can detect it.
-        //
-        // We intentionally do NOT return an error: the check/repair
-        // result is already produced, and the gate is now released
-        // (by the contender's sweep), so the caller's contract is
-        // honoured. We also do NOT emit on
-        // `AM_HIERARCHY_INTEGRITY_RUNS` — that metric documents a
-        // fixed outcome set (`completed | skipped_in_progress |
-        // failed | repair_*`) describing scheduler-tick state, and
-        // mixing in lock-health labels breaks dashboards keyed on
-        // it. Use the dedicated `AM_INTEGRITY_LOCK_EVENTS` family
-        // for lock-health alerting; the structured warn-log below
-        // carries the per-event worker context.
+        // Zero rows affected → a contender's stale-lock sweep reclaimed
+        // the slot before this release (work outran MAX_LOCK_AGE).
+        // Surface via AM_INTEGRITY_LOCK_EVENTS + warn — not an error
+        // because the gate is released either way.
         emit_metric(
             AM_INTEGRITY_LOCK_EVENTS,
             MetricKind::Counter,
@@ -201,19 +150,9 @@ pub async fn release(tx: &DbTx<'_>, worker_id: Uuid) -> Result<(), DomainError> 
     Ok(())
 }
 
-/// Sweep stale rows from `integrity_check_runs` whose `started_at`
-/// exceeds `MAX_LOCK_AGE`. Runs inside the caller's `tx` so a single
-/// `acquire_committed` round-trip handles cleanup + INSERT atomically.
-///
-/// The cutoff is computed DB-side (`NOW() - INTERVAL ...` on `Postgres`,
-/// `datetime('now', '-N seconds')` on `SQLite`) rather than on the Rust
-/// worker, so the comparison is anchored on the same clock that wrote
-/// `started_at`. Computing the cutoff worker-side made the eviction
-/// vulnerable to NTP drift between replicas: a worker whose clock was
-/// running ahead of the DB by more than the live holder's remaining
-/// TTL could reclaim the slot before the holder's actual TTL expired,
-/// silently breaching single-flight. Anchoring on the DB clock removes
-/// the worker-clock variable from the comparison entirely.
+/// Sweep rows with `started_at` older than `MAX_LOCK_AGE`. Cutoff
+/// computed DB-side so NTP drift between worker and DB cannot let a
+/// fast worker reclaim a slot whose true TTL has not yet expired.
 async fn sweep_stale(tx: &DbTx<'_>, engine: &str) -> Result<(), DomainError> {
     let allow_all = AccessScope::allow_all();
     let cutoff_expr = build_db_cutoff_expr(engine)?;

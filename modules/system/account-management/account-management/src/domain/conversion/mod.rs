@@ -15,8 +15,11 @@
 //!
 //! * [`model`] — pure value types ([`model::ConversionRequest`],
 //!   [`model::NewConversionRequest`], [`model::ConversionStatus`],
-//!   [`model::ConversionSide`], [`model::TargetMode`],
-//!   [`model::ConversionPagination`]).
+//!   [`model::ConversionSide`], [`model::TargetMode`]).
+//! * [`query`] — [`query::ConversionRequestQuery`] declares the
+//!   OData-filterable column surface for the listing endpoints
+//!   (`?$filter`, `?$orderby`); the field set is consumed by both
+//!   the SDK and the repo-impl pagination helper.
 //! * [`state_machine`] — the role-per-transition guard used by the
 //!   service layer (and re-applied as defence-in-depth by the
 //!   repo-impl) before touching the DB.
@@ -29,14 +32,11 @@
 //!   `pending -> {approved, cancelled, rejected, expired}` lifecycle.
 //!
 //! The REST surface for `/tenants/{id}/conversions` and
-//! `/tenants/{id}/child-conversions` is intentionally not wired in this
-//! crate yet — it lands in a follow-up PR once the `InTenantSubtree`
-//! predicate (cyberfabric-core#1813) makes the storage-level subtree
-//! clamp safe for cross-barrier authorization. The domain types here
-//! are REST-ready so that drop-in is a thin handler wiring step.
+//! `/tenants/{id}/child-conversions` is wired in the same branch
+//! (see [`crate::api::rest::handlers::conversions`]).
 
 pub mod model;
-pub mod page;
+pub mod query;
 pub mod repo;
 pub mod service;
 pub mod state_machine;

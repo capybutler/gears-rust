@@ -48,40 +48,16 @@ use uuid::Uuid;
 
 pub use tenant_resolver_sdk::{TenantId, TenantStatus};
 
-/// Public AM tenant projection returned from
-/// [`crate::AccountManagementClient`] CRUD and listing surfaces.
+/// AM-internal projection of a tenant row.
 ///
-/// Wider than the resolver's identity-shaped
-/// [`tenant_resolver_sdk::TenantInfo`] — `Tenant` is what AM hands
-/// to admin tooling, UIs, and inter-module Rust consumers that need
-/// to display or reason about a tenant. The extra fields beyond
-/// `TenantInfo` are:
+/// Wider than `tenant_resolver_sdk::TenantInfo`: carries lifecycle
+/// timestamps + depth that admin/UI consumers need. Internal columns
+/// (raw `tenant_type_uuid`, `retention_window_secs`,
+/// `claimed_by`/`claimed_at`) stay impl-side; promoting them is a
+/// `SemVer` minor bump.
 ///
-/// * `depth` — hierarchy depth at write time. `0` for the root.
-///   Available so UIs can render tree breadcrumbs without a second
-///   round-trip to the closure layer.
-/// * `created_at` / `updated_at` / `deleted_at` — lifecycle timestamps.
-///   `created_at` is set on insert and immutable thereafter;
-///   `updated_at` advances on every mutation. `deleted_at` is
-///   `Some(_)` exactly when `status == Deleted` and doubles as the
-///   retention-timer start (hard-delete becomes eligible at
-///   `deleted_at + retention_window`). All are wire-serialised as
-///   RFC 3339.
-///
-/// Internal-only columns are intentionally **not** here:
-/// `tenant_type_uuid` (consumers speak chained `tenant_type` string),
-/// `retention_window_secs` (operator override stored per-row but not
-/// part of the public lifecycle contract), `claimed_by` / `claimed_at`
-/// (hard-delete worker claim). Promoting any of them to the public
-/// projection is a `SemVer` minor bump.
-///
-/// Pre-1.0 SDK: NOT `#[non_exhaustive]`. Listing all fields in a
-/// struct expression is the documented construction style — the
-/// impl-side service composes `Tenant` directly without going
-/// through a constructor, and adding a column is an explicit `SemVer`
-/// minor bump that requires updating every literal site (the
-/// compiler will flag them via the `missing field` error). Promoting
-/// to `#[non_exhaustive]` is a 1.0 / wider-adoption decision.
+/// Not `#[non_exhaustive]` pre-1.0: missing-field compiler error is the `SemVer`
+/// guard for callers building literals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
     clippy::struct_field_names,
@@ -132,10 +108,10 @@ pub struct Tenant {
 /// `tenant_type` is a chained GTS identifier (e.g.
 /// `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~`); AM derives
 /// the canonical `UUIDv5` via [`gts::GtsID`] internally so callers do not
-/// supply two parallel identifiers (which used to drift). The field is
-/// typed [`GtsSchemaId`] rather than `String` so callers (REST handler,
-/// inter-module Rust consumers) get a self-documenting contract and
-/// any generated JSON Schema annotates the field with
+/// have to supply two parallel identifiers that can diverge. The field
+/// is typed [`GtsSchemaId`] rather than `String` so callers (REST
+/// handler, inter-module Rust consumers) get a self-documenting
+/// contract and any generated JSON Schema annotates the field with
 /// `format: gts-schema-id`. Wire shape stays a string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -228,45 +204,8 @@ impl UpdateTenantRequest {
     }
 }
 
-/// `OData` filter schema for
-/// [`crate::AccountManagementClient::list_children`].
-///
-/// Declares the columns of [`TenantInfo`] (and the storage-side
-/// `tenants` row) that callers may use in `$filter` and `$orderby`
-/// predicates. The derive expands into the [`TenantInfoFilterField`]
-/// enum the impl-crate's repo layer references when invoking
-/// `modkit_db::odata::paginate_odata`; keeping the field set in the
-/// SDK keeps the public contract a single source of truth.
-///
-/// Path-scoped `parent_id` is NOT part of this surface — it stays a
-/// positional argument on `list_children`. Listing for an arbitrary
-/// `parent_id` via `$filter` would let callers bypass the
-/// parent-existence + status guard the service layer runs before the
-/// repo call.
-///
-/// `id` is exposed primarily as the **cursor tiebreaker** — the
-/// listing surface composes `(created_at ASC, id ASC)` as its
-/// effective sort so two siblings sharing a `created_at` timestamp
-/// (microsecond collisions on batch INSERTs or parallel API calls)
-/// stay disambiguated across page boundaries. Without a unique
-/// secondary key the cursor predicate `created_at > last_ts`
-/// silently skips collision-mates on the next page. Exact-id lookups
-/// still go through `get_tenant` — the `OData` filter surface accepts
-/// `$filter=id eq <uuid>` for niche bulk-export flows but most
-/// callers will use the dedicated endpoint.
-///
-/// Status filtering retains the AM-default hidden-AND: when a caller
-/// supplies no `status` predicate, the repo layer ANDs
-/// `status IN (Active, Suspended)` so soft-deleted rows stay hidden by
-/// default. Callers wanting to see deleted rows opt in via
-/// `$filter=status eq 'deleted'`. The accepted string values match the
-/// serde rename on the public [`TenantStatus`] enum (`"active"`,
-/// `"suspended"`, `"deleted"`); the AM-internal `Provisioning` status
-/// has no SDK representation and is rejected as a validation error.
-///
-/// The struct is **never** constructed; its only role is to drive the
-/// derive macro. The `dead_code` allow keeps clippy quiet on the
-/// unused fields — the derive consumes them at compile time.
+/// Struct exists only to feed `#[derive(ODataFilterable)]`; `dead_code`
+/// allow is intentional.
 #[derive(ODataFilterable)]
 #[allow(dead_code)]
 pub struct TenantInfoQuery {
@@ -281,10 +220,10 @@ pub struct TenantInfoQuery {
     pub id: Uuid,
     /// `tenants.status` projected as the public [`TenantStatus`]
     /// lifecycle string: `"active"`, `"suspended"`, or `"deleted"`
-    /// (the serde rename on the SDK enum). The `OData` parser
-    /// validates the string up-front; unknown values — including the
-    /// AM-internal `"provisioning"` — are rejected as a validation
-    /// error before the predicate reaches storage.
+    /// (the serde rename on the SDK enum). The `OData` parser only
+    /// validates the value is a String; arbitrary unknown values
+    /// (including the AM-internal `"provisioning"`) reach storage and
+    /// are mapped to a domain error downstream.
     #[odata(filter(kind = "String"))]
     pub status: String,
     /// Deterministic `UUIDv5` of the registered tenant-type schema id.

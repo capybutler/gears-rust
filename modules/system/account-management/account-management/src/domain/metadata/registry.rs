@@ -6,8 +6,11 @@
 //! responsibilities:
 //!
 //! 1. *Existence* — surface unknown schemas as
-//!    [`DomainError::MetadataSchemaNotRegistered`] BEFORE any DB read
-//!    or write, satisfying `dod-tenant-metadata-distinct-404-codes`.
+//!    [`DomainError::MetadataEntryNotFound`] BEFORE any DB read or
+//!    write. AM no longer distinguishes "schema unknown to registry"
+//!    from "entry absent for this tenant" on the wire — both
+//!    collapse into a single 404 with `resource_type =
+//!    gts.cf.core.am.tenant_metadata.v1~`.
 //! 2. *Inheritance policy* — resolve the schema's `inheritance_policy`
 //!    trait (from `x-gts-traits`, default `override_only`). The
 //!    walk-up algorithm consumes this to decide whether to walk
@@ -27,8 +30,8 @@
 //!   unit tests. Reverse lookup uses the same map keyed by the
 //!   deterministic `UUIDv5` derivation via upstream
 //!   [`gts::GtsID::to_uuid`].
-//! * `GtsMetadataSchemaRegistry` (Phase 4) — the production
-//!   implementation backed by `types_registry_sdk::TypesRegistryClient`.
+//! * `GtsMetadataSchemaRegistry` — the production implementation
+//!   backed by `types_registry_sdk::TypesRegistryClient`.
 //!
 //! # Schema-id type contract
 //!
@@ -106,11 +109,12 @@ impl InheritancePolicy {
 ///
 /// # Errors
 ///
-/// * [`DomainError::MetadataSchemaNotRegistered`] — the supplied
-///   chained id (or `schema_uuid` for reverse lookup) is not
-///   registered. The service layer maps this to HTTP 404
-///   `code=metadata_schema_not_registered` per
-///   `dod-tenant-metadata-distinct-404-codes`.
+/// * [`DomainError::MetadataEntryNotFound`] — the supplied chained
+///   `schema_id` (or `schema_uuid` for reverse lookup) is not
+///   registered. The service layer maps this to HTTP 404 with
+///   `resource_type = gts.cf.core.am.tenant_metadata.v1~` — the
+///   "schema unknown" and "entry missing" cases collapse to the
+///   same wire shape per the unified-not-found contract.
 /// * [`DomainError::ServiceUnavailable`] — registry transport
 ///   failure. The service layer surfaces this unchanged so the
 ///   feature-errors-observability envelope can attach a retry-after
@@ -124,9 +128,10 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     ///
     /// Implementations MUST also use this method as the existence
     /// gate — an unregistered schema surfaces
-    /// [`DomainError::MetadataSchemaNotRegistered`] without falling
-    /// back to the `OverrideOnly` default, otherwise the distinct-404
-    /// contract breaks.
+    /// [`DomainError::MetadataEntryNotFound`] without falling back
+    /// to the `OverrideOnly` default; otherwise reads against an
+    /// unregistered schema would silently succeed with an empty
+    /// projection.
     async fn resolve_inheritance_policy(
         &self,
         schema_id: &GtsSchemaId,
@@ -137,22 +142,27 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     /// `/resolved` walk-up) to re-hydrate the public identifier from a
     /// single storage row.
     ///
-    /// Returns [`DomainError::MetadataSchemaNotRegistered`] when no
-    /// schema in the registry hashes to the supplied `schema_uuid`.
+    /// Returns [`DomainError::MetadataEntryNotFound`] when no schema
+    /// in the registry hashes to the supplied `schema_uuid`. Note that
+    /// in production this signals a true orphan row (chain was deleted
+    /// from the registry after metadata was written) — the LIST flow
+    /// in `MetadataService::list_metadata` treats this case as
+    /// `Internal` rather than surfacing the UUID through a public
+    /// envelope; this variant lets the registry stay schema-typed even
+    /// when the row-level caller knows better.
     async fn resolve_id_by_uuid(&self, schema_uuid: Uuid) -> Result<GtsSchemaId, DomainError>;
 
     /// Batch reverse-lookup for the LIST flow: resolve a slice of
     /// `schema_uuid` values to their public chained ids in a single
     /// round-trip. The returned map contains an entry only for
     /// uuids that ARE registered — the caller surfaces
-    /// [`DomainError::MetadataSchemaNotRegistered`] for any row whose
-    /// `schema_uuid` is missing from the map, so a single unregistered
-    /// row does not poison the whole page.
+    /// [`DomainError::MetadataEntryNotFound`] (or, in the LIST flow,
+    /// `Internal`) for any row whose `schema_uuid` is missing from
+    /// the map, so a single unregistered row does not poison the
+    /// whole page.
     ///
-    /// Default impl delegates to [`Self::resolve_id_by_uuid`] in a loop;
-    /// the production [`crate::infra::types_registry::metadata_schema_registry::GtsMetadataSchemaRegistry`]
-    /// implementation overrides this to amortise against the SDK's
-    /// in-memory snapshot.
+    /// Default impl is N round-trips per page; production adapter
+    /// overrides to a single registry call to amortise per-page.
     ///
     /// # Errors
     ///
@@ -168,9 +178,9 @@ pub trait MetadataSchemaRegistry: Send + Sync {
                 Ok(id) => {
                     out.insert(uuid, id);
                 }
-                Err(DomainError::MetadataSchemaNotRegistered { .. }) => {
-                    // Page-poisoning guard: omit unknowns; caller raises
-                    // the distinct-404 per row.
+                Err(DomainError::MetadataEntryNotFound { .. }) => {
+                    // Page-poisoning guard: omit unknowns; caller
+                    // decides per-row how to surface the miss.
                 }
                 Err(other) => return Err(other),
             }
@@ -186,9 +196,10 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     ///
     /// # Errors
     ///
-    /// * [`DomainError::MetadataSchemaNotRegistered`] — schema is not
-    ///   registered (distinct-404 contract; the PUT handler maps this
-    ///   to `code=metadata_schema_not_registered`).
+    /// * [`DomainError::MetadataEntryNotFound`] — schema is not
+    ///   registered. The PUT handler surfaces this as a uniform 404
+    ///   (the unified-not-found contract: AM no longer distinguishes
+    ///   "schema unknown" from "entry missing" on the wire).
     /// * [`DomainError::ServiceUnavailable`] — registry transport
     ///   failure.
     /// * [`DomainError::Internal`] — the registered schema is itself
@@ -270,8 +281,8 @@ impl StubState {
 
 impl StubMetadataSchemaRegistry {
     /// Build an empty stub — every lookup surfaces
-    /// `MetadataSchemaNotRegistered`. Useful for tests that pin the
-    /// unregistered-schema 404 code.
+    /// [`DomainError::MetadataEntryNotFound`]. Useful for tests that
+    /// pin the unified 404 contract on an unknown schema.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -321,22 +332,26 @@ impl MetadataSchemaRegistry for StubMetadataSchemaRegistry {
         schema_id: &GtsSchemaId,
     ) -> Result<InheritancePolicy, DomainError> {
         let state = self.inner.lock();
-        state.by_id.get(schema_id).copied().ok_or_else(|| {
-            DomainError::MetadataSchemaNotRegistered {
+        state
+            .by_id
+            .get(schema_id)
+            .copied()
+            .ok_or_else(|| DomainError::MetadataEntryNotFound {
                 detail: format!("schema {schema_id} is not registered in the types registry"),
-                schema: schema_id.to_string(),
-            }
-        })
+                entry: schema_id.to_string(),
+            })
     }
 
     async fn resolve_id_by_uuid(&self, schema_uuid: Uuid) -> Result<GtsSchemaId, DomainError> {
         let state = self.inner.lock();
-        state.by_uuid.get(&schema_uuid).cloned().ok_or_else(|| {
-            DomainError::MetadataSchemaNotRegistered {
+        state
+            .by_uuid
+            .get(&schema_uuid)
+            .cloned()
+            .ok_or_else(|| DomainError::MetadataEntryNotFound {
                 detail: format!("schema_uuid {schema_uuid} not registered in the types registry"),
-                schema: schema_uuid.to_string(),
-            }
-        })
+                entry: schema_uuid.to_string(),
+            })
     }
 
     async fn validate_value(
@@ -346,17 +361,17 @@ impl MetadataSchemaRegistry for StubMetadataSchemaRegistry {
     ) -> Result<(), DomainError> {
         let state = self.inner.lock();
         // Existence gate first — keeps the stub honest about the
-        // distinct-404 contract: validate_value against an unregistered
-        // schema MUST surface `MetadataSchemaNotRegistered`, not collapse
-        // to `Ok(())`. Mirrors `resolve_inheritance_policy`.
+        // unified-404 contract: validate_value against an unregistered
+        // schema MUST surface `MetadataEntryNotFound`, not collapse to
+        // `Ok(())`. Mirrors `resolve_inheritance_policy`.
         if !state.by_id.contains_key(schema_id) {
-            return Err(DomainError::MetadataSchemaNotRegistered {
+            return Err(DomainError::MetadataEntryNotFound {
                 detail: format!("schema {schema_id} is not registered in the types registry"),
-                schema: schema_id.to_string(),
+                entry: schema_id.to_string(),
             });
         }
         if state.fail_validation.contains(schema_id) {
-            return Err(DomainError::Validation {
+            return Err(DomainError::MetadataValidation {
                 detail: format!(
                     "stub: configured to reject every payload for schema `{schema_id}`"
                 ),

@@ -8,6 +8,7 @@ use modkit_macros::domain_model;
 use modkit_security::SecurityContext;
 use resource_group_sdk::{
     CreateTypeRequest, ResourceGroupClient, ResourceGroupError, ResourceGroupType,
+    UpdateTypeRequest,
 };
 use tracing::info;
 
@@ -51,14 +52,9 @@ pub struct UserGroupRegistrationOutcome {
     pub container: RegistrationOutcome,
 }
 
-/// Expected traits of a registered RG type.
-///
-/// Drives both the `CreateTypeRequest` AM submits to RG when the type
-/// is absent and the equivalence predicate AM applies when the type
-/// already exists (step-1 path or `TypeAlreadyExists` race re-read).
-/// Centralising the spec keeps the create / classify codepaths in
-/// sync so a future field addition cannot drift between the request
-/// and the check.
+/// Single source of truth for both the CREATE payload and the
+/// equivalence check, so a new field cannot drift between create
+/// and classify.
 #[domain_model]
 #[derive(Debug, Clone)]
 struct TypeSpec {
@@ -95,6 +91,15 @@ impl TypeSpec {
     /// representing AM user groups. `allowed_membership_types` MUST
     /// list the member handle so RG's `add_membership` validation
     /// admits AM users.
+    ///
+    /// The final logical spec carries the self-referential
+    /// `allowed_parent_types = [USER_GROUP_TYPE_CODE]` rule so AM-owned
+    /// user-groups can be nested under one another. RG's
+    /// `create_type` rejects self-references because
+    /// `resolve_ids(allowed_parent_types)` runs before the INSERT, so
+    /// AM registers in two passes (see [`register_user_group_types`]):
+    /// CREATE with empty parents → `update_type` patching the
+    /// self-parent rule once the row is in `gts_type`.
     fn user_group_container() -> Self {
         Self {
             code: USER_GROUP_TYPE_CODE,
@@ -104,9 +109,40 @@ impl TypeSpec {
         }
     }
 
+    /// First-pass spec for the container: same shape as
+    /// [`Self::user_group_container`] but with
+    /// `allowed_parent_types = []` so RG's `create_type` validation
+    /// passes. The follow-up `update_type` call patches the
+    /// self-parent rule against the same row.
+    fn user_group_container_without_parents() -> Self {
+        Self {
+            code: USER_GROUP_TYPE_CODE,
+            can_be_root: true,
+            allowed_parent_types: Vec::new(),
+            allowed_membership_types: vec![USER_MEMBERSHIP_TYPE],
+        }
+    }
+
     fn to_create_request(&self) -> CreateTypeRequest {
         CreateTypeRequest {
             code: self.code.to_owned(),
+            can_be_root: self.can_be_root,
+            allowed_parent_types: self
+                .allowed_parent_types
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            allowed_membership_types: self
+                .allowed_membership_types
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            metadata_schema: None,
+        }
+    }
+
+    fn to_update_request(&self) -> UpdateTypeRequest {
+        UpdateTypeRequest {
             can_be_root: self.can_be_root,
             allowed_parent_types: self
                 .allowed_parent_types
@@ -141,6 +177,21 @@ impl TypeSpec {
 /// on `DivergentSchema` aborts the pair; the caller (`module init`)
 /// surfaces the error and does NOT signal ready.
 ///
+/// # Self-parent rule patched as a follow-up `update_type`
+///
+/// The container type's logical spec includes the self-referential
+/// rule `allowed_parent_types = [USER_GROUP_TYPE_CODE]` so AM-owned
+/// user-groups can be nested under one another. RG's `create_type`
+/// validation runs `resolve_ids(allowed_parent_types)` BEFORE
+/// inserting the row, so a self-reference fails with `validation:
+/// Referenced types not found`. AM works around this by registering
+/// the container with empty `allowed_parent_types` (which classifies
+/// as inclusive-equivalent against either pre-state — see
+/// [`classify_existing`]), then patching the self-parent rule with
+/// `update_type` once the row is in RG's `gts_type` table. The
+/// follow-up patch is idempotent: a prior init that already wrote
+/// the self-parent rule sees the rule re-set to the same values.
+///
 /// Called during `AccountManagementModule::init`. On success the
 /// module may proceed to signal ready.
 pub async fn register_user_group_types(
@@ -150,9 +201,42 @@ pub async fn register_user_group_types(
     // Step 1: member handle first -- step 2 depends on it being
     // resolvable in `gts_type`.
     let member = register_one(client, ctx, &TypeSpec::user_member_handle()).await?;
-    // Step 2: container last; lists the member handle in
-    // `allowed_membership_types`.
-    let container = register_one(client, ctx, &TypeSpec::user_group_container()).await?;
+    // Step 2a: register the container with empty parents so RG's
+    // `resolve_ids(allowed_parent_types)` passes. `register_one`'s
+    // classification accepts a pre-existing row that already carries
+    // the self-parent rule (inclusive-equivalence on `allowed_parent_types`).
+    let container = register_one(
+        client,
+        ctx,
+        &TypeSpec::user_group_container_without_parents(),
+    )
+    .await?;
+    // Step 2b: patch the self-parent rule via `update_type`. Always
+    // run — `update_type` accepts the self-reference because
+    // `resolve_ids` resolves it against the already-inserted row.
+    let final_spec = TypeSpec::user_group_container();
+    if let Err(e) = client
+        .update_type(ctx, USER_GROUP_TYPE_CODE, final_spec.to_update_request())
+        .await
+    {
+        emit_metric(
+            AM_DEPENDENCY_HEALTH,
+            MetricKind::Counter,
+            &[
+                ("target", "resource_group"),
+                ("op", "register_user_group_type_patch_self_parent"),
+                ("outcome", "error"),
+            ],
+        );
+        return Err(RegistrationError::ServiceUnavailable(format!(
+            "resource-group: failed to patch self-parent rule on type '{USER_GROUP_TYPE_CODE}': {e}"
+        )));
+    }
+    info!(
+        target: "am.user_groups",
+        code = USER_GROUP_TYPE_CODE,
+        "user-groups RG container patched with self-parent rule"
+    );
     Ok(UserGroupRegistrationOutcome { member, container })
 }
 

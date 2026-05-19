@@ -101,12 +101,10 @@ pub fn build_activation_rows(
         child_status.is_sdk_visible(),
         "closure rows must not be written for provisioning tenants"
     );
-    // Promoted from `debug_assert!` to release-mode `assert!`: a
-    // malformed `ancestor_chain` would write corrupt closure rows
+    // A malformed `ancestor_chain` would write corrupt closure rows
     // (wrong ancestor pointers, missing self-row coverage). The
-    // integrity classifier set ships in a later PR — without these
-    // hard guards the bug would only surface there, after the bad
-    // rows have already been committed.
+    // integrity classifier would only surface the bug after the bad
+    // rows are already committed — fail fast at the call site instead.
     assert!(
         !ancestor_chain.iter().any(|t| t.id == child_id),
         "child_id must not appear in ancestor_chain"

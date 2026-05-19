@@ -19,21 +19,11 @@ info:
     migration window per the Compatibility NFR in DESIGN.md. Additive changes
     within v1 do not rev the path.
 
-    **Implementation status:** This PR lands the domain-layer
-    services for conversion requests (managed↔self-managed mode flips) and
-    IdP user-ops (`provision_user` / `deprovision_user` / `list_users`),
-    but does NOT publish their REST surfaces — the `/conversions`,
-    `/child-conversions`, and `/users` paths are intentionally absent
-    from this v1 contract. They land together with their handlers in
-    the follow-up REST PR (`cyberfabric-core#1813`). Pre-merging the
-    paths here would publish a contract that the server cannot satisfy:
-    standard OpenAPI codegen tools ignore `x-status` annotations and
-    generate clients that would hit `404 Not Found` at runtime. The
-    forward-looking schema shapes (`OwnConversionRequest`,
-    `ChildConversionRequest`, `UserSummary`, etc.) remain in
-    `#/components/schemas` so the handler PR ships paths + schemas
-    in one cohesive diff without re-introducing dangling type
-    definitions.
+    **Implementation status:** Tenant CRUD, tenant-metadata, IdP
+    user-ops, and conversion-request REST surfaces are all published.
+    The conversion family covers both sides of the dual-consent pair
+    (`/conversions` for the converting tenant; `/child-conversions`
+    for the parent counterparty).
 
 servers:
   - url: https://api.example.com
@@ -43,11 +33,14 @@ tags:
     description: Tenant hierarchy lifecycle and direct-child discovery.
   - name: metadata
     description: Tenant-scoped extensible metadata and effective-value resolution.
-  # `conversions` and `users` tags ship together with their paths in
-  # cyberfabric-core#1813 (REST handler PR). The domain-layer services
-  # (`ConversionService`, `UserService`) and their forward-looking
-  # schema shapes are already part of this contract; only the path
-  # surface is deferred.
+  - name: users
+    description: Tenant-scoped IdP user operations (provision, list, deprovision).
+  - name: conversions
+    description: |
+      Managed / self-managed mode conversion request lifecycle. Both
+      sides of the dual-consent pair are surfaced — the converting
+      tenant operates on `/conversions*`, the parent counterparty on
+      `/child-conversions*`.
 
 # Default security requirement applied to every operation. AM has no
 # public endpoints — the entire surface is tenant-scoped control-plane
@@ -68,10 +61,14 @@ paths:
       tags: [tenants]
       summary: Create a child tenant
       description: |
-        Creates a non-root tenant under an existing parent tenant. The server
-        validates tenant type compatibility, hierarchy constraints, and tenant
-        mode selection before invoking the configured IdP tenant-provisioning
-        contract.
+        Create a non-root tenant under an existing parent tenant. The
+        server validates the chained `tenant_type` against the published
+        GTS schema, derives the canonical UUIDv5 internally, and checks
+        hierarchy constraints (parent exists + is `active`) before
+        invoking the configured IdP tenant-provisioning contract. The
+        new tenant id is server-allocated; clients receive it in the
+        response body and in the `Location` header. Returns HTTP 201
+        Created with the post-create tenant projection in `status=active`.
       requestBody:
         required: true
         content:
@@ -97,6 +94,12 @@ paths:
       operationId: getTenant
       tags: [tenants]
       summary: Read tenant details
+      description: |
+        Read a tenant by id. The caller's PDP-narrowed scope clamps the
+        lookup to its authorised subtree at the database — a caller whose
+        scope does not contain `tenant_id` sees `not_found`, never the
+        row. Soft-deleted (`status=deleted`) tenants are SDK-visible;
+        AM-internal `provisioning` rows are never surfaced.
       responses:
         '200':
           description: Tenant details
@@ -110,6 +113,15 @@ paths:
       operationId: updateTenant
       tags: [tenants]
       summary: Update mutable tenant fields
+      description: |
+        Patch mutable tenant fields. Only `name` may be changed via
+        this endpoint; immutable fields (`parent_id`, `tenant_type`,
+        `self_managed`) and lifecycle fields (`status`) are rejected
+        by `additionalProperties: false`. Lifecycle transitions go
+        through `POST /tenants/{tenant_id}/suspend` /
+        `/unsuspend` (AIP-136 sub-resource fallback) and
+        `DELETE /tenants/{tenant_id}` for soft-delete. An empty patch
+        (no fields supplied) is a 400.
       requestBody:
         required: true
         content:
@@ -129,9 +141,69 @@ paths:
       operationId: deleteTenant
       tags: [tenants]
       summary: Soft-delete a tenant
+      description: |
+        Soft-delete a tenant. Flips `status=deleted` and stamps
+        `deleted_at` to arm the retention sweep; the row is hard-deleted
+        by the background reaper once the retention window elapses.
+        Preconditions: the tenant has no non-deleted children
+        (`tenant_has_children`), no resources owned in resource-group
+        (`tenant_has_resources`), and is not the platform root
+        (`root_tenant_cannot_delete`). Returns 204 No Content on success;
+        the post-delete projection (status=`deleted`,
+        `deleted_at` set) can be re-read via
+        `GET /tenants/{tenant_id}`.
+      responses:
+        '204':
+          description: Tenant soft-deleted
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/account-management/v1/tenants/{tenant_id}/suspend:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    post:
+      operationId: suspendTenant
+      tags: [tenants]
+      summary: Suspend an active tenant
+      description: |
+        Flip the target tenant's `status` from `active` to `suspended`.
+        Idempotent: a second call on an already-suspended row returns
+        200 with the same projection and does NOT bump `updated_at`
+        (the service short-circuits same-to-same inside the
+        SERIALIZABLE write). AIP-136 specifies the wire shape as
+        `POST /tenants/{tenant_id}:suspend`, but axum 0.8.x pins
+        `matchit = "=0.8.4"` which cannot split `{param}:suffix` in a
+        single segment; this endpoint uses the in-tree sub-resource
+        fallback (mirrors `mini-chat`'s `:retry` -> `/retry` fallback)
+        until axum bumps matchit (tracking
+        [axum#3702](https://github.com/tokio-rs/axum/pull/3702) and
+        [axum#3140](https://github.com/tokio-rs/axum/issues/3140)).
       responses:
         '200':
-          description: Tenant soft-deleted or already deleted
+          description: Suspended tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/account-management/v1/tenants/{tenant_id}/unsuspend:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    post:
+      operationId: unsuspendTenant
+      tags: [tenants]
+      summary: Unsuspend a suspended tenant
+      description: |
+        Flip the target tenant's `status` from `suspended` back to
+        `active`. Idempotent on already-active rows (same short-circuit
+        as `suspendTenant`). Sub-resource fallback for the AIP-136
+        colon-method — same axum/matchit constraint as the `suspend`
+        endpoint.
+      responses:
+        '200':
+          description: Unsuspended tenant
           content:
             application/json:
               schema:
@@ -142,13 +214,22 @@ paths:
   /api/account-management/v1/tenants/{tenant_id}/children:
     parameters:
       - $ref: '#/components/parameters/TenantId'
-      - $ref: '#/components/parameters/Top'
-      - $ref: '#/components/parameters/Skip'
-      - $ref: '#/components/parameters/StatusFilter'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/ODataFilter'
+      - $ref: '#/components/parameters/ODataOrderBy'
     get:
       operationId: listChildren
       tags: [tenants]
       summary: List direct children of a tenant
+      description: |
+        List direct children of the given tenant. Cursor-paginated with
+        `(created_at ASC, id ASC)` as the effective sort so siblings
+        sharing a `created_at` timestamp stay disambiguated across pages.
+        Soft-deleted rows are hidden by default — opt in with
+        `?$filter=status eq 'deleted'`. AM-internal `provisioning` rows are
+        never surfaced. The parent must exist and be SDK-visible,
+        otherwise the call collapses to `not_found`.
       responses:
         '200':
           description: Page of direct child tenants
@@ -159,28 +240,322 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
-  # /api/account-management/v1/tenants/{tenant_id}/conversions
-  # /api/account-management/v1/tenants/{tenant_id}/conversions/{request_id}
-  # /api/account-management/v1/tenants/{tenant_id}/child-conversions
-  # /api/account-management/v1/tenants/{tenant_id}/child-conversions/{request_id}
-  # /api/account-management/v1/tenants/{tenant_id}/users
-  # /api/account-management/v1/tenants/{tenant_id}/users/{user_id}
-  #
-  # Conversion-request and IdP user-ops REST paths land with their
-  # handlers in cyberfabric-core#1813. This PR ships only the
-  # domain-layer services (`ConversionService`, `UserService`) and
-  # their forward-looking schema shapes (`OwnConversionRequest`,
-  # `ChildConversionRequest`, `UserSummary`, etc. under
-  # `#/components/schemas`). Publishing the paths here without
-  # handlers would have generators emit clients hitting `404 Not
-  # Found` at runtime — standard OpenAPI tooling does not honor
-  # vendor `x-status` annotations.
+  /api/account-management/v1/tenants/{tenant_id}/users:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      operationId: listTenantUsers
+      tags: [users]
+      summary: List users provisioned in a tenant
+      description: |
+        Lists users provisioned in the tenant via the configured IdP plugin.
+        Supplying `user_id` turns the response into an authoritative existence
+        check — the page contains at most one element and an empty page is the
+        canonical "user absent" signal (no 404). AM persists no local user
+        state; every read is a pass-through to the IdP.
+
+        When `user_id` is supplied the server pins `top=1` and ignores any
+        client-provided `limit` / `cursor` — the filtered shape is an
+        existence check, not a paginated query.
+      parameters:
+        - $ref: '#/components/parameters/UserIdFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of tenant users
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPage'
+        default:
+          $ref: '#/components/responses/Problem'
+    post:
+      operationId: createTenantUser
+      tags: [users]
+      summary: Provision a user in a tenant
+      description: |
+        Provisions a user in the tenant via the configured IdP plugin. AM
+        persists no local user state — the IdP becomes the source of truth on
+        success.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreateRequest'
+      responses:
+        '201':
+          description: Tenant user provisioned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '4XX':
+          $ref: '#/components/responses/Problem'
+        '5XX':
+          $ref: '#/components/responses/Problem'
+
+  /api/account-management/v1/tenants/{tenant_id}/users/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+    delete:
+      operationId: deleteTenantUser
+      tags: [users]
+      summary: Deprovision a user from a tenant
+      description: |
+        Deprovisions a user from the tenant via the configured IdP plugin.
+        Idempotent: returns 204 No Content whether the IdP removed the row or
+        reported the user as already absent; a subsequent retry of the same
+        DELETE also returns 204. Provider implementations MUST NOT silently
+        no-op on a genuinely supported mutating operation — unsupported
+        deprovision surfaces as `code=idp_unsupported_operation`.
+      responses:
+        '204':
+          description: User deprovisioned (idempotent — same response on already-absent user)
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/account-management/v1/tenants/{tenant_id}/conversions:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    post:
+      operationId: requestOwnConversion
+      tags: [conversions]
+      summary: Initiate a conversion request (child-side)
+      description: |
+        Child-side initiation: the converting tenant requests a mode
+        flip. `target_mode` is REQUIRED and MUST be the strict binary
+        inverse of the tenant's current `self_managed` flag — the
+        service rejects any other value with `code=validation` so a
+        concurrent peer-flip surfaces as a clean envelope rather than
+        a silent implicit-inverse override. An optional `comment`
+        (1..=1000 chars; empty strings rejected with
+        `code=validation`) is persisted to `requested_comment`. The
+        partial-unique-index collision on the at-most-one-pending
+        invariant surfaces as `code=pending_exists` (HTTP 409) carrying
+        the existing `request_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RequestOwnConversion'
+      responses:
+        '201':
+          description: Conversion request created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OwnConversionRequest'
+        '4XX':
+          $ref: '#/components/responses/Problem'
+        '5XX':
+          $ref: '#/components/responses/Problem'
+    get:
+      operationId: listOwnConversions
+      tags: [conversions]
+      summary: List own conversion requests
+      description: |
+        Cursor-paginated listing of the converting tenant's own
+        conversion requests. Returns ALL lifecycle statuses (pending /
+        approved / cancelled / rejected / expired) — clients narrow to
+        the actionable subset via standard `?$filter=status eq 'pending'`.
+        Effective sort
+        defaults to `(created_at DESC, id ASC)` when no `$orderby` is
+        supplied; `id ASC` is the UNIQUE tiebreaker so cursor re-reads
+        stay deterministic.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/ODataFilter'
+        - $ref: '#/components/parameters/ODataOrderBy'
+      responses:
+        '200':
+          description: Paginated list of own conversion requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OwnConversionRequestPage'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/account-management/v1/tenants/{tenant_id}/conversions/{request_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getOwnConversion
+      tags: [conversions]
+      summary: Read a conversion request (child-side)
+      description: |
+        Point read of a single conversion request owned by the
+        URL-bound tenant. A `request_id` whose stored `tenant_id` does
+        NOT match the URL collapses to `code=not_found` — the
+        existence channel is uniform with a real not-found miss so
+        callers cannot probe row existence through the error code.
+      responses:
+        '200':
+          description: Conversion request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OwnConversionRequest'
+        default:
+          $ref: '#/components/responses/Problem'
+    patch:
+      operationId: patchOwnConversion
+      tags: [conversions]
+      summary: Resolve a conversion request (child-side)
+      description: |
+        Drive a `pending` row to one of three admissible terminal
+        statuses. The body's `status` field routes to the matching
+        service method: `cancel` is initiator-only, `approve` and
+        `reject` are counterparty-only (initiator gets
+        `code=invalid_actor_for_transition`). Idempotent retries on
+        already-resolved rows surface `code=already_resolved`.
+        `pending` and `expired` are NOT admissible PATCH targets and
+        are rejected at the wire layer with a clean 400 envelope.
+        `comment` is optional (1..=1000 chars) and stamped on the
+        matching per-transition column
+        (`approved_comment` / `cancelled_comment` / `rejected_comment`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConversionPatchRequest'
+      responses:
+        '200':
+          description: Resolved conversion request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OwnConversionRequest'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/account-management/v1/tenants/{tenant_id}/child-conversions:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    post:
+      operationId: requestChildConversion
+      tags: [conversions]
+      summary: Initiate a conversion request on a direct child (parent-side)
+      description: |
+        Parent-side initiation: the URL-bound parent requests a mode
+        flip on one of its direct children. The body carries the
+        child's `child_tenant_id`; the URL binds the parent.
+        `target_mode` follows the same inverse-only contract as the
+        own-side initiation. The service's URL-vs-row coherence guard
+        surfaces a misrouted call (a `child_tenant_id` whose
+        `parent_id` is not the URL-bound parent) as `code=not_found`.
+        Response surfaces the cross-barrier minimal projection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChildConversionCreateRequest'
+      responses:
+        '201':
+          description: Conversion request created (cross-barrier minimal projection)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChildConversionRequest'
+        '4XX':
+          $ref: '#/components/responses/Problem'
+        '5XX':
+          $ref: '#/components/responses/Problem'
+    get:
+      operationId: listChildConversions
+      tags: [conversions]
+      summary: List inbound child conversion requests (parent-side)
+      description: |
+        Cursor-paginated parent-side inbound listing. Surfaces only
+        the cross-barrier minimal projection per
+        `dod-managed-self-managed-modes-parent-side-minimal-surface`:
+        no child-subtree data (tenant metadata beyond
+        `child_tenant_name`, descendants, user records, resource
+        inventories) leaks across the barrier. Returns ALL lifecycle
+        statuses; clients filter via `?$filter=status eq 'pending'`
+        the same way as the own listing. The listing accepts
+        conversion requests targeting self-managed children whose
+        closure barrier hides the child tenant from the parent — the
+        dual-consent flows live under the parent's URL authority.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/ODataFilter'
+        - $ref: '#/components/parameters/ODataOrderBy'
+      responses:
+        '200':
+          description: Paginated list of inbound child conversion requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChildConversionRequestPage'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/account-management/v1/tenants/{tenant_id}/child-conversions/{request_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getChildConversion
+      tags: [conversions]
+      summary: Read an inbound child conversion request (parent-side)
+      description: |
+        Parent-side point read. Same cross-barrier minimal projection
+        contract as the list endpoint. A `request_id` whose stored
+        `parent_id` does NOT match the URL collapses to
+        `code=not_found`.
+      responses:
+        '200':
+          description: Conversion request (cross-barrier minimal projection)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChildConversionRequest'
+        default:
+          $ref: '#/components/responses/Problem'
+    patch:
+      operationId: patchChildConversion
+      tags: [conversions]
+      summary: Resolve an inbound child conversion request (parent-side)
+      description: |
+        Parent-side PATCH dispatcher. Same status-to-method routing
+        as the own PATCH endpoint, constructed with the URL-bound
+        parent caller so the service runs the counterparty-only rule
+        for `approve` / `reject` and the initiator-only rule for
+        `cancel` against the parent side. Response surfaces the
+        cross-barrier minimal projection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConversionPatchRequest'
+      responses:
+        '200':
+          description: Resolved conversion request (cross-barrier minimal projection)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChildConversionRequest'
+        default:
+          $ref: '#/components/responses/Problem'
 
   /api/account-management/v1/tenants/{tenant_id}/metadata:
     parameters:
       - $ref: '#/components/parameters/TenantId'
-      - $ref: '#/components/parameters/Top'
-      - $ref: '#/components/parameters/Skip'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/ODataFilter'
+      - $ref: '#/components/parameters/ODataOrderBy'
     get:
       operationId: listTenantMetadata
       tags: [metadata]
@@ -235,13 +610,17 @@ paths:
       operationId: deleteTenantMetadata
       tags: [metadata]
       summary: Delete a tenant metadata entry
+      description: |
+        Hard-delete the metadata entry attached directly to this tenant
+        for the given chained `schema_id`. Idempotent on missing rows:
+        returns 204 whether the direct entry existed and was removed or
+        was already absent (mirrors `delete_user` deprovision
+        idempotency). The tenant-existence and schema-registration gates
+        still raise their own 404 codes
+        (`tenant_not_found`, `metadata_schema_not_registered`).
       responses:
-        '200':
-          description: Metadata entry deleted
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TenantMetadataDeletionResult'
+        '204':
+          description: Metadata entry deleted or already absent
         default:
           $ref: '#/components/responses/Problem'
 
@@ -308,43 +687,64 @@ components:
         type: string
         format: uuid
         description: Optional UUID user identifier filter for point lookup behavior.
-    Top:
-      name: $top
+    Limit:
+      name: limit
       in: query
       required: false
+      description: Number of items per page (1..200).
       schema:
         type: integer
         minimum: 1
         maximum: 200
         default: 50
-    Skip:
-      name: $skip
-      in: query
-      required: false
-      schema:
-        type: integer
-        minimum: 0
-        default: 0
-    StatusFilter:
-      name: status
+    Cursor:
+      name: cursor
       in: query
       required: false
       description: |
-        Optional tenant-status filter. One of: `active`, `suspended`, `deleted`.
-        Omit to include all statuses.
+        Opaque cursor token from a previous response (`next_cursor`
+        or `prev_cursor`). Changing `$filter` on a follow-up request
+        with an existing cursor returns `400 FILTER_MISMATCH`.
       schema:
-        $ref: '#/components/schemas/TenantStatus'
-    ConversionStatusFilter:
-      name: status
+        type: string
+    ODataFilter:
+      name: $filter
       in: query
       required: false
-      schema:
-        oneOf:
-          - $ref: '#/components/schemas/ConversionStatus'
-          - type: string
-            enum: [any]
-        default: pending
+      description: |
+        OData `$filter` expression. Filterable columns are declared
+        per-endpoint via the SDK's `*FilterField` enum (e.g.
+        `MetadataEntryFilterField`, `TenantFilterField`). An
+        expression referencing a column not present in that enum
+        returns `400 INVALID_FILTER_FIELD`.
 
+        **Enum-shaped categorical columns.** `tenants.status`,
+        `conversion_requests.status`, `conversion_requests.target_mode`,
+        and `conversion_requests.initiator_side` accept the public
+        enum string on the wire and are mapped to the storage
+        `SMALLINT` ordinal at the repo boundary. Examples:
+        `status eq 'active'`, `status eq 'pending'`,
+        `target_mode eq 'self_managed'`, `initiator_side eq 'child'`.
+        Only `eq`, `ne`, and `in` are admissible on these columns;
+        ordered comparisons (`gt`/`ge`/`lt`/`le`) and `$orderby` are
+        rejected with `400 INVALID_FILTER` because there is no
+        consistent ordering across the wire (alphabetical) and
+        storage (numeric) shapes. Response bodies
+        return the same field as a string (`"pending"`, `"active"`,
+        etc.) for human readability — the filter is the one place
+        the wire surface diverges from the response shape.
+      schema:
+        type: string
+    ODataOrderBy:
+      name: $orderby
+      in: query
+      required: false
+      description: |
+        OData `$orderby` clause. Defaults are endpoint-specific; cursor
+        pagination merges a stable tiebreaker automatically when callers
+        omit `$orderby` or order by a non-unique column.
+      schema:
+        type: string
   responses:
     Problem:
       description: RFC 9457 problem response
@@ -373,15 +773,26 @@ components:
     PageInfo:
       type: object
       additionalProperties: false
-      required: [top, skip]
+      required: [limit]
+      description: |
+        Cursor-based pagination envelope, mirroring the
+        `modkit_odata::PageInfo` Rust shape that every cyberware
+        listing endpoint returns. The opaque `next_cursor` /
+        `prev_cursor` tokens are forward-only (the issuer is the only
+        party that can decode them) and are bound to the originating
+        `$filter` — changing the filter on a follow-up request with an
+        existing cursor returns `400 FILTER_MISMATCH`.
       properties:
-        top:
+        next_cursor:
+          type: string
+          description: Opaque token for the next page. Omitted on the last page.
+        prev_cursor:
+          type: string
+          description: Opaque token for the previous page. Omitted on the first page.
+        limit:
           type: integer
-        skip:
-          type: integer
-        total:
-          type: [integer, 'null']
           format: int64
+          description: Effective page size applied to this page.
 
     Tenant:
       type: object
@@ -390,7 +801,6 @@ components:
         - id
         - name
         - parent_id
-        - tenant_type
         - status
         - self_managed
         - depth
@@ -409,7 +819,11 @@ components:
           format: uuid
         tenant_type:
           type: string
-          description: Full chained GTS schema identifier for the tenant type.
+          description: |
+            Full chained GTS schema identifier for the tenant type. Omitted when
+            the types registry was momentarily unreachable at the lowering site
+            (best-effort field; AM does not block read responses on a registry
+            blip).
         status:
           $ref: '#/components/schemas/TenantStatus'
         self_managed:
@@ -426,6 +840,10 @@ components:
         deleted_at:
           type: [string, 'null']
           format: date-time
+          description: |
+            Soft-delete tombstone. Present iff `status == deleted`;
+            omitted for live tenants. The retention sweep becomes eligible
+            to hard-delete this row at `deleted_at + retention_window`.
 
     TenantCreateRequest:
       type: object
@@ -458,9 +876,14 @@ components:
           type: string
           minLength: 1
           maxLength: 255
-        status:
-          type: string
-          enum: [active, suspended]
+      description: |
+        Only `name` is mutable via PATCH. Lifecycle transitions
+        (`active <-> suspended`) go through
+        `POST /tenants/{tenant_id}/suspend` /
+        `POST /tenants/{tenant_id}/unsuspend`; soft-delete goes
+        through `DELETE /tenants/{tenant_id}`. A request body carrying
+        any other property (e.g. `status`, `parent_id`, `tenant_type`)
+        is rejected with HTTP 400 by `additionalProperties: false`.
 
     TenantPage:
       type: object
@@ -480,55 +903,6 @@ components:
       required:
         - id
         - tenant_id
-        - target_mode
-        - initiator_side
-        - status
-        - requested_by
-        - created_at
-        - expires_at
-        - updated_at
-      properties:
-        id:
-          type: string
-          format: uuid
-        tenant_id:
-          type: string
-          format: uuid
-        target_mode:
-          $ref: '#/components/schemas/TenantMode'
-        initiator_side:
-          type: string
-          enum: [child, parent]
-        status:
-          $ref: '#/components/schemas/ConversionStatus'
-        requested_by:
-          type: string
-          format: uuid
-        approved_by:
-          type: [string, 'null']
-          format: uuid
-        cancelled_by:
-          type: [string, 'null']
-          format: uuid
-        rejected_by:
-          type: [string, 'null']
-          format: uuid
-        created_at:
-          type: string
-          format: date-time
-        expires_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-
-    ChildConversionRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - child_tenant_id
         - child_tenant_name
         - target_mode
         - initiator_side
@@ -536,13 +910,15 @@ components:
         - requested_by
         - created_at
         - expires_at
-        - updated_at
       properties:
         id:
           type: string
           format: uuid
-        child_tenant_id:
+        tenant_id:
           type: string
+          format: uuid
+        parent_id:
+          type: [string, 'null']
           format: uuid
         child_tenant_name:
           type: string
@@ -571,9 +947,111 @@ components:
         expires_at:
           type: string
           format: date-time
-        updated_at:
+        resolved_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            Wall-clock at which the row entered a terminal state.
+            Present iff `status` is one of `approved` / `cancelled` /
+            `rejected` / `expired`; omitted on pending rows.
+        requested_comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
+          description: |
+            Optional caller-supplied rationale stamped at request
+            time. `Some("")` is rejected at the service boundary with
+            `code=validation`.
+        approved_comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
+          description: Optional approver rationale stamped on `pending -> approved`.
+        cancelled_comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
+          description: Optional initiator rationale stamped on `pending -> cancelled`.
+        rejected_comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
+          description: Optional rejecter rationale stamped on `pending -> rejected`.
+
+    ChildConversionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - request_id
+        - tenant_id
+        - child_tenant_name
+        - target_mode
+        - initiator_side
+        - status
+        - requested_by
+        - created_at
+        - expires_at
+      description: |
+        Parent-side cross-barrier minimal projection per
+        `dod-managed-self-managed-modes-parent-side-minimal-surface`:
+        every field is derivable from the conversion row itself or
+        the converting child's own `tenant_id` / `child_tenant_name`.
+        No subtree metadata, descendants, user records, or resource
+        inventories leak across the barrier.
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+          description: Converting child tenant's UUID.
+        child_tenant_name:
+          type: string
+        target_mode:
+          $ref: '#/components/schemas/TenantMode'
+        initiator_side:
+          type: string
+          enum: [child, parent]
+        status:
+          $ref: '#/components/schemas/ConversionStatus'
+        requested_by:
+          type: string
+          format: uuid
+        approved_by:
+          type: [string, 'null']
+          format: uuid
+        cancelled_by:
+          type: [string, 'null']
+          format: uuid
+        rejected_by:
+          type: [string, 'null']
+          format: uuid
+        created_at:
           type: string
           format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: [string, 'null']
+          format: date-time
+        requested_comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
+        approved_comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
+        cancelled_comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
+        rejected_comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
 
     OwnConversionRequestPage:
       type: object
@@ -599,23 +1077,68 @@ components:
         page_info:
           $ref: '#/components/schemas/PageInfo'
 
+    RequestOwnConversion:
+      type: object
+      additionalProperties: false
+      required: [target_mode]
+      description: |
+        Request body for `POST /tenants/{tenant_id}/conversions`. The
+        URL binds the converting tenant; the body carries the
+        REQUIRED `target_mode` (strict binary inverse of the tenant's
+        current `self_managed` — any other value surfaces
+        `code=validation`) and an optional `comment` (1..=1000 chars)
+        stamped on `requested_comment`.
+      properties:
+        target_mode:
+          $ref: '#/components/schemas/TenantMode'
+        comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
+
     ChildConversionCreateRequest:
       type: object
       additionalProperties: false
-      required: [child_tenant_id]
+      required: [child_tenant_id, target_mode]
+      description: |
+        Request body for
+        `POST /tenants/{tenant_id}/child-conversions`. The URL binds
+        the parent; the body carries the converting child's
+        `child_tenant_id`, the REQUIRED `target_mode` (same
+        inverse-only contract as the own-side initiation), and an
+        optional `comment` (1..=1000 chars) stamped on
+        `requested_comment`.
       properties:
         child_tenant_id:
           type: string
           format: uuid
+        target_mode:
+          $ref: '#/components/schemas/TenantMode'
+        comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
 
     ConversionPatchRequest:
       type: object
       additionalProperties: false
       required: [status]
+      description: |
+        Request body for `PATCH /conversions/{request_id}` (and the
+        parent-side mirror). `status` is wire-narrow to the three
+        admissible terminal transitions; `pending` and `expired` are
+        rejected at deserialise time with a clean 400 envelope.
+        `comment` is optional (1..=1000 chars; empty strings rejected
+        with `code=validation`) and stamped on the matching
+        per-transition column.
       properties:
         status:
           type: string
           enum: [approved, cancelled, rejected]
+        comment:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 1000
 
     UserCreateRequest:
       type: object
@@ -634,7 +1157,7 @@ components:
           type: [string, 'null']
           description: Optional display name surfaced through the projection.
 
-    UserSummary:
+    User:
       type: object
       additionalProperties: false
       required: [id, username]
@@ -659,42 +1182,38 @@ components:
         items:
           type: array
           items:
-            $ref: '#/components/schemas/UserSummary'
+            $ref: '#/components/schemas/User'
         page_info:
           $ref: '#/components/schemas/PageInfo'
 
-    UserDeletionResult:
-      type: object
-      additionalProperties: false
-      required: [user_id, deleted]
-      properties:
-        user_id:
-          type: string
-          format: uuid
-          description: Deleted IdP-issued UUID user identifier.
-        deleted:
-          type: boolean
-
     TenantMetadataValue:
-      type: object
-      description: GTS-schema-validated metadata payload.
-      additionalProperties: true
+      description: |
+        Opaque GTS-schema-validated metadata payload. The wire shape is
+        any JSON value (object, array, scalar, null) — the service-side
+        validator checks the payload against the registered JSON Schema
+        for the targeted `schema_id`. A `null` body specifically is
+        rejected with `400 metadata_validation`; other shapes pass the
+        DTO layer and are validated by the registered schema.
 
     TenantMetadataEntry:
       type: object
       additionalProperties: false
-      required: [tenant_id, schema_id, value, created_at, updated_at]
+      required: [tenant_id, schema_id, value, updated_at]
+      description: |
+        Direct-on-tenant metadata entry. `created_at` is intentionally
+        not exposed — the public contract only commits to `updated_at`
+        (cache-validation use cases); the storage layer carries
+        `created_at` for audit / retention reasoning but does not
+        surface it through the SDK projection.
       properties:
         tenant_id:
           type: string
           format: uuid
         schema_id:
           type: string
+          description: Chained `gts.cf.core.am.tenant_metadata.v1~vendor.pkg.ns.type.v1~` identifier.
         value:
           $ref: '#/components/schemas/TenantMetadataValue'
-        created_at:
-          type: string
-          format: date-time
         updated_at:
           type: string
           format: date-time
@@ -724,24 +1243,8 @@ components:
         resolved:
           type: boolean
           description: Whether an effective value was found.
-        source_tenant_id:
-          type: [string, 'null']
-          format: uuid
         value:
           $ref: '#/components/schemas/TenantMetadataValue'
-
-    TenantMetadataDeletionResult:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, schema_id, deleted]
-      properties:
-        tenant_id:
-          type: string
-          format: uuid
-        schema_id:
-          type: string
-        deleted:
-          type: boolean
 
     Problem:
       type: object

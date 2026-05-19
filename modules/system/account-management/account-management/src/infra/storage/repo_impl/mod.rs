@@ -7,6 +7,7 @@
 
 pub mod conversion;
 mod helpers;
+mod hierarchy_read;
 mod integrity;
 mod lifecycle;
 pub mod metadata;
@@ -15,6 +16,7 @@ mod retention;
 mod updates;
 
 pub use conversion::ConversionRepoImpl;
+pub use hierarchy_read::TenantHierarchyReadAdapter;
 pub use metadata::MetadataRepoImpl;
 
 use std::sync::Arc;

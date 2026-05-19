@@ -23,6 +23,7 @@ use account_management_sdk::{
 };
 
 use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, AM_TENANT_RETENTION, MetricKind, emit_metric};
+use crate::domain::system_actor::for_retention_sweep;
 use crate::domain::tenant::hooks::{HookError, TenantHardDeleteHook};
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::retention::{
@@ -95,14 +96,7 @@ impl<R: TenantRepo> TenantService<R> {
             guard.clone()
         };
 
-        // `AccountManagementConfig::validate` (the authoritative
-        // gate, called by the module `init` lifecycle) rejects
-        // `hard_delete_concurrency == 0` at startup, so this `.max(1)`
-        // is unreachable in a validated production config. Kept as
-        // defense-in-depth: a future code path that bypasses
-        // `validate` (e.g. a test that constructs a `TenantService`
-        // by hand) still gets forward progress instead of a stalled
-        // `buffer_unordered(0)` stream.
+        // .max(1) is defense-in-depth for hand-built TenantService instances that bypass validate(); buffer_unordered(0) would stall.
         let concurrency = self.cfg.retention.hard_delete_concurrency.max(1);
         let mut result = HardDeleteResult::default();
         // `BTreeMap` iterates keys ascending; reverse to drain the
@@ -217,23 +211,8 @@ impl<R: TenantRepo> TenantService<R> {
                         )
                         .await
                     {
-                        Ok(_) => {
-                            // `Ok(true)` — row parked; subsequent
-                            // ticks skip it via the
-                            // `terminal_failure_at IS NULL` scan
-                            // filter, so the per-tick
-                            // `cascade_terminal` /
-                            // `idp_terminal` outcome metric
-                            // naturally goes from "rising every
-                            // tick" to "single spike then flat" —
-                            // that IS the operator signal of
-                            // "parking landed".
-                            //
-                            // `Ok(false)` — idempotent no-op (claim
-                            // was lost mid-tick OR row already
-                            // parked). Either case is benign; no
-                            // separate metric needed.
-                        }
+                        // Ok(true) parked; Ok(false) idempotent no-op (lost claim or already parked). No separate metric needed.
+                        Ok(_) => {}
                         Err(err) => {
                             warn!(
                                 target: "am.retention",
@@ -445,11 +424,13 @@ impl<R: TenantRepo> TenantService<R> {
                 return HardDeleteOutcome::IdpRetryable;
             }
         };
+        let sys_ctx = for_retention_sweep(row.id);
         let idp_skipped = match self
             .idp
-            .deprovision_tenant(&IdpDeprovisionTenantRequest::new(IdpTenantContext::from(
-                &tenant_context,
-            )))
+            .deprovision_tenant(
+                &sys_ctx,
+                &IdpDeprovisionTenantRequest::new(IdpTenantContext::from(&tenant_context)),
+            )
             .await
         {
             Ok(()) => {

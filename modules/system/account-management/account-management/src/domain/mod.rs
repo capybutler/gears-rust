@@ -16,6 +16,7 @@
 //! transport contract lands, an `audit`-shaped sub-module can be
 //! reintroduced without touching the call sites that already log.
 
+pub(crate) mod authz;
 pub mod bootstrap;
 pub mod conversion;
 pub mod error;
@@ -25,6 +26,7 @@ pub mod integrity_check;
 pub mod metadata;
 pub mod metrics;
 pub mod ports;
+pub mod system_actor;
 pub mod tenant;
 pub mod tenant_type;
 pub mod user;

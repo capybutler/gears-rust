@@ -46,6 +46,12 @@ pub(crate) struct TenantResource;
 #[resource_error("gts.cf.core.am.user.v1~")]
 pub(crate) struct UserResource;
 
+// `TenantMetadataResource` carries the unified 404 for the metadata
+// surface — both "schema unknown to the registry" and "entry missing
+// for this tenant" resolve to this `resource_type`. The chained
+// `schema_id` the caller supplied is surfaced through
+// `resource_name`, so consumers still see *which* schema was
+// involved without a separate type-level discriminator.
 #[resource_error("gts.cf.core.am.tenant_metadata.v1~")]
 pub(crate) struct TenantMetadataResource;
 
@@ -71,6 +77,13 @@ impl From<DomainError> for AccountManagementError {
             // ---- Tenant CRUD ----
             DomainError::InvalidTenantType { detail } => Self::InvalidTenantType { detail },
             DomainError::Validation { detail } => Self::InvalidRequest { detail },
+            // Metadata-payload validation rejects (malformed chained
+            // schema id, GTS body validation failure, etc.) route to
+            // the dedicated `MetadataInvalidRequest` so the canonical
+            // envelope can carry `TENANT_METADATA_RESOURCE_TYPE`
+            // instead of the tenant default. Both map to HTTP 400
+            // `invalid_argument` at the AIP-193 layer.
+            DomainError::MetadataValidation { detail } => Self::MetadataInvalidRequest { detail },
             DomainError::RootTenantCannotDelete => Self::RootTenantCannotDelete,
             DomainError::RootTenantCannotConvert => Self::RootTenantCannotConvert,
 
@@ -110,9 +123,6 @@ impl From<DomainError> for AccountManagementError {
             DomainError::AlreadyResolved => Self::ConversionAlreadyResolved,
 
             // ---- Tenant metadata ----
-            DomainError::MetadataSchemaNotRegistered { detail, schema } => {
-                Self::MetadataSchemaNotRegistered { schema, detail }
-            }
             DomainError::MetadataEntryNotFound { detail, entry } => {
                 Self::MetadataEntryNotFound { entry, detail }
             }
@@ -136,18 +146,12 @@ impl From<DomainError> for AccountManagementError {
             // ---- Transactional ----
             DomainError::Aborted { reason: _, detail } => Self::SerializationConflict { detail },
 
-            // `IntegrityCheckInProgress` is intentionally not handled
-            // here — it is not part of the inter-module SDK contract
-            // (no `AccountManagementClient` method surfaces it). The
-            // canonical-boundary impl below short-circuits the variant
-            // straight to its 429 envelope.
-            DomainError::IntegrityCheckInProgress => {
-                unreachable!(
-                    "DomainError::IntegrityCheckInProgress must be handled by \
-                     From<DomainError> for CanonicalError before reaching the SDK boundary; \
-                     no public `AccountManagementClient` method surfaces it"
-                )
-            }
+            // Not reachable via REST (canonical impl short-circuits to 429);
+            // defensive fallback on `Internal` for tooling that lifts
+            // `DomainError` directly.
+            DomainError::IntegrityCheckInProgress => Self::Internal {
+                detail: "integrity check already in progress".to_owned(),
+            },
 
             // ---- IdP plugin (with detail redaction) ----
             //
@@ -217,10 +221,8 @@ impl From<DomainError> for AccountManagementError {
 
 // @cpt-begin:cpt-cf-account-management-algo-errors-observability-error-to-problem-mapping:p1:inst-algo-etp-sdk-to-canonical
 /// Lift the public SDK error envelope onto the AIP-193 canonical
-/// shape. Reproduces the resource-tagged builder calls AM emitted
-/// before the migration to per-semantic SDK variants — same category,
-/// status, resource type, field-violation / precondition-violation /
-/// reason context.
+/// shape — same category, status, resource type, field-violation /
+/// precondition-violation / reason context.
 #[must_use]
 pub(crate) fn account_management_error_to_canonical(err: AccountManagementError) -> CanonicalError {
     use AccountManagementError as A;
@@ -237,11 +239,12 @@ pub(crate) fn account_management_error_to_canonical(err: AccountManagementError)
                 .with_resource(request_id)
                 .create()
         }
-        A::MetadataSchemaNotRegistered { schema, detail } => {
-            TenantMetadataResource::not_found(detail)
-                .with_resource(schema)
-                .create()
-        }
+        // Both "schema unknown to registry" and "entry missing for
+        // tenant" resolve to the same `TenantMetadataResource` 404 —
+        // AM no longer distinguishes them on the wire. `entry`
+        // carries the chained `schema_id` the caller supplied (or a
+        // bare `schema_uuid` on the rare orphan-row paths handled
+        // via `Internal` rather than this 404).
         A::MetadataEntryNotFound { entry, detail } => TenantMetadataResource::not_found(detail)
             .with_resource(entry)
             .create(),
@@ -262,6 +265,9 @@ pub(crate) fn account_management_error_to_canonical(err: AccountManagementError)
             .create(),
         A::InvalidRequest { detail } => TenantResource::invalid_argument()
             .with_field_violation("request", detail, "VALIDATION")
+            .create(),
+        A::MetadataInvalidRequest { detail } => TenantMetadataResource::invalid_argument()
+            .with_field_violation("metadata", detail, "VALIDATION")
             .create(),
         A::RootTenantCannotDelete => TenantResource::invalid_argument()
             .with_field_violation(
@@ -311,16 +317,20 @@ pub(crate) fn account_management_error_to_canonical(err: AccountManagementError)
             .with_precondition_violation("configuration", detail, "FEATURE_DISABLED")
             .create(),
 
+        // ---- AlreadyExists (conversion request) ----
+        // Duplicate-on-create per AIP-193: at-most-one-pending invariant
+        // surfaces as `code=pending_exists` (HTTP 409). The OpenAPI
+        // contract (`docs/account-management-v1.yaml`) and the handler
+        // docstrings document the 409 wire shape; the existing
+        // `request_id` is the structural resource identifier so the
+        // canonical `with_resource(...)` carries it.
+        A::PendingConversionExists { request_id } => ConversionRequestResource::already_exists(
+            format!("a pending conversion request already exists: {request_id}"),
+        )
+        .with_resource(request_id)
+        .create(),
+
         // ---- FailedPrecondition (conversion request) ----
-        A::PendingConversionExists { request_id } => {
-            ConversionRequestResource::failed_precondition()
-                .with_precondition_violation(
-                    "conversion_request",
-                    format!("a pending conversion request already exists: {request_id}"),
-                    "PENDING_EXISTS",
-                )
-                .create()
-        }
         A::InvalidActorForConversionTransition {
             attempted_status,
             caller_side,
@@ -386,10 +396,9 @@ pub(crate) fn account_management_error_to_canonical(err: AccountManagementError)
         // ---- Internal ----
         A::Internal { detail } => CanonicalError::internal(detail).create(),
 
-        // `AccountManagementError` is `#[non_exhaustive]`; arms above
-        // cover every variant at the time this mapping was written. A
-        // future variant surfaces through this fallback as a 500 with
-        // a generic diagnostic until the mapping is extended.
+        // `AccountManagementError` is `#[non_exhaustive]`; this
+        // fallback maps any unmapped variant to a 500 with a generic
+        // diagnostic.
         #[allow(unreachable_patterns)]
         _ => CanonicalError::internal("unmapped AccountManagementError variant").create(),
     }

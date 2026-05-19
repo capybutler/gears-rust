@@ -30,20 +30,6 @@
 //!   [`crate::domain::metrics`]. Unit hints are attached on the
 //!   adapter via `.with_unit("ms")`/`.with_unit("s")`, not embedded
 //!   in the metric name.
-//!
-//! ## Phasing
-//!
-//! This file is **port-only**. No adapter, no wire-up, no migration of
-//! call sites. Follow-up PRs:
-//!
-//! 1. `infra/metrics.rs` — `AmMetricsMeter` adapter implementing every
-//!    trait against `opentelemetry::global::meter_with_scope(...)`.
-//! 2. `module.rs` wire-up: construct one `Arc<AmMetricsMeter>` and
-//!    coerce per-trait `Arc<dyn ...>` views to inject into services.
-//! 3. Per-subdomain call-site migration from the stringly-typed
-//!    `emit_metric` facade onto these typed methods.
-//! 4. Removal of [`crate::domain::metrics`] facade once all call sites
-//!    have moved.
 
 use account_management_sdk::idp::{IdpDeprovisionFailure, IdpProvisionFailure};
 use account_management_sdk::idp_user::IdpUserOperationFailure;
@@ -56,10 +42,9 @@ use crate::domain::tenant::retention::HardDeleteOutcome;
 //  Label-value taxonomy
 // ════════════════════════════════════════════════════════════════════
 //
-//  Enums for closed, statically-known value sets. Sealed newtypes
+//  Enums for closed, statically-known value sets; sealed newtypes
 //  (`pub struct X(&'static str)`) for value sets that need to bridge
-//  existing SDK/domain failure types via their `as_metric_label()`
-//  helpers.
+//  existing SDK/domain failure types via `as_metric_label()`.
 
 // ── am.bootstrap_lifecycle ──────────────────────────────────────────
 

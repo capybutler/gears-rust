@@ -84,6 +84,24 @@ pub struct Model {
     pub expires_at: OffsetDateTime,
     #[sea_orm(nullable)]
     pub deleted_at: Option<OffsetDateTime>,
+    /// Optional caller-supplied rationale captured at request time
+    /// (`request_conversion`). `m0006` enforces `length BETWEEN 1 AND
+    /// 1000` at the DB layer; the service layer rejects empty / oversize
+    /// values as defence-in-depth before INSERT.
+    #[sea_orm(nullable)]
+    pub requested_comment: Option<String>,
+    /// Optional approver rationale captured on the `pending -> approved`
+    /// transition. Same length contract as `requested_comment`.
+    #[sea_orm(nullable)]
+    pub approved_comment: Option<String>,
+    /// Optional canceller rationale captured on the
+    /// `pending -> cancelled` transition. Same length contract.
+    #[sea_orm(nullable)]
+    pub cancelled_comment: Option<String>,
+    /// Optional rejecter rationale captured on the
+    /// `pending -> rejected` transition. Same length contract.
+    #[sea_orm(nullable)]
+    pub rejected_comment: Option<String>,
 }
 // @cpt-end:cpt-cf-account-management-dbtable-conversion-requests:p1:inst-dbtable-conversion-requests-entity
 

@@ -49,12 +49,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use modkit_odata::{ODataQuery, Page, PageInfo};
 use modkit_security::AccessScope;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::conversion::model::{
-    ConversionPagination, ConversionRequest, ConversionStatus, NewConversionRequest, TargetMode,
+    ConversionRequest, ConversionStatus, NewConversionRequest, TargetMode,
 };
 use crate::domain::conversion::repo::{ApplyConversionApprovalInput, ConversionRepo};
 use crate::domain::error::DomainError;
@@ -340,6 +341,10 @@ fn materialize_pending(
         resolved_at: None,
         expires_at: new.expires_at,
         deleted_at: None,
+        requested_comment: new.requested_comment.clone(),
+        approved_comment: None,
+        cancelled_comment: None,
+        rejected_comment: None,
     }
 }
 
@@ -416,6 +421,7 @@ impl ConversionRepo for FakeConversionRepo {
         request_id: Uuid,
         approved_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
         let mut state = self.inner.lock().expect("lock");
         state.captured_scopes.push(scope.clone());
@@ -423,6 +429,7 @@ impl ConversionRepo for FakeConversionRepo {
         row.status = ConversionStatus::Approved;
         row.approved_by = Some(approved_by);
         row.resolved_at = Some(resolved_at);
+        row.approved_comment = comment;
         let updated = row.clone();
         state.pending_by_tenant.remove(&updated.tenant_id);
         Ok(updated)
@@ -684,6 +691,7 @@ impl ConversionRepo for FakeConversionRepo {
             row.status = ConversionStatus::Approved;
             row.approved_by = Some(input.approver_uuid);
             row.resolved_at = Some(input.resolved_at);
+            row.approved_comment = input.approval_comment.clone();
             let snap = row.clone();
             state.pending_by_tenant.remove(&snap.tenant_id);
             snap
@@ -699,6 +707,7 @@ impl ConversionRepo for FakeConversionRepo {
         request_id: Uuid,
         cancelled_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
         let mut state = self.inner.lock().expect("lock");
         state.captured_scopes.push(scope.clone());
@@ -706,6 +715,7 @@ impl ConversionRepo for FakeConversionRepo {
         row.status = ConversionStatus::Cancelled;
         row.cancelled_by = Some(cancelled_by);
         row.resolved_at = Some(resolved_at);
+        row.cancelled_comment = comment;
         let updated = row.clone();
         state.pending_by_tenant.remove(&updated.tenant_id);
         Ok(updated)
@@ -717,6 +727,7 @@ impl ConversionRepo for FakeConversionRepo {
         request_id: Uuid,
         rejected_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
         let mut state = self.inner.lock().expect("lock");
         state.captured_scopes.push(scope.clone());
@@ -724,6 +735,7 @@ impl ConversionRepo for FakeConversionRepo {
         row.status = ConversionStatus::Rejected;
         row.rejected_by = Some(rejected_by);
         row.resolved_at = Some(resolved_at);
+        row.rejected_comment = comment;
         let updated = row.clone();
         state.pending_by_tenant.remove(&updated.tenant_id);
         Ok(updated)
@@ -749,47 +761,54 @@ impl ConversionRepo for FakeConversionRepo {
         &self,
         _scope: &AccessScope,
         tenant_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-        pagination: ConversionPagination,
-    ) -> Result<Vec<ConversionRequest>, DomainError> {
+        query: &ODataQuery,
+    ) -> Result<Page<ConversionRequest>, DomainError> {
         let state = self.inner.lock().expect("lock");
+        let status_filter = query.filter().and_then(extract_status_eq);
         let rows = collect_filtered(&state, status_filter, |r| r.tenant_id == tenant_id);
-        Ok(paginate(rows, pagination))
+        Ok(paginate_odata_like(rows, query))
     }
 
     async fn list_inbound_for_parent(
         &self,
         _scope: &AccessScope,
         parent_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-        pagination: ConversionPagination,
-    ) -> Result<Vec<ConversionRequest>, DomainError> {
+        query: &ODataQuery,
+    ) -> Result<Page<ConversionRequest>, DomainError> {
         let state = self.inner.lock().expect("lock");
+        let status_filter = query.filter().and_then(extract_status_eq);
         let rows = collect_filtered(&state, status_filter, |r| r.parent_id == Some(parent_id));
-        Ok(paginate(rows, pagination))
+        Ok(paginate_odata_like(rows, query))
     }
 
-    async fn count_own_for_tenant(
+    async fn get_own_for_tenant(
         &self,
         _scope: &AccessScope,
         tenant_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-    ) -> Result<u64, DomainError> {
+        request_id: Uuid,
+    ) -> Result<Option<ConversionRequest>, DomainError> {
         let state = self.inner.lock().expect("lock");
-        let total = collect_filtered(&state, status_filter, |r| r.tenant_id == tenant_id).len();
-        Ok(u64::try_from(total).unwrap_or(u64::MAX))
+        Ok(state
+            .rows
+            .get(&request_id)
+            .filter(|r| r.tenant_id == tenant_id)
+            .filter(|r| r.deleted_at.is_none())
+            .cloned())
     }
 
-    async fn count_inbound_for_parent(
+    async fn get_inbound_for_parent(
         &self,
         _scope: &AccessScope,
         parent_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-    ) -> Result<u64, DomainError> {
+        request_id: Uuid,
+    ) -> Result<Option<ConversionRequest>, DomainError> {
         let state = self.inner.lock().expect("lock");
-        let total =
-            collect_filtered(&state, status_filter, |r| r.parent_id == Some(parent_id)).len();
-        Ok(u64::try_from(total).unwrap_or(u64::MAX))
+        Ok(state
+            .rows
+            .get(&request_id)
+            .filter(|r| r.parent_id == Some(parent_id))
+            .filter(|r| r.deleted_at.is_none())
+            .cloned())
     }
 
     async fn query_expired(
@@ -908,12 +927,20 @@ fn lookup_pending_mut(
     Ok(row)
 }
 
-/// Apply the listing predicate + soft-delete + status filter and sort
-/// the survivors using the documented `(requested_at DESC, id ASC)`
-/// stable order so cursor re-reads are deterministic.
+/// Apply the listing predicate + soft-delete + best-effort status
+/// filter and sort the survivors using the documented
+/// `(requested_at DESC, id ASC)` stable order so cursor re-reads are
+/// deterministic.
+///
+/// `status_filter` is the `i16` storage code (matching the production
+/// `OData` filter `?$filter=status eq <i16>`); the fake only honours the
+/// flat single-predicate `status eq <i16>` shape, mirroring
+/// `FakeTenantRepo::list_children` — boolean composition / other filter
+/// fields are ignored. Service-level tests that need richer filter
+/// evaluation go against the real repo.
 fn collect_filtered<P>(
     state: &State,
-    status_filter: Option<ConversionStatus>,
+    status_filter: Option<i16>,
     predicate: P,
 ) -> Vec<ConversionRequest>
 where
@@ -924,7 +951,10 @@ where
         .values()
         .filter(|r| r.deleted_at.is_none())
         .filter(|r| predicate(r))
-        .filter(|r| status_filter.is_none_or(|s| r.status == s))
+        .filter(|r| match status_filter {
+            Some(code) => r.status.as_smallint() == code,
+            None => true,
+        })
         .cloned()
         .collect();
     rows.sort_by(|a, b| {
@@ -935,13 +965,47 @@ where
     rows
 }
 
-fn paginate(
+/// Apply the `$top` from `ODataQuery::limit` (defaulting to the
+/// production 50) and wrap the survivors in a [`Page`] envelope.
+/// Cursor / `$orderby` are ignored — service-level tests pin the first
+/// page; richer `OData` behaviour is covered by the real
+/// `paginate_odata` integration tests in `modkit-db`. Mirrors the
+/// `FakeTenantRepo::list_children` posture.
+fn paginate_odata_like(
     rows: Vec<ConversionRequest>,
-    pagination: ConversionPagination,
-) -> Vec<ConversionRequest> {
-    let skip = usize::try_from(pagination.skip).unwrap_or(usize::MAX);
-    let take = usize::try_from(pagination.top).unwrap_or(usize::MAX);
-    rows.into_iter().skip(skip).take(take).collect()
+    query: &ODataQuery,
+) -> Page<ConversionRequest> {
+    let limit_u64 = query.limit.unwrap_or(50);
+    let take_n = usize::try_from(limit_u64).unwrap_or(usize::MAX);
+    let items: Vec<ConversionRequest> = rows.into_iter().take(take_n).collect();
+    Page {
+        items,
+        page_info: PageInfo {
+            next_cursor: None,
+            prev_cursor: None,
+            limit: limit_u64,
+        },
+    }
+}
+
+/// Extract a flat `status eq <i16>` predicate from a top-level
+/// `$filter` expression, if present. Mirrors the helper of the same
+/// name in `FakeTenantRepo` so the conversion fake honours the same
+/// filter-shape contract.
+fn extract_status_eq(expr: &modkit_odata::ast::Expr) -> Option<i16> {
+    use modkit_odata::ast::{CompareOperator, Expr, Value};
+    let Expr::Compare(l, CompareOperator::Eq, r) = expr else {
+        return None;
+    };
+    let value_side: Option<&Value> = match (l.as_ref(), r.as_ref()) {
+        (Expr::Identifier(name), Expr::Value(v)) if name == "status" => Some(v),
+        (Expr::Value(v), Expr::Identifier(name)) if name == "status" => Some(v),
+        _ => None,
+    };
+    match value_side? {
+        Value::Number(n) => n.to_string().parse::<i16>().ok(),
+        _ => None,
+    }
 }
 
 /// Walk the strict `(ancestor, descendant]` path in the parent map and

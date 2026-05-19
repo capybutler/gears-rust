@@ -1,7 +1,8 @@
 //! AM-internal validated `schema_id` type for the tenant-metadata flow.
 //!
-//! Encapsulates what the (now-retired) `account_management_sdk::MetadataSchemaId`
-//! newtype used to enforce at the SDK boundary:
+//! [`ParsedSchemaId`] is the service-layer guard that turns a raw
+//! wire `schema_id` string into a typed value before any registry or
+//! repo call. Four checks run in order:
 //!
 //! 1. Parse the wire `schema_id` string via [`gts::GtsID::new`] —
 //!    rejects malformed GTS syntax.
@@ -20,7 +21,7 @@
 //! `schema_uuid` mapping.
 //!
 //! All validation failures collapse onto
-//! [`DomainError::Validation`] which surfaces as
+//! [`DomainError::MetadataValidation`] which surfaces as
 //! `CanonicalError::InvalidArgument` (HTTP 400) at the AM canonical
 //! boundary. The SDK ships raw `String` for `schema_id` and never
 //! sees the granular validation error variants.
@@ -31,19 +32,9 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
-/// Stripped AM tenant-metadata root segment every parsed chain MUST
-/// start with.
-///
-/// Differs from [`account_management_sdk::TENANT_METADATA_RESOURCE_TYPE`]
-/// (`gts.cf.core.am.tenant_metadata.v1~`) in two ways mirroring what
-/// the upstream `gts_id` parser exposes via [`gts::GtsIdSegment::segment`]:
-///
-/// * The leading `gts.` prefix is stripped (`GtsID::new` removes
-///   `GTS_PREFIX` before splitting into segments, so per-segment
-///   strings carry only the body).
-/// * The trailing `~` chain-terminator is stripped (the chained id
-///   re-attaches its own `~` after the root segment as part of the
-///   chain syntax).
+/// Root segment every parsed chain MUST start with. Stored without
+/// the `gts.` prefix and trailing `~` because `GtsIdSegment::segment`
+/// exposes only the segment body.
 const METADATA_ROOT_SEGMENT: &str = "cf.core.am.tenant_metadata.v1";
 
 /// Parsed-and-validated chained metadata schema id, paired with its
@@ -65,17 +56,17 @@ impl ParsedSchemaId {
     ///
     /// # Errors
     ///
-    /// [`DomainError::Validation`] with a `detail` describing the
+    /// [`DomainError::MetadataValidation`] with a `detail` describing the
     /// specific failure mode (malformed GTS, wrong root segment,
     /// missing chained segment, instance-id shape).
     pub(crate) fn parse(s: &str) -> Result<Self, DomainError> {
-        let parsed = GtsID::new(s).map_err(|err| DomainError::Validation {
+        let parsed = GtsID::new(s).map_err(|err| DomainError::MetadataValidation {
             detail: format!("malformed metadata schema id: {err}"),
         })?;
 
         let segments = &parsed.gts_id_segments;
         if segments.len() < 2 {
-            return Err(DomainError::Validation {
+            return Err(DomainError::MetadataValidation {
                 detail: format!(
                     "metadata schema id `{}` is missing a chained user-registered segment \
                      after the root (`gts.{METADATA_ROOT_SEGMENT}`)",
@@ -88,7 +79,7 @@ impl ParsedSchemaId {
         // before comparing against the root constant.
         let root_str = segments[0].segment.trim_end_matches('~');
         if root_str != METADATA_ROOT_SEGMENT {
-            return Err(DomainError::Validation {
+            return Err(DomainError::MetadataValidation {
                 detail: format!(
                     "metadata schema id must start with `gts.{METADATA_ROOT_SEGMENT}`, \
                      got `gts.{root_str}`"
@@ -102,7 +93,7 @@ impl ParsedSchemaId {
         // boundary so the downstream `schema_uuid` lookup does not
         // surface as a confusing 404.
         if !parsed.is_type() {
-            return Err(DomainError::Validation {
+            return Err(DomainError::MetadataValidation {
                 detail: format!(
                     "metadata schema id `{}` is an instance id, not a schema chain",
                     parsed.as_ref()
@@ -116,13 +107,9 @@ impl ParsedSchemaId {
         // imports the `gts` crate.
         let uuid = parsed.to_uuid();
 
-        // Use the trimmed-normalised id from the parsed result
-        // (`GtsID::new` trims leading / trailing whitespace) when
-        // storing the raw form. Without this, an input like
-        // `"  gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.theme.v1~  "`
-        // would store the un-trimmed string verbatim, and reverse
-        // hydration from the registry would produce a different
-        // string than the cached `schema_uuid` corresponds to.
+        // Use parsed.as_ref(), not the original `s`: GtsID::new trims
+        // whitespace; storing the trimmed form keeps schema_uuid
+        // consistent with reverse-hydration.
         Ok(Self {
             raw: GtsSchemaId::new(parsed.as_ref()),
             uuid,
@@ -160,9 +147,7 @@ impl ParsedSchemaId {
     #[allow(
         dead_code,
         reason = "kept on the surface for callers that prefer the normalised \
-                  string echo over passing the caller-supplied `schema_id` \
-                  back through `MetadataEntry`; current service-side flow uses \
-                  the caller-supplied String directly"
+                  string echo; current flow uses the caller-supplied String."
     )]
     pub(crate) fn into_string(self) -> String {
         self.raw.into()

@@ -32,6 +32,8 @@
   - [Root-Tenant Non-Convertibility](#root-tenant-non-convertibility)
   - [Mixed-Mode Tree Consistency](#mixed-mode-tree-consistency)
   - [Dual-Consent Actor Discipline](#dual-consent-actor-discipline)
+  - [Audit Comments](#audit-comments)
+  - [Required Target Mode](#required-target-mode)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Deliberate Omissions](#7-deliberate-omissions)
 
@@ -102,7 +104,8 @@ Delivers the post-creation dual-consent conversion workflow described in PRD §5
 4. [ ] - `p1` - Invoke ConversionService `initiate(caller_side, tenant_id, actor)` to attempt the `pending` insert via ConversionRepository - `inst-flow-init-service-initiate`
 5. [ ] - `p1` - **IF** partial-unique-index collision on the single-pending invariant - `inst-flow-init-pending-collision`
    1. [ ] - `p1` - **RETURN** `(reject, code=pending_exists)` with the existing `request_id` body per `algo-single-pending-enforcement` - `inst-flow-init-pending-return`
-6. [ ] - `p1` - **RETURN** 201 Created with `{request_id, target_mode, initiator_side, status=pending, expires_at}` projected per caller scope - `inst-flow-init-success-return`
+6. [ ] - `p1` - Initiator MAY supply an optional `comment` (≤1000 chars) explaining the request rationale; ConversionService persists it to `dbtable-conversion-requests.requested_comment` on the new row, validated at the service layer (`length BETWEEN 1 AND 1000`, empty string rejected) and pinned at the DB layer by the `m0006` CHECK constraint per `dod-managed-self-managed-modes-audit-comments` - `inst-flow-init-comment`
+7. [ ] - `p1` - **RETURN** 201 Created with `{request_id, target_mode, initiator_side, status=pending, expires_at, requested_comment?}` projected per caller scope - `inst-flow-init-success-return`
 
 ### Conversion Approval
 
@@ -129,10 +132,11 @@ Delivers the post-creation dual-consent conversion workflow described in PRD §5
    1. [ ] - `p1` - **RETURN** `(reject, code=already_resolved)` via the `errors-observability` envelope - `inst-flow-appr-already-resolved-return`
 4. [ ] - `p1` - **IF** `caller_side == initiator_side` (initiator cannot approve their own request per PRD §5.4) - `inst-flow-appr-actor-guard`
    1. [ ] - `p1` - **RETURN** `(reject, code=invalid_actor_for_transition, attempted_status=approved, caller_side)` - `inst-flow-appr-actor-return`
-5. [ ] - `p1` - Invoke `algo-dual-consent-apply` with `(request_id, actor, caller_side)` — runs the whole approval transaction - `inst-flow-appr-apply`
-6. [ ] - `p1` - **IF** dual-consent-apply returned type-enforcement reject - `inst-flow-appr-type-reject`
+5. [ ] - `p1` - Counterparty MAY supply an optional `comment` (≤1000 chars) explaining the approval rationale; ConversionService threads it into `algo-dual-consent-apply`, which persists it to `dbtable-conversion-requests.approved_comment` inside the same TX as the state transition (never rewriteable) per `dod-managed-self-managed-modes-audit-comments` - `inst-flow-appr-comment`
+6. [ ] - `p1` - Invoke `algo-dual-consent-apply` with `(request_id, actor, caller_side, comment)` — runs the whole approval transaction - `inst-flow-appr-apply`
+7. [ ] - `p1` - **IF** dual-consent-apply returned type-enforcement reject - `inst-flow-appr-type-reject`
    1. [ ] - `p1` - **RETURN** the mapped error (`validation` / `invalid_tenant_type` OR `conflict` / `type_not_allowed`) per the envelope owned by `feature-errors-observability`; the `pending` row is left untouched for retry - `inst-flow-appr-type-reject-return`
-7. [ ] - `p1` - **RETURN** 200 OK with the approved `ConversionRequest` projection (`status=approved`, `approved_by=actor`, scope-specific fields) - `inst-flow-appr-success-return`
+8. [ ] - `p1` - **RETURN** 200 OK with the approved `ConversionRequest` projection (`status=approved`, `approved_by=actor`, `approved_comment?`, scope-specific fields) - `inst-flow-appr-success-return`
 
 ### Conversion Rejection
 
@@ -157,8 +161,9 @@ Delivers the post-creation dual-consent conversion workflow described in PRD §5
    1. [ ] - `p1` - **RETURN** `(reject, code=already_resolved)` - `inst-flow-rej-already-resolved-return`
 4. [ ] - `p1` - **IF** `caller_side == initiator_side` - `inst-flow-rej-actor-guard`
    1. [ ] - `p1` - **RETURN** `(reject, code=invalid_actor_for_transition, attempted_status=rejected, caller_side)` - `inst-flow-rej-actor-return`
-5. [ ] - `p1` - Invoke ConversionService `reject(caller_side, request_id, actor)` — single transaction setting `status=rejected`, `rejected_by=actor`; `tenants.self_managed` untouched; emit audit entry via `errors-observability` - `inst-flow-rej-service-reject`
-6. [ ] - `p1` - **RETURN** 200 OK with the rejected `ConversionRequest` projection - `inst-flow-rej-success-return`
+5. [ ] - `p1` - Counterparty MAY supply an optional `comment` (≤1000 chars) explaining the rejection rationale; ConversionService persists it to `dbtable-conversion-requests.rejected_comment` inside the same TX as the state transition per `dod-managed-self-managed-modes-audit-comments` - `inst-flow-rej-comment`
+6. [ ] - `p1` - Invoke ConversionService `reject(caller_side, request_id, actor, comment)` — single transaction setting `status=rejected`, `rejected_by=actor`, `rejected_comment?`; `tenants.self_managed` untouched; emit audit entry via `errors-observability` - `inst-flow-rej-service-reject`
+7. [ ] - `p1` - **RETURN** 200 OK with the rejected `ConversionRequest` projection - `inst-flow-rej-success-return`
 
 ### Conversion Cancellation
 
@@ -183,8 +188,9 @@ Delivers the post-creation dual-consent conversion workflow described in PRD §5
    1. [ ] - `p1` - **RETURN** `(reject, code=already_resolved)` - `inst-flow-can-already-resolved-return`
 4. [ ] - `p1` - **IF** `caller_side ≠ initiator_side` - `inst-flow-can-actor-guard`
    1. [ ] - `p1` - **RETURN** `(reject, code=invalid_actor_for_transition, attempted_status=cancelled, caller_side)` - `inst-flow-can-actor-return`
-5. [ ] - `p1` - Invoke ConversionService `cancel(caller_side, request_id, actor)` — single transaction setting `status=cancelled`, `cancelled_by=actor`; `tenants.self_managed` untouched; emit audit entry via `errors-observability` - `inst-flow-can-service-cancel`
-6. [ ] - `p1` - **RETURN** 200 OK with the cancelled `ConversionRequest` projection - `inst-flow-can-success-return`
+5. [ ] - `p1` - Initiator MAY supply an optional `comment` (≤1000 chars) explaining the cancellation rationale; ConversionService persists it to `dbtable-conversion-requests.cancelled_comment` inside the same TX as the state transition per `dod-managed-self-managed-modes-audit-comments` - `inst-flow-can-comment`
+6. [ ] - `p1` - Invoke ConversionService `cancel(caller_side, request_id, actor, comment)` — single transaction setting `status=cancelled`, `cancelled_by=actor`, `cancelled_comment?`; `tenants.self_managed` untouched; emit audit entry via `errors-observability` - `inst-flow-can-service-cancel`
+7. [ ] - `p1` - **RETURN** 200 OK with the cancelled `ConversionRequest` projection - `inst-flow-can-success-return`
 
 ### Parent-Side Child Conversions Discovery
 
@@ -511,6 +517,45 @@ The system **MUST** enforce that only the counterparty of a `pending` `Conversio
 - Data: `cpt-cf-account-management-dbtable-conversion-requests`
 - Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `invalid_actor_for_transition` and `already_resolved` codes referenced by name only, HTTP status mapping owned by `feature-errors-observability`.
 
+### Audit Comments
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-dod-managed-self-managed-modes-audit-comments`
+
+Each `ConversionRequest` state transition MAY carry an optional caller-supplied `comment` (1 to 1000 chars inclusive — measured in Unicode scalar values). The comment **MUST** be persisted to a per-transition column on `dbtable-conversion-requests`: `requested_comment` at request initiation, and `approved_comment` / `cancelled_comment` / `rejected_comment` on the matching lifecycle transition. Per-decision storage (one column per transition rather than a single rewriteable `audit_comment`) preserves the audit story across the dual-consent lifecycle — the counterparty's "why approved" **MUST NOT** be allowed to overwrite the initiator's "why requested".
+
+`Some("")` is rejected with `code=validation` before any DB write (the wire protocol's "no comment" sentinel is `None`, not the empty string); oversized values (`length > 1000` chars) are likewise rejected with `code=validation`. The length contract is pinned at the DB layer by the `m0006` `CHECK (length(<col>) BETWEEN 1 AND 1000)` invariant on each comment column, and re-validated at the service layer as defence-in-depth so the canonical `code=validation` envelope surfaces to the caller rather than a DB-layer constraint error.
+
+Comments are surfaced in plaintext on the read API (point-read by id, listing endpoints, and the parent-side cross-barrier minimal projection on `/child-conversions`). The expired-row transition (`pending → expired`) is system-driven and carries no comment column write.
+
+**Implements**:
+
+- `cpt-cf-account-management-flow-managed-self-managed-modes-conversion-initiation`
+- `cpt-cf-account-management-flow-managed-self-managed-modes-conversion-approval`
+- `cpt-cf-account-management-flow-managed-self-managed-modes-conversion-rejection`
+- `cpt-cf-account-management-flow-managed-self-managed-modes-conversion-cancellation`
+
+**Touches**:
+
+- Entities: `ConversionRequest`
+- Data: `cpt-cf-account-management-dbtable-conversion-requests` (columns `requested_comment`, `approved_comment`, `cancelled_comment`, `rejected_comment`)
+- Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `validation` referenced by name only.
+
+### Required Target Mode
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-dod-managed-self-managed-modes-target-mode-required`
+
+The system **MUST** require an explicit `target_mode` on every `POST /tenants/{tenant_id}/conversions` and `POST /tenants/{tenant_id}/child-conversions` request body. The service **MUST** accept exactly the strict binary inverse of the converting tenant's current `self_managed` flag (`Managed → SelfManaged` for `self_managed = false`; `SelfManaged → Managed` for `self_managed = true`); any other value — including the current mode (no-flip) — **MUST** be rejected with `code = validation`. Requiring the caller to declare the inverse explicitly turns a concurrent peer-flip between the client's mode snapshot and the request submission into a clean `validation` envelope rather than a silent absorbed override.
+
+**Implements**:
+
+- `cpt-cf-account-management-flow-managed-self-managed-modes-conversion-initiation`
+
+**Touches**:
+
+- Entities: `ConversionRequest`
+- Data: `cpt-cf-account-management-dbtable-conversion-requests` (`target_mode` column)
+- Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `validation` referenced by name only.
+
 ## 6. Acceptance Criteria
 
 - [ ] A counterparty PATCH approving a `pending` `ConversionRequest` flips `tenants.self_managed` to `target_mode`, re-materializes `tenant_closure.barrier` via `algo-closure-maintenance` on every `(ancestor, descendant]` strict path touching the converted tenant, transitions `dbtable-conversion-requests.state` to `approved` with `approved_by = counterparty actor uuid`, and emits the `conversion_approved` audit entry — all visible atomically inside one transaction; failure of any sub-step rolls back the whole transaction and leaves no half-applied state externally observable. Fingerprints `dod-managed-self-managed-modes-dual-consent-apply`.
@@ -525,6 +570,8 @@ The system **MUST** enforce that only the counterparty of a `pending` `Conversio
 - [ ] A `GET /tenants/{parent_id}/child-conversions` response includes for each conversion-request entry only the minimal cross-barrier projection per DESIGN §3.2 — `request_id`, child `tenant_id`, `child_name`, `initiator_side`, `target_mode`, `status`, actor uuids (`requested_by`, `approved_by`, `cancelled_by`, `rejected_by`), and timestamps; no child-subtree data (tenant metadata beyond `child_name`, descendants, user records, or resource inventories) is surfaced. A `GET /tenants/{parent_id}/child-conversions/{request_id}` targeting a `request_id` that does not belong to a direct child of `{parent_id}` returns `code=not_found` via the `feature-errors-observability` envelope. Fingerprints `dod-managed-self-managed-modes-parent-side-minimal-surface`.
 - [ ] A `POST /tenants/{root_id}/conversions` targeting the root tenant (`parent_id IS NULL`) is refused with `code=root_tenant_cannot_convert` through the `feature-errors-observability` envelope; no row is inserted into `dbtable-conversion-requests`. The refusal applies regardless of which actor initiates the request and is driven by `algo-root-tenant-conversion-refusal` as the first post-authorization guard of `flow-conversion-initiation`, before single-pending or status guards run. Fingerprints `dod-managed-self-managed-modes-root-tenant-non-convertibility`.
 - [ ] A hierarchy containing managed and self-managed tenants mixed across ancestor chains is admitted by both approval and creation paths without tree-shape rejections; on every conversion approval and every creation-time admission, `tenant_closure.barrier` is written via `algo-closure-maintenance` so that every `(ancestor, descendant]` strict path reflects the canonical invariant (`barrier = 1` iff any tenant on the strict path is `self_managed = true`). Hot-path read semantics over the materialized column are not implemented here — this AC binds the write-side contract only. Fingerprints `dod-managed-self-managed-modes-mixed-mode-tree-consistency`.
+- [ ] Each `ConversionRequest` lifecycle transition carries an optional caller-supplied `comment` (`1..=1000` chars); the comment is persisted to the per-transition column on `dbtable-conversion-requests` (`requested_comment` / `approved_comment` / `cancelled_comment` / `rejected_comment`) and is never rewritten on a later transition. `Some("")` and `length > 1000 chars` surface `code=validation` through the `feature-errors-observability` envelope before any DB write. Resolved-row reads (point-read by id, listings, and the parent-side cross-barrier minimal projection) surface every populated comment in plaintext. Fingerprints `dod-managed-self-managed-modes-audit-comments`.
+- [ ] `POST /tenants/{tenant_id}/conversions` and `POST /tenants/{tenant_id}/child-conversions` reject every request whose `target_mode` is not the strict binary inverse of the converting tenant's current `self_managed` flag with `code=validation` through the `feature-errors-observability` envelope; the inverse rule covers both `Managed → SelfManaged` (current `self_managed = false`) and `SelfManaged → Managed` (current `self_managed = true`). A request that supplies the current mode (no-flip) is itself a `validation` rejection, never a silent no-op. Fingerprints `dod-managed-self-managed-modes-target-mode-required`.
 
 ## 7. Deliberate Omissions
 

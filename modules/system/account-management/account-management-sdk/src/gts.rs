@@ -34,10 +34,13 @@
 /// errors (e.g. `tenant {id} not found` → 404).
 pub const TENANT_RESOURCE_TYPE: &str = "gts.cf.core.am.tenant.v1~";
 
-/// AM `TenantMetadata` resource. Used for canonical errors raised
-/// by the metadata feature (e.g. `MetadataSchemaNotRegistered`,
-/// `MetadataEntryNotFound`) and for the future PEP gate on
-/// metadata reads / writes.
+/// AM `TenantMetadata` resource. Used for every canonical error
+/// raised by the metadata surface — both "schema not registered" and
+/// "entry not found" collapse to this single `resource_type` per the
+/// unified-404 contract; `resource_name` carries the chained
+/// `schema_id` string the caller supplied so consumers can still see
+/// **which** schema was involved without needing a separate
+/// `resource_type` discriminator.
 pub const TENANT_METADATA_RESOURCE_TYPE: &str = "gts.cf.core.am.tenant_metadata.v1~";
 
 /// AM `ConversionRequest` resource. Used for canonical errors raised
@@ -57,35 +60,12 @@ pub const USER_RESOURCE_TYPE: &str = "gts.cf.core.am.user.v1~";
 // IdpUser-groups feature -- two flavours of identifiers
 // ---------------------------------------------------------------------------
 //
-// The user-groups feature delegates storage to the Resource Group module
-// (see DECOMPOSITION §2.6: "consumers call `ResourceGroupClient` directly
-// per the Delegation-to-RG principle"). That delegation produces TWO
-// related-but-distinct strings per resource:
+// Two related identifier forms:
+// - AM resource-type names (for PEP / canonical envelopes).
+// - RG-prefixed type codes (required by RG's `validate_type_code`).
 //
-// * The **AM resource-type identifier** (`gts.cf.core.am.*`) -- the
-//   semantic AM type used by PEP / canonical-error envelopes / future
-//   event-bus consumers. Mirrors the pattern of `TENANT_RESOURCE_TYPE`
-//   et al above.
-//
-// * The **RG-prefixed type code** (`gts.cf.core.rg.type.v1~cf.core.am.*`)
-//   -- the form RG's `validate_type_code` requires for entries in
-//   `gts_type` (the type-registry namespace). AM registers these codes
-//   at module init via `register_user_group_types`; sibling modules
-//   (RBAC, UI gateways, batch jobs) that interact with RG directly
-//   need the RG-prefixed strings to filter `list_groups` /
-//   `add_membership` / `remove_membership` calls.
-//
-// Sibling modules MUST import these constants instead of hard-coding
-// the strings; the impl crate re-exports them so the AM-internal call
-// sites stay aligned with the public SDK contract.
-//
-// TODO(#1930): drop `USER_RG_TYPE_CODE` / `USER_GROUP_RG_TYPE_CODE`
-// once the RG-side fix in PR cyberfabric/cyberware-rust#1929 lands.
-// That PR removes the `gts.cf.core.rg.type.v1~` prefix requirement
-// from `allowed_membership_types` validation, so AM can stop wrapping
-// external types and use plain `gts.cf.core.am.*` codes everywhere.
-// See https://github.com/cyberfabric/cyberware-rust/issues/1930 for
-// the AM-side cleanup checklist.
+// Both are exported as crate constants so sibling crates import them by
+// name instead of hard-coding strings.
 
 /// RG type-registry code for the AM user-group **container** type.
 ///
@@ -119,37 +99,24 @@ pub const USER_GROUP_RG_TYPE_CODE: &str = "gts.cf.core.rg.type.v1~cf.core.am.use
 pub const USER_RG_TYPE_CODE: &str = "gts.cf.core.rg.type.v1~cf.core.am.user.v1~";
 
 // ---------------------------------------------------------------------------
-// AM base envelope schema registration -- TODO
+// AM base envelope schema registration
 // ---------------------------------------------------------------------------
 //
-// TODO(am-envelope-registration): the AM-owned base envelope JSON schemas
-// in `docs/schemas/` are not yet all emitted into
-// `all_inventory_type_schemas()` at boot. Two still need to land.
+// Registered AM-owned base envelopes (boot-time, via
+// `modkit_gts::inventory::submit!`):
 //
-// Tracked: cyberfabric/cyberware-rust#1928. The clean Rust-struct path
-// is blocked on upstream GlobalTypeSystem/gts-rust#85
-// (`x-gts-traits-schema` macro support); a direct `inventory::submit!`
-// + `include_str!` workaround is available today (see the issue).
-//
-// 1. `gts.cf.core.am.tenant_metadata.v1~`
-//    (`docs/schemas/tenant_metadata.v1.schema.json`) -- vendor metadata
-//    schemas extend this envelope as derived `allOf` children. Without it
-//    in the registry, `register_type_schemas` rejects them as orphans
-//    and the default `inheritance_policy = "override_only"` from
-//    `x-gts-traits-schema` never reaches `effective_traits()`. See the
-//    long-form rationale at
-//    `account-management::infra::types_registry::metadata_schema_registry`.
-//
-// 2. `gts.cf.core.am.tenant_type.v1~`
-//    (`docs/schemas/tenant_type.v1.schema.json`) -- product roadmap calls
-//    for vendor-defined tenant types (derived from this base envelope).
-//    Same orphan-rejection failure mode applies once the first vendor
-//    tenant_type ships.
-//
-// Already registered (this PR):
-//   * `gts.cf.core.am.user.v1~` -- via [`UserV1`] below. Required because
+//   * `gts.cf.core.am.tenant_metadata.v1~` and
+//     `gts.cf.core.am.tenant_type.v1~` -- registered inline in
+//     `gts_envelopes.rs` so vendor metadata / tenant_type schemas
+//     deriving from them are admitted by `register_type_schemas`.
+//     The inline `inventory::submit!` is a workaround until the
+//     `#[gts_type_schema]` macro supports `x-gts-traits-schema` /
+//     `x-gts-traits` (tracked in
+//     <https://github.com/cyberfabric/cyberware-rust/issues/1928>,
+//     blocked upstream by GTS-rust/#85).
+//   * `gts.cf.core.am.user.v1~` -- registered via [`UserV1`] below.
 //     `domain::gts_validation::validate_new_user_payload_via_gts` is
-//     fail-closed and returns `ServiceUnavailable` if the envelope is
+//     fail-closed and returns `ServiceUnavailable` if this envelope is
 //     absent at boot.
 //
 // Not on the registration list (no vendor-derived extensions planned):
@@ -195,19 +162,12 @@ use modkit_gts::gts_type_schema;
 /// generated-schema vs hand-authored docs divergence on the `id`
 /// sub-schema has no functional impact.
 ///
-/// TODO(am-user-schema-constraints): the schemars-generated schema
-/// currently lacks the `minLength` / `maxLength` / `format: email`
-/// constraints present in `docs/schemas/user.v1.schema.json`.
-/// `validate_new_user_payload_via_gts` therefore accepts any
-/// non-empty string for `username` and `display_name` and any string
-/// for `email`. Adding `#[schemars(length(min = 1, max = 255))]` and
-/// `#[schemars(email)]` is blocked by an attribute-helper / derive
-/// ordering interaction with `#[gts_type_schema]` in gts-macros
-/// 0.9.3 (the derive helpers must be visible before the wrapper
-/// attribute macro expands, but adding `#[derive(JsonSchema)]`
-/// explicitly conflicts with the auto-added derive from the macro).
-/// Re-evaluate when gts-macros gains direct constraint-attribute
-/// support or when the version bumps.
+// TODO(GlobalTypeSystem/gts-rust#86): schemars-generated schema
+// currently lacks `minLength` / `maxLength` / `format: email` —
+// `#[gts_type_schema]` does not forward those constraints (blocked
+// on the derive-ordering bug upstream). Re-evaluate on
+// gts-macros / GTS-rust release that closes
+// <https://github.com/GlobalTypeSystem/gts-rust/issues/86>.
 #[gts_type_schema(
     dir_path = "schemas",
     schema_id = "gts.cf.core.am.user.v1~",

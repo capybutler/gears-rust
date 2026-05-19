@@ -100,13 +100,14 @@ pub enum AccountManagementError {
     // ===================================================================
     // Tenant Metadata
     // ===================================================================
-    /// `schema_id` is not registered in the types-registry; cannot
-    /// validate the metadata payload against an unknown schema.
-    #[error("metadata schema {schema} not registered: {detail}")]
-    MetadataSchemaNotRegistered { schema: String, detail: String },
-
-    /// `(tenant_id, schema_uuid)` row does not exist (distinct from
-    /// schema-not-registered per AM's 404 split).
+    /// Metadata entry not found. Surfaces uniformly for both
+    /// "`schema_id` is unknown to the types-registry" and "schema is
+    /// registered but no row exists at `(tenant_id, schema_uuid)`" —
+    /// AM intentionally does not distinguish the two on the wire so
+    /// clients see a single `not_found` shape for every metadata
+    /// lookup miss. `entry` carries the chained `schema_id` string
+    /// the caller supplied (or, on rare orphan-row paths, the bare
+    /// `schema_uuid`).
     #[error("metadata entry {entry} not found: {detail}")]
     MetadataEntryNotFound { entry: String, detail: String },
 
@@ -129,6 +130,17 @@ pub enum AccountManagementError {
     /// Request shape rejected by validator (no typed variant).
     #[error("invalid request: {detail}")]
     InvalidRequest { detail: String },
+
+    /// Metadata-payload validation rejected. Distinct from
+    /// [`Self::InvalidRequest`] so the canonical envelope can route
+    /// to `gts.cf.core.am.tenant_metadata.v1~` instead of the tenant
+    /// default — both still map to AIP-193 `InvalidArgument` (HTTP
+    /// 400). Producers raise this when the metadata payload itself or
+    /// its `schema_id` is malformed (chain-shape, null body, GTS body
+    /// validation), keeping [`Self::InvalidRequest`] for tenant-state
+    /// guards.
+    #[error("metadata validation failed: {detail}")]
+    MetadataInvalidRequest { detail: String },
 
     /// State precondition violation not covered by a more specific
     /// variant (tenant deleted, type immutable, etc.).
@@ -214,7 +226,6 @@ impl AccountManagementError {
             Self::TenantNotFound { .. }
                 | Self::UserNotFound { .. }
                 | Self::ConversionRequestNotFound { .. }
-                | Self::MetadataSchemaNotRegistered { .. }
                 | Self::MetadataEntryNotFound { .. }
         )
     }
@@ -244,6 +255,7 @@ impl AccountManagementError {
             self,
             Self::InvalidTenantType { .. }
                 | Self::InvalidRequest { .. }
+                | Self::MetadataInvalidRequest { .. }
                 | Self::RootTenantCannotDelete
                 | Self::RootTenantCannotConvert
         )
@@ -259,11 +271,24 @@ impl AccountManagementError {
                 | Self::TenantDepthExceeded { .. }
                 | Self::TenantHasChildren
                 | Self::TenantHasResources
-                | Self::PendingConversionExists { .. }
                 | Self::InvalidActorForConversionTransition { .. }
                 | Self::ConversionAlreadyResolved
                 | Self::PreconditionFailed { .. }
                 | Self::FeatureDisabled { .. }
+        )
+    }
+
+    /// `true` for duplicate-on-create failures (HTTP 409
+    /// `AlreadyExists` per AIP-193). Distinct from
+    /// [`Self::is_precondition_failed`] because the duplicate-resource
+    /// category carries the existing resource id as part of its
+    /// envelope and is retryable only after the caller resolves the
+    /// existing row.
+    #[must_use]
+    pub fn is_already_exists(&self) -> bool {
+        matches!(
+            self,
+            Self::TenantAlreadyExists { .. } | Self::PendingConversionExists { .. }
         )
     }
 

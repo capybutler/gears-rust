@@ -66,7 +66,7 @@ Standardizes how AM surfaces failures (so clients and operators react consistent
 
 ## 2. Actor Flows (CDSL)
 
-One generic flow models how a domain failure surfaces from any AM feature's code path to the client through the envelope defined here. Feature-specific failure modes (e.g., `tenant_has_children`, `pending_exists`, `metadata_schema_not_registered`) are emitted by their owning features; this flow shows the shared classification / envelope / emission path.
+One generic flow models how a domain failure surfaces from any AM feature's code path to the client through the envelope defined here. Feature-specific failure modes (e.g., `tenant_has_children`, `pending_exists`, `metadata_entry_not_found`) are emitted by their owning features; this flow shows the shared classification / envelope / emission path.
 
 ### Error Surface
 
@@ -114,7 +114,7 @@ One generic flow models how a domain failure surfaces from any AM feature's code
 1. [ ] - `p1` - Identify the `DomainError` variant - `inst-algo-etp-identify-kind`
 2. [ ] - `p1` - **IF** variant is `Validation` / `InvalidTenantType` / `RootTenantCannotDelete` / `RootTenantCannotConvert` - `inst-algo-etp-invalid-argument`
    1. [ ] - `p1` - **RETURN** `CanonicalError::InvalidArgument` (HTTP 400) populated with the matching `reason` token (`VALIDATION` / `INVALID_TENANT_TYPE` / `ROOT_TENANT_CANNOT_DELETE` / `ROOT_TENANT_CANNOT_CONVERT`) on a field-violation entry - `inst-algo-etp-invalid-argument-return`
-3. [ ] - `p1` - **IF** variant is `NotFound` / `MetadataSchemaNotRegistered` / `MetadataEntryNotFound` - `inst-algo-etp-not-found`
+3. [ ] - `p1` - **IF** variant is `NotFound` / `MetadataEntryNotFound` - `inst-algo-etp-not-found`
    1. [ ] - `p1` - **RETURN** `CanonicalError::NotFound` (HTTP 404) with `resource_type` set to the matching GTS tag (`gts.cf.core.am.{tenant|tenant_metadata|conversion_request}.v1~`) and `resource_name` carrying the missing identifier - `inst-algo-etp-not-found-return`
 4. [ ] - `p1` - **IF** variant is `TypeNotAllowed` / `TenantDepthExceeded` / `TenantHasChildren` / `TenantHasResources` / `PendingExists` / `InvalidActorForTransition` / `AlreadyResolved` / `Conflict` - `inst-algo-etp-failed-precondition`
    1. [ ] - `p1` - **RETURN** `CanonicalError::FailedPrecondition` (HTTP 400) with a precondition-violation entry whose `reason` token discriminates the specific cause (`TENANT_HAS_CHILDREN`, `TENANT_HAS_RESOURCES`, `TYPE_NOT_ALLOWED`, `PENDING_EXISTS`, `INVALID_ACTOR_FOR_TRANSITION`, `ALREADY_RESOLVED`, `PRECONDITION_FAILED`, …) - `inst-algo-etp-failed-precondition-return`
@@ -380,6 +380,6 @@ The following concerns are explicitly **not** addressed by this FEATURE. Each is
 - **Audit storage, retention, tamper resistance, security-monitoring integration** — *Inherited platform controls* (DESIGN §4.1). This FEATURE only defines the emission contract; the sink is platform-owned.
 - **Dashboards and alert-rule authoring** — *Downstream / deployment-specific.* This FEATURE defines the metric catalog and the naming-alignment contract (`dod-ops-metrics-treatment`); which panels to show, which alert thresholds to set, and how to route paging is a deployment / SRE concern.
 - **Token validation, session renewal, federation, MFA** — *Inherited from platform AuthN.* AM trusts the normalized `SecurityContext` and never validates bearer tokens itself (DESIGN §4.2).
-- **Feature-specific error emission points** — *Owned by each feature.* This FEATURE defines the taxonomy and envelope; `tenant-hierarchy-management` emits `tenant_has_children`, `managed-self-managed-modes` emits `pending_exists`, `tenant-metadata` emits `metadata_schema_not_registered`, etc.
+- **Feature-specific error emission points** — *Owned by each feature.* This FEATURE defines the taxonomy and envelope; `tenant-hierarchy-management` emits `tenant_has_children`, `managed-self-managed-modes` emits `pending_exists`, `tenant-metadata` emits the unified metadata `not_found`, etc.
 - **Concrete retention windows, privacy orchestration, DSAR flows** — *Inherited platform obligations* (DESIGN §4.1). AM contributes data minimization and audit hooks; DSAR/legal-hold/privacy policy administration is not in this FEATURE.
 - **Domain data persistence** — *Not applicable.* This FEATURE owns no dbtable, no GTS schema, and no domain entity; per DECOMPOSITION §2.8 Feature 8 **MUST NOT** own a dbtable.

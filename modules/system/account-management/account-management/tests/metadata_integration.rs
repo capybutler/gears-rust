@@ -6,9 +6,12 @@
 //!
 //! * **AC#1** — list / get / put / delete CRUD round-trip via
 //!   `MetadataService` against the production storage path.
-//! * **AC#3** — PUT 201 → 200 discriminator + DELETE 404 distinction.
-//! * **AC#4** — distinct 404 codes (`metadata_schema_not_registered`
-//!   vs `metadata_entry_not_found`) split deterministically.
+//! * **AC#3** — PUT 201 → 200 discriminator + DELETE idempotency on
+//!   missing rows.
+//! * **AC#4** — unified 404 on GET (both "schema unknown to
+//!   registry" and "entry missing for tenant" surface as
+//!   `MetadataEntryNotFound` with `resource_type =
+//!   gts.cf.core.am.tenant_metadata.v1~`).
 //! * **AC#5** — cascade-delete on tenant hard-delete (the `SQLite`
 //!   explicit `delete_many` branch in `TenantRepoImpl::hard_delete_one`).
 //! * **AC#6** — barrier-aware walk-up resolve across a 3-tenant tree
@@ -222,7 +225,7 @@ async fn crud_round_trip_via_service() {
     assert_eq!(page_after.items.len(), 1);
     assert_eq!(page_after.items[0].schema_id.as_ref(), SCHEMA_B);
 
-    // GET on deleted entry surfaces `MetadataEntryNotFound` (distinct 404).
+    // GET on deleted entry surfaces `MetadataEntryNotFound` (unified 404).
     let err = svc
         .get_metadata(&ctx_for(root), tenant, schema_a())
         .await
@@ -234,11 +237,16 @@ async fn crud_round_trip_via_service() {
 }
 
 // ---------------------------------------------------------------------
-// AC#4 — distinct 404 codes split deterministically.
+// AC#4 — unified 404 contract: schema-unknown and entry-missing both
+// surface as `MetadataEntryNotFound`.
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_distinguishes_schema_vs_entry_404() {
+async fn get_unified_404_for_unknown_schema_and_missing_entry() {
+    // Unified metadata 404: both "schema unknown to the
+    // types-registry" and "schema registered but no entry for this
+    // tenant" surface as the same `DomainError::MetadataEntryNotFound`.
+    // Clients see one shape on the wire for any metadata lookup miss.
     let h = setup_sqlite().await.expect("sqlite");
     let root = Uuid::new_v4();
     let tenant = Uuid::new_v4();
@@ -252,29 +260,29 @@ async fn get_distinguishes_schema_vs_entry_404() {
     )]));
     let (svc, _repo) = build_service(&h, registry);
 
-    // Unregistered schema → MetadataSchemaNotRegistered.
+    // Unregistered schema → MetadataEntryNotFound (unified 404).
     let err = svc
         .get_metadata(&ctx_for(root), tenant, schema_a())
         .await
         .expect_err("get unregistered");
     assert!(
-        matches!(err, DomainError::MetadataSchemaNotRegistered { .. }),
-        "expected MetadataSchemaNotRegistered, got {err:?}"
+        matches!(err, DomainError::MetadataEntryNotFound { .. }),
+        "expected MetadataEntryNotFound (unregistered schema), got {err:?}"
     );
 
-    // Registered schema with no row → MetadataEntryNotFound.
+    // Registered schema with no row → MetadataEntryNotFound (same shape).
     let err = svc
         .get_metadata(&ctx_for(root), tenant, schema_b())
         .await
         .expect_err("get registered missing row");
     assert!(
         matches!(err, DomainError::MetadataEntryNotFound { .. }),
-        "expected MetadataEntryNotFound, got {err:?}"
+        "expected MetadataEntryNotFound (missing entry under registered schema), got {err:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_missing_entry_returns_entry_not_found() {
+async fn delete_missing_entry_is_idempotent() {
     let h = setup_sqlite().await.expect("sqlite");
     let root = Uuid::new_v4();
     let tenant = Uuid::new_v4();
@@ -287,14 +295,13 @@ async fn delete_missing_entry_returns_entry_not_found() {
     )]));
     let (svc, _repo) = build_service(&h, registry);
 
-    let err = svc
-        .delete_metadata(&ctx_for(root), tenant, schema_a())
+    svc.delete_metadata(&ctx_for(root), tenant, schema_a())
         .await
-        .expect_err("delete missing row");
-    assert!(
-        matches!(err, DomainError::MetadataEntryNotFound { .. }),
-        "expected MetadataEntryNotFound, got {err:?}"
-    );
+        .expect("delete on missing row must be idempotent Ok");
+    // Repeat is still Ok.
+    svc.delete_metadata(&ctx_for(root), tenant, schema_a())
+        .await
+        .expect("repeat delete must remain Ok");
 }
 
 // ---------------------------------------------------------------------

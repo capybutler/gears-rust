@@ -62,3 +62,9 @@ use calculator_gateway as _;
 
 #[cfg(feature = "oop-example")]
 use calculator as _;
+
+#[cfg(feature = "static-idp")]
+use static_idp_plugin as _;
+
+#[cfg(feature = "account-management")]
+use account_management as _;

@@ -138,14 +138,20 @@ async fn pg_happy_path_approve_flips_self_managed_and_barrier() {
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
         .expect("request_conversion");
 
     let approved = svc
-        .approve(&ctx_for(root), initiated.id, ConversionCaller::parent(root))
+        .approve(
+            &ctx_for(root),
+            initiated.id,
+            ConversionCaller::parent(root),
+            None,
+        )
         .await
         .expect("approve");
     assert_eq!(approved.status, ConversionStatus::Approved);
@@ -191,6 +197,7 @@ async fn pg_single_pending_unique_index_rejects_second_insert() {
         requested_by: Uuid::new_v4(),
         requested_at: now,
         expires_at: now + TimeDuration::days(7),
+        requested_comment: None,
     };
     let inserted = conv_repo
         .insert_pending(&allow_all(), &new)
@@ -207,6 +214,7 @@ async fn pg_single_pending_unique_index_rejects_second_insert() {
         requested_by: Uuid::new_v4(),
         requested_at: now,
         expires_at: now + TimeDuration::days(7),
+        requested_comment: None,
     };
     let err = conv_repo
         .insert_pending(&allow_all(), &dup)
@@ -272,7 +280,8 @@ async fn pg_concurrent_approves_serialize_to_one_winner() {
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
@@ -304,13 +313,13 @@ async fn pg_concurrent_approves_serialize_to_one_winner() {
     let task_a = tokio::spawn(async move {
         gate_a.wait().await;
         svc_a
-            .approve(&ctx_for(root), id, ConversionCaller::parent(root))
+            .approve(&ctx_for(root), id, ConversionCaller::parent(root), None)
             .await
     });
     let task_b = tokio::spawn(async move {
         gate_b.wait().await;
         svc_b
-            .approve(&ctx_for(root), id, ConversionCaller::parent(root))
+            .approve(&ctx_for(root), id, ConversionCaller::parent(root), None)
             .await
     });
     gate.wait().await;

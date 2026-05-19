@@ -48,8 +48,9 @@ pub struct Model {
     #[sea_orm(nullable)]
     pub parent_id: Option<Uuid>,
     pub name: String,
-    /// `0=provisioning, 1=active, 2=suspended, 3=deleted` — matches the
-    /// `CHECK (status IN (0,1,2,3))` constraint in the migration DDL.
+    /// Stored as smallint to match the migration's
+    /// `CHECK (status IN (0,1,2,3))`; domain `TenantStatus` is the
+    /// typed view.
     pub status: i16,
     pub self_managed: bool,
     pub tenant_type_uuid: Uuid,
@@ -63,25 +64,23 @@ pub struct Model {
     /// scanner-default substituted when the per-row override is NULL).
     #[sea_orm(nullable)]
     pub deleted_at: Option<OffsetDateTime>,
-    /// Phase 3 — optional per-tenant override of the module-default
-    /// retention window. Stored as BIGINT seconds (not INTERVAL) so the
-    /// shape is portable across `SQLite` / `MySQL` / Postgres.
+    /// Optional per-tenant override of the module-default retention
+    /// window. Stored as BIGINT seconds (not INTERVAL) so the shape is
+    /// portable across `SQLite` / `MySQL` / Postgres.
     #[sea_orm(nullable)]
     pub retention_window_secs: Option<i64>,
-    /// Phase 5 — hard-delete worker claim. A non-NULL value means a
-    /// retention scanner atomically claimed the row before processing it.
+    /// Hard-delete worker claim. A non-NULL value means a worker
+    /// (retention sweep OR provisioning reaper) atomically claimed the
+    /// row before processing it.
     #[sea_orm(nullable)]
     pub claimed_by: Option<Uuid>,
-    /// Phase 5 — timestamp at which the current claim was made. The
-    /// stale-claim TTL evaluates against this column rather than
-    /// `updated_at` so worker-liveness detection is independent of any
-    /// future patch path that bumps `updated_at` on a `Deleted`-status
-    /// row. Cleared together with `claimed_by` when the scanner finishes
-    /// the row.
+    /// Claim timestamp. Stale-claim TTL evaluates against this column
+    /// (not `updated_at`) so worker-liveness detection stays
+    /// independent of any future patch path that bumps `updated_at`.
     #[sea_orm(nullable)]
     pub claimed_at: Option<OffsetDateTime>,
-    /// Phase 5 — operator-action-required marker for provisioning rows
-    /// the `IdP` plugin classified as
+    /// Operator-action-required marker for provisioning rows the `IdP`
+    /// plugin classified as
     /// [`account_management_sdk::IdpDeprovisionFailure::Terminal`]. Once
     /// stamped, [`scan_stuck_provisioning`](super::super::repo_impl::retention::scan_stuck_provisioning)
     /// filters the row out of the reaper retry loop until an operator

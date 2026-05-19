@@ -25,10 +25,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use crate::domain::conversion::page::OffsetPage;
 use authz_resolver_sdk::PolicyEnforcer;
-use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use authz_resolver_sdk::pep::ResourceType;
 use modkit_macros::domain_model;
+use modkit_odata::{ODataQuery, Page};
 use modkit_security::{
     AccessScope, InTenantSubtreeScopeFilter, ScopeConstraint, ScopeFilter, SecurityContext,
     pep_properties,
@@ -38,8 +38,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::domain::conversion::model::{
-    ConversionPagination, ConversionRequest, ConversionSide, ConversionStatus,
-    NewConversionRequest, TargetMode,
+    ConversionRequest, ConversionSide, ConversionStatus, NewConversionRequest, TargetMode,
 };
 use crate::domain::conversion::repo::{ApplyConversionApprovalInput, ConversionRepo};
 use crate::domain::conversion::state_machine::validate_transition;
@@ -47,6 +46,17 @@ use crate::domain::error::DomainError;
 use crate::domain::tenant::model::TenantStatus;
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant_type::TenantTypeChecker;
+
+/// Inclusive upper bound on caller-supplied per-transition audit
+/// comments — pinned at the DB-side by the `m0006` `CHECK
+/// (length(<col>) BETWEEN 1 AND 1000)` invariant and enforced as
+/// defence-in-depth at the service layer before any DB write.
+pub const COMMENT_MAX_LEN: usize = 1000;
+
+/// Builder fallback. Production wires `cfg.listing.max_top`; this
+/// const keeps tests / direct `new()` callers aligned with
+/// `CONVERSION_LISTING_LIMIT_CFG`.
+const DEFAULT_MAX_LISTING_TOP: u32 = 200;
 
 /// Shared clock seam. Produced by [`ConversionService::new`] from
 /// `OffsetDateTime::now_utc` and overridable in tests via
@@ -70,13 +80,12 @@ type NowFn = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 /// these IDs come from the URL path, which the platform `AuthN` layer
 /// has already verified the caller is authorized for.
 ///
-/// Today no SDK consumer wires this — the conversion-service handle is
-/// published for the upcoming REST PR — so the service-layer contract
-/// is the only authorization gate. When `feature-tenant-resolver-plugin`
-/// plumbs `InTenantSubtree` (cyberfabric-core#1813), the storage scope
-/// will narrow reads to the caller's subtree and this struct's
-/// `scope_id` will continue to provide the column-level fence on
-/// `request.tenant_id` / `request.parent_id`.
+/// The service-layer contract is the authorization gate today. When
+/// `feature-tenant-resolver-plugin` plumbs `InTenantSubtree`
+/// (cyberfabric-core#1813), the storage scope will narrow reads to the
+/// caller's subtree and this struct's `scope_id` will continue to
+/// provide the column-level fence on `request.tenant_id` /
+/// `request.parent_id`.
 #[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct ConversionCaller {
@@ -139,13 +148,20 @@ impl ConversionCaller {
 
 /// Service-level input to [`ConversionService::request_conversion`].
 ///
-/// Mirrors the dual-consent contract: the caller declares its scope
-/// (`caller`) and may override the target mode the conversion will
-/// land on. When `target_mode_override` is `None` the service
-/// computes the target as the inverse of the tenant's current
-/// `self_managed` flag — `Managed` becomes `SelfManaged` and vice
-/// versa, which is the only legal "flip" shape per FEATURE
-/// `managed-self-managed-modes` §2.
+/// Carries the dual-consent contract: the caller's scope (`caller`),
+/// the target mode the conversion will land on, and an optional
+/// rationale stamped on the new row's `requested_comment`.
+///
+/// `target_mode` MUST be the strict binary inverse of the resolved
+/// tenant's current `self_managed` flag; any other value surfaces
+/// [`DomainError::Validation`]. Requiring the caller to declare the
+/// inverse turns a concurrent peer-flip into a clean validation
+/// envelope at request time rather than a silent absorbed override.
+///
+/// `comment` is optional. When supplied, the service validates
+/// `1..=`[`COMMENT_MAX_LEN`] chars; `Some("")` is invalid (the
+/// "no comment" sentinel is `None`) and surfaces as `Validation`
+/// before any DB write.
 ///
 /// The actor UUID recorded on the resulting row is sourced from the
 /// caller's [`SecurityContext::subject_id`] inside the service — see
@@ -157,52 +173,8 @@ impl ConversionCaller {
 pub struct RequestConversionInput {
     pub tenant_id: Uuid,
     pub caller: ConversionCaller,
-    pub target_mode_override: Option<TargetMode>,
-}
-
-/// Three-way status selector consumed by the service-level `list_*`
-/// methods.
-///
-/// The original draft model used `Option<ConversionStatus>` where
-/// `None` meant "no filter / show every row". That cannot express the
-/// FEATURE-doc UX rule "child-scope listings default to only the
-/// actionable Pending rows; resolved history is visible only on
-/// explicit opt-in" — `None` collapses both intents to a single token.
-/// This enum makes the three intents distinguishable on the wire:
-///
-/// * [`DefaultPending`] — no explicit status passed by the caller; the
-///   service substitutes `Pending` so a child default-listing returns
-///   actionable rows only and does not implicitly include history.
-/// * [`Any`] — caller actively asked for "show me everything,
-///   including resolved history".
-/// * [`Status(s)`] — caller pinned a specific lifecycle status.
-///
-/// Lowering to the repo's `Option<ConversionStatus>` filter:
-/// `DefaultPending → Some(Pending)`, `Any → None`,
-/// `Status(s) → Some(s)`.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ConversionStatusSelector {
-    /// No explicit status — service substitutes `Pending`.
-    DefaultPending,
-    /// Explicit "every lifecycle status, including resolved history".
-    Any,
-    /// Explicit single lifecycle status.
-    Status(ConversionStatus),
-}
-
-impl ConversionStatusSelector {
-    /// Lower this selector to the `Option<ConversionStatus>` token the
-    /// repo layer consumes.
-    #[must_use]
-    pub const fn as_repo_filter(self) -> Option<ConversionStatus> {
-        match self {
-            Self::DefaultPending => Some(ConversionStatus::Pending),
-            Self::Any => None,
-            Self::Status(s) => Some(s),
-        }
-    }
+    pub target_mode: TargetMode,
+    pub comment: Option<String>,
 }
 
 /// Marker for how a conversion operation entered the service layer.
@@ -210,12 +182,7 @@ impl ConversionStatusSelector {
 /// Drives the docstring + audit kind on every reaper / retention emit
 /// (`actor_kind = "system"` vs the caller-supplied `actor_uuid`) and
 /// keeps the URL-bound and system-driven entry points statically
-/// distinct at the call site. The previous shape passed a raw
-/// `AccessScope::allow_all()` for both, which obscured the intent — a
-/// regression that wired the reaper to a caller-supplied scope, or a
-/// REST handler that accidentally invoked a system-only path, would
-/// not surface in code review until the scope filter zero-rowed a
-/// production request.
+/// distinct at the call site.
 ///
 /// `conversion_requests` is `Scopable(tenant_col = "tenant_id",
 /// resource_col = "id", no_owner, no_type)` — system-driven sweeps
@@ -301,203 +268,6 @@ impl ConversionScope {
     }
 }
 
-/// Pagination + status-filter shape consumed by the service-level
-/// `list_*` methods. Mirrors the
-/// `account_management_sdk::ListChildrenQuery` ergonomics so call sites
-/// stay symmetric with the tenant CRUD surface, but kept AM-internal
-/// here because the conversion REST shapes haven't landed yet.
-///
-/// Field visibility encodes the `top > 0` invariant AND the "set-once
-/// at construction" posture for the whole query: every field is private
-/// and constructed only via [`Self::default_pending`] / [`Self::any`] /
-/// [`Self::with_status`] (each fallible) and read via the
-/// [`Self::top`] / [`Self::skip`] / [`Self::status_filter`] accessors.
-/// Mirrors the `IdpUserPagination` `TopMustBePositive` posture: a `top = 0`
-/// listing collapses to an empty page even when the underlying filter
-/// matches rows, which silently breaks any caller that uses pagination
-/// to drive existence checks. Keeping `skip` and `status_filter`
-/// private prevents an external `let mut q = ...; q.skip = 1_000_000;`
-/// from mutating the value after construction and leaving the two
-/// fields semantically inconsistent with the (already-private) `top`.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ListConversionsQuery {
-    top: u32,
-    skip: u32,
-    status_filter: ConversionStatusSelector,
-}
-
-/// Validation errors reported by [`ListConversionsQuery`] constructors.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ListConversionsQueryError {
-    /// `top` was zero; the listing contract treats `top` as a strict
-    /// positive page size so a paginated read cannot silently collapse
-    /// to an empty page.
-    TopMustBePositive,
-    /// `top` exceeded [`ListConversionsQuery::MAX_TOP`]. Mirrors the
-    /// `IdpUserPagination::TopExceedsMax` ceiling so a misbehaving caller
-    /// forwarding `top = u32::MAX` cannot exhaust the page-buffer
-    /// allocation by widening a single listing past the documented
-    /// per-page row-count cap.
-    TopExceedsMax { requested: u32, max: u32 },
-}
-
-impl core::fmt::Display for ListConversionsQueryError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::TopMustBePositive => f.write_str("top must be at least 1"),
-            Self::TopExceedsMax { requested, max } => {
-                write!(f, "top {requested} exceeds max {max}")
-            }
-        }
-    }
-}
-
-impl core::error::Error for ListConversionsQueryError {}
-
-impl ListConversionsQuery {
-    /// Upper bound enforced by every [`ListConversionsQuery`]
-    /// constructor. Mirrors
-    /// [`account_management_sdk::idp_user::IdpUserPagination::MAX_TOP`]
-    /// so the conversion listing surface stays aligned with the
-    /// platform's `OpenAPI Top.maximum` ceiling and a single
-    /// listing request cannot exhaust the page-buffer allocation by
-    /// requesting an unbounded `top`.
-    pub const MAX_TOP: u32 = 200;
-
-    /// Read-only access to the validated `top`. Always `>= 1` per the
-    /// constructor invariants.
-    #[must_use]
-    pub const fn top(self) -> u32 {
-        self.top
-    }
-
-    /// Read-only access to `skip`. Always set once at construction
-    /// time so the value stays consistent with whatever validation the
-    /// caller used to build the query.
-    #[must_use]
-    pub const fn skip(self) -> u32 {
-        self.skip
-    }
-
-    /// Read-only access to the three-way status selector. Defaults to
-    /// [`ConversionStatusSelector::DefaultPending`] when constructed
-    /// via [`ListConversionsQuery::default_pending`].
-    #[must_use]
-    pub const fn status_filter(self) -> ConversionStatusSelector {
-        self.status_filter
-    }
-
-    /// Build a query that returns only `Pending` rows. This is the
-    /// "no explicit status filter" default for child-scope listings —
-    /// resolved history (`Approved`/`Cancelled`/`Rejected`/`Expired`)
-    /// is hidden until the caller explicitly opts in via
-    /// [`Self::any`] or [`Self::with_status`].
-    ///
-    /// # Errors
-    ///
-    /// * [`ListConversionsQueryError::TopMustBePositive`] when
-    ///   `top` is zero.
-    /// * [`ListConversionsQueryError::TopExceedsMax`] when `top`
-    ///   exceeds [`Self::MAX_TOP`] — guards against an unbounded
-    ///   page-buffer allocation by mirroring the
-    ///   `IdpUserPagination::TopExceedsMax` ceiling.
-    pub const fn default_pending(top: u32, skip: u32) -> Result<Self, ListConversionsQueryError> {
-        if top == 0 {
-            return Err(ListConversionsQueryError::TopMustBePositive);
-        }
-        if top > Self::MAX_TOP {
-            return Err(ListConversionsQueryError::TopExceedsMax {
-                requested: top,
-                max: Self::MAX_TOP,
-            });
-        }
-        Ok(Self {
-            top,
-            skip,
-            status_filter: ConversionStatusSelector::DefaultPending,
-        })
-    }
-
-    /// Build a query that returns rows of every lifecycle status
-    /// (no filter). Use this when the caller actively asks for
-    /// resolved history alongside pending.
-    ///
-    /// # Errors
-    ///
-    /// * [`ListConversionsQueryError::TopMustBePositive`] when
-    ///   `top` is zero.
-    /// * [`ListConversionsQueryError::TopExceedsMax`] when `top`
-    ///   exceeds [`Self::MAX_TOP`] — guards against an unbounded
-    ///   page-buffer allocation by mirroring the
-    ///   `IdpUserPagination::TopExceedsMax` ceiling.
-    pub const fn any(top: u32, skip: u32) -> Result<Self, ListConversionsQueryError> {
-        if top == 0 {
-            return Err(ListConversionsQueryError::TopMustBePositive);
-        }
-        if top > Self::MAX_TOP {
-            return Err(ListConversionsQueryError::TopExceedsMax {
-                requested: top,
-                max: Self::MAX_TOP,
-            });
-        }
-        Ok(Self {
-            top,
-            skip,
-            status_filter: ConversionStatusSelector::Any,
-        })
-    }
-
-    /// Build a query that narrows to a specific lifecycle status.
-    ///
-    /// # Errors
-    ///
-    /// * [`ListConversionsQueryError::TopMustBePositive`] when
-    ///   `top` is zero.
-    /// * [`ListConversionsQueryError::TopExceedsMax`] when `top`
-    ///   exceeds [`Self::MAX_TOP`] — guards against an unbounded
-    ///   page-buffer allocation by mirroring the
-    ///   `IdpUserPagination::TopExceedsMax` ceiling.
-    pub const fn with_status(
-        top: u32,
-        skip: u32,
-        status: ConversionStatus,
-    ) -> Result<Self, ListConversionsQueryError> {
-        if top == 0 {
-            return Err(ListConversionsQueryError::TopMustBePositive);
-        }
-        if top > Self::MAX_TOP {
-            return Err(ListConversionsQueryError::TopExceedsMax {
-                requested: top,
-                max: Self::MAX_TOP,
-            });
-        }
-        Ok(Self {
-            top,
-            skip,
-            status_filter: ConversionStatusSelector::Status(status),
-        })
-    }
-
-    /// Lower into the repo-level pagination value.
-    #[must_use]
-    pub const fn pagination(self) -> ConversionPagination {
-        ConversionPagination {
-            top: self.top,
-            skip: self.skip,
-        }
-    }
-
-    /// Lower the status selector into the repo's
-    /// `Option<ConversionStatus>` token.
-    #[must_use]
-    pub const fn repo_status_filter(self) -> Option<ConversionStatus> {
-        self.status_filter.as_repo_filter()
-    }
-}
-
 // @cpt-begin:cpt-cf-account-management-dod-managed-self-managed-modes-parent-side-minimal-surface:p1:inst-dod-parent-side-projection
 /// Minimal cross-barrier projection of a [`ConversionRequest`] surfaced
 /// to the parent side of the dual-consent pair.
@@ -524,6 +294,16 @@ pub struct ConversionRequestParentProjection {
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
     pub resolved_at: Option<OffsetDateTime>,
+    /// Per-transition audit comments mirrored from the conversion row.
+    /// Surfaced to the parent side because the rationale is part of
+    /// the audit trail the counterparty is allowed to read on its own
+    /// inbound listing (the comments are not closure-protected fields
+    /// — they live on the conversion row, not on the child tenant's
+    /// subtree).
+    pub requested_comment: Option<String>,
+    pub approved_comment: Option<String>,
+    pub cancelled_comment: Option<String>,
+    pub rejected_comment: Option<String>,
 }
 // @cpt-end:cpt-cf-account-management-dod-managed-self-managed-modes-parent-side-minimal-surface:p1:inst-dod-parent-side-projection
 
@@ -606,24 +386,16 @@ pub struct ConversionService {
     cleanup_interval: StdDuration,
     expire_batch_size: u32,
     retention_batch_size: u32,
+    /// Operator-controlled cap on the per-page `$top` value the
+    /// conversion listing endpoints honour. Defaults to
+    /// [`DEFAULT_MAX_LISTING_TOP`]; production wiring overrides via
+    /// [`Self::with_listing_max_top`] from `cfg.listing.max_top`.
+    max_listing_top: u32,
 }
 
-// `ConversionRepo` mutating calls (`find_by_id` / `transition_pending_to_*`
-// / `apply_conversion_approval`) receive a service-built `AccessScope`
-// derived from the [`ConversionCaller`] via [`conversion_repo_scope`].
-// `conversion_requests` declares `tenant_col = "tenant_id"` and
-// `resource_col = "id"` (post-#1813), so the secure-extension layer
-// materialises the caller-bound clamp at the database (`tenant_id =
-// child_id` for a child-side caller, `tenant_id IN closure(parent_id)`
-// with barrier penetration for a parent-side caller). The incoming
-// `&AccessScope` argument from REST handlers is forwarded to the
-// `TenantRepo` lookups and the `verify_caller_scope` PDP boundary; the
-// conversion-row scope is derived from the URL-bound caller side so
-// the repo's row-level enforcement stays consistent regardless of how
-// the platform PDP currently shapes the caller's tenant scope.
-// INSERT paths continue to call `scope_unchecked` — the Scopable
-// INSERT-time clamp isn't the right model for inserts (the row is
-// being created and cannot yet be filtered).
+// Mutating calls receive a scope derived from `ConversionCaller` via
+// `conversion_repo_scope`; INSERT paths use `scope_unchecked` (Scopable
+// INSERT clamp is not the right model).
 
 impl ConversionService {
     /// Default cleanup tick used when `with_cleanup_lifecycle` is not
@@ -665,6 +437,7 @@ impl ConversionService {
             cleanup_interval: Self::DEFAULT_CLEANUP_INTERVAL,
             expire_batch_size: Self::DEFAULT_EXPIRE_BATCH_SIZE,
             retention_batch_size: Self::DEFAULT_RETENTION_BATCH_SIZE,
+            max_listing_top: DEFAULT_MAX_LISTING_TOP,
         }
     }
 
@@ -694,15 +467,19 @@ impl ConversionService {
         action: &str,
         tenant_id: Uuid,
     ) -> Result<AccessScope, DomainError> {
-        let request = AccessRequest::new()
-            .resource_property(pep_properties::OWNER_TENANT_ID, tenant_id)
-            .resource_property(pep_properties::RESOURCE_ID, tenant_id)
-            .require_constraints(true);
-        let scope = self
-            .enforcer
-            .access_scope_with(ctx, &pep::CONVERSION, action, Some(tenant_id), &request)
-            .await?;
-        Ok(scope)
+        // Delegates to [`crate::domain::authz::authz_scope`] for the
+        // uniform PEP-gate shape. Both `OWNER_TENANT_ID` and
+        // `RESOURCE_ID` key on the URL-bound caller tenant.
+        crate::domain::authz::authz_scope(
+            &self.enforcer,
+            ctx,
+            &pep::CONVERSION,
+            action,
+            tenant_id,
+            Some(tenant_id),
+            |req| req,
+        )
+        .await
     }
 
     /// Override the wall-clock function used to compute `expires_at`
@@ -766,11 +543,76 @@ impl ConversionService {
         self.resolved_retention
     }
 
+    /// Override the per-page `$top` cap surfaced on the listing
+    /// endpoints. Production wiring (`AccountManagementModule::init`)
+    /// passes `cfg.listing.max_top` so the conversion listing surface
+    /// shares the platform-wide ceiling with `list_tenants` /
+    /// `list_metadata` / `list_users`.
+    #[must_use]
+    pub const fn with_listing_max_top(mut self, max_top: u32) -> Self {
+        self.max_listing_top = max_top;
+        self
+    }
+
+    /// Operator-controlled cap on the `$top` page size the conversion
+    /// listing endpoints expose. REST handlers read this through
+    /// [`Self::max_listing_top`] to clamp the caller-supplied `$top`
+    /// before delegating to the service. Mirrors
+    /// [`crate::domain::tenant::service::TenantService::max_list_children_top`].
+    #[must_use]
+    pub const fn max_listing_top(&self) -> u32 {
+        self.max_listing_top
+    }
+
     /// Helper: snapshot the current wall-clock through the configured
     /// `now_fn`. Centralised so every `expires_at` / `resolved_at` /
     /// `cutoff` derivation reads from the same seam.
     fn now(&self) -> OffsetDateTime {
         (self.now_fn)()
+    }
+
+    /// Validate an optional caller-supplied audit comment against the
+    /// `1..=`[`COMMENT_MAX_LEN`]-char contract pinned by the DB-side
+    /// `m0006` `CHECK` invariant.
+    ///
+    /// `None` is always admissible — the wire protocol's "no
+    /// comment" sentinel. `Some("")` is a contract bug (the only
+    /// "no comment" form is `None`); we reject it with
+    /// [`DomainError::Validation`] before any DB write so the DB-side
+    /// `length BETWEEN 1 AND 1000` CHECK never sees an empty string
+    /// and operators never see a `code=internal` envelope on what is
+    /// a caller-input bug.
+    ///
+    /// `Some(s)` with `s.chars().count() > COMMENT_MAX_LEN` likewise
+    /// surfaces as `Validation` — defence-in-depth above the
+    /// matching DB CHECK so the service envelope is the one the REST
+    /// boundary speaks.
+    ///
+    /// Length is measured in Unicode scalar values (`chars().count`)
+    /// rather than UTF-8 bytes, mirroring the DB-side `length()`
+    /// semantics on Postgres and `SQLite` (both return char count for
+    /// `TEXT`). The two checks therefore agree to the character on
+    /// every input shape.
+    #[allow(
+        clippy::unused_self,
+        reason = "future-proof for per-service comment policy overrides (e.g. operator-tunable max length); keep `&self` so call sites do not need to change when that wiring lands"
+    )]
+    fn validate_comment(&self, comment: Option<&str>) -> Result<(), DomainError> {
+        let Some(s) = comment else { return Ok(()) };
+        if s.is_empty() {
+            return Err(DomainError::Validation {
+                detail: "comment cannot be empty when supplied (omit the field instead of \
+                         passing an empty string)"
+                    .to_owned(),
+            });
+        }
+        let len = s.chars().count();
+        if len > COMMENT_MAX_LEN {
+            return Err(DomainError::Validation {
+                detail: format!("comment length {len} chars exceeds max {COMMENT_MAX_LEN}"),
+            });
+        }
+        Ok(())
     }
 
     /// Caller-visibility fence used by mutation methods (`cancel`,
@@ -784,13 +626,11 @@ impl ConversionService {
     /// [`AccessScope`] (the
     /// [`require_caller_scope_or_not_found`] check above only
     /// confirms URL-vs-row coherence, not the caller's authorization
-    /// to that tenant). Mirroring the pattern used by `approve` /
-    /// `list_*` methods, this helper resolves the caller-owned
-    /// tenant (`row.tenant_id` for child callers,
-    /// `row.parent_id` for parent callers) under the incoming
-    /// `scope` and collapses every miss (out-of-scope, nonexistent,
-    /// soft-deleted) into `NotFound` so the existence channel does
-    /// not leak.
+    /// to that tenant). This helper resolves the caller-owned tenant
+    /// (`row.tenant_id` for child callers, `row.parent_id` for parent
+    /// callers) under the incoming `scope` and collapses every miss
+    /// (out-of-scope, nonexistent, soft-deleted) into `NotFound` so the
+    /// existence channel does not leak.
     ///
     /// # Errors
     ///
@@ -1011,11 +851,28 @@ impl ConversionService {
         // @cpt-end:cpt-cf-account-management-algo-managed-self-managed-modes-root-tenant-conversion-refusal:p1:inst-algo-root-tenant-refusal
 
         // Status precondition: only `Active` tenants may convert.
-        // `Provisioning` is mid-saga; `Suspended` and `Deleted`
-        // freeze the lifecycle. Any non-`Active` status here is a
-        // validation failure rather than a not-found because the row
-        // exists and the caller can disambiguate from the
+        //
+        // `Provisioning` and `Deleted` collapse to `NotFound` here to
+        // keep the AM contract uniform — `get_tenant` / `update_tenant`
+        // already map both states to 404, so surfacing `Validation` on
+        // this path would leak the internal lifecycle state through the
+        // error-code channel (a parent admin could distinguish "child
+        // exists and is mid-provisioning" from "child does not exist"
+        // by varying the request).
+        //
+        // `Suspended` stays as `Validation`: a suspended tenant is
+        // observable through other read surfaces and the caller can
+        // legitimately disambiguate the state from the
         // `attempted_status` token in the detail.
+        if matches!(
+            tenant.status,
+            TenantStatus::Provisioning | TenantStatus::Deleted
+        ) {
+            return Err(DomainError::NotFound {
+                detail: format!("tenant {} not found", tenant.id),
+                resource: tenant.id.to_string(),
+            });
+        }
         if !matches!(tenant.status, TenantStatus::Active) {
             return Err(DomainError::Validation {
                 detail: format!(
@@ -1026,22 +883,23 @@ impl ConversionService {
             });
         }
 
-        // Compute target mode: the conversion semantics are
-        // "switch mode", so the default target is the strict
-        // inverse of the tenant's `self_managed` bool — derived
-        // directly from the bool to stay `#[non_exhaustive]`-safe
-        // on `TargetMode` (any future variant added to the enum
-        // would not be inferrable from a 2-valued bool).
+        // Comment validation runs alongside the tenant guards so an
+        // out-of-contract comment surfaces with the rest of the
+        // input-shape envelope (and not after the type re-eval).
+        // `Some("")` and `Some(s)` with `s.chars().count() > COMMENT_MAX_LEN`
+        // both surface as `Validation` here; `None` is always admissible.
+        self.validate_comment(input.comment.as_deref())?;
+
+        // `input.target_mode` MUST be the strict binary inverse of the
+        // tenant's current `self_managed` flag. A concurrent peer-flip
+        // between the client's mode snapshot and this request would
+        // otherwise silently land as a no-op; instead it surfaces here
+        // as `Validation` so the client retries on a fresh snapshot.
         //
-        // An explicit `target_mode_override` MUST match
-        // `inverse_of_current` exactly. The earlier shape used a
-        // `target_mode != current_mode` no-op guard which would
-        // silently accept a future `TargetMode::X` override against
-        // a `Managed` / `SelfManaged` tenant — the tenant has no
-        // `X`-mode column on the schema, so the inverse-check is
-        // the load-bearing validation. Reject any override that
-        // is not the strict binary inverse with `Validation`
-        // (envelope-consistent with the other initiation guards).
+        // The inverse is derived from the `self_managed` bool to stay
+        // `#[non_exhaustive]`-safe on `TargetMode` — any new variant
+        // added to the enum would not be inferrable from a 2-valued
+        // bool, so the inverse check is the load-bearing validation.
         let current_mode = if tenant.self_managed {
             TargetMode::SelfManaged
         } else {
@@ -1052,31 +910,23 @@ impl ConversionService {
         } else {
             TargetMode::SelfManaged
         };
-        let target_mode = match input.target_mode_override {
-            Some(requested) if requested == inverse_of_current => requested,
-            Some(requested) => {
-                return Err(DomainError::Validation {
-                    detail: format!(
-                        "target_mode_override={} is not the inverse of the tenant's current \
-                         mode ({}); the only admissible override is {}",
-                        requested.as_str(),
-                        current_mode.as_str(),
-                        inverse_of_current.as_str(),
-                    ),
-                });
-            }
-            None => inverse_of_current,
-        };
+        if input.target_mode != inverse_of_current {
+            return Err(DomainError::Validation {
+                detail: format!(
+                    "target_mode={} is not the inverse of the tenant's current mode ({}); \
+                     the only admissible value is {}",
+                    input.target_mode.as_str(),
+                    current_mode.as_str(),
+                    inverse_of_current.as_str(),
+                ),
+            });
+        }
+        let target_mode = input.target_mode;
 
         let now = self.now();
-        // `OffsetDateTime + StdDuration` panics on arithmetic overflow.
-        // `approval_ttl` is bounded by `ConversionConfig::MAX_APPROVAL_TTL_SECS`
-        // (30d) at config-validation time so today the addition is
-        // trivially safe — but `ConversionService::new` accepts an
-        // arbitrary `StdDuration`, and any future relaxation of the
-        // cap would crash the request-conversion path with a panic
-        // instead of returning a clean envelope. `checked_add`
-        // converts the panic into a recoverable `Internal`.
+        // `checked_add`: `approval_ttl` is cap-bounded today, but a
+        // future cap relaxation could overflow; surface the recoverable
+        // `Internal` envelope instead of a panic.
         let ttl =
             time::Duration::try_from(self.approval_ttl).map_err(|err| DomainError::Internal {
                 diagnostic: format!(
@@ -1102,6 +952,7 @@ impl ConversionService {
             requested_by: actor,
             requested_at: now,
             expires_at,
+            requested_comment: input.comment.clone(),
         };
 
         // @cpt-begin:cpt-cf-account-management-algo-managed-self-managed-modes-single-pending-enforcement:p1:inst-algo-single-pending-enforcement
@@ -1116,10 +967,6 @@ impl ConversionService {
             .await?;
         // @cpt-end:cpt-cf-account-management-algo-managed-self-managed-modes-single-pending-enforcement:p1:inst-algo-single-pending-enforcement
 
-        // TODO(events): emit AM event when the platform event-bus
-        // lands. Placeholder log marks the emission point with the
-        // v1-stand-in cadence proven by `TenantService` for
-        // `tenant_*` events.
         tracing::info!(
             target: "am.events",
             event = "conversion_requested",
@@ -1160,14 +1007,27 @@ impl ConversionService {
         ctx: &SecurityContext,
         request_id: Uuid,
         caller: ConversionCaller,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
         // PEP gate FIRST: compile the caller's `SecurityContext` into
         // an `AccessScope` keyed on the URL-bound caller tenant. A
         // denied caller surfaces as `CrossTenantDenied` BEFORE any
         // row lookup or visibility leak through the error channel.
+        // Running PEP BEFORE `validate_comment` closes a side-channel
+        // where an unauthorized caller could distinguish "the request
+        // exists but I'm not allowed" (403) from "the comment is
+        // malformed" (400) by varying the comment payload — both
+        // states MUST surface as the same `CrossTenantDenied` 403 to
+        // an out-of-scope caller. Mirrors `request_conversion`.
         let scope = self
             .authorize(ctx, pep::actions::CANCEL, caller.scope_id())
             .await?;
+        // Comment shape check, run AFTER the PEP gate so it is only
+        // reachable by an in-scope caller. `None` is always
+        // admissible; `Some("")` and oversize values map to
+        // `Validation`. The DB-side `m0006` CHECK on
+        // `cancelled_comment` is defence-in-depth.
+        self.validate_comment(comment.as_deref())?;
         let cancelled_by = ctx.subject_id();
         // `ConversionRepo` calls below pass a caller-bound scope built
         // by [`conversion_repo_scope`]; with the entity declaring
@@ -1239,7 +1099,7 @@ impl ConversionService {
         let now = self.now();
         let updated = self
             .repo
-            .transition_pending_to_cancelled(&repo_scope, request_id, cancelled_by, now)
+            .transition_pending_to_cancelled(&repo_scope, request_id, cancelled_by, now, comment)
             .await?;
 
         tracing::info!(
@@ -1283,11 +1143,16 @@ impl ConversionService {
         ctx: &SecurityContext,
         request_id: Uuid,
         caller: ConversionCaller,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
-        // PEP gate FIRST — see `cancel` for the full rationale.
+        // PEP gate FIRST — see `cancel` for the full rationale on why
+        // the caller-bound PEP authorization precedes the comment
+        // shape check (side-channel closure between 403 and 400).
         let scope = self
             .authorize(ctx, pep::actions::REJECT, caller.scope_id())
             .await?;
+        // Comment shape check, run AFTER the PEP gate — see `cancel`.
+        self.validate_comment(comment.as_deref())?;
         let rejected_by = ctx.subject_id();
         // See `cancel` for the rationale on the side-specific
         // `conversion_repo_scope` shape and the role of the
@@ -1337,7 +1202,7 @@ impl ConversionService {
         let now = self.now();
         let updated = self
             .repo
-            .transition_pending_to_rejected(&repo_scope, request_id, rejected_by, now)
+            .transition_pending_to_rejected(&repo_scope, request_id, rejected_by, now, comment)
             .await?;
 
         tracing::info!(
@@ -1358,31 +1223,9 @@ impl ConversionService {
     // ----------------------------------------------------------------
     // listings
     //
-    // Caller-visibility fence is asymmetric vs the mutation surface:
-    // the mutation methods (`cancel` / `reject` / `approve`) take a
-    // `ConversionCaller` and call `require_caller_scope_or_not_found`
-    // before any state read, so a misrouted call cannot probe row
-    // existence through a distinguishable error code. The listing
-    // methods take a bare `Uuid` and lean on the
-    // `tenant_repo.find_by_id(scope, ...)` lookup at the top of each
-    // implementation as the single existence gate — an out-of-scope /
-    // nonexistent / soft-deleted tenant collapses to `NotFound`
-    // there, before the conversion repo is touched.
-    //
-    // Conversion-repo scope: the listing methods build a derived
-    // `AccessScope` (`own_listing_repo_scope` / `parent_inbound_repo_scope`)
-    // and forward it to the conversion repo so the secure-extension
-    // layer materialises the row-level clamp at the database
-    // (`tenant_id = X` for own listings, `tenant_id IN closure(parent)
-    // AND barrier-ignored` for parent listings). This is defence-in-
-    // depth on top of the `tenant_repo.find_by_id(scope, ...)`
-    // visibility fence and is independent of the caller's incoming
-    // `&AccessScope`, mirroring the mutation-side `conversion_repo_scope`
-    // contract. Do NOT restore a `ConversionCaller` scope check on
-    // these paths — it would duplicate the gate and split the caller-
-    // visibility surface between two layers, which is exactly what
-    // `require_caller_scope_or_not_found` exists to prevent on the
-    // mutation paths (single source of truth).
+    // Listings derive their own repo scope (`own_listing_repo_scope`
+    // / `parent_inbound_repo_scope`); existence is gated by
+    // `tenant_repo.find_by_id(scope, ...)`.
     // ----------------------------------------------------------------
 
     /// List conversion requests owned by `tenant_id` (the converting
@@ -1397,8 +1240,8 @@ impl ConversionService {
         &self,
         ctx: &SecurityContext,
         tenant_id: Uuid,
-        page_query: &ListConversionsQuery,
-    ) -> Result<OffsetPage<ConversionRequest>, DomainError> {
+        query: &ODataQuery,
+    ) -> Result<Page<ConversionRequest>, DomainError> {
         // PEP gate FIRST: compile the caller's `SecurityContext` into
         // an `AccessScope` keyed on the URL-bound `tenant_id`. A
         // denied caller surfaces as `CrossTenantDenied` BEFORE any
@@ -1413,7 +1256,7 @@ impl ConversionService {
         // empty` page. The lookup also serves as the caller-visibility
         // fence — without it, an out-of-scope caller could probe the
         // existence of conversion requests for tenants outside their
-        // subtree by observing the page's `total`.
+        // subtree by observing whether a page surfaces at all.
         //
         // `TenantRepo::find_by_id` deliberately returns soft-deleted
         // rows too (see its trait docstring), so reject `Deleted`
@@ -1439,46 +1282,72 @@ impl ConversionService {
         // root of its own subtree and the rows we want are precisely
         // those whose `tenant_id == tenant_id`. Equality (via
         // [`own_listing_repo_scope`]) is sharper than a subtree clamp
-        // here: a tenant should NOT see its descendants' conversions
+        // here: a tenant MUST NOT see its descendants' conversions
         // through this listing (those belong to the descendants' own
         // surface). Defence-in-depth on top of the
         // `tenant_repo.find_by_id(scope, tenant_id)` visibility fence
-        // above.
+        // above. The `Page<T>` envelope carries the limit and
+        // forward/back cursors; no separate `total` lookup is
+        // performed — mirrors the AM-wide cursor-pagination posture
+        // (`list_children` / `list_metadata` / `list_users`).
         let repo_scope = own_listing_repo_scope(tenant_id);
-        let items = self
-            .repo
-            .list_own_for_tenant(
-                &repo_scope,
-                tenant_id,
-                page_query.repo_status_filter(),
-                page_query.pagination(),
-            )
+        self.repo
+            .list_own_for_tenant(&repo_scope, tenant_id, query)
+            .await
+    }
+
+    /// Point read of a single conversion request owned by `tenant_id`.
+    /// Implements the GET-by-id surface mirrored by REST handler
+    /// [`crate::api::rest::handlers::conversions::get_own_conversion`].
+    ///
+    /// Returns the full [`ConversionRequest`] row — the converting
+    /// tenant has no cross-barrier projection rules because the
+    /// request lives inside its own scope.
+    ///
+    /// # Errors
+    ///
+    /// * [`DomainError::NotFound`] when the URL-bound `tenant_id`
+    ///   does not resolve, is soft-deleted, or is outside the caller's
+    ///   `AccessScope`; same envelope when the `request_id` does not
+    ///   exist or its `tenant_id` does not match the URL-bound value
+    ///   (collapses through the same not-found channel so the existence
+    ///   surface stays uniform).
+    /// * Any error surfaced by `repo.get_own_for_tenant`.
+    pub async fn get_own_for_tenant(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<ConversionRequest, DomainError> {
+        // PEP gate FIRST — same posture as the sibling listing
+        // endpoint. The `LIST_OWN` action covers GET-by-id too; we
+        // do not introduce a separate `GET_OWN` action because the
+        // existence boundary is identical.
+        let scope = self
+            .authorize(ctx, pep::actions::LIST_OWN, tenant_id)
             .await?;
-        // `total` MUST reflect the count of all matching rows under the
-        // same `(tenant_id, status_filter)` predicate, NOT the current
-        // page size. The cheap `count_own_for_tenant` round-trip mirrors
-        // the tenant-CRUD listing contract (see
-        // `repo_impl::reads::list_children`) so cursor pagination
-        // (`top` / `skip`) behaves correctly when `total > top`.
-        //
-        // TOCTOU note: `list` and `count` are TWO independent queries.
-        // On Postgres each runs at READ COMMITTED so a row committed
-        // between them can make `total` differ by one from the
-        // snapshot the page reflects; on `SQLite` each is its own
-        // autocommit. This is the SAME asymmetry that
-        // `tenant-CRUD::list_children` accepts (DESIGN §3.6) and is
-        // intentional — wrapping both in a SERIALIZABLE TX would cost
-        // 40001-retry cycles for a read-only listing.
-        let total = self
-            .repo
-            .count_own_for_tenant(&repo_scope, tenant_id, page_query.repo_status_filter())
-            .await?;
-        Ok(OffsetPage::new(
-            items,
-            page_query.top(),
-            page_query.skip(),
-            Some(total),
-        ))
+        let tenant = self
+            .tenant_repo
+            .find_by_id(&scope, tenant_id)
+            .await?
+            .ok_or_else(|| DomainError::NotFound {
+                detail: format!("tenant {tenant_id} not found"),
+                resource: tenant_id.to_string(),
+            })?;
+        if matches!(tenant.status, TenantStatus::Deleted) {
+            return Err(DomainError::NotFound {
+                detail: format!("tenant {tenant_id} not found"),
+                resource: tenant_id.to_string(),
+            });
+        }
+        let repo_scope = own_listing_repo_scope(tenant_id);
+        self.repo
+            .get_own_for_tenant(&repo_scope, tenant_id, request_id)
+            .await?
+            .ok_or_else(|| DomainError::NotFound {
+                detail: format!("conversion request {request_id} not found"),
+                resource: request_id.to_string(),
+            })
     }
 
     /// List conversion requests inbound to `parent_id` (the parent of
@@ -1505,8 +1374,8 @@ impl ConversionService {
         &self,
         ctx: &SecurityContext,
         parent_id: Uuid,
-        page_query: &ListConversionsQuery,
-    ) -> Result<OffsetPage<ConversionRequestParentProjection>, DomainError> {
+        query: &ODataQuery,
+    ) -> Result<Page<ConversionRequestParentProjection>, DomainError> {
         // PEP gate FIRST: compile the caller's `SecurityContext` into
         // an `AccessScope` keyed on the URL-bound `parent_id`. A
         // denied caller surfaces as `CrossTenantDenied` BEFORE any
@@ -1546,129 +1415,165 @@ impl ConversionService {
         // clamp on `tenant_id` with `respect_barriers = false` so
         // those rows stay visible while still pinning the listing to
         // descendants of the URL-bound parent. See the helper's
-        // docstring for the full barrier-penetration rationale.
+        // docstring for the full barrier-penetration rationale. The
+        // parent-side projection is applied AFTER the repo returns
+        // its page, preserving the limit / cursor contract.
         let repo_scope = parent_inbound_repo_scope(parent_id);
-        let rows = self
+        let page = self
             .repo
-            .list_inbound_for_parent(
-                &repo_scope,
-                parent_id,
-                page_query.repo_status_filter(),
-                page_query.pagination(),
-            )
+            .list_inbound_for_parent(&repo_scope, parent_id, query)
             .await?;
-        // See `list_own_for_tenant` for the rationale on splitting
-        // `count` from `list` and the TOCTOU contract that both this
-        // and the sibling listing share with `tenant-CRUD::list_children`.
-        let total = self
-            .repo
-            .count_inbound_for_parent(&repo_scope, parent_id, page_query.repo_status_filter())
-            .await?;
+        // Live-name lookup runs at `AccessScope::allow_all()` —
+        // see `resolve_live_child_names`'s docstring for the
+        // cross-barrier widening rationale.
+        let live_names = self.resolve_live_child_names(parent_id, &page.items).await;
+        let projected: Vec<ConversionRequestParentProjection> = page
+            .items
+            .iter()
+            .map(|row| {
+                let child_tenant_name = live_names
+                    .get(&row.tenant_id)
+                    .cloned()
+                    .unwrap_or_else(|| row.child_tenant_name.clone());
+                project_to_parent_view(row, child_tenant_name)
+            })
+            .collect();
+        Ok(Page {
+            items: projected,
+            page_info: page.page_info,
+        })
+    }
 
-        // Live-name resolution: one batch lookup over the unique
-        // tenant ids referenced by the page, instead of one
-        // `find_by_id` round-trip per row. Build a positional map and
-        // fall back to the snapshot captured at request time when a
-        // row is missing (tenant soft-deleted, scope-invisible).
+    /// Point read of a single inbound conversion request as seen by
+    /// the parent side. Implements the GET-by-id surface mirrored by
+    /// REST handler
+    /// [`crate::api::rest::handlers::conversions::get_child_conversion`].
+    ///
+    /// Returns the cross-barrier minimal projection
+    /// ([`ConversionRequestParentProjection`]) — same per-row
+    /// projection contract as [`Self::list_inbound_for_parent`].
+    ///
+    /// # Errors
+    ///
+    /// * [`DomainError::NotFound`] when the URL-bound `parent_id`
+    ///   does not resolve, is soft-deleted, or is outside the
+    ///   caller's `AccessScope`; same envelope when the `request_id`
+    ///   does not exist or its `parent_id` does not match.
+    /// * Any error surfaced by `repo.get_inbound_for_parent`.
+    pub async fn get_inbound_for_parent(
+        &self,
+        ctx: &SecurityContext,
+        parent_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<ConversionRequestParentProjection, DomainError> {
+        let scope = self
+            .authorize(ctx, pep::actions::LIST_INBOUND, parent_id)
+            .await?;
+        let parent = self
+            .tenant_repo
+            .find_by_id(&scope, parent_id)
+            .await?
+            .ok_or_else(|| DomainError::NotFound {
+                detail: format!("tenant {parent_id} not found"),
+                resource: parent_id.to_string(),
+            })?;
+        if matches!(parent.status, TenantStatus::Deleted) {
+            return Err(DomainError::NotFound {
+                detail: format!("tenant {parent_id} not found"),
+                resource: parent_id.to_string(),
+            });
+        }
+        let repo_scope = parent_inbound_repo_scope(parent_id);
+        let row = self
+            .repo
+            .get_inbound_for_parent(&repo_scope, parent_id, request_id)
+            .await?
+            .ok_or_else(|| DomainError::NotFound {
+                detail: format!("conversion request {request_id} not found"),
+                resource: request_id.to_string(),
+            })?;
+        // Live-name lookup at `AccessScope::allow_all()` — see
+        // `resolve_live_child_names`'s docstring for the
+        // cross-barrier rationale.
+        Ok(self.project_for_parent_view(row).await)
+    }
+
+    /// Build the parent-side cross-barrier minimal projection from a
+    /// conversion-request row, refreshing `child_tenant_name` against
+    /// the converting tenant's current row. Falls back to the
+    /// snapshot name when the live lookup fails (see
+    /// [`Self::resolve_live_child_names`]).
+    pub async fn project_for_parent_view(
+        &self,
+        row: ConversionRequest,
+    ) -> ConversionRequestParentProjection {
+        let parent_id_for_log = row.parent_id.unwrap_or_else(Uuid::nil);
+        let live_names = self
+            .resolve_live_child_names(parent_id_for_log, std::slice::from_ref(&row))
+            .await;
+        let child_tenant_name = live_names
+            .get(&row.tenant_id)
+            .cloned()
+            .unwrap_or_else(|| row.child_tenant_name.clone());
+        project_to_parent_view(&row, child_tenant_name)
+    }
+
+    /// Resolve live `child_tenant_name` values for every distinct
+    /// `tenant_id` referenced by `rows`. On lookup failure returns
+    /// an empty map; the caller falls back to the per-row snapshot
+    /// `child_tenant_name`. Failures bump the
+    /// `list_inbound_for_parent_name_lookup / degraded_snapshot_fallback`
+    /// metric and surface on `am.domain`.
+    ///
+    /// # Why `AccessScope::allow_all`
+    ///
+    /// A self-managed child sits behind the closure barrier and is
+    /// invisible to the parent's narrowed `tenants` scope; reusing
+    /// the caller scope would silently degrade every parent listing
+    /// onto the snapshot name. The cross-barrier widening is safe:
+    /// the rows-to-look-up set is gated by the parent's
+    /// `find_by_id(scope, ..)` upstream, and only `(id, name)`
+    /// leaks — both are already on the public conversion-row
+    /// projection.
+    async fn resolve_live_child_names(
+        &self,
+        parent_id: Uuid,
+        rows: &[ConversionRequest],
+    ) -> HashMap<Uuid, String> {
         let unique_ids: Vec<Uuid> = {
             let mut ids: Vec<Uuid> = rows.iter().map(|r| r.tenant_id).collect();
             ids.sort_unstable();
             ids.dedup();
             ids
         };
-        let live_names: HashMap<Uuid, String> = if unique_ids.is_empty() {
-            HashMap::new()
-        } else {
-            // Tolerate `find_many` failures — a transient DB error on
-            // the names lookup MUST NOT shadow the conversion-row
-            // listing the parent is asking about. The snapshot path
-            // covers every row in that case. The error is surfaced on
-            // `am.domain` (NOT `am.events` — that channel is
-            // success-only by convention; routing errors there breaks
-            // downstream consumers grouping by `event` count) so a
-            // degraded listing (stale names) is not invisible to
-            // operators monitoring the structured log.
-            //
-            // # Why `allow_all` and not the caller's `scope`
-            //
-            // The parent-side inbound listing surfaces conversions
-            // owned by self-managed children which sit behind the
-            // tenant closure barrier — the parent's `scope` cannot
-            // read those child rows. Re-using `scope` here would
-            // make `find_many` return an empty set for every
-            // self-managed child, silently dropping every parent
-            // listing back onto the stale snapshot name from the
-            // request row (the converting child's name at the time
-            // of `request_conversion`). That is the `[P2] Bypass the
-            // tenant barrier when refreshing inbound child names`
-            // codex finding the doc comment promised to avoid.
-            //
-            // The cross-barrier read is safe here because:
-            //   * the rows-to-look-up set is constrained to
-            //     `row.tenant_id` values already returned by the
-            //     prior `list_inbound_for_parent` repo call, which
-            //     is gated by the parent's `find_by_id(scope, ..)`
-            //     upstream — so the caller already proved they may
-            //     list these conversions.
-            //   * the lookup returns only `name` (projected into a
-            //     `String` via `(t.id, t.name)`), so no closure-
-            //     barrier-protected attribute leaks; the name is
-            //     already exposed on the public conversion-row
-            //     projection (`child_tenant_name`).
-            //   * the same widening rationale documented on
-            //     `approve` (`scope` ignored, repo runs at
-            //     `allow_all`) applies — barrier transparency for
-            //     dual-consent operations is a service-level
-            //     decision, not a storage decision.
-            let _ = scope;
-            match self
-                .tenant_repo
-                .find_many(&AccessScope::allow_all(), &unique_ids)
-                .await
-            {
-                Ok(tenants) => tenants.into_iter().map(|t| (t.id, t.name)).collect(),
-                Err(err) => {
-                    // Increment a counter so the silent-fallback rate is
-                    // observable on dashboards (the `tracing::warn` alone
-                    // would only surface in log aggregators) — operators
-                    // alerting on `op = list_inbound_for_parent_name_lookup`
-                    // / `outcome = degraded_snapshot_fallback` see how
-                    // often parents land on stale snapshot names.
-                    crate::domain::metrics::emit_metric(
-                        crate::domain::metrics::AM_CONVERSION_LIFECYCLE,
-                        crate::domain::metrics::MetricKind::Counter,
-                        &[
-                            ("op", "list_inbound_for_parent_name_lookup"),
-                            ("outcome", "degraded_snapshot_fallback"),
-                        ],
-                    );
-                    tracing::warn!(
-                        target: "am.domain",
-                        error = %err,
-                        parent_id = %parent_id,
-                        unique_ids = unique_ids.len(),
-                        "list_inbound_for_parent: find_many failed; falling back to snapshot names"
-                    );
-                    HashMap::new()
-                }
-            }
-        };
-
-        let mut items: Vec<ConversionRequestParentProjection> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let child_tenant_name = live_names
-                .get(&row.tenant_id)
-                .cloned()
-                .unwrap_or_else(|| row.child_tenant_name.clone());
-            items.push(project_to_parent_view(&row, child_tenant_name));
+        if unique_ids.is_empty() {
+            return HashMap::new();
         }
-
-        Ok(OffsetPage::new(
-            items,
-            page_query.top(),
-            page_query.skip(),
-            Some(total),
-        ))
+        match self
+            .tenant_repo
+            .find_many(&AccessScope::allow_all(), &unique_ids)
+            .await
+        {
+            Ok(tenants) => tenants.into_iter().map(|t| (t.id, t.name)).collect(),
+            Err(err) => {
+                crate::domain::metrics::emit_metric(
+                    crate::domain::metrics::AM_CONVERSION_LIFECYCLE,
+                    crate::domain::metrics::MetricKind::Counter,
+                    &[
+                        ("op", "list_inbound_for_parent_name_lookup"),
+                        ("outcome", "degraded_snapshot_fallback"),
+                    ],
+                );
+                tracing::warn!(
+                    target: "am.domain",
+                    error = %err,
+                    parent_id = %parent_id,
+                    unique_ids = unique_ids.len(),
+                    "list_inbound_for_parent: find_many failed; falling back to snapshot names"
+                );
+                HashMap::new()
+            }
+        }
     }
     // @cpt-end:cpt-cf-account-management-flow-managed-self-managed-modes-parent-child-conversions-discovery:p1:inst-flow-parent-side-discovery-service
 
@@ -1773,13 +1678,16 @@ impl ConversionService {
         ctx: &SecurityContext,
         request_id: Uuid,
         caller: ConversionCaller,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
         // PEP gate FIRST — see `cancel` for the full rationale on
         // why the caller-bound PEP authorization precedes every
-        // other guard.
+        // other guard, including the comment shape check.
         let scope = self
             .authorize(ctx, pep::actions::APPROVE, caller.scope_id())
             .await?;
+        // Comment shape check, run AFTER the PEP gate — see `cancel`.
+        self.validate_comment(comment.as_deref())?;
         let approver_uuid = ctx.subject_id();
         // See `cancel` for the rationale on the side-specific
         // `conversion_repo_scope` shape (parent-side: subtree with
@@ -1880,13 +1788,10 @@ impl ConversionService {
         // above. A peer soft-delete of the parent between request
         // and approve is a recoverable user-state event (the parent
         // row still exists with `deleted_at` set), not a system
-        // fault — the apply TX would otherwise surface this case as
-        // `Internal` (HTTP 500) at `conversion.rs:apply_conversion_approval`
-        // because the TX-side reload uses a `deleted_at IS NULL`
-        // filter that turns soft-deleted parents into a "disappeared"
-        // diagnostic. Catching it here keeps the boundary symmetric
-        // with the converting-tenant check and maps the failure to
-        // a clean `Validation` (HTTP 400).
+        // fault. Reject a soft-deleted parent here as `Validation`;
+        // the TX-side parent reload deliberately does NOT filter
+        // `deleted_at IS NULL`, so the status check is what catches
+        // this — checking here keeps the error locally attributed.
         let parent_id = row.parent_id.ok_or_else(|| DomainError::Internal {
             diagnostic: format!(
                 "conversion {request_id}: parent_id missing on pending row; \
@@ -1945,6 +1850,7 @@ impl ConversionService {
                     expected_parent_tenant_type_uuid,
                     approver_uuid,
                     resolved_at: self.now(),
+                    approval_comment: comment,
                 },
             )
             .await?;
@@ -2045,17 +1951,10 @@ impl ConversionService {
         let mut transitioned: usize = 0;
         let mut failed: usize = 0;
         let due_total = due.len();
-        // Single `now` stamp shared across every row in the batch
-        // (previously re-sampled per row inside the loop). The
-        // reaper-tick semantics are "rows in this batch expired
-        // together at the tick instant" — re-sampling per row
-        // produced a `resolved_at` skew across a single tick that
-        // had no observable benefit (the batch is bounded by
-        // `expire_batch_size`, well below the wall-clock resolution
-        // a slow per-row UPDATE would observe), while letting tests
-        // assert deterministic `resolved_at` ordering across a
-        // batch. Matches the documented "each tick is a single
-        // wall-clock moment" semantics in the FEATURE doc.
+        // Single `now` stamp shared across every row in the batch so
+        // tests can assert deterministic `resolved_at` ordering and
+        // the tick matches the FEATURE doc's "each tick is a single
+        // wall-clock moment" semantics.
         let batch_stamp = self.now();
         for row in due {
             // Cancellation between rows: a runtime shutdown signal
@@ -2162,18 +2061,14 @@ impl ConversionService {
             }
         }
         // Escalate to a structured warn when half-or-more of the due
-        // batch fails per-row. The previous predicate
-        // (`transitioned == 0 && failed > 0`) only fired when 100% of
-        // due rows failed and missed the 99%-failure case where a
-        // single row succeeded — that asymmetry hides a degraded
-        // backend until every retry is exhausted. The `2 * failed >=
-        // due_total` form fires at or above 50% failure rate
-        // (integer-safe; no division). It is inclusive at the
-        // exact-50% point so a `due_total = 2, failed = 1` tick
-        // still alerts; this is deliberate — for small batches the
-        // safer posture is to alert at parity rather than wait for
-        // strict-majority confirmation. The lower bound `failed > 0
-        // && due_total > 0` keeps quiet ticks silent.
+        // batch fails per-row. The `2 * failed >= due_total` form
+        // fires at or above 50% failure rate (integer-safe; no
+        // division) and is inclusive at the exact-50% point so a
+        // `due_total = 2, failed = 1` tick still alerts — for small
+        // batches the safer posture is to alert at parity rather
+        // than wait for strict-majority confirmation. The lower
+        // bound `failed > 0 && due_total > 0` keeps quiet ticks
+        // silent.
         if failed > 0 && due_total > 0 && failed.saturating_mul(2) >= due_total {
             tracing::warn!(
                 target: "am.lifecycle",
@@ -2214,6 +2109,10 @@ fn project_to_parent_view(
         created_at: row.requested_at,
         expires_at: row.expires_at,
         resolved_at: row.resolved_at,
+        requested_comment: row.requested_comment.clone(),
+        approved_comment: row.approved_comment.clone(),
+        cancelled_comment: row.cancelled_comment.clone(),
+        rejected_comment: row.rejected_comment.clone(),
     }
 }
 // @cpt-end:cpt-cf-account-management-dod-managed-self-managed-modes-parent-side-minimal-surface:p1:inst-dod-parent-side-projection-mapping
@@ -2269,11 +2168,9 @@ fn verify_caller_scope(
         }
         ConversionSide::Parent => match row_parent_id {
             Some(p) if p == scope_id => Ok(()),
-            // Stored `parent_id == None` should be impossible by
-            // construction (root-tenant refusal runs before insert),
-            // but if a peer raw-SQL'ed such a row in we MUST surface
-            // it as a distinct diagnostic and not as a legitimate
-            // scope mismatch.
+            // `parent_id == None` is a data-integrity break (root-tenant
+            // refusal runs before insert) — distinct diagnostic so
+            // operators can grep it apart from a regular scope mismatch.
             None => Err(DomainError::Validation {
                 detail: format!(
                     "{op}: parent-side caller scoped to {scope_id} cannot act on a request \
@@ -2411,8 +2308,7 @@ fn conversion_repo_scope(caller: ConversionCaller) -> AccessScope {
 
 /// Build the [`AccessScope`] the [`ConversionRepo`] runs at for the
 /// own-tenant listing surface
-/// ([`ConversionService::list_own_for_tenant`] /
-/// `ConversionRepo::count_own_for_tenant`).
+/// ([`ConversionService::list_own_for_tenant`]).
 ///
 /// The converting tenant lists its own conversions, so the repo
 /// clamp is the flat-equality shape `tenant_id = tenant_id` —
@@ -2428,8 +2324,7 @@ fn own_listing_repo_scope(tenant_id: Uuid) -> AccessScope {
 
 /// Build the [`AccessScope`] the [`ConversionRepo`] runs at for the
 /// parent-side inbound listing surface
-/// ([`ConversionService::list_inbound_for_parent`] /
-/// [`ConversionService::count_inbound_for_parent`]).
+/// ([`ConversionService::list_inbound_for_parent`]).
 ///
 /// Same shape as the parent-side branch of [`conversion_repo_scope`]:
 /// `tenant_id IN closure(parent_id)` with `respect_barriers = false`,

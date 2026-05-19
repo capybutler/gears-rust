@@ -48,12 +48,10 @@ use crate::domain::ports::metrics::{
 };
 use crate::domain::tenant::integrity::IntegrityCategory;
 
-/// OpenTelemetry adapter that owns one instrument per AM metric
-/// family and implements every port trait.
+/// OpenTelemetry adapter that owns one instrument per AM metric family
+/// and implements every port trait.
 ///
-/// Pre-allocated families that have no live call sites today
-/// (`am.cross_tenant_denial`, `am.metadata_resolution`) are still
-/// constructed so the catalog shape is uniform and the typed port
+/// Pre-allocates families that have no live call sites today so typed-port
 /// methods can light up without an adapter change.
 pub struct AmMetricsMeter {
     // Counters (12)
@@ -332,10 +330,8 @@ impl StorageMetricsPort for AmMetricsMeter {
 //  Stringly-facade bridge (transitional)
 // ════════════════════════════════════════════════════════════════════
 //
-// Forwards `emit_metric` / `emit_gauge_value` / `emit_histogram_value`
-// calls onto the right instrument by matching the metric-family
-// constant. Removed once every call site has moved to the typed
-// port methods.
+// Transitional bridge: removed when the last legacy call site has moved
+// to typed ports.
 
 #[inline]
 fn to_kvs(labels: &[(&'static str, &str)]) -> Vec<KeyValue> {

@@ -6,8 +6,10 @@
 //! [`crate::domain::metadata::registry::MetadataSchemaRegistry`]):
 //!
 //! 1. *Existence* — surface unknown schemas as
-//!    [`DomainError::MetadataSchemaNotRegistered`] BEFORE any downstream
-//!    DB read or write.
+//!    [`DomainError::MetadataEntryNotFound`] BEFORE any downstream
+//!    DB read or write. AM does not distinguish "schema unknown" from
+//!    "entry missing" on the wire — both collapse into the unified
+//!    metadata 404.
 //! 2. *Inheritance policy* — read the schema's
 //!    `x-gts-traits.inheritance_policy` (effective, chain-merged) and
 //!    map onto [`InheritancePolicy::Inherit`] / [`InheritancePolicy::OverrideOnly`].
@@ -37,49 +39,15 @@ use crate::domain::metadata::registry::{InheritancePolicy, MetadataSchemaRegistr
 /// Top-level key in the effective trait map carrying the inheritance
 /// policy enum value. Defined on the `gts.cf.core.am.tenant_metadata.v1~`
 /// envelope's `x-gts-traits-schema`.
-///
-/// TODO(am-envelope-registration): the base envelope
-/// (`gts.cf.core.am.tenant_metadata.v1~`,
-/// `docs/schemas/tenant_metadata.v1.schema.json`) is **not currently
-/// registered** in the GTS Types Registry at runtime — AM neither
-/// annotates a Rust struct with `#[gts_type_schema]` nor calls
-/// `register_type_schemas` for the envelope JSON, so
-/// `all_inventory_type_schemas()` does not pick it up at
-/// `types-registry` boot. The same gap exists for
-/// `gts.cf.core.am.tenant_type.v1~` (planned vendor-derived tenant
-/// types). See the unified TODO list in
-/// [`account_management_sdk::gts`].
-///
-/// Tracked: [cyberfabric/cyberware-rust#1928](https://github.com/cyberfabric/cyberware-rust/issues/1928).
-/// The clean Rust-struct path is blocked on upstream
-/// [GlobalTypeSystem/gts-rust#85](https://github.com/GlobalTypeSystem/gts-rust/issues/85)
-/// (`x-gts-traits-schema` macro support); a direct `inventory::submit!`
-/// + `include_str!` workaround is available today (see the issue).
-///
-/// Consequences once vendors start registering derived schemas:
-///
-/// 1. `TypesRegistryClient::register_type_schemas` will reject
-///    `gts.cf.core.am.tenant_metadata.v1~vendor.app.foo.v1~` as an
-///    orphan-derived schema (`allOf.$ref` points at an unregistered
-///    base — see `test_register_type_schemas_orphan_derived_in_ready_fails`
-///    in `types-registry/src/domain/local_client_tests.rs`).
-/// 2. Phase-2 default `inheritance_policy = "override_only"` from the
-///    envelope is never injected by `effective_traits()` (the parent
-///    chain dead-ends), so the documented default lives only in
-///    `resolve_inheritance_policy`'s hard-coded `None` branch below.
-///
-/// Why it's silently fine today: (a) no real derived metadata schemas
-/// are registered yet — the feature just landed; (b) the AM-side
-/// `None`-fallback returns `OverrideOnly` regardless, so existing tests
-/// (which use `StubMetadataSchemaRegistry`) pass. The gap surfaces the
-/// moment a downstream module attempts a real registration.
-///
-/// Recommended fix: emit an `inventory::submit!{ modkit_gts::InventorySchema { … } }`
-/// in `account-management-sdk` (via `include_str!` on
-/// `docs/schemas/tenant_metadata.v1.schema.json`) so the envelope joins
-/// `all_inventory_type_schemas()` and lands in types-registry at boot
-/// alongside every other in-tree schema. Single source of truth (the
-/// hand-authored JSON), zero macro changes, ~10 lines.
+// TODO(cyberfabric/cyberware-rust#1928): the base envelope
+// `gts.cf.core.am.tenant_metadata.v1~` is currently registered via the
+// `inventory::submit!` workaround in
+// `account-management-sdk/src/gts_envelopes.rs`. Once the
+// `#[gts_type_schema]` macro grows `x-gts-traits-schema` /
+// `x-gts-traits` support (tracked in #1928, blocked upstream by
+// GTS-rust/#85), the envelope migrates to a macro-derived
+// registration and this comment can disappear.
+// See <https://github.com/cyberfabric/cyberware-rust/issues/1928>.
 const INHERITANCE_POLICY_TRAIT: &str = "inheritance_policy";
 
 /// Wire token for the `Inherit` policy. Anything else (missing key,
@@ -107,14 +75,15 @@ impl GtsMetadataSchemaRegistry {
 /// Map a `TypesRegistryError` onto the appropriate `DomainError` for
 /// the schema-registry seam:
 ///
-/// * `GtsTypeSchemaNotFound` → `MetadataSchemaNotRegistered` (HTTP 404,
-///   `code=metadata_schema_not_registered`).
+/// * `GtsTypeSchemaNotFound` → [`DomainError::MetadataEntryNotFound`]
+///   (HTTP 404 with the unified `resource_type =
+///   gts.cf.core.am.tenant_metadata.v1~`).
 /// * any other transport / registry error → `ServiceUnavailable`.
 fn map_registry_err(err: TypesRegistryError, schema_token: &str) -> DomainError {
     match err {
-        TypesRegistryError::GtsTypeSchemaNotFound(_) => DomainError::MetadataSchemaNotRegistered {
+        TypesRegistryError::GtsTypeSchemaNotFound(_) => DomainError::MetadataEntryNotFound {
             detail: format!("schema {schema_token} is not registered in the types registry"),
-            schema: schema_token.to_owned(),
+            entry: schema_token.to_owned(),
         },
         other => DomainError::service_unavailable(format!("types-registry: {other}")),
     }
@@ -214,9 +183,9 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
                 Ok(id) => {
                     out.insert(uuid, id);
                 }
-                Err(DomainError::MetadataSchemaNotRegistered { .. }) => {
+                Err(DomainError::MetadataEntryNotFound { .. }) => {
                     // Page-poisoning guard: omit unknowns; service layer
-                    // raises the distinct-404 per missing row.
+                    // decides per-row how to surface the miss.
                 }
                 Err(other) => return Err(other),
             }
@@ -273,14 +242,14 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
         // body validation) — single round-trip to the registry, then
         // `jsonschema::validator_for` on the effective (chain-merged)
         // schema, then `iter_errors` to collect every violation into one
-        // `DomainError::Validation` detail.
+        // `DomainError::MetadataValidation` detail.
         //
         // The error-shape differs by one variant vs the IdP helper:
-        // a missing schema here surfaces as `MetadataSchemaNotRegistered`
-        // (HTTP 404, `code=metadata_schema_not_registered`) per
-        // `dod-tenant-metadata-distinct-404-codes`, not `Internal` —
-        // metadata schemas are caller-named so an unregistered chain
-        // is a public 404, not a deploy-prerequisite failure.
+        // a missing schema here surfaces as
+        // [`DomainError::MetadataEntryNotFound`] (HTTP 404 with the
+        // unified metadata `resource_type`), not `Internal` — metadata
+        // schemas are caller-named so an unregistered chain is a
+        // public 404, not a deploy-prerequisite failure.
         let schema_str = schema_id.as_ref();
         let schema = self
             .registry
@@ -288,25 +257,38 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
             .await
             .map_err(|err| map_registry_err(err, schema_str))?;
         let resolved = schema.effective_schema();
-        let validator = jsonschema::validator_for(&resolved).map_err(|err| {
-            // Catalog drift: the schema body in the registry is not a
-            // valid JSON Schema. Operator action required; surface as
-            // `Internal` so the public envelope does not pretend the
-            // caller's payload is the problem.
-            DomainError::Internal {
-                diagnostic: format!(
-                    "GTS metadata schema `{schema_id}` is not a valid JSON Schema \
-                     (catalog drift): {err}"
-                ),
-                cause: None,
-            }
-        })?;
+        // The base AM metadata envelope declares `$schema:
+        // "http://json-schema.org/draft-07/schema#"`, and derived metadata
+        // schemas carry `$schema: "gts://gts.cf.core.am.tenant_metadata.v1~"`
+        // -- the GTS chain identifier that AM uses for inheritance. The
+        // generic `jsonschema::validator_for` auto-detects the draft from
+        // `$schema` and fails closed when the URI is not a registered
+        // meta-schema (which custom GTS chain ids never are). Pin the
+        // draft to 7 explicitly so the chain id is treated as opaque
+        // metadata and validation runs against the well-known draft the
+        // envelope was authored for.
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft7)
+            .build(&resolved)
+            .map_err(|err| {
+                // Catalog drift: the schema body in the registry is not a
+                // valid JSON Schema. Operator action required; surface as
+                // `Internal` so the public envelope does not pretend the
+                // caller's payload is the problem.
+                DomainError::Internal {
+                    diagnostic: format!(
+                        "GTS metadata schema `{schema_id}` is not a valid JSON Schema \
+                         (catalog drift): {err}"
+                    ),
+                    cause: None,
+                }
+            })?;
         let errors: Vec<String> = validator
             .iter_errors(value)
             .map(|e| e.to_string())
             .collect();
         if !errors.is_empty() {
-            return Err(DomainError::Validation {
+            return Err(DomainError::MetadataValidation {
                 detail: format!(
                     "metadata value violates registered schema `{schema_id}`: {}",
                     errors.join("; ")

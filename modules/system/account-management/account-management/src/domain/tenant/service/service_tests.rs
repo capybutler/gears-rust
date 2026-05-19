@@ -2052,6 +2052,7 @@ struct OrderingRecordingIdp {
 impl account_management_sdk::IdpPluginClient for OrderingRecordingIdp {
     async fn provision_tenant(
         &self,
+        _ctx: &modkit_security::SecurityContext,
         _req: &account_management_sdk::IdpProvisionTenantRequest,
     ) -> Result<
         account_management_sdk::IdpProvisionResult,
@@ -2065,6 +2066,7 @@ impl account_management_sdk::IdpPluginClient for OrderingRecordingIdp {
     }
     async fn deprovision_tenant(
         &self,
+        _ctx: &modkit_security::SecurityContext,
         _req: &account_management_sdk::IdpDeprovisionTenantRequest,
     ) -> Result<(), account_management_sdk::IdpDeprovisionFailure> {
         self.log.lock().expect("lock").push("idp");
@@ -4134,6 +4136,7 @@ struct ClaimStealingTerminalIdp {
 impl account_management_sdk::IdpPluginClient for ClaimStealingTerminalIdp {
     async fn provision_tenant(
         &self,
+        _ctx: &modkit_security::SecurityContext,
         _req: &account_management_sdk::IdpProvisionTenantRequest,
     ) -> Result<
         account_management_sdk::IdpProvisionResult,
@@ -4143,6 +4146,7 @@ impl account_management_sdk::IdpPluginClient for ClaimStealingTerminalIdp {
     }
     async fn deprovision_tenant(
         &self,
+        _ctx: &modkit_security::SecurityContext,
         req: &account_management_sdk::IdpDeprovisionTenantRequest,
     ) -> Result<(), account_management_sdk::IdpDeprovisionFailure> {
         // Mid-call: rotate the claim to a peer worker. Production
@@ -4243,6 +4247,7 @@ struct ClaimStealingCompensableIdp {
 impl account_management_sdk::IdpPluginClient for ClaimStealingCompensableIdp {
     async fn provision_tenant(
         &self,
+        _ctx: &modkit_security::SecurityContext,
         _req: &account_management_sdk::IdpProvisionTenantRequest,
     ) -> Result<
         account_management_sdk::IdpProvisionResult,
@@ -4252,6 +4257,7 @@ impl account_management_sdk::IdpPluginClient for ClaimStealingCompensableIdp {
     }
     async fn deprovision_tenant(
         &self,
+        _ctx: &modkit_security::SecurityContext,
         req: &account_management_sdk::IdpDeprovisionTenantRequest,
     ) -> Result<(), account_management_sdk::IdpDeprovisionFailure> {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_500).expect("epoch");
@@ -4381,6 +4387,7 @@ struct LeakySentinelIdp {
 impl account_management_sdk::IdpPluginClient for LeakySentinelIdp {
     async fn provision_tenant(
         &self,
+        _ctx: &modkit_security::SecurityContext,
         _req: &account_management_sdk::IdpProvisionTenantRequest,
     ) -> Result<
         account_management_sdk::IdpProvisionResult,
@@ -4390,6 +4397,7 @@ impl account_management_sdk::IdpPluginClient for LeakySentinelIdp {
     }
     async fn deprovision_tenant(
         &self,
+        _ctx: &modkit_security::SecurityContext,
         _req: &account_management_sdk::IdpDeprovisionTenantRequest,
     ) -> Result<(), account_management_sdk::IdpDeprovisionFailure> {
         if self.classify_terminal {

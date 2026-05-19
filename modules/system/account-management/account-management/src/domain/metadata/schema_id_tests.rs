@@ -3,8 +3,10 @@
 //!
 //! Mirrors the coverage previously held by the (now-retired)
 //! `account_management_sdk::MetadataSchemaId` tests, but asserts
-//! against [`DomainError::Validation`] surface rather than the
-//! granular SDK error enum.
+//! against the [`DomainError::MetadataValidation`] surface rather
+//! than the granular SDK error enum — the metadata-content variant
+//! routes the canonical envelope to `gts.cf.core.am.tenant_metadata.v1~`
+//! instead of the tenant default.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, reason = "test helpers")]
 
@@ -45,8 +47,8 @@ fn parse_normalises_leading_trailing_whitespace() {
 fn parse_rejects_malformed_gts_syntax() {
     let err = ParsedSchemaId::parse("not a gts at all").expect_err("malformed");
     let detail = match err {
-        DomainError::Validation { detail } => detail,
-        other => panic!("expected Validation, got {other:?}"),
+        DomainError::MetadataValidation { detail } => detail,
+        other => panic!("expected MetadataValidation, got {other:?}"),
     };
     assert!(
         detail.contains("malformed metadata schema id"),
@@ -60,8 +62,8 @@ fn parse_rejects_wrong_root_segment() {
     let alien = "gts.cf.core.other_module.dataset.v1~vendor.app.foo.bar.v1~";
     let err = ParsedSchemaId::parse(alien).expect_err("wrong root");
     let detail = match err {
-        DomainError::Validation { detail } => detail,
-        other => panic!("expected Validation, got {other:?}"),
+        DomainError::MetadataValidation { detail } => detail,
+        other => panic!("expected MetadataValidation, got {other:?}"),
     };
     assert!(
         detail.contains("must start with `gts.cf.core.am.tenant_metadata.v1`"),
@@ -75,8 +77,8 @@ fn parse_rejects_root_only_chain() {
     let root_only = "gts.cf.core.am.tenant_metadata.v1~";
     let err = ParsedSchemaId::parse(root_only).expect_err("root only");
     let detail = match err {
-        DomainError::Validation { detail } => detail,
-        other => panic!("expected Validation, got {other:?}"),
+        DomainError::MetadataValidation { detail } => detail,
+        other => panic!("expected MetadataValidation, got {other:?}"),
     };
     assert!(
         detail.contains("missing a chained user-registered segment"),
@@ -90,8 +92,8 @@ fn parse_rejects_instance_id_shape() {
     let instance = "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.branding.v1";
     let err = ParsedSchemaId::parse(instance).expect_err("instance shape");
     let detail = match err {
-        DomainError::Validation { detail } => detail,
-        other => panic!("expected Validation, got {other:?}"),
+        DomainError::MetadataValidation { detail } => detail,
+        other => panic!("expected MetadataValidation, got {other:?}"),
     };
     assert!(
         detail.contains("instance id, not a schema chain"),

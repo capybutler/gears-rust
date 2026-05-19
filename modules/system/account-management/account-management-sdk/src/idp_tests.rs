@@ -5,6 +5,7 @@ use super::*;
 
 use crate::{IdpNewUser, IdpTenantContext, IdpUserPagination};
 use async_trait::async_trait;
+use modkit_security::SecurityContext;
 use uuid::Uuid;
 
 /// Minimal stub implementing no trait methods. Pins the
@@ -24,12 +25,16 @@ fn sample_tenant_context() -> IdpTenantContext {
     )
 }
 
+fn sample_security_context() -> SecurityContext {
+    SecurityContext::anonymous()
+}
+
 #[tokio::test]
 async fn deprovision_default_impl_returns_unsupported_operation() {
     let s = Stub;
     let req = IdpDeprovisionTenantRequest::new(sample_tenant_context());
     let err = s
-        .deprovision_tenant(&req)
+        .deprovision_tenant(&sample_security_context(), &req)
         .await
         .expect_err("default impl must err");
     assert!(matches!(
@@ -47,7 +52,7 @@ async fn provision_tenant_default_impl_returns_unsupported_operation() {
         gts::GtsSchemaId::new("gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"),
     );
     let err = s
-        .provision_tenant(&req)
+        .provision_tenant(&sample_security_context(), &req)
         .await
         .expect_err("default impl must err");
     assert!(matches!(
@@ -61,7 +66,7 @@ async fn provision_user_default_impl_returns_unsupported_operation() {
     let s = Stub;
     let req = IdpProvisionUserRequest::new(sample_tenant_context(), IdpNewUser::new("alice"));
     let err = s
-        .provision_user(&req)
+        .provision_user(&sample_security_context(), &req)
         .await
         .expect_err("default impl must err");
     assert!(matches!(
@@ -78,7 +83,7 @@ async fn deprovision_user_default_impl_returns_unsupported_operation() {
         user_id: Uuid::nil(),
     };
     let err = s
-        .deprovision_user(&req)
+        .deprovision_user(&sample_security_context(), &req)
         .await
         .expect_err("default impl must err");
     assert!(matches!(
@@ -95,7 +100,10 @@ async fn list_users_default_impl_returns_unsupported_operation() {
         user_id_filter: None,
         pagination: IdpUserPagination::default(),
     };
-    let err = s.list_users(&req).await.expect_err("default impl must err");
+    let err = s
+        .list_users(&sample_security_context(), &req)
+        .await
+        .expect_err("default impl must err");
     assert!(matches!(
         err,
         IdpUserOperationFailure::UnsupportedOperation { .. }

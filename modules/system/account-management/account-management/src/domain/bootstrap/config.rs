@@ -29,24 +29,10 @@ use uuid::Uuid;
 
 /// Operational upper bound on `idp_wait_timeout` (1 hour).
 ///
-/// Caps `idp_wait_timeout` so that:
-///
-/// 1. `Instant::now() + idp_wait_timeout` cannot overflow the
-///    platform's `Instant` representation (any value past the
-///    `Instant::checked_add` ceiling is operationally meaningless --
-///    the bootstrap saga is a sub-second-to-minutes operation, not a
-///    multi-day wait), and
-/// 2. `i64::try_from(secs * 2)` for the FEATURE-§3 stuck-threshold
-///    (`2 × idp_wait_timeout.as_secs()`) cannot saturate to `i64::MAX`,
-///    which would silently disable the stuck-row branch in
-///    `step_loop_classify` for the entire platform.
-///
-/// Tightened from the previous 24h ceiling because no operationally
-/// meaningful bootstrap path waits longer than minutes — a wait
-/// pushing past an hour means something else is wrong (`IdP` down,
-/// types-registry stalled, network partition) and the platform
-/// should fail loud rather than spin silently. 1h still keeps the
-/// `secs * 2 -> i64` cast trivially in range.
+/// 1h chosen as a fail-loud upper bound: any wait pushing past an
+/// hour indicates an external problem (`IdP` down, types-registry
+/// stalled, partition); 1h keeps the `secs*2 → i64` cast trivially in
+/// range.
 pub const MAX_IDP_WAIT_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Bootstrap-feature configuration.
@@ -126,11 +112,9 @@ pub struct BootstrapConfig {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
-            // Deterministic placeholder root id; deployments **MUST**
-            // override this with their canonical platform-root UUID.
-            // The default exists only so `serde(default)` round-trips
-            // an empty TOML table without panicking — the production
-            // wiring path requires an explicit value.
+            // Nil placeholder; production wiring rejects via validate().
+            // The default exists only so serde(default) survives an empty
+            // [bootstrap] TOML table.
             root_id: Uuid::nil(),
             root_name: "platform-root".to_owned(),
             root_tenant_type: gts::GtsSchemaId::new(""),

@@ -140,19 +140,10 @@ pub(super) fn id_eq(id: Uuid) -> Condition {
 /// retry helper gives up and returns the underlying error to the caller.
 pub(super) const MAX_SERIALIZABLE_ATTEMPTS: u32 = 5;
 
-/// TTL after which a hard-delete scan claim is considered stale and may
-/// be stolen by another worker. Bounds the worst-case stuck-row latency
-/// when [`crate::domain::tenant::repo::TenantRepo::clear_retention_claim`]
-/// fails after a non-Cleaned outcome (network blip, pool exhaustion):
-/// without this, the row would be permanently invisible to future scans
-/// because `claimed_by` would never return to NULL. The dedicated
-/// `claimed_at` column carries the claim acquisition timestamp and is
-/// the claim-age marker the scanner reads (see
-/// `repo_impl::retention::scan_retention_due` — the stale-claim cutoff
-/// is `now - RETENTION_CLAIM_TTL` against `tenants.claimed_at`).
-/// `claimed_at` is intentionally decoupled from `updated_at` so any
-/// future patch path that bumps `updated_at` on a `Deleted` row does
-/// not accidentally keep stale claims alive.
+/// Bounds worst-case stuck row when `clear_retention_claim` fails —
+/// `claimed_by` would otherwise stay set forever. `claimed_at` decoupled
+/// from `updated_at` so future `updated_at` patches don't keep stale
+/// claims alive.
 // `from_mins` is unstable on the workspace MSRV; keep `from_secs` form.
 #[allow(clippy::duration_suboptimal_units)]
 pub(super) const RETENTION_CLAIM_TTL: Duration = Duration::from_secs(600);

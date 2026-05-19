@@ -12,8 +12,9 @@
 //!   [`ODataQuery`] for filter / order / cursor / limit; returns a
 //!   [`modkit_odata::Page<MetadataEntry>`].
 //! * [`MetadataService::get_metadata`] — single-entry read; surfaces
-//!   the distinct-404 split (`metadata_schema_not_registered` vs
-//!   `metadata_entry_not_found`).
+//!   the unified metadata 404 (both "schema unknown to registry"
+//!   and "entry missing for tenant" collapse to
+//!   [`DomainError::MetadataEntryNotFound`]).
 //! * [`MetadataService::upsert_metadata`] — upsert at
 //!   `(tenant_id, schema_uuid)`; returns the post-write
 //!   [`MetadataEntry`]. The insert-vs-update discriminator is recorded
@@ -23,9 +24,10 @@
 //!   FEATURE §6 AC line 393, leaving REST status-code mapping
 //!   (HTTP 200 vs 201) to the handler (or collapsing to a uniform 200
 //!   per RFC 7231 PUT semantics).
-//! * [`MetadataService::delete_metadata`] — non-idempotent delete;
-//!   missing rows surface as `MetadataEntryNotFound` per
-//!   `dod-tenant-metadata-distinct-404-codes`.
+//! * [`MetadataService::delete_metadata`] — idempotent delete: returns
+//!   `Ok(())` whether the row existed or not (mirrors `delete_user`
+//!   deprovision idempotency). Tenant-existence and
+//!   schema-registration gates still surface their own 404 codes.
 //! * [`MetadataService::resolve_metadata`] — barrier-aware walk-up
 //!   resolution per `algo-tenant-metadata-resolve-walk-up` and
 //!   ADR-0002.
@@ -44,7 +46,7 @@ use std::sync::Arc;
 
 use account_management_sdk::{MetadataEntry, UpsertMetadataRequest};
 use authz_resolver_sdk::PolicyEnforcer;
-use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use authz_resolver_sdk::pep::ResourceType;
 use gts::GtsSchemaId;
 use modkit_macros::domain_model;
 use modkit_odata::{ODataQuery, Page};
@@ -66,11 +68,7 @@ use crate::domain::tenant::repo::TenantRepo;
 /// Mirrors the `pep::TENANT` declaration on `TenantService` (DESIGN
 /// §4.2). The resource type name pins
 /// [`account_management_sdk::TENANT_METADATA_RESOURCE_TYPE`]; the
-/// duplicated string literal is required because `ResourceType.name`
-/// is a `&'static str` consumed at compile time, and a
-/// `&'static str = CONST_FROM_SDK` would require const-promotion the
-/// SDK does not yet expose. The literal is asserted against the SDK
-/// constant in
+/// literal duplication is cross-checked against the SDK constant in
 /// [`crate::domain::error_tests`] so a divergence trips at test time.
 pub(super) mod pep {
     use super::{ResourceType, pep_properties};
@@ -121,16 +119,25 @@ pub(super) mod pep {
 
     /// Action vocabulary mirroring DESIGN §`cpt-cf-account-management-fr-tenant-metadata-permissions`
     /// (`Metadata.read`, `Metadata.write`, `Metadata.list`,
-    /// `Metadata.delete`) plus the AM-specific `resolve` action for
-    /// the walk-up path. The `Metadata.` prefix lives on the resource
+    /// `Metadata.delete`). The `Metadata.` prefix lives on the resource
     /// type ([`METADATA::name`]); these constants carry only the
-    /// action verb the PDP rule body matches against. `resolve` is
-    /// AM-local: a future PDP rule can deny only inheritance reads
-    /// without blocking direct ones.
+    /// action verb the PDP rule body matches against.
+    ///
+    /// The inheritance-aware `/resolved` endpoint reuses [`READ`]
+    /// rather than carrying a separate `resolve` verb: the resolved
+    /// value is the caller's effective config for their schema slot
+    /// (the inheritance walk is bounded by `self_managed` barriers
+    /// and the schema's policy), so it is logically still a read of
+    /// that slot. A caller with `Metadata.read` grant on the schema
+    /// should be able to call both `GET /metadata/{schema_id}` and
+    /// `GET /metadata/{schema_id}/resolved` without an additional
+    /// per-endpoint permission. Per-row source disambiguation belongs
+    /// in the response surface (the [`ResolvedTenantMetadataDto::source_tenant_id`](account_management_sdk)
+    /// field is reserved for surfacing the ancestor that produced the
+    /// value) and audit log enrichment, not in the policy verb.
     pub mod actions {
         pub const READ: &str = "read";
         pub const LIST: &str = "list";
-        pub const RESOLVE: &str = "resolve";
         /// `Metadata.write` per DESIGN §`cpt-cf-account-management-fr-tenant-metadata-permissions`.
         /// Used by the upsert flow; PUT and the future PATCH share
         /// the same action — distinguishing them is up to the PDP,
@@ -140,25 +147,13 @@ pub(super) mod pep {
     }
 }
 
-/// Shared clock seam. Produced by [`MetadataService::new`] from
-/// `OffsetDateTime::now_utc` and overridable in tests via
-/// [`MetadataService::with_now_fn`]. Mirrors the
-/// [`crate::domain::conversion::service::ConversionService`] convention
-/// so the unit tests can pin `created_at` / `updated_at` for repeatable
-/// idempotency assertions.
+/// Clock seam: production uses `OffsetDateTime::now_utc`; tests
+/// override via [`MetadataService::with_now_fn`] to pin timestamps.
 type NowFn = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 
-/// Central AM domain service for tenant metadata.
-///
-/// Construction mirrors
-/// [`crate::domain::conversion::service::ConversionService`] — every
-/// dependency is `Arc<dyn ...>` so production wiring (`module.rs`)
-/// and tests (`FakeMetadataRepo` + `FakeTenantRepo` +
-/// `StubMetadataSchemaRegistry`) share the same constructor surface.
-///
-/// The [`PolicyEnforcer`] is owned by-value (it is `Clone`); the
-/// module wiring clones it from the shared instance used by
-/// `TenantService`.
+/// Central tenant-metadata orchestrator. Deps are `Arc<dyn ...>` so
+/// prod wiring and unit tests share one constructor; [`PolicyEnforcer`]
+/// is by-value (it is `Clone`).
 #[domain_model]
 pub struct MetadataService {
     metadata_repo: Arc<dyn MetadataRepo>,
@@ -166,7 +161,17 @@ pub struct MetadataService {
     schema_registry: Arc<dyn MetadataSchemaRegistry>,
     enforcer: PolicyEnforcer,
     now_fn: NowFn,
+    /// Per-deployment `$top` cap; override via
+    /// [`Self::with_listing_max_top`] from `cfg.listing.max_top`.
+    /// Default = [`DEFAULT_MAX_LISTING_TOP`].
+    max_listing_top: u32,
 }
+
+/// Default `$top` cap surfaced by [`MetadataService::max_listing_top`]
+/// when the production wiring does not call [`MetadataService::with_listing_max_top`]
+/// to override it. Mirrors the platform-wide listing cap baked into
+/// the metadata-repo listing config.
+const DEFAULT_MAX_LISTING_TOP: u32 = 200;
 
 impl MetadataService {
     /// Construct a fully-wired service with the production clock
@@ -184,7 +189,29 @@ impl MetadataService {
             schema_registry,
             enforcer,
             now_fn: Arc::new(OffsetDateTime::now_utc),
+            max_listing_top: DEFAULT_MAX_LISTING_TOP,
         }
+    }
+
+    /// Operator-tunable per-deployment listing cap. The module bootstrap
+    /// passes `cfg.listing.max_top` so the metadata listing surface
+    /// stays uniform with the tenant / conversion listing caps. Mirrors
+    /// [`crate::domain::tenant::service::TenantService::max_list_children_top`].
+    #[must_use]
+    pub const fn with_listing_max_top(mut self, max_top: u32) -> Self {
+        self.max_listing_top = max_top;
+        self
+    }
+
+    /// Per-deployment `$top` cap. The REST handler calls
+    /// [`crate::api::rest::handlers::common::clamp_listing_top`] with
+    /// this value so a deployment that tightened
+    /// `cfg.listing.max_top` below the repo-level absolute ceiling
+    /// (200) sees the tighter cap take effect uniformly across every
+    /// AM listing endpoint.
+    #[must_use]
+    pub const fn max_listing_top(&self) -> u32 {
+        self.max_listing_top
     }
 
     /// PEP gate. Calls the platform-side `PolicyEnforcer`, returns
@@ -219,24 +246,27 @@ impl MetadataService {
         tenant_id: Uuid,
         schema_id: Option<&str>,
     ) -> Result<AccessScope, DomainError> {
-        let mut request = AccessRequest::new()
-            .resource_property(pep_properties::OWNER_TENANT_ID, tenant_id)
-            .resource_property(pep_properties::RESOURCE_ID, tenant_id)
-            .require_constraints(true);
-        if let Some(sid) = schema_id {
-            // The `IntoPropertyValue: From<&str>` impl on
-            // `AccessRequest::resource_property` clones into the
-            // wire envelope itself — passing the borrow avoids the
-            // double allocation that an intermediate `to_owned()`
-            // would incur on the per-row loop (up to 200 rows per
-            // page).
-            request = request.resource_property(pep::SCHEMA_ID, sid);
-        }
-        let scope = self
-            .enforcer
-            .access_scope_with(ctx, &pep::METADATA, action, Some(tenant_id), &request)
-            .await?;
-        Ok(scope)
+        // Delegates to [`crate::domain::authz::authz_scope`] for the
+        // uniform PEP-gate shape; the metadata-specific `SCHEMA_ID`
+        // property is layered on via the `extend` closure so the
+        // shared helper does not have to know about per-service
+        // AccessRequest attributes.
+        //
+        // `&str` is passed verbatim to keep the per-row `list_metadata`
+        // path from double-allocating the schema id.
+        crate::domain::authz::authz_scope(
+            &self.enforcer,
+            ctx,
+            &pep::METADATA,
+            action,
+            tenant_id,
+            Some(tenant_id),
+            |req| match schema_id {
+                Some(sid) => req.resource_property(pep::SCHEMA_ID, sid),
+                None => req,
+            },
+        )
+        .await
     }
 
     /// Per-row schema-scoped authorization helper used by
@@ -318,12 +348,13 @@ impl MetadataService {
     ///   `Deleted` (Active + Suspended pass per FEATURE spec), or
     ///   the `ODataQuery` carries an unsupported filter / cursor
     ///   shape.
-    /// * [`DomainError::MetadataSchemaNotRegistered`] — a stored row
-    ///   carries a `schema_uuid` whose chained id is missing from the
-    ///   registry. This is a data-integrity signal; in practice
-    ///   schemas are removed from the registry only after every
-    ///   tenant has dropped its row, but the service surfaces the
-    ///   condition rather than swallowing it.
+    /// * [`DomainError::Internal`] — orphan row: a stored
+    ///   `schema_uuid` no longer resolves to a chained id in the
+    ///   types registry. This is a data-integrity signal (the
+    ///   chained id was deleted from the registry while metadata
+    ///   rows still reference it); the service logs a `warn!` and
+    ///   surfaces `Internal` rather than leaking the bare UUID
+    ///   through a public 404 envelope.
     // @cpt-begin:cpt-cf-account-management-flow-tenant-metadata-list:p1:inst-flow-mdlist-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-crud-contract:p1:inst-dod-crud-list-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-application-only-enforcement:p1:inst-dod-app-only-list-service
@@ -355,8 +386,14 @@ impl MetadataService {
         // one batch call. The registry adapter resolves all uuids in a
         // single round-trip and the lookup below is a pure map read.
         // Rows whose `schema_uuid` is no longer registered are an
-        // integrity-pipeline signal — operators get a precise
-        // `MetadataSchemaNotRegistered` rather than a panic.
+        // integrity-pipeline signal — operators see them on the
+        // `am.metadata` warn line and the caller gets a loud
+        // `Internal` (HTTP 500). We do NOT surface this through the
+        // public 404 path: leaking the bare `schema_uuid` as a
+        // `resource_name` exposes an AM-internal storage key (the
+        // chain that the caller would recognise is unknown by
+        // definition here), and silently skipping the row would mask
+        // a data-integrity drift behind a partial page.
         let uuids: Vec<Uuid> = page.items.iter().map(|r| r.schema_uuid).collect();
         let id_by_uuid: HashMap<Uuid, GtsSchemaId> =
             self.schema_registry.resolve_ids_by_uuid(&uuids).await?;
@@ -367,19 +404,37 @@ impl MetadataService {
         // the listing surface MUST filter entries by per-schema
         // `Metadata.read` policy — otherwise a caller granted only
         // `branding` could enumerate `billing` rows just by listing.
-        // Outer `LIST` already passed at line 322; this loop is the
+        // Outer `LIST` already passed above; this loop is the
         // per-row `READ` gate on the hydrated rows. `CrossTenantDenied`
         // for a row is silently dropped (the documented "omit"
         // semantic); any other PDP failure propagates so transport /
         // policy-load errors fail closed.
         let mut items: Vec<MetadataEntry> = Vec::with_capacity(page.items.len());
         for row in page.items {
-            let gts_schema_id = id_by_uuid.get(&row.schema_uuid).cloned().ok_or_else(|| {
-                DomainError::MetadataSchemaNotRegistered {
-                    detail: format!("schema_uuid {} not registered", row.schema_uuid),
-                    schema: row.schema_uuid.to_string(),
-                }
-            })?;
+            let Some(gts_schema_id) = id_by_uuid.get(&row.schema_uuid).cloned() else {
+                // Orphan row: `schema_uuid` is in `tenant_metadata`
+                // but its chained id is gone from the types registry.
+                // Loud `warn!` so the integrity-check pipeline can
+                // correlate, and `Internal` so the client sees an
+                // explicit "AM is broken" signal rather than a
+                // partial page.
+                tracing::warn!(
+                    target: "am.metadata",
+                    tenant_id = %tenant_id,
+                    schema_uuid = %row.schema_uuid,
+                    "metadata list: orphan row references a schema_uuid not present in the \
+                     types registry; surfacing Internal so the data-integrity drift is \
+                     observable"
+                );
+                return Err(DomainError::Internal {
+                    diagnostic: format!(
+                        "metadata list: orphan row for tenant {tenant_id} references \
+                         schema_uuid {} which the types registry no longer recognises",
+                        row.schema_uuid
+                    ),
+                    cause: None,
+                });
+            };
             if !self
                 .caller_allows_schema_read(ctx, tenant_id, gts_schema_id.as_ref())
                 .await?
@@ -389,24 +444,11 @@ impl MetadataService {
             items.push(project_to_entry(row, gts_schema_id));
         }
 
-        // NOTE on cursor stability: filtering rows out of the
-        // hydrated page returns a `Page` whose `items.len()` can be
-        // less than `page_info.limit`. The cursor itself is computed
-        // by the repo over the un-filtered set, so the next page
-        // still advances correctly — callers walking the listing
-        // observe gaps in cardinality but no missing rows. Returning
-        // `items` smaller than `limit` is the same contract the
-        // `OData` platform helpers honour when the underlying row
-        // count is less than the requested limit.
-        //
-        // Terminal-page case: when the repo has no further rows
-        // (`page_info.next_cursor = None`), the caller stops walking
-        // regardless of how many entries the per-row schema-deny
-        // filter dropped — the cursor presence (or absence) is the
-        // termination signal, not `items.len() == limit`. A page
-        // ending with `next_cursor = None` and zero passing rows is
-        // a legitimate "no readable metadata on this tenant" reply
-        // rather than a stuck-pagination bug.
+        // Per-row deny filtering can return items.len() <
+        // page_info.limit — pagination is still correct because the
+        // cursor advances over the unfiltered set. Consumers MUST use
+        // page_info.next_cursor (not items.len()) as the termination
+        // signal.
         Ok(Page {
             items,
             page_info: page.page_info,
@@ -424,26 +466,21 @@ impl MetadataService {
     ///
     /// Implements `cpt-cf-account-management-flow-tenant-metadata-get`.
     ///
-    /// Distinct-404 disambiguation per
-    /// `dod-tenant-metadata-distinct-404-codes`:
-    ///
-    /// * Schema unknown to the registry →
-    ///   [`DomainError::MetadataSchemaNotRegistered`] (HTTP 404,
-    ///   `code=metadata_schema_not_registered`).
-    /// * Schema known but no row at `(tenant_id, schema_uuid)` →
-    ///   [`DomainError::MetadataEntryNotFound`] (HTTP 404,
-    ///   `code=metadata_entry_not_found`).
+    /// Both "schema unknown to the registry" and "schema known but no
+    /// row at `(tenant_id, schema_uuid)`" surface as the same
+    /// [`DomainError::MetadataEntryNotFound`] — AM does not
+    /// distinguish them on the wire. The canonical envelope carries
+    /// `resource_type = gts.cf.core.am.tenant_metadata.v1~` and
+    /// `resource_name` = the chained `schema_id` the caller supplied.
     ///
     /// # Errors
     ///
     /// * [`DomainError::NotFound`] — `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] — tenant is `Provisioning` or
     ///   `Deleted` (Active + Suspended pass per FEATURE spec).
-    /// * [`DomainError::MetadataSchemaNotRegistered`] — see above.
     /// * [`DomainError::MetadataEntryNotFound`] — see above.
     // @cpt-begin:cpt-cf-account-management-flow-tenant-metadata-get:p1:inst-flow-mdget-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-crud-contract:p1:inst-dod-crud-get-service
-    // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes:p1:inst-dod-distinct-404-get-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-schema-registration-and-uuid-derivation:p1:inst-dod-schema-registration-get-service
     #[tracing::instrument(skip(self), fields(tenant_id = %tenant_id, schema_id = %schema_id))]
     pub async fn get_metadata(
@@ -482,13 +519,12 @@ impl MetadataService {
             .await?
             .ok_or_else(|| DomainError::MetadataEntryNotFound {
                 detail: format!("no metadata entry for tenant {tenant_id} at schema {schema_id}"),
-                entry: format!("({tenant_id}, {schema_id})"),
+                entry: schema_id.to_string(),
             })?;
 
         Ok(project_to_entry(row, schema_id))
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-metadata-schema-registration-and-uuid-derivation:p1:inst-dod-schema-registration-get-service
-    // @cpt-end:cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes:p1:inst-dod-distinct-404-get-service
     // @cpt-end:cpt-cf-account-management-dod-tenant-metadata-crud-contract:p1:inst-dod-crud-get-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-metadata-get:p1:inst-flow-mdget-service
 
@@ -507,44 +543,14 @@ impl MetadataService {
     /// FEATURE §6 AC line 393 — REST status-code mapping (200 vs 201)
     /// is the handler's call.
     ///
-    /// Guard ordering (full, matches FEATURE §6 AC):
-    /// 1. `ParsedSchemaId::parse(input.schema_id)` — pure input
-    ///    validation. Reads no external state; rejecting malformed
-    ///    GTS syntax / wrong root segment / instance-id shapes here
-    ///    does not leak tenant topology because the error depends
-    ///    solely on the caller-supplied bytes.
-    /// 2. `value.is_null()` — pure input validation; same rationale
-    ///    as step 1. The SDK boundary deliberately allows
-    ///    `Value::Null` (see `upsert_metadata_request_accepts_any_non_missing_value`
-    ///    in `metadata_tests.rs`); the service-side rejection
-    ///    surfaces as [`DomainError::Validation`] before any state
-    ///    read.
-    /// 3. `authorize` — PEP gate. Carries the `SCHEMA_ID` attribute
-    ///    so per-schema policies (`Metadata.write` on branding but
-    ///    not billing) can match.
-    /// 4. `resolve_visible_tenant` — `NotFound` / Provisioning /
-    ///    Deleted collapses BEFORE any registry lookup so tenant
-    ///    topology does not leak through a registry-call error.
-    ///    Suspended tenants pass — metadata writes on suspended
-    ///    tenants are explicitly allowed by the FEATURE spec.
-    /// 5. `schema_registry.resolve_inheritance_policy` — the
-    ///    schema-existence gate. Unregistered schemas surface as
-    ///    [`DomainError::MetadataSchemaNotRegistered`] without ever
-    ///    touching the validator.
-    /// 6. `schema_registry.validate_value` — GTS body validation
-    ///    against the registered JSON Schema. Payload-fail surfaces
-    ///    as [`DomainError::Validation`] BEFORE any DB write,
-    ///    fingerprinting `dod-tenant-metadata-crud-contract` line 393.
+    /// Guard ordering — pure → PEP → topology → schema → write:
+    /// 1. `ParsedSchemaId::parse` — pure input validation.
+    /// 2. `value.is_null()` — pure input validation.
+    /// 3. `authorize` — PEP gate carrying the `SCHEMA_ID` attribute.
+    /// 4. `resolve_visible_tenant` — tenant topology gate.
+    /// 5. `schema_registry.resolve_inheritance_policy` — schema-existence gate.
+    /// 6. `schema_registry.validate_value` — body validation before any DB write.
     /// 7. `metadata_repo.upsert_for_tenant` — the actual write.
-    ///
-    /// Steps 1–3 run before the tenant-existence gate intentionally:
-    /// (1, 2) are pure input checks whose error variant cannot encode
-    /// any server-side state, and (3) is the PEP gate which by design
-    /// MUST run for every request regardless of resource state so
-    /// PDP-deny is uniformly 403. Steps 4–7 carry the topology
-    /// ordering: tenant existence is checked before registry / DB
-    /// operations so an unregistered-schema or missing-row error
-    /// cannot surface on a non-existent tenant.
     ///
     /// `requested_by` is recorded on the success-side `am.events`
     /// line for audit correlation.
@@ -555,8 +561,8 @@ impl MetadataService {
     /// * [`DomainError::Validation`] — tenant is `Provisioning` or
     ///   `Deleted` (Active + Suspended pass per FEATURE spec), or
     ///   `value` violates the registered JSON Schema body.
-    /// * [`DomainError::MetadataSchemaNotRegistered`] — schema not
-    ///   in the registry; no row written.
+    /// * [`DomainError::MetadataEntryNotFound`] — schema not
+    ///   in the registry (unified metadata 404); no row written.
     /// * [`DomainError::ServiceUnavailable`] — types-registry transport
     ///   failure; no row written.
     /// * [`DomainError::Internal`] — registered schema is not a valid
@@ -582,14 +588,12 @@ impl MetadataService {
         } = input;
         let parsed = ParsedSchemaId::parse(schema_id.as_ref())?;
 
-        // Non-null `value` was previously enforced by
-        // `UpsertMetadataRequest::new` (returning the now-removed
-        // `MetadataValidationError::EmptyValue`). Now that the SDK
-        // ships a plain JSON shape with no validation, the gate runs
-        // service-side and surfaces as `DomainError::Validation`
-        // (HTTP 400) at the canonical boundary.
+        // Service-side null gate — SDK accepts plain JSON without
+        // validation, so the gate runs here and surfaces as
+        // `DomainError::Validation` (HTTP 400) at the canonical
+        // boundary.
         if value.is_null() {
-            return Err(DomainError::Validation {
+            return Err(DomainError::MetadataValidation {
                 detail: "metadata value must not be null".into(),
             });
         }
@@ -607,10 +611,9 @@ impl MetadataService {
             .await?;
 
         // GTS body validation. Runs AFTER the existence gate above so
-        // an unregistered-schema PUT still surfaces 404, not 400, per
-        // `dod-tenant-metadata-distinct-404-codes`. The registry's
-        // local-client cache amortizes the second round-trip in the
-        // steady state.
+        // an unregistered-schema PUT still surfaces 404, not 400.
+        // The registry's local-client cache amortizes the second
+        // round-trip in the steady state.
         self.schema_registry
             .validate_value(parsed.as_gts(), &value)
             .await?;
@@ -629,12 +632,9 @@ impl MetadataService {
         };
         let entry = project_to_entry(row, schema_id.clone());
 
-        // Audit emission with `schema_id` on the structured log. The
-        // `outcome` field carries `created` / `updated` so a downstream
-        // aggregator counting by (event, outcome) can still distinguish
-        // the insert vs rewrite path even though the public SDK
-        // contract collapses both into a single `MetadataEntry`
-        // return.
+        // Audit line preserves the insert-vs-update split
+        // (outcome=created/updated) that the SDK return type
+        // intentionally hides.
         tracing::info!(
             target: "am.events",
             event = "metadata_upserted",
@@ -659,24 +659,21 @@ impl MetadataService {
     ///
     /// Implements `cpt-cf-account-management-flow-tenant-metadata-delete`.
     ///
-    /// DELETE is intentionally NOT idempotent-success on missing rows:
-    /// the distinct-404 contract per
-    /// `dod-tenant-metadata-distinct-404-codes` makes the signal
-    /// observable to clients. Missing rows surface as
-    /// [`DomainError::MetadataEntryNotFound`].
+    /// Idempotent on missing rows: returns `Ok(())` whether the row
+    /// existed and was removed or was already absent (mirrors the
+    /// `delete_user` deprovision idempotency contract). The
+    /// tenant-existence and schema-registration gates still run upstream
+    /// — those `NotFound` paths surface their own 404 codes.
     ///
     /// # Errors
     ///
     /// * [`DomainError::NotFound`] — `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] — tenant is `Provisioning` or
     ///   `Deleted` (Active + Suspended pass per FEATURE spec).
-    /// * [`DomainError::MetadataSchemaNotRegistered`] — schema not
-    ///   registered; no DB write issued.
-    /// * [`DomainError::MetadataEntryNotFound`] — schema known but no
-    ///   row at `(tenant_id, schema_uuid)`.
+    /// * [`DomainError::MetadataEntryNotFound`] — schema not
+    ///   in the registry (unified metadata 404); no DB write issued.
     // @cpt-begin:cpt-cf-account-management-flow-tenant-metadata-delete:p1:inst-flow-mddel-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-crud-contract:p1:inst-dod-crud-delete-service
-    // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes:p1:inst-dod-distinct-404-delete-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-schema-registration-and-uuid-derivation:p1:inst-dod-schema-registration-delete-service
     #[tracing::instrument(
         skip(self),
@@ -703,28 +700,9 @@ impl MetadataService {
 
         let schema_uuid = parsed.uuid();
 
-        // The repo's `delete_for_tenant` returns
-        // [`DomainError::MetadataEntryNotFound`] on missing rows,
-        // satisfying the distinct-404 contract without an additional
-        // service-side existence probe. Remap to use the public
-        // `schema_id` in `detail` / `entry` so the wire shape matches
-        // `get_metadata`'s NotFound projection (which the repo cannot
-        // synthesise because it only sees the internal `schema_uuid`).
-        // Without the remap, GET and DELETE on the same missing entry
-        // would surface two different `entry` payloads, breaking
-        // aggregators keyed on that field.
         self.metadata_repo
             .delete_for_tenant(&scope, tenant_id, schema_uuid)
-            .await
-            .map_err(|e| match e {
-                DomainError::MetadataEntryNotFound { .. } => DomainError::MetadataEntryNotFound {
-                    detail: format!(
-                        "no metadata entry for tenant {tenant_id} at schema {schema_id}"
-                    ),
-                    entry: format!("({tenant_id}, {schema_id})"),
-                },
-                other => other,
-            })?;
+            .await?;
 
         tracing::info!(
             target: "am.events",
@@ -739,7 +717,6 @@ impl MetadataService {
         Ok(())
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-metadata-schema-registration-and-uuid-derivation:p1:inst-dod-schema-registration-delete-service
-    // @cpt-end:cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes:p1:inst-dod-distinct-404-delete-service
     // @cpt-end:cpt-cf-account-management-dod-tenant-metadata-crud-contract:p1:inst-dod-crud-delete-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-metadata-delete:p1:inst-flow-mddel-service
 
@@ -754,18 +731,16 @@ impl MetadataService {
     ///
     /// Empty resolution is `Ok(None)` — the normal terminal state of
     /// an unsuccessful walk per FEATURE §3 / DESIGN §3.2.3, NOT
-    /// [`DomainError::MetadataEntryNotFound`]. Per
-    /// `dod-tenant-metadata-distinct-404-codes` the future REST
-    /// handler surfaces `Ok(None)` as HTTP 200 with an empty
-    /// response.
+    /// [`DomainError::MetadataEntryNotFound`]. The REST handler
+    /// surfaces `Ok(None)` as HTTP 200 with an empty response.
     ///
     /// # Errors
     ///
     /// * [`DomainError::NotFound`] — `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] — tenant is `Provisioning` or
     ///   `Deleted` (Active + Suspended pass per FEATURE spec).
-    /// * [`DomainError::MetadataSchemaNotRegistered`] — schema not
-    ///   registered; no walk performed.
+    /// * [`DomainError::MetadataEntryNotFound`] — schema not in the
+    ///   registry (unified metadata 404); no walk performed.
     // @cpt-begin:cpt-cf-account-management-flow-tenant-metadata-resolve:p1:inst-flow-mdres-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-inheritance-resolution-contract:p1:inst-dod-inheritance-resolve-service
     // @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-application-only-enforcement:p1:inst-dod-app-only-resolve-service
@@ -777,8 +752,13 @@ impl MetadataService {
         schema_id: GtsSchemaId,
     ) -> Result<Option<MetadataEntry>, DomainError> {
         let parsed = ParsedSchemaId::parse(schema_id.as_ref())?;
+        // Reuse the READ action: the resolved value is the caller's
+        // effective config for their schema slot, and the inheritance
+        // walk is bounded by `self_managed` barriers and the schema's
+        // policy — see the `pep::actions` module docs for why the
+        // `/resolved` flow does not carry a separate verb.
         let scope = self
-            .authorize(ctx, pep::actions::RESOLVE, tenant_id, Some(parsed.as_str()))
+            .authorize(ctx, pep::actions::READ, tenant_id, Some(parsed.as_str()))
             .await?;
 
         let start_tenant = self.resolve_visible_tenant(&scope, tenant_id).await?;
@@ -881,26 +861,11 @@ impl MetadataService {
         // via step 1.
         let mut current_parent = start_tenant.parent_id;
 
-        // allow_all for the ancestor walk:
-        //
-        // The PEP gate above already authorised the caller on
-        // `start_tenant` (the resource the caller actually named).
-        // Once that gate has passed, walking up the ancestor chain
-        // for `Inherit`-policy inheritance is a STRUCTURAL read --
-        // the result is projected through the start tenant's
-        // visibility, never disclosed directly. The
-        // post-#1813 `tenants` entity declares `resource_col = "id"`
-        // (and `tenant_metadata` declares `tenant_col = "tenant_id"`),
-        // so reusing the caller's narrowed scope here would clamp
-        // both reads to descendants of the start tenant -- and an
-        // ancestor is by definition NOT in the start tenant's
-        // descendant subtree. The narrowed scope would therefore
-        // turn every ancestor lookup into a dangling-parent
-        // `Internal` error (step 8) or a silent miss (step 11),
-        // collapsing the FEATURE's inheritance semantics. Mirrors
-        // the saga-internal `allow_all` reads in `TenantService`
-        // (`create_tenant`, `update_tenant`, `delete_tenant` parent /
-        // structural-precondition reads).
+        // PEP authorised the caller on start_tenant. Ancestor walk is
+        // structural — results are projected through the start
+        // tenant's visibility, never disclosed directly. Reusing the
+        // narrowed InTenantSubtree scope would clamp to descendants of
+        // start_tenant, turning every ancestor read into a miss.
         let walk_scope = AccessScope::allow_all();
 
         // Hop counter for the `MAX_WALK_HOPS` cycle guard. Declared
@@ -1008,24 +973,9 @@ impl MetadataService {
     /// list users etc.) keep the stricter active-only gate because
     /// the `IdP` plugin contract requires an Active tenant.
     ///
-    /// # Scope on the start-tenant read
-    ///
-    /// The PEP-compiled `scope` is forwarded to the `tenants`
-    /// `find_by_id` so a misconfigured / overly-permissive PDP that
-    /// returns `decision: true` for an out-of-subtree `tenant_id`
-    /// (e.g. with only an `InTenantSubtree(caller_subtree)`
-    /// constraint) still fails closed at the database. The
-    /// post-#1813 `tenants` entity declares `resource_col = "id"`,
-    /// so the `InTenantSubtree` predicate compiles to
-    /// `tenants.id IN tenant_closure(caller_subtree)` and collapses
-    /// an out-of-subtree row to `NotFound`. The `OWNER_TENANT_ID`
-    /// predicate carried by the same scope does not appear on
-    /// `tenants` and resolves to `None` at the per-filter
-    /// compilation step — the surviving `RESOURCE_ID` /
-    /// `InTenantSubtree` predicate keeps the clamp intact
-    /// (fail-closed at the filter level; OR-of-constraints
-    /// semantics across the two `Constraint` alternatives the PDP
-    /// emits).
+    /// Forward the PEP scope through `tenants.find_by_id` so an
+    /// overly-permissive PDP still fails closed at the DB clamp
+    /// (`InTenantSubtree` compiles against `tenants.id`).
     async fn resolve_visible_tenant(
         &self,
         scope: &AccessScope,

@@ -70,6 +70,7 @@
 
 use async_trait::async_trait;
 use gts::GtsSchemaId;
+use modkit_security::SecurityContext;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -83,8 +84,8 @@ use crate::idp_user::{
 /// Whether the tenant being provisioned is the platform root or a
 /// regular child. Lives inside [`IdpProvisionTenantRequest::target`] so
 /// the root-bootstrap branch is expressed by an explicit named variant
-/// rather than the absence of a parent id (which previously read as
-/// "missing data" rather than "canonical bootstrap signal").
+/// rather than by the absence of a parent id — the explicit variant
+/// reads as a canonical bootstrap signal, not as missing data.
 ///
 /// Call-sites do not construct this enum directly — they go through
 /// [`IdpProvisionTenantRequest::for_root`] (bootstrap) or
@@ -357,6 +358,29 @@ impl core::error::Error for IdpDeprovisionFailure {}
 /// or read-only directory) compile without stubbing every method
 /// explicitly.
 ///
+/// # `SecurityContext` parameter
+///
+/// Every method receives `ctx: &SecurityContext` so the plugin can
+/// reach platform services (credential store, secret manager, audit
+/// pipeline) on behalf of the caller — e.g. fetching the IdP-side
+/// service credentials from credstore keyed by the system or tenant
+/// subject. AM forwards the resolver-built request context on
+/// REST-driven call sites (`provision_user` / `deprovision_user` /
+/// `list_users` and the user-initiated `provision_tenant` /
+/// `deprovision_tenant`). For background-driven flows (bootstrap,
+/// provisioning reaper, hard-delete retention) AM forwards a stable
+/// AM-internal system context minted by one of the per-site
+/// factories in `cyberware-account-management::domain::system_actor`
+/// (`for_bootstrap` / `for_provisioning_reaper` / `for_retention_sweep`
+/// / `for_user_cleanup` / `for_user_groups_cascade` / `for_module_init`);
+/// the plugin sees `subject_type = "am.system"` and a fixed,
+/// hand-picked `subject_id` stable across processes, which it MAY use
+/// to switch
+/// to a system credstore path. This is an AM-local convention, not a
+/// platform-wide standard — other modules calling external services
+/// in background flows MAY adopt their own (`<module>_system_context`)
+/// pending a `modkit-security` canonical helper.
+///
 /// # Retry, backoff, and rate-limiting are owned by the plugin
 ///
 /// AM does NOT wrap calls into this trait in retry loops, exponential
@@ -436,9 +460,10 @@ pub trait IdpPluginClient: Send + Sync + 'static {
     ///   level doc). AM issues exactly one call per saga attempt.
     async fn provision_tenant(
         &self,
+        ctx: &SecurityContext,
         req: &IdpProvisionTenantRequest,
     ) -> Result<IdpProvisionResult, IdpProvisionFailure> {
-        let _ = req;
+        let _ = (ctx, req);
         Err(IdpProvisionFailure::UnsupportedOperation {
             detail: "provision_tenant not implemented".to_owned(),
         })
@@ -465,9 +490,10 @@ pub trait IdpPluginClient: Send + Sync + 'static {
     ///   `Retryable` return defers the row to the next tick.
     async fn deprovision_tenant(
         &self,
+        ctx: &SecurityContext,
         req: &IdpDeprovisionTenantRequest,
     ) -> Result<(), IdpDeprovisionFailure> {
-        let _ = req;
+        let _ = (ctx, req);
         Err(IdpDeprovisionFailure::UnsupportedOperation {
             detail: "deprovision_tenant not implemented".to_owned(),
         })
@@ -487,9 +513,10 @@ pub trait IdpPluginClient: Send + Sync + 'static {
     /// adapters compile without stubbing user methods.
     async fn provision_user(
         &self,
+        ctx: &SecurityContext,
         req: &IdpProvisionUserRequest,
     ) -> Result<IdpUser, IdpUserOperationFailure> {
-        let _ = req;
+        let _ = (ctx, req);
         Err(IdpUserOperationFailure::UnsupportedOperation {
             detail: "provision_user not implemented".to_owned(),
         })
@@ -512,9 +539,10 @@ pub trait IdpPluginClient: Send + Sync + 'static {
     /// [`IdpUserOperationFailure::UnsupportedOperation`].
     async fn deprovision_user(
         &self,
+        ctx: &SecurityContext,
         req: &IdpDeprovisionUserRequest,
     ) -> Result<(), IdpUserOperationFailure> {
-        let _ = req;
+        let _ = (ctx, req);
         Err(IdpUserOperationFailure::UnsupportedOperation {
             detail: "deprovision_user not implemented".to_owned(),
         })
@@ -545,9 +573,10 @@ pub trait IdpPluginClient: Send + Sync + 'static {
     /// [`IdpUserOperationFailure::UnsupportedOperation`].
     async fn list_users(
         &self,
+        ctx: &SecurityContext,
         req: &IdpListUsersRequest,
     ) -> Result<Page<IdpUser>, IdpUserOperationFailure> {
-        let _ = req;
+        let _ = (ctx, req);
         Err(IdpUserOperationFailure::UnsupportedOperation {
             detail: "list_users not implemented".to_owned(),
         })

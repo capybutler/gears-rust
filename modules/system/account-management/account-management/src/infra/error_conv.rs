@@ -1,19 +1,7 @@
 //! Infrastructure-layer DB error classification helpers used by the
 //! boundary mapping in [`crate::infra::canonical_mapping`].
 //!
-//! After the AIP-193 / `#[domain_model]` refactor:
-//!
-//! - `domain::error::DomainError` is pure (no `sea_orm` / `modkit_db`
-//!   imports). The `Database(DbErr)` variant has been removed.
-//! - Inside `with_serializable_retry` the raw `DbErr` is carried by
-//!   the infra-internal `TxError::Db` enum (`infra/storage/repo_impl/
-//!   helpers.rs`) so the retry helper can extract the `DbErr` for
-//!   contention detection. Once the retry budget is exhausted, the
-//!   surviving `DbErr` is translated to a typed `DomainError`
-//!   (`Aborted` / `AlreadyExists` / `ServiceUnavailable` / `Internal`)
-//!   by [`crate::infra::canonical_mapping::classify_db_err_to_domain`].
-//!
-//! What stays here is **just the typed predicates** the boundary mapping
+//! These are **just the typed predicates** the boundary mapping
 //! relies on: backend-aware retryable-contention detection, connectivity
 //! signals, and the redacted diagnostic helper that drops operator-
 //! supplied text (DSN, env-var values) before logging.
@@ -39,47 +27,10 @@ pub(crate) fn is_serialization_failure(err: &DbErr) -> bool {
 
 /// Returns `true` iff `err` represents a `CHECK` constraint violation
 /// on either AM-supported backend.
-///
-/// AM's storage layer pins several invariants via `CHECK` constraints:
-/// `length(name) BETWEEN 1 AND 255` on `tenants` (`m0001`) and
-/// `conversion_requests.child_tenant_name` (`m0004`), the lifecycle
-/// status enum bounds on `conversion_requests.status` (`m0004`), the
-/// per-status actor invariant on `conversion_requests` (`m0004`), and
-/// the `ck_tenants_root_depth` rule for the single platform root
-/// (`m0001`). Without this classification, every such DB-side rejection
-/// falls through `classify_db_err_to_domain` into the unclassified
-/// arm and becomes `DomainError::Internal` (HTTP 500) — a 400→500
-/// regression for any payload the service layer was meant to reject
-/// upstream but admitted through a degraded-mode short-circuit (e.g.
-/// `validate_tenant_name_via_gts` returning `Ok(())` when the schema
-/// is not yet registered).
-///
-/// `sea_orm::SqlErr` does not currently expose a typed
-/// `CheckConstraintViolation` discriminant the way it does for unique
-/// and FK violations, so classification is string-based against the
-/// driver-emitted message, mirroring the fallback arm of
-/// [`modkit_db::secure::is_unique_violation`]. Recognised patterns:
-/// * **Postgres** SQLSTATE `23514` — "violates check constraint" /
-///   "`check_violation`".
-/// * **`SQLite`** extended code `275` (`SQLITE_CONSTRAINT_CHECK`) —
-///   "`CHECK constraint failed`" (the default driver text). Some
-///   connection proxies / `sqlx` versions strip the text and surface
-///   the symbolic name or the numeric code alone; cover those
-///   defensively so a stripped message still routes to `Validation`
-///   (HTTP 400) and not `Internal` (HTTP 500).
-///
-/// # Anchoring
-///
-/// Both numeric-code arms are **anchored** rather than free
-/// substring searches: a naked `msg.contains("23514")` /
-/// `msg.contains("275")` would mis-classify unrelated `DbErr`
-/// payloads whose `Display` text contains those digits (byte
-/// offsets, port numbers, timestamps in ms, retry counts) as CHECK
-/// violations. Each numeric token is therefore required to appear
-/// inside a SQLSTATE / extended-code shape (`"SQLSTATE 23514"`,
-/// `"code 23514"`, `"23514:"`, `"(23514)"` for Postgres; the
-/// existing `"sqlite"`-context plus `"code 275"` / `"(275)"` /
-/// `"275:"` for `SQLite`).
+// String-based classification (`SqlErr` lacks a `Check` discriminant).
+// Numeric SQLSTATEs are anchored inside code-shape tokens to avoid
+// mis-matching unrelated `DbErr` payloads that contain those digits in
+// offsets/ports/counters.
 pub(crate) fn is_check_violation(err: &DbErr) -> bool {
     let msg = err.to_string().to_lowercase();
     msg.contains("check constraint")

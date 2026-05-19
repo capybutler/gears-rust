@@ -73,15 +73,10 @@
 //!
 //! # Plugin-private metadata is opaque to AM
 //!
-//! Earlier revisions exposed `validate_provision_input_metadata_via_gts`
-//! and `validate_provision_metadata_entries_via_gts` so AM could
-//! schema-check both caller-supplied provisioning metadata and the
-//! payload the `IdP` plugin returned from
-//! `provision_tenant`. Both were removed when AM's contract with the
-//! plugin was reshaped to treat plugin metadata as a fully opaque
-//! blob persisted in `tenant_idp_metadata` and echoed back on every
-//! subsequent `IdP` call. The plugin owns the shape (input and output)
-//! end-to-end; AM does not interpret it.
+//! AM treats plugin metadata as a fully opaque blob persisted in
+//! `tenant_idp_metadata` and echoed back on every subsequent `IdP`
+//! call. The plugin owns the shape (input and output) end-to-end;
+//! AM does not interpret it.
 
 use account_management_sdk::IdpNewUser;
 use serde_json::Value;

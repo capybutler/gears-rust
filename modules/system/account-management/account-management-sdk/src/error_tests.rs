@@ -17,19 +17,14 @@ fn tenant_not_found_is_recognised_as_not_found() {
 }
 
 #[test]
-fn metadata_schema_not_registered_is_not_found() {
-    let err = AccountManagementError::MetadataSchemaNotRegistered {
-        schema: "billing.v1".to_owned(),
-        detail: "schema billing.v1 missing".to_owned(),
-    };
-    assert!(err.is_not_found());
-}
-
-#[test]
 fn metadata_entry_not_found_is_not_found() {
+    // Unified metadata 404: both "schema unknown to registry" and
+    // "entry missing for tenant" surface as `MetadataEntryNotFound`
+    // — `entry` carries the chained `schema_id` (or, on orphan
+    // paths, the bare `schema_uuid`).
     let err = AccountManagementError::MetadataEntryNotFound {
-        entry: "z".to_owned(),
-        detail: "entry z missing".to_owned(),
+        entry: "gts.cf.core.am.tenant_metadata.v1~cf.core.billing.usage.v1~".to_owned(),
+        detail: "entry missing".to_owned(),
     };
     assert!(err.is_not_found());
 }

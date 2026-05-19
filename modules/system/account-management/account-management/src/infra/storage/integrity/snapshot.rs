@@ -3,10 +3,10 @@
 //!
 //! The shape mirrors a projection of the `SeaORM` entities
 //! `crate::infra::storage::entity::{tenants, tenant_closure}`. The loader
-//! (Phase 3, `audit/loader.rs`) produces `Vec<TenantSnap>` +
+//! (`integrity/loader.rs`) produces `Vec<TenantSnap>` +
 //! `Vec<ClosureSnap>` from a `REPEATABLE READ` `SecureSelect` and hands
 //! them to [`Snapshot::new`], which precomputes the indexes used by the
-//! classifiers in `audit/classifiers/`.
+//! classifiers in `integrity/classifiers/`.
 //!
 //! Per the spec (phase-01 §4) provisioning rows MUST NOT enter the
 //! snapshot — the loader filters `tenants.status` to the SDK-visible set

@@ -26,6 +26,8 @@ static-credstore = ["dep:static-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
 k8s = ["mini-chat/k8s"]
 otel = ["modkit/otel"]
+account-management = ["dep:account_management"]
+static-idp = ["dep:static-idp-plugin"]
 
 [dependencies]
 mimalloc = { version = "0.1" }
@@ -71,6 +73,10 @@ clap = { workspace = true }
 
 # Optional mini-chat module
 mini-chat = { package = "cyberware-mini-chat", path = "../../modules/mini-chat/mini-chat", optional = true }
+
+# Optional Account Management module
+account_management = { package = "cyberware-account-management", path = "../../modules/system/account-management/account-management", optional = true }
+static-idp-plugin = { package = "cyberware-static-idp-plugin", path = "../../modules/system/account-management/plugins/static-idp-plugin", optional = true }
 
 # Optional example module
 users-info = { path = "../../examples/modkit/users-info/users-info", optional = true }

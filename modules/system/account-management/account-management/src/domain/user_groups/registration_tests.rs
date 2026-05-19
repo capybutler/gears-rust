@@ -125,6 +125,11 @@ struct FakeRgClient {
     /// Order in which `create_type` was observed -- lets tests assert
     /// that the member handle was registered before the container.
     create_order: Mutex<Vec<String>>,
+    /// Recorded `update_type` calls (code + final spec).
+    /// `register_user_group_types` patches the container's self-parent
+    /// rule via `update_type` after the initial create, so tests can
+    /// assert the patch ran with the expected payload.
+    update_calls: Mutex<Vec<(String, UpdateTypeRequest)>>,
 }
 
 impl FakeRgClient {
@@ -136,6 +141,7 @@ impl FakeRgClient {
         Self {
             states,
             create_order: Mutex::new(Vec::new()),
+            update_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -177,7 +183,12 @@ impl FakeRgClient {
         }
     }
 
-    fn divergent_container_missing_self_parent() -> ResourceGroupType {
+    /// Container row that lacks the self-parent rule. Represents the
+    /// "post-CREATE / pre-patch" shape an init crash would leave
+    /// behind, OR a fresh row before the follow-up `update_type` runs.
+    /// Two-pass registration self-heals this state by calling
+    /// `update_type` to install the self-parent rule.
+    fn container_row_without_self_parent() -> ResourceGroupType {
         ResourceGroupType {
             allowed_parent_types: Vec::new(),
             ..Self::equivalent_container_row()
@@ -288,10 +299,20 @@ impl ResourceGroupClient for FakeRgClient {
     async fn update_type(
         &self,
         _ctx: &SecurityContext,
-        _code: &str,
-        _request: UpdateTypeRequest,
+        code: &str,
+        request: UpdateTypeRequest,
     ) -> Result<ResourceGroupType, ResourceGroupError> {
-        unreachable!()
+        self.update_calls
+            .lock()
+            .expect("update_calls lock not poisoned")
+            .push((code.to_owned(), request.clone()));
+        Ok(ResourceGroupType {
+            code: code.to_owned(),
+            can_be_root: request.can_be_root,
+            allowed_parent_types: request.allowed_parent_types,
+            allowed_membership_types: request.allowed_membership_types,
+            metadata_schema: request.metadata_schema,
+        })
     }
     async fn delete_type(
         &self,
@@ -414,6 +435,30 @@ async fn both_types_absent_registers_both_in_member_then_container_order() {
         ],
         "member handle MUST be registered before container"
     );
+
+    // The container's CREATE submits an EMPTY `allowed_parent_types`
+    // (RG's `resolve_ids` rejects self-references at create time);
+    // the self-parent rule is patched as a follow-up `update_type`
+    // call once the row is in RG's `gts_type` table.
+    let updates = arc.update_calls.lock().expect("lock").clone();
+    assert_eq!(
+        updates.len(),
+        1,
+        "exactly one `update_type` call expected for the container's self-parent patch"
+    );
+    let (code, req) = &updates[0];
+    assert_eq!(code, USER_GROUP_TYPE_CODE);
+    assert!(req.can_be_root);
+    assert_eq!(
+        req.allowed_parent_types,
+        vec![USER_GROUP_TYPE_CODE.to_owned()],
+        "the patch MUST install the self-parent rule"
+    );
+    assert_eq!(
+        req.allowed_membership_types,
+        vec![USER_MEMBERSHIP_TYPE.to_owned()],
+        "the patch MUST preserve the member-handle in `allowed_membership_types`"
+    );
 }
 
 #[tokio::test]
@@ -473,20 +518,33 @@ async fn container_can_be_root_false_diverges() {
 }
 
 #[tokio::test]
-async fn container_missing_self_parent_diverges() {
-    let client = FakeRgClient::defaults().with(
+async fn container_missing_self_parent_is_patched_via_update_type() {
+    // A pre-existing container row that lacks the self-parent rule
+    // (e.g. a prior init that completed the CREATE but crashed before
+    // the `update_type` patch) MUST be self-healed on the next init.
+    // The two-pass algorithm classifies the row as inclusive-equivalent
+    // against the empty-parents spec and then calls `update_type` to
+    // install the self-parent rule, leaving the container in its
+    // canonical shape regardless of where the prior init stopped.
+    let arc: Arc<FakeRgClient> = Arc::new(FakeRgClient::defaults().with(
         USER_GROUP_TYPE_CODE,
-        TypeState::already_present(FakeRgClient::divergent_container_missing_self_parent()),
+        TypeState::already_present(FakeRgClient::container_row_without_self_parent()),
+    ));
+    let dyn_arc: Arc<dyn ResourceGroupClient + Send + Sync> = arc.clone();
+    let result = register_user_group_types(&dyn_arc, &ctx())
+        .await
+        .expect("missing self-parent must be patched, not surfaced as divergent");
+    assert_eq!(result.container, RegistrationOutcome::AlreadyPresent);
+
+    let updates = arc.update_calls.lock().expect("lock").clone();
+    assert_eq!(updates.len(), 1, "the patch MUST run exactly once");
+    let (code, req) = &updates[0];
+    assert_eq!(code, USER_GROUP_TYPE_CODE);
+    assert_eq!(
+        req.allowed_parent_types,
+        vec![USER_GROUP_TYPE_CODE.to_owned()],
+        "the patch MUST install the self-parent rule on the partially-registered row"
     );
-    match register_user_group_types(&into_client(client), &ctx()).await {
-        Err(RegistrationError::DivergentSchema(msg)) => {
-            assert!(
-                msg.contains("allowed_parent_type"),
-                "msg should name the missing parent trait: {msg}"
-            );
-        }
-        other => panic!("expected DivergentSchema, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -589,5 +647,150 @@ async fn container_create_type_transport_error_returns_service_unavailable() {
     match register_user_group_types(&into_client(client), &ctx()).await {
         Err(RegistrationError::ServiceUnavailable(_)) => {}
         other => panic!("expected ServiceUnavailable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn container_update_type_transport_error_returns_service_unavailable() {
+    // The follow-up `update_type` that patches the self-parent rule is
+    // the second hop in the two-pass registration. If RG is reachable
+    // for the CREATE but the immediately-following UPDATE trips a
+    // transport failure, init MUST fail closed with `ServiceUnavailable`
+    // rather than silently leaving the container without its
+    // self-parent rule.
+    struct FailingUpdateClient {
+        delegate: FakeRgClient,
+    }
+
+    #[async_trait]
+    impl ResourceGroupClient for FailingUpdateClient {
+        async fn get_type(
+            &self,
+            ctx: &SecurityContext,
+            code: &str,
+        ) -> Result<ResourceGroupType, ResourceGroupError> {
+            self.delegate.get_type(ctx, code).await
+        }
+        async fn create_type(
+            &self,
+            ctx: &SecurityContext,
+            request: CreateTypeRequest,
+        ) -> Result<ResourceGroupType, ResourceGroupError> {
+            self.delegate.create_type(ctx, request).await
+        }
+        async fn list_types(
+            &self,
+            ctx: &SecurityContext,
+            query: &ODataQuery,
+        ) -> Result<Page<ResourceGroupType>, ResourceGroupError> {
+            self.delegate.list_types(ctx, query).await
+        }
+        async fn update_type(
+            &self,
+            _ctx: &SecurityContext,
+            _code: &str,
+            _request: UpdateTypeRequest,
+        ) -> Result<ResourceGroupType, ResourceGroupError> {
+            Err(ResourceGroupError::ServiceUnavailable {
+                message: "connection refused".to_owned(),
+            })
+        }
+        async fn delete_type(
+            &self,
+            ctx: &SecurityContext,
+            code: &str,
+        ) -> Result<(), ResourceGroupError> {
+            self.delegate.delete_type(ctx, code).await
+        }
+        async fn create_group(
+            &self,
+            ctx: &SecurityContext,
+            request: CreateGroupRequest,
+        ) -> Result<ResourceGroup, ResourceGroupError> {
+            self.delegate.create_group(ctx, request).await
+        }
+        async fn get_group(
+            &self,
+            ctx: &SecurityContext,
+            id: Uuid,
+        ) -> Result<ResourceGroup, ResourceGroupError> {
+            self.delegate.get_group(ctx, id).await
+        }
+        async fn list_groups(
+            &self,
+            ctx: &SecurityContext,
+            query: &ODataQuery,
+        ) -> Result<Page<ResourceGroup>, ResourceGroupError> {
+            self.delegate.list_groups(ctx, query).await
+        }
+        async fn update_group(
+            &self,
+            ctx: &SecurityContext,
+            id: Uuid,
+            request: UpdateGroupRequest,
+        ) -> Result<ResourceGroup, ResourceGroupError> {
+            self.delegate.update_group(ctx, id, request).await
+        }
+        async fn delete_group(
+            &self,
+            ctx: &SecurityContext,
+            id: Uuid,
+        ) -> Result<(), ResourceGroupError> {
+            self.delegate.delete_group(ctx, id).await
+        }
+        async fn get_group_descendants(
+            &self,
+            ctx: &SecurityContext,
+            id: Uuid,
+            query: &ODataQuery,
+        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+            self.delegate.get_group_descendants(ctx, id, query).await
+        }
+        async fn get_group_ancestors(
+            &self,
+            ctx: &SecurityContext,
+            id: Uuid,
+            query: &ODataQuery,
+        ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError> {
+            self.delegate.get_group_ancestors(ctx, id, query).await
+        }
+        async fn add_membership(
+            &self,
+            ctx: &SecurityContext,
+            id: Uuid,
+            ty: &str,
+            rid: &str,
+        ) -> Result<ResourceGroupMembership, ResourceGroupError> {
+            self.delegate.add_membership(ctx, id, ty, rid).await
+        }
+        async fn remove_membership(
+            &self,
+            ctx: &SecurityContext,
+            id: Uuid,
+            ty: &str,
+            rid: &str,
+        ) -> Result<(), ResourceGroupError> {
+            self.delegate.remove_membership(ctx, id, ty, rid).await
+        }
+        async fn list_memberships(
+            &self,
+            ctx: &SecurityContext,
+            query: &ODataQuery,
+        ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError> {
+            self.delegate.list_memberships(ctx, query).await
+        }
+    }
+
+    let client: Arc<dyn ResourceGroupClient + Send + Sync> = Arc::new(FailingUpdateClient {
+        delegate: FakeRgClient::defaults(),
+    });
+    match register_user_group_types(&client, &ctx()).await {
+        Err(RegistrationError::ServiceUnavailable(msg)) => {
+            assert!(
+                msg.contains("self-parent"),
+                "msg should name the failing patch step: {msg}"
+            );
+        }
+        other => panic!("expected ServiceUnavailable on update_type failure, got {other:?}"),
     }
 }

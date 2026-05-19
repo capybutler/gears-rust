@@ -19,15 +19,15 @@
 //!   `(tenant_id, schema_uuid)`. The path is engine-portable (`SeaORM`'s
 //!   `OnConflict` builder is dialect-agnostic but UPSERT semantics
 //!   require us to read back the post-write row anyway, so the SELECT-
-//!   first form is simpler and matches the established
-//!   `run_guarded_transition` shape used by `conversion.rs`). On insert
-//!   `created_at == updated_at == now`; on update `created_at` is
-//!   preserved and `updated_at` is bumped to `now`.
-//! * `delete_for_tenant` is intentionally **non-idempotent** on missing
-//!   rows. A `rows_affected == 0` UPDATE result surfaces
-//!   [`DomainError::MetadataEntryNotFound`] per the trait contract — the
-//!   distinct-404 contract (FEATURE §6 AC line 394) makes the signal
-//!   observable to clients.
+//!   first form is simpler). On insert `created_at == updated_at ==
+//!   now`; on update `created_at` is preserved and `updated_at` is
+//!   bumped to `now`.
+//! * `delete_for_tenant` is **idempotent** on missing rows: a
+//!   `rows_affected == 0` outcome returns `Ok(())` (mirrors
+//!   `delete_user` deprovision idempotency). The tenant-existence and
+//!   schema-registration gates run upstream in the service layer, so a
+//!   0-row outcome here unambiguously means "no direct entry at
+//!   `(tenant_id, schema_uuid)`".
 //!
 //! Cascade-delete on tenant removal is owned by
 //! `TenantRepoImpl::hard_delete_one`: that path issues a single in-TX
@@ -65,14 +65,15 @@ use super::AmDbProvider;
 use super::helpers::{TxError, map_scope_err, map_scope_to_tx, with_serializable_retry};
 
 /// `OData` mapper for `tenant_metadata`. Maps the public SDK filter
-/// fields (`MetadataEntryFilterField` — currently `UpdatedAt` only)
+/// fields (`MetadataEntryFilterField` — `UpdatedAt` and `SchemaUuid`)
 /// onto the underlying `SeaORM` columns and surfaces cursor values
 /// for `paginate_odata`'s tiebreaker logic.
 ///
 /// Mirrors the RG pattern in
-/// `resource_group::infra::storage::odata_mapper`. Schema-id filtering
-/// is intentionally absent in v1; exact-schema lookups go through
-/// `get_metadata` instead.
+/// `resource_group::infra::storage::odata_mapper`. The chained
+/// `schema_id` is not a filter field — exact-schema lookups go through
+/// `get_metadata` instead; `SchemaUuid` is exposed so callers that
+/// already hold the derived `UUIDv5` can pin a row directly.
 struct MetadataODataMapper;
 
 impl FieldToColumn<MetadataEntryFilterField> for MetadataODataMapper {
@@ -116,20 +117,10 @@ const METADATA_LIMIT_CFG: LimitCfg = LimitCfg {
     max: 200,
 };
 
-/// Maximum extra attempts the upsert path will make after a
-/// `DomainError::AlreadyExists` race on the first-write code path.
-///
-/// Two concurrent first-time PUTs for the same `(tenant_id, schema_uuid)`
-/// can both observe `SELECT` returning `None` and both proceed to
-/// `INSERT`. SERIALIZABLE/serialization-failure detection is engine-
-/// dependent: `PostgreSQL` under SERIALIZABLE usually converts the
-/// collision to a `40001` (handled by `with_serializable_retry`), but
-/// `READ COMMITTED` and `SQLite` surface the raw `23505` / `2067`
-/// unique violation which `with_serializable_retry` does NOT retry.
-/// We retry here at the upsert boundary so the next attempt's `SELECT`
-/// finds the row written by the peer and takes the UPDATE path. 3
-/// retries (4 total attempts) is far above the realistic concurrency
-/// for the same composite key.
+/// Retry budget for the SELECT-then-INSERT race when
+/// `with_serializable_retry` cannot absorb it (PG READ COMMITTED /
+/// `SQLite` surface 23505/2067 raw, not as 40001). Next iteration's
+/// SELECT sees the peer's row → UPDATE path.
 const MAX_UPSERT_UNIQUE_VIOLATION_RETRIES: u8 = 3;
 
 /// `SeaORM` repository adapter for [`MetadataRepo`].
@@ -252,35 +243,13 @@ async fn upsert_for_tenant(
     now: OffsetDateTime,
     expected_version: Option<i64>,
 ) -> Result<UpsertOutcome, DomainError> {
-    // Engine-portable upsert: SELECT under TX, INSERT or UPDATE based on
-    // existence. The post-write `MetadataRow` is constructed in-memory
-    // from the known inputs + the previously-loaded `created_at` — no
-    // second SELECT round-trip per PUT.
-    //
     // Two retry layers wrap this:
-    //
-    // 1. **Inner** — `with_serializable_retry` retries the closure on
-    //    transient lock contention (PG 40001 / 40P01, MySQL deadlock,
-    //    SQLite BUSY / BUSY_SNAPSHOT). Engine-specific contention
-    //    signal lives there.
-    //
-    // 2. **Outer** — this function loops up to
-    //    `MAX_UPSERT_UNIQUE_VIOLATION_RETRIES` times when the inner
-    //    closure surfaces `DomainError::AlreadyExists`. That error
-    //    means a peer transaction completed its first-write INSERT
-    //    between our SELECT (which saw no row) and our INSERT (which
-    //    hit the unique constraint). The remedy is to re-enter the
-    //    closure: the next iteration's SELECT now finds the peer's
-    //    row and dispatches to the UPDATE branch — turning the race
-    //    into the idempotent "last write wins" semantics the PUT
-    //    contract promises.
-    //
-    //    The reason we do this here and not inside
-    //    `with_serializable_retry` is that the helper's classifier
-    //    (`is_retryable_contention`) deliberately covers only lock
-    //    contention, not constraint violations — every other repo
-    //    method wants `AlreadyExists` propagated as a domain signal,
-    //    not retried.
+    // 1. Inner — `with_serializable_retry` absorbs lock contention
+    //    (40001 / deadlock / BUSY).
+    // 2. Outer — this loop re-enters on `AlreadyExists` (the
+    //    SELECT-then-INSERT first-write race the inner helper does
+    //    not classify); the next iteration's SELECT finds the peer's
+    //    row and dispatches to UPDATE.
     let mut last_already_exists_detail: Option<String> = None;
     for attempt in 0..=MAX_UPSERT_UNIQUE_VIOLATION_RETRIES {
         match upsert_for_tenant_once(
@@ -298,13 +267,8 @@ async fn upsert_for_tenant(
             Err(DomainError::AlreadyExists { detail }) => {
                 last_already_exists_detail = Some(detail);
                 if attempt < MAX_UPSERT_UNIQUE_VIOLATION_RETRIES {
-                    // First-write race: peer landed INSERT between
-                    // our SELECT and INSERT. Retry — the next SELECT
-                    // sees the peer's row and takes the UPDATE
-                    // branch. Observable so a misclassification (a
-                    // non-race duplicate-key error wrongly routed
-                    // here) shows up in the dependency-health
-                    // counter rather than silently looping.
+                    // Metric makes misclassification observable
+                    // instead of silent looping.
                     emit_metric(
                         AM_DEPENDENCY_HEALTH,
                         MetricKind::Counter,
@@ -405,20 +369,15 @@ async fn upsert_for_tenant_once(
                         && existing.version != expected
                     {
                         return Err(TxError::Domain(DomainError::MetadataVersionMismatch {
-                            entry: format!("({tenant_id}, {schema_uuid})"),
+                            entry: schema_uuid.to_string(),
                             expected,
                             current: existing.version,
                         }));
                     }
-                    // UPDATE path: preserve `created_at`, stamp
-                    // `updated_at = now`, rewrite the opaque value,
-                    // bump `version = current + 1`. The WHERE clause
-                    // also pins on the current version as a
-                    // belt-and-braces guard — under SERIALIZABLE a
-                    // peer write would already surface 40001 and
-                    // retry, but the version-pinned filter keeps the
-                    // UPDATE deterministic even when the helper's
-                    // retry budget is engaged.
+                    // UPDATE pins on version as a belt-and-braces
+                    // guard — SERIALIZABLE already protects, but the
+                    // filter keeps writes deterministic when the
+                    // helper's retry budget is engaged.
                     let new_version = existing.version + 1;
                     let value_for_row = value.clone();
                     let res = tenant_metadata::Entity::update_many()
@@ -434,16 +393,9 @@ async fn upsert_for_tenant_once(
                         .await
                         .map_err(map_scope_to_tx)?;
                     if res.rows_affected == 0 {
-                        // Either the row vanished (concurrent
-                        // hard-delete) or its `version` advanced past
-                        // what we SELECTed. The latter should never
-                        // happen under SERIALIZABLE (the SELECT
-                        // becomes an anti-dependency anchor and a
-                        // peer commit triggers 40001 + retry), but if
-                        // a future driver loosens that contract the
-                        // version-pinned filter catches the drift and
-                        // surfaces it as `Internal` so the operator
-                        // sees the timing collision.
+                        // rows_affected == 0 ⇒ concurrent hard-delete
+                        // or version drift; surface Internal so the
+                        // timing-collision is operator-visible.
                         tracing::warn!(
                             target: "am.metadata",
                             tenant_id = %tenant_id,
@@ -478,7 +430,7 @@ async fn upsert_for_tenant_once(
                         && expected != 0
                     {
                         return Err(TxError::Domain(DomainError::MetadataVersionMismatch {
-                            entry: format!("({tenant_id}, {schema_uuid})"),
+                            entry: schema_uuid.to_string(),
                             expected,
                             current: 0,
                         }));
@@ -493,17 +445,11 @@ async fn upsert_for_tenant_once(
                         updated_at: ActiveValue::Set(now),
                         version: ActiveValue::Set(1),
                     };
-                    // `scope_unchecked` because the upstream
-                    // `MetadataService::authorize` PEP gate has already
-                    // authorised the caller on the supplied
-                    // `tenant_id`; the secure-orm `scope_with_model`
-                    // path runs `validate_insert_scope`, which short-
-                    // circuits to `Denied` whenever the scope's only
-                    // predicate is an `InTenantSubtree` (its
-                    // `values()` returns an empty slice — see
-                    // `modkit_security::ScopeFilter::values` doc).
-                    // Mirrors the production tenant-insert posture in
-                    // `repo_impl::lifecycle::insert_provisioning`.
+                    // scope_unchecked — PEP already authorised;
+                    // secure-orm's scope_with_model would deny because
+                    // InTenantSubtree scope yields no value()s on
+                    // validate_insert. Mirrors
+                    // lifecycle::insert_provisioning.
                     let model = tenant_metadata::Entity::insert(am)
                         .secure()
                         .scope_unchecked(&scope)
@@ -522,7 +468,6 @@ async fn upsert_for_tenant_once(
 // @cpt-end:cpt-cf-account-management-flow-tenant-metadata-put:p1:inst-storage-upsert-impl
 
 // @cpt-begin:cpt-cf-account-management-flow-tenant-metadata-delete:p1:inst-storage-delete-impl
-// @cpt-begin:cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes:p1:inst-dod-distinct-404-delete-storage
 async fn delete_for_tenant(
     repo: &MetadataRepoImpl,
     scope: &AccessScope,
@@ -530,28 +475,19 @@ async fn delete_for_tenant(
     schema_uuid: Uuid,
 ) -> Result<(), DomainError> {
     let conn = repo.db.conn()?;
-    let res = tenant_metadata::Entity::delete_many()
+    // Idempotent on missing rows: 0 rows_affected returns `Ok(())`.
+    // The tenant-existence and schema-registration gates run upstream
+    // in the service layer, so a 0-row outcome here unambiguously
+    // means "no direct entry at (tenant_id, schema_uuid)".
+    tenant_metadata::Entity::delete_many()
         .filter(pk_eq(tenant_id, schema_uuid))
         .secure()
-        // Same caller-scope forwarding as the rest of the file —
-        // `InTenantSubtree` clamps the DELETE to the caller's subtree.
         .scope_with(scope)
         .exec(&conn)
         .await
         .map_err(map_scope_err)?;
-    if res.rows_affected == 0 {
-        // Distinct-404 contract: missing rows MUST surface
-        // `MetadataEntryNotFound`, not `Ok(())`. The service layer
-        // forwards this verbatim per
-        // `dod-tenant-metadata-distinct-404-codes`.
-        return Err(DomainError::MetadataEntryNotFound {
-            detail: format!("no metadata entry for tenant {tenant_id} at schema {schema_uuid}"),
-            entry: format!("({tenant_id}, {schema_uuid})"),
-        });
-    }
     Ok(())
 }
-// @cpt-end:cpt-cf-account-management-dod-tenant-metadata-distinct-404-codes:p1:inst-dod-distinct-404-delete-storage
 // @cpt-end:cpt-cf-account-management-flow-tenant-metadata-delete:p1:inst-storage-delete-impl
 
 // ---------------------------------------------------------------------------

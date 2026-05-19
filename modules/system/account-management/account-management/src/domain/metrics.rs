@@ -1,9 +1,8 @@
 //! AM observability metric catalog.
 //!
 //! Declares the AM metric families from PRD §5.9 / FEATURE §5 "Metric
-//! Catalog". Metric constants and [`MetricKind`] were previously carried
-//! by the SDK's `metric_names` module; they are defined here so the
-//! runtime crate is self-contained and peer SDKs do not expose metric
+//! Catalog". Metric constants and [`MetricKind`] live in the runtime
+//! crate so it is self-contained and peer SDKs do not expose metric
 //! constants (see `resource-group-sdk`, `tenant-resolver-sdk`).
 //!
 //! ## Emission pipeline
@@ -57,24 +56,12 @@ pub const AM_CROSS_TENANT_DENIAL: &str = "am.cross_tenant_denial";
 pub const AM_HIERARCHY_INTEGRITY_VIOLATIONS: &str = "am.hierarchy_integrity_violations";
 
 /// Periodic integrity-check job tick outcome (`outcome` ∈ `completed` |
-/// `skipped_in_progress` | `failed`). Distinguishes "no violations
-/// because the check ran cleanly" from "no violations because the job
-/// hasn't run successfully" — the latter is invisible from
-/// [`AM_HIERARCHY_INTEGRITY_VIOLATIONS`] alone (which would just keep
-/// reporting stale-zero gauges).
-///
-/// **Outcome label set is fixed**: dashboards keyed on this counter
-/// rely on the three values above. Auto-repair tick outcomes live on
-/// [`AM_HIERARCHY_INTEGRITY_REPAIR_RUNS`] instead so this counter's
-/// label set stays stable across releases.
+/// `skipped_in_progress` | `failed`). Distinguishes a clean tick from a
+/// never-ran job, which [`AM_HIERARCHY_INTEGRITY_VIOLATIONS`] alone cannot.
 pub const AM_HIERARCHY_INTEGRITY_RUNS: &str = "am.hierarchy_integrity_runs";
 
-/// Periodic auto-repair tick outcome (`outcome` ∈ `completed` |
-/// `skipped_in_progress` | `failed`). Sister metric to
-/// [`AM_HIERARCHY_INTEGRITY_RUNS`] kept on its own family so the
-/// check-loop counter's documented label set is not silently widened
-/// when auto-repair lands. Dashboards filter by family rather than
-/// `outcome` prefix to avoid label-name collisions.
+/// Periodic auto-repair tick outcome — separate family from
+/// [`AM_HIERARCHY_INTEGRITY_RUNS`] so its fixed-label set is not widened.
 pub const AM_HIERARCHY_INTEGRITY_REPAIR_RUNS: &str = "am.hierarchy_integrity_repair_runs";
 
 /// Periodic integrity-check tick wall-clock duration in milliseconds.
@@ -93,14 +80,10 @@ pub const AM_HIERARCHY_INTEGRITY_DURATION: &str = "am.hierarchy_integrity_durati
 /// advancing.
 pub const AM_HIERARCHY_INTEGRITY_LAST_SUCCESS: &str = "am.hierarchy_integrity_last_success";
 
-/// Unix-epoch seconds of the last integrity-check tick that did NOT
-/// complete successfully (gate-conflict or generic error). Sister
-/// gauge to [`AM_HIERARCHY_INTEGRITY_LAST_SUCCESS`]: an alert wired
-/// to "`LAST_SUCCESS` older than threshold" alone cannot tell
-/// "sustained-failure-since-Y" from "never-ran" because the success
-/// gauge keeps the last good timestamp indefinitely. Emitting both
-/// gauges from the loop's failure arms lets operators triage which
-/// kind of staleness they're looking at.
+/// Unix-epoch seconds of the last failed integrity-check tick — paired
+/// with [`AM_HIERARCHY_INTEGRITY_LAST_SUCCESS`] so operators can tell
+/// "sustained failure" from "never ran" (the success gauge keeps the last
+/// good timestamp indefinitely).
 pub const AM_HIERARCHY_INTEGRITY_LAST_FAILURE: &str = "am.hierarchy_integrity_last_failure";
 
 /// Lock-lifecycle event counter for `integrity_check_runs`. Emitted
@@ -162,8 +145,6 @@ impl MetricKind {
 // OpenTelemetry-backed adapter without requiring every call site to
 // migrate at once. The adapter installs an implementation during
 // module init; calls before installation are silent no-ops.
-//
-// Removed in the same PR that retires the last `emit_*` call site.
 
 /// Forwarder used by the [`emit_*`] helpers to reach a real metrics
 /// adapter without the domain layer depending on infra. The infra

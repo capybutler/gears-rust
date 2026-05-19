@@ -52,6 +52,7 @@ use serde_json::Value;
 use crate::domain::bootstrap::config::BootstrapConfig;
 use crate::domain::error::DomainError;
 use crate::domain::metrics::{AM_BOOTSTRAP_LIFECYCLE, MetricKind, emit_metric};
+use crate::domain::system_actor::for_bootstrap;
 use crate::domain::tenant::TenantContext;
 use crate::domain::tenant::closure::build_activation_rows;
 use crate::domain::tenant::model::{NewTenant, TenantModel, TenantStatus};
@@ -60,11 +61,6 @@ use crate::domain::util::backoff::compute_next_backoff;
 use types_registry_sdk::TypesRegistryClient;
 
 /// Internal classification produced by `BootstrapService::classify`.
-///
-/// `TenantModel` is ~120 bytes; the previous `Box<TenantModel>` arms
-/// existed solely to placate `clippy::large_enum_variant`. Bootstrap
-/// runs at most once per process, so the per-call heap traffic is not
-/// worth the indirection — allow the lint instead.
 #[allow(clippy::large_enum_variant)]
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,10 +100,6 @@ const MAX_ALREADY_EXISTS_STREAK: u32 = 3;
 /// `BootstrapService`; the `step` dispatcher performs the IO and
 /// returns the next state. `Terminal` carries the final outcome
 /// for `run()`'s caller.
-///
-/// `TenantModel` payload on `Finalize` is ~120 bytes; bootstrap
-/// runs at most once per process so the per-call heap traffic is
-/// not worth the indirection — allow the lint instead.
 #[allow(clippy::large_enum_variant)]
 #[domain_model]
 enum BootstrapState {
@@ -198,9 +190,7 @@ impl SleepReason {
 /// `Provisioning` after a failed in-band compensation) plus a
 /// classify error into a single `Terminal` arm, leaving only the two
 /// context-divergent variants (`Resume`, `NoRoot`) for the call site
-/// to dispatch on. Owns `TenantModel` on `Resume` for the same
-/// reason `BootstrapState` does — the saga runs at most once per
-/// process so heap-traffic cost is irrelevant; allow the lint.
+/// to dispatch on.
 #[allow(clippy::large_enum_variant)]
 #[domain_model]
 enum ClassifyOutcome {
@@ -302,10 +292,7 @@ impl<R: TenantRepo> BootstrapService<R> {
     #[must_use]
     pub fn new(repo: Arc<R>, idp: Arc<dyn IdpPluginClient>, cfg: BootstrapConfig) -> Self {
         // Single `validate()` call so the assertion message and the
-        // boolean predicate cannot disagree (a previous shape called
-        // `validate()` twice and could in principle produce different
-        // error text on the second call once any non-pure check is
-        // added; the form below stays correct under refactor).
+        // boolean predicate cannot disagree.
         if cfg!(debug_assertions)
             && let Err(err) = cfg.validate()
         {
@@ -829,12 +816,6 @@ impl<R: TenantRepo> BootstrapService<R> {
         BootstrapState::LoopClassify
     }
 
-    // The previous `try_bootstrap_once` / `try_bootstrap_once_locked`
-    // forwarders were folded into the unified retry loop in `run()`
-    // above. Keeping a one-shot attempt helper would have re-classified
-    // on every iteration and called `preflight_root_tenant_type` more
-    // than once for a clean NoRoot path, both of which are unwanted.
-
     async fn preflight_root_tenant_type(&self, deadline: Instant) -> Result<(), DomainError> {
         let Some(registry) = &self.types_registry else {
             emit_metric(
@@ -1096,9 +1077,6 @@ impl<R: TenantRepo> BootstrapService<R> {
             depth: 0,
         };
         let inserted = self.repo.insert_provisioning(scope, &root_tenant).await?;
-        // Emit the success counter only after the insert returned
-        // `Ok(_)`; emitting before the await would record a phantom
-        // success on every `AlreadyExists` race-loser pass.
         emit_metric(
             AM_BOOTSTRAP_LIFECYCLE,
             MetricKind::Counter,
@@ -1118,11 +1096,6 @@ impl<R: TenantRepo> BootstrapService<R> {
         provisioning_root: TenantModel,
         deadline: Instant,
     ) -> Result<TenantModel, DomainError> {
-        // The `idp_provisioning` success counter is emitted from
-        // `handle_provision_success` after `provision_tenant` returns
-        // `Ok`; emitting it here would record a success on every IdP
-        // call attempt regardless of outcome.
-
         // Root tenants are the canonical bootstrap target per
         // `dod-platform-bootstrap-root-creation` — the SDK enum
         // names this branch explicitly so plugin authors see
@@ -1141,7 +1114,8 @@ impl<R: TenantRepo> BootstrapService<R> {
         // `IdpUnavailable` after compensating the row — the saga
         // retry loop handles that variant the same way it handles a
         // `CleanFailure`.
-        match tokio::time::timeout_at(deadline, self.idp.provision_tenant(&req)).await {
+        let sys_ctx = for_bootstrap(provisioning_root.id);
+        match tokio::time::timeout_at(deadline, self.idp.provision_tenant(&sys_ctx, &req)).await {
             Ok(Ok(result)) => {
                 let metadata = result.metadata;
                 match self
@@ -1253,21 +1227,9 @@ impl<R: TenantRepo> BootstrapService<R> {
         // `tenant::service::create_tenant` for the rationale on why
         // the up-front upsert is load-bearing.
         //
-        // # `?` on the upsert is safe here
-        //
-        // Unlike the create-child saga (where the `?` would skip the
-        // local compensation rung and we have to call
-        // `compensate_failed_activation` explicitly), the bootstrap
-        // caller — `BootstrapService::finalize` lines 1208-1242 —
-        // already wraps every `Err` from `handle_provision_success`
-        // in `compensate_step3_failure`, which runs the bounded
-        // `deprovision_tenant` + row-cleanup pipeline. A transient
-        // DB error on this line therefore propagates to that
-        // wrapper and the IdP-side teardown still runs. The
-        // bootstrap caller needs the saga `deadline` (an `Instant`
-        // not in scope here) to bound the IdP call, so inlining the
-        // compensation at this site would either require a
-        // signature change or skip the deadline guard.
+        // ? on upsert is safe: finalize already wraps every Err from
+        // handle_provision_success in compensate_step3_failure, which
+        // runs the bounded IdP-deprovision + row-cleanup pipeline.
         self.repo
             .upsert_idp_metadata(scope, root_id, idp_metadata)
             .await?;
@@ -1451,8 +1413,12 @@ impl<R: TenantRepo> BootstrapService<R> {
             idp_metadata.cloned(),
         );
         let req = IdpDeprovisionTenantRequest::new(IdpTenantContext::from(&tenant_context));
-        let idp_clean = match tokio::time::timeout_at(deadline, self.idp.deprovision_tenant(&req))
-            .await
+        let sys_ctx = for_bootstrap(root_id);
+        let idp_clean = match tokio::time::timeout_at(
+            deadline,
+            self.idp.deprovision_tenant(&sys_ctx, &req),
+        )
+        .await
         {
             // `Ok(())` confirmed cleanup; `NotFound` is the
             // vendor-side already-absent success-equivalent per
@@ -1637,8 +1603,12 @@ impl<R: TenantRepo> BootstrapService<R> {
             metadata,
         );
         let req = IdpDeprovisionTenantRequest::new(IdpTenantContext::from(&tenant_context));
-        let idp_clean = match tokio::time::timeout_at(deadline, self.idp.deprovision_tenant(&req))
-            .await
+        let sys_ctx = for_bootstrap(row.id);
+        let idp_clean = match tokio::time::timeout_at(
+            deadline,
+            self.idp.deprovision_tenant(&sys_ctx, &req),
+        )
+        .await
         {
             // `Ok(())` confirmed teardown; `NotFound` is the
             // vendor-side already-absent success-equivalent per

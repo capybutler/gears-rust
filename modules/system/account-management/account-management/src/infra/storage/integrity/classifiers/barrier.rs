@@ -19,9 +19,7 @@
 //! Expected `(ancestor, descendant) → barrier` pairs are derived once
 //! up front from `tenants.parent_id` in `O(N × depth)` and stored in
 //! a `HashMap`; the closure scan then becomes `O(|closure|)` lookups.
-//! Total work is `O(N × depth + |closure|)`, vs the previous
-//! `O(|closure| × depth)` per-row walk that degenerated to `O(N³ / 6)`
-//! on deep chains.
+//! Total work is `O(N × depth + |closure|)`.
 
 use std::collections::{HashMap, HashSet};
 

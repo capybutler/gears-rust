@@ -1,64 +1,16 @@
-//! Account Management `ModKit` module entry-point.
+//! Account Management module — multi-tenant lifecycle, `IdP` integration,
+//! and tenant relations.
 //!
-//! Owns the module declaration (`#[modkit::module]`), the
-//! [`DatabaseCapability`] implementation (Phase 1 migrations), and the
-//! lifecycle entry-point (`serve`) that drives the retention, reaper,
-//! and periodic hierarchy-integrity-check background ticks.
+//! Lifecycle:
+//! - `init`: validates config and constructs services; idempotent.
+//! - `serve`: runs the bootstrap saga, then retention/reaper/integrity/conversion
+//!   ticks under one shared cancel-token. A panic in any tick cancels the rest
+//!   so the runtime sees an abort, not a clean shutdown.
 //!
-//! REST routes are deliberately out of scope for this module file —
-//! they land in a subsequent PR that wires
-//! [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
-//! (cyberware-rust#1813) at the request-handler layer and threads the
-//! PDP-narrowed scope through to the storage seam.
-//!
-//! TODO(rest): expose tenant lifecycle through AIP-136 custom methods.
-//! Planned wire shape (final REST PR):
-//!
-//! * `DELETE /tenants/{uuid}` →
-//!   [`AccountManagementClient::delete_tenant`] — 200 + `Tenant`
-//!   (idempotent: second call returns the same tombstone).
-//! * `POST /tenants/{uuid}:suspend` →
-//!   [`AccountManagementClient::suspend_tenant`] — 200 + `Tenant`.
-//! * `POST /tenants/{uuid}:unsuspend` →
-//!   [`AccountManagementClient::unsuspend_tenant`] — 200 + `Tenant`.
-//!
-//! `PATCH /tenants/{uuid}` no longer accepts `status`; the
-//! [`UpdateTenantRequest`](account_management_sdk::UpdateTenantRequest)
-//! shape was narrowed to `name`-only and the `OpenAPI` schema for the
-//! patch body must drop the `status` property in the same PR.
-//!
-//! [`AccountManagementClient::delete_tenant`]: account_management_sdk::AccountManagementClient::delete_tenant
-//! [`AccountManagementClient::suspend_tenant`]: account_management_sdk::AccountManagementClient::suspend_tenant
-//! [`AccountManagementClient::unsuspend_tenant`]: account_management_sdk::AccountManagementClient::unsuspend_tenant
-//!
-//! Lifecycle ordering:
-//!
-//! 1. The runtime applies every migration via
-//!    [`modkit::contracts::DatabaseCapability::migrations`].
-//! 2. [`Module::init`] constructs `TenantRepoImpl`, hard-resolves
-//!    `AuthZResolverClient` (DESIGN §4.3 fail-closed),
-//!    `TypesRegistryClient`, and `ResourceGroupClient` from `ClientHub`
-//!    (all three are declared in `deps` so the runtime guarantees init
-//!    ordering; missing client → `init` returns an error), resolves
-//!    the `IdpPluginClient` plugin under a config-gated
-//!    policy (`idp.required = true` → fail-closed; `false` → fall back
-//!    to `NoopIdpProvider`), validates the bootstrap configuration
-//!    (fail-fast for strict-mode invalid configs), builds the
-//!    `TenantService`, and stores it in `OnceLock`. `init()` does
-//!    **not** run the bootstrap saga — it only validates the config
-//!    and stores the parameters for `serve()`.
-//! 3. The runtime invokes `serve` on a background task. `serve()`
-//!    first runs the platform-bootstrap saga (if configured) with
-//!    the `CancellationToken` provided by the runtime, ensuring the
-//!    saga is interruptible on SIGTERM. Under `bootstrap.strict = true`
-//!    (production posture) a successful saga guarantees an `Active`
-//!    root row is present before retention + reaper start, so those
-//!    loops never observe a rootless platform. Under
-//!    `bootstrap.strict = false` (or when the `[bootstrap]` section
-//!    is absent entirely) the saga is allowed to fail or skip —
-//!    `serve()` logs and continues. After bootstrap, `serve()` spawns
-//!    the retention + reaper interval loops and returns once `cancel`
-//!    fires.
+//! Hard dep on tenant-resolver: the in-crate `tr_plugin` publishes the TR
+//! contract from AM's local DB to avoid a cross-module read fan-out. Trade-off:
+//! AM-internal `Provisioning` rows are filtered server-side before crossing the
+//! TR boundary.
 
 use std::sync::{Arc, OnceLock};
 
@@ -66,11 +18,14 @@ use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer, models::Capability};
+use modkit::api::OpenApiRegistry;
 use modkit::contracts::DatabaseCapability;
 use modkit::lifecycle::ReadySignal;
-use modkit::{Module, ModuleCtx};
+use modkit::{Module, ModuleCtx, RestApiCapability};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+use crate::api::rest::routes as rest_routes;
 
 use account_management_sdk::IdpPluginClient;
 
@@ -94,9 +49,14 @@ use crate::infra::metrics::build_default_adapter;
 use crate::infra::rg::RgResourceOwnershipChecker;
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo_impl::{
-    AmDbProvider, ConversionRepoImpl, MetadataRepoImpl, TenantRepoImpl,
+    AmDbProvider, ConversionRepoImpl, MetadataRepoImpl, TenantHierarchyReadAdapter, TenantRepoImpl,
 };
 use crate::infra::types_registry::{GtsMetadataSchemaRegistry, GtsTenantTypeChecker};
+use crate::tr_plugin::PluginImpl as TrPluginImpl;
+use modkit::client_hub::ClientScope;
+use modkit::gts::PluginV1;
+use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
+use types_registry_sdk::RegisterResult;
 
 type ConcreteService = TenantService<TenantRepoImpl>;
 
@@ -121,32 +81,31 @@ struct BootstrapParams {
 
 #[modkit::module(
     name = "account-management",
-    deps = ["authz-resolver", "types-registry", "resource-group"],
-    capabilities = [db, stateful],
+    deps = ["authz-resolver", "types-registry", "resource-group", "tenant-resolver"],
+    capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 pub struct AccountManagementModule {
     service: OnceLock<Arc<ConcreteService>>,
     /// Conversion-request domain service handle, published alongside
-    /// [`Self::service`] so SDK consumers (and the upcoming REST
-    /// surface) can drive the dual-consent
+    /// [`Self::service`] so SDK consumers and the REST surface can
+    /// drive the dual-consent
     /// `pending -> {approved, cancelled, rejected, expired}` lifecycle
     /// without re-discovering its dependencies. Wired during
     /// [`Module::init`]; remains unset until init runs.
     conversion_service: OnceLock<Arc<ConversionService>>,
     /// `IdP` user-operations domain service handle, published alongside
-    /// [`Self::service`] so SDK consumers (and the upcoming REST
-    /// surface for `/tenants/{id}/users`) can drive provision /
-    /// deprovision / list flows without re-discovering the resolved
-    /// `IdpPluginClient`. Wired during [`Module::init`];
-    /// remains unset until init runs.
+    /// [`Self::service`] so SDK consumers and the REST surface for
+    /// `/tenants/{id}/users` can drive provision / deprovision / list
+    /// flows without re-discovering the resolved `IdpPluginClient`.
+    /// Wired during [`Module::init`]; remains unset until init runs.
     user_service: OnceLock<Arc<UserService>>,
     /// Tenant-metadata domain service handle, published alongside
-    /// [`Self::service`] so SDK consumers (and the upcoming REST
-    /// surface for `/tenants/{id}/metadata`) can drive the
-    /// list / get / put / delete / resolve flows without
-    /// re-discovering the resolved `TypesRegistryClient`. Wired during
-    /// [`Module::init`]; remains unset until init runs.
+    /// [`Self::service`] so SDK consumers and the REST surface for
+    /// `/tenants/{id}/metadata` can drive the list / get / put /
+    /// delete / resolve flows without re-discovering the resolved
+    /// `TypesRegistryClient`. Wired during [`Module::init`]; remains
+    /// unset until init runs.
     metadata_service: OnceLock<Arc<MetadataService>>,
     /// Hooks registered before [`Module::init`] has set up the service.
     /// Drained into the service inside `init` before the `OnceLock` is
@@ -174,105 +133,9 @@ impl Default for AccountManagementModule {
 }
 
 impl AccountManagementModule {
-    /// Crate-private accessor for the wired [`ConversionService`].
-    ///
-    /// # Visibility
-    ///
-    /// `pub(crate)` on purpose: same posture as
-    /// [`Self::user_service`] and [`Self::metadata_service`]. The
-    /// conversion service now PEP-gates every caller-facing method
-    /// via its injected [`PolicyEnforcer`], but the upcoming REST
-    /// surface for `/tenants/{id}/conversions` (cyberfabric-core#1813
-    /// follow-up) is the path consumers should reach the dual-consent
-    /// lifecycle through. Promoting this accessor back to `pub` lands
-    /// with the REST handler PR.
-    ///
-    /// # Lifecycle
-    ///
-    /// Returns `None` until [`Module::init`] has finished publishing
-    /// the service into its [`OnceLock`].
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "no in-tree caller until the conversion REST handler PR (cyberfabric-core#1813) wires the PEP boundary in front of this accessor"
-    )]
-    pub(crate) fn conversion_service(&self) -> Option<Arc<ConversionService>> {
-        self.conversion_service.get().cloned()
-    }
-
-    /// Crate-private accessor for the wired [`UserService`].
-    ///
-    /// # Visibility
-    ///
-    /// `pub(crate)` on purpose: `UserService` does not currently
-    /// inject a [`PolicyEnforcer`] -- `IdP` user-ops authorization
-    /// is expected to land at the REST/PEP boundary in the follow-up
-    /// surface for `/tenants/{id}/users` (cyberfabric-core#1813).
-    /// Until that boundary exists, exposing the service publicly
-    /// would let a sibling module reach `IdP` user-ops without going
-    /// through any authz check. Promoting back to `pub` lands with
-    /// the REST handler PR (or after `PolicyEnforcer` is injected
-    /// here, whichever ships first).
-    ///
-    /// # Lifecycle
-    ///
-    /// Returns `None` until [`Module::init`] has finished publishing
-    /// the service into its [`OnceLock`].
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "no in-tree caller until the user-ops REST handler PR (cyberfabric-core#1813) wires the PEP boundary in front of this accessor"
-    )]
-    pub(crate) fn user_service(&self) -> Option<Arc<UserService>> {
-        self.user_service.get().cloned()
-    }
-
-    /// Crate-private accessor for the wired [`MetadataService`].
-    ///
-    /// # Visibility
-    ///
-    /// `pub(crate)` on purpose: same posture as [`Self::conversion_service`]
-    /// and [`Self::user_service`] — `MetadataService` does not currently
-    /// inject a [`PolicyEnforcer`], so authorization for
-    /// `/tenants/{id}/metadata` is expected to land at the REST/PEP
-    /// boundary in the follow-up surface (cyberfabric-core#1813). Until
-    /// that boundary exists, exposing the service publicly would let a
-    /// sibling module reach metadata writes without going through any
-    /// authz check. Promoting back to `pub` lands with the REST handler
-    /// PR (or after `PolicyEnforcer` is injected here, whichever ships
-    /// first).
-    ///
-    /// # Lifecycle
-    ///
-    /// Returns `None` until [`Module::init`] has finished publishing
-    /// the service into its [`OnceLock`].
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "no in-tree caller until the metadata REST handler PR (cyberfabric-core#1813) wires the PEP boundary in front of this accessor"
-    )]
-    pub(crate) fn metadata_service(&self) -> Option<Arc<MetadataService>> {
-        self.metadata_service.get().cloned()
-    }
-
-    /// Append a cascade hook to the hard-delete pipeline. Sibling AM
-    /// features (user-groups, tenant-metadata) call this inside their
-    /// own `init` to register cleanup handlers before the module's
-    /// `serve` entry-point flips the state to `Running`.
-    ///
-    /// # Lifecycle ordering
-    ///
-    /// This module's `init` may run before *or* after sibling-feature
-    /// `init`s. To stay order-independent, hooks registered before
-    /// `init` are buffered and replayed into the service when `init`
-    /// finishes constructing it. After `init` completes, registrations
-    /// forward to the service directly. Siblings still **MUST**
-    /// register from their own `init` (not from a `serve` background
-    /// task): once `serve` starts the retention + reaper tick loops,
-    /// hooks registered later may race with an in-flight
-    /// `hard_delete_one` call (the hook list is snapshotted per tick,
-    /// so a late-arriving hook may be observed by some concurrent
-    /// tenants but not others).
+    /// Hooks registered before `init` are buffered, drained inside `init`
+    /// under the same lock, and forwarded directly after `init` — single
+    /// atomic switch with no lost-callback window.
     pub fn register_hard_delete_hook(&self, hook: TenantHardDeleteHook) {
         // Lock the buffer first, *then* check the OnceLock: this
         // ordering is the atomic switch with `init`, which drains
@@ -295,23 +158,9 @@ impl AccountManagementModule {
         }
     }
 
-    /// Lifecycle entry-point. Spawns the retention + reaper intervals
-    /// as two independent tasks under a shared child token of `cancel`
-    /// so a long-running retention tick cannot starve the reaper (and
-    /// vice versa). The function returns once both children exit after
-    /// either `cancel` fires (normal shutdown) or one of the children
-    /// panics (early-fail).
-    ///
-    /// # Errors
-    ///
-    /// Fails if [`Module::init`] has not run yet (the service handle
-    /// is stored in a `OnceLock` during init), or if either background
-    /// task panics — cooperative cancel-token shutdown returns
-    /// `Ok(())`, so any join error is a real fault we propagate so the
-    /// runtime sees the abort instead of believing the module shut
-    /// down cleanly. On panic, the surviving task is cancelled via the
-    /// shared child token and joined before we return, so neither task
-    /// is left orphaned beyond `serve()`.
+    /// Lifecycle entry. Spawns retention/reaper/integrity/conversion ticks
+    /// under a shared child token of `cancel`; a panic in one task cancels
+    /// the rest so the runtime sees the abort instead of a clean shutdown.
     #[allow(
         clippy::redundant_pub_crate,
         reason = "module-private serve entry-point invoked by the modkit runtime"
@@ -559,19 +408,9 @@ impl AccountManagementModule {
             }
         });
 
-        // Flip the runtime's `Starting -> Running` gate. Note: this
-        // returns once all three `tokio::spawn` calls above have
-        // submitted their futures to the scheduler, but **before** any
-        // child task has had its first poll on the `select!` inside
-        // its loop. The Tokio scheduler is free to defer that first
-        // poll, so there is a narrow window where a consumer observing
-        // `Running` could call `cancel.cancel()` before any tick loop
-        // has been polled even once. Each child task observes
-        // `cancelled()` on the very first `select!` poll — this is the
-        // accepted "Running but not yet ticked" pattern documented at
-        // [`modkit::lifecycle::ReadySignal`] — so the race is bounded
-        // (no missed work, no data loss; the tick loops simply exit
-        // before processing any tick).
+        // Running-but-not-yet-ticked race per `modkit::lifecycle::ReadySignal`:
+        // bounded by the `cancelled()` arm of each tick's `select!` — no work
+        // is missed.
         ready.notify();
         info!(
             target: "am.lifecycle",
@@ -582,18 +421,9 @@ impl AccountManagementModule {
             "account-management background ticks started"
         );
 
-        // `select!` on the join handles instead of `join!`: a `join!`
-        // would wait for **all** tasks to complete, which means a
-        // panic in one is invisible until the others finish their
-        // current ticks (potentially the full retention or reaper
-        // interval). With `select!` the first task to finish wins;
-        // we then cancel `tasks_cancel` to stop the survivors and
-        // join them before returning.
-        //
-        // The `&mut handle` borrow keeps every `JoinHandle` alive
-        // past the `select!` so we can `.await` the survivors in the
-        // tail of the chosen arm. `JoinHandle: Unpin`, so the
-        // implicit `&mut F: Future` blanket impl applies.
+        // `select!` on join handles, not `join!`: a panic in one task would
+        // otherwise stay invisible for up to a full tick before any other
+        // finishes. The `&mut handle` borrows keep survivors awaitable.
         let serve_result: anyhow::Result<()> = tokio::select! {
             res = &mut retention_handle => {
                 tasks_cancel.cancel();
@@ -868,7 +698,7 @@ impl Module for AccountManagementModule {
             // System-actor context: stable subject UUID across processes
             // so a future RG-side authz tightening that rejects anonymous
             // does not regress module init into permanent fail-closed.
-            let sys_ctx = crate::domain::user_groups::am_system_context(None);
+            let sys_ctx = crate::domain::system_actor::for_module_init();
             match crate::domain::user_groups::register_user_group_types(&rg_client, &sys_ctx).await
             {
                 Ok(outcome) => {
@@ -932,6 +762,13 @@ impl Module for AccountManagementModule {
         // `TenantService::new` below — the conversion service is
         // constructed afterwards and needs the same validated values.
         let conversion_cfg = cfg.conversion.clone();
+        // `cfg` is moved into `TenantService::new` below. Capture the
+        // tr_plugin knobs here so the registration block at the bottom
+        // of `init` can still read them — `enabled`/`priority` are
+        // `Copy`, `vendor` is cloned out as an owned `String`.
+        let tr_plugin_enabled = cfg.tr_plugin.enabled;
+        let tr_plugin_vendor = cfg.tr_plugin.vendor.clone();
+        let tr_plugin_priority = cfg.tr_plugin.priority;
 
         // Clone the enforcer for the user + metadata + conversion
         // services before moving the original into `TenantService::new`.
@@ -941,6 +778,11 @@ impl Module for AccountManagementModule {
         let user_enforcer = enforcer.clone();
         let metadata_enforcer = enforcer.clone();
         let conversion_enforcer = enforcer.clone();
+        // Snapshot `cfg.listing.max_top` before `cfg` moves into
+        // `TenantService::new` below — the conversion service wiring
+        // (constructed after the tenant service) plumbs the same cap
+        // through `with_listing_max_top`.
+        let listing_max_top = cfg.listing.max_top;
         let mut service = TenantService::new(
             Arc::clone(&repo),
             Arc::clone(&idp),
@@ -950,6 +792,146 @@ impl Module for AccountManagementModule {
             cfg,
         );
         service = service.with_types_registry(Arc::clone(&types_registry));
+
+        // Tenant Resolver Plugin (in-process, AM-co-located).
+        //
+        // **Opt-in**: gated by `cfg.tr_plugin.enabled`. While the
+        // plugin is still in build-out the default is `false` so a
+        // deploy that incidentally pulls AM into its binary does NOT
+        // register the plugin in either types-registry or
+        // `ClientHub` — without that gate, an AM-only binary would
+        // be the sole candidate under the configured vendor and the
+        // gateway's `choose_plugin_instance` would pick AM regardless
+        // of `priority`.
+        //
+        // Runs BEFORE `self.service.set(...)` below: TR-plugin GTS
+        // registration involves a network round-trip to
+        // types-registry and is fallible (serialization, registry
+        // contract violation, transient unavailability). Publishing
+        // AM's `service` to its `OnceLock` first would leave the
+        // module half-initialized and non-retriable on TR-plugin
+        // failure (the `OnceLock` would already be taken). Doing TR
+        // registration first preserves the "init() either fully
+        // succeeds or fully fails" contract.
+        //
+        // The plugin owns no state of its own; it borrows AM's `Db`
+        // and the already-resolved `TypesRegistryClient`.
+        // Registration order (when enabled):
+        //   1. Build `PluginImpl` from the shared deps.
+        //   2. Register a `PluginV1<TenantResolverPluginSpecV1>`
+        //      instance in types-registry (with idempotent
+        //      `AlreadyExists` spec verification).
+        //   3. **Only after** types-registry succeeds, bind the
+        //      plugin under a scoped `ClientHub` entry keyed by its
+        //      GTS instance id, matching the pattern in
+        //      `static-tr-plugin` and `rg-tr-plugin`.
+        // Step 3 follows step 2 so a registry failure cannot leave
+        // a stale `ClientHub` entry behind on a fail-closed init.
+        // The discovery race that could occur in the gap (gateway
+        // observes the registered instance but the bound client is
+        // not yet in the hub) is not reachable at init time —
+        // modkit's init phase is sequential and the TR gateway
+        // resolves plugins lazily on the first user request, after
+        // every dep has finished initializing.
+        //
+        // Co-location rationale (DESIGN §1.1): the plugin's
+        // correctness depends on AM-writer invariants beyond the
+        // two-table schema (transactional `(tenants, tenant_closure)`
+        // maintenance, barrier materialization over
+        // `(ancestor, descendant]`, provisioning lifecycle), which a
+        // standalone crate could not validate at runtime.
+        if tr_plugin_enabled {
+            // `tr_plugin` is enabled — emit a startup audit warning to
+            // make the in-process Tenant Resolver plugin visible in
+            // logs and pin the deviation from DESIGN §3.5: the plugin
+            // shares AM's normal connection pool rather than a
+            // dedicated read-only role. Provisioning a separate role
+            // is an operator concern that lands together with a
+            // `connection-pool-per-role` abstraction in `modkit-db`;
+            // until that exists, an `enabled = true` deploy reads
+            // through the writer-grade pool. Operators should be aware
+            // of this when granting AM's connection role.
+            tracing::warn!(
+                target: "am.tr_plugin.audit",
+                priority = tr_plugin_priority,
+                "AM tr_plugin enabled -- registering against shared writer pool \
+                 (DESIGN section 3.5 read-only role not yet provisioned)"
+            );
+            let hierarchy_read_adapter = Arc::new(TenantHierarchyReadAdapter::new(Arc::clone(&db)));
+            let tr_plugin = Arc::new(TrPluginImpl::new(
+                hierarchy_read_adapter,
+                Arc::clone(&types_registry),
+            ));
+            let tr_instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
+                "cf.builtin.account_management_tenant_resolver.plugin.v1",
+            );
+            // `vendor` and `priority` are both config-driven. `vendor`
+            // defaults to `"cyberfabric"` to match the default in
+            // `TenantResolverConfig::default()` — deploys that
+            // override `tenant-resolver.vendor` MUST also override
+            // `account-management.tr_plugin.vendor` to the same
+            // string, otherwise AM's instance is registered but
+            // never selectable by the gateway. `priority` defaults
+            // well above every in-tree alternative (`rg-tr-plugin`
+            // = 50, `static-tr-plugin` = 100) so even with
+            // `enabled = true` AM does NOT win selection when
+            // those plugins coexist. Full rationale lives on
+            // `config::TrPluginConfig`.
+            let tr_instance = PluginV1::<TenantResolverPluginSpecV1> {
+                id: tr_instance_id.clone(),
+                vendor: tr_plugin_vendor,
+                priority: tr_plugin_priority,
+                properties: TenantResolverPluginSpecV1,
+            };
+            let tr_instance_json = serde_json::to_value(&tr_instance)
+                .map_err(|e| anyhow::anyhow!("tr-plugin: serialize instance failed: {e}"))?;
+            let tr_results = types_registry
+                .register(vec![tr_instance_json.clone()])
+                .await?;
+            // Idempotent restart: treat `AlreadyExists` as success only
+            // when the stored spec matches our current serialized
+            // instance; fail otherwise so a stale registration under
+            // the same ID surfaces immediately.
+            for result in &tr_results {
+                if let RegisterResult::Err { error, .. } = result {
+                    if error.is_already_exists() {
+                        let existing = types_registry
+                            .get_instance(tr_instance_id.as_ref())
+                            .await
+                            .map_err(|e| {
+                            anyhow::anyhow!("tr-plugin: verify existing instance: {e}")
+                        })?;
+                        if existing.object != tr_instance_json {
+                            return Err(anyhow::anyhow!(
+                                "tr-plugin: instance already registered with a different spec"
+                            ));
+                        }
+                    } else {
+                        return Err(anyhow::anyhow!("tr-plugin: registration failed: {error}"));
+                    }
+                }
+            }
+            // Only after types-registry has accepted the instance
+            // (or confirmed an idempotent restart) do we publish the
+            // scoped client to the hub. A failure above returns Err
+            // before we reach this point, leaving `ClientHub`
+            // untouched.
+            let tr_api: Arc<dyn TenantResolverPluginClient> = tr_plugin;
+            ctx.client_hub()
+                .register_scoped::<dyn TenantResolverPluginClient>(
+                    ClientScope::gts_id(&tr_instance_id),
+                    tr_api,
+                );
+            info!(
+                tr_plugin_instance_id = %tr_instance_id,
+                "tenant-resolver plugin registered (in-process, AM-co-located)"
+            );
+        } else {
+            info!(
+                "tenant-resolver plugin (AM-co-located) is disabled by config; \
+                 set `account-management.tr_plugin.enabled = true` to opt in"
+            );
+        }
 
         // Build the conversion-request domain service alongside the
         // tenant service. The service owns the
@@ -974,7 +956,12 @@ impl Module for AccountManagementModule {
                 std::time::Duration::from_secs(conversion_cfg.cleanup_interval_secs),
                 conversion_cfg.expire_batch_size,
                 conversion_cfg.retention_batch_size,
-            ),
+            )
+            // Plumb the per-deployment `listing.max_top` so the
+            // conversion listing endpoints share the platform-wide
+            // operator cap with `list_children` / `list_metadata` /
+            // `list_users` instead of the in-impl default of 200.
+            .with_listing_max_top(listing_max_top),
         );
         // Build the user-operations domain service alongside the
         // conversion service. Shares the same `TenantRepoImpl` for
@@ -998,7 +985,11 @@ impl Module for AccountManagementModule {
             // gts.cf.core.rg.type.v1~cf.core.am.user.v1~, user_uuid)`
             // rows that surface in group-member listings until the
             // RG-side cleanup pipeline catches up.
-            .with_rg_membership_cleanup(Arc::clone(&rg_client)),
+            .with_rg_membership_cleanup(Arc::clone(&rg_client))
+            // Plumb the per-deployment `listing.max_top` so the user
+            // listing surface honors the operator knob uniformly with
+            // tenant / conversion / metadata listings.
+            .with_listing_max_top(listing_max_top),
         );
 
         // Build the tenant-metadata domain service.
@@ -1026,12 +1017,18 @@ impl Module for AccountManagementModule {
         let metadata_repo: Arc<dyn MetadataRepo> = Arc::new(MetadataRepoImpl::new(Arc::clone(&db)));
         let schema_registry: Arc<dyn MetadataSchemaRegistry> =
             Arc::new(GtsMetadataSchemaRegistry::new(Arc::clone(&types_registry)));
-        let metadata_service = Arc::new(MetadataService::new(
-            metadata_repo,
-            Arc::clone(&repo) as Arc<dyn TenantRepo>,
-            schema_registry,
-            metadata_enforcer,
-        ));
+        let metadata_service = Arc::new(
+            MetadataService::new(
+                metadata_repo,
+                Arc::clone(&repo) as Arc<dyn TenantRepo>,
+                schema_registry,
+                metadata_enforcer,
+            )
+            // Plumb the per-deployment `listing.max_top` so the
+            // metadata listing surface honors the operator knob
+            // uniformly with tenant / conversion / user listings.
+            .with_listing_max_top(listing_max_top),
+        );
 
         // Atomic publish of all four `OnceLock` handles together,
         // ordered so a half-published state is unobservable:
@@ -1051,11 +1048,6 @@ impl Module for AccountManagementModule {
         //    `Err` with no rollback of the already-set primary; the
         //    second `init` is supposed to fail closed anyway per the
         //    `OnceLock` contract.
-        //
-        // Previously the secondary handles were published BEFORE the
-        // primary, leaving a window where an external caller could
-        // see a wired `ConversionService` without `TenantService`
-        // being ready — a half-published init state.
         let tenant_service = {
             let mut buf = self.pending_hard_delete_hooks.lock();
             for hook in buf.drain(..) {
@@ -1123,6 +1115,72 @@ impl DatabaseCapability for AccountManagementModule {
         use sea_orm_migration::MigratorTrait;
         info!("providing account-management database migrations");
         Migrator::migrations()
+    }
+}
+
+impl RestApiCapability for AccountManagementModule {
+    /// Wire the AM REST surface onto the runtime router.
+    ///
+    /// Ships four endpoint families under `/api/account-management/v1`:
+    /// - `tenants` — tenant-hierarchy CRUD + `children` listing
+    ///   (`POST /tenants`, `GET / PATCH / DELETE /tenants/{tenant_id}`,
+    ///   `GET /tenants/{tenant_id}/children`).
+    /// - `tenants/{tenant_id}/metadata*` — tenant-scoped extensible
+    ///   metadata + effective-value resolution.
+    /// - `tenants/{tenant_id}/users*` — `IdP` user-ops (provision,
+    ///   list, deprovision).
+    /// - `tenants/{tenant_id}/conversions*` and
+    ///   `tenants/{tenant_id}/child-conversions*` — managed /
+    ///   self-managed mode conversion request lifecycle on both
+    ///   sides of the dual-consent pair.
+    ///
+    /// Handlers consume axum extensions instead of resolving services
+    /// through `ClientHub`, so this method publishes every wired
+    /// service handle here. `init()` MUST have completed — the runtime
+    /// calls `register_rest` after `init` per the modkit lifecycle
+    /// contract, so the `OnceLock` reads below are infallible in
+    /// practice; the `ok_or_else` guards turn a misordered runtime
+    /// into a precise bootstrap failure rather than a panic.
+    fn register_rest(
+        &self,
+        _ctx: &ModuleCtx,
+        router: axum::Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<axum::Router> {
+        info!("registering account-management REST routes");
+
+        let tenant_service = self
+            .service
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("TenantService not initialized"))?;
+        let metadata_service = self
+            .metadata_service
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("MetadataService not initialized"))?;
+        let user_service = self
+            .user_service
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("UserService not initialized"))?;
+        let conversion_service = self
+            .conversion_service
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("ConversionService not initialized"))?;
+
+        let router = rest_routes::register_routes(
+            router,
+            openapi,
+            tenant_service,
+            metadata_service,
+            user_service,
+            conversion_service,
+        );
+
+        info!("account-management REST routes registered");
+        Ok(router)
     }
 }
 

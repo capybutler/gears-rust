@@ -47,38 +47,18 @@ use crate::domain::tenant::retention::{
 ///
 /// # Caller contract on `scope`
 ///
-/// Both `tenants` and `tenant_closure` entities are declared
-/// `no_tenant, no_resource, no_owner, no_type`. On these declarations
-/// `Scopable::IS_UNRESTRICTED` is `false` and every constraint
-/// property resolves to `None`, which means:
-///
-/// * `scope_with(allow_all())` → no-op (no `WHERE` clause added).
-/// * `scope_with(<narrowed>)` → `deny_all()` (`WHERE false`) for reads
-///   / mutations, and `ScopeError::Denied` for INSERTs.
-///
-/// # Subtree clamp via `InTenantSubtree`
-///
-/// The [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
-/// predicate (cyberware-rust#1813) compiles to a JOIN on
-/// `tenant_closure`. AM-side, the trait does NOT itself wire that
-/// predicate — the entity declares `Scopable(no_tenant, no_resource,
-/// no_owner, no_type)` so the scope filter has no resolvable property
-/// to clamp on. Authorization on `tenants` is therefore enforced one
-/// layer up via:
-///
-/// * the PDP gate at the service layer (which produces the
-///   `InTenantSubtree` constraint the caller embedded in its scope),
-/// * and the URL-bound tenant id the REST handler trusts after the
-///   `AuthN` layer verifies the caller is bound to it.
-///
-/// For background callers (retention reaper, integrity check, etc.)
-/// that operate as `actor=system`, [`AccessScope::allow_all`] is the
-/// correct posture and the trait calls forward it through to the
-/// storage layer unchanged. Caller-driven reads of paginated children
-/// (`list_children`) already engage `InTenantSubtree` through the
-/// closure-table JOIN built by the secure-ORM when the caller passes
-/// a narrowed scope; the `tenants` entity itself stays
-/// scope-property-less.
+/// Both entities are declared `no_tenant, no_resource, no_owner,
+/// no_type`, so every constraint property resolves to `None`:
+/// `allow_all()` is a no-op WHERE-clause, narrowed scopes compile to
+/// `deny_all()` for reads/mutations and `ScopeError::Denied` for
+/// INSERTs. Authorization on `tenants` is therefore enforced one
+/// layer up — the PDP gate at the service layer (which embeds the
+/// `InTenantSubtree` constraint) plus the URL-bound tenant id the
+/// REST handler trusts after `AuthN`. Background callers (reaper,
+/// integrity check) operate as `actor=system` with
+/// [`AccessScope::allow_all`]; `list_children` engages
+/// `InTenantSubtree` through the closure-table JOIN the secure-ORM
+/// builds when the caller narrows scope.
 #[async_trait]
 pub trait TenantRepo: Send + Sync {
     // ---- Read operations -----------------------------------------------
@@ -107,29 +87,21 @@ pub trait TenantRepo: Send + Sync {
     /// # Soft-delete semantics — DELIBERATE asymmetry vs. `find_by_id`
     ///
     /// `find_many` returns only live rows (`deleted_at IS NULL`);
-    /// `find_by_id` does not filter by deletion. This is intentional:
-    /// `find_by_id`
-    /// is consumed by paths that need to disambiguate `NotFound` from
-    /// `Found-but-Deleted` (e.g. integrity check, conversion approve's
-    /// status precondition), while `find_many` is consumed by cross-
-    /// row metadata listings where surfacing a deleted tenant's name
-    /// would leak post-deletion state across a barrier. Callers that
-    /// need both behaviours should consult the trait method whose
-    /// docstring matches their semantics — do not paper over the
-    /// difference at the call site.
+    /// `find_by_id` does not filter by deletion. `find_by_id` callers
+    /// need to disambiguate `NotFound` from `Found-but-Deleted` (e.g.
+    /// integrity check, conversion approve's status precondition);
+    /// `find_many` callers are cross-row metadata listings where
+    /// surfacing a deleted tenant's name would leak post-deletion
+    /// state across a barrier. Pick the method whose docstring
+    /// matches the semantics — do not paper over at the call site.
     ///
     /// # Batch-size ceiling
     ///
-    /// The implementation lowers `ids` into a single SQL `IN (...)`
-    /// clause, which costs one bind parameter per id. Postgres caps
-    /// prepared-statement parameters at 65535, so callers MUST cap the
-    /// caller-supplied slice well below that limit (`SQLite` is
-    /// effectively unbounded but pays the same per-id round-trip cost
-    /// at very large fan-outs). Today every caller bounds its slice
-    /// from a paginated upstream listing whose `$top` is small (under
-    /// the module-config `listing.max_top` ceiling enforced by
-    /// `paginate_odata`'s `LimitCfg`), so the ceiling is implicit;
-    /// new callers MUST keep this invariant.
+    /// Postgres caps prepared-statement parameters at 65535 and the
+    /// impl binds one per id, so callers MUST cap the slice well
+    /// below that. Today every caller's slice comes from a paginated
+    /// upstream listing under `listing.max_top`, so the ceiling is
+    /// implicit; new callers MUST keep this invariant.
     async fn find_many(
         &self,
         scope: &AccessScope,
@@ -342,7 +314,7 @@ pub trait TenantRepo: Send + Sync {
         parent_id: Uuid,
     ) -> Result<Vec<TenantModel>, DomainError>;
 
-    // ---- Phase 3: retention + reaper + hard-delete --------------------
+    // ---- Retention + reaper + hard-delete -----------------------------
 
     /// Scan retention-due rows for the hard-delete pipeline.
     async fn scan_retention_due(

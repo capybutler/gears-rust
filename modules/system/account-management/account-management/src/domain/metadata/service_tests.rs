@@ -7,9 +7,10 @@
 //!
 //! * Guard ordering: tenant existence + status guard runs BEFORE any
 //!   registry / metadata-repo call on every flow.
-//! * Distinct-404 disambiguation: `MetadataSchemaNotRegistered` for
-//!   unknown schemas, `MetadataEntryNotFound` for unset rows under a
-//!   known schema (per FEATURE §6 AC line 392 / `dod-tenant-metadata-distinct-404-codes`).
+//! * Unified 404 on GET: both "schema unknown to registry" and "no
+//!   entry under a known schema for this tenant" collapse to
+//!   [`DomainError::MetadataEntryNotFound`]. DELETE is idempotent on
+//!   missing rows — see `delete_is_idempotent_on_missing_row`.
 //! * Walk-up algorithm: own-first short-circuit, `override_only`
 //!   short-circuit, start-tenant barrier, mid-walk barrier-stop,
 //!   suspended-skip, root-empty terminal.
@@ -506,7 +507,7 @@ async fn get_unregistered_schema_returns_distinct_schema_404() {
         .expect_err("unregistered schema must reject");
 
     assert!(
-        matches!(err, DomainError::MetadataSchemaNotRegistered { .. }),
+        matches!(err, DomainError::MetadataEntryNotFound { .. }),
         "got {err:?}"
     );
 }
@@ -540,7 +541,8 @@ async fn get_rejects_unknown_tenant_before_registry_call() {
     let md_repo = Arc::new(FakeMetadataRepo::new());
     let tenants = Arc::new(FakeTenantRepo::new());
     // Registry is empty: if guard order ever flips, the test would
-    // surface MetadataSchemaNotRegistered instead of NotFound.
+    // surface MetadataEntryNotFound (the unified metadata 404)
+    // instead of NotFound (the tenant 404).
     let registry = Arc::new(StubMetadataSchemaRegistry::new());
     let svc = make_service(md_repo, tenants, registry, fixed_now());
 
@@ -835,7 +837,7 @@ async fn put_rejects_unregistered_schema_with_distinct_404() {
         .expect_err("unregistered schema must reject");
 
     assert!(
-        matches!(err, DomainError::MetadataSchemaNotRegistered { .. }),
+        matches!(err, DomainError::MetadataEntryNotFound { .. }),
         "got {err:?}"
     );
     // Ensure no row was written.
@@ -875,12 +877,54 @@ async fn put_payload_failing_schema_validation_returns_validation_and_writes_not
         .expect_err("body failing schema validation must reject");
 
     assert!(
-        matches!(err, DomainError::Validation { .. }),
-        "got {err:?} (expected DomainError::Validation per FEATURE §6 AC line 393)"
+        matches!(err, DomainError::MetadataValidation { .. }),
+        "got {err:?} (expected DomainError::MetadataValidation per FEATURE §6 AC line 393 \
+         — body-validation failures route through the metadata-content variant so the \
+         canonical envelope carries TENANT_METADATA_RESOURCE_TYPE rather than the tenant \
+         default)"
     );
     assert!(
         md_repo.snapshot_all().is_empty(),
         "no row written when payload fails schema validation"
+    );
+}
+
+#[tokio::test]
+async fn put_null_body_returns_metadata_validation_and_writes_nothing() {
+    // DTO-side pin lives in `api/rest/dto_tests.rs::put_dto_accepts_null_body_…` —
+    // it asserts the wire layer surfaces JSON `null` as `Value::Null` rather than
+    // failing deserialization. This sibling pins the service-side half: the null
+    // guard at `service.rs:595` MUST raise `MetadataValidation` (NOT `Validation`)
+    // so the canonical envelope routes through `TENANT_METADATA_RESOURCE_TYPE`,
+    // matching the rest of the metadata-content rejection paths.
+    let md_repo = Arc::new(FakeMetadataRepo::new());
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let registry = Arc::new(StubMetadataSchemaRegistry::with_seed(vec![(
+        schema_a(),
+        InheritancePolicy::OverrideOnly,
+    )]));
+    let tid = Uuid::from_u128(0x1);
+    seed_tenant(&tenants, tid, None, TenantStatus::Active, false, "root");
+
+    let svc = make_service(md_repo.clone(), tenants, registry, fixed_now());
+
+    let err = svc
+        .upsert_metadata(
+            &ctx(),
+            tid,
+            UpsertMetadataRequest::new(schema_a(), Value::Null),
+        )
+        .await
+        .expect_err("null body must be rejected");
+
+    assert!(
+        matches!(err, DomainError::MetadataValidation { .. }),
+        "null body must surface as MetadataValidation so the canonical envelope \
+         carries TENANT_METADATA_RESOURCE_TYPE — got {err:?}"
+    );
+    assert!(
+        md_repo.snapshot_all().is_empty(),
+        "no row written when body is null"
     );
 }
 
@@ -934,7 +978,10 @@ async fn delete_happy_path_removes_only_target_row() {
 }
 
 #[tokio::test]
-async fn delete_returns_distinct_entry_404_on_missing_row() {
+async fn delete_is_idempotent_on_missing_row() {
+    // Idempotency contract: `delete_metadata` on a `(tenant_id,
+    // schema_uuid)` pair with no row returns `Ok(())`, mirroring
+    // `delete_user` deprovision idempotency.
     let md_repo = Arc::new(FakeMetadataRepo::new());
     let tenants = Arc::new(FakeTenantRepo::new());
     let registry = Arc::new(StubMetadataSchemaRegistry::with_seed(vec![(
@@ -946,15 +993,13 @@ async fn delete_returns_distinct_entry_404_on_missing_row() {
 
     let svc = make_service(md_repo, tenants, registry, fixed_now());
 
-    let err = svc
-        .delete_metadata(&ctx(), tid, schema_a())
+    svc.delete_metadata(&ctx(), tid, schema_a())
         .await
-        .expect_err("missing row must reject");
-
-    assert!(
-        matches!(err, DomainError::MetadataEntryNotFound { .. }),
-        "got {err:?}"
-    );
+        .expect("delete on missing row must be idempotent Ok");
+    // Repeat is still Ok.
+    svc.delete_metadata(&ctx(), tid, schema_a())
+        .await
+        .expect("repeat delete must remain Ok");
 }
 
 #[tokio::test]
@@ -973,7 +1018,7 @@ async fn delete_unregistered_schema_returns_distinct_schema_404() {
         .expect_err("unregistered schema must reject");
 
     assert!(
-        matches!(err, DomainError::MetadataSchemaNotRegistered { .. }),
+        matches!(err, DomainError::MetadataEntryNotFound { .. }),
         "got {err:?}"
     );
 }
@@ -1444,7 +1489,7 @@ async fn resolve_unregistered_schema_returns_distinct_404() {
         .expect_err("unregistered schema must reject");
 
     assert!(
-        matches!(err, DomainError::MetadataSchemaNotRegistered { .. }),
+        matches!(err, DomainError::MetadataEntryNotFound { .. }),
         "got {err:?}"
     );
 }

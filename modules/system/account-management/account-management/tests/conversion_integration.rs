@@ -41,12 +41,11 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use account_management::domain::conversion::model::{
-    ConversionPagination, ConversionSide, ConversionStatus, NewConversionRequest, TargetMode,
+    ConversionSide, ConversionStatus, NewConversionRequest, TargetMode,
 };
 use account_management::domain::conversion::repo::ConversionRepo;
 use account_management::domain::conversion::service::{
-    ConversionCaller, ConversionScope, ConversionService, ListConversionsQuery,
-    RequestConversionInput,
+    ConversionCaller, ConversionScope, ConversionService, RequestConversionInput,
 };
 use account_management::domain::error::DomainError;
 use account_management::domain::tenant::TenantRepo;
@@ -55,6 +54,7 @@ use account_management::domain::tenant::model::{NewTenant, TenantStatus};
 use account_management::domain::tenant_type::inert_tenant_type_checker;
 use account_management::infra::storage::repo_impl::{AmDbProvider, ConversionRepoImpl};
 use modkit_db::secure::SecureEntityExt;
+use modkit_odata::ODataQuery;
 use modkit_security::AccessScope;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -172,7 +172,8 @@ async fn happy_path_approve_flips_self_managed_and_barrier() {
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
@@ -180,7 +181,12 @@ async fn happy_path_approve_flips_self_managed_and_barrier() {
     assert_eq!(initiated.target_mode, TargetMode::SelfManaged);
 
     let approved = svc
-        .approve(&ctx_for(root), initiated.id, ConversionCaller::parent(root))
+        .approve(
+            &ctx_for(root),
+            initiated.id,
+            ConversionCaller::parent(root),
+            None,
+        )
         .await
         .expect("approve");
     assert_eq!(approved.status, ConversionStatus::Approved);
@@ -238,6 +244,7 @@ async fn single_pending_unique_index_rejects_second_insert() {
         requested_by: Uuid::new_v4(),
         requested_at: now,
         expires_at: now + TimeDuration::days(7),
+        requested_comment: None,
     };
     let inserted = conv_repo
         .insert_pending(&allow_all(), &new)
@@ -254,6 +261,7 @@ async fn single_pending_unique_index_rejects_second_insert() {
         requested_by: Uuid::new_v4(),
         requested_at: now,
         expires_at: now + TimeDuration::days(7),
+        requested_comment: None,
     };
     let err = conv_repo
         .insert_pending(&allow_all(), &dup)
@@ -302,13 +310,19 @@ async fn sqlite_partial_unique_admits_reinsert_after_soft_delete() {
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
         .expect("first request");
     let _ = svc
-        .cancel(&ctx_for(root), first.id, ConversionCaller::child(child))
+        .cancel(
+            &ctx_for(root),
+            first.id,
+            ConversionCaller::child(child),
+            None,
+        )
         .await
         .expect("first cancel");
 
@@ -349,6 +363,7 @@ async fn sqlite_partial_unique_admits_reinsert_after_soft_delete() {
                 requested_by: Uuid::new_v4(),
                 requested_at: now,
                 expires_at: now + TimeDuration::days(7),
+                requested_comment: None,
             },
         )
         .await
@@ -380,18 +395,24 @@ async fn dual_consent_matrix_actor_rules() {
             RequestConversionInput {
                 tenant_id: c1,
                 caller: ConversionCaller::child(c1),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
         .expect("request c1");
     let err = svc
-        .cancel(&ctx_for(root), req_c1.id, ConversionCaller::parent(root))
+        .cancel(
+            &ctx_for(root),
+            req_c1.id,
+            ConversionCaller::parent(root),
+            None,
+        )
         .await
         .expect_err("wrong-side cancel");
     assert!(matches!(err, DomainError::InvalidActorForTransition { .. }));
     let cancelled = svc
-        .cancel(&ctx_for(root), req_c1.id, ConversionCaller::child(c1))
+        .cancel(&ctx_for(root), req_c1.id, ConversionCaller::child(c1), None)
         .await
         .expect("right-side cancel");
     assert_eq!(cancelled.status, ConversionStatus::Cancelled);
@@ -405,18 +426,24 @@ async fn dual_consent_matrix_actor_rules() {
             RequestConversionInput {
                 tenant_id: c2,
                 caller: ConversionCaller::child(c2),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
         .expect("request c2");
     let err = svc
-        .reject(&ctx_for(root), req_c2.id, ConversionCaller::child(c2))
+        .reject(&ctx_for(root), req_c2.id, ConversionCaller::child(c2), None)
         .await
         .expect_err("wrong-side reject");
     assert!(matches!(err, DomainError::InvalidActorForTransition { .. }));
     let rejected = svc
-        .reject(&ctx_for(root), req_c2.id, ConversionCaller::parent(root))
+        .reject(
+            &ctx_for(root),
+            req_c2.id,
+            ConversionCaller::parent(root),
+            None,
+        )
         .await
         .expect("right-side reject");
     assert_eq!(rejected.status, ConversionStatus::Rejected);
@@ -430,18 +457,24 @@ async fn dual_consent_matrix_actor_rules() {
             RequestConversionInput {
                 tenant_id: c3,
                 caller: ConversionCaller::child(c3),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
         .expect("request c3");
     let err = svc
-        .approve(&ctx_for(root), req_c3.id, ConversionCaller::child(c3))
+        .approve(&ctx_for(root), req_c3.id, ConversionCaller::child(c3), None)
         .await
         .expect_err("wrong-side approve");
     assert!(matches!(err, DomainError::InvalidActorForTransition { .. }));
     let approved = svc
-        .approve(&ctx_for(root), req_c3.id, ConversionCaller::parent(root))
+        .approve(
+            &ctx_for(root),
+            req_c3.id,
+            ConversionCaller::parent(root),
+            None,
+        )
         .await
         .expect("right-side approve");
     assert_eq!(approved.status, ConversionStatus::Approved);
@@ -471,7 +504,8 @@ async fn expire_tick_transitions_past_pending() {
             RequestConversionInput {
                 tenant_id: child,
                 caller: ConversionCaller::child(child),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
@@ -540,13 +574,14 @@ async fn retention_soft_delete_resolved_only_old_rows() {
             RequestConversionInput {
                 tenant_id: c1,
                 caller: ConversionCaller::child(c1),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
         .expect("request c1");
     let cancelled = svc
-        .cancel(&ctx_for(root), req_c1.id, ConversionCaller::child(c1))
+        .cancel(&ctx_for(root), req_c1.id, ConversionCaller::child(c1), None)
         .await
         .expect("cancel c1");
     assert_eq!(cancelled.status, ConversionStatus::Cancelled);
@@ -572,13 +607,14 @@ async fn retention_soft_delete_resolved_only_old_rows() {
             RequestConversionInput {
                 tenant_id: c2,
                 caller: ConversionCaller::child(c2),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
         .expect("request c2");
     let _ = svc
-        .cancel(&ctx_for(root), req_c2.id, ConversionCaller::child(c2))
+        .cancel(&ctx_for(root), req_c2.id, ConversionCaller::child(c2), None)
         .await
         .expect("cancel c2");
 
@@ -633,7 +669,8 @@ async fn listings_own_and_inbound_return_correct_shape() {
             RequestConversionInput {
                 tenant_id: c1,
                 caller: ConversionCaller::child(c1),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
@@ -644,7 +681,8 @@ async fn listings_own_and_inbound_return_correct_shape() {
             RequestConversionInput {
                 tenant_id: c2,
                 caller: ConversionCaller::parent(root),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
@@ -652,11 +690,7 @@ async fn listings_own_and_inbound_return_correct_shape() {
 
     // Own listing for c1 only sees its own request.
     let own_c1 = svc
-        .list_own_for_tenant(
-            &ctx_for(root),
-            c1,
-            &ListConversionsQuery::any(50, 0).expect("top > 0"),
-        )
+        .list_own_for_tenant(&ctx_for(root), c1, &ODataQuery::default().with_limit(50))
         .await
         .expect("list own c1");
     assert_eq!(own_c1.items.len(), 1);
@@ -664,11 +698,7 @@ async fn listings_own_and_inbound_return_correct_shape() {
 
     // Inbound for root sees both children's requests.
     let inbound = svc
-        .list_inbound_for_parent(
-            &ctx_for(root),
-            root,
-            &ListConversionsQuery::any(50, 0).expect("top > 0"),
-        )
+        .list_inbound_for_parent(&ctx_for(root), root, &ODataQuery::default().with_limit(50))
         .await
         .expect("list inbound root");
     let ids: Vec<Uuid> = inbound.items.iter().map(|p| p.request_id).collect();
@@ -710,13 +740,14 @@ async fn repo_level_pagination_smoke() {
                 requested_by: Uuid::new_v4(),
                 requested_at: now,
                 expires_at: now + TimeDuration::days(7),
+                requested_comment: None,
             },
         )
         .await
         .expect("insert pending");
     // Drive it to cancelled to free up the pending slot.
     conv_repo
-        .transition_pending_to_cancelled(&allow_all(), pending_id, Uuid::new_v4(), now)
+        .transition_pending_to_cancelled(&allow_all(), pending_id, Uuid::new_v4(), now, None)
         .await
         .expect("cancel");
 
@@ -734,31 +765,22 @@ async fn repo_level_pagination_smoke() {
                 requested_by: Uuid::new_v4(),
                 requested_at: now,
                 expires_at: now + TimeDuration::days(7),
+                requested_comment: None,
             },
         )
         .await
         .expect("insert pending #2");
 
     let page = conv_repo
-        .list_own_for_tenant(
-            &allow_all(),
-            child,
-            None,
-            ConversionPagination { top: 50, skip: 0 },
-        )
+        .list_own_for_tenant(&allow_all(), child, &ODataQuery::default().with_limit(50))
         .await
         .expect("list");
-    assert_eq!(page.len(), 2, "two rows total");
+    assert_eq!(page.items.len(), 2, "two rows total");
     let page_top1 = conv_repo
-        .list_own_for_tenant(
-            &allow_all(),
-            child,
-            None,
-            ConversionPagination { top: 1, skip: 0 },
-        )
+        .list_own_for_tenant(&allow_all(), child, &ODataQuery::default().with_limit(1))
         .await
         .expect("list top=1");
-    assert_eq!(page_top1.len(), 1);
+    assert_eq!(page_top1.items.len(), 1);
 }
 
 // ---------------------------------------------------------------------
@@ -822,6 +844,7 @@ async fn apply_conversion_approval_on_soft_deleted_tenant_returns_validation_not
         requested_by: Uuid::new_v4(),
         requested_at: now,
         expires_at: now + TimeDuration::days(7),
+        requested_comment: None,
     };
     conv_repo
         .insert_pending(&allow_all(), &new)
@@ -850,6 +873,7 @@ async fn apply_conversion_approval_on_soft_deleted_tenant_returns_validation_not
                 expected_parent_tenant_type_uuid: Uuid::nil(),
                 approver_uuid: Uuid::new_v4(),
                 resolved_at: now,
+                approval_comment: None,
             },
         )
         .await
@@ -910,6 +934,7 @@ async fn apply_conversion_approval_rolls_back_on_tenant_type_drift_toctou() {
         requested_by: Uuid::new_v4(),
         requested_at: now,
         expires_at: now + TimeDuration::days(7),
+        requested_comment: None,
     };
     conv_repo
         .insert_pending(&allow_all(), &new)
@@ -958,6 +983,7 @@ async fn apply_conversion_approval_rolls_back_on_tenant_type_drift_toctou() {
                 expected_parent_tenant_type_uuid: Uuid::nil(),
                 approver_uuid: Uuid::new_v4(),
                 resolved_at: now,
+                approval_comment: None,
             },
         )
         .await
@@ -1036,14 +1062,20 @@ async fn approve_recomputes_barrier_for_closure_rows_referencing_soft_deleted_de
             RequestConversionInput {
                 tenant_id: mid,
                 caller: ConversionCaller::child(mid),
-                target_mode_override: None,
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
             },
         )
         .await
         .expect("request_conversion on mid");
 
     let approved = svc
-        .approve(&ctx_for(root), initiated.id, ConversionCaller::parent(root))
+        .approve(
+            &ctx_for(root),
+            initiated.id,
+            ConversionCaller::parent(root),
+            None,
+        )
         .await
         .expect("approve mid -> self_managed");
     assert_eq!(approved.status, ConversionStatus::Approved);

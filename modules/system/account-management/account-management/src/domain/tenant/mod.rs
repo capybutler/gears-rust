@@ -13,6 +13,7 @@
 
 pub mod closure;
 pub mod context;
+pub mod hierarchy_read_port;
 pub mod hooks;
 pub mod integrity;
 pub mod model;
@@ -26,6 +27,7 @@ pub(crate) mod test_support;
 
 pub use closure::{ClosureRow, build_activation_rows};
 pub use context::TenantContext;
+pub use hierarchy_read_port::{BarrierMode, StatusFilter, TenantHierarchyReadPort};
 pub use model::{ChildCountFilter, NewTenant, TenantModel, TenantStatus};
 pub use repo::TenantRepo;
 pub use retention::{

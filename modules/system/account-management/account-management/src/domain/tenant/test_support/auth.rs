@@ -250,9 +250,14 @@ impl AuthZResolverClient for SchemaSelectiveAuthZResolver {
         let root = uuid::Uuid::parse_str(root_str).expect("SchemaSelectiveAuthZResolver: bad UUID");
 
         // Per-row recheck happens on `Metadata.read`. For every other
-        // action (LIST outer gate, WRITE, DELETE, RESOLVE, plus any
+        // action (LIST outer gate, WRITE, DELETE, plus any
         // tenant-side action) the resolver behaves like the
-        // permissive baseline.
+        // permissive baseline. `/resolved` reuses `Metadata.read`
+        // (see `domain::metadata::service::pep::actions`), so the
+        // per-schema gate fires there too — that is the intent: a
+        // caller with `read` on schema X should be able to call both
+        // `GET /metadata/{X}` and `GET /metadata/{X}/resolved`,
+        // while a caller without `read` on X is denied on both.
         if request.action.name != "read" {
             return Ok(permit_with_subtree(root));
         }

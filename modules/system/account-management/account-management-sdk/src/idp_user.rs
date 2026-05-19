@@ -453,9 +453,8 @@ impl core::error::Error for IdpUserPaginationError {}
 /// provisioned into; AM has already validated the scope is `Active`
 /// before invoking the contract. There is intentionally no separate
 /// `tenant_id` field on the request — carrying both a top-level
-/// `tenant_id` and `tenant_context.tenant_id` previously made it
-/// ambiguous which was authoritative; the context is the single
-/// source of truth.
+/// `tenant_id` and `tenant_context.tenant_id` would make it ambiguous
+/// which is authoritative; the context is the single source of truth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct IdpProvisionUserRequest {

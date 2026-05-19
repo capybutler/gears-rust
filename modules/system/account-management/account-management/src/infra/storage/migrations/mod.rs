@@ -28,6 +28,13 @@
 //!   future per-schema cross-tenant scans. The `tenant_metadata`
 //!   table itself is owned by `m0001`; this migration only adds the
 //!   secondary index.
+//! * `m0006_add_conversion_audit_comments` — adds four nullable
+//!   per-transition audit comment columns to `conversion_requests`
+//!   (`requested_comment`, `approved_comment`, `cancelled_comment`,
+//!   `rejected_comment`) with `length BETWEEN 1 AND 1000` `CHECK`
+//!   guards. Per-decision storage preserves the full audit story
+//!   across the dual-consent lifecycle — the counterparty's
+//!   "why approved" cannot rewrite the initiator's "why requested".
 
 use sea_orm_migration::prelude::*;
 
@@ -36,6 +43,7 @@ pub mod m0002_add_terminal_failure_columns;
 pub mod m0003_create_integrity_check_runs;
 pub mod m0004_create_conversion_requests;
 pub mod m0005_tenant_metadata_indexes;
+pub mod m0006_add_conversion_audit_comments;
 
 pub struct Migrator;
 
@@ -48,6 +56,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0003_create_integrity_check_runs::Migration),
             Box::new(m0004_create_conversion_requests::Migration),
             Box::new(m0005_tenant_metadata_indexes::Migration),
+            Box::new(m0006_add_conversion_audit_comments::Migration),
         ]
     }
 }

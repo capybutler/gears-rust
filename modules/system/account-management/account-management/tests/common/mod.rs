@@ -23,7 +23,24 @@
 //!   would otherwise block. All data-side seeding still goes through
 //!   the same `SecureORM` helpers above.
 
-#![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
+#![allow(
+    dead_code,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    // The E2E harness section below docks doc-comments that mention
+    // identifiers like `OData`, `Router::oneshot`, `MetadataService`,
+    // `IdpUser`, etc. — the strict markdown linter wants every such
+    // mention back-ticked. The doc text is human-targeted, not a
+    // public-API reference; allow the broader doc style here.
+    clippy::doc_markdown,
+    clippy::too_many_arguments,
+    clippy::items_after_statements,
+    clippy::struct_field_names,
+    clippy::needless_pass_by_value,
+    clippy::duration_suboptimal_units,
+    clippy::double_must_use,
+    clippy::module_name_repetitions,
+)]
 
 use std::sync::Arc;
 
@@ -156,10 +173,25 @@ pub fn mock_enforcer() -> PolicyEnforcer {
 /// `InTenantSubtree(root = subject_tenant_id)` predicate, so every
 /// tenant in `root`'s closure subtree is visible under the compiled
 /// scope.
+///
+/// `subject_id` is fixed at `0xCAFE` — sufficient for tests that
+/// exercise behavior independent of audit-actor identity. Tests that
+/// assert audit-trail invariants (`requested_by != approved_by`,
+/// distinct cancel/reject initiator) MUST use
+/// [`ctx_for_with_subject`] with two different subject ids.
 #[must_use]
 pub fn ctx_for(root: Uuid) -> SecurityContext {
+    ctx_for_with_subject(root, Uuid::from_u128(0xCAFE))
+}
+
+/// Variant of [`ctx_for`] with a caller-supplied `subject_id`. Use
+/// when a test needs distinct actors on opposite sides of a
+/// dual-consent flow so the resulting `requested_by` / `approved_by`
+/// audit columns can be asserted as different uuids.
+#[must_use]
+pub fn ctx_for_with_subject(root: Uuid, subject_id: Uuid) -> SecurityContext {
     SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0xCAFE))
+        .subject_id(subject_id)
         .subject_tenant_id(root)
         .build()
         .expect("ctx")
@@ -175,8 +207,21 @@ pub struct Harness {
 
 /// Spin up a fresh in-memory `SQLite`, run migrations, and return
 /// the production-shaped `(provider, repo)` pair.
+///
+/// `ConnectOpts::default()` would use the production `max_conns: 10`
+/// pool. With a `sqlite::memory:` DSN every connection in the pool
+/// is a **separate private in-memory database**, so migrations
+/// applied through one connection are invisible to handlers reading
+/// from another — REST integration tests then pass or fail based on
+/// which pool slot the request lands in. Pin `max_conns: 1` so the
+/// whole test shares a single in-memory database. Mirrors the
+/// `tr_plugin::tests::setup` pattern.
 pub async fn setup_sqlite() -> Result<Harness> {
-    let db = connect_db("sqlite::memory:", ConnectOpts::default()).await?;
+    let opts = ConnectOpts {
+        max_conns: Some(1),
+        ..ConnectOpts::default()
+    };
+    let db = connect_db("sqlite::memory:", opts).await?;
     let provider: Arc<AmDbProvider> = Arc::new(AmDbProvider::new(db.clone()));
     run_migrations_for_testing(&db, Migrator::migrations())
         .await
@@ -190,6 +235,10 @@ pub async fn setup_sqlite() -> Result<Harness> {
 /// Insert a single tenant row, bypassing the create-tenant saga.
 /// Used to seed deliberately-broken states no production happy-path
 /// could produce on its own. Mirrors the donor's `common::insert_tenant`.
+///
+/// The `tenant_type_uuid` is left as [`Uuid::nil`] — fixtures that
+/// drive code paths through the types-registry should use
+/// [`insert_tenant_typed`] instead.
 pub async fn insert_tenant(
     provider: &Arc<AmDbProvider>,
     id: Uuid,
@@ -198,6 +247,54 @@ pub async fn insert_tenant(
     status: i16,
     self_managed: bool,
     depth: i32,
+) -> Result<()> {
+    insert_tenant_with_type(
+        provider,
+        id,
+        parent_id,
+        name,
+        status,
+        self_managed,
+        depth,
+        Uuid::nil(),
+    )
+    .await
+}
+
+/// Like [`insert_tenant`] but stamps the supplied
+/// `tenant_type_uuid`. Used by HTTP-level fixtures that drive
+/// `resolve_active_tenant` through a pre-seeded types-registry.
+pub async fn insert_tenant_typed(
+    provider: &Arc<AmDbProvider>,
+    id: Uuid,
+    parent_id: Option<Uuid>,
+    name: &str,
+    status: i16,
+    self_managed: bool,
+    depth: i32,
+) -> Result<()> {
+    insert_tenant_with_type(
+        provider,
+        id,
+        parent_id,
+        name,
+        status,
+        self_managed,
+        depth,
+        harness_tenant_type_uuid(),
+    )
+    .await
+}
+
+async fn insert_tenant_with_type(
+    provider: &Arc<AmDbProvider>,
+    id: Uuid,
+    parent_id: Option<Uuid>,
+    name: &str,
+    status: i16,
+    self_managed: bool,
+    depth: i32,
+    tenant_type_uuid: Uuid,
 ) -> Result<()> {
     let conn = provider
         .conn()
@@ -209,7 +306,7 @@ pub async fn insert_tenant(
         name: ActiveValue::Set(name.to_owned()),
         status: ActiveValue::Set(status),
         self_managed: ActiveValue::Set(self_managed),
-        tenant_type_uuid: ActiveValue::Set(Uuid::nil()),
+        tenant_type_uuid: ActiveValue::Set(tenant_type_uuid),
         depth: ActiveValue::Set(depth),
         created_at: ActiveValue::Set(now),
         updated_at: ActiveValue::Set(now),
@@ -498,6 +595,578 @@ pub fn deferred_count(
         .find(|(c, _)| *c == cat)
         .map_or(0, |(_, n)| *n)
 }
+
+// =====================================================================
+// E2E HTTP harness — `Router::oneshot` based in-process driver for
+// `tests/api_*_test.rs`.
+//
+// Mirrors `modules/system/resource-group/resource-group/tests/api_rest_test.rs`.
+// AM-specific divergences from the RG template:
+//
+// * Four services to wire (`TenantService`, `MetadataService`,
+//   `UserService`, `ConversionService`) vs RG's three.
+// * AM uses [`PermitWithSubtreeResolver`] (already defined above) — it
+//   emits `InTenantSubtree` predicates, matching the production
+//   PDP shape declared in `module.rs` (`Capability::TenantHierarchy`).
+// * Path prefix on every endpoint is `/account-management/v1/...` —
+//   the production `/api/` prefix is added by the gateway layer, not
+//   by `register_routes`, so the test router does NOT nest under
+//   `/api/`.
+// =====================================================================
+
+use std::any::Any;
+
+use account_management::api::rest::routes::register_routes;
+use account_management::domain::conversion::service::ConversionService;
+use account_management::domain::metadata::registry::{
+    InheritancePolicy, MetadataSchemaRegistry, StubMetadataSchemaRegistry,
+};
+use account_management::domain::metadata::repo::MetadataRepo;
+use account_management::domain::metadata::service::MetadataService;
+use account_management::domain::tenant::TenantRepo;
+use account_management::domain::tenant::resource_checker::InertResourceOwnershipChecker;
+use account_management::domain::tenant::service::TenantService;
+use account_management::domain::tenant_type::inert_tenant_type_checker;
+use account_management::domain::user::service::UserService;
+use account_management::infra::storage::repo_impl::{ConversionRepoImpl, MetadataRepoImpl};
+use account_management_sdk::{
+    IdpDeprovisionTenantRequest, IdpDeprovisionUserRequest, IdpListUsersRequest, IdpPluginClient,
+    IdpProvisionFailure, IdpProvisionResult, IdpProvisionTenantRequest, IdpProvisionUserRequest,
+    IdpUser, IdpUserOperationFailure,
+};
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, Response, StatusCode};
+use gts::GtsSchemaId;
+use http_body_util::BodyExt;
+use modkit::api::OpenApiRegistry;
+use modkit::api::operation_builder::OperationSpec;
+use modkit_odata::Page;
+use utoipa::openapi::RefOr;
+use utoipa::openapi::schema::Schema;
+
+// ── No-op OpenAPI registry ───────────────────────────────────────────
+
+/// `OpenApiRegistry` implementation that discards every operation and
+/// schema registration. The HTTP-level tests only exercise the runtime
+/// router; the `utoipa`-side OpenAPI emission is pinned by the route
+/// builder's own unit tests.
+pub struct NoopOpenApiRegistry;
+
+impl OpenApiRegistry for NoopOpenApiRegistry {
+    fn register_operation(&self, _spec: &OperationSpec) {}
+
+    fn ensure_schema_raw(&self, name: &str, _schemas: Vec<(String, RefOr<Schema>)>) -> String {
+        name.to_owned()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// ── In-memory `IdpPluginClient` fake ─────────────────────────────────
+
+/// Stateful in-memory `IdpPluginClient` for integration tests.
+///
+/// Mirrors the shape of the production
+/// `static-idp-plugin::domain::Service`: per-tenant `HashMap<user_id,
+/// IdpUser>`, deterministic UUIDv5 ids derived from the username, and
+/// a cursor walk over a sorted snapshot. Pre-fix the harness's IdP
+/// fake returned `Page::empty(50)` unconditionally and treated every
+/// deprovision as success without recording state — so regressions
+/// in `create → list → list-with-user_id-filter → delete → list`
+/// could ship green. This stateful fake exercises every transition
+/// end-to-end.
+pub struct FakeIdpPlugin {
+    users: parking_lot::Mutex<
+        std::collections::HashMap<Uuid, std::collections::HashMap<Uuid, IdpUser>>,
+    >,
+}
+
+impl FakeIdpPlugin {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            users: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn build_user(tenant_id: Uuid, req: &IdpProvisionUserRequest) -> IdpUser {
+        // Username is the natural key per tenant, so derive the IdP-
+        // assigned uuid from `(tenant_id, username)` — repeated calls
+        // against the same pair land on the same id (matches a real
+        // provider's stable user-uuid-per-tenant guarantee and keeps
+        // tests reproducible across runs).
+        let namespace = Uuid::new_v5(&Uuid::NAMESPACE_DNS, tenant_id.as_bytes());
+        let id = Uuid::new_v5(&namespace, req.payload.username.as_bytes());
+        let mut user = IdpUser::new(id, req.payload.username.clone());
+        if let Some(email) = req.payload.email.clone() {
+            user = user.with_email(email);
+        }
+        if let Some(display_name) = req.payload.display_name.clone() {
+            user = user.with_display_name(display_name);
+        }
+        user
+    }
+}
+
+impl Default for FakeIdpPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl IdpPluginClient for FakeIdpPlugin {
+    async fn provision_tenant(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpProvisionTenantRequest,
+    ) -> Result<IdpProvisionResult, IdpProvisionFailure> {
+        Ok(IdpProvisionResult::new(None))
+    }
+
+    async fn deprovision_tenant(
+        &self,
+        _ctx: &SecurityContext,
+        _req: &IdpDeprovisionTenantRequest,
+    ) -> Result<(), account_management_sdk::IdpDeprovisionFailure> {
+        Ok(())
+    }
+
+    async fn provision_user(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpProvisionUserRequest,
+    ) -> Result<IdpUser, IdpUserOperationFailure> {
+        let tenant_id = req.tenant_context.tenant_id;
+        let user = Self::build_user(tenant_id, req);
+        self.users
+            .lock()
+            .entry(tenant_id)
+            .or_default()
+            .insert(user.id, user.clone());
+        Ok(user)
+    }
+
+    async fn deprovision_user(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpDeprovisionUserRequest,
+    ) -> Result<(), IdpUserOperationFailure> {
+        // Removed vs already-absent collapse to `Ok(())` per the SDK
+        // trait contract; AM does not distinguish them on the wire.
+        let mut guard = self.users.lock();
+        if let Some(scope) = guard.get_mut(&req.tenant_context.tenant_id) {
+            scope.remove(&req.user_id);
+            if scope.is_empty() {
+                guard.remove(&req.tenant_context.tenant_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_users(
+        &self,
+        _ctx: &SecurityContext,
+        req: &IdpListUsersRequest,
+    ) -> Result<Page<IdpUser>, IdpUserOperationFailure> {
+        let mut snapshot: Vec<IdpUser> = {
+            let guard = self.users.lock();
+            let Some(scope) = guard.get(&req.tenant_context.tenant_id) else {
+                return Ok(Page::empty(u64::from(req.pagination.top())));
+            };
+            match req.user_id_filter {
+                Some(uid) => scope.get(&uid).cloned().into_iter().collect(),
+                None => scope.values().cloned().collect(),
+            }
+        };
+        // Deterministic order so the offset cursor below is stable.
+        snapshot.sort_by_key(|u| u.id);
+
+        let offset: usize = match req.pagination.cursor() {
+            None => 0,
+            Some(raw) => raw
+                .parse::<usize>()
+                .map_err(|err| IdpUserOperationFailure::Rejected {
+                    detail: format!(
+                        "FakeIdpPlugin: cursor must be a non-negative decimal offset \
+                         (got {raw:?}): {err}"
+                    ),
+                })?,
+        };
+        let total = snapshot.len();
+        let top = req.pagination.top() as usize;
+        let start = offset.min(total);
+        let end = start.saturating_add(top).min(total);
+        let items: Vec<IdpUser> = snapshot.drain(start..end).collect();
+        let next_cursor = (end < total).then(|| end.to_string());
+        let prev_cursor = (start > 0).then(|| start.saturating_sub(top).to_string());
+        Ok(Page::new(
+            items,
+            modkit_odata::PageInfo {
+                next_cursor,
+                prev_cursor,
+                limit: u64::from(req.pagination.top()),
+            },
+        ))
+    }
+}
+
+/// Shared `Arc<dyn IdpPluginClient>` handle for the test router.
+#[must_use]
+pub fn fake_idp() -> Arc<dyn IdpPluginClient> {
+    Arc::new(FakeIdpPlugin::new())
+}
+
+// ── Inert collaborators (resource checker, types registry) ───────────
+
+/// Resource-ownership checker that always reports zero owned
+/// resources, so soft-delete preconditions never trip on
+/// `tenant_has_resources`.
+#[must_use]
+pub fn inert_resource_checker()
+-> Arc<dyn account_management::domain::tenant::resource_checker::ResourceOwnershipChecker> {
+    Arc::new(InertResourceOwnershipChecker)
+}
+
+/// Empty `MockTypesRegistryClient` from the SDK's `test-util` feature.
+/// Every `get_*` returns `gts_type_schema_not_found`; reads that
+/// expect a populated registry (e.g. the `tenant_type` lift in
+/// `TenantDto::from_sdk_tenant`) collapse to `None` rather than
+/// failing the whole HTTP call.
+#[must_use]
+pub fn inert_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
+    Arc::new(types_registry_sdk::testing::MockTypesRegistryClient::new())
+}
+
+/// Canonical chained `tenant_type` id used by every E2E tenant fixture.
+/// Mirrors the in-source `domain::user::service_tests::TEST_TENANT_TYPE_ID`
+/// so the harness lines up byte-for-byte with the canonical AM unit-test
+/// shape.
+pub const HARNESS_TENANT_TYPE_ID: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~";
+
+/// The deterministic UUIDv5 derived from [`HARNESS_TENANT_TYPE_ID`].
+/// Used as the `tenant_type_uuid` on every tenant row seeded for HTTP
+/// tests so [`types_registry_for_users`] can resolve the chained id
+/// without a real catalog.
+#[must_use]
+pub fn harness_tenant_type_uuid() -> Uuid {
+    gts::GtsID::new(HARNESS_TENANT_TYPE_ID)
+        .expect("HARNESS_TENANT_TYPE_ID is a valid chain")
+        .to_uuid()
+}
+
+/// `MockTypesRegistryClient` pre-seeded with the schemas the AM REST
+/// surface needs to reach its happy-path branches: the
+/// `gts.cf.core.am.user.v1~` user-projection schema (required by
+/// `create_user` per the fail-closed GTS validator) and a minimal
+/// tenant-type schema chain so `resolve_active_tenant` (which uses
+/// `tenant_type_uuid` to compute the chained id) does not fail closed.
+#[must_use]
+pub fn types_registry_for_users() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
+    use serde_json::json;
+    use types_registry_sdk::{GtsTypeId, GtsTypeSchema, testing::MockTypesRegistryClient};
+
+    let user_body = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "username"],
+        "properties": {
+            "id": { "type": "string", "format": "uuid" },
+            "username": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "email": { "type": "string", "format": "email" },
+            "display_name": { "type": "string", "minLength": 1, "maxLength": 255 },
+        },
+    });
+    let user_schema = GtsTypeSchema::try_new(
+        GtsTypeId::new("gts.cf.core.am.user.v1~"),
+        user_body,
+        None,
+        None,
+    )
+    .expect("synthetic user schema is valid");
+
+    // Derived chains require the parent to be passed in. We build the
+    // full chain root→child recursively.
+    fn build_tenant_type_chain(type_id: &str) -> GtsTypeSchema {
+        let parent = GtsTypeSchema::derive_parent_type_id(type_id)
+            .map(|p| std::sync::Arc::new(build_tenant_type_chain(p.as_ref())));
+        GtsTypeSchema::try_new(GtsTypeId::new(type_id), serde_json::json!({}), None, parent)
+            .expect("synthetic tenant_type chain is valid")
+    }
+    let tenant_type_schema = build_tenant_type_chain(HARNESS_TENANT_TYPE_ID);
+
+    Arc::new(MockTypesRegistryClient::new().with_type_schemas([user_schema, tenant_type_schema]))
+}
+
+/// Empty metadata schema registry — every per-schema lookup
+/// surfaces [`DomainError::MetadataEntryNotFound`]. Used by tests
+/// that pin the unregistered-schema 404 envelope.
+#[must_use]
+pub fn empty_metadata_registry() -> Arc<dyn MetadataSchemaRegistry> {
+    Arc::new(StubMetadataSchemaRegistry::new())
+}
+
+/// Metadata schema registry seeded with one
+/// `(schema_id, InheritancePolicy::OverrideOnly)` pair so writes /
+/// reads against a registered schema land cleanly while still
+/// distinguishing the "schema unknown" 404 path.
+#[must_use]
+pub fn metadata_registry_with(
+    schemas: Vec<(GtsSchemaId, InheritancePolicy)>,
+) -> Arc<dyn MetadataSchemaRegistry> {
+    Arc::new(StubMetadataSchemaRegistry::with_seed(schemas))
+}
+
+/// Canonical "registered" metadata schema id used by the metadata
+/// REST tests. The chained shape mirrors the
+/// `metadata_integration::SCHEMA_A` fixture in the closure-walk
+/// integration suite and conforms to the GTS chain grammar
+/// (`vendor.package.namespace.type.vMAJOR[.MINOR]` on each segment).
+pub const REGISTERED_METADATA_SCHEMA: &str =
+    "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.feature_flag.v1~";
+
+/// Canonical "unregistered" metadata schema id — same chained shape,
+/// but the harness does NOT pre-seed it in [`metadata_registry_with`].
+pub const UNREGISTERED_METADATA_SCHEMA: &str =
+    "gts.cf.core.am.tenant_metadata.v1~vendor.app.metadata.unregistered.v1~";
+
+// ── Router builder ───────────────────────────────────────────────────
+
+/// Tuple of every service handle the test router wires up. Tests that
+/// need to drive a service directly outside HTTP (e.g. seed a
+/// conversion request and then PATCH it via the router) can grab the
+/// matching handle from this struct.
+pub struct TestServices {
+    pub tenant_service: Arc<TenantService<TenantRepoImpl>>,
+    pub metadata_service: Arc<MetadataService>,
+    pub user_service: Arc<UserService>,
+    pub conversion_service: Arc<ConversionService>,
+}
+
+/// Build the four AM domain services using the default fakes
+/// ([`fake_idp`], [`inert_resource_checker`], [`empty_metadata_registry`],
+/// inert types-registry, [`mock_enforcer`]). Mirrors the production
+/// `register_rest` wiring in `module.rs`.
+#[must_use]
+pub fn build_services(harness: &Harness) -> TestServices {
+    build_services_with(harness, fake_idp(), empty_metadata_registry())
+}
+
+/// Same as [`build_services`] but parameterised on the `IdP` plugin
+/// and the metadata-schema registry — used by tests that need a
+/// pre-seeded schema or a non-default IdP behaviour. Uses
+/// [`inert_types_registry`] for the types-registry side.
+#[must_use]
+pub fn build_services_with(
+    harness: &Harness,
+    idp: Arc<dyn IdpPluginClient>,
+    metadata_registry: Arc<dyn MetadataSchemaRegistry>,
+) -> TestServices {
+    build_services_full(harness, idp, metadata_registry, inert_types_registry())
+}
+
+/// Full variant of [`build_services_with`] that also takes the
+/// types-registry. Used by tests that exercise `create_user`
+/// (requires the `gts.cf.core.am.user.v1~` schema to be present).
+#[must_use]
+pub fn build_services_full(
+    harness: &Harness,
+    idp: Arc<dyn IdpPluginClient>,
+    metadata_registry: Arc<dyn MetadataSchemaRegistry>,
+    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+) -> TestServices {
+    use account_management::config::AccountManagementConfig;
+
+    let cfg = AccountManagementConfig::default();
+
+    let tenant_service = Arc::new(
+        TenantService::new(
+            Arc::clone(&harness.repo),
+            Arc::clone(&idp),
+            inert_resource_checker(),
+            inert_tenant_type_checker(),
+            mock_enforcer(),
+            cfg,
+        )
+        .with_types_registry(Arc::clone(&types_registry)),
+    );
+
+    let user_service = Arc::new(UserService::new(
+        Arc::clone(&harness.repo) as Arc<dyn TenantRepo>,
+        Arc::clone(&idp),
+        Arc::clone(&types_registry),
+        mock_enforcer(),
+    ));
+
+    let metadata_repo: Arc<dyn MetadataRepo> =
+        Arc::new(MetadataRepoImpl::new(Arc::clone(&harness.provider)));
+    let metadata_service = Arc::new(MetadataService::new(
+        metadata_repo,
+        Arc::clone(&harness.repo) as Arc<dyn TenantRepo>,
+        metadata_registry,
+        mock_enforcer(),
+    ));
+
+    let conversion_repo: Arc<dyn account_management::domain::conversion::repo::ConversionRepo> =
+        Arc::new(ConversionRepoImpl::new(Arc::clone(&harness.provider)));
+    let conversion_service = Arc::new(ConversionService::new(
+        conversion_repo,
+        Arc::clone(&harness.repo) as Arc<dyn TenantRepo>,
+        inert_tenant_type_checker(),
+        mock_enforcer(),
+        std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        std::time::Duration::from_secs(7 * 24 * 60 * 60),
+    ));
+
+    TestServices {
+        tenant_service,
+        metadata_service,
+        user_service,
+        conversion_service,
+    }
+}
+
+/// Build a full router with default fakes. Equivalent to
+/// `build_test_router_with(harness, fake_idp(), empty_metadata_registry())`.
+#[must_use]
+pub fn build_test_router(services: &TestServices) -> Router {
+    let openapi = NoopOpenApiRegistry;
+    register_routes(
+        Router::new(),
+        &openapi,
+        Arc::clone(&services.tenant_service),
+        Arc::clone(&services.metadata_service),
+        Arc::clone(&services.user_service),
+        Arc::clone(&services.conversion_service),
+    )
+}
+
+// ── HTTP request / response helpers ──────────────────────────────────
+
+/// Build a JSON request with an attached [`SecurityContext`] extension.
+/// `body` is optional — `None` produces an empty body and no
+/// `Content-Type` header (matches RG harness behavior).
+#[must_use]
+pub fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+    ctx: SecurityContext,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+
+    let body = match body {
+        Some(json) => Body::from(serde_json::to_vec(&json).unwrap()),
+        None => Body::empty(),
+    };
+
+    let mut req = builder.body(body).unwrap();
+    req.extensions_mut().insert(ctx);
+    req
+}
+
+/// Build a JSON request WITHOUT a [`SecurityContext`] extension. Used
+/// by negative tests that probe what happens when the gateway-injected
+/// `Extension<SecurityContext>` is missing.
+#[must_use]
+pub fn json_request_no_ctx(
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+
+    let body = match body {
+        Some(json) => Body::from(serde_json::to_vec(&json).unwrap()),
+        None => Body::empty(),
+    };
+
+    builder.body(body).unwrap()
+}
+
+/// Read the response body as a JSON [`serde_json::Value`]. Returns
+/// `serde_json::Value::Null` for empty / non-JSON bodies (per the RG
+/// harness convention).
+pub async fn response_body(resp: Response<Body>) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+/// Read the response status + parsed JSON body in one pass — the
+/// standard tuple used by error-path assertions on the RFC 9457
+/// `Problem` envelope.
+pub async fn response_problem(resp: Response<Body>) -> (StatusCode, serde_json::Value) {
+    let status = resp.status();
+    let body = response_body(resp).await;
+    (status, body)
+}
+
+// ── Seeding helpers used by the HTTP suite ───────────────────────────
+
+/// Seed the platform root tenant with its closure self-row. The
+/// resulting `root_id` is the tenant the test caller's
+/// [`SecurityContext`] should scope to. The `tenant_type_uuid` is
+/// stamped to [`harness_tenant_type_uuid`] so the user-ops surface
+/// (which mandates a registry-resolvable tenant type) reaches its
+/// happy path.
+pub async fn seed_root(h: &Harness, root_id: Uuid) {
+    insert_tenant_typed(&h.provider, root_id, None, "root", ACTIVE, false, 0)
+        .await
+        .expect("seed root tenant");
+    insert_closure(&h.provider, root_id, root_id, 0, ACTIVE)
+        .await
+        .expect("seed root self-row");
+}
+
+/// Seed an active child tenant under `parent_id`. Inserts the child
+/// row plus all closure rows along the ancestor chain — keeps the
+/// test fixtures FK-clean even on the FK-enforcing Postgres backend.
+/// Stamps [`harness_tenant_type_uuid`] on the row so user-ops
+/// fixtures resolve cleanly.
+pub async fn seed_active_child(
+    h: &Harness,
+    child_id: Uuid,
+    parent_id: Uuid,
+    name: &str,
+    depth: i32,
+) {
+    insert_tenant_typed(
+        &h.provider,
+        child_id,
+        Some(parent_id),
+        name,
+        ACTIVE,
+        false,
+        depth,
+    )
+    .await
+    .expect("seed child tenant");
+    insert_closure(&h.provider, child_id, child_id, 0, ACTIVE)
+        .await
+        .expect("seed child self-row");
+    // Strict ancestor closure rows along the chain from `parent_id`
+    // up to the root. `load_ancestor_chain_through_parent` would
+    // discover them at runtime; here we only need `(parent_id,
+    // child_id)` plus the root self-row already seeded.
+    insert_closure(&h.provider, parent_id, child_id, 0, ACTIVE)
+        .await
+        .expect("seed (parent, child) closure row");
+}
+
+// =====================================================================
+// END E2E HTTP harness
+// =====================================================================
 
 // ---------------------------------------------------------------------
 // Postgres bring-up (testcontainers).

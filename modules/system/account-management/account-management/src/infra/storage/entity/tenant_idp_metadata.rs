@@ -13,12 +13,8 @@
 //! owns the shape entirely. Size is capped at the AM service boundary
 //! by `MAX_IDP_METADATA_BYTES`.
 //!
-//! No `plugin_id` column today: AM resolves at most one
-//! `IdpPluginClient` from `ClientHub` per deployment, and adding the
-//! column before a multi-plugin contract exists would persist a value
-//! no caller actually owns. A future multi-plugin design will land
-//! together with its disambiguator column and a migration that
-//! backfills the existing rows.
+//! Single tenant_id-keyed row — AM resolves at most one
+//! `IdpPluginClient` via `ClientHub`.
 
 use modkit_db_macros::Scopable;
 use sea_orm::entity::prelude::*;

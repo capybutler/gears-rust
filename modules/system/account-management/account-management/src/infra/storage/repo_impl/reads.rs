@@ -331,14 +331,7 @@ pub(super) async fn list_children(
     // * Cursor pages — when a cursor is present, `paginate_odata`
     //   re-derives the effective order from the cursor's signed
     //   tokens, so the injection here is skipped (the helper
-    //   ignores `query.order` on cursor pages). Cursors generated
-    //   before this change had a single key (`created_at`); the
-    //   cursor-key-count check in `build_cursor_predicate` will
-    //   reject them as `InvalidCursor`, which the service surfaces
-    //   as `Validation`. This is acceptable on a feature branch
-    //   before public release; if any environment has emitted
-    //   tokens with the old shape, treat token rotation as part of
-    //   the rollout.
+    //   ignores `query.order` on cursor pages).
     let query = if query.cursor.is_none() && query.order.is_empty() {
         let mut adjusted = query.clone();
         adjusted.order = adjusted.order.ensure_tiebreaker("created_at", SortDir::Asc);

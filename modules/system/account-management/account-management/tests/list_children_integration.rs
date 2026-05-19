@@ -143,11 +143,11 @@ fn ids_of(items: &[account_management::domain::tenant::model::TenantModel]) -> V
 // ---- pinned filter-field surface ------------------------------------
 
 /// Sanity-pin against the SDK's declared filter set — duplicated from
-/// the SDK-side `tenant_info_filter_fields_are_pinned` so the
-/// integration suite trips immediately on a wire-contract drift even
-/// when the SDK lib tests are not re-run.
+/// the SDK-side `tenant_filter_fields_are_pinned` so the integration
+/// suite trips immediately on a wire-contract drift even when the SDK
+/// lib tests are not re-run.
 #[test]
-fn tenant_info_filter_fields_are_stable() {
+fn tenant_filter_fields_are_stable() {
     let names: Vec<&'static str> = TenantInfoFilterField::FIELDS
         .iter()
         .map(FilterField::name)

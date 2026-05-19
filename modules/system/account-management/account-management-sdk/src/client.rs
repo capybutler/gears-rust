@@ -461,15 +461,21 @@ pub trait AccountManagementClient: Send + Sync + 'static {
     /// for `schema_id`. Inherited entries (resolved through an
     /// ancestor) are NOT affected — only the direct row is removed.
     ///
+    /// Idempotent on missing rows: returns `Ok(())` whether the row
+    /// existed and was removed or was already absent (mirrors
+    /// [`Self::delete_user`] deprovision idempotency). The
+    /// tenant-existence and schema-registration gates still raise
+    /// `NotFound` if the tenant cannot be resolved or the schema is
+    /// not registered.
+    ///
     /// The actor recorded on audit lines is `ctx.subject_id()`.
     ///
     /// # Errors
     ///
     /// * `PermissionDenied`, `FailedPrecondition` as on
     ///   [`Self::get_metadata`].
-    /// * `NotFound` (HTTP 404) — tenant does not exist, schema is
-    ///   not registered, OR no direct row exists at
-    ///   `(tenant_id, schema_id)`.
+    /// * `NotFound` (HTTP 404) — tenant does not exist or schema is
+    ///   not registered.
     async fn delete_metadata(
         &self,
         ctx: &SecurityContext,

@@ -4,11 +4,8 @@
 //!
 //! Two tables land in the same migration because they belong to the
 //! same feature slice (managed/self-managed conversion + IdP-metadata
-//! isolation) and the PR has not yet shipped — there is no migration
-//! ordering invariant to preserve, and the sibling `am/05-tenant-metadata`
-//! branch already claims the `m0005` slot. A future PR that needs to
-//! alter either table opens a new migration file rather than mutating
-//! this one.
+//! isolation). A future PR that needs to alter either table opens a
+//! new migration file rather than mutating this one.
 //!
 //! # `conversion_requests`
 //!

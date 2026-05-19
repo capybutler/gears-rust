@@ -24,8 +24,18 @@ modkit-security = { workspace = true }
 modkit-db = { workspace = true, features = ["sqlite", "pg"] }
 modkit-db-macros = { workspace = true }
 modkit-canonical-errors = { workspace = true, features = ["sea-orm"] }
-modkit-odata = { workspace = true }
+modkit-odata = { workspace = true, features = ["with-utoipa"] }
+# Macro-derived `ODataFilterable` for the conversion-request listing
+# surface (`domain/conversion/query.rs`). Tenant + metadata filter
+# fields live on the SDK side, but the conversion filter field set
+# is impl-only and never re-exported on the SDK, so the derive crate
+# is pulled directly into this crate.
+modkit-odata-macros = { workspace = true }
 modkit-utils = { workspace = true, features = ["humantime-serde"] }
+
+axum = { workspace = true, features = ["macros"] }
+http = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
 resource-group-sdk = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
 types-registry-sdk = { workspace = true }
@@ -71,6 +81,11 @@ postgres = []
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
+# In-process `Router::oneshot` HTTP harness for the REST integration
+# suite (`tests/api_*_test.rs`). Mirrors the resource-group module's
+# wiring.
+tower = { workspace = true }
+http-body-util = { workspace = true }
 proptest = "1.5"
 # `no-env-filter` accepts events with `target: "am.*"` (otherwise the
 # default `{crate}=trace` filter rejects custom targets, hiding the

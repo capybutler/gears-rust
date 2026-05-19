@@ -24,8 +24,8 @@ use uuid::Uuid;
 // `tenant_closure` is an auxiliary index used internally by AM + by the
 // tenant-resolver read model. It does not carry a tenant-ownership column
 // (each row references two tenants via `ancestor_id` + `descendant_id`),
-// so it is declared with `no_tenant` / `no_resource`. Phase 2 addition:
-// keeps the table writable from `TenantRepoImpl` via SecureConn without
+// so it is declared with `no_tenant` / `no_resource`. This keeps the
+// table writable from `TenantRepoImpl` via SecureConn without
 // compromising the per-row scope contract enforced on `tenants` itself.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Scopable)]
 #[sea_orm(table_name = "tenant_closure")]
@@ -37,7 +37,8 @@ pub struct Model {
     pub descendant_id: Uuid,
     /// `0` for the self-row and for rows with no self-managed tenant on the
     /// strict `(ancestor, descendant]` path; `1` when such a tenant exists.
-    /// v1 uses only bit 0; reserved as `SMALLINT` for future barrier bits.
+    /// SMALLINT (not BOOL) so future barrier bits (beyond self-managed
+    /// boundary) can be added without an ALTER COLUMN.
     pub barrier: i16,
     /// `1=active, 2=suspended, 3=deleted` — the SDK-visible subset only.
     /// `provisioning` tenants never have closure rows.

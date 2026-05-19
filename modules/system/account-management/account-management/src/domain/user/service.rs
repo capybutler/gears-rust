@@ -48,7 +48,7 @@ use account_management_sdk::{
     IdpProvisionUserRequest, IdpTenantContext, IdpUser, IdpUserPagination, ListUsersQuery,
 };
 use authz_resolver_sdk::PolicyEnforcer;
-use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use authz_resolver_sdk::pep::ResourceType;
 use modkit_macros::domain_model;
 use modkit_odata::Page;
 use modkit_odata::ast::{CompareOperator, Expr, Value};
@@ -63,10 +63,10 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::idp::UserOperationFailureExt;
 use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, MetricKind, emit_metric};
+use crate::domain::system_actor::for_user_cleanup;
 use crate::domain::tenant::TenantContext;
 use crate::domain::tenant::model::TenantStatus;
 use crate::domain::tenant::repo::TenantRepo;
-use crate::domain::user_groups::am_system_context;
 
 /// Upper bound on `username` length enforced at the AM boundary
 /// before the `IdP` round-trip. Matches the `child_tenant_name`
@@ -96,23 +96,9 @@ const MAX_USERNAME_CHARS: usize = 255;
 /// remains authoritative).
 const MAX_PROFILE_FIELD_CHARS: usize = 255;
 
-/// Central AM domain service for the `IdP` user-operations contract.
-///
-/// Construction mirrors [`crate::domain::conversion::service::ConversionService`]
-/// -- every dependency is passed in as `Arc<dyn ...>` so production
-/// wiring (`module.rs`) and tests (`FakeTenantRepo` /
-/// `FakeIdpUserProvisioner`) share the same constructor surface. The
-/// service holds no clock seam and no batch-size knobs because the
-/// FEATURE doc state model is empty (no AM-side lifecycle here -- see
-/// the section "States (CDSL): Not applicable").
-/// PEP descriptors for the tenant-scoped `IdP` user resource.
-///
-/// Mirrors the `pep::TENANT` / `pep::METADATA` declarations on
-/// sibling services. The resource type name pins
-/// [`account_management_sdk::USER_RESOURCE_TYPE`]; the impl-side
-/// duplication is required because `ResourceType.name` is a
-/// `&'static str` consumed at compile time. Cross-checks live in
-/// `domain::error_tests`.
+/// PEP descriptors. The literal type-name duplicates
+/// `USER_RESOURCE_TYPE` because `ResourceType.name` is `&'static str`;
+/// a cross-check test pins them in sync.
 pub(super) mod pep {
     use super::{ResourceType, pep_properties};
 
@@ -138,11 +124,8 @@ pub(super) mod pep {
         &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
     );
 
-    /// Action vocabulary. `get_user` is internally a single-row
-    /// `list_users` projection so it shares the `LIST` policy bucket;
-    /// fine-grained per-user `READ` is reserved for the future
-    /// (e.g. policies that gate per-user-id metadata reads behind a
-    /// separate decision).
+    /// Action vocabulary. `get_user` is a single-row `list_users`
+    /// projection so it shares the `LIST` bucket.
     pub mod actions {
         pub const CREATE: &str = "create";
         pub const LIST: &str = "list";
@@ -150,37 +133,31 @@ pub(super) mod pep {
     }
 }
 
+/// Central AM domain service for the `IdP` user-operations contract.
+/// Pass-through service: no clock seam, no batch-size knobs — the
+/// contract has no AM-side lifecycle state.
 #[domain_model]
 pub struct UserService {
     tenant_repo: Arc<dyn TenantRepo>,
     idp_user: Arc<dyn IdpPluginClient>,
-    /// GTS Types Registry client used to fetch the
-    /// `gts.cf.core.am.user.v1~` schema at runtime so the structural
-    /// contract (length bounds, formats) is enforced from the
-    /// published JSON Schema rather than re-hardcoded here. Mirrors
-    /// the wiring in `cf-resource-group::validate_metadata_via_gts`.
+    /// GTS schema source for the user JSON-Schema contract — keeps
+    /// structural rules (length, format) authoritative in the
+    /// catalogue rather than duplicated in code.
     types_registry: Arc<dyn TypesRegistryClient>,
-    /// PEP gate. Mirrors `TenantService` / `MetadataService`: every
-    /// public user-ops method PEP-gates via [`Self::authorize`]
-    /// before any `IdP` / RG round trip. The `PolicyEnforcer` is owned
-    /// by-value (it is `Clone`); the module wiring clones it from
-    /// the shared instance used by sibling services.
+    /// PEP gate run before any `IdP` / RG round trip.
     enforcer: PolicyEnforcer,
-    /// Optional `ResourceGroupClient` used by
-    /// [`Self::delete_user`] to remove dangling user-group
-    /// memberships referencing the deleted user from RG's
-    /// `resource_group_membership` table. `None` in tests that don't
-    /// exercise the cleanup path; production wiring in `module.rs`
-    /// always passes `Some(...)`.
+    /// RG client for `delete_user` membership cleanup. `None` in
+    /// tests that don't exercise the cleanup path; production wiring
+    /// always sets it.
     rg_client: Option<Arc<dyn ResourceGroupClient + Send + Sync>>,
+    /// Per-deployment listing cap. Defaults to
+    /// [`IdpUserPagination::MAX_TOP`]; production wiring overrides
+    /// via [`Self::with_listing_max_top`] from `cfg.listing.max_top`.
+    max_listing_top: u32,
 }
 
-/// Per-call RG timeout for the cleanup helper.
-///
-/// Matches `CASCADE_TIMEOUT` in `domain::user_groups::cascade` so the
-/// two pipelines share an operator-tunable upper bound. Lifted into
-/// a constant so the `delete_user` test fixtures can construct
-/// it without re-deriving the literal.
+/// Per-call RG timeout. Matches `CASCADE_TIMEOUT` so cleanup and
+/// cascade share one operator-tunable bound.
 #[allow(
     clippy::duration_suboptimal_units,
     reason = "from_mins is unstable on workspace MSRV; keep from_secs"
@@ -192,20 +169,9 @@ const RG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Matches `CASCADE_PAGE_SIZE` in `domain::user_groups::cascade`.
 const RG_CLEANUP_PAGE_SIZE: u64 = 100;
 
-/// Overall budget for one `cleanup_user_group_memberships` invocation.
-///
-/// Caps the worst-case time the deprovision request can spend on RG
-/// cleanup before surfacing [`DomainError::ServiceUnavailable`].
-/// Without this cap a tenant with N user-groups would compound
-/// `RG_CLEANUP_TIMEOUT` × pages × N remove-calls into a request future
-/// that the caller cannot cancel.
-///
-/// Tighter sibling of `CASCADE_BUDGET` in
-/// `domain::user_groups::cascade`: cleanup runs on the synchronous
-/// `delete_user` request path (60s -- a user-visible response
-/// budget), whereas cascade runs on the retention pipeline's tenant
-/// hard-delete tick (120s -- a background-job budget that can yield
-/// cheaply). The two are intentionally asymmetric on purpose.
+/// Overall cleanup budget. Tighter than `CASCADE_BUDGET` because
+/// cleanup runs on the synchronous `delete_user` request path
+/// (user-visible response), not on a background retention tick.
 #[allow(
     clippy::duration_suboptimal_units,
     reason = "from_mins is unstable on workspace MSRV; keep from_secs"
@@ -232,7 +198,28 @@ impl UserService {
             types_registry,
             enforcer,
             rg_client: None,
+            max_listing_top: account_management_sdk::IdpUserPagination::MAX_TOP,
         }
+    }
+
+    /// Operator-tunable per-deployment listing cap. The module
+    /// bootstrap passes `cfg.listing.max_top` so the user listing
+    /// surface stays uniform with the tenant / conversion / metadata
+    /// listing caps.
+    #[must_use]
+    pub const fn with_listing_max_top(mut self, max_top: u32) -> Self {
+        self.max_listing_top = max_top;
+        self
+    }
+
+    /// Per-deployment `top` cap. The `list_users` REST handler clamps
+    /// the caller-supplied `limit` against this ceiling so a
+    /// deployment that tightened `cfg.listing.max_top` below the SDK
+    /// constructor's absolute ceiling (200) sees the tighter cap take
+    /// effect.
+    #[must_use]
+    pub const fn max_listing_top(&self) -> u32 {
+        self.max_listing_top
     }
 
     /// PEP gate. Calls the platform-side `PolicyEnforcer`, returns
@@ -258,15 +245,19 @@ impl UserService {
         action: &str,
         tenant_id: Uuid,
     ) -> Result<AccessScope, DomainError> {
-        let request = AccessRequest::new()
-            .resource_property(pep_properties::OWNER_TENANT_ID, tenant_id)
-            .resource_property(pep_properties::RESOURCE_ID, tenant_id)
-            .require_constraints(true);
-        let scope = self
-            .enforcer
-            .access_scope_with(ctx, &pep::USER, action, Some(tenant_id), &request)
-            .await?;
-        Ok(scope)
+        // Delegates to [`crate::domain::authz::authz_scope`] for the
+        // uniform PEP-gate shape. `User` keys both `OWNER_TENANT_ID`
+        // and `RESOURCE_ID` on the IdP user's owning tenant.
+        crate::domain::authz::authz_scope(
+            &self.enforcer,
+            ctx,
+            &pep::USER,
+            action,
+            tenant_id,
+            Some(tenant_id),
+            |req| req,
+        )
+        .await
     }
 
     /// Wire the [`ResourceGroupClient`] used by
@@ -318,17 +309,24 @@ impl UserService {
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] -- tenant exists but is not
     ///   [`TenantStatus::Active`] (provisioning, suspended, deleted).
+    /// * [`DomainError::Validation`] -- payload rejected before the
+    ///   `IdP` call: empty / whitespace-only username, username or
+    ///   email / `display_name` exceeding the length cap, or GTS
+    ///   schema rejection on a structural property.
+    /// * [`DomainError::ServiceUnavailable`] -- GTS Types Registry
+    ///   transport failure or `gts.cf.core.am.user.v1~` not yet
+    ///   registered (fails closed rather than forwarding an
+    ///   unvalidated payload to the `IdP`); also DB transport
+    ///   failure inside `resolve_active_tenant`.
     /// * [`DomainError::IdpUnavailable`] -- transport failure or
     ///   timeout on the `IdP` call.
     /// * [`DomainError::UnsupportedOperation`] -- provider declined
     ///   the operation.
     /// * [`DomainError::Validation`] -- provider rejected the payload
-    ///   (duplicate username, malformed email, etc.).
-    /// * [`DomainError::ServiceUnavailable`] -- GTS Types Registry
-    ///   transport failure while fetching the
-    ///   `gts.cf.core.am.user.v1~` schema; AM cannot validate the
-    ///   payload structurally, so the call fails closed rather than
-    ///   forwarding an unvalidated payload to the `IdP`.
+    ///   (duplicate username, vendor-side checks, etc.).
+    /// * [`DomainError::Internal`] -- provider returned `Uuid::nil()`
+    ///   as the user id (plugin contract violation) or an unknown
+    ///   SDK failure variant.
     // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-provision-user:p1:inst-flow-puser-service
     #[allow(
         clippy::cognitive_complexity,
@@ -359,35 +357,10 @@ impl UserService {
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-puser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-provision-user:p1:inst-flow-puser-resolve-tenant
 
-        // AM business invariants on the username, enforced AFTER the
-        // tenant guard so payload-shape feedback never leaks tenant
-        // existence, and BEFORE the GTS schema round-trip so the
-        // structural validator sees the canonical (trimmed) value:
-        //   * Reject all-whitespace / empty — the schema's
-        //     `minLength: 1` does not catch `"  "` which is
-        //     semantically empty for a login identifier.
-        //   * Reject lengths past 255 chars before the IdP round-trip
-        //     — matches the `child_tenant_name` bound (`m0004` line
-        //     45) so AM caps payload size at the boundary instead of
-        //     forwarding megabyte-scale strings to the provider only
-        //     to be rejected as `Validation` with a redacted detail.
-        //   * Normalise surrounding whitespace — `" alice "` and
-        //     `"alice"` MUST resolve to the same provider identity
-        //     regardless of the vendor's storage semantics (literal /
-        //     auto-trim / hard-reject).
-        //
-        // # Trim-before-schema ordering is deliberate
-        //
-        // AM-side trim is the **canonical normalisation** for the
-        // username field — the published GTS schema declares
-        // structural shape (`minLength` / `maxLength` / format) but
-        // delegates whitespace-and-equivalence policy to the AM
-        // service layer. If a future schema revision wants to
-        // enforce a no-surrounding-whitespace pattern via JSON
-        // Schema `pattern`, mirror it as an AM-side pre-trim
-        // assertion here instead of inverting the order; the AM-side
-        // normalisation MUST stay authoritative because the
-        // schema-validation seam is structural-shape only.
+        // Trim username BEFORE the GTS schema check: whitespace-equivalence is AM
+        // policy, not schema-level (the schema enforces structural shape only).
+        // Cap at MAX_USERNAME_CHARS BEFORE the IdP round-trip so megabyte payloads
+        // don't ride the wire just to be rejected upstream.
         let trimmed = payload.username.trim();
         if trimmed.is_empty() {
             return Err(DomainError::Validation {
@@ -404,16 +377,9 @@ impl UserService {
         if trimmed.len() != payload.username.len() {
             payload.username = trimmed.to_owned();
         }
-        // Defence-in-depth caps on the secondary profile fields.
-        // Runs BEFORE the GTS round-trip as belt-and-suspenders:
-        // the helper below fails closed with `ServiceUnavailable`
-        // when the `gts.cf.core.am.user.v1~` schema is not yet
-        // registered (so a missing schema can never silently bypass
-        // `format` / `pattern` rules), but these cheap pre-flight
-        // caps cut megabyte-scale payloads before they ever hit the
-        // JSON-Schema validator. When the schema IS registered the
-        // validator below ALSO enforces `maxLength` / `format`; the
-        // duplication is intentional, not load-bearing.
+        // Pre-flight char-count caps on email/display_name. Cuts megabyte-scale
+        // payloads before the GTS validator runs, and stays fail-closed when the
+        // schema is unregistered (ServiceUnavailable path).
         check_profile_field_bound("email", payload.email.as_deref())?;
         check_profile_field_bound("display_name", payload.display_name.as_deref())?;
         crate::domain::gts_validation::validate_new_user_payload_via_gts(
@@ -431,7 +397,7 @@ impl UserService {
         // @cpt-end:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-package-request-puser
 
         // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-invoke-puser
-        let outcome = self.idp_user.provision_user(&req).await;
+        let outcome = self.idp_user.provision_user(ctx, &req).await;
         // @cpt-end:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-invoke-puser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-provision-user:p1:inst-flow-puser-invoke-contract
 
@@ -461,28 +427,14 @@ impl UserService {
                 // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-provision-user:p1:inst-flow-puser-success-return
                 // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-success-return-puser
                 // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-user-projection-schema:p1:inst-dod-user-projection-schema-puser
-                // Response-side schema validation is NOT performed.
-                // AM trusts the plugin's published `IdpPluginClient`
-                // contract: a successful `Ok(IdpUser)` is, by
-                // contract, a schema-conformant projection. Adding an
-                // AM-side `validate_user_projection_via_gts` fence
-                // here would either (a) fail closed on the entire
-                // response when a drifted plugin emits a single bad
-                // field — breaking the public surface that callers
-                // depend on for existence checks — or (b) silently
-                // drop bad rows, which would invent phantom-absent
-                // users and corrupt downstream membership state. The
-                // input-side gate (`validate_new_user_payload_via_gts`
-                // above) keeps AM from forwarding bad payloads; the
-                // output-side contract is owned by the plugin.
-                // Audit-success line is the ONLY `am.events` emission
-                // for this flow; failure-side correlation lives on
-                // `am.idp` warn lines emitted by the redaction pipeline
-                // in [`UserOperationFailureExt::into_domain_error`]
-                // (digest + len + tenant_id). Mirrors the conversion
-                // service which also emits `am.events` only on the Ok
-                // arm so a downstream consumer grouping by `event`
-                // counts successes, not attempts.
+                // Response-side schema validation is intentionally NOT performed:
+                // AM trusts the plugin's published projection contract. A
+                // response-side fence would either break the listing on a single
+                // drifted field or silently drop bad rows — both worse than the
+                // contract-trust posture.
+                // Only the Ok arm emits am.events; failure correlation lives on
+                // am.idp warn lines so downstream consumers grouping by event
+                // count successes, not attempts.
                 tracing::info!(
                     target: "am.events",
                     event = "user_provisioned",
@@ -536,11 +488,19 @@ impl UserService {
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] -- tenant exists but is not
     ///   [`TenantStatus::Active`].
+    /// * [`DomainError::ServiceUnavailable`] -- GTS Types Registry or
+    ///   DB transport failure inside `resolve_active_tenant`, or
+    ///   resource-group transport / overall-budget timeout during the
+    ///   post-deprovision membership cleanup (the call returns `Err`
+    ///   so a retry re-enters; `IdP` returns `Ok(())` idempotently,
+    ///   cleanup retries).
     /// * [`DomainError::IdpUnavailable`] -- transport failure or
     ///   timeout on the `IdP` call.
     /// * [`DomainError::UnsupportedOperation`] -- provider declined
     ///   the operation.
     /// * [`DomainError::Validation`] -- provider rejected the request.
+    /// * [`DomainError::Internal`] -- unknown SDK failure variant
+    ///   (catch-all in the internal failure-mapping helper).
     // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-service
     pub async fn delete_user(
         &self,
@@ -563,7 +523,7 @@ impl UserService {
         let req = IdpDeprovisionUserRequest::new(IdpTenantContext::from(&tenant_context), user_id);
         // @cpt-end:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-package-request-duser
         // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-invoke-duser
-        let outcome = self.idp_user.deprovision_user(&req).await;
+        let outcome = self.idp_user.deprovision_user(ctx, &req).await;
         // @cpt-end:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-invoke-duser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-invoke-contract
 
@@ -696,15 +656,24 @@ impl UserService {
     ///
     /// # Errors
     ///
+    /// * [`DomainError::Validation`] -- pagination shape: `cursor`
+    ///   present or `top != 1` combined with `user_id_filter` (the
+    ///   filtered shape is an authoritative existence check, not a
+    ///   paginated query).
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
     /// * [`DomainError::Validation`] -- tenant exists but is not
     ///   [`TenantStatus::Active`].
+    /// * [`DomainError::ServiceUnavailable`] -- GTS Types Registry or
+    ///   DB transport failure inside `resolve_active_tenant`.
     /// * [`DomainError::IdpUnavailable`] -- transport failure or
     ///   timeout. NO stale projection is served per
     ///   `cpt-cf-account-management-principle-idp-agnostic`.
     /// * [`DomainError::UnsupportedOperation`] -- provider declined
     ///   the operation.
     /// * [`DomainError::Validation`] -- provider rejected the request.
+    /// * [`DomainError::Internal`] -- provider returned a row that
+    ///   does not match `user_id_filter` (contract-drift guard) or
+    ///   an unknown SDK failure variant.
     // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-service
     pub async fn list_users(
         &self,
@@ -734,23 +703,11 @@ impl UserService {
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-luser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-resolve-tenant
 
-        // When `user_id_filter` is set the call is an authoritative
-        // existence check per the SDK doc on
-        // `IdpListUsersRequest::user_id_filter` — both a one-element page
-        // and an empty page are success and downstream callers
-        // (feature-user-groups membership writes, RBAC mapping) treat
-        // the empty page as authoritative absence. Enforce two
-        // pagination disciplines at the AM boundary so the
-        // existence-check semantics cannot be bypassed:
-        //   * `cursor` MUST be absent — a continuation cursor would
-        //     let the provider step past the matching row and return
-        //     an empty page, turning the lookup into a false negative.
-        //   * `top` MUST be 1 — an oversized `top` (e.g. 1000) plus a
-        //     filter forwards both to a vendor that ignores the
-        //     filter, returning up to `top` unrelated rows; the
-        //     downstream `user_id_filter` contract check would then
-        //     surface a caller-side bug as `Internal` (HTTP 500)
-        //     instead of catching it at the AM seam.
+        // When user_id_filter is set the call is an existence check (empty page =
+        // authoritative absent). Reject cursor/top>1: a continuation cursor turns
+        // existence into a false negative; top>1 lets a vendor that ignores the
+        // filter return unrelated rows and surface a caller bug as Internal 500
+        // instead of Validation 400.
         if user_id_filter.is_some() {
             if pagination.cursor().is_some() {
                 return Err(DomainError::Validation {
@@ -784,7 +741,7 @@ impl UserService {
         };
         // @cpt-end:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-package-request-luser
         // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-invoke-luser
-        let outcome = self.idp_user.list_users(&req).await;
+        let outcome = self.idp_user.list_users(ctx, &req).await;
         // @cpt-end:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-invoke-luser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-invoke-contract
 
@@ -793,14 +750,10 @@ impl UserService {
             // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-list-users:p1:inst-flow-luser-project
             // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-success-return-luser
             Ok(page) => {
-                // Plugin-contract validation when `user_id_filter` is set:
-                // a buggy provider could echo back unrelated users or
-                // multiple rows under a single-user lookup. Downstream
-                // callers (existence checks, RBAC mapping) treat the
-                // returned page as authoritative, so a contract drift
-                // here is a security-relevant correctness bug. Surface
-                // any drift as `Internal` rather than silently passing
-                // wrong data through.
+                // Provider contract guard: surface user_id_filter drift as
+                // Internal 500 — downstream existence checks and RBAC mapping
+                // treat this page as authoritative, so silent drift is
+                // security-relevant.
                 if let Some(filter_id) = user_id_filter
                     && (page.items.len() > 1 || page.items.iter().any(|u| u.id != filter_id))
                 {
@@ -822,15 +775,8 @@ impl UserService {
                         cause: None,
                     });
                 }
-                // Response-side schema validation is NOT performed
-                // (mirrors the `create_user` rationale above): AM
-                // trusts the plugin's published projection contract
-                // and only enforces the `user_id_filter` discipline
-                // here. Failing closed on a single drifted row would
-                // break the entire listing for read-only consumers,
-                // and user projections are pass-through (never
-                // persisted), so a stale projection cannot lock in
-                // the way a persisted bad row could.
+                // Response-side schema validation is intentionally NOT performed
+                // (see `create_user` for the rationale).
                 Ok(page)
             }
             // @cpt-end:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-success-return-luser
@@ -941,9 +887,9 @@ impl UserService {
     ///
     /// Short-circuits on `rg_client = None` (test fixtures that don't
     /// model membership scenarios). System-actor context is built via
-    /// [`am_system_context`] so the call goes through cross-module
-    /// authz with the stable AM subject UUID, mirroring the
-    /// user-group cascade hook.
+    /// [`crate::domain::system_actor::for_user_cleanup`] so the call
+    /// goes through cross-module authz with the stable AM subject
+    /// UUID, mirroring the user-group cascade hook.
     ///
     /// Two-step, tenant-scoped by construction:
     ///
@@ -987,7 +933,7 @@ impl UserService {
         let Some(rg) = self.rg_client.as_ref() else {
             return Ok(());
         };
-        let sys_ctx = am_system_context(Some(tenant_id));
+        let sys_ctx = for_user_cleanup(tenant_id);
 
         let body = cleanup_inner(rg.as_ref(), &sys_ctx, tenant_id, user_id);
         match tokio::time::timeout(RG_CLEANUP_BUDGET, body).await {

@@ -54,6 +54,7 @@ members = [
     "modules/file-parser",
     "modules/system/account-management/account-management",
     "modules/system/account-management/account-management-sdk",
+    "modules/system/account-management/plugins/static-idp-plugin",
     "modules/system/api-gateway",
     "modules/system/grpc-hub",
     "modules/system/nodes-registry/nodes-registry",

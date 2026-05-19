@@ -40,6 +40,7 @@ use account_management_sdk::{
 };
 
 use crate::domain::metrics::{AM_TENANT_RETENTION, MetricKind, emit_metric};
+use crate::domain::system_actor::for_provisioning_reaper;
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::retention::ReaperResult;
 
@@ -76,9 +77,14 @@ impl<R: TenantRepo> TenantService<R> {
     /// `repo.compensate_provisioning()` (compensable / already-absent
     /// arms), (b) stamp `terminal_failure_at` and park the row
     /// (`Terminal` arm), or (c) release the claim and defer to the
-    /// next tick (`Retryable` / unknown-variant arms). Worst-case
-    /// stuck → row-gone latency is one `reaper_tick_secs` (no
-    /// retention-pipeline hop). See FEATURE §3
+    /// next tick (`Retryable` / unknown-variant arms). A storage fault
+    /// on the (a) hard-delete falls through to (c) — defer + release —
+    /// so a peer reaper can retry the compensation on a later tick.
+    /// See `compensate_provisioning_row` for the storage-fault → defer
+    /// branch that fences the hard-delete on the worker's claim and
+    /// releases it on infra failure.
+    /// Worst-case stuck → row-gone latency is one `reaper_tick_secs`
+    /// (no retention-pipeline hop). See FEATURE §3
     /// `algo-tenant-hierarchy-management-provisioning-reaper-compensation`.
     #[allow(
         clippy::cognitive_complexity,
@@ -192,9 +198,7 @@ impl<R: TenantRepo> TenantService<R> {
         // needs a re-audit (an analogous comment lives next to the
         // retention pipeline's symmetric streaming refactor).
         //
-        // `validate()` rejects `deprovision_concurrency == 0` at
-        // startup; the `.max(1)` is defense-in-depth for hand-built
-        // configs (e.g. tests) that bypass `validate`.
+        // .max(1) is defense-in-depth for hand-built TenantService instances that bypass validate(); buffer_unordered(0) would stall.
         let concurrency = self.cfg.reaper.deprovision_concurrency.max(1);
         let mut stream = stream::iter(rows)
             .map(|row| {
@@ -284,11 +288,13 @@ impl<R: TenantRepo> TenantService<R> {
                 return ReaperOutcome::Defer;
             }
         };
+        let sys_ctx = for_provisioning_reaper(tenant_id);
         match self
             .idp
-            .deprovision_tenant(&IdpDeprovisionTenantRequest::new(IdpTenantContext::from(
-                &tenant_context,
-            )))
+            .deprovision_tenant(
+                &sys_ctx,
+                &IdpDeprovisionTenantRequest::new(IdpTenantContext::from(&tenant_context)),
+            )
             .await
         {
             Ok(()) => ReaperOutcome::Compensable("compensated"),
@@ -354,12 +360,7 @@ impl<R: TenantRepo> TenantService<R> {
             Err(IdpDeprovisionFailure::Terminal { detail }) => {
                 // Per the SDK contract, `Terminal` means the vendor
                 // refused to deprovision and operator intervention is
-                // required. The reaper used to map this to `Defer`,
-                // which released the claim and let
-                // `scan_stuck_provisioning` re-pick the row on the
-                // next tick — producing an indefinite reissue loop
-                // without any new operator-visible signal. We now
-                // stamp `terminal_failure_at` (in
+                // required. Stamp `terminal_failure_at` (in
                 // `compensate_terminal_provisioning_row`) so the
                 // scan filter excludes the row until an operator
                 // clears the column or hard-deletes the row.
@@ -413,14 +414,12 @@ impl<R: TenantRepo> TenantService<R> {
     /// is the v1 stand-in observers can correlate against the metric
     /// until that sink exists.
     ///
-    /// Provisioning rows never become SDK-visible, so reconciling
-    /// them through the soft-delete + retention pipeline (the
-    /// previous `schedule_deletion` approach) would leak tombstones —
-    /// operators would see `Deleted` rows in the DB long after the
-    /// `IdP` teardown finished and the retention pipeline would have
-    /// to re-claim and re-process the same row on a later tick.
-    /// Deleting directly here keeps the outcome local to one reaper
-    /// tick.
+    /// Provisioning rows never become SDK-visible, so deleting
+    /// directly here keeps the outcome local to one reaper tick —
+    /// routing through the soft-delete + retention pipeline would
+    /// leak tombstones (`Deleted` rows visible in the DB long after
+    /// `IdP` teardown finished) and force a re-claim/re-process on a
+    /// later tick.
     ///
     /// Releases the claim only on infra failure (the row is gone on
     /// success, including the `claimed_by` column).
@@ -492,16 +491,10 @@ impl<R: TenantRepo> TenantService<R> {
             outcome = outcome_label,
             "am tenant state changed"
         );
-        // No `release_claim` call: `compensate_provisioning` is a
-        // physical hard delete (see method doc upstream) — the row is
-        // gone, including its `claimed_by` column. An explicit release
-        // here would be a no-op against a missing row at best, and at
-        // worst surface a spurious "failed to clear claim" warning on
-        // every successful compensation. The previous flow soft-
-        // deleted the row and left it for the retention pipeline; that
-        // path no longer exists. `scope` and `claimed_by` remain
-        // function args because the storage-error branch above still
-        // releases the claim so a peer can retry.
+        // compensate_provisioning is a physical delete (claimed_by gone);
+        // explicit release on success would warn against a missing row.
+        // `scope` and `claimed_by` stay function args — the storage-error
+        // branch above still releases the claim so a peer can retry.
     }
 
     /// Stamp `terminal_failure_at` on the row via

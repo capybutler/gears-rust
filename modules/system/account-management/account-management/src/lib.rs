@@ -42,11 +42,13 @@
 //! `ConversionRepo` call.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod api;
 pub mod client;
 pub mod config;
 pub mod domain;
 pub mod infra;
 pub mod module;
+pub(crate) mod tr_plugin;
 
 pub use domain::error::DomainError;
 pub use domain::metrics::{
@@ -62,7 +64,14 @@ pub use domain::tenant::{
 };
 
 pub use infra::storage::migrations::Migrator;
-pub use infra::storage::repo_impl::{AmDbProvider, TenantRepoImpl};
+// `AmDbProvider` and `TenantRepoImpl` are crate-internal: external
+// consumers depend on `account-management-sdk` (the trait surface) and
+// resolve a live instance through `ClientHub`, never on the impl crate's
+// concrete storage types. Re-exporting them here would re-open the
+// impl/SDK boundary documented in `account-management-sdk/src/lib.rs`
+// (every SeaORM bump or schema change in `infra::storage::repo_impl`
+// would then break every dependent crate). Kept reachable only via the
+// `infra::storage::repo_impl` path inside the crate.
 
 pub use client::AccountManagementClientImpl;
 pub use module::AccountManagementModule;

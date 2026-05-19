@@ -15,10 +15,13 @@
 //!   (`child` vs `parent`).
 //! * [`TargetMode`] — target mode the conversion will land on
 //!   (`managed` vs `self_managed`).
-//! * [`ConversionRequest`] — full storage row exposed by the repo.
+//! * [`ConversionRequest`] — full storage row exposed by the repo,
+//!   including the four optional per-transition audit comment columns
+//!   (`requested_comment`, `approved_comment`, `cancelled_comment`,
+//!   `rejected_comment`).
 //! * [`NewConversionRequest`] — repo-level insert input for
-//!   `insert_pending`.
-//! * [`ConversionPagination`] — repo-level pagination value type.
+//!   `insert_pending`, including the optional `requested_comment`
+//!   stamped at request time.
 
 use modkit_macros::domain_model;
 use time::OffsetDateTime;
@@ -213,6 +216,20 @@ pub struct ConversionRequest {
     pub resolved_at: Option<OffsetDateTime>,
     pub expires_at: OffsetDateTime,
     pub deleted_at: Option<OffsetDateTime>,
+    /// Optional caller-supplied rationale captured at request time
+    /// (`request_conversion`). The DB-side `m0006` CHECK pins length to
+    /// `1..=1000`; absent comments stay `None`.
+    pub requested_comment: Option<String>,
+    /// Optional approver rationale captured on the
+    /// `pending -> approved` transition. Same length contract as
+    /// [`Self::requested_comment`].
+    pub approved_comment: Option<String>,
+    /// Optional canceller rationale captured on the
+    /// `pending -> cancelled` transition. Same length contract.
+    pub cancelled_comment: Option<String>,
+    /// Optional rejecter rationale captured on the
+    /// `pending -> rejected` transition. Same length contract.
+    pub rejected_comment: Option<String>,
 }
 
 /// Repo-level insert input for
@@ -240,15 +257,9 @@ pub struct NewConversionRequest {
     pub requested_by: Uuid,
     pub requested_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
-}
-
-/// Top/skip pagination shape consumed by the conversion-list repo
-/// methods (`list_own_for_tenant` / `list_inbound_for_parent`). Mirrors
-/// the `ListChildrenQuery` shape used by the tenant repo so call-site
-/// ergonomics stay symmetric across the two domains.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConversionPagination {
-    pub top: u32,
-    pub skip: u32,
+    /// Optional caller-supplied rationale stamped on
+    /// `conversion_requests.requested_comment`. The service layer
+    /// enforces `1..=1000` chars before the INSERT; the DB-side
+    /// `m0006` CHECK is defence-in-depth.
+    pub requested_comment: Option<String>,
 }

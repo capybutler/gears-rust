@@ -44,9 +44,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bigdecimal::BigDecimal;
+use modkit_db::odata::sea_orm_filter::{
+    FieldToColumn, LimitCfg, ODataFieldMapping, PaginateOdataTryError, paginate_odata_try,
+};
 use modkit_db::secure::{
     DbTx, SecureEntityExt, SecureInsertExt, SecureUpdateExt, is_unique_violation,
 };
+use modkit_odata::filter::{FilterOp, ODataValue};
+use modkit_odata::{ODataQuery, Page, SortDir};
 use modkit_security::AccessScope;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, Order, QueryFilter};
@@ -54,9 +60,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::conversion::model::{
-    ConversionPagination, ConversionRequest, ConversionSide, ConversionStatus,
-    NewConversionRequest, TargetMode,
+    ConversionRequest, ConversionSide, ConversionStatus, NewConversionRequest, TargetMode,
 };
+use crate::domain::conversion::query::ConversionRequestFilterField;
 use crate::domain::conversion::repo::{ApplyConversionApprovalInput, ConversionRepo};
 use crate::domain::error::DomainError;
 use crate::domain::tenant::model::TenantStatus;
@@ -95,10 +101,10 @@ impl ConversionRepoImpl {
 
 /// Lift a [`conversion_requests::Model`] row into the domain
 /// [`ConversionRequest`]. Translates the `SMALLINT`-encoded enums into
-/// their typed forms; out-of-domain encodings surface as
-/// [`DomainError::Internal`] (the column-level `CHECK` constraint
-/// declared by `m0004` already prevents invalid writes, so a violation
-/// here implies schema-vs-domain drift).
+/// their typed forms.
+///
+/// Schema-vs-domain drift trips `Internal` — `CHECK` on `m0004`
+/// prevents this at write time.
 fn entity_to_conversion(row: conversion_requests::Model) -> Result<ConversionRequest, DomainError> {
     let status =
         ConversionStatus::from_smallint(row.status).ok_or_else(|| DomainError::Internal {
@@ -140,6 +146,10 @@ fn entity_to_conversion(row: conversion_requests::Model) -> Result<ConversionReq
         resolved_at: row.resolved_at,
         expires_at: row.expires_at,
         deleted_at: row.deleted_at,
+        requested_comment: row.requested_comment,
+        approved_comment: row.approved_comment,
+        cancelled_comment: row.cancelled_comment,
+        rejected_comment: row.rejected_comment,
     })
 }
 
@@ -151,6 +161,172 @@ fn id_eq_alive(id: Uuid) -> Condition {
         .add(conversion_requests::Column::Id.eq(id))
         .add(conversion_requests::Column::DeletedAt.is_null())
 }
+
+/// `OData` mapper for `conversion_requests`. Maps the public filter
+/// fields ([`ConversionRequestFilterField`]) onto the underlying
+/// `SeaORM` columns and surfaces cursor values for `paginate_odata`'s
+/// tiebreaker logic. Mirrors the
+/// [`super::reads::TenantODataMapper`] / [`super::metadata::MetadataODataMapper`]
+/// patterns.
+///
+/// Field-name aliasing pinned here (the public `OData` field name does
+/// not always match the storage column name):
+///
+/// * `created_at` -> `conversion_requests.requested_at`
+/// * `updated_at` -> `conversion_requests.resolved_at`
+///
+/// All other fields map identifier-for-identifier.
+struct ConversionRequestODataMapper;
+
+impl FieldToColumn<ConversionRequestFilterField> for ConversionRequestODataMapper {
+    type Column = conversion_requests::Column;
+
+    fn map_field(field: ConversionRequestFilterField) -> conversion_requests::Column {
+        match field {
+            ConversionRequestFilterField::Id => conversion_requests::Column::Id,
+            ConversionRequestFilterField::TenantId => conversion_requests::Column::TenantId,
+            ConversionRequestFilterField::ParentId => conversion_requests::Column::ParentId,
+            ConversionRequestFilterField::Status => conversion_requests::Column::Status,
+            ConversionRequestFilterField::TargetMode => conversion_requests::Column::TargetMode,
+            ConversionRequestFilterField::InitiatorSide => {
+                conversion_requests::Column::InitiatorSide
+            }
+            ConversionRequestFilterField::RequestedBy => conversion_requests::Column::RequestedBy,
+            ConversionRequestFilterField::CreatedAt => conversion_requests::Column::RequestedAt,
+            ConversionRequestFilterField::ExpiresAt => conversion_requests::Column::ExpiresAt,
+            ConversionRequestFilterField::UpdatedAt => conversion_requests::Column::ResolvedAt,
+        }
+    }
+
+    /// Translate the wire-side enum strings (`status`, `target_mode`,
+    /// `initiator_side`) to the storage `SMALLINT` ordinal. Only
+    /// membership operators are admissible; ordered comparisons would
+    /// silently fall back to the hidden numeric ordinal.
+    fn map_value(
+        field: ConversionRequestFilterField,
+        op: FilterOp,
+        value: &ODataValue,
+    ) -> Result<ODataValue, String> {
+        match (field, value) {
+            (ConversionRequestFilterField::Status, ODataValue::String(s)) => {
+                reject_ordered(op, "status")?;
+                let code = match s.as_str() {
+                    "pending" => ConversionStatus::Pending.as_smallint(),
+                    "approved" => ConversionStatus::Approved.as_smallint(),
+                    "cancelled" => ConversionStatus::Cancelled.as_smallint(),
+                    "rejected" => ConversionStatus::Rejected.as_smallint(),
+                    "expired" => ConversionStatus::Expired.as_smallint(),
+                    other => {
+                        return Err(format!(
+                            "invalid `status` value '{other}'; expected one of \
+                             'pending', 'approved', 'cancelled', 'rejected', 'expired'"
+                        ));
+                    }
+                };
+                Ok(ODataValue::Number(BigDecimal::from(i64::from(code))))
+            }
+            (ConversionRequestFilterField::TargetMode, ODataValue::String(s)) => {
+                reject_ordered(op, "target_mode")?;
+                let code = match s.as_str() {
+                    "managed" => TargetMode::Managed.as_smallint(),
+                    "self_managed" => TargetMode::SelfManaged.as_smallint(),
+                    other => {
+                        return Err(format!(
+                            "invalid `target_mode` value '{other}'; expected \
+                             'managed' or 'self_managed'"
+                        ));
+                    }
+                };
+                Ok(ODataValue::Number(BigDecimal::from(i64::from(code))))
+            }
+            (ConversionRequestFilterField::InitiatorSide, ODataValue::String(s)) => {
+                reject_ordered(op, "initiator_side")?;
+                let code = match s.as_str() {
+                    "child" => ConversionSide::Child.as_smallint(),
+                    "parent" => ConversionSide::Parent.as_smallint(),
+                    other => {
+                        return Err(format!(
+                            "invalid `initiator_side` value '{other}'; expected \
+                             'child' or 'parent'"
+                        ));
+                    }
+                };
+                Ok(ODataValue::Number(BigDecimal::from(i64::from(code))))
+            }
+            _ => Ok(value.clone()),
+        }
+    }
+
+    /// Reject `$orderby` on the categorical enum columns: wire is
+    /// alphabetical, storage is numeric, no consistent ordering.
+    fn is_orderable(field: ConversionRequestFilterField) -> bool {
+        !matches!(
+            field,
+            ConversionRequestFilterField::Status
+                | ConversionRequestFilterField::TargetMode
+                | ConversionRequestFilterField::InitiatorSide,
+        )
+    }
+}
+
+fn reject_ordered(op: FilterOp, field: &str) -> Result<(), String> {
+    match op {
+        FilterOp::Eq | FilterOp::Ne | FilterOp::In => Ok(()),
+        other => Err(format!(
+            "operator {other:?} is not supported on `{field}`; use `eq`, `ne`, or `in`"
+        )),
+    }
+}
+
+impl ODataFieldMapping<ConversionRequestFilterField> for ConversionRequestODataMapper {
+    type Entity = conversion_requests::Entity;
+
+    fn extract_cursor_value(
+        model: &conversion_requests::Model,
+        field: ConversionRequestFilterField,
+    ) -> sea_orm::Value {
+        match field {
+            ConversionRequestFilterField::Id => sea_orm::Value::Uuid(Some(Box::new(model.id))),
+            ConversionRequestFilterField::TenantId => {
+                sea_orm::Value::Uuid(Some(Box::new(model.tenant_id)))
+            }
+            ConversionRequestFilterField::ParentId => {
+                sea_orm::Value::Uuid(model.parent_id.map(Box::new))
+            }
+            ConversionRequestFilterField::Status => sea_orm::Value::SmallInt(Some(model.status)),
+            ConversionRequestFilterField::TargetMode => {
+                sea_orm::Value::SmallInt(Some(model.target_mode))
+            }
+            ConversionRequestFilterField::InitiatorSide => {
+                sea_orm::Value::SmallInt(Some(model.initiator_side))
+            }
+            ConversionRequestFilterField::RequestedBy => {
+                sea_orm::Value::Uuid(Some(Box::new(model.requested_by)))
+            }
+            ConversionRequestFilterField::CreatedAt => {
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.requested_at)))
+            }
+            ConversionRequestFilterField::ExpiresAt => {
+                sea_orm::Value::TimeDateTimeWithTimeZone(Some(Box::new(model.expires_at)))
+            }
+            ConversionRequestFilterField::UpdatedAt => {
+                sea_orm::Value::TimeDateTimeWithTimeZone(model.resolved_at.map(Box::new))
+            }
+        }
+    }
+}
+
+/// Pagination limits for the conversion-request listing surface.
+/// Mirrors [`super::metadata::METADATA_LIMIT_CFG`] /
+/// [`super::reads::TENANT_LISTING_LIMIT_CFG`] so every AM listing
+/// endpoint shares one platform-wide cap. The module-config
+/// `listing.max_top` accessor remains for future REST handlers that
+/// want to surface the per-deployment cap; the repo seam itself uses
+/// this constant to defend against builders that forget to clamp.
+const CONVERSION_LISTING_LIMIT_CFG: LimitCfg = LimitCfg {
+    default: 50,
+    max: 200,
+};
 
 // ---------------------------------------------------------------------------
 // Free functions implementing each ConversionRepo method.
@@ -181,6 +357,10 @@ async fn insert_pending(
         resolved_at: ActiveValue::Set(None),
         expires_at: ActiveValue::Set(new.expires_at),
         deleted_at: ActiveValue::Set(None),
+        requested_comment: ActiveValue::Set(new.requested_comment.clone()),
+        approved_comment: ActiveValue::Set(None),
+        cancelled_comment: ActiveValue::Set(None),
+        rejected_comment: ActiveValue::Set(None),
     };
     let conn = repo.db.conn()?;
     let insert_res = conversion_requests::Entity::insert(am)
@@ -204,17 +384,11 @@ async fn insert_pending(
             // Partial-unique-index violation on
             // `ux_conversion_requests_pending` — re-read the existing
             // pending row to surface [`DomainError::PendingExists`]
-            // with the conflicting request id. The classifier in
-            // `is_unique_violation` is engine-agnostic and may
-            // theoretically match other unique constraints on this
-            // table; today the partial-unique on `(tenant_id) WHERE
-            // status = pending AND deleted_at IS NULL` is the only
-            // unique index defined on the table besides the PK. A
-            // PK collision (caller-supplied duplicate `request_id`)
-            // is impossible by construction — the service layer
-            // generates the id at request time — but the post-lookup
-            // fall-through to `Internal` below covers it should the
-            // contract change.
+            // with the conflicting request id.
+            //
+            // Today the only non-PK unique on the table is the pending
+            // partial-unique; the fall-through `Internal` arm covers a
+            // hypothetical PK collision so a contract change is loud.
             let existing = conversion_requests::Entity::find()
                 .secure()
                 // Read uses `allow_all` for the same reason the INSERT
@@ -418,6 +592,7 @@ async fn __transition_pending_to_approved_test_only(
     request_id: Uuid,
     approved_by: Uuid,
     resolved_at: OffsetDateTime,
+    comment: Option<String>,
 ) -> Result<ConversionRequest, DomainError> {
     run_guarded_transition(
         repo,
@@ -433,6 +608,10 @@ async fn __transition_pending_to_approved_test_only(
                 conversion_requests::Column::ResolvedAt,
                 Expr::value(Some(resolved_at)),
             )
+            .col_expr(
+                conversion_requests::Column::ApprovedComment,
+                Expr::value(comment),
+            )
         },
     )
     .await
@@ -444,6 +623,7 @@ async fn transition_pending_to_cancelled(
     request_id: Uuid,
     cancelled_by: Uuid,
     resolved_at: OffsetDateTime,
+    comment: Option<String>,
 ) -> Result<ConversionRequest, DomainError> {
     run_guarded_transition(
         repo,
@@ -459,6 +639,10 @@ async fn transition_pending_to_cancelled(
                 conversion_requests::Column::ResolvedAt,
                 Expr::value(Some(resolved_at)),
             )
+            .col_expr(
+                conversion_requests::Column::CancelledComment,
+                Expr::value(comment),
+            )
         },
     )
     .await
@@ -470,6 +654,7 @@ async fn transition_pending_to_rejected(
     request_id: Uuid,
     rejected_by: Uuid,
     resolved_at: OffsetDateTime,
+    comment: Option<String>,
 ) -> Result<ConversionRequest, DomainError> {
     run_guarded_transition(
         repo,
@@ -484,6 +669,10 @@ async fn transition_pending_to_rejected(
             .col_expr(
                 conversion_requests::Column::ResolvedAt,
                 Expr::value(Some(resolved_at)),
+            )
+            .col_expr(
+                conversion_requests::Column::RejectedComment,
+                Expr::value(comment),
             )
         },
     )
@@ -553,7 +742,14 @@ async fn apply_conversion_approval(
     }
     let scope_owned = scope.clone();
     with_serializable_retry(&repo.db, move || {
+        // `with_serializable_retry` invokes this factory once per
+        // attempt (up to `MAX_SERIALIZABLE_ATTEMPTS`). Clone the
+        // owned values per attempt so the inner FnOnce can consume
+        // them by `move`. `input` is owned by-value (not Copy since
+        // the audit-comment field is `Option<String>`); cloning is
+        // cheap because the struct is value-typed.
         let scope = scope_owned.clone();
+        let input = input.clone();
         Box::new(move |tx: &DbTx<'_>| {
             Box::pin(async move {
                 // 1. Re-load the pending row inside the TX. SI / SSI
@@ -738,7 +934,7 @@ async fn apply_conversion_approval(
                 // truly missing row is the only `Internal` path; a
                 // soft-deleted or suspended parent surfaces as
                 // `Validation` to mirror the converting-tenant
-                // status-flip arm at lines 634-652.
+                // status-flip arm earlier in this transaction.
                 let parent_row = tenants::Entity::find()
                     .secure()
                     .scope_with(&AccessScope::allow_all())
@@ -849,19 +1045,6 @@ async fn apply_conversion_approval(
                 // stale barrier values until retention cleanup — the
                 // integrity checker would then flag the divergence.
                 //
-                // TODO(scale): full-table `tenants` load inside the
-                // SERIALIZABLE retry loop. At ~10K+ tenants this is a
-                // multi-MB heap allocation per retry attempt and
-                // widens the SI conflict surface. Replace with a
-                // closure-bounded query (load only tenants on the
-                // strict path of the converted subtree) once a
-                // closure-walk helper exists — the `tenant_closure`
-                // table is the natural anchor (same machinery
-                // [`ScopeFilter::in_tenant_subtree`](modkit_security::ScopeFilter::in_tenant_subtree)
-                // compiles against). Today this is the only
-                // engine-agnostic shape that keeps the barrier
-                // recompute correct for soft-deleted descendants.
-                //
                 // NOTE(ordering): this snapshot MUST run after the
                 // step-4 `tenants.self_managed` flip above —
                 // `recompute_barriers_for_subtree` consumes
@@ -871,39 +1054,22 @@ async fn apply_conversion_approval(
                 // stale data into the barrier rewrite (no test pins
                 // the order today; the integrity checker would only
                 // flag the divergence after the fact).
-                let tenant_snapshots: Vec<(Uuid, Option<Uuid>, bool)> = tenants::Entity::find()
-                    .secure()
-                    .scope_with(&AccessScope::allow_all())
-                    .all(tx)
-                    .await
-                    .map_err(map_scope_to_tx)?
-                    .into_iter()
-                    .map(|t| (t.id, t.parent_id, t.self_managed))
-                    .collect();
-                let parent_map: HashMap<Uuid, Option<Uuid>> = tenant_snapshots
-                    .iter()
-                    .map(|(id, p, _)| (*id, *p))
-                    .collect();
-                let self_managed_map: HashMap<Uuid, bool> = tenant_snapshots
-                    .iter()
-                    .map(|(id, _, sm)| (*id, *sm))
-                    .collect();
-
-                // Affected rows: every closure row whose strict path
-                // crosses the converted tenant. Cheap pre-filter:
-                // either ancestor_id == target, or descendant_id ==
-                // target, OR the row's strict path includes target.
-                // We pull every row referencing the target as either
-                // endpoint plus every row in the converted tenant's
-                // descendant set (via closure self-join).
                 //
-                // Simpler portable strategy (works on SQLite + PG):
-                // pull every closure row where `descendant_id` is in
-                // the converted tenant's descendants set (descendants
-                // INCLUSIVE of the target). For each such row,
-                // recompute the barrier — the path crosses the
-                // target iff `ancestor_id` is a strict ancestor of
-                // (or equal to) the target's parent.
+                // We bound the snapshot to exactly the tenants whose
+                // `(parent_id, self_managed)` may appear on a
+                // `strict_path` walk: `strict_path_crosses_impl` walks
+                // `descendant_id` UP via `parent_map` until it
+                // reaches `ancestor_id`. For every closure row in the
+                // `candidate_rows` set below, both endpoints belong
+                // to `ancestors(target) ∪ subtree(target)` (the union
+                // of the upward chain to root and the entire downward
+                // subtree); every node walked between the endpoints
+                // is also in that union by transitivity. Loading the
+                // full `tenants` table would still be correct but is
+                // O(N) per retry attempt — the bounded load is
+                // O(depth + subtree_size). Both subqueries hit
+                // `tenant_closure` (indexed) and never the full
+                // `tenants` table.
                 let descendants_of_target: Vec<Uuid> = tenant_closure::Entity::find()
                     .secure()
                     .scope_with(&AccessScope::allow_all())
@@ -917,23 +1083,83 @@ async fn apply_conversion_approval(
                     .into_iter()
                     .map(|r| r.descendant_id)
                     .collect();
+                let ancestors_of_target: Vec<Uuid> = tenant_closure::Entity::find()
+                    .secure()
+                    .scope_with(&AccessScope::allow_all())
+                    .filter(
+                        Condition::all()
+                            .add(tenant_closure::Column::DescendantId.eq(input.target_tenant_id)),
+                    )
+                    .all(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?
+                    .into_iter()
+                    .map(|r| r.ancestor_id)
+                    .collect();
+
+                // Chunked `IN()` load over the bounded id set —
+                // mirrors the `candidate_rows` chunking further down
+                // to stay under the PG 65535-param ceiling. Wrapped
+                // in its own block so the `const` can sit at the top
+                // of the scope (satisfies
+                // `clippy::items-after-statements`).
+                let tenant_snapshots: Vec<(Uuid, Option<Uuid>, bool)> = {
+                    const TENANT_LOAD_IN_CHUNK: usize = 4_096;
+
+                    // Union ancestors + descendants. Closure self-rows
+                    // make the target appear in both lists; `dedup`
+                    // collapses the duplicate.
+                    let mut relevant_ids: Vec<Uuid> =
+                        Vec::with_capacity(ancestors_of_target.len() + descendants_of_target.len());
+                    relevant_ids.extend(&ancestors_of_target);
+                    relevant_ids.extend(&descendants_of_target);
+                    relevant_ids.sort_unstable();
+                    relevant_ids.dedup();
+
+                    let mut snapshots: Vec<(Uuid, Option<Uuid>, bool)> =
+                        Vec::with_capacity(relevant_ids.len());
+                    for chunk in relevant_ids.chunks(TENANT_LOAD_IN_CHUNK) {
+                        let rows = tenants::Entity::find()
+                            .secure()
+                            .scope_with(&AccessScope::allow_all())
+                            .filter(
+                                Condition::all()
+                                    .add(tenants::Column::Id.is_in(chunk.iter().copied())),
+                            )
+                            .all(tx)
+                            .await
+                            .map_err(map_scope_to_tx)?;
+                        snapshots.extend(
+                            rows.into_iter()
+                                .map(|t| (t.id, t.parent_id, t.self_managed)),
+                        );
+                    }
+                    snapshots
+                };
+                let parent_map: HashMap<Uuid, Option<Uuid>> = tenant_snapshots
+                    .iter()
+                    .map(|(id, p, _)| (*id, *p))
+                    .collect();
+                let self_managed_map: HashMap<Uuid, bool> = tenant_snapshots
+                    .iter()
+                    .map(|(id, _, sm)| (*id, *sm))
+                    .collect();
+
+                // Affected rows: every closure row whose strict path
+                // crosses the converted tenant. Pull every row in the
+                // converted tenant's descendant set (via the
+                // `descendants_of_target` list already computed
+                // above). For each such row, recompute the barrier —
+                // the path crosses the target iff `ancestor_id` is a
+                // strict ancestor of (or equal to) the target's
+                // parent.
 
                 if !descendants_of_target.is_empty() {
-                    // Chunk the `IN (...)` over the descendant id list
-                    // so a wide subtree cannot approach the Postgres
-                    // 65 535-bind-parameter ceiling and turn a
-                    // recoverable approve into a hard failure
-                    // mid-transaction. The 4 096 chunk size leaves
-                    // ample headroom for SeaORM-internal binds and
-                    // keeps the per-query plan cost bounded; on a
-                    // typical subtree the loop runs once.
-                    //
-                    // Long-term, the self-join on `tenant_closure`
-                    // (`tc1 JOIN tc2 ON tc1.descendant_id =
-                    // tc2.descendant_id WHERE tc2.ancestor_id =
-                    // target`) is the right shape — chunking is the
-                    // portable Phase-1 substitute until that lands
-                    // (tracked alongside the recursive-CTE work).
+                    // Chunked `IN()` over `descendants_of_target` —
+                    // 4096 leaves headroom for the PG 65535 param
+                    // ceiling. Replace with self-join on
+                    // `tenant_closure` once the recursive-CTE work
+                    // lands.
                     const CLOSURE_DESCENDANTS_IN_CHUNK: usize = 4_096;
                     let mut candidate_rows: Vec<tenant_closure::Model> = Vec::new();
                     for chunk in descendants_of_target.chunks(CLOSURE_DESCENDANTS_IN_CHUNK) {
@@ -1011,6 +1237,10 @@ async fn apply_conversion_approval(
                         conversion_requests::Column::ResolvedAt,
                         Expr::value(Some(input.resolved_at)),
                     )
+                    .col_expr(
+                        conversion_requests::Column::ApprovedComment,
+                        Expr::value(input.approval_comment.clone()),
+                    )
                     .filter(
                         Condition::all()
                             .add(conversion_requests::Column::Id.eq(input.request_id))
@@ -1072,11 +1302,7 @@ async fn apply_conversion_approval(
 /// snapshot size. The one-hop slack between "snapshot size" and
 /// "guard fires" is intentional — a non-strict `hops == cap`
 /// form would short-circuit a path of exactly length N before
-/// its final node could match. The previous fixed cap of `1024`
-/// was tighter than `AccountManagementConfig::MAX_DEPTH_THRESHOLD`
-/// (`1_000_000`) and would silently truncate legitimate deep
-/// paths in large-hierarchy deployments — leaving stale barriers
-/// after a successful approve. Sizing the cap to the snapshot
+/// its final node could match. Sizing the cap to the snapshot
 /// makes the walk correct for any depth representable in the map,
 /// while preserving the cycle-safety guarantee. Emits a `warn!`
 /// on `am.domain` when the cap fires so the data-integrity event
@@ -1157,15 +1383,13 @@ async fn list_own_for_tenant(
     repo: &ConversionRepoImpl,
     scope: &AccessScope,
     tenant_id: Uuid,
-    status_filter: Option<ConversionStatus>,
-    pagination: ConversionPagination,
-) -> Result<Vec<ConversionRequest>, DomainError> {
-    list_by(
+    query: &ODataQuery,
+) -> Result<Page<ConversionRequest>, DomainError> {
+    list_paged(
         repo,
         scope,
         Condition::all().add(conversion_requests::Column::TenantId.eq(tenant_id)),
-        status_filter,
-        pagination,
+        query,
     )
     .await
 }
@@ -1174,107 +1398,144 @@ async fn list_inbound_for_parent(
     repo: &ConversionRepoImpl,
     scope: &AccessScope,
     parent_id: Uuid,
-    status_filter: Option<ConversionStatus>,
-    pagination: ConversionPagination,
-) -> Result<Vec<ConversionRequest>, DomainError> {
-    list_by(
+    query: &ODataQuery,
+) -> Result<Page<ConversionRequest>, DomainError> {
+    list_paged(
         repo,
         scope,
         Condition::all().add(conversion_requests::Column::ParentId.eq(parent_id)),
-        status_filter,
-        pagination,
+        query,
     )
     .await
 }
 
-async fn count_own_for_tenant(
+/// Shared listing body. Applies the caller-supplied base filter (the
+/// URL-bound `tenant_id` / `parent_id` pin) and the always-on
+/// `deleted_at IS NULL` predicate, then defers `$filter` / `$orderby` /
+/// cursor / `$top` / `$skip` handling to `paginate_odata_try` (fallible
+/// because `entity_to_conversion` validates the `SMALLINT`-encoded
+/// enums and may surface drift as `Internal`).
+///
+/// Chronological default: when the caller supplies no `$orderby`, we
+/// inject `requested_at DESC` into `query.order` so recent rows surface
+/// first; `id ASC` is appended by `paginate_odata`'s
+/// `ensure_tiebreaker` as the UNIQUE tiebreaker, yielding effective
+/// order `(requested_at DESC, id ASC)`. The cursor-key-count check
+/// inside `paginate_odata` would reject any pre-OData cursor (none yet
+/// emitted on a feature branch).
+async fn list_paged(
+    repo: &ConversionRepoImpl,
+    scope: &AccessScope,
+    base: Condition,
+    query: &ODataQuery,
+) -> Result<Page<ConversionRequest>, DomainError> {
+    let conn = repo.db.conn()?;
+    let base = conversion_requests::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(base.add(conversion_requests::Column::DeletedAt.is_null()));
+
+    let query = if query.cursor.is_none() && query.order.is_empty() {
+        let mut adjusted = query.clone();
+        adjusted.order = adjusted
+            .order
+            .ensure_tiebreaker("created_at", SortDir::Desc);
+        std::borrow::Cow::Owned(adjusted)
+    } else {
+        std::borrow::Cow::Borrowed(query)
+    };
+    let page = paginate_odata_try::<
+        ConversionRequestFilterField,
+        ConversionRequestODataMapper,
+        _,
+        _,
+        _,
+        _,
+        _,
+    >(
+        base,
+        &conn,
+        query.as_ref(),
+        ("id", SortDir::Asc),
+        CONVERSION_LISTING_LIMIT_CFG,
+        entity_to_conversion,
+    )
+    .await
+    .map_err(|e| match e {
+        PaginateOdataTryError::OData(odata_err) => DomainError::Validation {
+            detail: format!("conversion listing query rejected: {odata_err}"),
+        },
+        // Caller's domain error is preserved verbatim — an out-of-domain
+        // `SMALLINT` value on a `conversion_requests` row surfaces as
+        // `Internal` (HTTP 500) per the `entity_to_conversion`
+        // classifier, with the bad row identifier in the diagnostic.
+        PaginateOdataTryError::MapError(domain_err) => domain_err,
+    })?;
+
+    Ok(page)
+}
+
+async fn get_own_for_tenant(
     repo: &ConversionRepoImpl,
     scope: &AccessScope,
     tenant_id: Uuid,
-    status_filter: Option<ConversionStatus>,
-) -> Result<u64, DomainError> {
-    count_by(
+    request_id: Uuid,
+) -> Result<Option<ConversionRequest>, DomainError> {
+    get_by(
         repo,
         scope,
+        request_id,
         Condition::all().add(conversion_requests::Column::TenantId.eq(tenant_id)),
-        status_filter,
     )
     .await
 }
 
-async fn count_inbound_for_parent(
+async fn get_inbound_for_parent(
     repo: &ConversionRepoImpl,
     scope: &AccessScope,
     parent_id: Uuid,
-    status_filter: Option<ConversionStatus>,
-) -> Result<u64, DomainError> {
-    count_by(
+    request_id: Uuid,
+) -> Result<Option<ConversionRequest>, DomainError> {
+    get_by(
         repo,
         scope,
+        request_id,
         Condition::all().add(conversion_requests::Column::ParentId.eq(parent_id)),
-        status_filter,
     )
     .await
 }
 
-/// Shared count helper that applies the same predicate `list_by` uses
-/// (caller-supplied base + optional `status_filter` + soft-delete
-/// exclusion) and returns the row count without pagination. Used by
-/// the service layer to populate `OffsetPage.total` correctly when
-/// `top < total` or `skip > 0`.
-async fn count_by(
+/// Shared point-read helper for [`get_own_for_tenant`] /
+/// [`get_inbound_for_parent`]. Applies the caller-supplied base
+/// predicate (the URL-bound `tenant_id` / `parent_id` pin), the
+/// always-on `deleted_at IS NULL` filter, and the secure-extension
+/// scope clamp.
+///
+/// Every miss collapses through `Ok(None)` — including "row exists
+/// but is outside scope" — so the service layer can surface every
+/// not-found / scope-mismatch through the same `NotFound` channel
+/// without an existence-leak distinguisher.
+async fn get_by(
     repo: &ConversionRepoImpl,
     scope: &AccessScope,
+    request_id: Uuid,
     base: Condition,
-    status_filter: Option<ConversionStatus>,
-) -> Result<u64, DomainError> {
+) -> Result<Option<ConversionRequest>, DomainError> {
     let conn = repo.db.conn()?;
-    let mut filter = base.add(conversion_requests::Column::DeletedAt.is_null());
-    if let Some(status) = status_filter {
-        filter = filter.add(conversion_requests::Column::Status.eq(status.as_smallint()));
-    }
-    conversion_requests::Entity::find()
+    let row = conversion_requests::Entity::find()
         .secure()
         .scope_with(scope)
-        .filter(filter)
-        .count(&conn)
-        .await
-        .map_err(map_scope_err)
-}
-
-/// Shared listing body. Applies the caller-supplied base filter, the
-/// optional `status_filter`, the always-on `deleted_at IS NULL`
-/// predicate, and the documented stable ordering
-/// `(requested_at DESC, id ASC)` before paginating with `top` /
-/// `skip`.
-async fn list_by(
-    repo: &ConversionRepoImpl,
-    scope: &AccessScope,
-    base: Condition,
-    status_filter: Option<ConversionStatus>,
-    pagination: ConversionPagination,
-) -> Result<Vec<ConversionRequest>, DomainError> {
-    let conn = repo.db.conn()?;
-    let mut filter = base.add(conversion_requests::Column::DeletedAt.is_null());
-    if let Some(status) = status_filter {
-        filter = filter.add(conversion_requests::Column::Status.eq(status.as_smallint()));
-    }
-    let rows = conversion_requests::Entity::find()
-        .secure()
-        .scope_with(scope)
-        .filter(filter)
-        .order_by(conversion_requests::Column::RequestedAt, Order::Desc)
-        .order_by(conversion_requests::Column::Id, Order::Asc)
-        .limit(u64::from(pagination.top))
-        .offset(u64::from(pagination.skip))
-        .all(&conn)
+        .filter(
+            base.add(conversion_requests::Column::Id.eq(request_id))
+                .add(conversion_requests::Column::DeletedAt.is_null()),
+        )
+        .one(&conn)
         .await
         .map_err(map_scope_err)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        out.push(entity_to_conversion(r)?);
+    match row {
+        Some(r) => Ok(Some(entity_to_conversion(r)?)),
+        None => Ok(None),
     }
-    Ok(out)
 }
 
 async fn query_expired(
@@ -1432,6 +1693,7 @@ impl ConversionRepo for ConversionRepoImpl {
         request_id: Uuid,
         approved_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
         __transition_pending_to_approved_test_only(
             self,
@@ -1439,6 +1701,7 @@ impl ConversionRepo for ConversionRepoImpl {
             request_id,
             approved_by,
             resolved_at,
+            comment,
         )
         .await
     }
@@ -1457,8 +1720,10 @@ impl ConversionRepo for ConversionRepoImpl {
         request_id: Uuid,
         cancelled_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
-        transition_pending_to_cancelled(self, scope, request_id, cancelled_by, resolved_at).await
+        transition_pending_to_cancelled(self, scope, request_id, cancelled_by, resolved_at, comment)
+            .await
     }
 
     async fn transition_pending_to_rejected(
@@ -1467,8 +1732,10 @@ impl ConversionRepo for ConversionRepoImpl {
         request_id: Uuid,
         rejected_by: Uuid,
         resolved_at: OffsetDateTime,
+        comment: Option<String>,
     ) -> Result<ConversionRequest, DomainError> {
-        transition_pending_to_rejected(self, scope, request_id, rejected_by, resolved_at).await
+        transition_pending_to_rejected(self, scope, request_id, rejected_by, resolved_at, comment)
+            .await
     }
 
     async fn transition_pending_to_expired(
@@ -1484,38 +1751,36 @@ impl ConversionRepo for ConversionRepoImpl {
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-        pagination: ConversionPagination,
-    ) -> Result<Vec<ConversionRequest>, DomainError> {
-        list_own_for_tenant(self, scope, tenant_id, status_filter, pagination).await
+        query: &ODataQuery,
+    ) -> Result<Page<ConversionRequest>, DomainError> {
+        list_own_for_tenant(self, scope, tenant_id, query).await
     }
 
     async fn list_inbound_for_parent(
         &self,
         scope: &AccessScope,
         parent_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-        pagination: ConversionPagination,
-    ) -> Result<Vec<ConversionRequest>, DomainError> {
-        list_inbound_for_parent(self, scope, parent_id, status_filter, pagination).await
+        query: &ODataQuery,
+    ) -> Result<Page<ConversionRequest>, DomainError> {
+        list_inbound_for_parent(self, scope, parent_id, query).await
     }
 
-    async fn count_own_for_tenant(
+    async fn get_own_for_tenant(
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-    ) -> Result<u64, DomainError> {
-        count_own_for_tenant(self, scope, tenant_id, status_filter).await
+        request_id: Uuid,
+    ) -> Result<Option<ConversionRequest>, DomainError> {
+        get_own_for_tenant(self, scope, tenant_id, request_id).await
     }
 
-    async fn count_inbound_for_parent(
+    async fn get_inbound_for_parent(
         &self,
         scope: &AccessScope,
         parent_id: Uuid,
-        status_filter: Option<ConversionStatus>,
-    ) -> Result<u64, DomainError> {
-        count_inbound_for_parent(self, scope, parent_id, status_filter).await
+        request_id: Uuid,
+    ) -> Result<Option<ConversionRequest>, DomainError> {
+        get_inbound_for_parent(self, scope, parent_id, request_id).await
     }
 
     async fn query_expired(
