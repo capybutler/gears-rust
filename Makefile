@@ -390,9 +390,20 @@ test-db: test-sqlite test-pg test-mysql
 test-users-info-pg: install-tools
 	cargo nextest run -p users-info --features "integration"
 
-## Run FIPS-mode integration tests (cyberware-modkit, requires Go for aws-lc-fips-sys)
+## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
+## Covers:
+##   - cyberware-modkit         : bootstrap + init_crypto_provider dispatch
+##   - cyberware-modkit-http    : TLS client fail-closed path (NoCryptoProvider,
+##                                apply_fips_hardening, builder/client FIPS-feature
+##                                test surface). See issue #1935.
+##
+## Per-package `pkg/feat` syntax is required because `bootstrap` exists only
+## on `cyberware-modkit` and the two crates have independent FIPS feature
+## spaces (modkit doesn't depend on modkit-http). Single invocation so the
+## shared FIPS dep graph compiles once.
 test-fips: install-tools
-	cargo nextest run -p cyberware-modkit --features bootstrap,fips
+	cargo nextest run -p cyberware-modkit -p cyberware-modkit-http \
+		--features cyberware-modkit/bootstrap,cyberware-modkit/fips,cyberware-modkit-http/fips
 
 ## Cross-compile gate for the Windows+FIPS path (Windows handshake
 ## verification is the manual runbook in cyberware-fips-probe/README.md). Catches

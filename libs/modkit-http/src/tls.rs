@@ -63,7 +63,7 @@ pub fn native_root_certs() -> &'static [CertificateDer<'static>] {
 /// This avoids global state mutation and is safe to call from multiple
 /// threads.
 ///
-/// ## Two-providers caveat
+/// ## Two-providers caveat (non-FIPS only)
 ///
 /// The fallback at step (3) does **not** call `install_default()`. If
 /// `modkit::bootstrap::init_crypto_provider` (the canonical install
@@ -82,6 +82,16 @@ pub fn native_root_certs() -> &'static [CertificateDer<'static>] {
 /// Callers outside the bootstrap path (probe binaries, ad-hoc tests)
 /// should invoke it first. The fallback here is a safety net for code
 /// that genuinely cannot run bootstrap, not a substitute for it.
+///
+/// Under `--features fips`, `build_client_config` bypasses this fallback
+/// entirely and instead returns [`TlsConfigError::NoCryptoProvider`] when
+/// no global provider is installed — silently constructing an uninstalled
+/// FIPS provider would mask a misconfigured bootstrap.
+// Under `--features fips`, `build_client_config` no longer routes through this
+// function — it goes straight to `CryptoProvider::get_default()` and fails
+// closed when none is installed. The function still exists for the non-FIPS
+// path; suppress the unused-function lint for the FIPS build.
+#[cfg_attr(feature = "fips", allow(dead_code))]
 pub fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     rustls::crypto::CryptoProvider::get_default()
         .cloned()
@@ -127,11 +137,72 @@ pub fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
         })
 }
 
-/// Type alias for the fallible TLS-config builders in this module. Using a
-/// boxed `dyn Error` (rather than `String`) preserves the source-error chain
-/// from rustls and from `apply_fips_hardening`, so downstream
-/// `HttpError::Tls(_)` carries a proper `.source()`.
-pub type TlsConfigError = Box<dyn std::error::Error + Send + Sync + 'static>;
+/// Error type returned by the fallible TLS-config builders in this module.
+///
+/// The `Other` variant carries a boxed `dyn Error` so the source-error chain
+/// from rustls (and any future foreign error) is preserved end-to-end —
+/// downstream `HttpError::Tls(_)` wraps this and reports a proper `.source()`.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TlsConfigError {
+    /// `rustls::crypto::CryptoProvider::get_default()` returned `None` when a
+    /// FIPS-mode TLS config was requested. Under `--features fips` the
+    /// crypto provider must be installed up-front via
+    /// `modkit::bootstrap::init_crypto_provider`; falling back to an
+    /// uninstalled provider here would silently bypass the canonical
+    /// install path and yield a config whose FIPS-validation status is
+    /// indeterminate.
+    #[error(
+        "rustls CryptoProvider has not been installed; call \
+         modkit::bootstrap::init_crypto_provider() before building any TLS \
+         config under --features fips"
+    )]
+    NoCryptoProvider,
+
+    /// `apply_fips_hardening` rejected the freshly-built `ClientConfig`
+    /// because `ClientConfig::fips()` reported `false`. Carries the
+    /// human-readable diagnostic — typically a witness mismatch
+    /// (`cyberware_rustls_corecrypto_provider::oe::fips_witness_ok` on macOS)
+    /// or a missed `init_crypto_provider()` call.
+    #[error("{0}")]
+    FipsHardeningFailed(String),
+
+    /// Catch-all for foreign errors (`rustls::Error`, etc.) propagated
+    /// via `?`. Marked `#[error(transparent)]` so the `Display` and
+    /// `source()` impls forward to the inner error unchanged.
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+/// Test-only auto-install of the platform-appropriate FIPS crypto provider.
+///
+/// Gated on `cfg(all(test, feature = "fips"))` — `cfg(test)` is only set when
+/// compiling the crate's own unit-test target, NOT when compiling the lib for
+/// use by integration tests under `tests/`. The regression test in
+/// `tests/no_crypto_provider_fips.rs` therefore sees a clean process state and
+/// can still assert `TlsConfigError::NoCryptoProvider`.
+///
+/// Forced from inside `build_client_config` so every TLS-config-building
+/// entry point (`webpki_roots_client_config`, `native_roots_client_config`,
+/// and `HttpClientBuilder::build`) auto-installs uniformly. nextest's default
+/// "process-per-test" execution means a builder-level `LazyLock` would not
+/// cover tests that bypass the builder.
+#[cfg(all(test, feature = "fips"))]
+mod fips_test_provider {
+    use std::sync::LazyLock;
+
+    pub(super) static INSTALL: LazyLock<()> = LazyLock::new(|| {
+        // `install_default()` returns `Err` if a provider is already installed
+        // (benign here); drop the result. `drop` rather than `let _ =`
+        // satisfies clippy::let_underscore_must_use.
+        #[cfg(target_os = "macos")]
+        drop(rustls_corecrypto_provider::default_provider().install_default());
+        #[cfg(target_os = "windows")]
+        drop(rustls_cng_crypto::fips_provider().install_default());
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        drop(rustls::crypto::default_fips_provider().install_default());
+    });
+}
 
 /// Build a rustls `ClientConfig` from the given root store.
 ///
@@ -146,12 +217,38 @@ pub type TlsConfigError = Box<dyn std::error::Error + Send + Sync + 'static>;
 fn build_client_config(
     root_store: rustls::RootCertStore,
 ) -> Result<rustls::ClientConfig, TlsConfigError> {
+    // Test-only: ensure the platform-appropriate FIPS crypto provider is
+    // installed before this funnel runs. The fail-closed path below requires
+    // `modkit::bootstrap::init_crypto_provider` to have run in production;
+    // in-crate tests that don't go through bootstrap (most of them) would
+    // otherwise hit `NoCryptoProvider`. Placed here rather than in the
+    // builder so it covers every TLS-config-building entry point uniformly
+    // (`webpki_roots_client_config`, `native_roots_client_config`, and any
+    // future addition). `cfg(test)` is set only for in-crate unit tests, NOT
+    // for integration tests under `tests/` — so
+    // `tests/no_crypto_provider_fips.rs` still sees a clean process state.
+    #[cfg(all(test, feature = "fips"))]
+    std::sync::LazyLock::force(&fips_test_provider::INSTALL);
+
+    // Under `--features fips` the crypto provider MUST have been installed
+    // up-front via `modkit::bootstrap::init_crypto_provider` — otherwise
+    // `get_crypto_provider()`'s fallback would mint an *uninstalled* provider
+    // whose FIPS-validation status is indeterminate from the rustls global's
+    // point of view. Fail closed instead.
+    //
+    // The non-FIPS branch preserves the historical infallible fallback
+    // (see `get_crypto_provider` docstring).
+    #[cfg(feature = "fips")]
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .ok_or(TlsConfigError::NoCryptoProvider)?;
+    #[cfg(not(feature = "fips"))]
     let provider = get_crypto_provider();
 
     #[allow(unused_mut)]
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(TlsConfigError::from)?
+        .map_err(|e| TlsConfigError::Other(Box::new(e)))?
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
@@ -178,17 +275,16 @@ fn build_client_config(
 fn apply_fips_hardening(cfg: &mut rustls::ClientConfig) -> Result<(), TlsConfigError> {
     cfg.require_ems = true;
     if !cfg.fips() {
-        return Err(
+        return Err(TlsConfigError::FipsHardeningFailed(
             "TLS ClientConfig does not advertise FIPS after enabling require_ems. \
-             Either (a) init_crypto_provider() was not called before this TLS config was built, \
-             or (b) the runtime FIPS witness \
+             The runtime FIPS witness \
              (cyberware_rustls_corecrypto_provider::oe::fips_witness_ok on macOS) \
              is reporting false -- typically because the running macOS major is \
              outside the active corecrypto CMVP cert OE. \
              Set CYBERWARE_FIPS_OE_OVERRIDE=1 (CI / pre-release only) to force the \
              witness to true; never set this in production."
-                .into(),
-        );
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -209,7 +305,9 @@ pub fn native_roots_client_config() -> Result<rustls::ClientConfig, TlsConfigErr
     let mut root_store = rustls::RootCertStore::empty();
 
     if certs.is_empty() {
-        return Err("no native root CA certificates found in OS certificate store".into());
+        return Err(TlsConfigError::Other(
+            "no native root CA certificates found in OS certificate store".into(),
+        ));
     }
 
     let (added, ignored) = root_store.add_parsable_certificates(certs.iter().cloned());
@@ -223,12 +321,14 @@ pub fn native_roots_client_config() -> Result<rustls::ClientConfig, TlsConfigErr
     }
 
     if added == 0 {
-        return Err(format!(
-            "no valid native root CA certificates parsed (found {}, all {} failed to parse)",
-            certs.len(),
-            ignored
-        )
-        .into());
+        return Err(TlsConfigError::Other(
+            format!(
+                "no valid native root CA certificates parsed (found {}, all {} failed to parse)",
+                certs.len(),
+                ignored
+            )
+            .into(),
+        ));
     }
 
     build_client_config(root_store)
@@ -350,7 +450,10 @@ mod tests {
     /// through `build_client_config`); calling it avoids a hard dependency on
     /// the OS keychain that `native_roots_client_config` carries.
     ///
-    /// Run via `cargo test -p cf-modkit-http --features fips`.
+    /// Run via `cargo test -p cyberware-modkit-http --features fips`.
+    /// `build_client_config` auto-installs the platform FIPS provider in
+    /// test mode (see `fips_test_provider` module) so this test does not
+    /// need its own explicit install.
     #[test]
     #[cfg(feature = "fips")]
     fn fips_client_config_requires_ems_and_advertises_fips() {

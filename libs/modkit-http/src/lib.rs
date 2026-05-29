@@ -68,3 +68,4 @@ pub use layers::{
 };
 pub use request::RequestBuilder;
 pub use response::{HttpResponse, LimitedBody, ResponseBody};
+pub use tls::TlsConfigError;

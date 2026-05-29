@@ -528,14 +528,15 @@ fn build_https_connector(
     // Both branches build a `ClientConfig` ourselves (rather than using
     // `with_provider_and_webpki_roots`) so we can apply `require_ems = true`
     // under the `fips` feature — see `tls::build_client_config`. The
-    // functions now return `tls::TlsConfigError` (= `Box<dyn Error + Send + Sync>`),
-    // which is exactly what `HttpError::Tls` wraps — no string conversion,
-    // source chain preserved.
+    // functions return `tls::TlsConfigError` (an enum implementing
+    // `std::error::Error`); boxing it into `HttpError::Tls`'s
+    // `Box<dyn Error + Send + Sync>` preserves the source chain via
+    // `TlsConfigError`'s own `Error::source()` impl.
     let client_config = match tls_roots {
         TlsRootConfig::WebPki => tls::webpki_roots_client_config(),
         TlsRootConfig::Native => tls::native_roots_client_config(),
     }
-    .map_err(HttpError::Tls)?;
+    .map_err(|e| HttpError::Tls(Box::new(e)))?;
 
     let builder = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(client_config);
     let connector = if allow_http {
