@@ -96,6 +96,62 @@ fn validate_type_code_rejects_prefix_only() {
     assert!(result.is_ok());
 }
 
+// ── validate_membership_type_code ───────────────────────────────────────
+
+#[test]
+fn validate_membership_type_code_accepts_non_rg_prefix() {
+    // Per DESIGN.md, membership resource types are external domain types
+    // and do NOT require the `gts.cf.core.rg.type.v1~` prefix.
+    let result = validation::validate_membership_type_code("gts.cf.core.idp.user.v1~");
+    assert!(result.is_ok(), "Expected ok, got {result:?}");
+}
+
+#[test]
+fn validate_membership_type_code_accepts_rg_prefixed() {
+    // Backwards compatibility: RG-prefixed codes still validate.
+    let code = format!("{RG_TYPE_PREFIX}y.core.tn.tenant.v1~");
+    let result = validation::validate_membership_type_code(&code);
+    assert!(result.is_ok(), "Expected ok, got {result:?}");
+}
+
+#[test]
+fn validate_membership_type_code_rejects_empty() {
+    let result = validation::validate_membership_type_code("");
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), DomainError::Validation { .. }));
+}
+
+#[test]
+fn validate_membership_type_code_rejects_trailing_wildcard_after_tilde() {
+    // Wildcard patterns are not accepted: `gts_type_allowed_membership`
+    // stores a SMALLINT FK to a concrete registered type, not a pattern.
+    let result = validation::validate_membership_type_code("gts.cf.core.rg.type.v1~*");
+    assert!(result.is_err(), "Expected err, got {result:?}");
+    assert!(matches!(result.unwrap_err(), DomainError::Validation { .. }));
+}
+
+#[test]
+fn validate_membership_type_code_rejects_trailing_wildcard_after_dot() {
+    // `gts.cf.*` -- a wildcard pattern, rejected like any other wildcard.
+    let result = validation::validate_membership_type_code("gts.cf.*");
+    assert!(result.is_err(), "Expected err, got {result:?}");
+    assert!(matches!(result.unwrap_err(), DomainError::Validation { .. }));
+}
+
+#[test]
+fn validate_membership_type_code_rejects_malformed_gts_path() {
+    let result = validation::validate_membership_type_code("not-a-gts-path");
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), DomainError::Validation { .. }));
+}
+
+#[test]
+fn validate_membership_type_code_rejects_mid_string_wildcard() {
+    let result = validation::validate_membership_type_code("gts.cf.*.user.v1~");
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), DomainError::Validation { .. }));
+}
+
 // ── validate_metadata_schema ────────────────────────────────────────────
 
 #[test]

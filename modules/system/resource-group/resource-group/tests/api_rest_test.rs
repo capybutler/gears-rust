@@ -595,7 +595,7 @@ async fn rest_post_membership_returns_201() {
     let ctx = make_ctx(tenant_id);
 
     let mt_code = format!(
-        "gts.cf.core.rg.type.v1~test.mt2.{}.v1~",
+        "gts.cf.core.rg.type.v1~test.mt2._.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -735,7 +735,7 @@ async fn rest_delete_membership_returns_204() {
     let ctx = make_ctx(tenant_id);
 
     let mt = format!(
-        "gts.cf.core.rg.type.v1~test.mtr.{}.v1~",
+        "gts.cf.core.rg.type.v1~test.mtr._.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1614,7 +1614,7 @@ async fn gts_membership_post_tilde_encoded() {
     let ctx = make_ctx(tenant_id);
 
     let mt = format!(
-        "gts.cf.core.rg.type.v1~test.tmt.{}.v1~",
+        "gts.cf.core.rg.type.v1~test.tmt._.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1680,7 +1680,7 @@ async fn gts_membership_delete_tilde_encoded() {
     let ctx = make_ctx(tenant_id);
 
     let mt = format!(
-        "gts.cf.core.rg.type.v1~test.tmd.{}.v1~",
+        "gts.cf.core.rg.type.v1~test.tmd._.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1863,7 +1863,7 @@ async fn smallint_membership_response_has_no_surrogate_ids() {
     let ctx = make_ctx(tenant_id);
 
     let mt = format!(
-        "gts.cf.core.rg.type.v1~test.msid.{}.v1~",
+        "gts.cf.core.rg.type.v1~test.msid._.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc

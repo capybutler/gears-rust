@@ -58,6 +58,7 @@ authz-resolver-sdk = { workspace = true }
 
 # GTS type system — types registry for schema resolution
 types-registry-sdk = { workspace = true }
+gts = { workspace = true }
 
 # Local dependencies
 modkit = { workspace = true }

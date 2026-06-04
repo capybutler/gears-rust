@@ -490,11 +490,11 @@ async fn group_based_membership_data_correctly_stored() {
 
     // Create types: project (root, allows "task" members) and task
     let project_type = format!(
-        "gts.cf.core.rg.type.v1~x.test.proj{}.v1~",
+        "gts.cf.core.rg.type.v1~x.test.proj.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     let task_type = format!(
-        "gts.cf.core.rg.type.v1~x.test.task{}.v1~",
+        "gts.cf.core.rg.type.v1~x.test.task.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
 

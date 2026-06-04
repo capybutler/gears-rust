@@ -74,11 +74,11 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         // FOR EACH membership_path in allowed_membership_types
         for membership_code in &req.allowed_membership_types {
             // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6a
-            // Validate membership_path is a valid GtsTypePath (the RG-prefix
-            // requirement is currently shared with parent types via
-            // `validate_type_code`; non-RG membership types would relax this
-            // check at the value-object level).
-            validation::validate_type_code(membership_code)?;
+            // Validate membership_path is a syntactically valid GtsTypePath.
+            // Per DESIGN.md, membership resource types are external domain
+            // types (e.g. `gts.cf.core.idp.user.v1~`) and are NOT required
+            // to carry the RG type-registry prefix.
+            validation::validate_membership_type_code(membership_code)?;
             // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6a
         }
         // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-6
@@ -226,7 +226,7 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
             validation::validate_type_code(parent_code)?;
         }
         for membership_code in &req.allowed_membership_types {
-            validation::validate_type_code(membership_code)?;
+            validation::validate_membership_type_code(membership_code)?;
         }
         if let Some(ref schema) = req.metadata_schema {
             validation::validate_metadata_schema(schema)?;

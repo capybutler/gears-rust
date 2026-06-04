@@ -43,9 +43,13 @@ fn nil_ctx() -> modkit_security::SecurityContext {
 }
 
 fn unique_type_code(suffix: &str) -> String {
+    // 5-token GTS segment per ADR-001 Finding 2:
+    // vendor.package.namespace.type.vMAJOR. Suffix goes in namespace
+    // (lowercased); UUID-hex (with `i` prefix to start with a letter)
+    // goes in type.
     format!(
-        "gts.cf.core.rg.type.v1~x.test.{}{}.v1~",
-        suffix,
+        "gts.cf.core.rg.type.v1~x.test.{}.i{}.v1~",
+        suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     )
 }

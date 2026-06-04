@@ -265,9 +265,13 @@ pub async fn create_root_type(
     svc: &TypeService<TypeRepository>,
     suffix: &str,
 ) -> ResourceGroupType {
+    // Format: vendor.package.namespace.type.vMAJOR -- 5 tokens per ADR-001
+    // Finding 2. Suffix goes in namespace (lowercased so callers can use
+    // CamelCase without breaking the GTS regex); UUID-hex (prefixed with
+    // `i` so it starts with a letter) goes in type.
     let code = format!(
-        "gts.cf.core.rg.type.v1~x.test.{}{}.v1~",
-        suffix,
+        "gts.cf.core.rg.type.v1~x.test.{}.i{}.v1~",
+        suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
     svc.create_type(CreateTypeRequest {
@@ -288,9 +292,13 @@ pub async fn create_child_type(
     parents: &[&str],
     memberships: &[&str],
 ) -> ResourceGroupType {
+    // Format: vendor.package.namespace.type.vMAJOR -- 5 tokens per ADR-001
+    // Finding 2. Suffix goes in namespace (lowercased so callers can use
+    // CamelCase without breaking the GTS regex); UUID-hex (prefixed with
+    // `i` so it starts with a letter) goes in type.
     let code = format!(
-        "gts.cf.core.rg.type.v1~x.test.{}{}.v1~",
-        suffix,
+        "gts.cf.core.rg.type.v1~x.test.{}.i{}.v1~",
+        suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
     svc.create_type(CreateTypeRequest {
