@@ -21,7 +21,7 @@ Templates work standalone or can be enhanced with Cypilot annotations (`cpt-id`)
 
 **Governance**: Steering committee with vote/veto authority on major requirements and architecture decisions. Escalation paths documented separately.
 
-**Global Guidelines**: Project-wide standards defined in root PRD, DESIGN, and [guidelines/](../../guidelines/) covering architecture, security, performance, operations, runtime environments, testing strategy.
+**Global Guidelines**: Project-wide standards (architecture, security, performance, operations, runtime environments, testing strategy) live in the repository's foundational documents — for this repo, the [architecture manifest](../ARCHITECTURE_MANIFEST.md) and [guidelines/](../../guidelines/). A project may also have a parent/root PRD or DESIGN; link whichever foundational sources actually exist rather than assuming a fixed set.
 
 **Gear-level specs**: Document only **deviations** or **extensions** from global standards. Avoid duplicating project-wide requirements.
 

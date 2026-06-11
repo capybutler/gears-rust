@@ -84,7 +84,7 @@ The application is designed for individual use with cross-device synchronization
 
 ## 3. Operational Concept & Environment
 
-> **Note**: Project-wide runtime, OS, architecture, lifecycle policy, and gear integration patterns (Rust native + auto-generated gRPC/REST) are defined in root [PRD.md](../../PRD.md). Only document gear-specific deviations or additional constraints here. **If this gear has no special environment constraints, delete this entire section.**
+> **Note**: Runtime, OS, architecture, lifecycle policy, and gear integration patterns (Rust native + auto-generated gRPC/REST) are defined in this repository's foundational documents — the [architecture manifest](../../../../ARCHITECTURE_MANIFEST.md) and [guidelines/](../../../../../guidelines/) — not in a gear PRD. This section captures only this gear's deviations.
 
 ### 3.1 Gear-Specific Environment Constraints
 
@@ -153,7 +153,7 @@ The system **MUST** allow users to filter tasks by status (all, active, complete
 
 ## 6. Non-Functional Requirements
 
-> **Default guidelines**: Project-wide NFR baselines (performance, security, reliability, scalability) are defined in root [PRD.md](../../PRD.md) and [docs/guidelines/](../../guidelines/). Only document gear-specific NFRs here — either **exclusions** from defaults or **standalone** requirements unique to this gear.
+> **Default guidelines**: Project-wide NFR baselines (performance, security, reliability, scalability) are defined in this repository's foundational documents — the [architecture manifest](../../../../ARCHITECTURE_MANIFEST.md) and [guidelines/](../../../../../guidelines/). This section captures only this gear's NFR deviations and extensions.
 >
 > **Testing strategy**: NFRs are verified via automated benchmarks, security scans, and monitoring unless otherwise specified.
 
