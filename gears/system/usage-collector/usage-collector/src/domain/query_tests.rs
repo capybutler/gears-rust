@@ -4,9 +4,11 @@
 //! conjuncts), preventing an unbounded full-table scan / aggregation.
 
 use toolkit_odata::ODataQuery;
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use usage_collector_sdk::{UsageCollectorError, ValidationReason};
+use uuid::Uuid;
 
-use super::require_bounded_time_window;
+use super::{compose_query_with_scope, require_bounded_time_window};
 
 /// Build an [`ODataQuery`] whose `$filter` is the parsed `filter` string.
 fn query_with_filter(filter: &str) -> ODataQuery {
@@ -101,4 +103,70 @@ fn bounds_among_other_top_level_conjuncts_are_accepted() {
          and resource_id eq 'r1' and created_at lt 2026-02-01T00:00:00Z",
     );
     require_bounded_time_window(&q).expect("window bounds among other conjuncts still count");
+}
+
+// ---------------------------------------------------------------------------
+// compose_query_with_scope — AND-merges PDP scope but MUST keep filter_hash
+// pinned to the user `$filter` (keyset-cursor stability across pages).
+// ---------------------------------------------------------------------------
+
+/// A user query whose `filter_hash` mirrors the gateway: it is the hash of the
+/// USER `$filter`, not of anything the service later AND-merges in.
+fn user_query_with_gateway_hash(filter: &str) -> ODataQuery {
+    let mut q = query_with_filter(filter);
+    q.filter_hash = toolkit_odata::short_filter_hash(q.filter());
+    q
+}
+
+#[test]
+fn compose_preserves_user_filter_hash_when_scope_narrows() {
+    // Regression for the keyset-pagination FILTER_MISMATCH 400: re-hashing the
+    // AND-merged filter into `filter_hash` embeds a hash in the next_cursor
+    // that the gateway's hash(user $filter) can never match on the follow-up
+    // page. `filter_hash` must stay the USER-filter hash.
+    let user = user_query_with_gateway_hash(
+        "created_at ge 2026-01-01T00:00:00Z and created_at lt 2026-02-01T00:00:00Z",
+    );
+    let user_hash = user.filter_hash.clone();
+    assert!(
+        user_hash.is_some(),
+        "precondition: gateway populated filter_hash"
+    );
+
+    let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+        pep_properties::OWNER_TENANT_ID,
+        vec![Uuid::from_u128(0xA)],
+    )]));
+    let composed = compose_query_with_scope(&user, &scope).expect("compose ok");
+
+    // The filter AST genuinely changed (the tenant predicate was AND-merged):
+    // its hash differs from the user-filter hash.
+    assert_ne!(
+        toolkit_odata::short_filter_hash(composed.filter()),
+        user_hash,
+        "scope narrowing must change the filter AST",
+    );
+    // But the stored filter_hash stays pinned to the USER-filter hash, so the
+    // keyset cursor's `f` keeps matching the gateway's hash across pages.
+    assert_eq!(
+        composed.filter_hash, user_hash,
+        "compose MUST NOT re-hash the server-injected scope into filter_hash",
+    );
+}
+
+#[test]
+fn compose_unconstrained_scope_passes_filter_and_hash_through() {
+    let user = user_query_with_gateway_hash(
+        "created_at ge 2026-01-01T00:00:00Z and created_at lt 2026-02-01T00:00:00Z",
+    );
+    let composed = compose_query_with_scope(&user, &AccessScope::allow_all()).expect("compose ok");
+    assert_eq!(
+        composed.filter_hash, user.filter_hash,
+        "allow_all leaves filter_hash unchanged",
+    );
+    assert_eq!(
+        toolkit_odata::short_filter_hash(composed.filter()),
+        toolkit_odata::short_filter_hash(user.filter()),
+        "allow_all adds no predicate, so the filter is unchanged",
+    );
 }

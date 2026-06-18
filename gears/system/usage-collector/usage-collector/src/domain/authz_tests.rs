@@ -30,7 +30,7 @@ use uuid::Uuid;
 use super::{
     AttributionTupleKey, authorize_attribution_tuple, authorize_usage_record, usage_record,
 };
-use crate::domain::test_support::{CapturingAllowAllResolver, enforcer_for};
+use crate::domain::test_support::{CapturingTenantPermitResolver, enforcer_for};
 
 const SAMPLE_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
 
@@ -59,11 +59,20 @@ fn record_with(subject: Option<SubjectRef>) -> UsageRecord {
     }
 }
 
+/// A record identical to [`record_with(None)`] but owned by `tenant_id`, for
+/// driving the per-record tenant gate against a specific owning tenant.
+fn record_with_tenant(tenant_id: Uuid) -> UsageRecord {
+    UsageRecord {
+        tenant_id,
+        ..record_with(None)
+    }
+}
+
 /// Run both PDP composers against the same record and return the
 /// captured `EvaluationRequest`s as JSON values (for stable, transitive
 /// equality across `HashMap`-backed property bags).
 async fn captured_requests_for(record: &UsageRecord) -> (serde_json::Value, serde_json::Value) {
-    let resolver = CapturingAllowAllResolver::new();
+    let resolver = CapturingTenantPermitResolver::new();
     let enforcer =
         enforcer_for(Arc::clone(&resolver) as Arc<dyn authz_resolver_sdk::AuthZResolverClient>);
 
@@ -172,7 +181,7 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         "test premise: records were constructed to share the attribution tuple",
     );
 
-    let resolver = CapturingAllowAllResolver::new();
+    let resolver = CapturingTenantPermitResolver::new();
     let enforcer =
         enforcer_for(Arc::clone(&resolver) as Arc<dyn authz_resolver_sdk::AuthZResolverClient>);
 
@@ -209,6 +218,48 @@ fn different_actions_yield_distinct_tuple_keys_for_same_attribution() {
          tuple would share a single PDP decision and silently bypass \
          per-action policy",
     );
+}
+
+/// Integration pin: the per-record tenant gate is actually WIRED into
+/// [`authorize_attribution_tuple`], not merely unit-tested in isolation via
+/// `scope_admits_tenant`. The tenant-echoing happy-path fakes can never produce
+/// a scope that fails the gate, so without this test a regression that dropped
+/// the gate call — re-opening the cross-tenant bypass this change closes —
+/// would pass the whole gear suite. Here the PDP permits but scopes the grant
+/// to ONE tenant: a record owned by a different tenant MUST be denied, and the
+/// granted tenant MUST be permitted.
+#[tokio::test]
+async fn authorize_attribution_tuple_denies_record_outside_granted_tenant() {
+    use toolkit_security::pep_properties;
+
+    use crate::domain::DomainError;
+    use crate::domain::test_support::CountingPermitResolver;
+
+    let granted = Uuid::from_u128(0x6001);
+    let foreign = Uuid::from_u128(0x6002);
+    // Permit, but scope the grant to exactly `granted` (independent of the
+    // request) — models a `/tenants/{granted}`-scoped caller.
+    let resolver =
+        CountingPermitResolver::new(pep_properties::OWNER_TENANT_ID, granted.to_string());
+    let enforcer = enforcer_for(resolver as Arc<dyn authz_resolver_sdk::AuthZResolverClient>);
+
+    let foreign_key = AttributionTupleKey::from_record(
+        &record_with_tenant(foreign),
+        usage_record::actions::CREATE,
+    );
+    let denied = authorize_attribution_tuple(&enforcer, &ctx(), &foreign_key).await;
+    assert!(
+        matches!(denied, Err(DomainError::AuthorizationDenied { .. })),
+        "a record owned by a tenant outside the PDP-granted scope MUST be denied, got {denied:?}",
+    );
+
+    let granted_key = AttributionTupleKey::from_record(
+        &record_with_tenant(granted),
+        usage_record::actions::CREATE,
+    );
+    authorize_attribution_tuple(&enforcer, &ctx(), &granted_key)
+        .await
+        .expect("a record owned by the granted tenant is permitted");
 }
 
 // ---------------------------------------------------------------------------
@@ -406,5 +457,99 @@ mod scope_to_odata_tests {
         )]));
         let expr = scope_to_odata_filter(&scope).unwrap().unwrap();
         assert_eq!(fmt_expr(&expr), "(eq subject_type \"user\")");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scope_admits_tenant — per-record tenant gate applied after a permit
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tenant_gate_tests {
+    use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue, pep_properties};
+    use uuid::Uuid;
+
+    use crate::domain::authz::{scope_admits_tenant, usage_record};
+
+    fn uid(seed: u128) -> Uuid {
+        Uuid::from_u128(seed)
+    }
+
+    #[test]
+    fn unconstrained_scope_is_denied_fail_closed() {
+        // Under require_constraints(true) a legitimate permit always carries an
+        // OWNER_TENANT_ID In[..] narrowing (a Global-scoped admin resolves to
+        // In[all tenants], NOT allow_all — covered by the In-closure cases). An
+        // unconstrained scope here only arises from a degenerate empty-predicate
+        // permit, so the per-record gate MUST fail closed rather than admit
+        // every tenant. (Contrast the LIST path, where allow_all legitimately
+        // means "no row narrowing".)
+        assert!(!scope_admits_tenant(&AccessScope::allow_all(), uid(0xAB)));
+    }
+
+    #[test]
+    fn deny_all_scope_admits_no_tenant() {
+        assert!(!scope_admits_tenant(&AccessScope::deny_all(), uid(0xAB)));
+    }
+
+    #[test]
+    fn tenant_within_in_closure_is_admitted() {
+        let a = uid(1);
+        let b = uid(2);
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+            pep_properties::OWNER_TENANT_ID,
+            vec![a, b],
+        )]));
+        assert!(scope_admits_tenant(&scope, a));
+        assert!(scope_admits_tenant(&scope, b));
+    }
+
+    #[test]
+    fn tenant_outside_in_closure_is_denied() {
+        // The cross-tenant case: caller scoped to {a}, record names some
+        // other tenant -> fail closed. This is the bug fix #2 closes.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+            pep_properties::OWNER_TENANT_ID,
+            vec![uid(1)],
+        )]));
+        assert!(!scope_admits_tenant(&scope, uid(0xC)));
+    }
+
+    #[test]
+    fn tenant_as_uuid_string_value_is_admitted() {
+        // The compiler may emit a UUID as a String ScopeValue; the gate MUST
+        // accept it (mirrors scope_value_to_ast / AccessScope::contains_uuid).
+        let t = uid(0x1234);
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            ScopeValue::String(t.to_string()),
+        )]));
+        assert!(scope_admits_tenant(&scope, t));
+    }
+
+    #[test]
+    fn scope_without_owner_tenant_filter_is_denied() {
+        // A constrained permit that narrows by some OTHER property (no
+        // OWNER_TENANT_ID filter) MUST NOT admit a tenant — fail closed.
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            usage_record::PROP_RESOURCE_TYPE,
+            "compute.vm",
+        )]));
+        assert!(!scope_admits_tenant(&scope, uid(0xAB)));
+    }
+
+    #[test]
+    fn multi_constraint_disjunction_admits_when_any_path_covers_tenant() {
+        // Constraints are OR-ed (independent access paths); a record tenant
+        // covered by ANY path is admitted.
+        let a = uid(1);
+        let b = uid(2);
+        let scope = AccessScope::from_constraints(vec![
+            ScopeConstraint::new(vec![ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, a)]),
+            ScopeConstraint::new(vec![ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, b)]),
+        ]);
+        assert!(scope_admits_tenant(&scope, a));
+        assert!(scope_admits_tenant(&scope, b));
+        assert!(!scope_admits_tenant(&scope, uid(3)));
     }
 }

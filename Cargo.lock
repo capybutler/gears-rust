@@ -2207,6 +2207,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-timescaledb-usage-collector-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bigdecimal",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-types-registry-sdk",
+ "cf-gears-usage-collector-sdk",
+ "chrono",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-toolkit"
 version = "0.6.12"
 dependencies = [

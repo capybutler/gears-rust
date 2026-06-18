@@ -55,12 +55,19 @@ pub(crate) fn compose_query_with_scope(
     // @cpt-end:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-intersect
 
     let mut composed = user_query.clone();
-    // Keep `filter_hash` consistent with the AND-merged filter so the
-    // (filter, filter_hash) pair stays coupled. Today the handler validates
-    // the cursor before composition, so a stale hash is latent; refreshing
-    // it here pre-empts a contract-drift bite when downstream consumers
-    // re-derive the hash off `composed`.
-    composed.filter_hash = toolkit_odata::short_filter_hash(Some(&composed_filter));
+    // Preserve the caller's `filter_hash` (the hash of the *user* `$filter`,
+    // computed by the gateway) — do NOT re-hash the AND-merged filter. The
+    // keyset cursor's `f` field exists to detect the *user* changing their
+    // `$filter` between paginated requests; the PDP scope AND-merged here is
+    // server-injected and not user-controlled, so it MUST be excluded from the
+    // hash. Both cursor validators (the gateway, pre-composition, and the
+    // plugin's `cursor.f == query.filter_hash` check) compare against the
+    // user-filter hash, and the plugin embeds `query.filter_hash` into the
+    // next_cursor. Re-hashing to `hash(user AND scope)` here would embed a hash
+    // the gateway's `hash(user)` can never match on the follow-up request —
+    // breaking keyset pagination with a spurious `FILTER_MISMATCH` 400 the
+    // moment PDP returns any row scope (latent until LIST began requiring
+    // constraints). `composed` keeps `user_query.filter_hash` from the clone.
     composed.filter = Some(Box::new(composed_filter));
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-return
     Ok(composed)

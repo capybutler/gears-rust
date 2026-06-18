@@ -7,8 +7,13 @@
 //! no resource id, no per-row scoping), so catalog authz is subject-only;
 //! the ingestion surface declares per-record attribution attributes
 //! (tenant, optional subject, resource type and id) so policy can reason
-//! over them. Both surfaces opt out of `require_constraints`, making an
-//! unconstrained permit (`allow_all`) a legitimate happy-path outcome.
+//! over them. The catalog surface opts out of `require_constraints`
+//! (subject-only authz, so an unconstrained `allow_all` permit is the
+//! legitimate happy-path outcome); the per-record ingestion surface runs
+//! under `require_constraints(true)` and gates each record's owning tenant
+//! against the PDP-returned row scope, so a tenant-scoped caller cannot
+//! attribute usage to — or read / deactivate a record of — a tenant outside
+//! its closure.
 //!
 //! Fail-closed wiring (transport → `AuthorizationUnavailable`, deny /
 //! compile-failed → `AuthorizationDenied`) lives here so it cannot drift
@@ -219,14 +224,22 @@ pub(crate) async fn authorize(
 /// resource reference. `action` selects the verb the PDP authorizes against
 /// (`actions::CREATE` for emission, `actions::DEACTIVATE` for event
 /// deactivation); the per-verb PEP vocabulary is identical so policy authors
-/// reason over a single attribute set. The `require_constraints(false)`
-/// posture mirrors [`authorize`]; an unconstrained permit is the legitimate
-/// happy-path outcome.
+/// reason over a single attribute set. Unlike [`authorize`], this path runs
+/// under `require_constraints(true)` and applies the per-record tenant gate
+/// in [`scope_admits_tenant`]: `access_scope_with` fails closed only on an
+/// outright PDP deny / transport / compile error, so a *permit* carrying a
+/// row-scope narrowing constraint (e.g. `OWNER_TENANT_ID In [caller's tenant
+/// closure]`) is returned as `Ok(scope)` and the SDK does NOT auto-match it
+/// against the request's resource properties. The record's owning tenant
+/// must therefore be matched against the granted scope here, or cross-tenant
+/// attribution (create) / cross-tenant read (get) / cross-tenant deactivate
+/// would slip through.
 ///
 /// # Errors
 ///
-/// * [`DomainError::AuthorizationDenied`] when the PDP denies or returns an
-///   uncompilable constraint shape.
+/// * [`DomainError::AuthorizationDenied`] when the PDP denies, returns an
+///   uncompilable constraint shape, or grants a scope that does not cover
+///   the record's owning tenant.
 /// * [`DomainError::AuthorizationUnavailable`] when the PDP transport fails.
 // @cpt-algo:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1
 // @cpt-algo:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1
@@ -274,7 +287,7 @@ pub(crate) async fn authorize_attribution_tuple(
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-compose-tuple
     // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-compose-tuple
     let mut request = AccessRequest::new()
-        .require_constraints(false)
+        .require_constraints(true)
         .resource_property(pep_properties::OWNER_TENANT_ID, key.tenant_id.to_string())
         .resource_property(usage_record::PROP_RESOURCE_TYPE, key.resource_type.clone())
         .resource_property(usage_record::PROP_RESOURCE_ID, key.resource_id.clone());
@@ -299,11 +312,32 @@ pub(crate) async fn authorize_attribution_tuple(
     // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-deny
     // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-fail-closed
     // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-allow
-    enforcer
+    let scope = enforcer
         .access_scope_with(ctx, &usage_record::RESOURCE, key.action, None, &request)
         .await
-        .map(|_| ())
-        .map_err(DomainError::from)
+        .map_err(DomainError::from)?;
+
+    // Per-record tenant gate (see [`scope_admits_tenant`]). A permit that
+    // narrows to the caller's tenant closure comes back as `Ok(scope)`, not a
+    // bare yes — the record's owning tenant must fall inside that scope or
+    // this is cross-tenant attribution / access and we fail closed.
+    if scope_admits_tenant(&scope, key.tenant_id) {
+        Ok(())
+    } else {
+        tracing::warn!(
+            target: "authz",
+            tenant_id = %key.tenant_id,
+            action = key.action,
+            "PDP permit did not authorize the record's owning tenant; \
+             denying cross-tenant usage_record attribution"
+        );
+        Err(DomainError::AuthorizationDenied {
+            reason: Some(format!(
+                "caller is not authorized for usage_record owning tenant {}",
+                key.tenant_id
+            )),
+        })
+    }
     // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-allow
     // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-fail-closed
     // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-deny
@@ -314,16 +348,65 @@ pub(crate) async fn authorize_attribution_tuple(
     // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-resolver-call
 }
 
+/// Decide whether a PDP-returned [`AccessScope`] authorizes a per-record
+/// operation whose owning tenant is `tenant_id`.
+///
+/// [`authorize_attribution_tuple`] runs under `require_constraints(true)`, so
+/// a permit comes back as a compiled scope rather than a bare yes/no, and the
+/// SDK does NOT auto-match that scope against the request's resource
+/// properties — confirming the record's `OWNER_TENANT_ID` falls inside the
+/// granted scope is the gear's responsibility. Without this check a
+/// `/tenants/{A}`-scoped caller could create / read / deactivate records
+/// attributed to any other tenant: the resolver returns a permit plus an
+/// `OWNER_TENANT_ID In [A's closure]` narrowing, but nothing otherwise
+/// rejects an out-of-closure record.
+///
+/// * **Admitted** iff the scope's `OWNER_TENANT_ID` value set contains
+///   `tenant_id`. [`AccessScope::contains_uuid`] matches both
+///   `ScopeValue::Uuid` and the UUID-as-`String` form the compiler may emit,
+///   mirroring [`scope_value_to_ast`]'s tolerance. A tenant-scoped caller
+///   resolves to `OWNER_TENANT_ID In [closure]` and a platform-admin
+///   (`Global` scope) to `In [all tenants]`; both carry the property and are
+///   admitted, while a `/tenants/{A}`-scoped caller's closure excludes any
+///   other tenant, so a cross-tenant record is denied.
+/// * **Everything else** is denied, fail-closed — including an
+///   *unconstrained* (`allow_all`) scope. Under `require_constraints(true)` a
+///   legitimate permit always carries the `OWNER_TENANT_ID In [..]` narrowing
+///   (admin included, as `In [all tenants]`), so `allow_all` is NOT a
+///   happy-path outcome on this path; it only arises from a degenerate permit
+///   whose constraints carry no predicates — which the PEP compiler collapses
+///   to `allow_all` even under `require_constraints(true)`. Honouring it would
+///   let such a permit grant cross-tenant access, so this gate deliberately
+///   does NOT short-circuit on [`AccessScope::is_unconstrained`] — unlike the
+///   LIST projection ([`scope_to_odata_filter`]), where an unconstrained scope
+///   legitimately means "no row narrowing".
+///
+/// This gate enforces tenant isolation specifically; `usage_record` grants in
+/// the platform RBAC model are tenant-scoped (the resource-type / resource-id
+/// / subject attributes are caller-supplied attribution for PDP tuple
+/// matching, not grant row-scope), so a tenant match is the operative check.
+fn scope_admits_tenant(scope: &AccessScope, tenant_id: Uuid) -> bool {
+    scope.contains_uuid(pep_properties::OWNER_TENANT_ID, tenant_id)
+}
+
 /// Authorize a `list_usage_records` request and return the compiled
 /// [`AccessScope`] for downstream `OData` composition.
 ///
-/// Mirrors [`authorize`] in posture — `require_constraints(false)` so an
-/// unconstrained permit (`AccessScope::allow_all`) is a legitimate
-/// happy-path outcome and the caller can dispatch the user-supplied
-/// filter unchanged. A permit carrying constraints is projected through
+/// `require_constraints(true)` so the PDP MUST return row-scope narrowing
+/// for a tenant-scoped caller rather than short-circuiting to an
+/// unconstrained `AccessScope::allow_all`. The authz-resolver materializes
+/// the caller's tenant closure into a flat `OWNER_TENANT_ID In [..]`
+/// constraint — `usage_record` does not advertise
+/// `Capability::TenantHierarchy`, so the closure is expanded eagerly rather
+/// than pushed down as an `InTenantSubtree` predicate this flat resource
+/// cannot consume. A platform-admin (`Global` scope) still resolves to a
+/// constraint over the full tenant set (never `allow_all`), so requiring
+/// constraints does not deny admin. The compiled scope is projected through
 /// [`scope_to_odata_filter`] at the call site and AND-merged into the
 /// user's filter before plugin dispatch (see
-/// [`crate::domain::service::Service::list_usage_records`]).
+/// [`crate::domain::service::Service::list_usage_records`]); with
+/// `require_constraints(false)` the PDP returned `allow_all`, leaving LIST
+/// unscoped across tenants (no tenant isolation).
 ///
 /// The request carries no per-record attribution attributes (LIST is
 /// pre-row), so the composed PEP request is action+resource-type only —
@@ -347,7 +430,7 @@ pub(crate) async fn authorize_list_usage_records(
             &usage_record::RESOURCE,
             usage_record::actions::LIST,
             None,
-            &AccessRequest::new().require_constraints(false),
+            &AccessRequest::new().require_constraints(true),
         )
         .await
         .map_err(DomainError::from)

@@ -1450,7 +1450,7 @@ mod deactivate_usage_record_tests {
 
     use crate::domain::Service;
     use crate::domain::test_support::{
-        CountingAllowAllResolver, DenyAllResolver, UnreachableResolver, enforcer_for,
+        CountingTenantPermitResolver, DenyAllResolver, UnreachableResolver, enforcer_for,
     };
 
     /// Programmable deactivate-stub plugin. Each `deactivate_usage_record`
@@ -1689,7 +1689,7 @@ mod deactivate_usage_record_tests {
 
     fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
         let hub = hub_with(plugin, suffix);
-        let enforcer = enforcer_for(CountingAllowAllResolver::new());
+        let enforcer = enforcer_for(CountingTenantPermitResolver::new());
         Arc::new(Service::new(hub, "cyberfabric".into(), enforcer))
     }
 
@@ -1973,7 +1973,8 @@ mod pdp_dedup_tests {
     use uuid::Uuid;
 
     use crate::domain::test_support::{
-        HappyPathPlugin, authenticated_ctx, service_with_counting_permit,
+        HappyPathPlugin, authenticated_ctx, permit_scoped_to_request_tenant,
+        service_with_counting_permit,
     };
 
     const HAPPY_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1";
@@ -2201,16 +2202,23 @@ mod pdp_dedup_tests {
                     .get(PROP_RESOURCE_ID)
                     .and_then(serde_json::Value::as_str)
                     == Some(self.deny_resource_id.as_str());
-                Ok(EvaluationResponse {
-                    decision: !matches_deny,
-                    context: EvaluationResponseContext {
-                        constraints: Vec::new(),
-                        deny_reason: matches_deny.then(|| DenyReason {
-                            error_code: "test-deny".to_owned(),
-                            details: None,
-                        }),
-                    },
-                })
+                if matches_deny {
+                    return Ok(EvaluationResponse {
+                        decision: false,
+                        context: EvaluationResponseContext {
+                            constraints: Vec::new(),
+                            deny_reason: Some(DenyReason {
+                                error_code: "test-deny".to_owned(),
+                                details: None,
+                            }),
+                        },
+                    });
+                }
+                // Permit: scope the grant to the record's own tenant so the
+                // per-record gate (`require_constraints(true)`) admits it,
+                // rather than an empty-constraints permit that would now fail
+                // closed as `CompileFailed`.
+                Ok(permit_scoped_to_request_tenant(&request))
             }
         }
 
