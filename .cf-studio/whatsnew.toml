@@ -1,3 +1,7 @@
+[whatsnew."v1.5.4"]
+summary = "v1.5.4"
+details = "## What's Changed\r\n* Update version to v1.5.3 and add release notes by @ainetx in https://github.com/constructorfabric/studio/pull/46\r\n* Enhance agent path resolution for register mode project root kits by @ainetx in https://github.com/constructorfabric/studio/pull/47\r\n\r\n\r\n**Full Changelog**: https://github.com/constructorfabric/studio/compare/v1.5.3...v1.5.4"
+
 [whatsnew."v1.5.2"]
 summary = "v1.5.2"
 details = "## What's Changed\r\n* Improve Pylint rules and enhance documentation by @ainetx in https://github.com/constructorfabric/studio/pull/38\r\n* Enforce active workflow state law by @ainetx in https://github.com/constructorfabric/studio/pull/42\r\n* Enhance Git Kit Source Management and Manifest Validation by @ainetx in https://github.com/constructorfabric/studio/pull/43\r\n\r\n\r\n**Full Changelog**: https://github.com/constructorfabric/studio/compare/v1.5.1...v1.5.2"
