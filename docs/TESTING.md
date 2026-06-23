@@ -53,7 +53,7 @@ make all                   # full pipeline (build + check + test-sqlite + e2e-lo
 ### 2.1 Threshold
 
 The project-wide **line-coverage threshold is 80 %**.  The threshold is enforced in
-`scripts/coverage.py` (`COVERAGE_THRESHOLD`) and printed as a warning when any gear
+`tools/scripts/coverage.py` (`COVERAGE_THRESHOLD`) and printed as a warning when any gear
 or library falls below it.
 
 ### 2.2 Coverage modes
@@ -224,28 +224,47 @@ See [`fuzz/README.md`](../tools/fuzz/README.md) for corpus management and crash 
 
 ## 7. CI / Development Commands
 
-Gears uses a unified, cross-platform Python CI script (`scripts/ci.py`).
+Gears uses a unified, cross-platform Python CI script (`tools/scripts/ci.py`).
 This is the **primary entry point on Windows** where `make` is not available.
 Requires Python 3.9+.
 
-### 7.1 Cross-platform commands (`scripts/ci.py`)
+### 7.1 Cross-platform commands (`tools/scripts/ci.py`)
 
 ```bash
-python scripts/ci.py all            # build + full check suite + e2e
-python scripts/ci.py check          # fmt, clippy, test, audit, deny
-python scripts/ci.py fmt            # check formatting
-python scripts/ci.py fmt --fix      # auto-format code
-python scripts/ci.py clippy         # run linter
-python scripts/ci.py clippy --fix   # attempt to fix warnings
-python scripts/ci.py dylint         # custom project compliance lints
-python scripts/ci.py audit          # security audit
-python scripts/ci.py deny           # license & dependency checks
-python scripts/ci.py e2e-local      # build server + run E2E tests locally
-python scripts/ci.py e2e-local --smoke  # E2E smoke subset only
-python scripts/ci.py e2e-docker     # E2E in Docker
-python scripts/ci.py fuzz-build     # build fuzz targets
-python scripts/ci.py fuzz --seconds 60  # fuzz smoke run
-python scripts/ci.py fuzz-run fuzz_odata_filter --seconds 300  # single target
+python tools/scripts/ci.py all            # build + full check suite + e2e
+python tools/scripts/ci.py check          # fmt, clippy, test, audit, deny
+python tools/scripts/ci.py fmt            # check formatting
+python tools/scripts/ci.py fmt --fix      # auto-format code
+python tools/scripts/ci.py clippy         # run linter
+python tools/scripts/ci.py clippy --fix   # attempt to fix warnings
+python tools/scripts/ci.py dylint         # custom project compliance lints
+python tools/scripts/ci.py audit          # security audit
+python tools/scripts/ci.py deny           # license & dependency checks
+python tools/scripts/ci.py e2e-local      # build server + run E2E tests locally
+python tools/scripts/ci.py e2e-local --smoke  # E2E smoke subset only
+python tools/scripts/ci.py e2e-docker     # E2E in Docker
+python tools/scripts/ci.py fuzz-build     # build fuzz targets
+python tools/scripts/ci.py fuzz --seconds 60  # fuzz smoke run
+python tools/scripts/ci.py fuzz-run fuzz_odata_filter --seconds 300  # single target
+```
+
+> On Windows, invoke these helpers with `python` (the `python3` alias is
+> frequently absent).
+
+Code coverage is produced by a separate script, `coverage.py`:
+
+```bash
+python tools/scripts/coverage.py unit       # unit-test coverage
+python tools/scripts/coverage.py e2e-local  # e2e-local coverage
+python tools/scripts/coverage.py combined   # unit + e2e-local (== make coverage)
+```
+
+Prerequisites (install once; `make setup` handles these on supported hosts):
+
+```bash
+pip install -r testing/e2e/requirements.txt   # pytest + httpx (e2e tests)
+pip install -r testing/requirements.txt        # PyYAML + requests (coverage.py)
+cargo install cargo-llvm-cov                    # coverage backend (works on Windows too)
 ```
 
 ### 7.2 Makefile shortcuts (Unix / Linux / macOS)

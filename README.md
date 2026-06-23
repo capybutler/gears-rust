@@ -230,13 +230,25 @@ make coverage-unit   # unit test code coverage
 make fuzz            # fuzz smoke tests (30 s per target)
 ```
 
-On **Windows** (no `make`), use the cross-platform CI script directly:
+On **Windows** (no `make`), use the cross-platform Python scripts directly
+(invoke them with `python`; `python3` is often absent on Windows):
 
 ```bash
 python tools/scripts/ci.py check          # full CI suite
 python tools/scripts/ci.py e2e-local      # end-to-end tests
 python tools/scripts/ci.py e2e-local -- testing/e2e/gears/file_parser/  # targeted end-to-end scope
 python tools/scripts/ci.py fuzz --seconds 60  # fuzz smoke run
+
+python tools/scripts/coverage.py unit      # unit-test code coverage
+python tools/scripts/coverage.py combined  # unit + e2e-local coverage
+```
+
+These scripts need a few prerequisites on Windows:
+
+```bash
+pip install -r testing/e2e/requirements.txt   # pytest + httpx (e2e tests)
+pip install -r testing/requirements.txt        # PyYAML + requests (coverage.py)
+cargo install cargo-llvm-cov                    # coverage backend (or run `make setup`)
 ```
 
 For the complete test strategy, coverage policy, CI pipeline details, and all

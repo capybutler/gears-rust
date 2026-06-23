@@ -1,5 +1,10 @@
 CI := 1
 
+# Python interpreter used by helper scripts. Defaults to python3 (Linux/macOS);
+# on Windows, where `python3` is often absent, it falls back to `python`.
+# Override explicitly with `make <target> PYTHON=...` if needed.
+PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null || echo python3)
+
 OPENAPI_URL ?= http://127.0.0.1:8087/cf/openapi.json
 OPENAPI_OUT ?= docs/api/api.json
 
@@ -114,7 +119,7 @@ endef
 
 # Show the help message with list of commands (default target)
 help:
-	@python3 tools/scripts/make_help.py Makefile
+	@$(PYTHON) tools/scripts/make_help.py Makefile
 
 
 # -------- Set up --------
@@ -139,8 +144,10 @@ setup: .setup-stamp
 	cargo install cargo-hack
 	cargo install gts-validator
 	@if echo "$$OS" | grep -iq windows || [ -n "$$COMSPEC" ]; then \
-		echo "WARNING: kani-verifier and cargo-llvm-cov installation skipped on Windows."; \
-		echo "These tools are not supported on Windows. Use WSL2 or Docker to install instead."; \
+		echo "NOTE: kani-verifier is not supported on Windows; skipping (use WSL2/Docker for Kani)."; \
+		echo "Installing cargo-llvm-cov (supported on Windows; needs llvm-tools-preview)..."; \
+		rustup component add llvm-tools-preview; \
+		cargo install cargo-llvm-cov; \
 		if ! command -v nasm >/dev/null 2>&1; then \
 			echo "Installing NASM (required by aws-lc-sys on Windows)..."; \
 			winget install NASM.NASM --accept-source-agreements --accept-package-agreements || \
@@ -170,7 +177,7 @@ fmt:
 
 ## Validate gear folder names follow kebab-case convention
 validate-gear-names:
-	@python3 tools/scripts/validate_gear_names.py
+	@$(PYTHON) tools/scripts/validate_gear_names.py
 
 # -------- Code safety checks --------
 #
@@ -388,12 +395,12 @@ openapi:
 	mkdir -p $$(dirname "$(OPENAPI_OUT)") && \
 	curl -fsS "$(OPENAPI_URL)" -o "$(OPENAPI_OUT)" && \
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
-	python3 tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
+	$(PYTHON) tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
 	echo "OpenAPI spec saved to $(OPENAPI_OUT)"
 
 ## Generate Markdown files map
 md-fabric:
-	python3 ./tools/scripts/md-fabric.py --out docs/md-fabric/md-fabric.html
+	$(PYTHON) ./tools/scripts/md-fabric.py --out docs/md-fabric/md-fabric.html
 
 ## Build the slides with Marp
 slides:
@@ -555,25 +562,25 @@ e2e: e2e-docker
 
 ## Run E2E tests in Docker environment
 e2e-docker:
-	python3 tools/scripts/ci.py e2e-docker -- $(E2E_TARGET)
+	$(PYTHON) tools/scripts/ci.py e2e-docker -- $(E2E_TARGET)
 
 ## Run E2E smoke tests in Docker (only tests marked @pytest.mark.smoke)
 e2e-docker-smoke:
-	python3 tools/scripts/ci.py e2e-docker -- -m smoke $(E2E_TARGET)
+	$(PYTHON) tools/scripts/ci.py e2e-docker -- -m smoke $(E2E_TARGET)
 
 # Run E2E tests locally, use `make e2e-local E2E_TARGET=testing/e2e/gears/` to specify target
 e2e-local:
-	python3 tools/scripts/ci.py e2e-local -- $(E2E_TARGET)
+	$(PYTHON) tools/scripts/ci.py e2e-local -- $(E2E_TARGET)
 
 ## Run RG + AuthZ barrier E2E tests with tr-authz-plugin going through TR -> RG
 e2e-tr-authz:
-	python3 tools/scripts/ci.py e2e-local \
+	$(PYTHON) tools/scripts/ci.py e2e-local \
 		--config config/e2e-tr-authz.yaml \
 		-- -k "resource_group"
 
 ## Run E2E smoke tests locally (only tests marked @pytest.mark.smoke)
 e2e-local-smoke:
-	python3 tools/scripts/ci.py e2e-local --smoke
+	$(PYTHON) tools/scripts/ci.py e2e-local --smoke
 
 MINI_CHAT_FEATURES = mini-chat,static-authn,static-authz,single-tenant,static-credstore
 MINI_CHAT_K8S_FEATURES = $(MINI_CHAT_FEATURES),k8s
@@ -585,7 +592,7 @@ MINI_CHAT_TAG   ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo latest
 e2e-mini-chat:
 	cargo build --bin cf-gears-example-server --features=$(MINI_CHAT_FEATURES)
 	E2E_BINARY=target/debug/cf-gears-example-server \
-		python3 -m pytest testing/e2e/gears/mini_chat/ --mode offline -vv
+		$(PYTHON) -m pytest testing/e2e/gears/mini_chat/ --mode offline -vv
 
 # -------- Code coverage --------
 
@@ -594,21 +601,21 @@ e2e-mini-chat:
 # Generate code coverage report (unit + e2e-local tests)
 coverage:
 	$(call check_tool,cargo-llvm-cov)
-	python3 tools/scripts/coverage.py combined
+	$(PYTHON) tools/scripts/coverage.py combined
 
 # Generate code coverage report (unit tests only)
 coverage-unit:
 	$(call check_tool,cargo-llvm-cov)
-	python3 tools/scripts/coverage.py unit
+	$(PYTHON) tools/scripts/coverage.py unit
 
 ## Ensure needed packages and programs installed for local e2e testing
 check-prereq-e2e-local:
-	python3 tools/scripts/check_local_env.py --mode e2e-local
+	$(PYTHON) tools/scripts/check_local_env.py --mode e2e-local
 
 # Generate code coverage report (e2e-local tests only)
 coverage-e2e-local: check-prereq-e2e-local
 	$(call check_tool,cargo-llvm-cov)
-	python3 tools/scripts/coverage.py e2e-local
+	$(PYTHON) tools/scripts/coverage.py e2e-local
 
 # -------- Fuzzing --------
 
