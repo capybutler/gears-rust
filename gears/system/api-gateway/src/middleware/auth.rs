@@ -1,6 +1,5 @@
 use axum::http::Method;
 use axum::response::IntoResponse;
-use http::HeaderValue;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::middleware::common;
@@ -200,13 +199,19 @@ pub async fn authn_middleware(
         }
         AuthRequirement::Required => {
             let Some(token) = extract_bearer_token(req.headers()) else {
-                let err = CanonicalError::unauthenticated()
-                    .with_reason("MISSING_BEARER")
-                    .create();
                 // `instance` / `trace_id` are filled by the canonical
                 // error middleware (`toolkit::api::canonical_error_middleware`)
                 // on the way out — this middleware sits inside its layer.
-                return err.into_response();
+                let mut response = CanonicalError::unauthenticated()
+                    .with_reason("MISSING_BEARER")
+                    .create()
+                    .into_response();
+                // No bearer credentials were presented (RFC 6750 §3).
+                common::append_bearer_challenge(
+                    &mut response,
+                    common::BearerChallenge::NoCredentials,
+                );
+                return response;
             };
 
             match state.authn_client.authenticate(token).await {
@@ -229,19 +234,12 @@ fn authn_error_to_response(err: &AuthNResolverError) -> axum::response::Response
     log_authn_error(err);
     match err {
         AuthNResolverError::Unauthorized(_) => {
-            // A token was presented but rejected. RFC 6750 §3 requires a
-            // rejected bearer request to carry a `WWW-Authenticate` challenge,
-            // with an `error` code when a token was supplied — here
-            // `invalid_token`. We deliberately omit `realm` and
-            // `error_description` so the challenge discloses no internal detail.
+            // A token was presented but rejected (RFC 6750 §3).
             let mut response = CanonicalError::unauthenticated()
                 .with_reason("AUTHN_FAILED")
                 .create()
                 .into_response();
-            response.headers_mut().append(
-                "WWW-Authenticate",
-                HeaderValue::from_static(r#"Bearer error="invalid_token""#),
-            );
+            common::append_bearer_challenge(&mut response, common::BearerChallenge::InvalidToken);
             response
         }
         AuthNResolverError::NoPluginAvailable | AuthNResolverError::ServiceUnavailable(_) => {
