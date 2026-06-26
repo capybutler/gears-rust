@@ -38,6 +38,7 @@ ignore = [
   "RUSTSEC-2024-0437", # protobuf 2.28 stack overflow — transitive via pingora-core→prometheus 0.13; we never parse untrusted protobuf (prometheus metrics endpoint is unused)
   "RUSTSEC-2023-0071", # Marvin Attack timing sidechannel in rsa 0.9 — dev-only dep of rustls-corecrypto-provider; used solely for RSA-PSS *verification* (public-key op, no private key involved) in rsa_pss_apple_salt_length_matches_rfc8017 test; no safe upgrade available; advisory itself permits "local use on a non-compromised computer"
   "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained — direct dep of our proc-macro crate cf-gears-toolkit-db-macros (compile-time only, never in any runtime artifact); no advisory of a vulnerability, only maintenance status. Tracked for migration to std syn::Error -> compile_error! emission.
+  "RUSTSEC-2026-0187", # lopdf <0.42 unbounded-recursion DoS on crafted PDFs — transitive via kreuzberg→cf-gears-file-parser→cf-gears-example-server (example app only, never parses untrusted PDFs). No usable fix: kreuzberg 4.9.x pins lopdf "^0.41" (<0.42) and the fix landed in 0.42.0; 5.x drops the bundled-pdfium feature we use. Remove once kreuzberg ships a release allowing lopdf >=0.42.
 ]
 
 # Note:
