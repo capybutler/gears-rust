@@ -319,13 +319,18 @@ does not block the usage-type / dimensions decision. The UsageType entity
 does NOT yet declare a `unit` field.
 
 `UsageTypeGtsId` is a newtype wrapping the platform-primitive `gts::GtsID`
-(re-exported by `libs/toolkit-gts`). Its `Deserialize` impl parses the input
-string as a GTS type id (trailing `~`) and asserts the parsed value derives
-from the reserved abstract base `USAGE_RECORD_BASE = "gts.cf.core.uc.usage_record.v1~"`
-(exposed by the usage-collector SDK / contracts crate) with at least one
-further `~`-separated derivation segment. The newtype is the validation
-point on REST `Json<UsageType>` deserialization at
-`POST /usage-collector/v1/usage-types`. The `kind` field is validated
+(re-exported by `libs/toolkit-gts`). `UsageTypeGtsId::new` parses the input
+string as a GTS *instance* id and rejects a type id (one ending in `~`),
+then asserts the parsed value derives directly from the reserved abstract
+base `USAGE_RECORD_BASE = "gts.cf.core.uc.usage_record.v1~"` (exposed by the
+usage-collector SDK / contracts crate) — the base plus exactly one further
+`~`-separated derivation segment, so a well-formed value contains one `~`
+and never ends with one. The bare base is itself a type id and is rejected.
+The newtype is the validation point inside the
+`POST /usage-collector/v1/usage-types` handler, not at deserialization:
+`CreateUsageTypeRequest::gts_id` is a permissive `String` so the handler can
+surface the canonical `invalid_base_gts_id` `Problem` rather than axum's
+`text/plain` rejection. The `kind` field is validated
 independently by parsing the permissive `CreateUsageTypeRequest::kind`
 string through `UsageKind::from_str` at the handler boundary (unknown
 values rejected).

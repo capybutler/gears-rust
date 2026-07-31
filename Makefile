@@ -573,7 +573,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector
 
 E2E_TARGET ?=
 
@@ -613,6 +613,14 @@ e2e-mini-chat:
 	cargo build --bin cf-gears-example-server --features=$(MINI_CHAT_FEATURES)
 	E2E_BINARY=target/debug/cf-gears-example-server \
 		$(PYTHON) -m pytest testing/e2e/gears/mini_chat/ --mode offline -vv
+
+UC_E2E_FEATURES = usage-collector,timescaledb-usage-collector,static-tenants,static-authn,static-authz
+
+## Run usage-collector E2E tests (dedicated binary + TimescaleDB container; Docker required)
+e2e-usage-collector:
+	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES)
+	E2E_BINARY=target/debug/cf-gears-example-server \
+		$(PYTHON) -m pytest testing/e2e/gears/usage_collector/ -vv
 
 # -------- Code coverage --------
 
