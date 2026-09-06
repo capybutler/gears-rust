@@ -112,7 +112,14 @@ impl Gear for UsageCollectorModule {
             cfg.type_cache_ttl_secs,
             cfg.type_cache_capacity,
         );
-        let svc = Service::new_with_metrics(hub, cfg.vendor, enforcer, metrics, type_resolver);
+        let svc = Service::new_with_metrics(
+            hub,
+            cfg.vendor,
+            enforcer,
+            metrics,
+            type_resolver,
+            cfg.metadata_size_cap_bytes,
+        );
 
         let svc = Arc::new(svc);
         self.service

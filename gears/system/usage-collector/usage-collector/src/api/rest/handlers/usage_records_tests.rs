@@ -33,7 +33,7 @@ use crate::api::rest::dto::{CreateUsageRecordRequest, CreateUsageRecordsRequest,
 use crate::domain::Service;
 use crate::domain::test_support::{
     CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx, enforcer_for,
-    service_with_permit,
+    fake_declaration_source_with_fold, service_with_permit, service_with_permit_and_source,
 };
 
 /// Wire a `Service` against a counting unreachable-PDP resolver and an
@@ -331,20 +331,12 @@ async fn deactivate_with_unreachable_pdp_surfaces_503() {
 
 use std::collections::BTreeMap;
 use usage_collector_sdk::{
-    IdempotencyKey, ResourceRef, UsageKind, UsageRecord, UsageRecordStatus, UsageType,
-    UsageTypeGtsId, derive_usage_record_id,
+    IdempotencyKey, ResourceRef, UsageRecord, UsageRecordStatus, UsageTypeGtsId,
+    derive_usage_record_id,
 };
 
 const HAPPY_RECORD_GTS_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
-
-fn happy_usage_type() -> UsageType {
-    UsageType {
-        gts_id: UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id"),
-        kind: UsageKind::Counter,
-        metadata_fields: std::collections::BTreeSet::new(),
-    }
-}
 
 fn sample_persisted_record(id: Uuid, tenant_id: Uuid) -> UsageRecord {
     sample_persisted_record_with_status(id, tenant_id, UsageRecordStatus::Active)
@@ -395,8 +387,6 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
     // MUST be the persisted id — proving the handler composes the
     // response from the SERVICE-RETURNED record, not from the dispatched one.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(happy_usage_type());
-
     let tenant_id = Uuid::from_u128(2);
     let gts_id = UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id");
     let idempotency_key = IdempotencyKey::new("idem-happy").expect("valid idempotency key");
@@ -410,9 +400,10 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
     assert_ne!(derived_id, persisted_uuid, "test premise");
     plugin.set_create_records(vec![Ok(sample_persisted_record(persisted_uuid, tenant_id))]);
 
-    let service = service_with_permit(
+    let service = service_with_permit_and_source(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.create_records.happy.v1",
+        fake_declaration_source_with_fold("SUM"),
     );
 
     let req = CreateUsageRecordsRequest {
@@ -491,8 +482,6 @@ async fn create_stamps_derived_id() {
     // `derive_usage_record_id` AND that a same-key resubmit derives the
     // identical id (determinism).
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(happy_usage_type());
-
     let tenant_id = Uuid::from_u128(2);
     let gts_id = UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id");
     let idempotency_key = IdempotencyKey::new("idem-derive-1").expect("valid idempotency key");
@@ -503,9 +492,10 @@ async fn create_stamps_derived_id() {
         OffsetDateTime::UNIX_EPOCH,
     );
 
-    let service = service_with_permit(
+    let service = service_with_permit_and_source(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.create_records.derive_id.v1",
+        fake_declaration_source_with_fold("SUM"),
     );
 
     let build_req = || CreateUsageRecordsRequest {
@@ -574,12 +564,11 @@ async fn create_same_key_different_created_at_derives_distinct_ids() {
     // values MUST be dispatched with DISTINCT ids (previously they collided on
     // one derived id).
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(happy_usage_type());
-
     let tenant_id = Uuid::from_u128(2);
-    let service = service_with_permit(
+    let service = service_with_permit_and_source(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.create_records.distinct_created_at.v1",
+        fake_declaration_source_with_fold("SUM"),
     );
 
     let build_req = |created_at: OffsetDateTime| CreateUsageRecordsRequest {
@@ -645,8 +634,6 @@ async fn create_records_happy_path_wire_body_projects_inactive_status_as_lowerca
     // case, empty string, or the wrong variant) would not surface in any
     // existing test.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(happy_usage_type());
-
     let tenant_id = Uuid::from_u128(2);
     let persisted_uuid = Uuid::new_v4();
     plugin.set_create_records(vec![Ok(sample_persisted_record_with_status(
@@ -655,9 +642,10 @@ async fn create_records_happy_path_wire_body_projects_inactive_status_as_lowerca
         UsageRecordStatus::Inactive,
     ))]);
 
-    let service = service_with_permit(
+    let service = service_with_permit_and_source(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.create_records.inactive_projection.v1",
+        fake_declaration_source_with_fold("SUM"),
     );
 
     let req = CreateUsageRecordsRequest {
@@ -715,8 +703,6 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
     // handler's sort-by-input-index step against a regression that would
     // append accepted entries after rejected ones.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(happy_usage_type());
-
     let tenant_id = Uuid::from_u128(2);
     let gts_id = UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id");
     let derived_id_0 = derive_usage_record_id(
@@ -738,9 +724,10 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         Ok(sample_persisted_record(persisted_uuid_2, tenant_id)),
     ]);
 
-    let service = service_with_permit(
+    let service = service_with_permit_and_source(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.create_records.mixed.v1",
+        fake_declaration_source_with_fold("SUM"),
     );
 
     let valid_record = |idem: &str| CreateUsageRecordRequest {

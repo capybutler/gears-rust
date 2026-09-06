@@ -556,19 +556,50 @@ pub fn hub_with_plugin(
     hub
 }
 
-/// Build a [`Service`] wired against a permit-by-default PDP and the
-/// supplied plugin stub, registered under the `cyberfabric` vendor.
+/// Shared builder behind [`service_with_permit`] / [`service_with_counting_permit`]
+/// / [`service_with_permit_and_source`] / [`service_with_counting_permit_and_source`]:
+/// wires a [`Service`] against a permit-by-default PDP and the supplied
+/// plugin stub (registered under the `cyberfabric` vendor) and the given
+/// pre-built Type Resolver, so the four public builders differ only in
+/// whether the resolver is the inert default or a working one over a
+/// [`DeclarationSource`].
 ///
 /// The PDP fake ([`CountingTenantPermitResolver`]) scopes its permit to the
 /// request's own `OWNER_TENANT_ID`, so per-record paths under
 /// `require_constraints(true)` pass the tenant gate for whatever tenant the
 /// record names, while the subject-only catalog surface (no `OWNER_TENANT_ID`,
 /// `require_constraints(false)`) still gets an `allow_all` permit.
+fn service_with_permit_over_resolver(
+    plugin: Arc<dyn UsageCollectorPluginV1>,
+    suffix: &str,
+    type_resolver: Arc<TypeResolver>,
+) -> (Arc<Service>, Arc<CountingTenantPermitResolver>) {
+    let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
+    let resolver = CountingTenantPermitResolver::new();
+    let enforcer = enforcer_for(Arc::clone(&resolver) as Arc<dyn AuthZResolverApi>);
+    let service = Arc::new(Service::new_with_metrics(
+        hub,
+        "cyberfabric".to_owned(),
+        enforcer,
+        Arc::new(NoopMetrics),
+        type_resolver,
+        crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+    ));
+    (service, resolver)
+}
+
+/// Build a [`Service`] wired against a permit-by-default PDP and the
+/// supplied plugin stub, registered under the `cyberfabric` vendor.
+///
+/// The Type Resolver is the inert [`UnavailableDeclarationSource`] default
+/// (see [`inert_type_resolver`]) — fine for tests that never reach
+/// declaration resolution (plugin-host / PDP / deactivation / by-id paths).
+/// A test that drives `create_usage_record{,s}` or
+/// `query_aggregated_usage_records` to completion needs a resolver that
+/// actually resolves — use [`service_with_permit_and_source`] instead.
 #[must_use]
 pub fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
-    let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
-    let enforcer = enforcer_for(CountingTenantPermitResolver::new());
-    Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+    service_with_permit_over_resolver(plugin, suffix, inert_type_resolver()).0
 }
 
 /// Variant of [`service_with_permit`] that exposes the underlying
@@ -579,11 +610,47 @@ pub fn service_with_counting_permit(
     plugin: Arc<dyn UsageCollectorPluginV1>,
     suffix: &str,
 ) -> (Arc<Service>, Arc<CountingTenantPermitResolver>) {
-    let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
-    let resolver = CountingTenantPermitResolver::new();
-    let enforcer = enforcer_for(Arc::clone(&resolver) as Arc<dyn AuthZResolverApi>);
-    let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
-    (service, resolver)
+    service_with_permit_over_resolver(plugin, suffix, inert_type_resolver())
+}
+
+/// Variant of [`service_with_permit`] wired with a working Type Resolver over
+/// `source` instead of the inert default — for ingestion tests that must
+/// reach declaration resolution (`create_usage_record` /
+/// `create_usage_records` now resolve the referenced meter's declaration
+/// before dispatch, unlike the pre-Task-9 plugin-owned catalog lookup
+/// [`service_with_permit`]'s inert resolver used to stand in for).
+#[must_use]
+pub fn service_with_permit_and_source(
+    plugin: Arc<dyn UsageCollectorPluginV1>,
+    suffix: &str,
+    source: Arc<dyn DeclarationSource>,
+) -> Arc<Service> {
+    service_with_permit_over_resolver(plugin, suffix, type_resolver_over(source)).0
+}
+
+/// Variant of [`service_with_counting_permit`] wired with a working Type
+/// Resolver over `source` — see [`service_with_permit_and_source`].
+#[must_use]
+pub fn service_with_counting_permit_and_source(
+    plugin: Arc<dyn UsageCollectorPluginV1>,
+    suffix: &str,
+    source: Arc<dyn DeclarationSource>,
+) -> (Arc<Service>, Arc<CountingTenantPermitResolver>) {
+    service_with_permit_over_resolver(plugin, suffix, type_resolver_over(source))
+}
+
+/// A working Type Resolver over `source`, with a TTL generous enough that a
+/// test's several service calls hit the same cached entry rather than
+/// re-resolving (mirrors [`service_with_recording_plugin`]'s cache policy).
+#[must_use]
+fn type_resolver_over(source: Arc<dyn DeclarationSource>) -> Arc<TypeResolver> {
+    Arc::new(TypeResolver::new(
+        source,
+        TypeResolverConfig {
+            ttl: std::time::Duration::from_mins(1),
+            capacity: 16,
+        },
+    ))
 }
 
 // ── Metrics-instrumented Service builders + in-memory readback ──────────────
@@ -621,24 +688,49 @@ pub fn local_metrics() -> (
 
 /// A [`Service`] wired against `resolver` + `plugin` (under `cyberfabric`) with
 /// a real metrics adapter bound to the returned provider/exporter.
+///
+/// The Type Resolver is the inert default — fine for tests that don't drive
+/// ingestion / aggregate-query to completion. A test that does needs a
+/// working resolver — use [`service_with_metrics_and_source`] instead.
 #[must_use]
 pub fn service_with_metrics(
     plugin: Arc<dyn UsageCollectorPluginV1>,
     suffix: &str,
     resolver: Arc<dyn AuthZResolverApi>,
 ) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
+    service_with_metrics_over_resolver(plugin, suffix, resolver, inert_type_resolver())
+}
+
+/// Variant of [`service_with_metrics`] wired with a working Type Resolver
+/// over `source` instead of the inert default — for ingestion-metrics tests
+/// that must reach declaration resolution.
+#[must_use]
+pub fn service_with_metrics_and_source(
+    plugin: Arc<dyn UsageCollectorPluginV1>,
+    suffix: &str,
+    resolver: Arc<dyn AuthZResolverApi>,
+    source: Arc<dyn DeclarationSource>,
+) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
+    service_with_metrics_over_resolver(plugin, suffix, resolver, type_resolver_over(source))
+}
+
+/// Shared builder behind [`service_with_metrics`] / [`service_with_metrics_and_source`].
+#[must_use]
+fn service_with_metrics_over_resolver(
+    plugin: Arc<dyn UsageCollectorPluginV1>,
+    suffix: &str,
+    resolver: Arc<dyn AuthZResolverApi>,
+    type_resolver: Arc<TypeResolver>,
+) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
     let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
     let (metrics, provider, exporter) = local_metrics();
-    // These tests assert on emitted PDP/plugin instruments, not on type
-    // resolution, so the resolver is inert here (see `inert_type_resolver`)
-    // the same way `Service::new`'s own default is — no reason for this
-    // domain-layer test helper to reach into `infra` for one.
     let service = Arc::new(Service::new_with_metrics(
         hub,
         "cyberfabric".to_owned(),
         enforcer_for(resolver),
         metrics,
-        inert_type_resolver(),
+        type_resolver,
+        crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
     ));
     (service, provider, exporter)
 }
@@ -673,6 +765,7 @@ pub fn service_with_metrics_unready_plugin(
         enforcer_for(resolver),
         metrics,
         inert_type_resolver(),
+        crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
     ));
     (service, provider, exporter)
 }
@@ -1364,7 +1457,6 @@ pub(crate) fn fake_declaration_source_with_fold(fold: &str) -> Arc<dyn Declarati
 /// A `DeclarationSource` resolving to a meter whose metadata surface declares
 /// exactly `keys`.
 #[must_use]
-#[allow(dead_code)] // consumed starting Task 9 (ingestion metadata validation)
 pub(crate) fn fake_declaration_source_with_metadata(keys: &[&str]) -> Arc<dyn DeclarationSource> {
     Arc::new(FakeDeclarationSource {
         fold: "SUM".to_owned(),
@@ -1391,22 +1483,77 @@ pub(crate) fn fake_declaration_source_not_found() -> Arc<dyn DeclarationSource> 
     Arc::new(NotFoundDeclarationSource)
 }
 
-/// A [`DeclarationSource`] counting its `fetch` calls, so a batch test can
-/// assert one resolution per distinct meter rather than one per record.
-/// Resolves every `id` the same way [`FakeDeclarationSource`] does (fold
-/// `SUM`, unit `bytes`, no metadata properties).
-#[allow(dead_code)] // constructed starting Task 12/13 (batch dedup tests)
+/// A [`DeclarationSource`] that resolves every id except `unresolvable`,
+/// which always answers a definite not-found — the mixed-batch analogue of
+/// [`fake_declaration_source_not_found`], for a test driving "one distinct
+/// type resolves, another does not" in the same batch. Also counts its
+/// `fetch` calls (mirroring [`CountingDeclarationSource`]) so such a test can
+/// still assert one resolution per distinct meter, not one per record, even
+/// though one of the distinct ids never populates the cache.
+pub(crate) struct PartiallyUnresolvableDeclarationSource {
+    inner: FakeDeclarationSource,
+    unresolvable: MeterTypeId,
+    calls: AtomicUsize,
+}
+
+impl PartiallyUnresolvableDeclarationSource {
+    /// Total number of `fetch` calls observed so far.
+    #[must_use]
+    pub(crate) fn fetch_calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl DeclarationSource for PartiallyUnresolvableDeclarationSource {
+    async fn fetch(&self, id: &MeterTypeId) -> Result<GtsTypeSchema, DomainError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if id == &self.unresolvable {
+            return Err(DomainError::declaration_not_found(id));
+        }
+        self.inner.fetch(id).await
+    }
+}
+
+/// A `DeclarationSource` resolving every id to a meter declaring `SUM` /
+/// `bytes` / no metadata properties, except `unresolvable`, which always
+/// answers a definite not-found.
+#[must_use]
+pub(crate) fn fake_declaration_source_with_one_unresolvable(
+    unresolvable: MeterTypeId,
+) -> Arc<PartiallyUnresolvableDeclarationSource> {
+    Arc::new(PartiallyUnresolvableDeclarationSource {
+        inner: FakeDeclarationSource {
+            fold: "SUM".to_owned(),
+            metadata_keys: Vec::new(),
+        },
+        unresolvable,
+        calls: AtomicUsize::new(0),
+    })
+}
+
+/// A [`DeclarationSource`] counting its `fetch` calls (and recording the id
+/// each one resolved), so a batch test can assert one resolution per
+/// distinct meter rather than one per record. Resolves every `id` the same
+/// way [`FakeDeclarationSource`] does (fold `SUM`, unit `bytes`, no metadata
+/// properties).
 pub(crate) struct CountingDeclarationSource {
     inner: FakeDeclarationSource,
     calls: AtomicUsize,
+    inputs: Mutex<Vec<MeterTypeId>>,
 }
 
 impl CountingDeclarationSource {
     /// Total number of `fetch` calls observed so far.
     #[must_use]
-    #[allow(dead_code)] // consumed starting Task 12/13 (batch dedup tests)
     pub(crate) fn fetch_calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Every id passed to `fetch`, in call order.
+    #[must_use]
+    pub(crate) fn fetch_inputs(&self) -> Vec<MeterTypeId> {
+        self.inputs.lock().expect("mutex").clone()
     }
 }
 
@@ -1414,6 +1561,7 @@ impl CountingDeclarationSource {
 impl DeclarationSource for CountingDeclarationSource {
     async fn fetch(&self, id: &MeterTypeId) -> Result<GtsTypeSchema, DomainError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inputs.lock().expect("mutex").push(id.clone());
         self.inner.fetch(id).await
     }
 }
@@ -1421,7 +1569,6 @@ impl DeclarationSource for CountingDeclarationSource {
 /// A `DeclarationSource` counting its calls, so a batch test can assert one
 /// resolution per distinct meter rather than one per record.
 #[must_use]
-#[allow(dead_code)] // consumed starting Task 12/13 (batch dedup tests)
 pub(crate) fn fake_declaration_source_counting() -> Arc<CountingDeclarationSource> {
     Arc::new(CountingDeclarationSource {
         inner: FakeDeclarationSource {
@@ -1429,6 +1576,7 @@ pub(crate) fn fake_declaration_source_counting() -> Arc<CountingDeclarationSourc
             metadata_keys: Vec::new(),
         },
         calls: AtomicUsize::new(0),
+        inputs: Mutex::new(Vec::new()),
     })
 }
 
@@ -1450,8 +1598,26 @@ pub(crate) fn fake_declaration_source_counting() -> Arc<CountingDeclarationSourc
 /// `service_with_metrics`, `service_with_metrics_unready_plugin`) — none of
 /// them await anything either, so this one does not introduce an
 /// inconsistent shape by staying sync too.
+///
+/// Enforces the default metadata size cap
+/// ([`crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES`]) — a test
+/// exercising a non-default configured cap should use
+/// [`service_with_recording_plugin_and_cap`] instead.
 pub(crate) fn service_with_recording_plugin(
     source: Arc<dyn DeclarationSource>,
+) -> (Service, Arc<RecordingPlugin>) {
+    service_with_recording_plugin_and_cap(
+        source,
+        crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+    )
+}
+
+/// Variant of [`service_with_recording_plugin`] taking an explicit
+/// `metadata_size_cap_bytes`, for tests pinning that a non-default
+/// configured cap is actually honoured by the ingestion path.
+pub(crate) fn service_with_recording_plugin_and_cap(
+    source: Arc<dyn DeclarationSource>,
+    metadata_size_cap_bytes: usize,
 ) -> (Service, Arc<RecordingPlugin>) {
     let plugin = RecordingPlugin::new();
     let hub = hub_with_plugin(
@@ -1464,19 +1630,13 @@ pub(crate) fn service_with_recording_plugin(
         Uuid::from_u128(2).to_string(),
     );
     let enforcer = enforcer_for(Arc::clone(&resolver) as Arc<dyn AuthZResolverApi>);
-    let type_resolver = Arc::new(TypeResolver::new(
-        source,
-        TypeResolverConfig {
-            ttl: std::time::Duration::from_mins(1),
-            capacity: 16,
-        },
-    ));
     let service = Service::new_with_metrics(
         hub,
         "cyberfabric".to_owned(),
         enforcer,
         Arc::new(NoopMetrics),
-        type_resolver,
+        type_resolver_over(source),
+        metadata_size_cap_bytes,
     );
     (service, plugin)
 }

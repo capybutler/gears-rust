@@ -9,7 +9,11 @@
 //!   then make malformed declarations impossible past this conversion.
 //! - [`validate_submit_record_metadata`] enforces the ingest-time closed
 //!   shape membership and the configurable size cap against an already-typed
-//!   `BTreeMap<MetadataKey, String>`.
+//!   `BTreeMap<MetadataKey, String>`, validating against the meter's
+//!   resolved [`ResolvedDeclaration`] rather than a plugin-owned `UsageType`
+//!   (Task 9): the declaration's compiled `metadata_schema` is the closed
+//!   surface, enforced in code per
+//!   [`crate::domain::type_resolver::CompiledMetadataSchema::validate`].
 //!
 //! `gts_id` is NOT re-validated here: [`usage_collector_sdk::UsageTypeGtsId`]
 //! is a validating newtype that already rejects empty values, ids missing
@@ -21,15 +25,21 @@
 //! non-empty strings" but does NOT require at least one entry — a usage
 //! type may accept no caller-supplied metadata keys, only the mandatory
 //! attribution composites.
+//!
+//! [`validate_record_semantics`] no longer takes a `UsageType`: with usage-type
+//! ownership moved to `types-registry`, there is no caller-visible `kind` left
+//! to enforce a gauge/counter value-sign rule against, so those branches are
+//! deleted outright (not relocated). The `corrects_id` / compensation
+//! mechanism itself is unaffected — it is removed in a later slice, not
+//! this one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rust_decimal::Decimal;
 use toolkit_macros::domain_model;
-use usage_collector_sdk::{
-    MetadataKey, UsageCollectorError, UsageRecord, UsageRecordStatus, UsageType,
-};
+use usage_collector_sdk::{MetadataKey, UsageCollectorError, UsageRecord, UsageRecordStatus};
 use uuid::Uuid;
+
+use crate::domain::type_resolver::ResolvedDeclaration;
 
 /// Convert the wire-permissive `Vec<String>` into the SDK's
 /// [`BTreeSet<MetadataKey>`] per
@@ -76,20 +86,37 @@ pub fn metadata_fields_from_wire(
     // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-usage-type-shape-validation:p1:inst-algo-shape-return-valid
 }
 
-/// Per-record metadata payload size cap (8 KiB) enforced on
-/// `create_usage_record` before plugin dispatch.
+/// Default per-record metadata payload size cap (8 KiB), enforced on
+/// `create_usage_record` before plugin dispatch when the host has no more
+/// specific configured value.
+///
+/// `UsageCollectorConfig::metadata_size_cap_bytes` (Task 7) defaults to the
+/// identical `8192`, so a `Service` built without an explicit cap (every
+/// `Service::new` / `Service::new_with_metrics` caller not itself threading a
+/// configured value) enforces exactly this constant — wiring the config value
+/// through is a behavioural no-op for the default deployment. `pub(crate)` so
+/// `crate::config` and `crate::domain::service` can both anchor their own
+/// defaults on this single constant rather than duplicating the magic number.
 // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-read-cap
-const RECORD_METADATA_SIZE_CAP_BYTES: usize = 8 * 1024;
+pub(crate) const DEFAULT_METADATA_SIZE_CAP_BYTES: usize = 8 * 1024;
 // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-read-cap
 
 /// Validates the `metadata` payload of a `UsageRecord` submission against the
-/// referenced `UsageType` per the usage-emission ingestion contract.
+/// referenced meter's resolved [`ResolvedDeclaration`] per the usage-emission
+/// ingestion contract.
 ///
-/// Runs two checks: a closed-shape key check (every key MUST be a member of
-/// `UsageType.metadata_fields`, surfaced as
-/// [`UsageCollectorError::InvalidArgument`]) and a size cap (serialized
-/// metadata ≤ [`RECORD_METADATA_SIZE_CAP_BYTES`], surfaced as
-/// [`UsageCollectorError::InvalidArgument`]).
+/// Runs two checks: a closed-shape / per-value check delegated to the
+/// declaration's compiled
+/// [`metadata_schema`](ResolvedDeclaration::metadata_schema) (every key MUST
+/// be a member of the declared closed surface, and every declared key's value
+/// MUST satisfy whatever per-value constraint the schema names — both
+/// enforced in code, surfaced as [`UsageCollectorError::InvalidArgument`])
+/// and a size cap (serialized metadata ≤ `metadata_size_cap_bytes`, surfaced
+/// as [`UsageCollectorError::InvalidArgument`]). `metadata_size_cap_bytes` is
+/// the caller's configured cap (`Service::metadata_size_cap_bytes`, itself
+/// threaded from `UsageCollectorConfig::metadata_size_cap_bytes`), not a
+/// hard-coded constant — see [`DEFAULT_METADATA_SIZE_CAP_BYTES`] for the
+/// value it defaults to.
 ///
 /// The "metadata must be a JSON object" and "value must be a string" branches
 /// no longer exist here: the SDK / REST DTO now carries `metadata` as a
@@ -103,20 +130,20 @@ const RECORD_METADATA_SIZE_CAP_BYTES: usize = 8 * 1024;
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-constraint-no-business-logic:p1
 #[allow(clippy::missing_errors_doc)]
 pub fn validate_submit_record_metadata(
-    usage_type: &UsageType,
+    declaration: &ResolvedDeclaration,
     metadata: &BTreeMap<MetadataKey, String>,
+    metadata_size_cap_bytes: usize,
 ) -> Result<(), UsageCollectorError> {
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-closed-shape
-    for key in metadata.keys() {
-        if !usage_type.metadata_fields.contains(key) {
-            // @cpt-begin:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-reject
-            return Err(UsageCollectorError::unknown_metadata_key(
-                &usage_type.gts_id,
-                key.as_str(),
-            ));
-            // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-reject
-        }
-    }
+    // `CompiledMetadataSchema::validate` takes plain `String` keys (it is
+    // shared with the read-path query surface, which has no `MetadataKey`
+    // newtype of its own); the conversion is a cheap per-entry copy, not a
+    // second validation pass.
+    let plain_metadata: BTreeMap<String, String> = metadata
+        .iter()
+        .map(|(key, value)| (key.as_str().to_owned(), value.clone()))
+        .collect();
+    declaration.metadata_schema.validate(&plain_metadata)?;
     // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-closed-shape
 
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-read-input
@@ -133,10 +160,10 @@ pub fn validate_submit_record_metadata(
         .map_err(|err| {
             UsageCollectorError::internal(format!("metadata size measurement failed: {err}"))
         })?;
-    if size > RECORD_METADATA_SIZE_CAP_BYTES {
+    if size > metadata_size_cap_bytes {
         return Err(UsageCollectorError::metadata_size_exceeded(
             size,
-            RECORD_METADATA_SIZE_CAP_BYTES,
+            metadata_size_cap_bytes,
         ));
     }
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-exceeds
@@ -151,127 +178,51 @@ pub fn validate_submit_record_metadata(
     // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-return-valid
 }
 
-/// Outcome of the synchronous four-cell value-matrix check inside
-/// `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`.
+/// Outcome of the write-path semantics check.
 ///
-/// The semantics-enforcement algorithm is split into two halves so the host
-/// service can sequence them around the L1 `corrects_id` SPI lookup:
+/// Pre-Task-9 this was the result of a four-cell `(MetricSemantics ×
+/// corrects_id presence)` value-sign matrix keyed off a plugin-owned
+/// `UsageType.kind`. With usage-type ownership moved to `types-registry`
+/// there is no caller-visible `kind` left, so the matrix — and the
+/// gauge/counter value-sign rules it enforced — is deleted outright, not
+/// relocated. Only the `corrects_id`-presence half of the check survives:
 ///
-/// * [`validate_record_semantics`] is sync and runs the (`MetricSemantics` ×
-///   `corrects_id` presence) value-sign matrix. When the submitted record
-///   carries a `corrects_id` against a counter usage type it returns
-///   [`SemanticsOutcome::NeedsL1Lookup`] so the caller dispatches the SPI
-///   single-row read and runs [`verify_l1_corrects_id`] against the result.
-/// * [`verify_l1_corrects_id`] is sync and runs the four L1 referential
-///   checks against the referenced row returned by the SPI.
+/// * [`validate_record_semantics`] is sync and infallible: it only reads
+///   whether the submitted record carries a `corrects_id`. When it does, it
+///   returns [`SemanticsOutcome::NeedsL1Lookup`] so the caller dispatches
+///   the SPI single-row read and runs [`verify_l1_corrects_id`] against the
+///   result.
+/// * [`verify_l1_corrects_id`] is sync and runs the L1 referential checks
+///   against the referenced row returned by the SPI.
+///
+/// The `corrects_id` / compensation mechanism itself (this enum included) is
+/// unaffected by this change — it is removed in a later slice, not this one.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticsOutcome {
-    /// Value-matrix accepted the submission AND no L1 lookup is needed
-    /// (ordinary counter usage row or ordinary gauge submission).
+    /// The submission carries no `corrects_id`; no L1 lookup is needed.
     Valid,
-    /// Value-matrix accepted the counter compensation submission; the
-    /// caller MUST dispatch `get_usage_record(corrects_id)` and run
-    /// [`verify_l1_corrects_id`] before persisting.
+    /// The submission carries a `corrects_id`; the caller MUST dispatch
+    /// `get_usage_record(corrects_id)` and run [`verify_l1_corrects_id`]
+    /// before persisting.
     NeedsL1Lookup {
         /// `corrects_id` to look up via the storage Plugin SPI.
         corrects_id: Uuid,
     },
 }
 
-/// Run the synchronous half of
-/// `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`:
-/// the four-cell `(MetricSemantics × corrects_id presence)` value-sign matrix.
+/// Does this submission carry a `corrects_id`?
 ///
-/// Returns [`SemanticsOutcome::Valid`] for ordinary counter / gauge
-/// submissions; [`SemanticsOutcome::NeedsL1Lookup`] for a counter
-/// compensation whose value-sign passes (caller MUST follow up with an SPI
-/// `get_usage_record` + [`verify_l1_corrects_id`]).
-///
-/// # Errors
-///
-/// * [`UsageCollectorError::InvalidArgument`] for an ordinary counter
-///   record with `value < 0`.
-/// * [`UsageCollectorError::InvalidArgument`] for a counter
-///   compensation with `value >= 0` (zero is not accepted).
-/// * [`UsageCollectorError::InvalidArgument`] (wire
-///   `GAUGE_COMPENSATION_REJECTED`) when a gauge usage type is submitted
-///   with `corrects_id` set.
-/// * [`UsageCollectorError::Internal`] for the defensive unreachable
-///   `kind` arm (the [`crate::models::UsageTypeGtsId`] newtype constrains
-///   the prefix to exactly counter / gauge — hitting this means the
-///   catalog read was inconsistent).
-// @cpt-algo:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-counter-semantics:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-gauge-semantics:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-value-matrix:p1
+/// Infallible: with the `kind`-driven value-sign matrix deleted (see
+/// [`SemanticsOutcome`]'s doc comment), there is nothing left here that can
+/// reject a submission — only presence/absence of `corrects_id` decides
+/// whether the caller must follow up with the L1 SPI lookup.
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-compensation-no-business-logic:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-principle-semantics-enforcement:p1
-pub fn validate_record_semantics(
-    usage_type: &UsageType,
-    record: &UsageRecord,
-) -> Result<SemanticsOutcome, UsageCollectorError> {
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-read-input-v2
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-read-type-v2
-    let value_signum = value_signum(record.value);
-    let corrects_id = record.corrects_id;
-    // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-read-type-v2
-    // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-read-input-v2
-
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-branch-v2
-    if usage_type.is_counter() {
-        match corrects_id {
-            // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-usage
-            None => {
-                // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-usage-negative
-                if value_signum < 0 {
-                    return Err(UsageCollectorError::negative_counter_value(record.value));
-                }
-                // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-usage-negative
-                // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-usage-valid
-                Ok(SemanticsOutcome::Valid)
-                // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-usage-valid
-            }
-            // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-usage
-            // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-compensation
-            Some(corrects_id) => {
-                // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-compensation-non-negative
-                if value_signum >= 0 {
-                    return Err(UsageCollectorError::non_negative_counter_compensation(
-                        record.value,
-                    ));
-                }
-                // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-compensation-non-negative
-                Ok(SemanticsOutcome::NeedsL1Lookup { corrects_id })
-            } // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-compensation
-        }
-    // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-branch-v2
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-gauge-branch-v2
-    } else if usage_type.is_gauge() {
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-gauge-compensation-rejected
-        if corrects_id.is_some() {
-            return Err(UsageCollectorError::gauge_compensation_rejected(
-                &usage_type.gts_id,
-            ));
-        }
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-gauge-compensation-rejected
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-gauge-accept-v2
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-gauge-valid-v2
-        Ok(SemanticsOutcome::Valid)
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-gauge-valid-v2
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-gauge-accept-v2
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-gauge-branch-v2
-    } else {
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-unsupported-v2
-        // Defensive — the `UsageTypeGtsId` newtype constrains the prefix to
-        // exactly counter / gauge, so this arm is unreachable when the
-        // catalog read is consistent. Hitting it means catalog corruption,
-        // not a caller error, so it lifts to `Internal` (HTTP 500).
-        Err(UsageCollectorError::internal(format!(
-            "unsupported usage type semantics for {gts_id}",
-            gts_id = usage_type.gts_id,
-        )))
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-unsupported-v2
+#[must_use]
+pub fn validate_record_semantics(record: &UsageRecord) -> SemanticsOutcome {
+    match record.corrects_id {
+        Some(corrects_id) => SemanticsOutcome::NeedsL1Lookup { corrects_id },
+        None => SemanticsOutcome::Valid,
     }
 }
 
@@ -300,8 +251,11 @@ pub fn validate_record_semantics(
 ///   deactivated — the same active-status check serialises against the
 ///   cascade).
 // (algo scope marker `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`
-// is declared on `validate_record_semantics` above — this function continues the
-// same algorithm; declaring it here would be a duplicate scope marker.)
+// is declared on `resolve_l1_lookups` in `domain/service.rs`, not here: the
+// kind-driven branches `validate_record_semantics` used to anchor it on were
+// deleted in this file along with the marker. This function still realizes
+// part of that same algorithm; declaring the scope marker here too would be
+// a duplicate.)
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-corrects-id-l1:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-compensation-concurrency:p1
 //
@@ -340,21 +294,6 @@ pub fn verify_l1_corrects_id(
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-compensation-valid
     Ok(())
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-counter-compensation-valid
-}
-
-/// Read the sign of a `UsageRecord.value` (`<0`, `0`, or `>0`).
-///
-/// `UsageRecord.value` is carried as [`rust_decimal::Decimal`] on every
-/// surface, so the helper reduces to a tri-state sign read; non-numeric
-/// inputs are excluded by the type at the deserialize boundary, and
-/// `Decimal` admits no NaN / ±Inf representations.
-fn value_signum(value: Decimal) -> i32 {
-    use std::cmp::Ordering;
-    match value.cmp(&Decimal::ZERO) {
-        Ordering::Less => -1,
-        Ordering::Greater => 1,
-        Ordering::Equal => 0,
-    }
 }
 
 #[cfg(test)]

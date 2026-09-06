@@ -50,11 +50,15 @@ pub struct UsageCollectorConfig {
     /// declared-shape check, not instead of it: a payload can sit inside the
     /// cap and still carry an undeclared key.
     ///
-    /// Defaults to `8192`, matching the cap `domain::validation` currently
-    /// hard-codes (`RECORD_METADATA_SIZE_CAP_BYTES`), so that wiring this
-    /// value into that existing check (deferred to a later task — see that
-    /// module's doc comment) is a no-op for the default deployment rather
-    /// than a silent tightening.
+    /// Defaults to
+    /// [`DEFAULT_METADATA_SIZE_CAP_BYTES`](crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES)
+    /// (`8192`) — the same constant `Service::new` hard-codes when it
+    /// delegates to `Service::new_with_metrics` (which takes the cap as a
+    /// plain mandatory `usize`, with no default of its own; every other
+    /// caller, `module.rs` bootstrap included, passes this configured value
+    /// or the constant explicitly) — so wiring this value through to
+    /// `domain::validation::validate_submit_record_metadata` (Task 9) is a
+    /// no-op for the default deployment rather than a silent tightening.
     pub metadata_size_cap_bytes: usize,
 }
 
@@ -65,7 +69,7 @@ impl Default for UsageCollectorConfig {
             metrics: MetricsConfig::default(),
             type_cache_ttl_secs: 300,
             type_cache_capacity: 10_000,
-            metadata_size_cap_bytes: 8192,
+            metadata_size_cap_bytes: crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
         }
     }
 }

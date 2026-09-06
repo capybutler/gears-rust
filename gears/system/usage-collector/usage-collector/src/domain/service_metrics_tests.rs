@@ -38,9 +38,10 @@ use crate::domain::ports::metrics::{
 use crate::domain::test_support::{
     CountingAllowAllResolver, CountingPermitResolver, CountingTenantPermitResolver,
     DenyAllResolver, HappyPathPlugin, UnreachableResolver, authenticated_ctx,
-    counter_sum_with_label, enforcer_for, fake_declaration_source_with_fold, gauge_last,
-    histogram_count, histogram_count_with_label, histogram_sum, histogram_sum_with_label,
-    hub_with_plugin, local_metrics, service_with_metrics, service_with_metrics_unready_plugin,
+    counter_sum_with_label, enforcer_for, fake_declaration_source_with_fold,
+    fake_declaration_source_with_metadata, gauge_last, histogram_count, histogram_count_with_label,
+    histogram_sum, histogram_sum_with_label, hub_with_plugin, local_metrics, service_with_metrics,
+    service_with_metrics_and_source, service_with_metrics_unready_plugin,
 };
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use usage_collector_sdk::UsageCollectorPluginError;
@@ -156,17 +157,6 @@ fn single_bucket_aggregation() -> AggregationResult {
             key: Vec::new(),
             value: Some(BigDecimal::from(42)),
         }],
-    }
-}
-
-/// A usage type whose closed `metadata_fields` admits exactly `key`.
-fn usage_type_with_metadata_field(key: &str) -> UsageType {
-    UsageType {
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid usage-type gts_id"),
-        kind: UsageKind::Counter,
-        metadata_fields: [MetadataKey::new(key).expect("valid metadata key")]
-            .into_iter()
-            .collect(),
     }
 }
 
@@ -844,13 +834,13 @@ async fn per_record_permit_records_exactly_one_permit_no_double_count() {
     // sample — never `permit` + `deny` for the same call, which would corrupt
     // both sides of the deny-anomaly ratio.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(sample_usage_type());
     plugin.set_create_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics(
+    let (service, provider, exporter) = service_with_metrics_and_source(
         plugin,
         "test.metrics.perrecord.permit.v1",
         CountingTenantPermitResolver::new(),
+        fake_declaration_source_with_fold("SUM"),
     );
 
     service
@@ -984,28 +974,33 @@ async fn plugin_unready_increments_unready_counter_and_zeroes_ready() {
 
 // ── Emit-path plugin-host instrument coverage ───────────────────────────────
 //
-// The ingestion/emit SPI dispatches (`get_usage_type`, `get_usage_record`,
-// `create_usage_record` / `create_usage_records`) route through the same
-// `instrument_spi` / `resolve_plugin_for` wrappers as the read paths, so a
-// permitted emit MUST land on `uc_plugin_call_duration_seconds` (and, on a
-// backend fault, `uc_plugin_accept_errors_total`) under the emit `operation`
-// labels. The deny-path emit tests above short-circuit at PDP and never reach
-// the SPI, so they cannot guard this wiring; these tests drive the dispatch.
+// The ingestion/emit SPI dispatches (`get_usage_record`, `create_usage_record`
+// / `create_usage_records`) route through the same `instrument_spi` /
+// `resolve_plugin_for` wrappers as the read paths, so a permitted emit MUST
+// land on `uc_plugin_call_duration_seconds` (and, on a backend fault,
+// `uc_plugin_accept_errors_total`) under the emit `operation` labels. The
+// deny-path emit tests above short-circuit at PDP and never reach the SPI, so
+// they cannot guard this wiring; these tests drive the dispatch.
+//
+// Task 9: the referenced meter's declaration is now resolved through the Type
+// Resolver, not a plugin-side `get_usage_type` catalog dispatch — so these
+// tests wire a working resolver (`service_with_metrics_and_source`) and no
+// longer assert a `get_usage_type` duration sample on the emit path (there is
+// none to assert any more).
 
 #[tokio::test]
 async fn ingestion_single_success_dispatch_records_plugin_call_duration_per_op() {
-    // Permit + catalog hit + ordinary counter semantics + persist echo. The
-    // catalog `get_usage_type` and the persist `create_usage_record` are BOTH
-    // instrumented dispatches, each contributing one duration sample under its
-    // own `operation` label.
+    // Permit + declaration resolution + persist echo. The persist
+    // `create_usage_record` dispatch is instrumented, contributing one
+    // duration sample under its own `operation` label.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(sample_usage_type());
     plugin.set_create_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics(
+    let (service, provider, exporter) = service_with_metrics_and_source(
         plugin,
         "test.metrics.ingestok.single.v1",
         CountingTenantPermitResolver::new(),
+        fake_declaration_source_with_fold("SUM"),
     );
 
     service
@@ -1024,16 +1019,6 @@ async fn ingestion_single_success_dispatch_records_plugin_call_duration_per_op()
         1,
         "the persist SPI dispatch MUST contribute exactly one duration sample",
     );
-    assert_eq!(
-        histogram_count_with_label(
-            &exporter,
-            "uc_plugin_call_duration_seconds",
-            "operation",
-            "get_usage_type",
-        ),
-        1,
-        "the catalog lookup on the emit path is instrumented too",
-    );
     // A clean persist raises no backend fault.
     assert_eq!(
         counter_sum_with_label(
@@ -1048,17 +1033,19 @@ async fn ingestion_single_success_dispatch_records_plugin_call_duration_per_op()
 
 #[tokio::test]
 async fn ingestion_batch_success_dispatch_records_plugin_call_duration_per_op() {
-    // Two records sharing one gts_id: the catalog pre-pass dedups to a single
-    // `get_usage_type` dispatch, and the eligible records persist through one
-    // `create_usage_records` dispatch — each an instrumented completion.
+    // Two records sharing one gts_id: the declaration resolves once (Task 9's
+    // resolver fan-out — see `ingestion_declared_type_tests` in
+    // `service_tests.rs` for the dedicated dedup coverage), and the eligible
+    // records persist through one `create_usage_records` dispatch — an
+    // instrumented completion.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(sample_usage_type());
     plugin.set_create_records(vec![Ok(sample_record()), Ok(sample_record())]);
 
-    let (service, provider, exporter) = service_with_metrics(
+    let (service, provider, exporter) = service_with_metrics_and_source(
         plugin,
         "test.metrics.ingestok.batch.v1",
         CountingTenantPermitResolver::new(),
+        fake_declaration_source_with_fold("SUM"),
     );
 
     let per_record = service
@@ -1083,16 +1070,6 @@ async fn ingestion_batch_success_dispatch_records_plugin_call_duration_per_op() 
         ),
         1,
         "the batch persist SPI dispatch MUST contribute exactly one duration sample",
-    );
-    assert_eq!(
-        histogram_count_with_label(
-            &exporter,
-            "uc_plugin_call_duration_seconds",
-            "operation",
-            "get_usage_type",
-        ),
-        1,
-        "the two records dedup to a single catalog dispatch",
     );
     // Every record persisted → the batch request completes as `accepted` (not
     // `partial`, which needs at least one per-record rejection).
@@ -1128,19 +1105,20 @@ async fn ingestion_batch_success_dispatch_records_plugin_call_duration_per_op() 
 
 #[tokio::test]
 async fn ingestion_single_backend_error_increments_accept_errors_per_op() {
-    // Catalog hit, then the persist SPI faults with `Internal` (backend). The
-    // failed dispatch is still a completed dispatch (one duration sample) AND a
-    // backend-classified accept error under `operation="create_usage_record"`.
+    // Declaration resolves, then the persist SPI faults with `Internal`
+    // (backend). The failed dispatch is still a completed dispatch (one
+    // duration sample) AND a backend-classified accept error under
+    // `operation="create_usage_record"`.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(sample_usage_type());
     plugin.set_create_record_err(UsageCollectorPluginError::internal(
         "usage-collector test fake: simulated persist backend fault",
     ));
 
-    let (service, provider, exporter) = service_with_metrics(
+    let (service, provider, exporter) = service_with_metrics_and_source(
         plugin,
         "test.metrics.ingesterr.single.v1",
         CountingTenantPermitResolver::new(),
+        fake_declaration_source_with_fold("SUM"),
     );
 
     let outcome = service
@@ -1181,17 +1159,17 @@ async fn ingestion_single_backend_error_increments_accept_errors_per_op() {
 
 #[tokio::test]
 async fn ingestion_batch_backend_error_increments_accept_errors_per_op() {
-    // `get_usage_type` succeeds so the record is eligible and the batch reaches
-    // the persist SPI; `create_usage_records` is left unprogrammed, so the stub
-    // returns an outer `Internal` transport fault (backend-classified) which
-    // surfaces as the batch-level outer `Err`.
+    // The declaration resolves so the record is eligible and the batch
+    // reaches the persist SPI; `create_usage_records` is left unprogrammed,
+    // so the stub returns an outer `Internal` transport fault
+    // (backend-classified) which surfaces as the batch-level outer `Err`.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(sample_usage_type());
 
-    let (service, provider, exporter) = service_with_metrics(
+    let (service, provider, exporter) = service_with_metrics_and_source(
         plugin,
         "test.metrics.ingesterr.batch.v1",
         CountingTenantPermitResolver::new(),
+        fake_declaration_source_with_fold("SUM"),
     );
 
     let outcome = service
@@ -1582,6 +1560,7 @@ async fn query_aggregated_success_records_success_rows_and_duration() {
         enforcer_for(tenant_scoped_permit()),
         metrics,
         type_resolver,
+        crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
     ));
 
     let result = service
@@ -1641,16 +1620,16 @@ async fn query_aggregated_success_records_success_rows_and_duration() {
 
 #[tokio::test]
 async fn ingestion_single_with_metadata_observes_record_metadata_bytes() {
-    // A permitted single emit whose usage type declares the key it carries
-    // reaches `observe_metadata_bytes` and persists.
+    // A permitted single emit whose resolved declaration declares the key it
+    // carries reaches `observe_metadata_bytes` and persists.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(usage_type_with_metadata_field("region"));
     plugin.set_create_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics(
+    let (service, provider, exporter) = service_with_metrics_and_source(
         plugin,
         "test.metrics.ingest.meta.v1",
         CountingTenantPermitResolver::new(),
+        fake_declaration_source_with_metadata(&["region"]),
     );
 
     service
@@ -1676,13 +1655,13 @@ async fn ingestion_single_empty_metadata_skips_record_metadata_bytes() {
     // `sample_record()` carries no metadata → `observe_metadata_bytes` returns
     // before recording, so the instrument stays empty even on a clean persist.
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_usage_type(sample_usage_type());
     plugin.set_create_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics(
+    let (service, provider, exporter) = service_with_metrics_and_source(
         plugin,
         "test.metrics.ingest.nometa.v1",
         CountingTenantPermitResolver::new(),
+        fake_declaration_source_with_fold("SUM"),
     );
 
     service

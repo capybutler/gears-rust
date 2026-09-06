@@ -44,10 +44,10 @@ use crate::domain::ports::metrics::{
     UsageTypeOp,
 };
 use crate::domain::query::{compose_query_with_scope, require_bounded_time_window};
-use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
+use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
-    SemanticsOutcome, validate_record_semantics, validate_submit_record_metadata,
-    verify_l1_corrects_id,
+    DEFAULT_METADATA_SIZE_CAP_BYTES, SemanticsOutcome, validate_record_semantics,
+    validate_submit_record_metadata, verify_l1_corrects_id,
 };
 
 use super::error::DomainError;
@@ -69,21 +69,24 @@ pub const MAX_BATCH_RECORDS: usize = 100;
 /// `cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization`.
 const PDP_CONCURRENCY: usize = 8;
 
-/// Concurrency cap for the per-distinct-`gts_id` `get_usage_type` SPI
-/// fan-out in `create_usage_records`. Bounds plugin-side pressure for
-/// the catalog lookup pre-pass; sized identically to [`PDP_CONCURRENCY`]
-/// (the two fan-outs run sequentially, not concurrently, so the
-/// effective in-flight ceiling against the bound storage plugin stays
-/// at 8). Bounds the `inst-algo-catalog-bounded-fanout` step of
-/// `cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup`.
-const CATALOG_FANOUT_CONCURRENCY: usize = 8;
+/// Concurrency cap for the per-distinct-`gts_id` Type Resolver fan-out in
+/// `create_usage_records`. Bounds request-local pressure on
+/// [`TypeResolver::resolve`] (itself single-flighted per key, and normally
+/// served from cache — see [`crate::domain::type_resolver`]) for the
+/// type-resolution pre-pass; sized identically to [`PDP_CONCURRENCY`] (the
+/// two fan-outs run sequentially, not concurrently, so the effective
+/// in-flight ceiling stays at 8). Replaces the pre-Task-9
+/// `CATALOG_FANOUT_CONCURRENCY`, which bounded the plugin-side
+/// `get_usage_type` catalog fan-out this pre-pass supersedes.
+const TYPE_RESOLUTION_FANOUT_CONCURRENCY: usize = 8;
 
 /// Concurrency cap for the per-distinct-`corrects_id` `get_usage_record`
 /// L1 lookup fan-out in `create_usage_records`. Bounds plugin-side
 /// pressure for the compensation referential-check pre-pass; same value
-/// as [`CATALOG_FANOUT_CONCURRENCY`] because both pre-passes hit the
-/// same plugin handle. Bounds the `inst-algo-semantics-l1-bounded-fanout`
-/// step of
+/// as [`TYPE_RESOLUTION_FANOUT_CONCURRENCY`] because that pre-pass and this
+/// one both contend for the platform's external-call posture even though
+/// the type-resolution pre-pass no longer shares a plugin handle with this
+/// one. Bounds the `inst-algo-semantics-l1-bounded-fanout` step of
 /// `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`.
 const L1_LOOKUP_FANOUT_CONCURRENCY: usize = 8;
 
@@ -111,11 +114,11 @@ const USAGE_TYPES_GAUGE_MAX_PAGES: usize = 100;
 /// → per-index `results[index]` slot) reads this shape.
 type PdpGroupDecision = (Vec<usize>, Result<(), DomainError>);
 
-/// Cached catalog lookup result per distinct `gts_id`, lifted into
-/// [`DomainError`] (Clone-able) so a single SPI outcome can be
-/// projected to every record sharing the id without re-issuing the
-/// `get_usage_type` call.
-type CatalogCache = HashMap<UsageTypeGtsId, Result<UsageType, DomainError>>;
+/// Cached resolution per distinct meter, lifted into [`DomainError`] so one
+/// resolution outcome projects to every record sharing that type without
+/// re-resolving it. Replaces the pre-Task-9 `CatalogCache`, which cached a
+/// plugin-owned `UsageType` per `gts_id` instead of a resolved declaration.
+type DeclarationCache = HashMap<UsageTypeGtsId, Result<Arc<ResolvedDeclaration>, DomainError>>;
 
 /// Cached L1 referential lookup per distinct `corrects_id`, lifted into
 /// [`DomainError`] so the variant identity of
@@ -126,8 +129,8 @@ type L1LookupCache = HashMap<Uuid, Result<UsageRecord, DomainError>>;
 
 /// A per-record validation outcome deferred to the post-loop L1 pre-pass:
 /// `(input_index, the record itself, the corrects_id to fetch)`. Records
-/// only end up here when they passed PDP, the catalog cache lookup, AND
-/// semantics validation reported `NeedsL1Lookup`.
+/// only end up here when they passed PDP, the declaration resolution
+/// pre-pass, AND semantics validation reported `NeedsL1Lookup`.
 type PendingL1Lookup = (usize, UsageRecord, Uuid);
 
 /// Log a host-invariant breach (cache miss, SPI size mismatch, unfilled
@@ -437,7 +440,8 @@ async fn resolve_l1_lookups(
     plugin: &dyn UsageCollectorPluginV1,
     metrics: &dyn UsageCollectorMetrics,
     pending: Vec<PendingL1Lookup>,
-    catalog_cache: &CatalogCache,
+    declaration_cache: &DeclarationCache,
+    metadata_size_cap_bytes: usize,
     results: &mut [Option<Result<UsageRecord, UsageCollectorError>>],
     eligible: &mut Vec<(usize, UsageRecord)>,
 ) {
@@ -496,13 +500,13 @@ async fn resolve_l1_lookups(
 
         // Metadata check deferred behind L1 to preserve the
         // `semantics → L1 → metadata` error-priority ordering the pre-A3
-        // in-loop code exposed. A missing catalog entry here is a
+        // in-loop code exposed. A missing declaration entry here is a
         // host-invariant breach (the pre-pass covers every PDP-allowed
         // record's gts_id); surface it as a typed `Internal` rather than
         // panic the request thread.
-        let Some(Ok(usage_type)) = catalog_cache.get(&record.gts_id) else {
+        let Some(Ok(declaration)) = declaration_cache.get(&record.gts_id) else {
             results[index] = Some(Err(invariant_breach(format!(
-                "catalog pre-pass cache miss for gts_id {} before L1 metadata check",
+                "declaration pre-pass cache miss for gts_id {} before L1 metadata check",
                 record.gts_id,
             ))));
             continue;
@@ -510,7 +514,9 @@ async fn resolve_l1_lookups(
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-observe-bytes
         observe_metadata_bytes(metrics, &record.metadata);
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-observe-bytes
-        if let Err(e) = validate_submit_record_metadata(usage_type, &record.metadata) {
+        if let Err(e) =
+            validate_submit_record_metadata(declaration, &record.metadata, metadata_size_cap_bytes)
+        {
             results[index] = Some(Err(e));
             continue;
         }
@@ -558,9 +564,23 @@ pub struct Service {
     /// metadata surface) through a local TTL cache in front of
     /// `types-registry`, so ingestion's own NFRs stay independent of a
     /// second gear's availability and latency. Consulted by
-    /// [`Self::query_aggregated_usage_records`] to serve the declared fold
-    /// — see [`crate::domain::type_resolver`].
+    /// [`Self::query_aggregated_usage_records`] to serve the declared fold,
+    /// and by the ingestion paths ([`Self::create_usage_record_inner`] /
+    /// [`Self::create_usage_records_inner`]) to validate a submission's
+    /// metadata against the declared closed surface — see
+    /// [`crate::domain::type_resolver`].
     type_resolver: Arc<TypeResolver>,
+
+    /// Cap on an entry's serialized metadata map, in bytes, enforced by
+    /// [`validate_submit_record_metadata`] on every ingestion path.
+    /// [`Self::new_with_metrics`] takes this as a plain mandatory `usize` —
+    /// it has no default of its own. [`Self::new`] is the one place a
+    /// default applies: it has no cap parameter at all and hard-codes
+    /// [`DEFAULT_METADATA_SIZE_CAP_BYTES`] when it delegates to
+    /// `new_with_metrics`. Production bootstrap (`module.rs`) instead
+    /// threads `UsageCollectorConfig::metadata_size_cap_bytes` through
+    /// explicitly.
+    metadata_size_cap_bytes: usize,
 }
 
 impl Service {
@@ -577,7 +597,11 @@ impl Service {
     /// practice — the TTL/capacity below are irrelevant for the same reason
     /// (a source that never succeeds never populates the cache). Production
     /// bootstrap always goes through [`Service::new_with_metrics`] with a
-    /// genuine adapter-backed resolver instead.
+    /// genuine adapter-backed resolver instead. The metadata size cap is
+    /// likewise hard-coded to [`DEFAULT_METADATA_SIZE_CAP_BYTES`] here —
+    /// `new_with_metrics` itself takes the cap as a plain mandatory `usize`
+    /// with no default; production bootstrap passes
+    /// `UsageCollectorConfig::metadata_size_cap_bytes` explicitly instead.
     #[must_use]
     pub fn new(hub: Arc<ClientHub>, vendor: String, enforcer: PolicyEnforcer) -> Self {
         let type_resolver = Arc::new(TypeResolver::new(
@@ -587,24 +611,36 @@ impl Service {
                 capacity: 1,
             },
         ));
-        Self::new_with_metrics(hub, vendor, enforcer, Arc::new(NoopMetrics), type_resolver)
+        Self::new_with_metrics(
+            hub,
+            vendor,
+            enforcer,
+            Arc::new(NoopMetrics),
+            type_resolver,
+            DEFAULT_METADATA_SIZE_CAP_BYTES,
+        )
     }
 
-    /// Construct the service with an explicit operational-metrics sink and a
-    /// pre-built Type Resolver.
+    /// Construct the service with an explicit operational-metrics sink, a
+    /// pre-built Type Resolver, and the configured metadata size cap.
     ///
     /// Used at gear bootstrap (`module.rs`), which builds the resolver via
     /// [`crate::infra::types_registry_source::build_default_resolver`] over
-    /// the configured `[usage_collector]` cache knobs, and by tests that need
-    /// a real metrics adapter or a resolver over a fake `DeclarationSource` —
-    /// build one with [`TypeResolver::new`] and pass it in directly, the way
-    /// `service_with_metrics` (test-only) does for metrics.
+    /// the configured `[usage_collector]` cache knobs and passes
+    /// `UsageCollectorConfig::metadata_size_cap_bytes` verbatim as
+    /// `metadata_size_cap_bytes`, and by tests that need a real metrics
+    /// adapter, a resolver over a fake `DeclarationSource`, or a non-default
+    /// size cap — build the resolver with [`TypeResolver::new`] and pass it
+    /// in directly, the way `service_with_metrics` (test-only) does for
+    /// metrics.
     ///
     /// Taking the finished `Arc<TypeResolver>` here, rather than raw cache
     /// knobs or a `DeclarationSource`, keeps this domain module free of any
     /// dependency on the concrete `types-registry` adapter — mirrors how
     /// `metrics` is injected as a finished `Arc<dyn UsageCollectorMetrics>`
-    /// rather than built from a prefix string in here.
+    /// rather than built from a prefix string in here. `metadata_size_cap_bytes`
+    /// is likewise taken as the plain `usize` the config carries (not the
+    /// whole `UsageCollectorConfig`), for the same reason.
     #[must_use]
     pub fn new_with_metrics(
         hub: Arc<ClientHub>,
@@ -612,6 +648,7 @@ impl Service {
         enforcer: PolicyEnforcer,
         metrics: Arc<dyn UsageCollectorMetrics>,
         type_resolver: Arc<TypeResolver>,
+        metadata_size_cap_bytes: usize,
     ) -> Self {
         Self {
             hub,
@@ -620,6 +657,7 @@ impl Service {
             enforcer,
             metrics,
             type_resolver,
+            metadata_size_cap_bytes,
         }
     }
 
@@ -706,16 +744,18 @@ impl Service {
 
     /// Create a single `UsageRecord` through the ingestion path per
     /// `cpt-cf-usage-collector-flow-usage-emission-emit-record`. No
-    /// in-process catalog cache — the referenced `UsageType` is resolved
-    /// from the bound storage plugin on each call.
+    /// in-process catalog cache — the referenced meter's declaration is
+    /// resolved through the Type Resolver on each call (itself
+    /// TTL-cached — see [`crate::domain::type_resolver`]), not read from a
+    /// plugin-owned `UsageType` catalog.
     ///
     /// # Errors
     ///
     /// * [`UsageCollectorError::PermissionDenied`] /
     ///   [`UsageCollectorError::ServiceUnavailable`] when the PDP denies or
     ///   is unavailable.
-    /// * [`UsageCollectorError::NotFound`] when the referenced
-    ///   `gts_id` is absent from the plugin-owned catalog.
+    /// * [`UsageCollectorError::NotFound`] when the referenced `gts_id` does
+    ///   not resolve to a usable declaration.
     /// * [`UsageCollectorError::InvalidArgument`] /
     ///   [`UsageCollectorError::InvalidArgument`] on a malformed
     ///   `metadata` payload.
@@ -783,7 +823,7 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
 
         let plugin = self
-            .resolve_plugin_for(PluginOp::GetUsageType)
+            .resolve_plugin_for(PluginOp::CreateUsageRecord)
             .await
             .map_err(UsageCollectorError::from)?;
 
@@ -791,31 +831,14 @@ impl Service {
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-usage-type-not-found
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-catalog-lookup
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-usage-type-not-found
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-read-input
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-spi-dispatch
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-spi-fail
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-not-found
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-found
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-resolve-fields
-        let usage_type = match instrument_spi(
-            self.metrics.as_ref(),
-            PluginOp::GetUsageType,
-            plugin.get_usage_type(record.gts_id.clone()),
-        )
-        .await
-        {
-            Ok(ut) => ut,
-            Err(UsageCollectorPluginError::UsageTypeNotFound { gts_id }) => {
-                return Err(UsageCollectorError::usage_type_not_found(&gts_id));
-            }
-            Err(e) => return Err(UsageCollectorError::from(DomainError::from(e))),
-        };
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-resolve-fields
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-found
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-not-found
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-spi-fail
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-spi-dispatch
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-read-input
+        // Resolve the referenced meter's declaration through the Type
+        // Resolver (not the plugin — there is no in-process catalog cache,
+        // and validation no longer reads a plugin-owned `UsageType` at
+        // all). An unresolvable type fails closed here, before any plugin
+        // dispatch, mirroring `Self::query_aggregated_usage_records`'s
+        // identical fail-closed posture on the read path.
+        let meter_id = meter_type_id_of(&record.gts_id)?;
+        let declaration = self.type_resolver.resolve(&meter_id).await?;
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-usage-type-not-found
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-catalog-lookup
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-usage-type-not-found
@@ -825,8 +848,7 @@ impl Service {
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-invalid
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate-fail
-        if let SemanticsOutcome::NeedsL1Lookup { corrects_id } =
-            validate_record_semantics(&usage_type, &record)?
+        if let SemanticsOutcome::NeedsL1Lookup { corrects_id } = validate_record_semantics(&record)
         {
             // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-lookup
             let referenced = match instrument_spi(
@@ -861,7 +883,11 @@ impl Service {
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-closed-shape
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-cap
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-too-large
-        validate_submit_record_metadata(&usage_type, &record.metadata)?;
+        validate_submit_record_metadata(
+            &declaration,
+            &record.metadata,
+            self.metadata_size_cap_bytes,
+        )?;
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-too-large
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-cap
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-closed-shape
@@ -917,8 +943,9 @@ impl Service {
     /// # Errors
     ///
     /// Surfaces the same [`UsageCollectorError`] variants as
-    /// [`Self::create_usage_record_inner`] — PDP denial, unknown `UsageType`,
-    /// semantics / metadata validation, idempotency conflict, or plugin fault.
+    /// [`Self::create_usage_record_inner`] — PDP denial, an unresolvable
+    /// declaration, semantics / metadata validation, idempotency conflict,
+    /// or plugin fault.
     pub async fn create_usage_record(
         &self,
         ctx: &SecurityContext,
@@ -1058,10 +1085,10 @@ impl Service {
     /// * Any other [`UsageCollectorError`] variant lifted from a batch-level
     ///   plugin transport / persistence failure.
     ///
-    /// Per-record failures (authorization denial, missing usage type,
-    /// malformed metadata, SPI errors against individual records) surface in
-    /// the per-index `Result` entries of the returned vector rather than the
-    /// outer `Err`.
+    /// Per-record failures (authorization denial, an unresolvable
+    /// declaration, malformed metadata, SPI errors against individual
+    /// records) surface in the per-index `Result` entries of the returned
+    /// vector rather than the outer `Err`.
     ///
     /// # Post-condition
     ///
@@ -1099,7 +1126,7 @@ impl Service {
             .collect();
 
         let plugin = self
-            .resolve_plugin_for(PluginOp::GetUsageType)
+            .resolve_plugin_for(PluginOp::CreateUsageRecords)
             .await
             .map_err(UsageCollectorError::from)?;
 
@@ -1175,41 +1202,36 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-pdp
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-catalog
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-dedup-gts-id
         let distinct_gts_ids: HashSet<UsageTypeGtsId> = records
             .iter()
             .enumerate()
             .filter(|(idx, _)| pdp_allowed[*idx])
             .map(|(_, r)| r.gts_id.clone())
             .collect();
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-dedup-gts-id
 
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-bounded-fanout
-        // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-spi-dispatch
-        // The fan-out lifts each per-id outcome to `DomainError` eagerly so
-        // the cached value is Clone and a single SPI response can be
-        // projected to every input index that references the id without
-        // re-issuing the `get_usage_type` call.
-        let catalog_cache: CatalogCache =
+        // The fan-out lifts each per-id outcome to `DomainError` (the Type
+        // Resolver's own error type) eagerly so the cached value is Clone
+        // and a single resolution can be projected to every input index
+        // that references the gts_id without re-resolving it. Replaces the
+        // pre-Task-9 plugin-side `get_usage_type` catalog fan-out at the
+        // same bounded concurrency.
+        let declaration_cache: DeclarationCache =
             stream::iter(distinct_gts_ids.into_iter().map(|gts_id| {
-                let plugin = plugin.as_ref();
-                let metrics = self.metrics.as_ref();
+                let type_resolver = self.type_resolver.as_ref();
                 async move {
-                    let outcome = instrument_spi(
-                        metrics,
-                        PluginOp::GetUsageType,
-                        plugin.get_usage_type(gts_id.clone()),
-                    )
-                    .await
-                    .map_err(DomainError::from);
+                    let outcome = match meter_type_id_of(&gts_id) {
+                        Ok(meter_id) => type_resolver.resolve(&meter_id).await,
+                        // Host-invariant hedge only — see `meter_type_id_of`'s
+                        // doc comment; surfaces as a typed `Internal`
+                        // per-id outcome rather than panicking the fan-out.
+                        Err(e) => Err(DomainError::Internal(e.to_string())),
+                    };
                     (gts_id, outcome)
                 }
             }))
-            .buffer_unordered(CATALOG_FANOUT_CONCURRENCY)
+            .buffer_unordered(TYPE_RESOLUTION_FANOUT_CONCURRENCY)
             .collect()
             .await;
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-spi-dispatch
-        // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-bounded-fanout
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-catalog
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-foreach-validate
@@ -1224,50 +1246,35 @@ impl Service {
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-catalog
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-unknown-usage-type
-            // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-read-input
-            // @cpt-begin:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-resolve-fields
-            // The catalog pre-pass populated `catalog_cache` with a Clone
-            // outcome per distinct gts_id; every PDP-allowed record's
+            // The declaration pre-pass populated `declaration_cache` with a
+            // Clone outcome per distinct gts_id; every PDP-allowed record's
             // gts_id is guaranteed to be present.
-            let usage_type = match catalog_cache.get(&record.gts_id) {
-                // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-found
-                Some(Ok(ut)) => ut.clone(),
-                // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-found
-                // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-not-found
-                // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-spi-fail
+            let declaration = match declaration_cache.get(&record.gts_id) {
+                Some(Ok(decl)) => Arc::clone(decl),
                 Some(Err(e)) => {
                     results[index] = Some(Err(UsageCollectorError::from(e.clone())));
                     continue;
                 }
-                // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-spi-fail
-                // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-not-found
-                // Host-invariant breach (catalog pre-pass populated by
+                // Host-invariant breach (declaration pre-pass populated by
                 // `distinct_gts_ids`); typed `Internal` per-record error
                 // rather than `unreachable!()` so a future refactor cannot
                 // turn an invariant slip into a request-thread panic.
                 None => {
                     results[index] = Some(Err(invariant_breach(format!(
-                        "catalog pre-pass cache miss for gts_id {} during record dispatch",
+                        "declaration pre-pass cache miss for gts_id {} during record dispatch",
                         record.gts_id,
                     ))));
                     continue;
                 }
             };
-            // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-resolve-fields
-            // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup:p1:inst-algo-catalog-read-input
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-unknown-usage-type
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-catalog
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics-invalid
-            let semantics_outcome = match validate_record_semantics(&usage_type, &record) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    results[index] = Some(Err(e));
-                    continue;
-                }
-            };
-            if let SemanticsOutcome::NeedsL1Lookup { corrects_id } = semantics_outcome {
+            if let SemanticsOutcome::NeedsL1Lookup { corrects_id } =
+                validate_record_semantics(&record)
+            {
                 // L1 lookup is deferred to a post-loop dedup + bounded
                 // fan-out pre-pass (`inst-algo-semantics-l1-dedup` /
                 // `inst-algo-semantics-l1-bounded-fanout`); the metadata
@@ -1286,7 +1293,11 @@ impl Service {
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-metadata-closed-shape
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-metadata
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-metadata-too-large
-            if let Err(e) = validate_submit_record_metadata(&usage_type, &record.metadata) {
+            if let Err(e) = validate_submit_record_metadata(
+                &declaration,
+                &record.metadata,
+                self.metadata_size_cap_bytes,
+            ) {
                 results[index] = Some(Err(e));
                 continue;
             }
@@ -1305,7 +1316,8 @@ impl Service {
             plugin.as_ref(),
             self.metrics.as_ref(),
             pending_l1,
-            &catalog_cache,
+            &declaration_cache,
+            self.metadata_size_cap_bytes,
             &mut results,
             &mut eligible,
         )

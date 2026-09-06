@@ -1,20 +1,24 @@
 //! Unit tests for the shape-validation algorithm.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use toolkit_gts::gts_id;
 
 use rust_decimal::Decimal;
+use serde_json::json;
 use time::OffsetDateTime;
+use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
 use usage_collector_sdk::{
-    ConflictReason, IdempotencyKey, MetadataKey, ResourceRef, SubjectRef, UsageCollectorError,
-    UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId, ValidationReason,
+    ConflictReason, IdempotencyKey, MetadataKey, MeterTypeId, ResourceRef, SubjectRef,
+    UsageCollectorError, UsageRecord, UsageRecordStatus, UsageTypeGtsId, ValidationReason,
 };
 use uuid::Uuid;
 
 use super::{
-    RECORD_METADATA_SIZE_CAP_BYTES, SemanticsOutcome, metadata_fields_from_wire,
+    DEFAULT_METADATA_SIZE_CAP_BYTES, SemanticsOutcome, metadata_fields_from_wire,
     validate_record_semantics, validate_submit_record_metadata, verify_l1_corrects_id,
 };
+use crate::domain::type_resolver::ResolvedDeclaration;
 
 fn mk_key(value: &str) -> MetadataKey {
     MetadataKey::new(value).expect("test fixture supplies a valid metadata key")
@@ -26,6 +30,8 @@ fn mk_keys<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
 
 const SAMPLE_COUNTER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.foo.v1");
 const SAMPLE_GAUGE_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.bar.v1");
+const SAMPLE_METER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.foo.v1~");
+const BASE_ID: &str = gts_id!("cf.core.uc.usage_record.v1~");
 
 fn counter_id() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_COUNTER_ID).expect("valid usage_record-derived id")
@@ -35,33 +41,107 @@ fn gauge_id() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_GAUGE_ID).expect("valid usage_record-derived id")
 }
 
+fn meter_id() -> MeterTypeId {
+    MeterTypeId::new(SAMPLE_METER_ID).expect("valid meter type id")
+}
+
+/// A [`ResolvedDeclaration`] (fold `SUM`, unit `bytes`) whose closed metadata
+/// surface admits exactly `keys` — the unit-test analogue of
+/// `test_support::fake_meter_schema`, built locally so this file stays
+/// self-contained (mirrors the pattern `type_resolver::metadata_tests` and
+/// `type_resolver::declaration_tests` already use for their own schema
+/// fixtures).
+fn declaration_with_metadata_keys(keys: &[&str]) -> ResolvedDeclaration {
+    let base = GtsTypeSchema::try_new(
+        GtsTypeId::try_new(BASE_ID).expect("base type id"),
+        json!({
+            "type": "object",
+            "x-gts-abstract": true,
+            "properties": {
+                "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
+            }
+        }),
+        None,
+        None,
+    )
+    .expect("base schema");
+
+    let properties: serde_json::Map<String, serde_json::Value> = keys
+        .iter()
+        .map(|key| ((*key).to_owned(), json!({ "type": "string" })))
+        .collect();
+
+    let schema = GtsTypeSchema::try_new(
+        meter_id().as_gts().clone(),
+        json!({
+            "allOf": [{ "$ref": format!("gts://{BASE_ID}") }],
+            "x-gts-traits": {
+                "aggregation_fold": "SUM",
+                "canonical_unit": "bytes"
+            },
+            "properties": {
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": properties
+                }
+            }
+        }),
+        None,
+        Some(Arc::new(base)),
+    )
+    .expect("derived schema");
+
+    ResolvedDeclaration::from_schema(meter_id(), &schema).expect("valid declaration")
+}
+
 #[test]
 fn metadata_fields_from_wire_empty_vec_yields_empty_set() {
     let set = metadata_fields_from_wire(Vec::new()).expect("empty input accepted");
     assert!(set.is_empty());
+}
 
-    let usage_type = UsageType {
-        gts_id: counter_id(),
-        kind: UsageKind::Counter,
-        metadata_fields: set,
-    };
-    validate_submit_record_metadata(&usage_type, &BTreeMap::new())
-        .expect("empty metadata_fields must accept an empty record metadata payload");
+// Repointed at the resolved declaration (Task 9): the closed-shape check now
+// runs against `ResolvedDeclaration::metadata_schema`, not a plugin-owned
+// `UsageType.metadata_fields` set — but the intent this test pins ("an
+// undeclared metadata key is rejected") is unchanged.
+#[test]
+fn undeclared_metadata_key_is_rejected_before_persistence() {
+    let declaration = declaration_with_metadata_keys(&[]);
+    validate_submit_record_metadata(
+        &declaration,
+        &BTreeMap::new(),
+        DEFAULT_METADATA_SIZE_CAP_BYTES,
+    )
+    .expect("a declaration with no metadata properties must accept an empty payload");
 
     let mut bad = BTreeMap::new();
     bad.insert(mk_key("region"), "us-east".to_owned());
-    let err = validate_submit_record_metadata(&usage_type, &bad)
-        .expect_err("empty metadata_fields must reject any wire metadata key");
+    let err = validate_submit_record_metadata(&declaration, &bad, DEFAULT_METADATA_SIZE_CAP_BYTES)
+        .expect_err("a key outside the declared closed surface must be rejected");
     assert!(
         matches!(
             err,
             UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::UnknownMetadataKey,
+                reason: ValidationReason::MetadataValidation,
                 ..
             }
         ),
-        "expected UnknownMetadataKey, got {err:?}"
+        "expected MetadataValidation, got {err:?}"
     );
+    assert!(
+        err.to_string().contains("region"),
+        "the rejection must name the offending key: {err}"
+    );
+}
+
+#[test]
+fn declared_metadata_key_is_accepted() {
+    let declaration = declaration_with_metadata_keys(&["region"]);
+    let mut metadata = BTreeMap::new();
+    metadata.insert(mk_key("region"), "eu-west-1".to_owned());
+    validate_submit_record_metadata(&declaration, &metadata, DEFAULT_METADATA_SIZE_CAP_BYTES)
+        .expect("a declared key must be accepted");
 }
 
 #[test]
@@ -136,22 +216,24 @@ fn metadata_fields_from_wire_nul_byte_rejected() {
 // Metadata size-cap enforcement
 // (`cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement`)
 //
-// The serialized-size gate (`size > RECORD_METADATA_SIZE_CAP_BYTES`) is a
-// `>`, not `>=`, comparison — exactly at the cap is accepted; one byte over
-// is rejected. The value length is sized off the measured single-entry
+// The serialized-size gate (`size > metadata_size_cap_bytes`) is a `>`, not
+// `>=`, comparison — exactly at the cap is accepted; one byte over is
+// rejected. The value length is sized off the measured single-entry
 // overhead so the boundary holds regardless of `MetadataKey`'s serde shape.
+// Task 9 threads the cap in as a parameter (`Service::metadata_size_cap_bytes`,
+// itself from `UsageCollectorConfig::metadata_size_cap_bytes`) rather than
+// reading a hard-coded constant; these tests pin the DEFAULT cap value
+// (`DEFAULT_METADATA_SIZE_CAP_BYTES`) behaves exactly as the old hard-coded
+// constant did, and a separate test below pins that a non-default configured
+// cap is actually honoured.
 // ---------------------------------------------------------------------------
 
-fn size_cap_usage_type() -> UsageType {
-    UsageType {
-        gts_id: counter_id(),
-        kind: UsageKind::Counter,
-        metadata_fields: mk_keys(["blob"]),
-    }
+fn size_cap_declaration() -> ResolvedDeclaration {
+    declaration_with_metadata_keys(&["blob"])
 }
 
 /// Serialized overhead of a one-entry `{ "blob": "" }` map, so a value can be
-/// sized to land the serialized payload exactly on the cap boundary.
+/// sized to land the serialized payload exactly on a cap boundary.
 fn single_entry_overhead() -> usize {
     let mut probe = BTreeMap::new();
     probe.insert(mk_key("blob"), String::new());
@@ -161,15 +243,16 @@ fn single_entry_overhead() -> usize {
 }
 
 #[test]
-fn metadata_one_byte_over_size_cap_is_rejected() {
-    let usage_type = size_cap_usage_type();
+fn metadata_one_byte_over_default_size_cap_is_rejected() {
+    let declaration = size_cap_declaration();
     let mut metadata = BTreeMap::new();
     metadata.insert(
         mk_key("blob"),
-        "x".repeat(RECORD_METADATA_SIZE_CAP_BYTES - single_entry_overhead() + 1),
+        "x".repeat(DEFAULT_METADATA_SIZE_CAP_BYTES - single_entry_overhead() + 1),
     );
-    let err = validate_submit_record_metadata(&usage_type, &metadata)
-        .expect_err("metadata one byte over the cap must reject");
+    let err =
+        validate_submit_record_metadata(&declaration, &metadata, DEFAULT_METADATA_SIZE_CAP_BYTES)
+            .expect_err("metadata one byte over the default cap must reject");
     assert!(
         matches!(
             err,
@@ -183,40 +266,65 @@ fn metadata_one_byte_over_size_cap_is_rejected() {
 }
 
 #[test]
-fn metadata_exactly_at_size_cap_is_accepted() {
-    let usage_type = size_cap_usage_type();
+fn metadata_exactly_at_default_size_cap_is_accepted() {
+    let declaration = size_cap_declaration();
     let mut metadata = BTreeMap::new();
     metadata.insert(
         mk_key("blob"),
-        "x".repeat(RECORD_METADATA_SIZE_CAP_BYTES - single_entry_overhead()),
+        "x".repeat(DEFAULT_METADATA_SIZE_CAP_BYTES - single_entry_overhead()),
     );
-    validate_submit_record_metadata(&usage_type, &metadata)
-        .expect("metadata serialized exactly to the cap must be accepted");
+    validate_submit_record_metadata(&declaration, &metadata, DEFAULT_METADATA_SIZE_CAP_BYTES)
+        .expect("metadata serialized exactly to the default cap must be accepted");
+}
+
+/// A configured cap smaller than the default MUST be honoured, not silently
+/// widened back to the default — proves the parameter (not a hard-coded
+/// constant) drives the check.
+#[test]
+fn a_configured_non_default_cap_is_honoured() {
+    let declaration = size_cap_declaration();
+    let mut metadata = BTreeMap::new();
+    // Comfortably under the 8 KiB default cap...
+    metadata.insert(mk_key("blob"), "x".repeat(64));
+    validate_submit_record_metadata(&declaration, &metadata, DEFAULT_METADATA_SIZE_CAP_BYTES)
+        .expect("well under the default cap must be accepted");
+
+    // ...but over a much smaller configured cap.
+    let configured_cap = 16;
+    let err = validate_submit_record_metadata(&declaration, &metadata, configured_cap)
+        .expect_err("a configured cap smaller than the payload must reject it");
+    match err {
+        UsageCollectorError::InvalidArgument {
+            reason: ValidationReason::MetadataValidation,
+            ref detail,
+            ..
+        } => {
+            assert!(
+                detail.contains(&configured_cap.to_string()),
+                "the rejection must name the configured cap, not a hard-coded \
+                 one: {detail}"
+            );
+        }
+        other => panic!("expected MetadataValidation size-cap rejection, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Semantics-enforcement algorithm
 // (`cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`)
 //
-// Covers each cell of the locked four-cell value matrix plus every L1
-// referential failure mode.
+// Pre-Task-9 this section covered every cell of a four-cell
+// `(MetricSemantics × corrects_id presence)` value matrix keyed off a
+// plugin-owned `UsageType.kind`. That matrix — and the six tests that pinned
+// its gauge/counter value-sign cells — is deleted outright along with the
+// `kind` it was keyed on: `validate_record_semantics` no longer takes a
+// `UsageType` at all, so there is no more (kind, op) disagreement left to
+// assert on (see that function's doc comment). What remains is the L1
+// referential check (`verify_l1_corrects_id`, unaffected by this change) plus
+// the two tests below pinning `validate_record_semantics`'s new, simpler
+// contract: presence of `corrects_id` alone decides `Valid` vs
+// `NeedsL1Lookup`, independent of the record's value sign.
 // ---------------------------------------------------------------------------
-
-fn counter_usage_type() -> UsageType {
-    UsageType {
-        gts_id: counter_id(),
-        kind: UsageKind::Counter,
-        metadata_fields: BTreeSet::new(),
-    }
-}
-
-fn gauge_usage_type() -> UsageType {
-    UsageType {
-        gts_id: gauge_id(),
-        kind: UsageKind::Gauge,
-        metadata_fields: BTreeSet::new(),
-    }
-}
 
 fn ordinary_counter_record(value: Decimal) -> UsageRecord {
     UsageRecord {
@@ -248,86 +356,35 @@ fn referenced_ordinary_row(tenant: Uuid) -> UsageRecord {
 }
 
 #[test]
-fn counter_ordinary_with_non_negative_value_is_valid() {
-    let ut = counter_usage_type();
-    let record = ordinary_counter_record(Decimal::ZERO);
-    assert_eq!(
-        validate_record_semantics(&ut, &record).unwrap(),
-        SemanticsOutcome::Valid
-    );
+fn record_without_corrects_id_is_valid_regardless_of_value_sign() {
+    // No caller-visible `kind` survives to gate a counter/gauge value-sign
+    // rule, so a record with no `corrects_id` is `Valid` whatever its value's
+    // sign — negative included, which the pre-Task-9 counter rule used to
+    // reject.
+    for value in [Decimal::from(-9999), Decimal::ZERO, Decimal::from(42)] {
+        let record = ordinary_counter_record(value);
+        assert_eq!(
+            validate_record_semantics(&record),
+            SemanticsOutcome::Valid,
+            "value {value} without corrects_id must be Valid",
+        );
+    }
 }
 
 #[test]
-fn counter_ordinary_with_negative_value_is_semantics_violation() {
-    let ut = counter_usage_type();
-    let record = ordinary_counter_record(Decimal::from(-1));
-    let err = validate_record_semantics(&ut, &record).expect_err("negative counter rejected");
-    assert!(
-        matches!(
-            err,
-            UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::SemanticsViolation,
-                ref detail,
-                ..
-            } if detail.contains("value >= 0") && detail.contains("got -1")
-        ),
-        "expected NegativeCounterValue {{ value: -1 }}, got {err:?}"
-    );
-}
-
-#[test]
-fn counter_compensation_with_non_negative_value_is_semantics_violation() {
-    let ut = counter_usage_type();
-    let record = counter_compensation_record(Decimal::ZERO, Uuid::new_v4());
-    let err = validate_record_semantics(&ut, &record).expect_err("zero compensation rejected");
-    assert!(
-        matches!(
-            err,
-            UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::SemanticsViolation,
-                ref detail,
-                ..
-            } if detail.contains("value < 0") && detail.contains("got 0")
-        ),
-        "expected NonNegativeCounterCompensation {{ value: 0 }}, got {err:?}"
-    );
-}
-
-#[test]
-fn counter_compensation_with_negative_value_needs_l1_lookup() {
-    let ut = counter_usage_type();
-    let corrects_id = Uuid::new_v4();
-    let record = counter_compensation_record(Decimal::from(-5), corrects_id);
-    assert_eq!(
-        validate_record_semantics(&ut, &record).unwrap(),
-        SemanticsOutcome::NeedsL1Lookup { corrects_id },
-    );
-}
-
-#[test]
-fn gauge_ordinary_accepts_any_signed_value() {
-    let ut = gauge_usage_type();
-    let mut record = ordinary_counter_record(Decimal::from(-9999));
-    record.gts_id = gauge_id();
-    assert_eq!(
-        validate_record_semantics(&ut, &record).unwrap(),
-        SemanticsOutcome::Valid
-    );
-}
-
-#[test]
-fn gauge_with_corrects_id_is_rejected_dedicated_variant() {
-    let ut = gauge_usage_type();
-    let mut record = counter_compensation_record(Decimal::from(-1), Uuid::new_v4());
-    record.gts_id = gauge_id();
-    let err = validate_record_semantics(&ut, &record).expect_err("gauge compensation rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::GaugeCompensationRejected,
-            ..
-        }
-    ));
+fn record_with_corrects_id_needs_l1_lookup_regardless_of_value_sign() {
+    // Likewise, presence of `corrects_id` alone routes to the L1 detour now —
+    // the pre-Task-9 "counter compensation value must be negative" rule (and
+    // the gauge-compensation rejection) is gone.
+    for value in [Decimal::from(-5), Decimal::ZERO, Decimal::from(5)] {
+        let corrects_id = Uuid::new_v4();
+        let record = counter_compensation_record(value, corrects_id);
+        assert_eq!(
+            validate_record_semantics(&record),
+            SemanticsOutcome::NeedsL1Lookup { corrects_id },
+            "value {value} with corrects_id must need an L1 lookup",
+        );
+    }
 }
 
 // The `corrects_id not found` translation lives at the service-layer call
