@@ -126,10 +126,118 @@ fn rejects_a_value_violating_a_declared_constraint() {
     assert!(compiled.validate(&metadata(&[("region", "")])).is_err());
 }
 
+/// Mirrors the *real* `docs/schemas/usage_record.v1.schema.json` base: an
+/// open `metadata` (`additionalProperties: {"type": "string"}`, no
+/// `properties`). This is the shape every meter actually inherits from —
+/// unlike the earlier synthetic case below, this one is not hypothetical.
+fn realistic_base_schema() -> GtsTypeSchema {
+    GtsTypeSchema::try_new(
+        GtsTypeId::try_new(BASE).expect("base type id"),
+        json!({
+            "type": "object",
+            "properties": {
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" }
+                }
+            }
+        }),
+        None,
+        None,
+    )
+    .unwrap()
+}
+
 #[test]
-fn a_meter_declaring_no_metadata_property_admits_no_keys() {
-    // A meter that declares no metadata surface has an empty one. Admitting
-    // arbitrary keys would reopen the closed shape the base only half-closes.
+fn a_meter_with_no_metadata_override_inherits_the_open_base_and_admits_no_keys() {
+    // `GtsTypeSchema::effective_properties` resolves `metadata` by
+    // *override*, not by intersection: a meter that supplies no closing
+    // override does not get "no metadata property at all" (which `compile`
+    // could special-case) — it inherits the base's open definition
+    // verbatim. Closure must therefore come from `declared_keys` being
+    // empty and `validate` enforcing it directly, not from anything the
+    // inherited subschema itself says.
+    let base = realistic_base_schema();
+    let meter = GtsTypeSchema::try_new(
+        GtsTypeId::try_new(METER).expect("meter type id"),
+        json!({
+            "allOf": [
+                { "$ref": format!("gts://{BASE}") }
+            ]
+        }),
+        None,
+        Some(Arc::new(base)),
+    )
+    .unwrap();
+    let compiled = CompiledMetadataSchema::compile(&meter_id(), &meter).unwrap();
+
+    assert!(compiled.declared_keys().is_empty());
+    compiled.validate(&BTreeMap::new()).expect("empty accepted");
+    let err = compiled
+        .validate(&metadata(&[("anything", "x")]))
+        .expect_err("no metadata override means no admissible key, not an open one");
+    assert!(
+        err.to_string().contains("anything"),
+        "diagnostic must name the offending key, got: {err}"
+    );
+}
+
+#[test]
+fn closure_does_not_depend_on_additional_properties_false_being_set() {
+    // The derived override below declares `properties` but omits
+    // `additionalProperties: false` (JSON Schema defaults it to open). If
+    // closure were still delegated to the compiled schema, an undeclared
+    // key would slip through. It must not: `validate` rejects it itself,
+    // regardless of what the subschema's own keywords say.
+    let base = realistic_base_schema();
+    let meter = GtsTypeSchema::try_new(
+        GtsTypeId::try_new(METER).expect("meter type id"),
+        json!({
+            "allOf": [
+                { "$ref": format!("gts://{BASE}") },
+                {
+                    "properties": {
+                        "metadata": {
+                            "type": "object",
+                            "properties": {
+                                "region": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ]
+        }),
+        None,
+        Some(Arc::new(base)),
+    )
+    .unwrap();
+    let compiled = CompiledMetadataSchema::compile(&meter_id(), &meter).unwrap();
+
+    assert_eq!(
+        compiled
+            .declared_keys()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["region"]
+    );
+    let err = compiled
+        .validate(&metadata(&[("region", "eu-west-1"), ("tier", "gold")]))
+        .expect_err("an undeclared key must be rejected even without additionalProperties: false");
+    assert!(
+        err.to_string().contains("tier"),
+        "diagnostic must name the offending key, got: {err}"
+    );
+}
+
+#[test]
+fn a_schema_chain_with_no_metadata_key_at_all_gets_an_empty_closed_default() {
+    // Defensive/synthetic case, not the production-representative one (see
+    // the two tests above for that): a chain that declares no `metadata`
+    // key anywhere hits `compile`'s `None` default branch directly. Every
+    // real usage_record-derived declaration inherits the base's open
+    // `metadata`, so this branch does not fire in practice — but it is
+    // harmless to keep closed anyway.
     let base = GtsTypeSchema::try_new(
         GtsTypeId::try_new(BASE).expect("base type id"),
         json!({ "type": "object" }),
