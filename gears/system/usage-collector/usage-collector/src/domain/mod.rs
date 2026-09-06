@@ -8,6 +8,7 @@ pub mod query;
 pub mod service;
 #[cfg(test)]
 pub mod test_support;
+pub mod type_resolver;
 pub mod validation;
 
 pub use error::DomainError;

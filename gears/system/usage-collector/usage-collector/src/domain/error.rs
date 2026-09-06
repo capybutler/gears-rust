@@ -13,7 +13,10 @@
 //! caller verbatim and are not re-classified through `DomainError`.
 
 use toolkit_macros::domain_model;
-use usage_collector_sdk::{UsageCollectorError, UsageCollectorPluginError, UsageTypeGtsId};
+use usage_collector_sdk::{
+    MeterTypeId, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
+    UsageTypeGtsId,
+};
 use uuid::Uuid;
 
 /// Internal domain errors for the usage-collector host.
@@ -114,8 +117,73 @@ pub enum DomainError {
     #[error("usage record already inactive: {id}")]
     UsageRecordAlreadyInactive { id: Uuid },
 
+    /// The referenced GTS type does not resolve to a usable declaration:
+    /// `types-registry` has no row for it, or the row it has does not carry
+    /// what a meter needs (a required trait is missing, or it names a fold
+    /// this major version does not serve).
+    ///
+    /// Both collapse to the identical wire failure on purpose. DESIGN §3.2
+    /// "Type Resolver" responsibility boundaries say the resolver "does NOT
+    /// substitute a default for any declared attribute" and DESIGN §3.3's
+    /// ingestion sequence sends every "unresolved" outcome to the same
+    /// `NotFound` naming the identifier — so a malformed declaration is
+    /// exactly as unresolvable, from every caller's perspective, as an
+    /// absent one. Use [`Self::declaration_not_found`] and
+    /// [`Self::declaration_incomplete`] to construct this; use
+    /// [`Self::is_declaration_not_found`] to test for it.
+    #[error("GTS type `{gts_type_id}` {reason}")]
+    DeclarationNotFound {
+        /// The unresolvable meter reference.
+        gts_type_id: String,
+        /// Why it does not resolve: `"is not declared"` for a genuine
+        /// not-found answer from the registry, or the specific
+        /// missing/unserved trait otherwise.
+        reason: String,
+    },
+
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl DomainError {
+    /// `types-registry` has no declaration under this identifier.
+    ///
+    /// Distinct from [`Self::TypesRegistryUnavailable`]: this is a definite
+    /// answer, not a transport failure, so a cache built on top of this port
+    /// (Task 6) can act on it directly rather than riding it out on a stale
+    /// entry. Test for it with [`Self::is_declaration_not_found`].
+    #[must_use]
+    pub fn declaration_not_found(id: &MeterTypeId) -> Self {
+        Self::DeclarationNotFound {
+            gts_type_id: id.as_str().to_owned(),
+            reason: "is not declared".to_owned(),
+        }
+    }
+
+    /// A declaration that resolved but does not carry what a meter needs:
+    /// `why` names the missing required trait, or the fold this major
+    /// version does not serve.
+    ///
+    /// Fails closed exactly like [`Self::declaration_not_found`] — the gear
+    /// never treats an incomplete declaration as more resolvable than an
+    /// absent one, so the two constructors build the same variant.
+    #[must_use]
+    pub fn declaration_incomplete(id: &MeterTypeId, why: &str) -> Self {
+        Self::DeclarationNotFound {
+            gts_type_id: id.as_str().to_owned(),
+            reason: why.to_owned(),
+        }
+    }
+
+    /// True when this is a definite "does not resolve" answer rather than a
+    /// possibly-transient availability failure. The `DeclarationSource` port
+    /// contract (and Task 6's cache) depends on telling the two apart: only
+    /// this case is safe to act on immediately rather than served from a
+    /// stale cached entry.
+    #[must_use]
+    pub fn is_declaration_not_found(&self) -> bool {
+        matches!(self, Self::DeclarationNotFound { .. })
+    }
 }
 
 // NOTE(DE1302): `DomainError::Internal` / `TypesRegistryUnavailable` only carry
@@ -305,6 +373,22 @@ impl From<DomainError> for UsageCollectorError {
             } => Self::idempotency_conflict(&idempotency_key, existing_id),
             DomainError::UsageRecordNotFound { id } => Self::usage_record_not_found(id),
             DomainError::UsageRecordAlreadyInactive { id } => Self::already_inactive(id),
+            // DESIGN §3.3: an unresolvable GTS type is a 404 naming the
+            // identifier, whether the registry never declared it or the
+            // Type Resolver rejected an incomplete declaration for it — both
+            // reach this same arm because both build
+            // `DomainError::DeclarationNotFound` (see its doc comment).
+            DomainError::DeclarationNotFound {
+                gts_type_id,
+                reason,
+            } => {
+                let detail = format!("GTS type `{gts_type_id}` {reason}");
+                Self::NotFound {
+                    resource_type: USAGE_TYPE_RESOURCE.to_owned(),
+                    name: gts_type_id,
+                    detail,
+                }
+            }
             DomainError::InvalidPluginInstance { gts_id, reason } => {
                 Self::internal(format!("invalid plugin instance '{gts_id}': {reason}"))
             }

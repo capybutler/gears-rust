@@ -3,8 +3,10 @@
 //! Ports are the domain-layer contracts that infra adapters implement,
 //! keeping the domain free of transport / vendor types (`OTel`, HTTP, …).
 
+pub mod declarations;
 pub mod metrics;
 
+pub use declarations::DeclarationSource;
 pub use metrics::{
     AuthzDecision, DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome,
     NoopMetrics, PdpFailureCause, PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory,

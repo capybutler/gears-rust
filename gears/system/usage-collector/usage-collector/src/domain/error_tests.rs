@@ -9,7 +9,7 @@
 
 use toolkit_gts::gts_id;
 use usage_collector_sdk::{
-    ConflictReason, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError,
+    ConflictReason, MeterTypeId, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError,
     UsageCollectorPluginError, UsageTypeGtsId, ValidationReason,
 };
 
@@ -318,4 +318,72 @@ fn plugin_usage_record_already_inactive_lifts_to_sdk_conflict() {
 fn sdk_already_inactive_is_not_retryable() {
     let err = UsageCollectorError::already_inactive(uuid::Uuid::nil());
     assert!(!err.is_retryable(), "AlreadyInactive is not retryable");
+}
+
+// ---------------------------------------------------------------------------
+// DeclarationNotFound — Type Resolver's fail-closed "does not resolve" case
+// (task 4). Both constructors build this one variant: a genuine not-found
+// answer from the registry and an incomplete declaration collapse to the
+// identical wire failure, per DESIGN §3.2/§3.3 (see the variant's doc
+// comment).
+// ---------------------------------------------------------------------------
+
+fn sample_meter_id() -> MeterTypeId {
+    MeterTypeId::new("gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~")
+        .expect("valid usage_record-derived meter type id")
+}
+
+#[test]
+fn declaration_not_found_names_the_identifier_and_says_not_declared() {
+    let id = sample_meter_id();
+    let err = DomainError::declaration_not_found(&id);
+    assert!(matches!(
+        &err,
+        DomainError::DeclarationNotFound { gts_type_id, reason }
+            if gts_type_id == id.as_str() && reason == "is not declared"
+    ));
+    assert!(err.is_declaration_not_found());
+}
+
+#[test]
+fn declaration_incomplete_names_the_identifier_and_carries_the_reason() {
+    let id = sample_meter_id();
+    let err = DomainError::declaration_incomplete(&id, "declares no `canonical_unit`");
+    assert!(matches!(
+        &err,
+        DomainError::DeclarationNotFound { gts_type_id, reason }
+            if gts_type_id == id.as_str() && reason == "declares no `canonical_unit`"
+    ));
+    assert!(
+        err.to_string().contains("canonical_unit"),
+        "diagnostic must name the offending trait, got: {err}"
+    );
+    // Same predicate as a genuine not-found: Task 6's cache must not treat an
+    // incomplete declaration as more resolvable than an absent one.
+    assert!(err.is_declaration_not_found());
+}
+
+#[test]
+fn other_domain_errors_are_not_declaration_not_found() {
+    assert!(!DomainError::Internal("boom".to_owned()).is_declaration_not_found());
+}
+
+#[test]
+fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_type_resource() {
+    let id = sample_meter_id();
+    let domain = DomainError::declaration_not_found(&id);
+    let sdk: UsageCollectorError = domain.into();
+    match sdk {
+        UsageCollectorError::NotFound {
+            resource_type,
+            name,
+            detail,
+        } => {
+            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
+            assert_eq!(name, id.as_str());
+            assert!(detail.contains(id.as_str()));
+            assert!(detail.contains("is not declared"));
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
 }

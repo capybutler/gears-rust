@@ -167,6 +167,24 @@ fn usage_record_not_found_maps_to_404() {
 }
 
 #[test]
+fn declaration_not_found_maps_to_404_naming_the_gts_type_id() {
+    // Pins DESIGN §3.3: an unresolvable GTS type is a 404 naming the
+    // identifier. Exercises the full chain from `domain::DomainError` (task
+    // 4's `DeclarationNotFound`) through the `UsageCollectorError` bridge
+    // (`domain/error.rs`) to this crate's `CanonicalError` lift, rather than
+    // hand-building the intermediate `UsageCollectorError::NotFound`.
+    let id = usage_collector_sdk::MeterTypeId::new(
+        "gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~",
+    )
+    .expect("valid meter type id");
+    let domain_err = crate::domain::DomainError::declaration_not_found(&id);
+    let c = lift_type(UsageCollectorError::from(domain_err));
+    assert_eq!(c.status_code(), 404);
+    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
+    assert_eq!(c.resource_name(), Some(id.as_str()));
+}
+
+#[test]
 fn already_inactive_maps_to_409_aborted_with_already_inactive_reason() {
     let id = Uuid::from_u128(0xCAFE_BABE);
     let c = lift_record(UsageCollectorError::already_inactive(id));
