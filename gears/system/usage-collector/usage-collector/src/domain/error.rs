@@ -92,10 +92,13 @@ pub enum DomainError {
     },
 
     /// Ingestion supplied a `metadata` map carrying a key that is not a
-    /// member of the referenced usage type's declared `metadata_fields` list
-    /// per ADR-0012 (closed shape, keyed by `gts_id`).
-    #[error("unknown metadata key '{key}' for usage type {gts_id}")]
-    UnknownMetadataKey { gts_id: UsageTypeGtsId, key: String },
+    /// member of the referenced meter's declared `metadata_fields` list
+    /// per ADR-0012 (closed shape, keyed by `gts_type_id`).
+    #[error("unknown metadata key '{key}' for meter {gts_type_id}")]
+    UnknownMetadataKey {
+        gts_type_id: MeterTypeId,
+        key: String,
+    },
 
     /// Idempotency conflict on a usage submission: the supplied
     /// `idempotency_key` is already bound to a different usage submission
@@ -378,8 +381,8 @@ impl From<DomainError> for UsageCollectorError {
             DomainError::UsageTypeAlreadyExists { gts_id } => {
                 Self::usage_type_already_exists(&gts_id)
             }
-            DomainError::UnknownMetadataKey { gts_id, key } => {
-                Self::unknown_metadata_key(&gts_id, &key)
+            DomainError::UnknownMetadataKey { gts_type_id, key } => {
+                Self::unknown_metadata_key(&gts_type_id, &key)
             }
             DomainError::UsageTypeReferenced {
                 gts_id,

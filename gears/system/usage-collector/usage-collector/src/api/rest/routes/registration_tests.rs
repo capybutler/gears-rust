@@ -30,7 +30,7 @@ use tower::ServiceExt as _;
 use usage_collector_sdk::UsageTypeGtsId;
 
 use crate::domain::Service;
-use crate::domain::test_support::{HappyPathPlugin, authenticated_ctx, service_with_permit};
+use crate::domain::test_support::{HappyPathPlugin, ServiceFixture, authenticated_ctx};
 
 const SAMPLE_USAGE_TYPE_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
@@ -59,7 +59,7 @@ fn service_reporting_not_found() -> Arc<Service> {
     plugin.set_get_usage_type_not_found(
         UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage-type gts_id"),
     );
-    service_with_permit(
+    ServiceFixture::default().build(
         plugin as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.routes.service_layer.happy.v1",
     )

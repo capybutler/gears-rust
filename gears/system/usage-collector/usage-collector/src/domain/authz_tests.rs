@@ -24,7 +24,7 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    IdempotencyKey, ResourceRef, SubjectRef, UsageRecord, UsageRecordStatus, UsageTypeGtsId,
+    IdempotencyKey, MeterTypeId, ResourceRef, SubjectRef, UsageRecord, UsageRecordStatus,
 };
 use uuid::Uuid;
 
@@ -34,7 +34,8 @@ use super::{
 use crate::domain::ports::metrics::{NoopMetrics, PdpOp};
 use crate::domain::test_support::{CapturingTenantPermitResolver, enforcer_for};
 
-const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+const SAMPLE_GTS_TYPE_ID: &str =
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
 fn ctx() -> SecurityContext {
     SecurityContext::builder()
@@ -48,7 +49,7 @@ fn ctx() -> SecurityContext {
 fn record_with(subject: Option<SubjectRef>) -> UsageRecord {
     UsageRecord {
         id: Uuid::from_u128(0x0001),
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_GTS_TYPE_ID).expect("valid gts_type_id"),
         tenant_id: Uuid::from_u128(0xC330),
         resource_ref: ResourceRef::new("rsc-eq", "compute.vm").expect("valid resource ref"),
         subject_ref: subject,
@@ -148,7 +149,7 @@ async fn key_and_record_compose_byte_identical_pdp_requests_with_full_subject() 
 
 /// Two records that hash-equal under `AttributionTupleKey` MUST always
 /// produce equal PDP requests -- even when their *non*-tuple fields
-/// (`id`, `gts_id`, `value`, `idempotency_key`, `metadata`,
+/// (`id`, `gts_type_id`, `value`, `idempotency_key`, `metadata`,
 /// `corrects_id`, `created_at`) differ wildly. This pins the
 /// projection-correctness premise of the dedup directly: "share the
 /// tuple => share the PDP payload".
@@ -156,7 +157,7 @@ async fn key_and_record_compose_byte_identical_pdp_requests_with_full_subject() 
 async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_differ() {
     let record_a = UsageRecord {
         id: Uuid::from_u128(0xAAAA),
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_GTS_TYPE_ID).expect("valid gts_type_id"),
         tenant_id: Uuid::from_u128(0xDEAD),
         resource_ref: ResourceRef::new("rsc-shared", "compute.vm").expect("valid resource ref"),
         subject_ref: Some(SubjectRef::new("sub-shared", Some("user")).expect("valid subject")),
@@ -174,7 +175,7 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         subject_ref: record_a.subject_ref.clone(),
         // … wildly different non-tuple fields:
         id: Uuid::from_u128(0xBBBB),
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_GTS_TYPE_ID).expect("valid gts_type_id"),
         metadata: BTreeMap::new(),
         value: Decimal::from(-999),
         idempotency_key: IdempotencyKey::new("idem-B-different").expect("valid idempotency key"),

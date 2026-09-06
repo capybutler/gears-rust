@@ -69,7 +69,7 @@ pub const MAX_BATCH_RECORDS: usize = 100;
 /// `cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization`.
 const PDP_CONCURRENCY: usize = 8;
 
-/// Concurrency cap for the per-distinct-`gts_id` Type Resolver fan-out in
+/// Concurrency cap for the per-distinct-`gts_type_id` Type Resolver fan-out in
 /// `create_usage_records`. Bounds request-local pressure on
 /// [`TypeResolver::resolve`] (itself single-flighted per key, and normally
 /// served from cache — see [`crate::domain::type_resolver`]) for the
@@ -118,7 +118,7 @@ type PdpGroupDecision = (Vec<usize>, Result<(), DomainError>);
 /// resolution outcome projects to every record sharing that type without
 /// re-resolving it. Replaces the pre-Task-9 `CatalogCache`, which cached a
 /// plugin-owned `UsageType` per `gts_id` instead of a resolved declaration.
-type DeclarationCache = HashMap<UsageTypeGtsId, Result<Arc<ResolvedDeclaration>, DomainError>>;
+type DeclarationCache = HashMap<MeterTypeId, Result<Arc<ResolvedDeclaration>, DomainError>>;
 
 /// Cached L1 referential lookup per distinct `corrects_id`, lifted into
 /// [`DomainError`] so the variant identity of
@@ -139,41 +139,6 @@ type PendingL1Lookup = (usize, UsageRecord, Uuid);
 fn invariant_breach(detail: String) -> UsageCollectorError {
     tracing::error!(detail = %detail, "usage-collector host-invariant breach");
     UsageCollectorError::internal(detail)
-}
-
-/// Converts a catalog `gts_id` into the [`MeterTypeId`] the Type Resolver
-/// keys its cache on.
-///
-/// Scaffolding, not a permanent conversion utility: `UsageTypeGtsId` is the
-/// wire-level type-reference parameter only until Task 10 swaps every such
-/// surface to `MeterTypeId` directly. Once that lands, callers already hold
-/// a `MeterTypeId` and this function — along with the validation gap it
-/// hedges below — is deleted with it.
-///
-/// `UsageTypeGtsId` wraps a GTS *instance* id (no trailing `~`) already
-/// validated by [`UsageTypeGtsId::new`] to derive from the reserved usage
-/// base with exactly one further segment; `MeterTypeId` wraps the
-/// corresponding GTS *type* id — the identical string, `~`-terminated.
-/// Appending the terminator is therefore the only difference between the
-/// two wire forms for a value that already passed that validation, so this
-/// conversion is not expected to fail against one in practice — but the
-/// two validators do not share a length ceiling: `UsageTypeGtsId::new`
-/// delegates to `gts_id`'s `GtsId::try_new`, capped at 1024 bytes, while
-/// `MeterTypeId::new` caps at 512. A `gts_id` between those two bounds
-/// therefore passes the former and fails the latter here, surfacing as a
-/// 500 rather than the 400 an over-long identifier should be. That gap is
-/// exactly what the `Result` (not an `.expect()`) below is for, and it
-/// closes on its own once `MeterTypeId` becomes the boundary type and this
-/// validation moves to the surface that first parses the identifier.
-/// Surfaced as a typed `Internal` (never a panic) so a host-invariant
-/// breach here still returns an error rather than crashing the request
-/// thread.
-fn meter_type_id_of(gts_id: &UsageTypeGtsId) -> Result<MeterTypeId, UsageCollectorError> {
-    MeterTypeId::new(format!("{gts_id}~")).map_err(|e| {
-        invariant_breach(format!(
-            "usage-type gts_id `{gts_id}` did not convert to a meter type id: {e}"
-        ))
-    })
 }
 
 /// Classify a Plugin SPI error for `uc_plugin_accept_errors_total`.
@@ -502,12 +467,12 @@ async fn resolve_l1_lookups(
         // `semantics → L1 → metadata` error-priority ordering the pre-A3
         // in-loop code exposed. A missing declaration entry here is a
         // host-invariant breach (the pre-pass covers every PDP-allowed
-        // record's gts_id); surface it as a typed `Internal` rather than
+        // record's gts_type_id); surface it as a typed `Internal` rather than
         // panic the request thread.
-        let Some(Ok(declaration)) = declaration_cache.get(&record.gts_id) else {
+        let Some(Ok(declaration)) = declaration_cache.get(&record.gts_type_id) else {
             results[index] = Some(Err(invariant_breach(format!(
-                "declaration pre-pass cache miss for gts_id {} before L1 metadata check",
-                record.gts_id,
+                "declaration pre-pass cache miss for gts_type_id {} before L1 metadata check",
+                record.gts_type_id,
             ))));
             continue;
         };
@@ -754,8 +719,8 @@ impl Service {
     /// * [`UsageCollectorError::PermissionDenied`] /
     ///   [`UsageCollectorError::ServiceUnavailable`] when the PDP denies or
     ///   is unavailable.
-    /// * [`UsageCollectorError::NotFound`] when the referenced `gts_id` does
-    ///   not resolve to a usable declaration.
+    /// * [`UsageCollectorError::NotFound`] when the referenced `gts_type_id`
+    ///   does not resolve to a usable declaration.
     /// * [`UsageCollectorError::InvalidArgument`] /
     ///   [`UsageCollectorError::InvalidArgument`] on a malformed
     ///   `metadata` payload.
@@ -837,8 +802,7 @@ impl Service {
         // all). An unresolvable type fails closed here, before any plugin
         // dispatch, mirroring `Self::query_aggregated_usage_records`'s
         // identical fail-closed posture on the read path.
-        let meter_id = meter_type_id_of(&record.gts_id)?;
-        let declaration = self.type_resolver.resolve(&meter_id).await?;
+        let declaration = self.type_resolver.resolve(&record.gts_type_id).await?;
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-usage-type-not-found
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-catalog-lookup
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-usage-type-not-found
@@ -1202,31 +1166,25 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-pdp
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-catalog
-        let distinct_gts_ids: HashSet<UsageTypeGtsId> = records
+        let distinct_gts_type_ids: HashSet<MeterTypeId> = records
             .iter()
             .enumerate()
             .filter(|(idx, _)| pdp_allowed[*idx])
-            .map(|(_, r)| r.gts_id.clone())
+            .map(|(_, r)| r.gts_type_id.clone())
             .collect();
 
         // The fan-out lifts each per-id outcome to `DomainError` (the Type
         // Resolver's own error type) eagerly so the cached value is Clone
         // and a single resolution can be projected to every input index
-        // that references the gts_id without re-resolving it. Replaces the
-        // pre-Task-9 plugin-side `get_usage_type` catalog fan-out at the
+        // that references the gts_type_id without re-resolving it. Replaces
+        // the pre-Task-9 plugin-side `get_usage_type` catalog fan-out at the
         // same bounded concurrency.
         let declaration_cache: DeclarationCache =
-            stream::iter(distinct_gts_ids.into_iter().map(|gts_id| {
+            stream::iter(distinct_gts_type_ids.into_iter().map(|gts_type_id| {
                 let type_resolver = self.type_resolver.as_ref();
                 async move {
-                    let outcome = match meter_type_id_of(&gts_id) {
-                        Ok(meter_id) => type_resolver.resolve(&meter_id).await,
-                        // Host-invariant hedge only — see `meter_type_id_of`'s
-                        // doc comment; surfaces as a typed `Internal`
-                        // per-id outcome rather than panicking the fan-out.
-                        Err(e) => Err(DomainError::Internal(e.to_string())),
-                    };
-                    (gts_id, outcome)
+                    let outcome = type_resolver.resolve(&gts_type_id).await;
+                    (gts_type_id, outcome)
                 }
             }))
             .buffer_unordered(TYPE_RESOLUTION_FANOUT_CONCURRENCY)
@@ -1247,22 +1205,22 @@ impl Service {
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-catalog
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-unknown-usage-type
             // The declaration pre-pass populated `declaration_cache` with a
-            // Clone outcome per distinct gts_id; every PDP-allowed record's
-            // gts_id is guaranteed to be present.
-            let declaration = match declaration_cache.get(&record.gts_id) {
+            // Clone outcome per distinct gts_type_id; every PDP-allowed
+            // record's gts_type_id is guaranteed to be present.
+            let declaration = match declaration_cache.get(&record.gts_type_id) {
                 Some(Ok(decl)) => Arc::clone(decl),
                 Some(Err(e)) => {
                     results[index] = Some(Err(UsageCollectorError::from(e.clone())));
                     continue;
                 }
                 // Host-invariant breach (declaration pre-pass populated by
-                // `distinct_gts_ids`); typed `Internal` per-record error
+                // `distinct_gts_type_ids`); typed `Internal` per-record error
                 // rather than `unreachable!()` so a future refactor cannot
                 // turn an invariant slip into a request-thread panic.
                 None => {
                     results[index] = Some(Err(invariant_breach(format!(
-                        "declaration pre-pass cache miss for gts_id {} during record dispatch",
-                        record.gts_id,
+                        "declaration pre-pass cache miss for gts_type_id {} during record dispatch",
+                        record.gts_type_id,
                     ))));
                     continue;
                 }
@@ -1783,7 +1741,7 @@ impl Service {
     ///    filter via [`authz::scope_to_odata_filter`]. The composition is
     ///    intersection-only (`composed = user_filter AND constraints`) per
     ///    `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`
-    ///    — no widening is permitted. `gts_id` stays a typed parameter
+    ///    — no widening is permitted. `gts_type_id` stays a typed parameter
     ///    and is NOT touched here. The `[from, to)` time window flows
     ///    through `query.filter` as a `created_at` predicate (see
     ///    [`usage_collector_sdk::UsageRecordFilterField`]); the gateway
@@ -1810,7 +1768,7 @@ impl Service {
     pub async fn list_usage_records(
         &self,
         ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError> {
@@ -1855,7 +1813,7 @@ impl Service {
             instrument_spi(
                 self.metrics.as_ref(),
                 PluginOp::ListUsageRecords,
-                plugin.list_usage_records(gts_id, &composed, metadata_filter),
+                plugin.list_usage_records(gts_type_id, &composed, metadata_filter),
             )
             .await
             .map_err(|e| UsageCollectorError::from(DomainError::from(e)))
@@ -1904,7 +1862,7 @@ impl Service {
     ///    `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`.
     /// 4. **Delegate** to the bound storage plugin's
     ///    `query_aggregated_usage_records` SPI with the composed filter,
-    ///    the typed `gts_id`, the metadata side-channel, the declared
+    ///    the typed `gts_type_id`, the metadata side-channel, the declared
     ///    `usage_collector_sdk::AggregationFold`, and any `group_by`
     ///    dimensions, executed server-side per `plugin-spi.md` Method 3.
     ///
@@ -1915,7 +1873,7 @@ impl Service {
     ///   or is unavailable, or when the PDP returns a constraint shape
     ///   this gear cannot honour (tree predicates on a flat resource,
     ///   unknown PEP property, type mismatch on a value).
-    /// * [`UsageCollectorError::NotFound`] when the queried `gts_id` does
+    /// * [`UsageCollectorError::NotFound`] when the queried `gts_type_id` does
     ///   not resolve to a usable declaration.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
     ///   transport / persistence failure.
@@ -1924,7 +1882,7 @@ impl Service {
     pub async fn query_aggregated_usage_records(
         &self,
         ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
@@ -1963,8 +1921,7 @@ impl Service {
             // (never declared, or an incomplete declaration) fails closed
             // here as a pre-dispatch 404, so the plugin stays pure
             // persistence and never sees a type it cannot resolve.
-            let meter_id = meter_type_id_of(&gts_id)?;
-            let declaration = self.type_resolver.resolve(&meter_id).await?;
+            let declaration = self.type_resolver.resolve(&gts_type_id).await?;
 
             let plugin = self
                 .resolve_plugin_for(PluginOp::QueryAggregatedUsageRecords)
@@ -1982,7 +1939,7 @@ impl Service {
                 self.metrics.as_ref(),
                 PluginOp::QueryAggregatedUsageRecords,
                 plugin.query_aggregated_usage_records(
-                    gts_id,
+                    gts_type_id,
                     declaration.aggregation_fold,
                     &composed,
                     metadata_filter,

@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
 use usage_collector_sdk::{
     ConflictReason, IdempotencyKey, MetadataKey, MeterTypeId, ResourceRef, SubjectRef,
-    UsageCollectorError, UsageRecord, UsageRecordStatus, UsageTypeGtsId, ValidationReason,
+    UsageCollectorError, UsageRecord, UsageRecordStatus, ValidationReason,
 };
 use uuid::Uuid;
 
@@ -28,17 +28,20 @@ fn mk_keys<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
     values.into_iter().map(mk_key).collect()
 }
 
-const SAMPLE_COUNTER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.foo.v1");
-const SAMPLE_GAUGE_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.bar.v1");
 const SAMPLE_METER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.foo.v1~");
+const SAMPLE_OTHER_METER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.bar.v1~");
 const BASE_ID: &str = gts_id!("cf.core.uc.usage_record.v1~");
 
-fn counter_id() -> UsageTypeGtsId {
-    UsageTypeGtsId::new(SAMPLE_COUNTER_ID).expect("valid usage_record-derived id")
+/// The ordinary-record fixtures' meter reference. Named for the pre-Task-9
+/// counter/gauge distinction the fixtures used to exercise; `UsageRecord` no
+/// longer carries a `kind`, but the two distinct meter ids are still needed
+/// to exercise the L1 cross-meter scope check below.
+fn counter_id() -> MeterTypeId {
+    meter_id()
 }
 
-fn gauge_id() -> UsageTypeGtsId {
-    UsageTypeGtsId::new(SAMPLE_GAUGE_ID).expect("valid usage_record-derived id")
+fn gauge_id() -> MeterTypeId {
+    MeterTypeId::new(SAMPLE_OTHER_METER_ID).expect("valid meter type id")
 }
 
 fn meter_id() -> MeterTypeId {
@@ -329,7 +332,7 @@ fn a_configured_non_default_cap_is_honoured() {
 fn ordinary_counter_record(value: Decimal) -> UsageRecord {
     UsageRecord {
         id: Uuid::new_v4(),
-        gts_id: counter_id(),
+        gts_type_id: counter_id(),
         tenant_id: Uuid::from_u128(1),
         resource_ref: ResourceRef::new("rsc-1", "compute.vm").expect("valid resource ref"),
         subject_ref: None,
@@ -435,7 +438,7 @@ fn l1_cross_tenant_reference_is_rejected_as_wrong_scope() {
 fn l1_cross_usage_type_reference_is_rejected_as_wrong_scope() {
     let record = counter_compensation_record(Decimal::from(-1), Uuid::new_v4());
     let mut referenced = referenced_ordinary_row(record.tenant_id);
-    referenced.gts_id = gauge_id();
+    referenced.gts_type_id = gauge_id();
     let err = verify_l1_corrects_id(
         &record,
         record.corrects_id.expect("test fixture sets corrects_id"),

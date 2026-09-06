@@ -382,7 +382,7 @@ mod create_usage_type_tests {
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use usage_collector_sdk::{
         AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MetadataKey,
-        UsageCollectorClientV1, UsageCollectorError, UsageCollectorPluginError,
+        MeterTypeId, UsageCollectorClientV1, UsageCollectorError, UsageCollectorPluginError,
         UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageKind, UsageRecord, UsageType,
         UsageTypeGtsId,
     };
@@ -470,7 +470,7 @@ mod create_usage_type_tests {
 
         async fn query_aggregated_usage_records(
             &self,
-            _gts_id: UsageTypeGtsId,
+            _gts_type_id: MeterTypeId,
             _fold: AggregationFold,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
@@ -483,7 +483,7 @@ mod create_usage_type_tests {
 
         async fn list_usage_records(
             &self,
-            _gts_id: UsageTypeGtsId,
+            _gts_type_id: MeterTypeId,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
         ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
@@ -897,9 +897,9 @@ mod catalog_dispatch_tests {
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use usage_collector_sdk::{
         AggregationDimension, AggregationFold, AggregationResult, ConflictReason, MetadataFilter,
-        MetadataKey, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
-        UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageKind, UsageRecord, UsageType,
-        UsageTypeGtsId,
+        MetadataKey, MeterTypeId, USAGE_TYPE_RESOURCE, UsageCollectorError,
+        UsageCollectorPluginError, UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageKind,
+        UsageRecord, UsageType, UsageTypeGtsId,
     };
     use uuid::Uuid;
 
@@ -1017,7 +1017,7 @@ mod catalog_dispatch_tests {
 
         async fn query_aggregated_usage_records(
             &self,
-            _gts_id: UsageTypeGtsId,
+            _gts_type_id: MeterTypeId,
             _fold: AggregationFold,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
@@ -1030,7 +1030,7 @@ mod catalog_dispatch_tests {
 
         async fn list_usage_records(
             &self,
-            _gts_id: UsageTypeGtsId,
+            _gts_type_id: MeterTypeId,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
         ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
@@ -1507,7 +1507,7 @@ mod deactivate_usage_record_tests {
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use usage_collector_sdk::{
         AggregationDimension, AggregationFold, AggregationResult, ConflictReason, MetadataFilter,
-        USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
+        MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
         UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
     };
     use uuid::Uuid;
@@ -1582,13 +1582,13 @@ mod deactivate_usage_record_tests {
 
     fn sample_loaded_record() -> UsageRecord {
         use time::OffsetDateTime;
-        use usage_collector_sdk::{IdempotencyKey, ResourceRef, UsageRecordStatus, UsageTypeGtsId};
+        use usage_collector_sdk::{IdempotencyKey, MeterTypeId, ResourceRef, UsageRecordStatus};
         UsageRecord {
             id: Uuid::from_u128(0xAAAA_AAAA),
-            gts_id: UsageTypeGtsId::new(gts_id!(
-                "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
+            gts_type_id: MeterTypeId::new(gts_id!(
+                "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~"
             ))
-            .expect("valid usage_record-derived gts_id"),
+            .expect("valid usage_record-derived gts_type_id"),
             tenant_id: Uuid::from_u128(2),
             resource_ref: ResourceRef::new("rsc-stub", "compute.vm").expect("valid resource ref"),
             subject_ref: None,
@@ -1639,7 +1639,7 @@ mod deactivate_usage_record_tests {
 
         async fn query_aggregated_usage_records(
             &self,
-            _gts_id: UsageTypeGtsId,
+            _gts_type_id: MeterTypeId,
             _fold: AggregationFold,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
@@ -1652,7 +1652,7 @@ mod deactivate_usage_record_tests {
 
         async fn list_usage_records(
             &self,
-            _gts_id: UsageTypeGtsId,
+            _gts_type_id: MeterTypeId,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
         ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
@@ -2032,22 +2032,22 @@ mod pdp_dedup_tests {
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, ResourceRef, SubjectRef, UsageCollectorPluginV1,
-        UsageRecord, UsageRecordStatus, UsageTypeGtsId,
+        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, SubjectRef,
+        UsageCollectorPluginV1, UsageRecord, UsageRecordStatus,
     };
     use uuid::Uuid;
 
     use crate::domain::test_support::{
-        HappyPathPlugin, authenticated_ctx, fake_declaration_source_with_fold,
-        permit_scoped_to_request_tenant, service_with_counting_permit_and_source,
+        HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
+        permit_scoped_to_request_tenant,
     };
 
     const HAPPY_GTS_ID: &str =
-        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
-    /// [`service_with_counting_permit_and_source`] wired with an arbitrary
-    /// working declaration (these tests exercise PDP dedup, not the
-    /// declaration itself).
+    /// A [`ServiceFixture`] wired with an arbitrary working declaration
+    /// (these tests exercise PDP dedup, not the declaration itself),
+    /// exposing the [`CountingTenantPermitResolver`] handle.
     fn service_with_counting_permit(
         plugin: Arc<dyn UsageCollectorPluginV1>,
         suffix: &str,
@@ -2055,17 +2055,15 @@ mod pdp_dedup_tests {
         Arc<crate::domain::Service>,
         Arc<crate::domain::test_support::CountingTenantPermitResolver>,
     ) {
-        service_with_counting_permit_and_source(
-            plugin,
-            suffix,
-            fake_declaration_source_with_fold("SUM"),
-        )
+        ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build_with_default_resolver_handle(plugin, suffix)
     }
 
     fn persisted_record(tenant_id: Uuid, resource_id: &str, idem: &str) -> UsageRecord {
         UsageRecord {
             id: Uuid::new_v4(),
-            gts_id: UsageTypeGtsId::new(HAPPY_GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(HAPPY_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new(resource_id, "compute.vm").expect("valid resource ref"),
             subject_ref: None,
@@ -2083,7 +2081,7 @@ mod pdp_dedup_tests {
         // attribution tuple; the create surface is identity-free (the id is
         // derived from the dedup key inside the service).
         CreateUsageRecord {
-            gts_id: UsageTypeGtsId::new(HAPPY_GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(HAPPY_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new(resource_id, "compute.vm").expect("valid resource ref"),
             subject_ref: None,
@@ -2430,16 +2428,16 @@ mod pdp_dedup_tests {
     }
 }
 
-// ── gts_id dedup pre-pass in `create_usage_records` ────────────────────────
+// ── gts_type_id dedup pre-pass in `create_usage_records` ───────────────────
 //
-// Pins the intra-batch catalog-lookup dedup behavior described in
+// Pins the intra-batch declaration-resolution dedup behavior described in
 // `cpt-cf-usage-collector-algo-usage-emission-catalog-existence-and-kind-lookup`
 // instructions `inst-algo-catalog-dedup-gts-id` and
-// `inst-algo-catalog-bounded-fanout`: records sharing the same
-// `UsageType` `gts_id` MUST collapse to a single `get_usage_type` SPI
-// round-trip, projected onto every input index referencing that id.
+// `inst-algo-catalog-bounded-fanout`: records sharing the same meter
+// `gts_type_id` MUST collapse to a single Type Resolver round-trip,
+// projected onto every input index referencing that id.
 #[cfg(test)]
-mod gts_id_dedup_tests {
+mod gts_type_id_dedup_tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use toolkit_gts::gts_id;
@@ -2448,29 +2446,25 @@ mod gts_id_dedup_tests {
     use usage_collector_sdk::{
         CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, USAGE_TYPE_RESOURCE,
         UsageCollectorError, UsageCollectorPluginV1, UsageRecord, UsageRecordStatus,
-        UsageTypeGtsId,
     };
     use uuid::Uuid;
 
     use crate::domain::test_support::{
-        HappyPathPlugin, authenticated_ctx, fake_declaration_source_counting,
-        fake_declaration_source_with_one_unresolvable, service_with_permit_and_source,
+        HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_counting,
+        fake_declaration_source_with_one_unresolvable,
     };
 
-    const GTS_A: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
-    const GTS_B: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_emitted.v1");
-    const GTS_C: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_buffered.v1");
+    const GTS_A: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+    const GTS_B: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_emitted.v1~");
+    const GTS_C: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_buffered.v1~");
 
-    /// The `MeterTypeId` the Type Resolver keys its cache on for the
-    /// catalog `gts_id` `gts` — identical string, `~`-terminated (see
-    /// `service::meter_type_id_of`).
     fn meter_id_for(gts: &str) -> MeterTypeId {
-        MeterTypeId::new(format!("{gts}~")).expect("valid meter type id")
+        MeterTypeId::new(gts).expect("valid meter type id")
     }
 
     fn record_for(gts: &str, tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
-            gts_id: UsageTypeGtsId::new(gts).expect("valid gts_id"),
+            gts_type_id: meter_id_for(gts),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-gts-dedup", "compute.vm")
                 .expect("valid resource ref"),
@@ -2486,7 +2480,7 @@ mod gts_id_dedup_tests {
     fn persisted_for(input: &CreateUsageRecord) -> UsageRecord {
         UsageRecord {
             id: Uuid::new_v4(),
-            gts_id: input.gts_id.clone(),
+            gts_type_id: input.gts_type_id.clone(),
             tenant_id: input.tenant_id,
             resource_ref: input.resource_ref.clone(),
             subject_ref: input.subject_ref.clone(),
@@ -2499,16 +2493,16 @@ mod gts_id_dedup_tests {
         }
     }
 
-    // The "5 records, identical gts_id → exactly one resolution" case is now
-    // covered by `ingestion_declared_type_tests::a_batch_resolves_each_distinct_type_once`
+    // The "5 records, identical gts_type_id → exactly one resolution" case is
+    // now covered by `ingestion_declared_type_tests::a_batch_resolves_each_distinct_type_once`
     // (Task 9's own required test, using `CountingDeclarationSource`) —
     // deleted here rather than duplicated.
 
-    /// Three records, three distinct `gts_id`s → exactly three
+    /// Three records, three distinct `gts_type_id`s → exactly three
     /// declaration resolutions (one per distinct id), asking the resolver
     /// for exactly the distinct ids in the batch.
     #[tokio::test]
-    async fn create_usage_records_issues_one_resolution_per_distinct_gts_id() {
+    async fn create_usage_records_issues_one_resolution_per_distinct_gts_type_id() {
         let plugin = HappyPathPlugin::new();
         let source = fake_declaration_source_counting();
 
@@ -2521,10 +2515,9 @@ mod gts_id_dedup_tests {
 
         plugin.set_create_records(input.iter().map(|r| Ok(persisted_for(r))).collect());
 
-        let service = service_with_permit_and_source(
+        let service = ServiceFixture::default().with_source(source.clone()).build(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.gts_dedup.distinct.records.v1",
-            source.clone(),
         );
 
         let results = service
@@ -2537,7 +2530,7 @@ mod gts_id_dedup_tests {
         assert_eq!(
             source.fetch_calls(),
             3,
-            "3 distinct gts_ids MUST produce 3 declaration resolutions; \
+            "3 distinct gts_type_ids MUST produce 3 declaration resolutions; \
              observed {} calls",
             source.fetch_calls(),
         );
@@ -2560,11 +2553,11 @@ mod gts_id_dedup_tests {
         );
     }
 
-    /// Mixed batch: `gts_id` A resolves, `gts_id` B does not. Records
-    /// sharing the unresolvable id are all rejected with `NotFound`,
-    /// records sharing the resolvable id are accepted.
+    /// Mixed batch: `gts_type_id` A resolves, `gts_type_id` B does not.
+    /// Records sharing the unresolvable id are all rejected with
+    /// `NotFound`, records sharing the resolvable id are accepted.
     #[tokio::test]
-    async fn create_usage_records_projects_not_found_to_every_record_sharing_unknown_gts_id() {
+    async fn create_usage_records_projects_not_found_to_every_record_sharing_unknown_gts_type_id() {
         let plugin = HappyPathPlugin::new();
         let source = fake_declaration_source_with_one_unresolvable(meter_id_for(GTS_B));
 
@@ -2576,20 +2569,22 @@ mod gts_id_dedup_tests {
             record_for(GTS_B, tenant_id, "idem-B-1"),
         ];
 
-        // Only the two resolvable-gts_id records reach the SPI; program two
-        // accepted-persist responses.
+        // Only the two resolvable-gts_type_id records reach the SPI; program
+        // two accepted-persist responses.
         let accepted: Vec<_> = input
             .iter()
-            .filter(|r| r.gts_id.to_string() == GTS_A)
+            .filter(|r| r.gts_type_id.to_string() == GTS_A)
             .map(|r| Ok(persisted_for(r)))
             .collect();
         plugin.set_create_records(accepted);
 
-        let service = service_with_permit_and_source(
-            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.gts_dedup.mixed.records.v1",
-            Arc::clone(&source) as Arc<dyn crate::domain::ports::declarations::DeclarationSource>,
-        );
+        let service = ServiceFixture::default()
+            .with_source(Arc::clone(&source)
+                as Arc<dyn crate::domain::ports::declarations::DeclarationSource>)
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.gts_dedup.mixed.records.v1",
+            );
 
         let results = service
             .create_usage_records(&authenticated_ctx(), input)
@@ -2599,12 +2594,12 @@ mod gts_id_dedup_tests {
 
         assert!(
             results[0].is_ok(),
-            "record at index 0 (gts_id A) MUST be accepted, got {:?}",
+            "record at index 0 (gts_type_id A) MUST be accepted, got {:?}",
             results[0],
         );
         assert!(
             results[2].is_ok(),
-            "record at index 2 (gts_id A) MUST be accepted, got {:?}",
+            "record at index 2 (gts_type_id A) MUST be accepted, got {:?}",
             results[2],
         );
         let expected_name = meter_id_for(GTS_B).to_string();
@@ -2623,7 +2618,7 @@ mod gts_id_dedup_tests {
                     );
                 }
                 other => panic!(
-                    "record at index {idx} (gts_id B) MUST surface NotFound, \
+                    "record at index {idx} (gts_type_id B) MUST surface NotFound, \
                      got {other:?}",
                 ),
             }
@@ -2632,7 +2627,7 @@ mod gts_id_dedup_tests {
         assert_eq!(
             source.fetch_calls(),
             2,
-            "2 distinct gts_ids carrying 4 records MUST produce 2 declaration \
+            "2 distinct gts_type_ids carrying 4 records MUST produce 2 declaration \
              resolutions; observed {} calls",
             source.fetch_calls(),
         );
@@ -2656,37 +2651,38 @@ mod corrects_id_dedup_tests {
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
-        UsageCollectorPluginV1, UsageRecord, UsageRecordStatus, UsageTypeGtsId,
+        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, USAGE_RECORD_RESOURCE,
+        UsageCollectorError, UsageCollectorPluginV1, UsageRecord, UsageRecordStatus,
     };
     use uuid::Uuid;
 
     use crate::domain::Service;
     use crate::domain::test_support::{
-        HappyPathPlugin, authenticated_ctx, fake_declaration_source_with_fold,
-        service_with_permit_and_source,
+        HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
     };
 
     const COUNTER_GTS_ID: &str =
-        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
-    /// [`service_with_permit_and_source`] wired with an arbitrary working
-    /// declaration — these tests exercise the L1 `corrects_id` dedup
-    /// pre-pass, not the declaration itself.
+    /// A [`ServiceFixture`] wired with an arbitrary working declaration —
+    /// these tests exercise the L1 `corrects_id` dedup pre-pass, not the
+    /// declaration itself.
     fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
-        service_with_permit_and_source(plugin, suffix, fake_declaration_source_with_fold("SUM"))
+        ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build(plugin, suffix)
     }
 
     fn referenced_original(tenant_id: Uuid) -> UsageRecord {
         // The L1 verifier checks (corrects_id IS NULL, identity-tuple match,
         // status=Active) against this row, so the compensation records under
-        // test must mirror its (tenant, gts_id, resource_ref, subject_ref)
+        // test must mirror its (tenant, gts_type_id, resource_ref, subject_ref)
         // shape. `set_get_record` returns this same row for any id the
         // host looks up — that's fine because verify_l1_corrects_id reads
         // identity fields, not id.
         UsageRecord {
             id: Uuid::from_u128(0xDEAD_BEEF),
-            gts_id: UsageTypeGtsId::new(COUNTER_GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-comp", "compute.vm").expect("valid resource ref"),
             subject_ref: None,
@@ -2701,7 +2697,7 @@ mod corrects_id_dedup_tests {
 
     fn compensation_for(tenant_id: Uuid, corrects_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
-            gts_id: UsageTypeGtsId::new(COUNTER_GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-comp", "compute.vm").expect("valid resource ref"),
             subject_ref: None,
@@ -2715,7 +2711,7 @@ mod corrects_id_dedup_tests {
 
     fn ordinary_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
-            gts_id: UsageTypeGtsId::new(COUNTER_GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-comp", "compute.vm").expect("valid resource ref"),
             subject_ref: None,
@@ -2957,20 +2953,20 @@ mod get_usage_record_tests {
 
     use crate::domain::Service;
     use crate::domain::test_support::{
-        DenyAllResolver, HappyPathPlugin, UnreachableResolver, authenticated_ctx, enforcer_for,
-        hub_with_plugin, service_with_permit,
+        DenyAllResolver, HappyPathPlugin, ServiceFixture, UnreachableResolver, authenticated_ctx,
+        enforcer_for, hub_with_plugin,
     };
 
     const HAPPY_RECORD_GTS_ID: &str =
-        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
     fn sample_persisted_record(id: Uuid, tenant_id: Uuid) -> UsageRecord {
         use std::collections::BTreeMap;
         use time::OffsetDateTime;
-        use usage_collector_sdk::{IdempotencyKey, ResourceRef, UsageTypeGtsId};
+        use usage_collector_sdk::{IdempotencyKey, MeterTypeId, ResourceRef};
         UsageRecord {
             id,
-            gts_id: UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-happy", "compute.vm").expect("valid resource ref"),
             subject_ref: None,
@@ -2993,7 +2989,7 @@ mod get_usage_record_tests {
         let tenant_id = Uuid::from_u128(2);
         plugin.set_get_record(sample_persisted_record(target, tenant_id));
 
-        let svc = service_with_permit(
+        let svc = ServiceFixture::default().build(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.usage_collector.get_record.happy.v1",
         );
@@ -3152,7 +3148,7 @@ mod get_usage_record_tests {
             }
             async fn query_aggregated_usage_records(
                 &self,
-                _gts_id: usage_collector_sdk::UsageTypeGtsId,
+                _gts_type_id: usage_collector_sdk::MeterTypeId,
                 _fold: usage_collector_sdk::AggregationFold,
                 _query: &toolkit_odata::ODataQuery,
                 _metadata_filter: &[usage_collector_sdk::MetadataFilter],
@@ -3165,7 +3161,7 @@ mod get_usage_record_tests {
             }
             async fn list_usage_records(
                 &self,
-                _gts_id: usage_collector_sdk::UsageTypeGtsId,
+                _gts_type_id: usage_collector_sdk::MeterTypeId,
                 _query: &toolkit_odata::ODataQuery,
                 _metadata_filter: &[usage_collector_sdk::MetadataFilter],
             ) -> Result<toolkit_odata::Page<UsageRecord>, UsageCollectorPluginError> {
@@ -3227,7 +3223,8 @@ mod get_usage_record_tests {
         }
 
         let plugin: Arc<dyn UsageCollectorPluginV1> = Arc::new(TransientGetPlugin);
-        let svc = service_with_permit(plugin, "test.usage_collector.get_record.transient.v1");
+        let svc =
+            ServiceFixture::default().build(plugin, "test.usage_collector.get_record.transient.v1");
 
         let err = svc
             .get_usage_record(&authenticated_ctx(), Uuid::from_u128(0x01))
@@ -3337,31 +3334,31 @@ mod create_usage_record_path_tests {
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
-        ConflictReason, CreateUsageRecord, IdempotencyKey, ResourceRef, USAGE_RECORD_RESOURCE,
-        UsageCollectorError, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
-        UsageRecordStatus, UsageTypeGtsId,
+        ConflictReason, CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef,
+        USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
+        UsageCollectorPluginV1, UsageRecord, UsageRecordStatus,
     };
     use uuid::Uuid;
 
     use crate::domain::Service;
     use crate::domain::test_support::{
-        DenyAllResolver, HappyPathPlugin, authenticated_ctx, enforcer_for,
-        fake_declaration_source_with_fold, hub_with_plugin, service_with_permit_and_source,
+        DenyAllResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx, enforcer_for,
+        fake_declaration_source_with_fold, hub_with_plugin,
     };
 
     const COUNTER_GTS_ID: &str =
-        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
     /// Build an ordinary record (no `corrects_id`) with the given
     /// `tenant_id` and `value`. Used as the base shape every test in this
-    /// module shapes — call sites mutate `value` / `gts_id` /
+    /// module shapes — call sites mutate `value` / `gts_type_id` /
     /// `corrects_id` to drive the per-stage outcome. There is no more
     /// `UsageType.kind` to gate a value-sign rule on, so `value` no longer
     /// drives any accept/reject decision here — it is carried only because
     /// `CreateUsageRecord` requires one.
     fn counter_record(tenant_id: Uuid, value: i64, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
-            gts_id: UsageTypeGtsId::new(COUNTER_GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-singular", "compute.vm")
                 .expect("valid resource ref"),
@@ -3385,7 +3382,9 @@ mod create_usage_record_path_tests {
     /// ingestion, not the aggregate path — the fold value is irrelevant),
     /// and the supplied plugin stub.
     fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
-        service_with_permit_and_source(plugin, suffix, fake_declaration_source_with_fold("SUM"))
+        ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build(plugin, suffix)
     }
 
     /// Build a `Service` wired against a deny-all PDP. The deny path
@@ -3515,8 +3514,8 @@ mod create_usage_record_path_tests {
     /// `corrects_id` references a row in a different `tenant_id` ⇒
     /// `CorrectsIdWrongScope`. Pins the L1 referential rule 3 lift on
     /// the singular path: the verifier reads identity-tuple fields
-    /// (tenant, `gts_id`, `resource_ref`, `subject_ref`) off the referenced
-    /// row and rejects on the first mismatch.
+    /// (tenant, `gts_type_id`, `resource_ref`, `subject_ref`) off the
+    /// referenced row and rejects on the first mismatch.
     #[tokio::test]
     async fn create_usage_record_l1_corrects_id_wrong_scope_returns_typed_error() {
         let plugin = HappyPathPlugin::new();
@@ -3530,7 +3529,7 @@ mod create_usage_record_path_tests {
         // identity-tuple comparison fails on the tenant axis.
         let referenced = UsageRecord {
             id: corrects_id,
-            gts_id: UsageTypeGtsId::new(COUNTER_GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
             tenant_id: referenced_tenant,
             resource_ref: ResourceRef::new("rsc-singular", "compute.vm")
                 .expect("valid resource ref"),
@@ -3633,19 +3632,19 @@ mod batch_size_cap_tests {
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, ResourceRef, UsageCollectorError,
-        UsageCollectorPluginV1, UsageTypeGtsId, ValidationReason,
+        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorError,
+        UsageCollectorPluginV1, ValidationReason,
     };
     use uuid::Uuid;
 
     use crate::domain::service::MAX_BATCH_RECORDS;
-    use crate::domain::test_support::{HappyPathPlugin, authenticated_ctx, service_with_permit};
+    use crate::domain::test_support::{HappyPathPlugin, ServiceFixture, authenticated_ctx};
 
-    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
     fn input_record(idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
-            gts_id: UsageTypeGtsId::new(GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id: Uuid::from_u128(1),
             resource_ref: ResourceRef::new("rsc-batch-cap", "compute.vm")
                 .expect("valid resource ref"),
@@ -3677,7 +3676,7 @@ mod batch_size_cap_tests {
     async fn create_usage_records_rejects_empty_batch_without_dispatch() {
         let plugin = HappyPathPlugin::new();
 
-        let service = service_with_permit(
+        let service = ServiceFixture::default().build(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.batch_cap.empty.records.v1",
         );
@@ -3700,7 +3699,7 @@ mod batch_size_cap_tests {
     async fn create_usage_records_rejects_over_cap_batch_without_dispatch() {
         let plugin = HappyPathPlugin::new();
 
-        let service = service_with_permit(
+        let service = ServiceFixture::default().build(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.batch_cap.over.records.v1",
         );
@@ -3741,33 +3740,33 @@ mod derived_id_stamp_tests {
     use time::OffsetDateTime;
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, ResourceRef, UsageCollectorPluginV1, UsageTypeGtsId,
+        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorPluginV1,
         derive_usage_record_id,
     };
     use uuid::Uuid;
 
     use crate::domain::Service;
     use crate::domain::test_support::{
-        HappyPathPlugin, authenticated_ctx, fake_declaration_source_with_fold,
-        service_with_permit_and_source,
+        HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
     };
 
-    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
-    /// [`service_with_permit_and_source`] wired with an arbitrary working
-    /// declaration — these tests exercise id derivation, not the
-    /// declaration itself.
+    /// A [`ServiceFixture`] wired with an arbitrary working declaration —
+    /// these tests exercise id derivation, not the declaration itself.
     fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
-        service_with_permit_and_source(plugin, suffix, fake_declaration_source_with_fold("SUM"))
+        ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build(plugin, suffix)
     }
 
     /// Build a create submission with a known dedup key
-    /// (`tenant_id` / `gts_id` / `idempotency_key` / `created_at`), so a
+    /// (`tenant_id` / `gts_type_id` / `idempotency_key` / `created_at`), so a
     /// passing assertion can only mean the service derived the dispatched
     /// record's id from it.
     fn input_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
-            gts_id: UsageTypeGtsId::new(GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-derive", "compute.vm").expect("valid resource ref"),
             subject_ref: None,
@@ -3789,7 +3788,7 @@ mod derived_id_stamp_tests {
         let input = input_record(tenant_id, idem);
         let expected = derive_usage_record_id(
             input.tenant_id,
-            &input.gts_id,
+            &input.gts_type_id,
             &input.idempotency_key,
             input.created_at,
         );
@@ -3814,7 +3813,7 @@ mod derived_id_stamp_tests {
         assert_eq!(
             dispatched.id, expected,
             "the SERVICE MUST stamp the dispatched record's id with \
-             derive_usage_record_id(tenant_id, gts_id, idempotency_key, created_at) - this \
+             derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, created_at) - this \
              guards the in-process (non-REST) caller path independently of the \
              handler",
         );
@@ -3834,7 +3833,12 @@ mod derived_id_stamp_tests {
         let expected: Vec<Uuid> = input
             .iter()
             .map(|r| {
-                derive_usage_record_id(r.tenant_id, &r.gts_id, &r.idempotency_key, r.created_at)
+                derive_usage_record_id(
+                    r.tenant_id,
+                    &r.gts_type_id,
+                    &r.idempotency_key,
+                    r.created_at,
+                )
             })
             .collect();
 
@@ -3864,7 +3868,7 @@ mod derived_id_stamp_tests {
         assert_eq!(
             dispatched_ids, expected,
             "the SERVICE MUST stamp each dispatched record's id with its own \
-             derive_usage_record_id(tenant_id, gts_id, idempotency_key, created_at), \
+             derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, created_at), \
              overwriting the caller-supplied ids - this guards the in-process \
              (non-REST) batch caller path independently of the handler",
         );
@@ -3886,18 +3890,40 @@ mod aggregate_declared_fold_tests {
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
         AggregationBucket, AggregationFold, AggregationResult, MAX_AGGREGATION_BUCKETS,
-        UsageCollectorError, UsageTypeGtsId, ValidationReason,
+        MeterTypeId, UsageCollectorError, ValidationReason,
     };
 
     use crate::domain::test_support::{
-        authenticated_ctx, fake_declaration_source_not_found, fake_declaration_source_with_fold,
-        service_with_recording_plugin,
+        RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
+        fake_declaration_source_not_found, fake_declaration_source_with_fold,
+        recording_plugin_resolver,
     };
 
-    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
-    fn meter_id() -> UsageTypeGtsId {
-        UsageTypeGtsId::new(GTS_ID).expect("valid gts_id")
+    fn meter_id() -> MeterTypeId {
+        MeterTypeId::new(GTS_ID).expect("valid gts_type_id")
+    }
+
+    /// Build a `Service` + [`RecordingPlugin`] spy over `source`, wired
+    /// against the fixed-tenant PDP fake the aggregate surface requires
+    /// (see [`recording_plugin_resolver`]).
+    fn service_with_recording_plugin(
+        source: std::sync::Arc<dyn crate::domain::ports::declarations::DeclarationSource>,
+    ) -> (
+        std::sync::Arc<crate::domain::Service>,
+        std::sync::Arc<RecordingPlugin>,
+    ) {
+        let plugin = RecordingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(source)
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                std::sync::Arc::clone(&plugin)
+                    as std::sync::Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+                RECORDING_PLUGIN_SUFFIX,
+            );
+        (service, plugin)
     }
 
     fn ctx() -> SecurityContext {
@@ -4042,24 +4068,59 @@ mod aggregate_declared_fold_tests {
 mod ingestion_declared_type_tests {
     use std::collections::BTreeMap;
 
+    use std::sync::Arc;
+
     use time::OffsetDateTime;
     use toolkit_gts::gts_id;
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MetadataKey, ResourceRef, UsageTypeGtsId,
+        CreateUsageRecord, IdempotencyKey, MetadataKey, MeterTypeId, ResourceRef,
+        UsageCollectorPluginV1,
     };
     use uuid::Uuid;
 
+    use crate::domain::Service;
+    use crate::domain::ports::declarations::DeclarationSource;
     use crate::domain::test_support::{
-        authenticated_ctx, fake_declaration_source_counting, fake_declaration_source_not_found,
-        fake_declaration_source_with_metadata, service_with_recording_plugin,
-        service_with_recording_plugin_and_cap,
+        RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
+        fake_declaration_source_counting, fake_declaration_source_not_found,
+        fake_declaration_source_with_metadata, recording_plugin_resolver,
     };
 
-    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
     fn ctx() -> SecurityContext {
         authenticated_ctx()
+    }
+
+    /// Build a `Service` + [`RecordingPlugin`] spy over `source` at the
+    /// default metadata size cap, wired against the fixed-tenant PDP fake
+    /// (see [`recording_plugin_resolver`]).
+    fn service_with_recording_plugin(
+        source: Arc<dyn DeclarationSource>,
+    ) -> (Arc<Service>, Arc<RecordingPlugin>) {
+        service_with_recording_plugin_and_cap(
+            source,
+            crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+        )
+    }
+
+    /// Variant of [`service_with_recording_plugin`] taking an explicit
+    /// `metadata_size_cap_bytes`.
+    fn service_with_recording_plugin_and_cap(
+        source: Arc<dyn DeclarationSource>,
+        metadata_size_cap_bytes: usize,
+    ) -> (Arc<Service>, Arc<RecordingPlugin>) {
+        let plugin = RecordingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(source)
+            .with_resolver(recording_plugin_resolver())
+            .with_cap(metadata_size_cap_bytes)
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                RECORDING_PLUGIN_SUFFIX,
+            );
+        (service, plugin)
     }
 
     /// A minimal valid `CreateUsageRecord`, tenant-matched to
@@ -4068,7 +4129,7 @@ mod ingestion_declared_type_tests {
     /// declaration under test.
     fn valid_create_record() -> CreateUsageRecord {
         CreateUsageRecord {
-            gts_id: UsageTypeGtsId::new(GTS_ID).expect("valid gts_id"),
+            gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id: Uuid::from_u128(2),
             resource_ref: ResourceRef::new("rsc-ingestion-declared", "compute.vm")
                 .expect("valid resource ref"),

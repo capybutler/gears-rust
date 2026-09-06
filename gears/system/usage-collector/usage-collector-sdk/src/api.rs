@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::error::UsageCollectorError;
 use crate::models::{
-    AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, UsageRecord,
-    UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, MeterTypeId,
+    UsageRecord, UsageType, UsageTypeGtsId,
 };
 
 /// Consumer-facing API for Usage Collector operations.
@@ -58,7 +58,7 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
     async fn query_aggregated_usage_records(
         &self,
         ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
@@ -68,7 +68,7 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
     async fn list_usage_records(
         &self,
         ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError>;

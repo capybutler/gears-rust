@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::error::UsageCollectorPluginError;
 use crate::models::{
-    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, UsageRecord,
-    UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
+    UsageRecord, UsageType, UsageTypeGtsId,
 };
 
 /// Backend storage adapter trait implemented by
@@ -50,7 +50,7 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// separate typed parameter.
     async fn query_aggregated_usage_records(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
         fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
@@ -64,7 +64,7 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// plugins MUST honour it for stable pagination.
     async fn list_usage_records(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;

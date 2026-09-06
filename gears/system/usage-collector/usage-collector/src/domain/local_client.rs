@@ -16,7 +16,7 @@ use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter,
+    AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, MeterTypeId,
     UsageCollectorClientV1, UsageCollectorError, UsageRecord, UsageType, UsageTypeGtsId,
 };
 use uuid::Uuid;
@@ -66,13 +66,13 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
     async fn query_aggregated_usage_records(
         &self,
         ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorError> {
         self.svc
-            .query_aggregated_usage_records(ctx, gts_id, query, metadata_filter, group_by)
+            .query_aggregated_usage_records(ctx, gts_type_id, query, metadata_filter, group_by)
             .await
     }
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
@@ -81,12 +81,12 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
     async fn list_usage_records(
         &self,
         ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError> {
         self.svc
-            .list_usage_records(ctx, gts_id, query, metadata_filter)
+            .list_usage_records(ctx, gts_type_id, query, metadata_filter)
             .await
     }
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received

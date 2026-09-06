@@ -218,10 +218,10 @@ fn plugin_usage_type_referenced_lifts_to_sdk_conflict() {
 
 #[test]
 fn domain_unknown_metadata_key_lifts_to_invalid_argument() {
-    let gts_id = sample_gts_id();
+    let gts_type_id = sample_meter_id();
     let key = "unexpected_field".to_owned();
     let domain = DomainError::UnknownMetadataKey {
-        gts_id: gts_id.clone(),
+        gts_type_id: gts_type_id.clone(),
         key: key.clone(),
     };
     let sdk: UsageCollectorError = domain.into();
@@ -234,7 +234,7 @@ fn domain_unknown_metadata_key_lifts_to_invalid_argument() {
             ..
         } => {
             assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
-            assert_eq!(resource_name.as_deref(), Some(gts_id.as_ref()));
+            assert_eq!(resource_name.as_deref(), Some(gts_type_id.as_ref()));
             assert_eq!(reason, ValidationReason::UnknownMetadataKey);
             assert!(detail.contains(&key));
         }
@@ -391,7 +391,7 @@ fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_type_resource()
 // ---------------------------------------------------------------------------
 // DomainError::invalid_metadata / InvalidMetadata (task 5): the closed
 // metadata surface a meter declares. `CompiledMetadataSchema::validate` has
-// no `gts_id` in scope (only the entry's own metadata map), so — unlike
+// no `gts_type_id` in scope (only the entry's own metadata map), so — unlike
 // `UnknownMetadataKey` above — this lifts attributed to the record surface,
 // not a specific resource name.
 // ---------------------------------------------------------------------------

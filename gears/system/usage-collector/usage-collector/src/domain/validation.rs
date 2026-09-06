@@ -15,7 +15,7 @@
 //!   surface, enforced in code per
 //!   [`crate::domain::type_resolver::CompiledMetadataSchema::validate`].
 //!
-//! `gts_id` is NOT re-validated here: [`usage_collector_sdk::UsageTypeGtsId`]
+//! `gts_type_id` is NOT re-validated here: [`usage_collector_sdk::MeterTypeId`]
 //! is a validating newtype that already rejects empty values, ids missing
 //! the reserved-prefix `~` segment, and ids whose prefix is not one of the
 //! reserved counter / gauge base type ids.
@@ -243,7 +243,7 @@ pub fn validate_record_semantics(record: &UsageRecord) -> SemanticsOutcome {
 ///   referenced row is itself a compensation.
 /// * [`UsageCollectorError::Conflict`] when the referenced row
 ///   does not share the full identity tuple
-///   `(tenant_id, gts_id, resource_ref, subject_ref)` with the incoming
+///   `(tenant_id, gts_type_id, resource_ref, subject_ref)` with the incoming
 ///   compensation. `subject_ref` presence is part of the identity — a
 ///   `None` vs `Some(_)` mismatch is a scope error.
 /// * [`UsageCollectorError::Conflict`] when the referenced row is
@@ -277,7 +277,7 @@ pub fn verify_l1_corrects_id(
 
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-cross-scope
     if referenced.tenant_id != record.tenant_id
-        || referenced.gts_id != record.gts_id
+        || referenced.gts_type_id != record.gts_type_id
         || referenced.resource_ref != record.resource_ref
         || referenced.subject_ref != record.subject_ref
     {

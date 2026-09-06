@@ -37,8 +37,15 @@ fn metadata_map<const N: usize>(entries: [(&str, &str); N]) -> BTreeMap<Metadata
 const SAMPLE_USAGE_TYPE_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
+const SAMPLE_METER_TYPE_ID: &str =
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
 fn sample_id() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived id")
+}
+
+fn sample_meter_id() -> MeterTypeId {
+    MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid usage_record-derived meter type id")
 }
 
 fn sample_usage_type() -> UsageType {
@@ -52,7 +59,7 @@ fn sample_usage_type() -> UsageType {
 fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid>) -> UsageRecord {
     UsageRecord {
         id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("record id"),
-        gts_id: sample_id(),
+        gts_type_id: sample_meter_id(),
         tenant_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("tenant uuid"),
         resource_ref: ResourceRef::new("vm-1", "compute.vm").expect("valid resource ref"),
         subject_ref,
@@ -70,7 +77,7 @@ fn sample_create_usage_record(
     corrects_id: Option<Uuid>,
 ) -> CreateUsageRecord {
     CreateUsageRecord {
-        gts_id: sample_id(),
+        gts_type_id: sample_meter_id(),
         tenant_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("tenant uuid"),
         resource_ref: ResourceRef::new("vm-1", "compute.vm").expect("valid resource ref"),
         subject_ref,
@@ -97,7 +104,7 @@ fn into_usage_record_stamps_derived_id_and_active_status() {
 
     let expected_id = crate::id::derive_usage_record_id(
         input.tenant_id,
-        &input.gts_id,
+        &input.gts_type_id,
         &input.idempotency_key,
         input.created_at,
     );
@@ -114,7 +121,7 @@ fn into_usage_record_stamps_derived_id_and_active_status() {
         "a fresh submission must be stamped Active",
     );
     // Every caller-supplied field is forwarded verbatim.
-    assert_eq!(record.gts_id, input.gts_id);
+    assert_eq!(record.gts_type_id, input.gts_type_id);
     assert_eq!(record.tenant_id, input.tenant_id);
     assert_eq!(record.resource_ref, input.resource_ref);
     assert_eq!(record.subject_ref, input.subject_ref);
@@ -127,22 +134,23 @@ fn into_usage_record_stamps_derived_id_and_active_status() {
 
 // A submission whose dedup key matches an existing `UsageRecord` projects to
 // the SAME `id` that record carries — the derivation is a pure function of
-// `(tenant_id, gts_id, idempotency_key, created_at)`, so the create input and
-// the persisted shape agree on identity without the caller ever supplying it.
+// `(tenant_id, gts_type_id, idempotency_key, created_at)`, so the create input
+// and the persisted shape agree on identity without the caller ever supplying
+// it.
 #[test]
 fn into_usage_record_id_matches_full_record_with_same_dedup_key() {
     let input = sample_create_usage_record(None, None);
     let persisted = sample_usage_record(None, None);
-    // `sample_usage_record` shares the same tenant / gts_id / idempotency_key.
+    // `sample_usage_record` shares the same tenant / gts_type_id / idempotency_key.
     assert_eq!(input.tenant_id, persisted.tenant_id);
-    assert_eq!(input.gts_id, persisted.gts_id);
+    assert_eq!(input.gts_type_id, persisted.gts_type_id);
     assert_eq!(input.idempotency_key, persisted.idempotency_key);
 
     assert_eq!(
         input.into_usage_record().id,
         crate::id::derive_usage_record_id(
             persisted.tenant_id,
-            &persisted.gts_id,
+            &persisted.gts_type_id,
             &persisted.idempotency_key,
             persisted.created_at,
         ),
@@ -173,7 +181,7 @@ fn into_usage_record_truncates_created_at_to_micros() {
         record.id,
         crate::id::derive_usage_record_id(
             input.tenant_id,
-            &input.gts_id,
+            &input.gts_type_id,
             &input.idempotency_key,
             sub_us,
         ),
@@ -1261,69 +1269,69 @@ fn subject_ref_deserialize_rejects_unknown_fields() {
 // UsageRecordQuery — OData filter surface
 // ---------------------------------------------------------------------------
 //
-// `gts_id` is carried as a typed parameter on `list_usage_records` /
+// `gts_type_id` is carried as a typed parameter on `list_usage_records` /
 // `query_aggregated_usage_records`. The OData filter surface declared by
 // `UsageRecordQuery` deliberately omits it so that
 // `parse_odata_filter::<UsageRecordFilterField>` rejects any
-// `gts_id`-touching predicate at parse time — implementations and the
+// `gts_type_id`-touching predicate at parse time — implementations and the
 // gateway do not need a runtime reject path.
 
 #[test]
-fn usage_record_query_filter_surface_rejects_gts_id_eq() {
+fn usage_record_query_filter_surface_rejects_gts_type_id_eq() {
     let err = toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(
-        "gts_id eq 'gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1'",
+        "gts_type_id eq 'gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~'",
     )
-    .expect_err("gts_id must not be exposed on the OData filter surface");
+    .expect_err("gts_type_id must not be exposed on the OData filter surface");
     assert!(
         matches!(
             &err,
-            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_id"
+            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_type_id"
         ),
-        "expected UnknownField(\"gts_id\"), got {err:?}",
+        "expected UnknownField(\"gts_type_id\"), got {err:?}",
     );
 }
 
 #[test]
-fn usage_record_query_filter_surface_rejects_gts_id_in_list() {
+fn usage_record_query_filter_surface_rejects_gts_type_id_in_list() {
     let err = toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(
-        "gts_id in ('a', 'b')",
+        "gts_type_id in ('a', 'b')",
     )
-    .expect_err("gts_id must not be exposed on the OData filter surface");
+    .expect_err("gts_type_id must not be exposed on the OData filter surface");
     assert!(
         matches!(
             &err,
-            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_id"
+            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_type_id"
         ),
-        "expected UnknownField(\"gts_id\"), got {err:?}",
+        "expected UnknownField(\"gts_type_id\"), got {err:?}",
     );
 }
 
 #[test]
-fn usage_record_query_filter_surface_rejects_gts_id_inside_composite() {
+fn usage_record_query_filter_surface_rejects_gts_type_id_inside_composite() {
     let err = toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(
-        "tenant_id eq 22222222-2222-2222-2222-222222222222 and gts_id eq 'x'",
+        "tenant_id eq 22222222-2222-2222-2222-222222222222 and gts_type_id eq 'x'",
     )
-    .expect_err("gts_id-touching predicates must be rejected at parse time");
+    .expect_err("gts_type_id-touching predicates must be rejected at parse time");
     assert!(
         matches!(
             &err,
-            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_id"
+            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_type_id"
         ),
-        "expected UnknownField(\"gts_id\"), got {err:?}",
+        "expected UnknownField(\"gts_type_id\"), got {err:?}",
     );
 }
 
 #[test]
 fn aggregation_op_not_allowed_for_kind_builds_invalid_argument() {
-    let gts_id = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
+    let gts_type_id = MeterTypeId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~"
     ))
-    .expect("valid gts_id");
+    .expect("valid gts_type_id");
 
     let err = crate::UsageCollectorError::aggregation_op_not_allowed_for_kind(
         AggregationOp::Sum,
         UsageKind::Gauge,
-        &gts_id,
+        &gts_type_id,
     );
 
     match err {
@@ -1336,7 +1344,7 @@ fn aggregation_op_not_allowed_for_kind_builds_invalid_argument() {
         } => {
             assert_eq!(field, "aggregation.op");
             assert_eq!(reason, crate::reason::ValidationReason::OpNotAllowedForKind);
-            assert_eq!(resource_name.as_deref(), Some(gts_id.as_ref()));
+            assert_eq!(resource_name.as_deref(), Some(gts_type_id.as_ref()));
             // `detail` is the user-facing 400 message; a broken op→text or
             // kind→allowed-set branch would otherwise ship silently. Pin the
             // offending op, the rejecting kind, and that kind's allowed set.
@@ -1359,17 +1367,17 @@ fn aggregation_op_not_allowed_for_kind_builds_invalid_argument() {
 
 #[test]
 fn aggregation_op_not_allowed_for_kind_counter_detail_names_op_kind_and_allowed_set() {
-    let gts_id = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
+    let gts_type_id = MeterTypeId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~"
     ))
-    .expect("valid gts_id");
+    .expect("valid gts_type_id");
 
     // Min on a counter exercises the other kind→allowed-set branch
     // (counter → {sum, count}) and a distinct op→text mapping (Min → "min").
     let err = crate::UsageCollectorError::aggregation_op_not_allowed_for_kind(
         AggregationOp::Min,
         UsageKind::Counter,
-        &gts_id,
+        &gts_type_id,
     );
 
     let crate::UsageCollectorError::InvalidArgument { detail, .. } = err else {

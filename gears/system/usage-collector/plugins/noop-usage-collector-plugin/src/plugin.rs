@@ -12,7 +12,7 @@ use toolkit_odata::{ODataQuery, Page as ODataPage};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
     UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
 };
 
@@ -54,7 +54,7 @@ impl UsageCollectorPluginV1 for NoopBackend {
 
     async fn query_aggregated_usage_records(
         &self,
-        _gts_id: UsageTypeGtsId,
+        _gts_type_id: MeterTypeId,
         _fold: AggregationFold,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
@@ -67,7 +67,7 @@ impl UsageCollectorPluginV1 for NoopBackend {
 
     async fn list_usage_records(
         &self,
-        _gts_id: UsageTypeGtsId,
+        _gts_type_id: MeterTypeId,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {

@@ -22,7 +22,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::gts::{USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE};
-use crate::models::{AggregationOp, UsageKind, UsageTypeGtsId};
+use crate::models::{AggregationOp, MeterTypeId, UsageKind, UsageTypeGtsId};
 use crate::reason::{ConflictReason, ValidationReason};
 
 /// Public error envelope for the Usage Collector SDK and REST surfaces.
@@ -350,25 +350,25 @@ impl UsageCollectorError {
         Self::newtype_validation("idempotency_key", detail)
     }
 
-    /// Compensation submitted against a gauge usage type. Emitted on the
+    /// Compensation submitted against a gauge meter. Emitted on the
     /// ingestion surface, so the wire `resource_type` is the usage **record**
-    /// resource, with `resource_name` carrying the offending gauge `gts_id`
-    /// (`field` = `corrects_id`).
+    /// resource, with `resource_name` carrying the offending gauge
+    /// `gts_type_id` (`field` = `corrects_id`).
     #[must_use]
-    pub fn gauge_compensation_rejected(gts_id: &UsageTypeGtsId) -> Self {
+    pub fn gauge_compensation_rejected(gts_type_id: &MeterTypeId) -> Self {
         Self::InvalidArgument {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: Some(gts_id.as_ref().to_owned()),
+            resource_name: Some(gts_type_id.as_ref().to_owned()),
             field: "corrects_id".to_owned(),
             reason: ValidationReason::GaugeCompensationRejected,
-            detail: format!("compensation against gauge usage type {gts_id} is rejected"),
+            detail: format!("compensation against gauge meter {gts_type_id} is rejected"),
         }
     }
 
     /// Dead: no path constructs this any more. It named an aggregation op
     /// requested against a usage kind that does not admit it (`SUM` on a
     /// gauge, or `MIN`/`MAX`/`AVG` on a counter), attributed to the
-    /// usage-type resource with the offending `gts_id` as `resource_name`
+    /// usage-type resource with the offending `gts_type_id` as `resource_name`
     /// and the aggregation operator field as `field`. There is no
     /// caller-chosen op any more — the fold is resolved from the queried
     /// meter's declaration — so `field: "aggregation.op"` below now names a
@@ -378,7 +378,7 @@ impl UsageCollectorError {
     pub fn aggregation_op_not_allowed_for_kind(
         op: AggregationOp,
         kind: UsageKind,
-        gts_id: &UsageTypeGtsId,
+        gts_type_id: &MeterTypeId,
     ) -> Self {
         let op_str = match op {
             AggregationOp::Sum => "sum",
@@ -393,26 +393,26 @@ impl UsageCollectorError {
         };
         Self::InvalidArgument {
             resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: Some(gts_id.as_ref().to_owned()),
+            resource_name: Some(gts_type_id.as_ref().to_owned()),
             field: "aggregation.op".to_owned(),
             reason: ValidationReason::OpNotAllowedForKind,
             detail: format!(
                 "aggregation op `{op_str}` is not valid for {kind_str} usage type \
-                 {gts_id}; {kind_str} allows {{{allowed}}}"
+                 {gts_type_id}; {kind_str} allows {{{allowed}}}"
             ),
         }
     }
 
-    /// Ingestion supplied a metadata key not declared in the usage type's
+    /// Ingestion supplied a metadata key not declared in the meter's
     /// closed `metadata_fields`. Attributes to the usage type resource.
     #[must_use]
-    pub fn unknown_metadata_key(gts_id: &UsageTypeGtsId, key: &str) -> Self {
+    pub fn unknown_metadata_key(gts_type_id: &MeterTypeId, key: &str) -> Self {
         Self::InvalidArgument {
             resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: Some(gts_id.as_ref().to_owned()),
+            resource_name: Some(gts_type_id.as_ref().to_owned()),
             field: "metadata".to_owned(),
             reason: ValidationReason::UnknownMetadataKey,
-            detail: format!("unknown metadata key '{key}' for usage type {gts_id}"),
+            detail: format!("unknown metadata key '{key}' for meter {gts_type_id}"),
         }
     }
 

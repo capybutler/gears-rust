@@ -3,16 +3,16 @@ use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use crate::id::{USAGE_RECORD_ID_NAMESPACE, created_at_micros, derive_usage_record_id};
-use crate::models::{IdempotencyKey, UsageTypeGtsId};
+use crate::models::{IdempotencyKey, MeterTypeId};
 
 fn tenant() -> Uuid {
     Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
 }
-fn gts() -> UsageTypeGtsId {
-    // Must be a valid derived GTS instance id: the segment after `~` is itself
-    // a full vendor.package.namespace.type.vMAJOR[.MINOR] chain.
-    UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
+fn gts() -> MeterTypeId {
+    // Must be a valid derived GTS type id: `~`-terminated, adding exactly one
+    // segment to the reserved usage-record base.
+    MeterTypeId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~"
     ))
     .unwrap()
 }
@@ -34,13 +34,14 @@ fn derive_is_deterministic() {
 #[test]
 fn derive_matches_golden_vector() {
     // UUIDv5(NS, "11111111-1111-1111-1111-111111111111" 0x1F
-    //            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1" 0x1F
+    //            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~" 0x1F
     //            "1700000000000000" 0x1F
     //            "idem-1")
-    // Regenerated in Task 1 Step 4 — DO NOT hand-edit without rerunning.
+    // Regenerated in Task 10 (MeterTypeId's `~`-terminated string form
+    // replaces UsageTypeGtsId's) — DO NOT hand-edit without rerunning.
     assert_eq!(
         derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000)),
-        Uuid::parse_str("a019f808-e219-5bc0-b95f-dd5981b40d51").unwrap(),
+        Uuid::parse_str("85943b3f-fd3d-5920-9e8c-2f29d1a15dc2").unwrap(),
     );
 }
 
@@ -72,9 +73,9 @@ fn distinct_tenants_yield_distinct_ids() {
 
 #[test]
 fn distinct_gts_ids_yield_distinct_ids() {
-    // Same tenant + idempotency_key + created_at, different gts_id.
-    let other = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.messages_sent.v1"
+    // Same tenant + idempotency_key + created_at, different gts_type_id.
+    let other = MeterTypeId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.mini_chat._.messages_sent.v1~"
     ))
     .unwrap();
     assert_ne!(
@@ -116,11 +117,12 @@ fn sub_microsecond_created_at_truncates_to_same_id() {
 
 #[test]
 fn separator_in_key_does_not_alias() {
-    // Regenerated in Task 1 Step 4 — DO NOT hand-edit without rerunning.
+    // Regenerated in Task 10 (MeterTypeId's `~`-terminated string form
+    // replaces UsageTypeGtsId's) — DO NOT hand-edit without rerunning.
     let with_us = derive_usage_record_id(tenant(), &gts(), &key("idem\u{1f}1"), at(1_700_000_000));
     assert_eq!(
         with_us,
-        Uuid::parse_str("0a1bbbeb-220b-58a1-a73f-5ec86ef74fb0").unwrap()
+        Uuid::parse_str("cd292ac5-13d4-53cf-8102-df466b52e33c").unwrap()
     );
     assert_ne!(
         with_us,

@@ -15,7 +15,7 @@ use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     AggregationDimension, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey,
-    ResourceRef, SubjectRef, UsageCollectorError, UsageRecord, UsageTypeGtsId,
+    MeterTypeId, ResourceRef, SubjectRef, UsageCollectorError, UsageRecord,
     is_keyset_safe_record_field,
 };
 use uuid::Uuid;
@@ -160,8 +160,8 @@ pub async fn handle_get_usage_record(
 ///
 /// Keyset-paginated raw read over the persisted usage records.
 ///
-/// `gts_id` is the only mandatory non-OData query parameter (the SDK
-/// trait carries it as a typed [`UsageTypeGtsId`] and the plugin SPI
+/// `gts_type_id` is the only mandatory non-OData query parameter (the SDK
+/// trait carries it as a typed [`MeterTypeId`] and the plugin SPI
 /// takes it as a typed named parameter). A bounded `[from, to)` time
 /// window is also mandatory: it is expressed inside `$filter` as
 /// `created_at ge … and created_at lt …` —
@@ -222,11 +222,11 @@ pub async fn handle_list_usage_records(
     OData(query): OData,
 ) -> ApiResult<Json<ODataPage<UsageRecordDto>>> {
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
-    let (gts_id, metadata_filter, query) = prepare_list_request(&params, query)?;
+    let (gts_type_id, metadata_filter, query) = prepare_list_request(&params, query)?;
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
 
     let page = service
-        .list_usage_records(&ctx, gts_id, &query, &metadata_filter)
+        .list_usage_records(&ctx, gts_type_id, &query, &metadata_filter)
         .await
         .map_err(usage_collector_error_to_canonical)?;
 
@@ -239,7 +239,7 @@ pub async fn handle_list_usage_records(
 ///
 /// Server-side aggregated read over the persisted usage records.
 ///
-/// The wire shape mirrors `GET /usage-collector/v1/records`: `gts_id` is a
+/// The wire shape mirrors `GET /usage-collector/v1/records`: `gts_type_id` is a
 /// mandatory typed query parameter, the `OData` `$filter` (carrying the
 /// `[from, to)` time window as a `created_at` predicate) and the
 /// `metadata.<key>=<value>` typed side-channel flow through query
@@ -269,12 +269,12 @@ pub async fn handle_query_aggregated_usage_records(
     Json(req): Json<QueryAggregatedUsageRecordsRequest>,
 ) -> ApiResult<Json<AggregationResultDto>> {
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
-    let (gts_id, metadata_filter, query, group_by) =
+    let (gts_type_id, metadata_filter, query, group_by) =
         prepare_aggregate_request(&params, query, req)?;
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
 
     let result = service
-        .query_aggregated_usage_records(&ctx, gts_id, &query, &metadata_filter, &group_by)
+        .query_aggregated_usage_records(&ctx, gts_type_id, &query, &metadata_filter, &group_by)
         .await
         .map_err(usage_collector_error_to_canonical)?;
 
@@ -285,14 +285,14 @@ pub async fn handle_query_aggregated_usage_records(
 
 /// Result of every aggregate-path pre-service validator.
 type PreparedAggregateRequest = (
-    UsageTypeGtsId,
+    MeterTypeId,
     Vec<MetadataFilter>,
     ODataQuery,
     Vec<AggregationDimension>,
 );
 
 /// Bundle of every aggregate-path pre-service validator: parameter
-/// allowlist, typed `gts_id`, metadata filters, and the body-shape
+/// allowlist, typed `gts_type_id`, metadata filters, and the body-shape
 /// projection into typed [`AggregationDimension`]s. Propagates the
 /// canonical envelope verbatim on the first failing validator.
 fn prepare_aggregate_request(
@@ -301,12 +301,12 @@ fn prepare_aggregate_request(
     req: QueryAggregatedUsageRecordsRequest,
 ) -> Result<PreparedAggregateRequest, CanonicalError> {
     reject_unknown_aggregate_params(params)?;
-    let gts_id = parse_required_gts_id(params)?;
+    let gts_type_id = parse_required_gts_type_id(params)?;
     let metadata_filter = parse_metadata_filters(params)?;
     let group_by = req
         .into_group_by()
         .map_err(usage_collector_error_to_canonical)?;
-    Ok((gts_id, metadata_filter, query, group_by))
+    Ok((gts_type_id, metadata_filter, query, group_by))
 }
 
 /// `$`-prefixed `OData` parameters accepted on the aggregate path. `$top`
@@ -316,7 +316,7 @@ fn prepare_aggregate_request(
 const AGGREGATE_ODATA_PARAMS: &[&str] = &["$filter"];
 
 /// Reject any query parameter on the aggregate path that is not in the
-/// declared aggregate-OData set, the typed list parameters (`gts_id`),
+/// declared aggregate-OData set, the typed list parameters (`gts_type_id`),
 /// or a `metadata.<key>` entry. Silent drop of unrecognised parameters
 /// is a documented contract-drift surface, mirroring `list_usage_records`.
 fn reject_unknown_aggregate_params(params: &[(String, String)]) -> Result<(), CanonicalError> {
@@ -342,10 +342,10 @@ fn reject_unknown_aggregate_params(params: &[(String, String)]) -> Result<(), Ca
 
 /// Result of every pre-service validator, returned as a typed tuple
 /// so the handler can propagate the canonical envelope verbatim.
-type PreparedListRequest = (UsageTypeGtsId, Vec<MetadataFilter>, ODataQuery);
+type PreparedListRequest = (MeterTypeId, Vec<MetadataFilter>, ODataQuery);
 
 /// Bundle of every pre-service validator: parameter allowlist, typed
-/// `gts_id`, metadata filters, and the `prepare_list_query`
+/// `gts_type_id`, metadata filters, and the `prepare_list_query`
 /// gateway-side guards. Propagates the canonical envelope verbatim on
 /// the first failing validator.
 fn prepare_list_request(
@@ -353,10 +353,10 @@ fn prepare_list_request(
     query: ODataQuery,
 ) -> Result<PreparedListRequest, CanonicalError> {
     reject_unknown_list_params(params)?;
-    let gts_id = parse_required_gts_id(params)?;
+    let gts_type_id = parse_required_gts_type_id(params)?;
     let metadata_filter = parse_metadata_filters(params)?;
     let query = prepare_list_query(query)?;
-    Ok((gts_id, metadata_filter, query))
+    Ok((gts_type_id, metadata_filter, query))
 }
 
 /// Maximum number of records the gateway will request from the plugin
@@ -399,7 +399,7 @@ const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$top", "limit", "cur
 
 /// Typed query parameters carrying SDK values that are NOT part of the
 /// `OData` surface.
-const TYPED_LIST_PARAMS: &[&str] = &["gts_id"];
+const TYPED_LIST_PARAMS: &[&str] = &["gts_type_id"];
 
 /// Prefix marking the typed-side-channel [`MetadataFilter`] entries
 /// (`metadata.<key>=<value>`, repeatable).
@@ -598,16 +598,16 @@ fn reject_unknown_list_params(params: &[(String, String)]) -> Result<(), Canonic
     Ok(())
 }
 
-/// Extract the mandatory `gts_id` query parameter and validate it
-/// through [`UsageTypeGtsId::new`]. A missing value surfaces as the
+/// Extract the mandatory `gts_type_id` query parameter and validate it
+/// through [`MeterTypeId::new`]. A missing value surfaces as the
 /// canonical `InvalidArgument` `Problem` with a field violation on
-/// `gts_id`; a malformed value lifts through the SDK's
+/// `gts_type_id`; a malformed value lifts through the SDK's
 /// [`UsageCollectorError::InvalidArgument`] mapping. A duplicate
 /// occurrence is rejected so silent last-wins ambiguity cannot mask a
 /// caller bug.
-fn parse_required_gts_id(params: &[(String, String)]) -> Result<UsageTypeGtsId, CanonicalError> {
-    let raw = require_single_value(params, "gts_id")?;
-    UsageTypeGtsId::new(raw.clone()).map_err(usage_collector_error_to_canonical)
+fn parse_required_gts_type_id(params: &[(String, String)]) -> Result<MeterTypeId, CanonicalError> {
+    let raw = require_single_value(params, "gts_type_id")?;
+    MeterTypeId::new(raw.clone()).map_err(usage_collector_error_to_canonical)
 }
 
 /// Group `metadata.<key>=<value>` entries into a `Vec<MetadataFilter>`
@@ -744,7 +744,7 @@ pub async fn handle_deactivate_usage_record(
 }
 
 /// Convert one per-record submission into the identity-free domain create
-/// input, lifting `gts_id`-, attribution-, `idempotency_key`-, and
+/// input, lifting `gts_type_id`-, attribution-, `idempotency_key`-, and
 /// metadata-shape failures into per-record `Problem` envelopes. `created_at`
 /// is caller-supplied and forwarded verbatim. The record's `id` and initial
 /// `status` are NOT set here: they are stamped once, authoritatively, inside
@@ -752,7 +752,7 @@ pub async fn handle_deactivate_usage_record(
 /// [`usage_collector_sdk::CreateUsageRecord::into_usage_record`].
 #[allow(clippy::result_large_err)]
 fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsageRecord, Problem> {
-    let gts_id = UsageTypeGtsId::new(req.gts_id)
+    let gts_type_id = MeterTypeId::new(req.gts_type_id)
         .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
 
     let resource_ref = ResourceRef::try_from(req.resource_ref)
@@ -771,7 +771,7 @@ fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsa
         .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
 
     Ok(CreateUsageRecord {
-        gts_id,
+        gts_type_id,
         tenant_id: req.tenant_id,
         resource_ref,
         subject_ref,

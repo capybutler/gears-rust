@@ -38,8 +38,7 @@ use super::{
 use crate::api::rest::dto::CreateUsageTypeRequest;
 use crate::domain::Service;
 use crate::domain::test_support::{
-    CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx, enforcer_for,
-    service_with_permit,
+    CountingUnreachableResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx, enforcer_for,
 };
 
 /// Wire a `Service` against a counting unreachable-PDP resolver and an
@@ -398,7 +397,7 @@ async fn register_happy_path_returns_201_with_location_and_wire_body() {
     let persisted = happy_usage_type();
     plugin.set_create_usage_type(persisted.clone());
 
-    let service = service_with_permit(
+    let service = ServiceFixture::default().build(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.register.happy.v1",
     );
@@ -461,7 +460,7 @@ async fn get_usage_type_happy_path_returns_200_with_wire_body() {
     let plugin = HappyPathPlugin::new();
     plugin.set_get_usage_type(happy_usage_type());
 
-    let service = service_with_permit(
+    let service = ServiceFixture::default().build(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.get.happy.v1",
     );
@@ -519,7 +518,7 @@ async fn list_usage_types_happy_path_returns_200_with_page_envelope() {
         },
     });
 
-    let service = service_with_permit(
+    let service = ServiceFixture::default().build(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.list.happy.v1",
     );
@@ -582,7 +581,7 @@ async fn delete_usage_type_happy_path_returns_204_no_content() {
     let plugin = HappyPathPlugin::new();
     plugin.set_delete_usage_type_ok();
 
-    let service = service_with_permit(
+    let service = ServiceFixture::default().build(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.delete.happy.v1",
     );

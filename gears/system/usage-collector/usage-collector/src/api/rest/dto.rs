@@ -140,7 +140,7 @@ impl TryFrom<SubjectRefDto> for SubjectRef {
     }
 }
 
-/// Per-record create payload. Carries `gts_id` as a permissive `String`
+/// Per-record create payload. Carries `gts_type_id` as a permissive `String`
 /// (same rationale as [`CreateUsageTypeRequest`]) so a bad-prefix value
 /// surfaces as the per-record `Problem` instead of axum's default
 /// `text/plain` 422 for the entire batch. per-record problem envelopes
@@ -152,7 +152,7 @@ impl TryFrom<SubjectRefDto> for SubjectRef {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUsageRecordRequest {
-    pub gts_id: String,
+    pub gts_type_id: String,
     pub tenant_id: Uuid,
     pub resource_ref: ResourceRefDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,7 +164,7 @@ pub struct CreateUsageRecordRequest {
     /// Mandatory caller-supplied idempotency key per
     /// `cpt-cf-usage-collector-dod-usage-emission-fr-idempotency`. The
     /// plugin SPI dedups every persisted record on
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` (ADR-0014); a
+    /// `(tenant_id, gts_type_id, idempotency_key, created_at)` (ADR-0014); a
     /// missing key surfaces as a request-deserialization failure.
     pub idempotency_key: String,
     /// When set, marks this submission as a counter compensation
@@ -187,7 +187,7 @@ pub struct CreateUsageRecordsRequest {
     pub records: Vec<CreateUsageRecordRequest>,
 }
 
-/// Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_id` is
+/// Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_type_id` is
 /// flattened to `String` (same rationale as [`UsageTypeDto`]) so the type
 /// can derive `utoipa::ToSchema` without pulling `utoipa` into the SDK
 /// crate; `created_at` is emitted as RFC 3339 to match the SDK wire shape.
@@ -196,7 +196,7 @@ pub struct CreateUsageRecordsRequest {
 #[toolkit_macros::api_dto(response)]
 pub struct UsageRecordDto {
     pub id: Uuid,
-    pub gts_id: String,
+    pub gts_type_id: String,
     pub tenant_id: Uuid,
     pub resource_ref: ResourceRefDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,7 +226,7 @@ impl From<UsageRecord> for UsageRecordDto {
     fn from(value: UsageRecord) -> Self {
         Self {
             id: value.id,
-            gts_id: value.gts_id.to_string(),
+            gts_type_id: value.gts_type_id.to_string(),
             tenant_id: value.tenant_id,
             resource_ref: value.resource_ref.into(),
             subject_ref: value.subject_ref.map(Into::into),
@@ -331,7 +331,7 @@ impl From<AggregationDimension> for AggregationDimensionDto {
 }
 
 /// Aggregated-query request body for
-/// `POST /usage-collector/v1/records/aggregate`. The typed `gts_id`, the
+/// `POST /usage-collector/v1/records/aggregate`. The typed `gts_type_id`, the
 /// `OData` `$filter`, and the `metadata.<key>` side-channel remain query
 /// parameters (mirroring `GET /usage-collector/v1/records`); only the
 /// group-by dimensions ship in the body. Carries no aggregation parameter

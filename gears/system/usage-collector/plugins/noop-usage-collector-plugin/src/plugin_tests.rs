@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 use usage_collector_sdk::{
-    IdempotencyKey, MetadataKey, ResourceRef, UsageCollectorPluginError, UsageCollectorPluginV1,
-    UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
+    IdempotencyKey, MetadataKey, MeterTypeId, ResourceRef, UsageCollectorPluginError,
+    UsageCollectorPluginV1, UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
 };
 use uuid::Uuid;
 
@@ -29,7 +29,8 @@ fn keyset<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
 fn sample_record(id: &str, idempotency_key: &str) -> UsageRecord {
     UsageRecord {
         id: Uuid::parse_str(id).expect("valid record id fixture"),
-        gts_id: sample_id("test.uc.batch.order.v1"),
+        gts_type_id: MeterTypeId::new("gts.cf.core.uc.usage_record.v1~test.uc.batch.order.v1~")
+            .expect("meter type id fixture"),
         tenant_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222")
             .expect("valid tenant uuid fixture"),
         resource_ref: ResourceRef::new("vm-1", "compute.vm").expect("valid resource ref fixture"),

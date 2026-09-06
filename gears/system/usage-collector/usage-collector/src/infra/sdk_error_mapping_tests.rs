@@ -19,7 +19,7 @@
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 use usage_collector_sdk::{
-    USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageTypeGtsId,
+    MeterTypeId, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageTypeGtsId,
 };
 use uuid::Uuid;
 
@@ -34,6 +34,13 @@ const SAMPLE_USAGE_TYPE_ID: &str =
 
 fn sample_gts_id() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived usage-type gts_id")
+}
+
+fn sample_meter_id() -> MeterTypeId {
+    MeterTypeId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~"
+    ))
+    .expect("valid usage_record-derived meter type id")
 }
 
 #[test]
@@ -134,19 +141,19 @@ fn invalid_batch_size_maps_to_400_invalid_argument() {
 }
 
 /// `UnknownMetadataKey` lifts onto `InvalidArgument` (HTTP 400) and identifies
-/// the `UsageType` whose closed shape was violated (`resource_type` +
-/// `resource.name = gts_id`), even though the failing operation is record
+/// the meter whose closed shape was violated (`resource_type` +
+/// `resource.name = gts_type_id`), even though the failing operation is record
 /// submission — the variant's intrinsic resource is the type it references.
 #[test]
 fn unknown_metadata_key_maps_to_invalid_argument() {
-    let gts_id = sample_gts_id();
+    let gts_type_id = sample_meter_id();
     let c = lift_record(UsageCollectorError::unknown_metadata_key(
-        &gts_id,
+        &gts_type_id,
         "unexpected",
     ));
     assert_eq!(c.status_code(), 400);
     assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
-    assert_eq!(c.resource_name(), Some(gts_id.as_ref()));
+    assert_eq!(c.resource_name(), Some(gts_type_id.as_ref()));
 }
 
 #[test]
@@ -260,11 +267,13 @@ fn non_negative_counter_compensation_carries_semantics_violation_reason() {
 
 #[test]
 fn gauge_compensation_rejected_maps_to_invalid_argument_with_reason() {
-    let gts_id = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~tenant.example._.cpu_seconds.v1"
+    let gts_type_id = MeterTypeId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~tenant.example._.cpu_seconds.v1~"
     ))
-    .expect("gauge gts_id");
-    let c = lift_record(UsageCollectorError::gauge_compensation_rejected(&gts_id));
+    .expect("gauge meter type id");
+    let c = lift_record(UsageCollectorError::gauge_compensation_rejected(
+        &gts_type_id,
+    ));
     assert_eq!(c.status_code(), 400);
     assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
     let problem = Problem::from(c);
@@ -510,7 +519,7 @@ fn every_usage_type_surface_variant() -> Vec<UsageCollectorError> {
 fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
     use rust_decimal::Decimal;
 
-    let gts_id = sample_gts_id();
+    let gts_type_id = sample_meter_id();
     let uuid = Uuid::new_v4();
     vec![
         UsageCollectorError::permission_denied("denied"),
@@ -524,11 +533,11 @@ fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
         UsageCollectorError::invalid_subject_ref("r"),
         UsageCollectorError::invalid_idempotency_key("r"),
         UsageCollectorError::invalid_usage_type_gts_id("bad", "r"),
-        UsageCollectorError::unknown_metadata_key(&gts_id, "k"),
+        UsageCollectorError::unknown_metadata_key(&gts_type_id, "k"),
         UsageCollectorError::usage_record_not_found(uuid),
         UsageCollectorError::already_inactive(uuid),
         UsageCollectorError::idempotency_conflict("idem-fence", uuid),
-        UsageCollectorError::gauge_compensation_rejected(&gts_id),
+        UsageCollectorError::gauge_compensation_rejected(&gts_type_id),
         UsageCollectorError::corrects_id_not_found(uuid),
         UsageCollectorError::corrects_id_targets_compensation(uuid),
         UsageCollectorError::corrects_id_wrong_scope(uuid),

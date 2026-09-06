@@ -18,8 +18,8 @@ use toolkit_gts::gts_id;
 use toolkit_odata::{CursorV1, ODataQuery, Page as ODataPage, PageInfo, SortDir};
 use usage_collector_sdk::{
     AggregationBucket, AggregationResult, CreateUsageRecord, IdempotencyKey, MetadataKey,
-    ResourceRef, UsageCollectorError, UsageKind, UsageRecord, UsageRecordStatus, UsageType,
-    UsageTypeGtsId,
+    MeterTypeId, ResourceRef, UsageCollectorError, UsageKind, UsageRecord, UsageRecordStatus,
+    UsageType, UsageTypeGtsId,
 };
 use uuid::Uuid;
 
@@ -37,21 +37,23 @@ use crate::domain::ports::metrics::{
 };
 use crate::domain::test_support::{
     CountingAllowAllResolver, CountingPermitResolver, CountingTenantPermitResolver,
-    DenyAllResolver, HappyPathPlugin, UnreachableResolver, authenticated_ctx,
+    DenyAllResolver, HappyPathPlugin, ServiceFixture, UnreachableResolver, authenticated_ctx,
     counter_sum_with_label, enforcer_for, fake_declaration_source_with_fold,
     fake_declaration_source_with_metadata, gauge_last, histogram_count, histogram_count_with_label,
-    histogram_sum, histogram_sum_with_label, hub_with_plugin, local_metrics, service_with_metrics,
-    service_with_metrics_and_source, service_with_metrics_unready_plugin,
+    histogram_sum, histogram_sum_with_label, hub_with_plugin, local_metrics,
+    service_with_metrics_unready_plugin,
 };
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use usage_collector_sdk::UsageCollectorPluginError;
 
 const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1");
+const SAMPLE_METER_TYPE_ID: &str =
+    gts_id!("cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1~");
 
 fn sample_record() -> UsageRecord {
     UsageRecord {
         id: Uuid::from_u128(0x1234),
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
         tenant_id: Uuid::from_u128(2),
         resource_ref: ResourceRef::new("rsc-1", "compute.vm").expect("valid resource ref"),
         subject_ref: None,
@@ -69,7 +71,7 @@ fn sample_record() -> UsageRecord {
 /// `create_usage_record{,s}` entry points which now take `CreateUsageRecord`.
 fn sample_create_record() -> CreateUsageRecord {
     CreateUsageRecord {
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
         tenant_id: Uuid::from_u128(2),
         resource_ref: ResourceRef::new("rsc-1", "compute.vm").expect("valid resource ref"),
         subject_ref: None,
@@ -175,11 +177,9 @@ fn create_record_with_metadata(key: &str, value: &str) -> CreateUsageRecord {
 
 #[tokio::test]
 async fn usage_type_list_deny_records_denied_authz() {
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.ut.listdeny.v1",
-        Arc::new(DenyAllResolver),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(Arc::new(DenyAllResolver))
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.ut.listdeny.v1");
 
     let _outcome = service
         .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
@@ -223,11 +223,9 @@ async fn usage_type_create_success_records_request() {
     let plugin = HappyPathPlugin::new();
     plugin.set_create_usage_type(sample_usage_type());
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.ut.create.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin, "test.metrics.ut.create.v1");
 
     let result = service
         .create_usage_type(&authenticated_ctx(), sample_usage_type())
@@ -267,11 +265,9 @@ async fn refresh_usage_types_gauge_sums_across_pages() {
         type_page(1, None),
     ]);
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.ut.paginate.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin, "test.metrics.ut.paginate.v1");
 
     service.refresh_usage_types_gauge().await;
     provider.force_flush().unwrap();
@@ -294,11 +290,9 @@ async fn refresh_usage_types_gauge_single_page_sets_true_count() {
     let plugin = HappyPathPlugin::new();
     plugin.set_list_usage_types(type_page(4, None));
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.ut.singlepage.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin, "test.metrics.ut.singlepage.v1");
 
     service.refresh_usage_types_gauge().await;
     provider.force_flush().unwrap();
@@ -312,11 +306,9 @@ async fn refresh_usage_types_gauge_spi_error_leaves_gauge_unset() {
     // gauge is never set.
     let plugin = HappyPathPlugin::new();
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.ut.spierr.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin, "test.metrics.ut.spierr.v1");
 
     service.refresh_usage_types_gauge().await;
     provider.force_flush().unwrap();
@@ -332,11 +324,9 @@ async fn refresh_usage_types_gauge_error_leaves_prior_value() {
     let plugin = HappyPathPlugin::new();
     plugin.set_list_usage_types_pages(vec![type_page(2, None)]);
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.ut.priorval.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin, "test.metrics.ut.priorval.v1");
 
     service.refresh_usage_types_gauge().await; // -> Some(2)
     service.refresh_usage_types_gauge().await; // queue empty -> error -> no-op
@@ -352,11 +342,9 @@ async fn refresh_usage_types_gauge_timeout_leaves_prior_value() {
     let plugin = HappyPathPlugin::new();
     plugin.set_list_usage_types_pages(vec![type_page(5, None)]);
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin.clone(),
-        "test.metrics.ut.pgtimeout.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin.clone(), "test.metrics.ut.pgtimeout.v1");
 
     service.refresh_usage_types_gauge().await; // -> Some(5)
     plugin.set_list_usage_types_hang();
@@ -373,11 +361,9 @@ async fn refresh_usage_types_gauge_undecodable_cursor_is_noop() {
     let plugin = HappyPathPlugin::new();
     plugin.set_list_usage_types_pages(vec![type_page(1, Some("not-a-valid-cursor".to_owned()))]);
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.ut.badcursor.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin, "test.metrics.ut.badcursor.v1");
 
     service.refresh_usage_types_gauge().await;
     provider.force_flush().unwrap();
@@ -395,11 +381,9 @@ async fn refresh_usage_types_gauge_page_cap_leaves_prior_value() {
     let plugin = HappyPathPlugin::new();
     plugin.set_list_usage_types_pages(vec![type_page(6, None)]);
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin.clone(),
-        "test.metrics.ut.pagecap.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin.clone(), "test.metrics.ut.pagecap.v1");
 
     service.refresh_usage_types_gauge().await; // -> Some(6)
 
@@ -443,11 +427,9 @@ async fn deactivation_pdp_deny_records_true_denied_authz_despite_notfound_respon
     let plugin = HappyPathPlugin::new();
     plugin.set_get_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.deact.deny.v1",
-        Arc::new(DenyAllResolver),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(Arc::new(DenyAllResolver))
+        .build_with_metrics(plugin, "test.metrics.deact.deny.v1");
 
     let result = service
         .deactivate_usage_record(&authenticated_ctx(), Uuid::from_u128(0x1234))
@@ -486,16 +468,14 @@ async fn deactivation_pdp_deny_records_true_denied_authz_despite_notfound_respon
 
 #[tokio::test]
 async fn query_raw_deny_records_denied_authz_and_inflight_net_zero() {
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.query.deny.v1",
-        Arc::new(DenyAllResolver),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(Arc::new(DenyAllResolver))
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.query.deny.v1");
 
     let _outcome = service
         .list_usage_records(
             &authenticated_ctx(),
-            UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+            MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
             &ODataQuery::default(),
             &[],
         )
@@ -523,11 +503,9 @@ async fn query_raw_deny_records_denied_authz_and_inflight_net_zero() {
 
 #[tokio::test]
 async fn ingestion_single_deny_records_rejected_authz_and_duration_no_request_counter() {
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.ingest.single.v1",
-        Arc::new(DenyAllResolver),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(Arc::new(DenyAllResolver))
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.ingest.single.v1");
 
     let _outcome = service
         .create_usage_record(&authenticated_ctx(), sample_create_record())
@@ -579,11 +557,9 @@ async fn ingestion_single_deny_records_rejected_authz_and_duration_no_request_co
 
 #[tokio::test]
 async fn ingestion_batch_all_denied_observes_batch_size_and_partial_request() {
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.ingest.batch.v1",
-        Arc::new(DenyAllResolver),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(Arc::new(DenyAllResolver))
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.ingest.batch.v1");
 
     let result = service
         .create_usage_records(
@@ -629,11 +605,9 @@ async fn ingestion_batch_all_denied_observes_batch_size_and_partial_request() {
 
 #[tokio::test]
 async fn pdp_permit_emits_permit_decision_and_duration() {
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.pdp.permit.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.pdp.permit.v1");
 
     // Catalog LIST runs under require_constraints(false); an allow_all permit
     // is the legitimate happy path. The downstream plugin call may error, but
@@ -661,11 +635,9 @@ async fn pdp_permit_emits_permit_decision_and_duration() {
 
 #[tokio::test]
 async fn pdp_deny_emits_deny_decision_not_failure() {
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.pdp.deny.v1",
-        Arc::new(DenyAllResolver),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(Arc::new(DenyAllResolver))
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.pdp.deny.v1");
 
     let _outcome = service
         .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
@@ -690,11 +662,9 @@ async fn pdp_deny_emits_deny_decision_not_failure() {
 
 #[tokio::test]
 async fn pdp_unreachable_emits_failure_not_decision() {
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.pdp.unreachable.v1",
-        Arc::new(UnreachableResolver),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(Arc::new(UnreachableResolver))
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.pdp.unreachable.v1");
 
     let _outcome = service
         .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
@@ -742,11 +712,9 @@ async fn pdp_permit_with_foreign_tenant_gate_denial_records_deny_not_permit() {
     let resolver =
         CountingPermitResolver::new(pep_properties::OWNER_TENANT_ID, granted.to_string());
 
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.pdp.gatedeny.v1",
-        resolver,
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(resolver)
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.pdp.gatedeny.v1");
 
     let outcome = service
         .create_usage_record(&authenticated_ctx(), sample_create_record())
@@ -785,16 +753,14 @@ async fn list_projection_denial_records_deny_not_permit() {
     let resolver =
         CountingPermitResolver::new(usage_record::PROP_RESOURCE_TYPE, "compute.vm".to_owned());
 
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.list.projdeny.v1",
-        resolver,
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(resolver)
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.list.projdeny.v1");
 
     let outcome = service
         .list_usage_records(
             &authenticated_ctx(),
-            UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+            MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
             &ODataQuery::default(),
             &[],
         )
@@ -836,12 +802,10 @@ async fn per_record_permit_records_exactly_one_permit_no_double_count() {
     let plugin = HappyPathPlugin::new();
     plugin.set_create_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics_and_source(
-        plugin,
-        "test.metrics.perrecord.permit.v1",
-        CountingTenantPermitResolver::new(),
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build_with_metrics(plugin, "test.metrics.perrecord.permit.v1");
 
     service
         .create_usage_record(&authenticated_ctx(), sample_create_record())
@@ -871,11 +835,9 @@ async fn per_record_permit_records_exactly_one_permit_no_double_count() {
 async fn plugin_backend_error_records_duration_counter_and_ready() {
     // AllowAll permits; the unprogrammed HappyPathPlugin returns
     // `Internal` for `list_usage_types` → a backend-classified fault.
-    let (service, provider, exporter) = service_with_metrics(
-        HappyPathPlugin::new(),
-        "test.metrics.plugin.backend.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.plugin.backend.v1");
 
     let _outcome = service
         .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
@@ -918,11 +880,9 @@ async fn plugin_domain_typed_error_does_not_increment_accept_counter() {
     let gts_id = UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id");
     plugin.set_get_usage_type_not_found(gts_id.clone());
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.plugin.domain.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin, "test.metrics.plugin.domain.v1");
 
     let _outcome = service.get_usage_type(&authenticated_ctx(), gts_id).await;
     provider.force_flush().unwrap();
@@ -996,12 +956,10 @@ async fn ingestion_single_success_dispatch_records_plugin_call_duration_per_op()
     let plugin = HappyPathPlugin::new();
     plugin.set_create_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics_and_source(
-        plugin,
-        "test.metrics.ingestok.single.v1",
-        CountingTenantPermitResolver::new(),
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build_with_metrics(plugin, "test.metrics.ingestok.single.v1");
 
     service
         .create_usage_record(&authenticated_ctx(), sample_create_record())
@@ -1041,12 +999,10 @@ async fn ingestion_batch_success_dispatch_records_plugin_call_duration_per_op() 
     let plugin = HappyPathPlugin::new();
     plugin.set_create_records(vec![Ok(sample_record()), Ok(sample_record())]);
 
-    let (service, provider, exporter) = service_with_metrics_and_source(
-        plugin,
-        "test.metrics.ingestok.batch.v1",
-        CountingTenantPermitResolver::new(),
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build_with_metrics(plugin, "test.metrics.ingestok.batch.v1");
 
     let per_record = service
         .create_usage_records(
@@ -1114,12 +1070,10 @@ async fn ingestion_single_backend_error_increments_accept_errors_per_op() {
         "usage-collector test fake: simulated persist backend fault",
     ));
 
-    let (service, provider, exporter) = service_with_metrics_and_source(
-        plugin,
-        "test.metrics.ingesterr.single.v1",
-        CountingTenantPermitResolver::new(),
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build_with_metrics(plugin, "test.metrics.ingesterr.single.v1");
 
     let outcome = service
         .create_usage_record(&authenticated_ctx(), sample_create_record())
@@ -1165,12 +1119,10 @@ async fn ingestion_batch_backend_error_increments_accept_errors_per_op() {
     // (backend-classified) which surfaces as the batch-level outer `Err`.
     let plugin = HappyPathPlugin::new();
 
-    let (service, provider, exporter) = service_with_metrics_and_source(
-        plugin,
-        "test.metrics.ingesterr.batch.v1",
-        CountingTenantPermitResolver::new(),
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build_with_metrics(plugin, "test.metrics.ingesterr.batch.v1");
 
     let outcome = service
         .create_usage_records(&authenticated_ctx(), vec![sample_create_record()])
@@ -1278,9 +1230,19 @@ async fn ingestion_batch_unready_plugin_increments_unready_counter() {
 // the closed §3.11.5 vocabularies, so a misrouted variant is caught here rather
 // than as a silently-wrong dashboard series.
 
-/// The canonical sample `gts_id` as a typed id, for classifier fixtures.
+/// The canonical sample `gts_id` as a typed id, for classifier fixtures
+/// exercising the `UsageType` catalog surface.
 fn gts() -> UsageTypeGtsId {
     UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id")
+}
+
+/// The canonical sample `gts_type_id` as a typed id, for classifier
+/// fixtures exercising the record / meter-reference surface
+/// (`list_usage_records`, `query_aggregated_usage_records`, and the
+/// `UnknownMetadataKey` variant, which is attributed to the meter the
+/// ingested record referenced).
+fn meter_gts() -> MeterTypeId {
+    MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id")
 }
 
 /// `(input result, expected (outcome, error_category))` row for the query
@@ -1326,7 +1288,7 @@ fn classify_record_error_maps_each_arm() {
             RecordErrorCategory::MetadataSize,
         ),
         (
-            UsageCollectorError::unknown_metadata_key(&gts(), "region"),
+            UsageCollectorError::unknown_metadata_key(&meter_gts(), "region"),
             RecordErrorCategory::MetadataSize,
         ),
         (
@@ -1488,14 +1450,12 @@ async fn query_raw_success_records_success_rows_and_duration() {
     let plugin = HappyPathPlugin::new();
     plugin.set_list_usage_records_response(record_page(3));
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.query.rawok.v1",
-        tenant_scoped_permit(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(tenant_scoped_permit())
+        .build_with_metrics(plugin, "test.metrics.query.rawok.v1");
 
     let page = service
-        .list_usage_records(&authenticated_ctx(), gts(), &bounded_query(), &[])
+        .list_usage_records(&authenticated_ctx(), meter_gts(), &bounded_query(), &[])
         .await
         .expect("a permitted, bounded raw query succeeds");
     assert_eq!(page.items.len(), 3);
@@ -1564,7 +1524,13 @@ async fn query_aggregated_success_records_success_rows_and_duration() {
     ));
 
     let result = service
-        .query_aggregated_usage_records(&authenticated_ctx(), gts(), &bounded_query(), &[], &[])
+        .query_aggregated_usage_records(
+            &authenticated_ctx(),
+            meter_gts(),
+            &bounded_query(),
+            &[],
+            &[],
+        )
         .await
         .expect("a permitted, bounded aggregation succeeds");
     assert_eq!(result.buckets.len(), 1);
@@ -1625,12 +1591,10 @@ async fn ingestion_single_with_metadata_observes_record_metadata_bytes() {
     let plugin = HappyPathPlugin::new();
     plugin.set_create_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics_and_source(
-        plugin,
-        "test.metrics.ingest.meta.v1",
-        CountingTenantPermitResolver::new(),
-        fake_declaration_source_with_metadata(&["region"]),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_metadata(&["region"]))
+        .build_with_metrics(plugin, "test.metrics.ingest.meta.v1");
 
     service
         .create_usage_record(
@@ -1657,12 +1621,10 @@ async fn ingestion_single_empty_metadata_skips_record_metadata_bytes() {
     let plugin = HappyPathPlugin::new();
     plugin.set_create_record(sample_record());
 
-    let (service, provider, exporter) = service_with_metrics_and_source(
-        plugin,
-        "test.metrics.ingest.nometa.v1",
-        CountingTenantPermitResolver::new(),
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build_with_metrics(plugin, "test.metrics.ingest.nometa.v1");
 
     service
         .create_usage_record(&authenticated_ctx(), sample_create_record())
@@ -1684,11 +1646,9 @@ async fn usage_type_delete_success_records_request() {
     let plugin = HappyPathPlugin::new();
     plugin.set_delete_usage_type_ok();
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.ut.delete.v1",
-        CountingAllowAllResolver::new(),
-    );
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingAllowAllResolver::new())
+        .build_with_metrics(plugin, "test.metrics.ut.delete.v1");
 
     service
         .delete_usage_type(&authenticated_ctx(), gts())

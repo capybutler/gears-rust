@@ -3,7 +3,7 @@
 //!
 //! Scope: pin handler-shaped concerns the SDK error-mapping and service
 //! tests cannot reach. Specifically, the create handler lifts per-record
-//! `gts_id` validation failures into the canonical `InvalidArgument`
+//! `gts_type_id` validation failures into the canonical `InvalidArgument`
 //! `Problem` envelope (`field_violations[0].reason="INVALID_BASE_GTS_ID"`)
 //! WITHOUT failing the surrounding batch, and the deactivate handler
 //! lifts a malformed `uuid` path segment into the canonical
@@ -32,8 +32,8 @@ use super::{handle_create_usage_records, handle_deactivate_usage_record, handle_
 use crate::api::rest::dto::{CreateUsageRecordRequest, CreateUsageRecordsRequest, ResourceRefDto};
 use crate::domain::Service;
 use crate::domain::test_support::{
-    CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx, enforcer_for,
-    fake_declaration_source_with_fold, service_with_permit, service_with_permit_and_source,
+    CountingUnreachableResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx, enforcer_for,
+    fake_declaration_source_with_fold,
 };
 
 /// Wire a `Service` against a counting unreachable-PDP resolver and an
@@ -51,8 +51,8 @@ fn service_with_sentinel_pdp() -> (Arc<Service>, Arc<CountingUnreachableResolver
 }
 
 #[tokio::test]
-async fn create_with_only_bad_gts_id_records_short_circuits_to_207_without_calling_service() {
-    // Every record carries a bad-prefix `gts_id`, so every record is
+async fn create_with_only_bad_gts_type_id_records_short_circuits_to_207_without_calling_service() {
+    // Every record carries a bad-prefix `gts_type_id`, so every record is
     // rejected at the handler boundary BEFORE the service is invoked. We
     // pair the service with a `CountingUnreachableResolver` so the test
     // can pin the short-circuit two ways: the response status is 207
@@ -61,7 +61,7 @@ async fn create_with_only_bad_gts_id_records_short_circuits_to_207_without_calli
 
     let req = CreateUsageRecordsRequest {
         records: vec![CreateUsageRecordRequest {
-            gts_id: "not-a-valid-prefix".to_owned(),
+            gts_type_id: "not-a-valid-prefix".to_owned(),
             tenant_id: Uuid::new_v4(),
             resource_ref: ResourceRefDto {
                 resource_id: "rsc-1".to_owned(),
@@ -124,8 +124,8 @@ async fn create_with_only_bad_gts_id_records_short_circuits_to_207_without_calli
         .expect("rejected error carries field_violations[0]");
     assert_eq!(
         violation.get("field").and_then(serde_json::Value::as_str),
-        Some("gts_id"),
-        "per-record bad-prefix error MUST carry field_violations[0].field = gts_id",
+        Some("gts_type_id"),
+        "per-record bad-prefix error MUST carry field_violations[0].field = gts_type_id",
     );
     assert_eq!(
         violation.get("reason").and_then(serde_json::Value::as_str),
@@ -137,6 +137,125 @@ async fn create_with_only_bad_gts_id_records_short_circuits_to_207_without_calli
         0,
         "handler MUST short-circuit before dispatching to the service \
          (resolver MUST NOT be touched on the all-rejected path)",
+    );
+}
+
+/// Closes the id-length window `MeterTypeId` replaces `UsageTypeGtsId` to
+/// fix: `gts-id` (the old boundary type, deleted with this task) capped a
+/// whole identifier at 1024 bytes, but `MeterTypeId` (the new, sole boundary
+/// type) caps at 512 — so an identifier between those two bounds used to
+/// pass the record DTO's conversion and only fail deep inside the aggregate
+/// path's `meter_type_id_of` bridge, surfacing as a host-invariant `Internal`
+/// (500) rather than the `InvalidArgument` (400) an over-long identifier
+/// should be. `MeterTypeId` is now the parameter type at construction, so
+/// the same identifier is rejected once, at the wire boundary, before the
+/// service (and therefore the PDP) is ever reached.
+///
+/// The identifier below is otherwise grammatically valid — a genuine
+/// `vendor.package.namespace.type.v1` derivation segment, just with a long
+/// `type` token — so this test is falsifiable: pin `MAX_METER_TYPE_ID_LEN`
+/// to something larger than 520 and `MeterTypeId::new` accepts it, the
+/// handler dispatches to the service, and every assertion below (status,
+/// `field_violations`, and `resolver.calls() == 0`) breaks.
+#[tokio::test]
+async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_not_500() {
+    let (service, resolver) = service_with_sentinel_pdp();
+
+    // 520 bytes: over MeterTypeId's 512-byte cap, comfortably under the old
+    // gts-id boundary's 1024-byte cap.
+    let over_long_gts_type_id = format!(
+        "{}cf.mini_chat._.{}.v1~",
+        gts_id!("cf.core.uc.usage_record.v1~"),
+        "a".repeat(470),
+    );
+    assert!(
+        over_long_gts_type_id.len() > 512,
+        "test premise: the identifier must exceed MeterTypeId's cap"
+    );
+    assert!(
+        over_long_gts_type_id.len() < 1024,
+        "test premise: the identifier must stay under gts-id's old cap"
+    );
+
+    let req = CreateUsageRecordsRequest {
+        records: vec![CreateUsageRecordRequest {
+            gts_type_id: over_long_gts_type_id,
+            tenant_id: Uuid::new_v4(),
+            resource_ref: ResourceRefDto {
+                resource_id: "rsc-1".to_owned(),
+                resource_type: "compute.vm".to_owned(),
+            },
+            subject_ref: None,
+            metadata: std::collections::BTreeMap::new(),
+            value: rust_decimal::Decimal::from(1),
+            idempotency_key: "idem-over-long-1".to_owned(),
+            corrects_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }],
+    };
+
+    let response = handle_create_usage_records(
+        Extension(SecurityContext::anonymous()),
+        Extension(service),
+        Json(req),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::MULTI_STATUS,
+        "an over-long gts_type_id MUST reject as a per-record 400, not a 500 \
+         (all-rejected single-record batch surfaces as 207)",
+    );
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collected");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("body is JSON");
+    let results = body
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .expect("response carries a `results` array");
+    assert_eq!(results.len(), 1);
+    let problem = results[0]
+        .get("error")
+        .expect("rejected item carries `error`");
+    assert_eq!(
+        problem.get("status").and_then(serde_json::Value::as_u64),
+        Some(400),
+        "over-long gts_type_id MUST lift to InvalidArgument (400), never Internal (500)",
+    );
+    let violation = problem
+        .get("context")
+        .and_then(|c| c.get("field_violations"))
+        .and_then(|fv| fv.as_array())
+        .and_then(|arr| arr.first())
+        .expect("rejected error carries field_violations[0]");
+    assert_eq!(
+        violation.get("field").and_then(serde_json::Value::as_str),
+        Some("gts_type_id"),
+    );
+    assert_eq!(
+        violation.get("reason").and_then(serde_json::Value::as_str),
+        Some("INVALID_BASE_GTS_ID"),
+    );
+    let description = violation
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        description.contains("512 bytes"),
+        "the rejection detail MUST name the length cap that was breached \
+         (got `{description}`)",
+    );
+
+    assert_eq!(
+        resolver.calls(),
+        0,
+        "the over-long identifier MUST be rejected before the service (and \
+         therefore the PDP) is ever reached - closing the window by \
+         construction, not by a deep bridge-conversion check",
     );
 }
 
@@ -331,12 +450,12 @@ async fn deactivate_with_unreachable_pdp_surfaces_503() {
 
 use std::collections::BTreeMap;
 use usage_collector_sdk::{
-    IdempotencyKey, ResourceRef, UsageRecord, UsageRecordStatus, UsageTypeGtsId,
+    IdempotencyKey, MeterTypeId, ResourceRef, UsageRecord, UsageRecordStatus,
     derive_usage_record_id,
 };
 
 const HAPPY_RECORD_GTS_ID: &str =
-    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
 fn sample_persisted_record(id: Uuid, tenant_id: Uuid) -> UsageRecord {
     sample_persisted_record_with_status(id, tenant_id, UsageRecordStatus::Active)
@@ -361,7 +480,7 @@ fn sample_persisted_record_with_status(
 ) -> UsageRecord {
     UsageRecord {
         id,
-        gts_id: UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id"),
         tenant_id,
         resource_ref: ResourceRef::new("rsc-happy", "compute.vm").expect("valid resource ref"),
         subject_ref: None,
@@ -388,7 +507,7 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
     // response from the SERVICE-RETURNED record, not from the dispatched one.
     let plugin = HappyPathPlugin::new();
     let tenant_id = Uuid::from_u128(2);
-    let gts_id = UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id");
+    let gts_id = MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id");
     let idempotency_key = IdempotencyKey::new("idem-happy").expect("valid idempotency key");
     let derived_id = derive_usage_record_id(
         tenant_id,
@@ -400,15 +519,16 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
     assert_ne!(derived_id, persisted_uuid, "test premise");
     plugin.set_create_records(vec![Ok(sample_persisted_record(persisted_uuid, tenant_id))]);
 
-    let service = service_with_permit_and_source(
-        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-        "test.handler.create_records.happy.v1",
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let service = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            "test.handler.create_records.happy.v1",
+        );
 
     let req = CreateUsageRecordsRequest {
         records: vec![CreateUsageRecordRequest {
-            gts_id: HAPPY_RECORD_GTS_ID.to_owned(),
+            gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
             tenant_id,
             resource_ref: ResourceRefDto {
                 resource_id: "rsc-happy".to_owned(),
@@ -477,13 +597,13 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
 #[tokio::test]
 async fn create_stamps_derived_id() {
     // The gateway MUST derive the dispatched record's id from the dedup key
-    // `(tenant_id, gts_id, idempotency_key, created_at)` rather than accept a
+    // `(tenant_id, gts_type_id, idempotency_key, created_at)` rather than accept a
     // caller-chosen value — pin both that the dispatched id matches
     // `derive_usage_record_id` AND that a same-key resubmit derives the
     // identical id (determinism).
     let plugin = HappyPathPlugin::new();
     let tenant_id = Uuid::from_u128(2);
-    let gts_id = UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id");
+    let gts_id = MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id");
     let idempotency_key = IdempotencyKey::new("idem-derive-1").expect("valid idempotency key");
     let expected = derive_usage_record_id(
         tenant_id,
@@ -492,15 +612,16 @@ async fn create_stamps_derived_id() {
         OffsetDateTime::UNIX_EPOCH,
     );
 
-    let service = service_with_permit_and_source(
-        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-        "test.handler.create_records.derive_id.v1",
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let service = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            "test.handler.create_records.derive_id.v1",
+        );
 
     let build_req = || CreateUsageRecordsRequest {
         records: vec![CreateUsageRecordRequest {
-            gts_id: HAPPY_RECORD_GTS_ID.to_owned(),
+            gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
             tenant_id,
             resource_ref: ResourceRefDto {
                 resource_id: "rsc-happy".to_owned(),
@@ -533,7 +654,7 @@ async fn create_stamps_derived_id() {
     assert_eq!(
         forwarded[0].id, expected,
         "gateway MUST stamp the dispatched record's id with \
-         derive_usage_record_id(tenant_id, gts_id, idempotency_key, created_at)",
+         derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, created_at)",
     );
 
     // Same-key resubmit: the derived id MUST be identical.
@@ -560,20 +681,21 @@ async fn create_stamps_derived_id() {
 #[tokio::test]
 async fn create_same_key_different_created_at_derives_distinct_ids() {
     // ADR-0014: `created_at` is part of the identity. Two submissions sharing
-    // `(tenant_id, gts_id, idempotency_key)` but carrying different `created_at`
+    // `(tenant_id, gts_type_id, idempotency_key)` but carrying different `created_at`
     // values MUST be dispatched with DISTINCT ids (previously they collided on
     // one derived id).
     let plugin = HappyPathPlugin::new();
     let tenant_id = Uuid::from_u128(2);
-    let service = service_with_permit_and_source(
-        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-        "test.handler.create_records.distinct_created_at.v1",
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let service = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            "test.handler.create_records.distinct_created_at.v1",
+        );
 
     let build_req = |created_at: OffsetDateTime| CreateUsageRecordsRequest {
         records: vec![CreateUsageRecordRequest {
-            gts_id: HAPPY_RECORD_GTS_ID.to_owned(),
+            gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
             tenant_id,
             resource_ref: ResourceRefDto {
                 resource_id: "rsc-happy".to_owned(),
@@ -642,15 +764,16 @@ async fn create_records_happy_path_wire_body_projects_inactive_status_as_lowerca
         UsageRecordStatus::Inactive,
     ))]);
 
-    let service = service_with_permit_and_source(
-        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-        "test.handler.create_records.inactive_projection.v1",
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let service = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            "test.handler.create_records.inactive_projection.v1",
+        );
 
     let req = CreateUsageRecordsRequest {
         records: vec![CreateUsageRecordRequest {
-            gts_id: HAPPY_RECORD_GTS_ID.to_owned(),
+            gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
             tenant_id,
             resource_ref: ResourceRefDto {
                 resource_id: "rsc-happy".to_owned(),
@@ -704,7 +827,7 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
     // append accepted entries after rejected ones.
     let plugin = HappyPathPlugin::new();
     let tenant_id = Uuid::from_u128(2);
-    let gts_id = UsageTypeGtsId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_id");
+    let gts_id = MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id");
     let derived_id_0 = derive_usage_record_id(
         tenant_id,
         &gts_id,
@@ -724,14 +847,15 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         Ok(sample_persisted_record(persisted_uuid_2, tenant_id)),
     ]);
 
-    let service = service_with_permit_and_source(
-        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-        "test.handler.create_records.mixed.v1",
-        fake_declaration_source_with_fold("SUM"),
-    );
+    let service = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            "test.handler.create_records.mixed.v1",
+        );
 
     let valid_record = |idem: &str| CreateUsageRecordRequest {
-        gts_id: HAPPY_RECORD_GTS_ID.to_owned(),
+        gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
         tenant_id,
         resource_ref: ResourceRefDto {
             resource_id: "rsc-mixed".to_owned(),
@@ -749,7 +873,7 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         records: vec![
             valid_record("idem-mixed-0"),
             CreateUsageRecordRequest {
-                gts_id: "not-a-valid-prefix".to_owned(),
+                gts_type_id: "not-a-valid-prefix".to_owned(),
                 tenant_id,
                 resource_ref: ResourceRefDto {
                     resource_id: "rsc-mixed".to_owned(),
@@ -847,7 +971,7 @@ async fn deactivate_happy_path_returns_204_no_content() {
     plugin.set_get_record(sample_persisted_record(target_uuid, tenant_id));
     plugin.set_deactivate_ok();
 
-    let service = service_with_permit(
+    let service = ServiceFixture::default().build(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.deactivate.happy.v1",
     );
@@ -1035,7 +1159,7 @@ async fn get_happy_path_returns_200_with_record_body() {
     let tenant_id = Uuid::from_u128(2);
     plugin.set_get_record(sample_persisted_record(target_uuid, tenant_id));
 
-    let service = service_with_permit(
+    let service = ServiceFixture::default().build(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.get_record.happy.v1",
     );
@@ -1488,7 +1612,7 @@ mod parse_metadata_filters_tests {
 
     #[test]
     fn no_metadata_entries_yields_empty_vec() {
-        let out = parse_metadata_filters(&[p("gts_id", "x")]).expect("ok");
+        let out = parse_metadata_filters(&[p("gts_type_id", "x")]).expect("ok");
         assert!(out.is_empty());
     }
 
@@ -1539,7 +1663,7 @@ mod parse_metadata_filters_tests {
     #[test]
     fn non_metadata_params_are_ignored() {
         let out = parse_metadata_filters(&[
-            p("gts_id", "g"),
+            p("gts_type_id", "g"),
             p("from", "f"),
             p("metadata.k", "v"),
             p("$filter", "x"),
@@ -1630,22 +1754,22 @@ mod parse_metadata_filters_tests {
 }
 
 // ---------------------------------------------------------------------------
-// parse_required_gts_id — typed mandatory query parameter
+// parse_required_gts_type_id — typed mandatory query parameter
 // ---------------------------------------------------------------------------
 //
-// `parse_required_gts_id` is the only place the gateway lifts `gts_id`
-// query-string presence + validity into the typed `UsageTypeGtsId`. The
-// service tests cannot reach this surface (they construct the typed
-// value directly), and the wire-level `handle_list_usage_records` tests
-// would conflate three failure modes into the same 400. Pin each
-// failure mode separately here so a regression in one path doesn't get
-// masked by another.
+// `parse_required_gts_type_id` is the only place the gateway lifts
+// `gts_type_id` query-string presence + validity into the typed
+// `MeterTypeId`. The service tests cannot reach this surface (they
+// construct the typed value directly), and the wire-level
+// `handle_list_usage_records` tests would conflate three failure modes
+// into the same 400. Pin each failure mode separately here so a
+// regression in one path doesn't get masked by another.
 
-mod parse_required_gts_id_tests {
+mod parse_required_gts_type_id_tests {
     use toolkit_canonical_errors::CanonicalError;
     use toolkit_canonical_errors::context::InvalidArgumentV1;
 
-    use super::super::parse_required_gts_id;
+    use super::super::parse_required_gts_type_id;
     use super::HAPPY_RECORD_GTS_ID;
 
     fn p(key: &str, value: &str) -> (String, String) {
@@ -1666,11 +1790,11 @@ mod parse_required_gts_id_tests {
     }
 
     #[test]
-    fn missing_gts_id_param_rejects_as_missing_required() {
-        let err =
-            parse_required_gts_id(&[p("$filter", "x")]).expect_err("missing gts_id MUST reject");
+    fn missing_gts_type_id_param_rejects_as_missing_required() {
+        let err = parse_required_gts_type_id(&[p("$filter", "x")])
+            .expect_err("missing gts_type_id MUST reject");
         let (field, reason, description) = first_violation(&err);
-        assert_eq!(field, "gts_id");
+        assert_eq!(field, "gts_type_id");
         assert_eq!(
             reason, "VALIDATION",
             "host-private wire-shape rejection uses the gateway-side \
@@ -1683,17 +1807,19 @@ mod parse_required_gts_id_tests {
     }
 
     #[test]
-    fn duplicate_gts_id_param_rejects_instead_of_silently_last_winning() {
-        // Two `gts_id=…` entries with DIFFERENT values: last-wins
+    fn duplicate_gts_type_id_param_rejects_instead_of_silently_last_winning() {
+        // Two `gts_type_id=…` entries with DIFFERENT values: last-wins
         // would silently mask the caller bug. The helper MUST reject
         // outright. Pin BOTH the field/reason and that the rejection
         // happens regardless of whether either value is well-formed.
         let valid_gts = HAPPY_RECORD_GTS_ID.to_owned();
-        let err =
-            parse_required_gts_id(&[p("gts_id", &valid_gts), p("gts_id", "even.something.else")])
-                .expect_err("duplicate gts_id MUST reject");
+        let err = parse_required_gts_type_id(&[
+            p("gts_type_id", &valid_gts),
+            p("gts_type_id", "even.something.else"),
+        ])
+        .expect_err("duplicate gts_type_id MUST reject");
         let (field, reason, description) = first_violation(&err);
-        assert_eq!(field, "gts_id");
+        assert_eq!(field, "gts_type_id");
         assert_eq!(reason, "VALIDATION");
         assert!(
             description.contains("at most once"),
@@ -1703,22 +1829,23 @@ mod parse_required_gts_id_tests {
     }
 
     #[test]
-    fn malformed_gts_id_lifts_through_sdk_invalid_base_gts_id() {
-        // A single but malformed `gts_id` must surface the SDK-side
+    fn malformed_gts_type_id_lifts_through_sdk_invalid_base_gts_id() {
+        // A single but malformed `gts_type_id` must surface the SDK-side
         // `INVALID_BASE_GTS_ID` reason — NOT the host's `VALIDATION`
         // bucket — so caller-facing diagnostics distinguish "wrong
         // shape" from "missing / duplicate".
-        let err = parse_required_gts_id(&[p("gts_id", "not-a-valid-prefix")])
-            .expect_err("malformed gts_id MUST reject");
+        let err = parse_required_gts_type_id(&[p("gts_type_id", "not-a-valid-prefix")])
+            .expect_err("malformed gts_type_id MUST reject");
         let (field, reason, _) = first_violation(&err);
-        assert_eq!(field, "gts_id");
+        assert_eq!(field, "gts_type_id");
         assert_eq!(reason, "INVALID_BASE_GTS_ID");
     }
 
     #[test]
-    fn well_formed_gts_id_round_trips_through_the_typed_newtype() {
+    fn well_formed_gts_type_id_round_trips_through_the_typed_newtype() {
         let raw = HAPPY_RECORD_GTS_ID;
-        let parsed = parse_required_gts_id(&[p("gts_id", raw)]).expect("well-formed gts_id passes");
+        let parsed = parse_required_gts_type_id(&[p("gts_type_id", raw)])
+            .expect("well-formed gts_type_id passes");
         assert_eq!(AsRef::<str>::as_ref(&parsed), raw);
     }
 }
@@ -1765,7 +1892,7 @@ mod reject_unknown_list_params_tests {
             p("$orderby", "created_at asc"),
             p("limit", "10"),
             p("cursor", "opaque"),
-            p("gts_id", "g"),
+            p("gts_type_id", "g"),
             p("metadata.user_id", "u1"),
         ])
         .expect("the list allowlist admits every documented parameter");
@@ -1776,7 +1903,7 @@ mod reject_unknown_list_params_tests {
         // `$top` is canonical OData (OASIS OData 4.01 Part 2 §5.1.6) and
         // the toolkit extractor binds it as an alias of `limit`. Rejecting
         // it here would refuse a page size the platform honours.
-        reject_unknown_list_params(&[p("gts_id", "g"), p("$top", "5")])
+        reject_unknown_list_params(&[p("gts_type_id", "g"), p("$top", "5")])
             .expect("`$top` MUST be admitted: the extractor binds it onto `ODataQuery.limit`");
     }
 
@@ -1788,7 +1915,7 @@ mod reject_unknown_list_params_tests {
         // would answer `200` with every field to a caller who asked for
         // one, which reads as a satisfied projection rather than an
         // unsupported parameter.
-        let err = reject_unknown_list_params(&[p("gts_id", "g"), p("$select", "id")])
+        let err = reject_unknown_list_params(&[p("gts_type_id", "g"), p("$select", "id")])
             .expect_err("`$select` MUST be rejected: no code path applies the projection");
         assert_eq!(
             violating_field(&err).as_deref(),
@@ -1824,14 +1951,14 @@ mod reject_unknown_aggregate_params_tests {
 
     #[test]
     fn allowed_params_pass() {
-        // `$filter`, typed `gts_id`, and `metadata.<key>` entries are
+        // `$filter`, typed `gts_type_id`, and `metadata.<key>` entries are
         // explicitly admitted on the aggregate path.
         reject_unknown_aggregate_params(&[
             p("$filter", "x"),
-            p("gts_id", "g"),
+            p("gts_type_id", "g"),
             p("metadata.user_id", "u1"),
         ])
-        .expect("aggregate allowlist admits $filter, gts_id, metadata.<key>");
+        .expect("aggregate allowlist admits $filter, gts_type_id, metadata.<key>");
     }
 
     #[test]
@@ -1932,7 +2059,7 @@ async fn create_with_batch_above_cap_rejects_without_iterating_records() {
     let oversize = MAX_BATCH_RECORDS + 1;
     let records: Vec<_> = (0..oversize)
         .map(|i| CreateUsageRecordRequest {
-            gts_id: HAPPY_RECORD_GTS_ID.to_owned(),
+            gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
             tenant_id: Uuid::from_u128(2),
             resource_ref: ResourceRefDto {
                 resource_id: format!("rsc-{i}"),
@@ -1993,7 +2120,7 @@ async fn create_with_batch_above_cap_rejects_without_iterating_records() {
 // service-layer tests cover authorize / compose / dispatch; these tests
 // pin two handler-only concerns:
 //
-//   1. Pre-service validation rejections (missing / malformed `gts_id`,
+//   1. Pre-service validation rejections (missing / malformed `gts_type_id`,
 //      unknown query parameter, cursor / filter-hash mismatch) surface
 //      as a `400` canonical envelope before the service runs.
 //   2. A successful list lifts the plugin's `Page<UsageRecord>` to the
@@ -2043,7 +2170,7 @@ mod handle_list_usage_records_tests {
     }
 
     #[tokio::test]
-    async fn missing_gts_id_returns_400() {
+    async fn missing_gts_type_id_returns_400() {
         let service = service_no_plugin();
 
         let response = handle_list_usage_records(
@@ -2059,17 +2186,20 @@ mod handle_list_usage_records_tests {
     }
 
     #[tokio::test]
-    async fn malformed_gts_id_returns_400() {
-        // A single but shape-invalid `gts_id` must surface through the
-        // SDK's `InvalidUsageTypeGtsId` mapping as a 400 — covering
-        // gts_id-shape rejections, not just missing / duplicate /
+    async fn malformed_gts_type_id_returns_400() {
+        // A single but shape-invalid `gts_type_id` must surface through the
+        // SDK's `MeterTypeId` mapping as a 400 — covering
+        // gts_type_id-shape rejections, not just missing / duplicate /
         // unknown-param.
         let service = service_no_plugin();
 
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(vec![("gts_id".to_owned(), "not-a-valid-prefix".to_owned())]),
+            Query(vec![(
+                "gts_type_id".to_owned(),
+                "not-a-valid-prefix".to_owned(),
+            )]),
             OData(ODataQuery::new()),
         )
         .await
@@ -2081,7 +2211,7 @@ mod handle_list_usage_records_tests {
     #[tokio::test]
     async fn unknown_query_parameter_returns_400() {
         // A parameter that is neither an OData token, a typed
-        // (`gts_id`), nor a `metadata.<key>` entry MUST be refused
+        // (`gts_type_id`), nor a `metadata.<key>` entry MUST be refused
         // rather than silently dropped — silent drop is a documented
         // contract-drift surface.
         let service = service_no_plugin();
@@ -2090,7 +2220,7 @@ mod handle_list_usage_records_tests {
             Extension(SecurityContext::anonymous()),
             Extension(service),
             Query(vec![
-                ("gts_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
+                ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
                 ("totally_unknown".to_owned(), "x".to_owned()),
             ]),
             OData(ODataQuery::new()),
@@ -2121,7 +2251,10 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(vec![("gts_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())]),
+            Query(vec![(
+                "gts_type_id".to_owned(),
+                HAPPY_RECORD_GTS_ID.to_owned(),
+            )]),
             OData(q),
         )
         .await
@@ -2157,7 +2290,10 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(authenticated_ctx()),
             Extension(service),
-            Query(vec![("gts_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())]),
+            Query(vec![(
+                "gts_type_id".to_owned(),
+                HAPPY_RECORD_GTS_ID.to_owned(),
+            )]),
             OData(super::bounded_window_query()),
         )
         .await
@@ -2225,7 +2361,7 @@ mod handle_list_usage_records_tests {
 // ---------------------------------------------------------------------------
 // handle_query_aggregated_usage_records — wire validation + body projection
 //
-// The aggregate handler shares the metadata + gts_id surface with list,
+// The aggregate handler shares the metadata + gts_type_id surface with list,
 // but its allowlist is stricter (no `$top`, no `cursor`) and it ships only
 // group-by dimensions in the body — no aggregation parameter; the fold is
 // resolved from the queried type's declaration. The tests here pin only
@@ -2253,12 +2389,13 @@ mod handle_query_aggregated_usage_records_tests {
     use crate::api::rest::dto::{AggregationDimensionDto, QueryAggregatedUsageRecordsRequest};
     use crate::domain::Service;
     use crate::domain::test_support::{
-        CountingUnreachableResolver, authenticated_ctx, enforcer_for,
-        fake_declaration_source_with_fold, service_with_recording_plugin,
+        CountingUnreachableResolver, RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture,
+        authenticated_ctx, enforcer_for, fake_declaration_source_with_fold,
+        recording_plugin_resolver,
     };
 
     const VALID_GTS_ID: &str =
-        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+        gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
     fn service_no_plugin() -> Arc<Service> {
         let hub = Arc::new(ClientHub::new());
@@ -2274,9 +2411,9 @@ mod handle_query_aggregated_usage_records_tests {
     }
 
     #[tokio::test]
-    async fn missing_gts_id_on_aggregate_path_returns_400() {
-        // The aggregate path uses the same `parse_required_gts_id`
-        // helper as list; a missing `gts_id` MUST be refused with a 400
+    async fn missing_gts_type_id_on_aggregate_path_returns_400() {
+        // The aggregate path uses the same `parse_required_gts_type_id`
+        // helper as list; a missing `gts_type_id` MUST be refused with a 400
         // here too.
         let service = service_no_plugin();
 
@@ -2294,16 +2431,19 @@ mod handle_query_aggregated_usage_records_tests {
     }
 
     #[tokio::test]
-    async fn malformed_gts_id_on_aggregate_path_returns_400() {
-        // Parallel to the list-side `malformed_gts_id_returns_400` test:
-        // a shape-invalid `gts_id` on the aggregate path MUST surface
-        // through `parse_required_gts_id` as a 400.
+    async fn malformed_gts_type_id_on_aggregate_path_returns_400() {
+        // Parallel to the list-side `malformed_gts_type_id_returns_400` test:
+        // a shape-invalid `gts_type_id` on the aggregate path MUST surface
+        // through `parse_required_gts_type_id` as a 400.
         let service = service_no_plugin();
 
         let response = handle_query_aggregated_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(vec![("gts_id".to_owned(), "not-a-valid-prefix".to_owned())]),
+            Query(vec![(
+                "gts_type_id".to_owned(),
+                "not-a-valid-prefix".to_owned(),
+            )]),
             OData(ODataQuery::new()),
             Json(no_group()),
         )
@@ -2324,7 +2464,7 @@ mod handle_query_aggregated_usage_records_tests {
             Extension(SecurityContext::anonymous()),
             Extension(service),
             Query(vec![
-                ("gts_id".to_owned(), VALID_GTS_ID.to_owned()),
+                ("gts_type_id".to_owned(), VALID_GTS_ID.to_owned()),
                 ("cursor".to_owned(), "any-blob".to_owned()),
             ]),
             OData(ODataQuery::new()),
@@ -2349,7 +2489,7 @@ mod handle_query_aggregated_usage_records_tests {
         let response = handle_query_aggregated_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(vec![("gts_id".to_owned(), VALID_GTS_ID.to_owned())]),
+            Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
             OData(ODataQuery::new()),
             Json(QueryAggregatedUsageRecordsRequest {
                 group_by: vec![AggregationDimensionDto::Metadata(String::new())],
@@ -2376,7 +2516,14 @@ mod handle_query_aggregated_usage_records_tests {
         // this wires a working Type Resolver rather than the plugin-side
         // catalog the pre-Task-8 test used.
         let source = fake_declaration_source_with_fold("SUM");
-        let (service, plugin) = service_with_recording_plugin(source);
+        let plugin = RecordingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(source)
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+                RECORDING_PLUGIN_SUFFIX,
+            );
         plugin.set_query_aggregated_usage_records_response(AggregationResult {
             buckets: vec![
                 AggregationBucket {
@@ -2389,12 +2536,11 @@ mod handle_query_aggregated_usage_records_tests {
                 },
             ],
         });
-        let service = Arc::new(service);
 
         let response = handle_query_aggregated_usage_records(
             Extension(authenticated_ctx()),
             Extension(service),
-            Query(vec![("gts_id".to_owned(), VALID_GTS_ID.to_owned())]),
+            Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
             OData(super::bounded_window_query()),
             Json(QueryAggregatedUsageRecordsRequest {
                 group_by: vec![AggregationDimensionDto::ResourceType],

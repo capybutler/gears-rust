@@ -352,7 +352,7 @@ impl<'de> Deserialize<'de> for SubjectRef {
 ///
 /// Every [`UsageRecord::idempotency_key`] carries this type rather than a
 /// bare `String`. The plugin SPI dedups on
-/// `(tenant_id, usage_type_gts_id, idempotency_key)` per `plugin-spi.md`,
+/// `(tenant_id, gts_type_id, idempotency_key)` per `plugin-spi.md`,
 /// and the key is declared mandatory on every record — the newtype
 /// enforces that "mandatory" at the type level so an SDK consumer cannot
 /// build a record with an empty key.
@@ -853,14 +853,16 @@ pub enum UsageRecordStatus {
 #[serde(deny_unknown_fields)]
 pub struct UsageRecord {
     /// Deterministic gateway-derived record identity: `UUIDv5` of the 4-tuple
-    /// dedup key `(tenant_id, gts_id, idempotency_key, created_at)` (see
+    /// dedup key `(tenant_id, gts_type_id, idempotency_key, created_at)` (see
     /// [`crate::derive_usage_record_id`]; ADR-0014). Stamped by
     /// [`CreateUsageRecord::into_usage_record`] on create and authoritative on
     /// read / return. The identity cannot be caller-supplied: the create
     /// surface takes the identity-free [`CreateUsageRecord`], not this type.
     pub id: Uuid,
-    /// Usage type this record attaches to.
-    pub gts_id: UsageTypeGtsId,
+    /// Meter this record attaches to — the derived GTS type declaration
+    /// (`gts.cf.core.uc.usage_record.v1~<segment>~`) resolved through
+    /// `types-registry`, not a plugin-owned catalog row.
+    pub gts_type_id: MeterTypeId,
     /// Owning tenant for this record. Caller-supplied; PDP uses it as the
     /// `OWNER_TENANT_ID` attribute.
     pub tenant_id: Uuid,
@@ -887,7 +889,7 @@ pub struct UsageRecord {
     #[serde(with = "rust_decimal::serde::str")]
     pub value: Decimal,
     /// Mandatory caller-supplied key for at-least-once-with-dedup semantics.
-    /// The plugin SPI dedups on `(tenant_id, usage_type_gts_id, idempotency_key)`.
+    /// The plugin SPI dedups on `(tenant_id, gts_type_id, idempotency_key)`.
     pub idempotency_key: IdempotencyKey,
     /// When set, marks this row as a counter compensation referencing a
     /// previously emitted ordinary usage row. The four-cell value matrix
@@ -920,8 +922,10 @@ pub struct UsageRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUsageRecord {
-    /// Usage type this record attaches to.
-    pub gts_id: UsageTypeGtsId,
+    /// Meter this record attaches to — the derived GTS type declaration
+    /// (`gts.cf.core.uc.usage_record.v1~<segment>~`) resolved through
+    /// `types-registry`, not a plugin-owned catalog row.
+    pub gts_type_id: MeterTypeId,
     /// Owning tenant for this record. Caller-supplied; PDP uses it as the
     /// `OWNER_TENANT_ID` attribute.
     pub tenant_id: Uuid,
@@ -957,7 +961,7 @@ impl CreateUsageRecord {
     ///
     /// This is the single point at which a submission acquires its identity:
     /// `id` is stamped as the deterministic `UUIDv5` derivation of the 4-tuple
-    /// dedup key `(tenant_id, gts_id, idempotency_key, created_at)` (see
+    /// dedup key `(tenant_id, gts_type_id, idempotency_key, created_at)` (see
     /// [`crate::derive_usage_record_id`]; ADR-0014), `created_at` is normalized
     /// to microsecond precision, and `status` is initialized to
     /// [`UsageRecordStatus::Active`]. Every other field is forwarded verbatim.
@@ -984,13 +988,13 @@ impl CreateUsageRecord {
             .unwrap_or(self.created_at);
         let id = crate::id::derive_usage_record_id(
             self.tenant_id,
-            &self.gts_id,
+            &self.gts_type_id,
             &self.idempotency_key,
             created_at,
         );
         UsageRecord {
             id,
-            gts_id: self.gts_id,
+            gts_type_id: self.gts_type_id,
             tenant_id: self.tenant_id,
             resource_ref: self.resource_ref,
             subject_ref: self.subject_ref,
@@ -1225,11 +1229,11 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 // a `FieldToColumn<UsageRecordFilterField>` mapper next to their entity
 // definition; the SDK does not encode storage-layer column mapping.
 //
-// `gts_id` is intentionally absent from this schema. It is carried as a
+// `gts_type_id` is intentionally absent from this schema. It is carried as a
 // typed parameter on `list_usage_records` /
 // `query_aggregated_usage_records`; omitting it here means
 // `parse_odata_filter::<UsageRecordFilterField>` rejects any
-// `gts_id`-touching predicate at parse time as
+// `gts_type_id`-touching predicate at parse time as
 // `FilterError::UnknownField`, so neither plugins nor the gateway need a
 // runtime reject path.
 //

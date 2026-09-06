@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use toolkit_gts::gts_id;
 use usage_collector_sdk::{
-    IdempotencyKey, ResourceRef, UsageCollectorError, UsageRecord, UsageRecordStatus,
+    IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorError, UsageRecord, UsageRecordStatus,
     UsageTypeGtsId, ValidationReason,
 };
 use uuid::Uuid;
@@ -27,6 +27,9 @@ use super::{
 
 const SAMPLE_USAGE_TYPE_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+
+const SAMPLE_METER_TYPE_ID: &str =
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
 const SAMPLE_RECORD_RFC3339: &str = "2026-06-11T12:34:56Z";
 const SAMPLE_RECORD_VALUE: &str = "42.5";
@@ -43,7 +46,7 @@ fn sample_tenant_uuid() -> Uuid {
 fn sample_persisted_record(status: UsageRecordStatus) -> UsageRecord {
     UsageRecord {
         id: sample_record_uuid(),
-        gts_id: UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
         tenant_id: sample_tenant_uuid(),
         resource_ref: ResourceRef::new("rsc-dto", "compute.vm").expect("valid resource ref"),
         subject_ref: None,
@@ -58,6 +61,21 @@ fn sample_persisted_record(status: UsageRecordStatus) -> UsageRecord {
         )
         .expect("RFC 3339 fixture parses"),
     }
+}
+
+fn sample_usage_record_dto() -> UsageRecordDto {
+    UsageRecordDto::from(sample_persisted_record(UsageRecordStatus::Active))
+}
+
+#[test]
+fn record_dto_names_the_type_reference_gts_type_id() {
+    // usage-collector-v1.yaml renamed gts_id to gts_type_id on every shape.
+    let json = serde_json::to_value(sample_usage_record_dto()).unwrap();
+    assert!(
+        json.get("gts_type_id").is_some(),
+        "wire field is gts_type_id"
+    );
+    assert!(json.get("gts_id").is_none(), "the old name must be gone");
 }
 
 #[test]
@@ -126,7 +144,7 @@ fn register_request_body_is_permissive_at_deserialize() {
 
 fn minimal_create_record_json() -> serde_json::Value {
     serde_json::json!({
-        "gts_id": SAMPLE_USAGE_TYPE_ID,
+        "gts_type_id": SAMPLE_METER_TYPE_ID,
         "tenant_id": sample_tenant_uuid().to_string(),
         "resource_ref": {
             "resource_id": "rsc-dto",
@@ -160,7 +178,7 @@ fn create_request_rejects_client_supplied_id() {
     // `id` is server-derived; deny_unknown_fields must reject a client-sent id.
     let json = serde_json::json!({
         "id": "11111111-1111-1111-1111-111111111111",
-        "gts_id": SAMPLE_USAGE_TYPE_ID,
+        "gts_type_id": SAMPLE_METER_TYPE_ID,
         "tenant_id": "11111111-1111-1111-1111-111111111111",
         "resource_ref": { "resource_id": "r1", "resource_type": "compute.vm" },
         "value": "1",
