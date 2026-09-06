@@ -277,6 +277,22 @@ impl UsageCollectorError {
         }
     }
 
+    /// `AggregationFold::from_str` received a string outside the declared
+    /// set. Raised when a resolved declaration names a fold this major
+    /// version does not serve.
+    #[must_use]
+    pub fn invalid_aggregation_fold(raw: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "aggregation_fold".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "unknown aggregation fold `{raw}`; expected one of SUM, COUNT, MAX, MIN, LATEST"
+            ),
+        }
+    }
+
     /// Build a record-surface validating-newtype `InvalidArgument` whose wire
     /// `detail` is the newtype's self-describing reason. `field` attributes
     /// the violation (`metadata`, `resource_ref`, …).

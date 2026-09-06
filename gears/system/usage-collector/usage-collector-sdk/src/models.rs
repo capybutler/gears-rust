@@ -914,6 +914,77 @@ impl AggregationOp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Declared aggregation fold
+// ---------------------------------------------------------------------------
+
+/// The single aggregation a meter declares, read from its GTS type
+/// declaration's `x-gts-traits.aggregation_fold`.
+///
+/// This is never a request parameter. The aggregate path serves the declared
+/// fold and no other, so no class of request is well-formed and semantically
+/// wrong. The set is closed: adding a fold is an additive change, removing one
+/// is breaking.
+///
+/// `SUM` is the only fold yielding a chargeable period quantity. A meter whose
+/// consumption is naturally a level is pre-integrated at the emitter into an
+/// accrued quantity and declared `SUM`; this gear integrates on no path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum AggregationFold {
+    /// Total of the selected quantities.
+    Sum,
+    /// Count of selected entries. Under this fold a quantity means nothing:
+    /// one record is one event.
+    Count,
+    /// Greatest selected quantity.
+    Max,
+    /// Least selected quantity.
+    Min,
+    /// The quantity of the entry with the greatest `window_end`, ties broken
+    /// by the greatest `acceptance_sequence`.
+    Latest,
+}
+
+impl AggregationFold {
+    /// The wire spelling, identical to the trait-schema enum member.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sum => "SUM",
+            Self::Count => "COUNT",
+            Self::Max => "MAX",
+            Self::Min => "MIN",
+            Self::Latest => "LATEST",
+        }
+    }
+}
+
+impl std::fmt::Display for AggregationFold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AggregationFold {
+    type Err = UsageCollectorError;
+
+    /// Mirrors the serde wire shape without paying a `serde_json::Value`
+    /// allocation per call. Case-sensitive: the trait schema's enum is upper
+    /// case, so accepting another casing would admit a declaration
+    /// `types-registry` rejects.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SUM" => Ok(Self::Sum),
+            "COUNT" => Ok(Self::Count),
+            "MAX" => Ok(Self::Max),
+            "MIN" => Ok(Self::Min),
+            "LATEST" => Ok(Self::Latest),
+            other => Err(UsageCollectorError::invalid_aggregation_fold(other)),
+        }
+    }
+}
+
 /// Dimension to group an aggregation by.
 ///
 /// Each variant is a column or JSON-key facet of the underlying record

@@ -11,9 +11,9 @@ use uuid::Uuid;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    AggregationBucket, AggregationDimension, AggregationOp, AggregationResult, AggregationSpec,
-    CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, ResourceRef, SubjectRef,
-    UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationOp, AggregationResult,
+    AggregationSpec, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, ResourceRef,
+    SubjectRef, UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
     is_keyset_safe_record_field, is_keyset_safe_type_field,
 };
 use crate::error::UsageCollectorError;
@@ -1463,4 +1463,66 @@ fn keyset_safe_type_fields_are_the_catalog_not_null_columns() {
     assert!(is_keyset_safe_type_field("kind"));
     assert!(!is_keyset_safe_type_field("metadata_fields"));
     assert!(!is_keyset_safe_type_field("definitely_not_a_field"));
+}
+
+// ---------------------------------------------------------------------------
+// AggregationFold — declared-fold serde/FromStr surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aggregation_fold_serde_round_trips_screaming_case() {
+    for (fold, wire) in [
+        (AggregationFold::Sum, "\"SUM\""),
+        (AggregationFold::Count, "\"COUNT\""),
+        (AggregationFold::Max, "\"MAX\""),
+        (AggregationFold::Min, "\"MIN\""),
+        (AggregationFold::Latest, "\"LATEST\""),
+    ] {
+        assert_eq!(serde_json::to_string(&fold).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<AggregationFold>(wire).unwrap(), fold);
+    }
+}
+
+#[test]
+fn aggregation_fold_rejects_avg() {
+    // AVG was an AggregationOp. It is not a declared fold: a declaration
+    // naming it must fail resolution rather than silently pick another.
+    assert!(serde_json::from_str::<AggregationFold>("\"AVG\"").is_err());
+
+    let err = "AVG"
+        .parse::<AggregationFold>()
+        .expect_err("AVG must be rejected by FromStr");
+    assert!(
+        matches!(err, UsageCollectorError::InvalidArgument { ref field, ref detail, .. } if field == "aggregation_fold" && detail.contains("AVG")),
+        "expected InvalidArgument on field `aggregation_fold` naming AVG, got {err:?}"
+    );
+}
+
+#[test]
+fn aggregation_fold_from_str_matches_the_wire_shape() {
+    assert_eq!(
+        "SUM".parse::<AggregationFold>().unwrap(),
+        AggregationFold::Sum
+    );
+    assert_eq!(
+        "LATEST".parse::<AggregationFold>().unwrap(),
+        AggregationFold::Latest
+    );
+    // Case-sensitive on purpose: the enum in the trait schema is upper case,
+    // and accepting "sum" would admit a declaration the registry rejects.
+    assert!("sum".parse::<AggregationFold>().is_err());
+}
+
+#[test]
+fn aggregation_fold_as_str_matches_the_wire_spelling() {
+    assert_eq!(AggregationFold::Sum.as_str(), "SUM");
+    assert_eq!(AggregationFold::Count.as_str(), "COUNT");
+    assert_eq!(AggregationFold::Max.as_str(), "MAX");
+    assert_eq!(AggregationFold::Min.as_str(), "MIN");
+    assert_eq!(AggregationFold::Latest.as_str(), "LATEST");
+}
+
+#[test]
+fn aggregation_fold_display_matches_as_str() {
+    assert_eq!(AggregationFold::Latest.to_string(), "LATEST");
 }
