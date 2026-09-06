@@ -8,7 +8,7 @@
 //! returns a well-formed default response. MUST NOT be used in production.
 
 use async_trait::async_trait;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
@@ -48,7 +48,11 @@ impl UsageCollectorPluginV1 for NoopBackend {
         Ok(records.into_iter().map(Ok).collect())
     }
 
-    async fn get_usage_record(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        _scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::UsageRecordNotFound { id })
     }
 

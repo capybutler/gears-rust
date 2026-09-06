@@ -31,12 +31,11 @@ use crate::domain::ports::metrics::{
     DeactivationErrorCategory, QueryErrorCategory, RecordErrorCategory, RequestOutcome,
 };
 use crate::domain::test_support::{
-    CountingAllowAllResolver, CountingPermitResolver, CountingTenantPermitResolver,
-    DenyAllResolver, HappyPathPlugin, ServiceFixture, UnreachableResolver, authenticated_ctx,
-    counter_sum_with_label, enforcer_for, fake_declaration_source_with_fold,
-    fake_declaration_source_with_metadata, gauge_last, histogram_count, histogram_count_with_label,
-    histogram_sum, histogram_sum_with_label, hub_with_plugin, local_metrics,
-    service_with_metrics_unready_plugin,
+    CountingPermitResolver, CountingTenantPermitResolver, DenyAllResolver, HappyPathPlugin,
+    ServiceFixture, UnreachableResolver, authenticated_ctx, counter_sum_with_label, enforcer_for,
+    fake_declaration_source_with_fold, fake_declaration_source_with_metadata, gauge_last,
+    histogram_count, histogram_count_with_label, histogram_sum, histogram_sum_with_label,
+    hub_with_plugin, local_metrics, service_with_metrics_unready_plugin,
 };
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use usage_collector_sdk::UsageCollectorPluginError;
@@ -517,11 +516,19 @@ async fn per_record_permit_records_exactly_one_permit_no_double_count() {
 
 #[tokio::test]
 async fn plugin_backend_error_records_duration_counter_and_ready() {
-    // AllowAll permits; the unprogrammed HappyPathPlugin returns
-    // `Internal` for `get_usage_record` (the prefetch runs before PDP) → a
+    // `get_usage_record` now authorizes via a pre-row compiled-scope PDP
+    // request (Task 13 — no per-record attribution attributes), which
+    // `CountingAllowAllResolver`'s unconstrained permit would fail closed
+    // under `require_constraints(true)` before the plugin is ever
+    // dispatched. `CountingPermitResolver` grants a real tenant-narrowing
+    // scope instead, so the flow reaches the plugin: the unprogrammed
+    // `HappyPathPlugin` then returns `Internal` for `get_usage_record` — a
     // backend-classified fault.
     let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
+        .with_resolver(CountingPermitResolver::new(
+            pep_properties::OWNER_TENANT_ID,
+            Uuid::from_u128(2).to_string(),
+        ))
         .build_with_metrics(HappyPathPlugin::new(), "test.metrics.plugin.backend.v1");
 
     let _outcome = service
@@ -560,15 +567,21 @@ async fn plugin_backend_error_records_duration_counter_and_ready() {
 async fn plugin_domain_typed_error_does_not_increment_accept_counter() {
     // A domain-typed variant (UsageRecordNotFound) is a caller-visible
     // outcome, NOT a plugin fault — its duration is still observed, but it
-    // MUST NOT increment uc_plugin_accept_errors_total. The prefetch inside
-    // `get_usage_record` runs before PDP, so an unreachable/deny-anything
-    // resolver would never even be reached here.
+    // MUST NOT increment uc_plugin_accept_errors_total. `get_usage_record`
+    // authorizes via a pre-row compiled-scope PDP request (Task 13), so
+    // (as above) a real permitting resolver is required to reach the
+    // plugin dispatch this test means to exercise — `CountingAllowAllResolver`'s
+    // unconstrained permit would instead fail closed before the plugin
+    // was ever dispatched.
     let plugin = HappyPathPlugin::new();
     let id = Uuid::from_u128(0x02);
     plugin.set_get_usage_record_not_found(id);
 
     let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
+        .with_resolver(CountingPermitResolver::new(
+            pep_properties::OWNER_TENANT_ID,
+            Uuid::from_u128(2).to_string(),
+        ))
         .build_with_metrics(plugin, "test.metrics.plugin.domain.v1");
 
     let _outcome = service.get_usage_record(&authenticated_ctx(), id).await;

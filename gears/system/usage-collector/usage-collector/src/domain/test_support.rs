@@ -27,7 +27,7 @@ use authz_resolver_sdk::models::{
 };
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
     AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
@@ -105,7 +105,11 @@ impl UsageCollectorPluginV1 for MockPlugin {
         ))
     }
 
-    async fn get_usage_record(&self, _id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
+    async fn get_usage_record(
+        &self,
+        _id: Uuid,
+        _scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::internal(
             "test_fake: MockPlugin::get_usage_record not implemented",
         ))
@@ -989,6 +993,11 @@ pub struct HappyPathPlugin {
     /// `UsageCollectorPluginError::UsageRecordNotFound` instead of
     /// returning the default `get_record_response`.
     get_usage_record_not_found: Mutex<std::collections::BTreeSet<Uuid>>,
+    /// `Debug` rendering of the most-recent `scope` passed to
+    /// `get_usage_record`, so a test can assert the plugin actually
+    /// received a compiled PDP scope (Task 13 / DESIGN §3.3) rather than
+    /// merely that the call succeeded.
+    last_get_scope: Mutex<Option<String>>,
 }
 
 impl HappyPathPlugin {
@@ -1007,6 +1016,7 @@ impl HappyPathPlugin {
             deactivate_input: Mutex::new(None),
             get_usage_record_inputs: Mutex::new(Vec::new()),
             get_usage_record_not_found: Mutex::new(std::collections::BTreeSet::new()),
+            last_get_scope: Mutex::new(None),
         })
     }
 
@@ -1047,6 +1057,15 @@ impl HappyPathPlugin {
     #[must_use]
     pub fn get_usage_record_calls(&self) -> usize {
         self.get_usage_record_inputs.lock().expect("mutex").len()
+    }
+    /// `Debug` rendering of the `scope` filter passed to the most-recent
+    /// `get_usage_record` call, or `None` if it was never invoked. Proves
+    /// the caller-facing point lookup actually handed the plugin a
+    /// compiled PDP scope (Task 13 / DESIGN §3.3), not merely that the
+    /// call returned `Ok`.
+    #[must_use]
+    pub fn last_get_scope(&self) -> Option<String> {
+        self.last_get_scope.lock().expect("mutex").clone()
     }
     pub fn set_list_usage_records_response(&self, page: ODataPage<UsageRecord>) {
         *self.list_usage_records_response.lock().expect("mutex") = Some(page);
@@ -1159,8 +1178,13 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
             .ok_or_else(|| not_programmed("deactivate_usage_record"))
     }
 
-    async fn get_usage_record(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
         self.get_usage_record_inputs.lock().expect("mutex").push(id);
+        *self.last_get_scope.lock().expect("mutex") = Some(format!("{scope:?}"));
         if self
             .get_usage_record_not_found
             .lock()

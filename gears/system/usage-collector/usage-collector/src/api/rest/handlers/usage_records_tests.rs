@@ -25,15 +25,15 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use time::OffsetDateTime;
 use toolkit::client_hub::ClientHub;
-use toolkit_security::SecurityContext;
+use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use super::{handle_create_usage_records, handle_deactivate_usage_record, handle_get_usage_record};
 use crate::api::rest::dto::{CreateUsageRecordRequest, CreateUsageRecordsRequest, ResourceRefDto};
 use crate::domain::Service;
 use crate::domain::test_support::{
-    CountingUnreachableResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx, enforcer_for,
-    fake_declaration_source_with_fold,
+    CountingPermitResolver, CountingUnreachableResolver, HappyPathPlugin, ServiceFixture,
+    authenticated_ctx, enforcer_for, fake_declaration_source_with_fold, recording_plugin_resolver,
 };
 
 /// Wire a `Service` against a counting unreachable-PDP resolver and an
@@ -1008,8 +1008,12 @@ async fn deactivate_happy_path_returns_204_no_content() {
 // Handler-shaped concerns the service tests cannot reach:
 //   - Malformed UUID path segment lifts to InvalidArgument (HTTP 400)
 //     BEFORE the service is invoked.
-//   - Missing storage plugin surfaces 503 BEFORE the PDP is reached.
-//   - Unreachable PDP surfaces 503 AFTER the plugin prefetch succeeds.
+//   - `get_usage_record` now authorizes via a pre-row compiled-scope PDP
+//     request BEFORE resolving the plugin (Task 13 / DESIGN §3.3), unlike
+//     `deactivate_usage_record`'s unchanged prefetch-then-authorize
+//     posture above — so a missing plugin surfaces 503 AFTER the PDP is
+//     reached (not before), and an unreachable PDP surfaces 503 before any
+//     plugin dispatch (not after a prefetch).
 //   - Happy path: 200 OK with the persisted record body, wire-projected
 //     through `UsageRecordDto`.
 // ---------------------------------------------------------------------------
@@ -1071,15 +1075,25 @@ async fn get_with_malformed_uuid_returns_400_before_reaching_service() {
 
 #[tokio::test]
 async fn get_without_plugin_surfaces_503() {
-    // No usage-collector storage plugin registered: the handler reaches
-    // the service, whose first step (`Service::get_plugin`) fails closed.
-    // The unreachable-PDP resolver is NOT touched — the failure is on
-    // plugin resolution, before PDP — and `resolver.calls() == 0` pins
-    // the short-circuit ordering.
-    let (service, resolver) = service_with_sentinel_pdp();
+    // No usage-collector storage plugin registered. `get_usage_record` now
+    // authorizes via a pre-row compiled-scope PDP request BEFORE resolving
+    // the plugin (Task 13 moved the point lookup onto the same posture as
+    // list/aggregate), so a *permitting* resolver is required to reach
+    // `Service::get_plugin`'s failure at all — a `CountingUnreachableResolver`
+    // sentinel would instead surface 503 from the PDP step itself, proving
+    // nothing about plugin resolution. `CountingPermitResolver` grants a
+    // real scope and lets the test pin that the PDP WAS reached exactly
+    // once before the plugin-resolution failure.
+    let hub = Arc::new(ClientHub::new());
+    let resolver = CountingPermitResolver::new(
+        pep_properties::OWNER_TENANT_ID,
+        Uuid::from_u128(2).to_string(),
+    );
+    let enforcer = enforcer_for(Arc::clone(&resolver) as _);
+    let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
 
     let response = handle_get_usage_record(
-        Extension(SecurityContext::anonymous()),
+        Extension(authenticated_ctx()),
         Extension(service),
         Path(Uuid::new_v4().to_string()),
     )
@@ -1103,20 +1117,21 @@ async fn get_without_plugin_surfaces_503() {
     );
     assert_eq!(
         resolver.calls(),
-        0,
-        "missing-plugin path MUST short-circuit BEFORE reaching the PDP",
+        1,
+        "authorization now runs BEFORE plugin resolution - the PDP IS \
+         reached once, and it is the subsequent plugin-resolution failure \
+         that produces the 503",
     );
 }
 
 #[tokio::test]
 async fn get_with_unreachable_pdp_surfaces_503() {
-    // Real plugin (so the prefetch succeeds and loads the attribution
-    // tuple) + unreachable PDP resolver. The PDP step IS reached after
-    // the prefetch, and the resolver fails with transport
-    // `ServiceUnavailable` lifted to the canonical 503 `Problem`. The
-    // counting resolver pins the real PDP path: `calls() >= 1` is
-    // direct evidence the handler walked past `get_plugin` and the
-    // prefetch SPI dispatch.
+    // A real plugin is wired (unused here — authorization now runs BEFORE
+    // any plugin dispatch) plus an unreachable PDP resolver. The resolver
+    // fails with transport `ServiceUnavailable`, lifted to the canonical
+    // 503 `Problem`. The counting resolver pins the real PDP path:
+    // `calls() >= 1` is direct evidence the handler reached the PDP call —
+    // the very first thing `Service::get_usage_record` does.
     let plugin = HappyPathPlugin::new();
     let target_uuid = Uuid::new_v4();
     let tenant_id = Uuid::from_u128(2);
@@ -1158,10 +1173,19 @@ async fn get_happy_path_returns_200_with_record_body() {
     let tenant_id = Uuid::from_u128(2);
     plugin.set_get_record(sample_persisted_record(target_uuid, tenant_id));
 
-    let service = ServiceFixture::default().build(
-        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-        "test.handler.get_record.happy.v1",
-    );
+    // `get_usage_record` now authorizes via a pre-row compiled-scope PDP
+    // request (Task 13); the fixture's default `CountingTenantPermitResolver`
+    // reads the constraint back out of the caller's own request, which a
+    // pre-row request carries none of, so it would fall back to an
+    // allow-all permit and fail closed under `require_constraints(true)`.
+    // `recording_plugin_resolver` grants a fixed tenant-narrowing scope
+    // regardless of request shape instead.
+    let service = ServiceFixture::default()
+        .with_resolver(recording_plugin_resolver())
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            "test.handler.get_record.happy.v1",
+        );
 
     let response = handle_get_usage_record(
         Extension(authenticated_ctx()),

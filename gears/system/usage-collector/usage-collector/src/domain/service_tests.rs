@@ -372,7 +372,7 @@ mod deactivate_usage_record_tests {
 
     use async_trait::async_trait;
     use toolkit::client_hub::{ClientHub, ClientScope};
-    use toolkit_odata::{ODataQuery, Page as ODataPage};
+    use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
     use toolkit_security::SecurityContext;
     use types_registry_sdk::TypesRegistryClient;
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
@@ -535,6 +535,7 @@ mod deactivate_usage_record_tests {
         async fn get_usage_record(
             &self,
             id: Uuid,
+            _scope: &ast::Expr,
         ) -> Result<UsageRecord, UsageCollectorPluginError> {
             self.get_record_calls.fetch_add(1, Ordering::SeqCst);
             let outcome = self.get_record_outcome.lock().expect("mutex not poisoned");
@@ -1758,25 +1759,31 @@ mod corrects_id_dedup_tests {
 // ─── usage-emission feature (read-by-id) ─────────────────────────────────
 //
 // `Service::get_usage_record` is the host-side gateway for the read-by-id
-// surface of the usage-emission feature: lazy plugin resolution, Plugin
-// SPI Method 10 `get_usage_record` prefetch (so PDP can authorize over
-// the loaded attribution tuple), PDP authz, and 1:1 outcome mapping of
-// the plugin result taxonomy onto the SDK envelope. The pre-PDP fetch
-// mirrors the deactivation gateway pattern in
-// `cpt-cf-usage-collector-flow-event-deactivation-deactivate-record`:
-// the handler has only `id` at the boundary and needs the row to compose
-// the attribution-tuple PDP request. Tests pin:
+// surface of the usage-emission feature. Per DESIGN §3.3 / §3.5 (Task 13)
+// it now authorizes like `list_usage_records` / `query_aggregated_usage_records`
+// rather than like `deactivate_usage_record`: a pre-row PDP call
+// (`authz::authorize_get_usage_record_scope`, no per-record attribution
+// attributes — the id-only boundary doesn't have the record's tenant /
+// resource / subject fields to offer yet) compiles the caller's scope
+// FIRST, and only a permitted caller's compiled scope ever reaches Plugin
+// SPI Method 10 `get_usage_record(id, scope)`. The point lookup carries no
+// caller filter, so the compiled scope is the whole plugin-side filter — a
+// row outside it is never returned, mirroring "does not exist". Tests pin:
 //
-// - Happy path: prefetch succeeds, PDP permits, the loaded record is
-//   returned verbatim. Exactly one `get_usage_record` SPI dispatch.
-// - Prefetch returns `UsageRecordNotFound { id }` → lifted to
-//   `UsageCollectorError::NotFound { id }` BEFORE the PDP
-//   step (the PDP is deny-all to prove the short-circuit).
-// - PDP `deny` short-circuits AFTER the prefetch but BEFORE the record
-//   is handed back to the caller.
-// - PDP transport failure (`unreachable`) fails closed AFTER the
-//   prefetch but BEFORE the record is handed back.
-// - Prefetch transient error lifts to `ServiceUnavailable`.
+// - Happy path: PDP permits, the plugin returns the row, it's returned
+//   verbatim. Exactly one `get_usage_record` SPI dispatch, carrying a
+//   compiled scope (not merely succeeding — see
+//   `the_point_lookup_passes_the_compiled_scope_to_the_plugin`).
+// - The plugin reports `UsageRecordNotFound { id }` for a permitted
+//   caller's genuinely-missing target → lifted to
+//   `UsageCollectorError::NotFound { id }`.
+// - PDP `deny` collapses to that same `NotFound` — BEFORE any plugin
+//   dispatch, since authorization now runs first: the plugin never even
+//   sees the id, let alone the row.
+// - PDP transport failure (`unreachable`) fails closed, also before any
+//   plugin dispatch.
+// - A plugin-side transient error (on an otherwise-permitted call) lifts
+//   to `ServiceUnavailable`.
 mod get_usage_record_tests {
     use std::sync::Arc;
     use toolkit_gts::gts_id;
@@ -1787,10 +1794,9 @@ mod get_usage_record_tests {
     };
     use uuid::Uuid;
 
-    use crate::domain::Service;
     use crate::domain::test_support::{
-        DenyAllResolver, HappyPathPlugin, ServiceFixture, UnreachableResolver, authenticated_ctx,
-        enforcer_for, hub_with_plugin,
+        DenyAllResolver, RecordingPlugin, ServiceFixture, UnreachableResolver, authenticated_ctx,
+        recording_plugin_resolver,
     };
 
     const HAPPY_RECORD_GTS_ID: &str =
@@ -1815,20 +1821,23 @@ mod get_usage_record_tests {
         }
     }
 
-    /// Happy path: prefetch returns the row, PDP permits, the service
-    /// returns the loaded record verbatim. Exactly one
-    /// `get_usage_record` SPI round-trip.
+    /// Happy path: PDP permits (a real, tenant-narrowing compiled scope —
+    /// see [`recording_plugin_resolver`]), the plugin returns the row, the
+    /// service returns it verbatim. Exactly one `get_usage_record` SPI
+    /// dispatch.
     #[tokio::test]
     async fn get_usage_record_happy_path_returns_loaded_record() {
-        let plugin = HappyPathPlugin::new();
+        let plugin = RecordingPlugin::new();
         let target = Uuid::from_u128(0x00C0_FFEE);
         let tenant_id = Uuid::from_u128(2);
         plugin.set_get_record(sample_persisted_record(target, tenant_id));
 
-        let svc = ServiceFixture::default().build(
-            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.usage_collector.get_record.happy.v1",
-        );
+        let svc = ServiceFixture::default()
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.usage_collector.get_record.happy.v1",
+            );
 
         let record = svc
             .get_usage_record(&authenticated_ctx(), target)
@@ -1840,7 +1849,7 @@ mod get_usage_record_tests {
         assert_eq!(
             plugin.get_usage_record_calls(),
             1,
-            "exactly one SPI prefetch on the happy path; observed {} calls",
+            "exactly one SPI dispatch on the happy path; observed {} calls",
             plugin.get_usage_record_calls(),
         );
         assert_eq!(
@@ -1850,30 +1859,28 @@ mod get_usage_record_tests {
         );
     }
 
-    /// Prefetch `UsageRecordNotFound { id }` short-circuits BEFORE the
-    /// PDP step (the PDP is deny-all and would otherwise mask this
-    /// outcome as `Authorization`). Mirrors the deactivate gateway's
-    /// `inst-deactivate-record-prefetch-not-found` test.
+    /// A permitted caller's genuinely-missing target (the plugin reports
+    /// `UsageRecordNotFound { id }`) surfaces as `NotFound` — the ordinary
+    /// missing-row case, distinct from the PDP-deny case below even though
+    /// both converge on the same envelope (that convergence is the whole
+    /// point: see the module doc comment).
     #[tokio::test]
-    async fn get_usage_record_prefetch_not_found_skips_pdp() {
-        let plugin = HappyPathPlugin::new();
+    async fn get_usage_record_plugin_not_found_surfaces_as_not_found() {
+        let plugin = RecordingPlugin::new();
         let target = Uuid::from_u128(0xDEAD_F00D);
         plugin.set_get_usage_record_not_found(target);
 
-        // Deny-all PDP: if the gateway reached the PDP step, the surface
-        // error would be `Authorization`, not `UsageRecordNotFound`.
-        let hub = hub_with_plugin(
-            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.usage_collector.get_record.prefetch_not_found.v1",
-            "cyberfabric",
-        );
-        let enforcer = enforcer_for(Arc::new(DenyAllResolver));
-        let svc = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+        let svc = ServiceFixture::default()
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.usage_collector.get_record.plugin_not_found.v1",
+            );
 
         let err = svc
             .get_usage_record(&authenticated_ctx(), target)
             .await
-            .expect_err("prefetch UsageRecordNotFound MUST surface as NotFound");
+            .expect_err("plugin UsageRecordNotFound MUST surface as NotFound");
 
         assert!(
             matches!(
@@ -1883,23 +1890,31 @@ mod get_usage_record_tests {
             ),
             "expected NotFound carrying the target id, got {err:?}",
         );
+        assert_eq!(
+            plugin.get_usage_record_calls(),
+            1,
+            "the PDP permitted, so the dispatch DID happen - the plugin, not \
+             authorization, is what reported NotFound here",
+        );
     }
 
-    /// PDP deny collapses to `NotFound` AFTER the prefetch.
+    /// PDP deny collapses to `NotFound` — BEFORE any plugin dispatch.
+    /// Authorization now runs first (a pre-row compiled-scope request, like
+    /// LIST/aggregate), so a denied caller's scope never reaches the
+    /// plugin at all: the row is never even queried, let alone returned.
     #[tokio::test]
-    async fn get_usage_record_pdp_deny_collapses_to_not_found_after_prefetch() {
-        let plugin = HappyPathPlugin::new();
+    async fn get_usage_record_pdp_deny_collapses_to_not_found() {
+        let plugin = RecordingPlugin::new();
         let target = Uuid::from_u128(0xFEED);
         let tenant_id = Uuid::from_u128(2);
         plugin.set_get_record(sample_persisted_record(target, tenant_id));
 
-        let hub = hub_with_plugin(
-            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.usage_collector.get_record.pdp_deny.v1",
-            "cyberfabric",
-        );
-        let enforcer = enforcer_for(Arc::new(DenyAllResolver));
-        let svc = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+        let svc = ServiceFixture::default()
+            .with_resolver(Arc::new(DenyAllResolver))
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.usage_collector.get_record.pdp_deny.v1",
+            );
 
         let err = svc
             .get_usage_record(&authenticated_ctx(), target)
@@ -1912,26 +1927,27 @@ mod get_usage_record_tests {
         );
         assert_eq!(
             plugin.get_usage_record_calls(),
-            1,
-            "prefetch DID happen (it's the only way to load the attribution tuple)",
+            0,
+            "authorization runs BEFORE dispatch - a denied caller's compiled \
+             scope never reaches the plugin, so it is never even called",
         );
     }
 
-    /// PDP transport failure fails closed AFTER the prefetch.
+    /// PDP transport failure fails closed — also before any plugin
+    /// dispatch, for the same reason as the deny case above.
     #[tokio::test]
-    async fn get_usage_record_pdp_unreachable_fails_closed_after_prefetch() {
-        let plugin = HappyPathPlugin::new();
+    async fn get_usage_record_pdp_unreachable_fails_closed() {
+        let plugin = RecordingPlugin::new();
         let target = Uuid::from_u128(0xFACE);
         let tenant_id = Uuid::from_u128(2);
         plugin.set_get_record(sample_persisted_record(target, tenant_id));
 
-        let hub = hub_with_plugin(
-            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.usage_collector.get_record.pdp_unreachable.v1",
-            "cyberfabric",
-        );
-        let enforcer = enforcer_for(Arc::new(UnreachableResolver));
-        let svc = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+        let svc = ServiceFixture::default()
+            .with_resolver(Arc::new(UnreachableResolver))
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.usage_collector.get_record.pdp_unreachable.v1",
+            );
 
         let err = svc
             .get_usage_record(&authenticated_ctx(), target)
@@ -1942,17 +1958,50 @@ mod get_usage_record_tests {
             matches!(err, UsageCollectorError::ServiceUnavailable { .. }),
             "expected ServiceUnavailable, got {err:?}",
         );
-        assert!(
-            plugin.get_usage_record_calls() >= 1,
-            "prefetch MUST run before PDP transport failure causes the fail-closed lift",
+        assert_eq!(
+            plugin.get_usage_record_calls(),
+            0,
+            "the PDP call fails before the plugin is ever dispatched",
         );
     }
 
-    /// Prefetch transient failure lifts through the canonical chain to
-    /// `ServiceUnavailable` — same envelope the deactivate gateway emits
-    /// on a prefetch transient.
+    /// The plugin receives the compiled PDP scope on the point lookup —
+    /// DESIGN §3.3 / Task 13's central guarantee. Asserts the spy actually
+    /// captured a scope expression (not merely that the call completed);
+    /// the captured `Debug` rendering must carry the tenant-narrowing
+    /// predicate `recording_plugin_resolver` grants, so a regression that
+    /// wires an unrestricted/placeholder filter through instead (rather
+    /// than the real compiled scope) is caught, not just "some string".
     #[tokio::test]
-    async fn get_usage_record_prefetch_transient_lifts_to_service_unavailable() {
+    async fn the_point_lookup_passes_the_compiled_scope_to_the_plugin() {
+        let plugin = RecordingPlugin::new();
+        let target = Uuid::from_u128(0xC0DE);
+        plugin.set_get_record(sample_persisted_record(target, Uuid::from_u128(2)));
+
+        let svc = ServiceFixture::default()
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.usage_collector.get_record.scope_capture.v1",
+            );
+
+        let _outcome = svc.get_usage_record(&authenticated_ctx(), target).await;
+
+        let scope = plugin
+            .last_get_scope()
+            .expect("the plugin must receive a compiled scope, not an unscoped read");
+        assert!(
+            scope.contains("tenant_id"),
+            "expected the compiled scope to carry the tenant-narrowing \
+             predicate the PDP granted, got {scope:?}",
+        );
+    }
+
+    /// A plugin-side transient error, on an otherwise-permitted call,
+    /// lifts through the canonical chain to `ServiceUnavailable` — same
+    /// envelope the deactivate gateway emits on its own prefetch transient.
+    #[tokio::test]
+    async fn get_usage_record_plugin_transient_lifts_to_service_unavailable() {
         use usage_collector_sdk::UsageCollectorPluginError;
 
         // Build a tiny one-shot stub that always returns Transient on
@@ -2016,6 +2065,7 @@ mod get_usage_record_tests {
             async fn get_usage_record(
                 &self,
                 _id: Uuid,
+                _scope: &toolkit_odata::ast::Expr,
             ) -> Result<UsageRecord, UsageCollectorPluginError> {
                 Err(UsageCollectorPluginError::transient(
                     "test_fake: TransientGetPlugin: simulated prefetch transient",
@@ -2024,17 +2074,23 @@ mod get_usage_record_tests {
         }
 
         let plugin: Arc<dyn UsageCollectorPluginV1> = Arc::new(TransientGetPlugin);
-        let svc =
-            ServiceFixture::default().build(plugin, "test.usage_collector.get_record.transient.v1");
+        // The PDP MUST permit here (`recording_plugin_resolver`, not the
+        // fixture's tenant-echoing default — which would fail closed on
+        // this pre-row request and mask the plugin's Transient behind an
+        // authz NotFound) so the flow actually reaches the plugin dispatch
+        // this test means to exercise.
+        let svc = ServiceFixture::default()
+            .with_resolver(recording_plugin_resolver())
+            .build(plugin, "test.usage_collector.get_record.transient.v1");
 
         let err = svc
             .get_usage_record(&authenticated_ctx(), Uuid::from_u128(0x01))
             .await
-            .expect_err("prefetch Transient MUST lift to ServiceUnavailable");
+            .expect_err("plugin Transient MUST lift to ServiceUnavailable");
 
         assert!(
             matches!(err, UsageCollectorError::ServiceUnavailable { .. }),
-            "expected ServiceUnavailable from prefetch, got {err:?}",
+            "expected ServiceUnavailable from the plugin dispatch, got {err:?}",
         );
         assert!(err.is_retryable());
     }

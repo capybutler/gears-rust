@@ -655,6 +655,56 @@ pub(crate) async fn authorize_list_usage_records(
     .await
 }
 
+/// Authorize a `get_usage_record` (point lookup) request and return the
+/// **already-projected** `OData` filter expression the plugin must apply.
+///
+/// Mirrors [`authorize_list_usage_records`] in every respect (pre-row PEP
+/// request — no per-record attribution attributes, because the id-only
+/// boundary doesn't have the record's tenant / resource / subject fields
+/// yet — under `require_constraints(true)`, the same
+/// [`scope_to_odata_filter`] projectability gate) except the PEP `action`:
+/// `usage_record::actions::GET`, not `LIST`. The two verbs share the same
+/// resource and attribute set (see [`usage_record::RESOURCE`]) but are
+/// distinct PEP actions, so a policy permitting one need not permit the
+/// other — reusing `authorize_list_usage_records`'s `LIST` action here
+/// would authorize the wrong verb.
+///
+/// Unlike [`authorize_list_usage_records`], the gate's success value is
+/// the projected [`ast::Expr`] itself, not the [`AccessScope`] it came
+/// from: the point lookup carries no caller-supplied filter to AND it
+/// with (there is no [`compose_query_with_scope`](super::query::compose_query_with_scope)
+/// analogue here), so the projected scope *is* the whole filter handed to
+/// `UsageCollectorPluginV1::get_usage_record` — nothing downstream needs
+/// the raw `AccessScope` again.
+///
+/// # Errors
+///
+/// * [`DomainError::AuthorizationDenied`] when the PDP denies, or returns
+///   an unconstrained / deny-all / un-projectable (tree predicate, unknown
+///   property, not tenant-pinned) constraint shape — see
+///   [`scope_to_odata_filter`] for the full fail-closed enumeration.
+/// * [`DomainError::AuthorizationUnavailable`] when the PDP transport
+///   fails.
+pub(crate) async fn authorize_get_usage_record_scope(
+    enforcer: &PolicyEnforcer,
+    metrics: &dyn UsageCollectorMetrics,
+    op: PdpOp,
+    ctx: &SecurityContext,
+) -> Result<ast::Expr, DomainError> {
+    pdp_scope_with(
+        enforcer,
+        metrics,
+        op,
+        ctx,
+        &usage_record::RESOURCE,
+        usage_record::actions::GET,
+        None,
+        &AccessRequest::new().require_constraints(true),
+        |scope| scope_to_odata_filter(&scope),
+    )
+    .await
+}
+
 /// Project an [`AccessScope`] into an `OData` filter expression over the
 /// `UsageRecord` raw-read filter surface.
 ///

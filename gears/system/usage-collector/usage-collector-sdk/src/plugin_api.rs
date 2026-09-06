@@ -1,7 +1,7 @@
 //! Storage Plugin SPI for the Usage Collector.
 
 use async_trait::async_trait;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use crate::error::UsageCollectorPluginError;
@@ -39,7 +39,22 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     ) -> Result<Vec<Result<UsageRecord, UsageCollectorPluginError>>, UsageCollectorPluginError>;
 
     /// Get a single usage record by its `id`.
-    async fn get_usage_record(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError>;
+    ///
+    /// `scope` is the caller's compiled PDP scope, projected into a
+    /// `toolkit_odata` filter expression by
+    /// `authz::scope_to_odata_filter` (gateway-side; never a plugin
+    /// concern). The point lookup carries no caller-supplied filter of its
+    /// own, so `scope` is the *whole* filter the row must satisfy — a row
+    /// whose attribution tuple falls outside it MUST NOT be returned; the
+    /// plugin reports `UsageRecordNotFound` exactly as it would for an
+    /// `id` that does not exist at all. This is what keeps the by-id
+    /// surface from acting as an existence oracle: the caller cannot tell
+    /// "exists but not yours" apart from "does not exist".
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError>;
 
     /// Compute the given fold over the authorized scope.
     ///

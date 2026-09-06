@@ -23,7 +23,7 @@ use futures::stream;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use toolkit_macros::domain_model;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use toolkit_security::SecurityContext;
 use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
@@ -326,6 +326,34 @@ fn classify_deactivation_plugin_error(
     }
 }
 
+/// A trivially-true `toolkit_odata` filter: "every row satisfies this."
+///
+/// `UsageCollectorPluginV1::get_usage_record` now takes a compiled-scope
+/// filter on every call, but only `Service::get_usage_record` — the
+/// caller-facing point lookup DESIGN §3.3 requires to read under the
+/// compiled PDP scope — actually has one to give it. The other two call
+/// sites in this module use the same SPI method for a system-internal
+/// lookup that predates (and is out of scope for) that guarantee, and
+/// whose own authorization already happens elsewhere:
+///
+/// * [`resolve_l1_lookups`] / [`Service::create_usage_record_inner`]'s
+///   `corrects_id` L1 referential lookup — a same-request existence /
+///   shape check on the record being corrected, run *after* the
+///   submitted record's own PDP authorization already succeeded. It is
+///   not a caller-scoped read of a chosen row.
+/// * [`Service::deactivate_usage_record`]'s attribution prefetch — still
+///   authorized afterward via the unchanged per-record
+///   [`authz::authorize_usage_record`] tuple check (a later slice owns
+///   threading a compiled scope through deactivation).
+///
+/// Passing `true` at these two call sites asks the plugin for exactly the
+/// "no SPI-level narrowing" behaviour they had before this SPI grew a
+/// `scope` parameter — a deliberate, honest "not this surface's scope to
+/// give," not a shortcut around the point lookup's guarantee.
+fn unrestricted_read_filter() -> ast::Expr {
+    ast::Expr::Value(ast::Value::Bool(true))
+}
+
 /// Collapse a PDP denial into `NotFound` so the by-id surfaces (`get` /
 /// `deactivate`) never act as an existence oracle; every other error
 /// (notably `ServiceUnavailable`, which leaks nothing) is preserved.
@@ -379,7 +407,7 @@ async fn resolve_l1_lookups(
             let outcome = instrument_spi(
                 metrics,
                 PluginOp::GetUsageRecord,
-                plugin.get_usage_record(corrects_id),
+                plugin.get_usage_record(corrects_id, &unrestricted_read_filter()),
             )
             .await
             .map_err(DomainError::from);
@@ -691,7 +719,7 @@ impl Service {
             let referenced = match instrument_spi(
                 self.metrics.as_ref(),
                 PluginOp::GetUsageRecord,
-                plugin.get_usage_record(corrects_id),
+                plugin.get_usage_record(corrects_id, &unrestricted_read_filter()),
             )
             .await
             {
@@ -1286,7 +1314,7 @@ impl Service {
         let record = match instrument_spi(
             self.metrics.as_ref(),
             PluginOp::GetUsageRecord,
-            plugin.get_usage_record(id),
+            plugin.get_usage_record(id, &unrestricted_read_filter()),
         )
         .await
         {
@@ -1413,20 +1441,29 @@ impl Service {
     // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2:inst-algo-telemetry-duration-observe
     // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2:inst-algo-telemetry-outcome-counter
 
-    /// Read a single `UsageRecord` by `uuid` from the bound storage plugin.
+    /// Read a single `UsageRecord` by `uuid` from the bound storage plugin,
+    /// scoped to the caller's compiled PDP grant.
     ///
-    /// The handler first fetches the target row via Plugin SPI Method 10
-    /// `get_usage_record(id)` so PDP can authorize over the full attribution
-    /// tuple (`tenant_id`, `resource_ref`, optional `subject_ref`). A PDP
-    /// denial is collapsed into the same `NotFound` the missing-row path
-    /// returns, so an unauthorized caller cannot use this by-id surface as an
-    /// existence oracle (mirrors `deactivate_usage_record`).
+    /// Authorizes FIRST via [`authz::authorize_get_usage_record_scope`] — a
+    /// pre-row PDP request (no per-record attribution attributes; the
+    /// id-only boundary doesn't have the record's tenant / resource /
+    /// subject fields to offer yet) under `require_constraints(true)`,
+    /// mirroring [`Self::list_usage_records`]'s posture. The point lookup
+    /// carries no caller-supplied filter, so the projected scope IS the
+    /// whole filter passed to Plugin SPI Method 10 `get_usage_record(id,
+    /// scope)`: a row outside it is never returned — the plugin reports
+    /// `UsageRecordNotFound` exactly as it would for an `id` that doesn't
+    /// exist at all, so this surface cannot be used as an existence oracle.
+    /// A PDP deny is additionally collapsed into that same `NotFound`
+    /// (mirrors `deactivate_usage_record`) so a caller denied outright
+    /// can't distinguish "denied" from "no matching row" either.
     ///
     /// # Errors
     ///
-    /// * [`UsageCollectorError::NotFound`] when the targeted record does not
-    ///   exist (raised by the pre-PDP fetch), or when the PDP denies
-    ///   (collapsed, see above).
+    /// * [`UsageCollectorError::NotFound`] when the PDP denies (collapsed,
+    ///   see above), or when the targeted record does not exist, or exists
+    ///   but falls outside the compiled scope (both of the latter reported
+    ///   by the plugin as `UsageRecordNotFound`).
     /// * [`UsageCollectorError::ServiceUnavailable`] when the PDP is
     ///   unavailable.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
@@ -1438,37 +1475,33 @@ impl Service {
         ctx: &SecurityContext,
         id: Uuid,
     ) -> Result<UsageRecord, UsageCollectorError> {
-        let plugin = self
-            .resolve_plugin_for(PluginOp::GetUsageRecord)
-            .await
-            .map_err(UsageCollectorError::from)?;
-
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-prefetch
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-prefetch-not-found
-        let record = instrument_spi(
-            self.metrics.as_ref(),
-            PluginOp::GetUsageRecord,
-            plugin.get_usage_record(id),
-        )
-        .await
-        .map_err(|e| UsageCollectorError::from(DomainError::from(e)))?;
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-prefetch-not-found
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-prefetch
-
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-pdp
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-pdp-deny
-        authz::authorize_usage_record(
+        let scope_expr = authz::authorize_get_usage_record_scope(
             &self.enforcer,
             self.metrics.as_ref(),
             PdpOp::GetRecord,
             ctx,
-            &record,
-            usage_record::actions::GET,
         )
         .await
         .map_err(|e| collapse_deny_to_not_found(e, id))?;
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-pdp-deny
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-pdp
+
+        let plugin = self
+            .resolve_plugin_for(PluginOp::GetUsageRecord)
+            .await
+            .map_err(UsageCollectorError::from)?;
+
+        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-plugin-dispatch
+        let record = instrument_spi(
+            self.metrics.as_ref(),
+            PluginOp::GetUsageRecord,
+            plugin.get_usage_record(id, &scope_expr),
+        )
+        .await
+        .map_err(|e| UsageCollectorError::from(DomainError::from(e)))?;
+        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-plugin-dispatch
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-success
         Ok(record)

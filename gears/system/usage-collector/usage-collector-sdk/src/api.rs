@@ -42,7 +42,10 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
     /// Get a single usage record by its `id`.
     ///
     /// Returns the persisted record on `Ok`; an unknown `id` surfaces
-    /// as [`UsageCollectorError::NotFound`].
+    /// as [`UsageCollectorError::NotFound`]. The read runs under the
+    /// caller's compiled PDP scope, so a record outside it is
+    /// [`UsageCollectorError::NotFound`] too — this surface is never an
+    /// existence oracle.
     async fn get_usage_record(
         &self,
         ctx: &SecurityContext,
