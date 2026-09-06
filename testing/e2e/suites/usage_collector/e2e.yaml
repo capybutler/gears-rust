@@ -1,7 +1,12 @@
+# NOT RUN IN CI during the type-plane rewrite: the step that invoked this
+# suite has been removed from .github/workflows/e2e.yml. The suite asserts
+# persistence round-trips, and the only persisting plugin is unwired from
+# the build (see docs/superpowers/plans/2026-09-06-usage-collector-type-plane.md,
+# Task 1). `make e2e-usage-collector` still runs it locally and is expected
+# to fail until the TimescaleDB plugin is ported.
 suite: usage-collector
 features:
   - usage-collector
-  - timescaledb-usage-collector
   - static-tenants
   - static-authn
   - static-authz
