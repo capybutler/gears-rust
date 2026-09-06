@@ -166,3 +166,70 @@ fn validate_rejects_prefix_with_hyphen() {
     // a hyphen is not a legal Prometheus/OTel name character.
     assert!(cfg_with_prefix("usage-collector").validate().is_err());
 }
+
+// ── Type Resolver cache knobs (`type_cache_ttl_secs` / `type_cache_capacity` /
+// `metadata_size_cap_bytes`) ──
+//
+// The cache is what keeps ingestion's NFRs independent of types-registry's
+// own availability/latency (see `domain::type_resolver`); a zero TTL or
+// capacity defeats that purpose, so `validate()` rejects both at
+// `Gear::init` rather than silently degrading every dispatch into a
+// registry round-trip.
+
+#[test]
+fn type_cache_defaults_are_applied_when_absent() {
+    // `serde_json`, not `toml`: every other test in this file parses via
+    // `serde_json::from_str`, and this crate does not depend on the `toml`
+    // crate at all — adding it just for this assertion would be a new
+    // dependency for a format-agnostic serde derive to exercise.
+    let cfg: UsageCollectorConfig = serde_json::from_str("{}").expect("empty config parses");
+    assert_eq!(cfg.type_cache_ttl_secs, 300);
+    assert_eq!(cfg.type_cache_capacity, 10_000);
+    // Matches `RECORD_METADATA_SIZE_CAP_BYTES` in `domain::validation`: the
+    // incumbent hard-coded cap, not an invented placeholder, so wiring the
+    // two together later is a no-op for the default deployment.
+    assert_eq!(cfg.metadata_size_cap_bytes, 8192);
+}
+
+#[test]
+fn type_cache_knobs_are_overridable() {
+    let json = r#"{
+        "type_cache_ttl_secs": 60,
+        "type_cache_capacity": 500,
+        "metadata_size_cap_bytes": 2048
+    }"#;
+    let cfg: UsageCollectorConfig = serde_json::from_str(json).expect("config parses");
+    assert_eq!(cfg.type_cache_ttl_secs, 60);
+    assert_eq!(cfg.type_cache_capacity, 500);
+    assert_eq!(cfg.metadata_size_cap_bytes, 2048);
+}
+
+#[test]
+fn a_zero_ttl_is_rejected() {
+    // A zero TTL turns every ingestion into a registry round-trip, which is
+    // the coupling the cache exists to remove.
+    let cfg = UsageCollectorConfig {
+        type_cache_ttl_secs: 0,
+        ..Default::default()
+    };
+    let err = cfg.validate().expect_err("zero TTL must be rejected");
+    assert!(
+        err.to_string().contains("type_cache_ttl_secs"),
+        "error must name the offending key, got: {err}"
+    );
+}
+
+#[test]
+fn a_zero_capacity_is_rejected() {
+    // A zero capacity cannot hold even a single resolved declaration, which
+    // would make the cache a no-op while still claiming to exist.
+    let cfg = UsageCollectorConfig {
+        type_cache_capacity: 0,
+        ..Default::default()
+    };
+    let err = cfg.validate().expect_err("zero capacity must be rejected");
+    assert!(
+        err.to_string().contains("type_cache_capacity"),
+        "error must name the offending key, got: {err}"
+    );
+}

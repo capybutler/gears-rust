@@ -102,7 +102,14 @@ impl Gear for UsageCollectorModule {
         //    catalog SPI calls through
         //    `ClientHub::try_get_scoped::<dyn UsageCollectorPluginV1>`.
         let hub = ctx.client_hub();
-        let svc = Service::new_with_metrics(hub, cfg.vendor, enforcer, metrics);
+        let svc = Service::new_with_metrics(
+            hub,
+            cfg.vendor,
+            enforcer,
+            metrics,
+            cfg.type_cache_ttl_secs,
+            cfg.type_cache_capacity,
+        );
 
         let svc = Arc::new(svc);
         self.service

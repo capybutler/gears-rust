@@ -614,6 +614,8 @@ pub fn service_with_metrics(
         "cyberfabric".to_owned(),
         enforcer_for(resolver),
         metrics,
+        crate::domain::service::DEFAULT_TYPE_CACHE_TTL_SECS,
+        crate::domain::service::DEFAULT_TYPE_CACHE_CAPACITY,
     ));
     (service, provider, exporter)
 }
@@ -647,6 +649,8 @@ pub fn service_with_metrics_unready_plugin(
         "cyberfabric".to_owned(),
         enforcer_for(resolver),
         metrics,
+        crate::domain::service::DEFAULT_TYPE_CACHE_TTL_SECS,
+        crate::domain::service::DEFAULT_TYPE_CACHE_CAPACITY,
     ));
     (service, provider, exporter)
 }

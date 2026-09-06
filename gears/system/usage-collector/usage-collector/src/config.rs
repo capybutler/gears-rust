@@ -30,6 +30,32 @@ pub struct UsageCollectorConfig {
     /// ToolKit-owned (`[opentelemetry]` block) per
     /// `cpt-cf-usage-collector-principle-otlp-push-emission`.
     pub metrics: MetricsConfig,
+
+    /// How long a resolved GTS type declaration is served before the Type
+    /// Resolver refreshes it, in seconds.
+    ///
+    /// Fold, unit and metadata surface are immutable for a type's life, so
+    /// this is not a correctness window for them. It bounds how long a
+    /// withdrawn declaration keeps resolving, and it is what keeps the cache
+    /// honest once `types-registry` admits mutable major-only identifiers.
+    pub type_cache_ttl_secs: u64,
+
+    /// Ceiling on cached declarations. One entry per meter, not per entry,
+    /// so realistic deployments sit far below the default.
+    pub type_cache_capacity: usize,
+
+    /// Cap on an entry's serialized metadata map, in bytes.
+    ///
+    /// DESIGN 3.1 makes the cap per deployment. It is enforced alongside the
+    /// declared-shape check, not instead of it: a payload can sit inside the
+    /// cap and still carry an undeclared key.
+    ///
+    /// Defaults to `8192`, matching the cap `domain::validation` currently
+    /// hard-codes (`RECORD_METADATA_SIZE_CAP_BYTES`), so that wiring this
+    /// value into that existing check (deferred to a later task — see that
+    /// module's doc comment) is a no-op for the default deployment rather
+    /// than a silent tightening.
+    pub metadata_size_cap_bytes: usize,
 }
 
 impl Default for UsageCollectorConfig {
@@ -37,6 +63,9 @@ impl Default for UsageCollectorConfig {
         Self {
             vendor: "cyberfabric".to_owned(),
             metrics: MetricsConfig::default(),
+            type_cache_ttl_secs: 300,
+            type_cache_capacity: 10_000,
+            metadata_size_cap_bytes: 8192,
         }
     }
 }
@@ -107,18 +136,31 @@ impl UsageCollectorConfig {
     ///
     /// Rejects an empty or whitespace-only `vendor` selector so the failure
     /// surfaces at `Gear::init` rather than lazily on the first dispatch when
-    /// plugin selection finds no match.
+    /// plugin selection finds no match. Also rejects a zero type-cache TTL
+    /// or capacity: a zero TTL turns every ingestion into a types-registry
+    /// round-trip, which is exactly the coupling the cache exists to remove,
+    /// and a zero capacity cannot hold even a single resolved declaration.
     ///
     /// # Errors
     ///
-    /// Returns an error if `vendor` is empty or whitespace-only, or if the
+    /// Returns an error if `vendor` is empty or whitespace-only, if the
     /// metrics prefix is not a valid instrument-name prefix (see
-    /// [`MetricsConfig::validate`]).
+    /// [`MetricsConfig::validate`]), or if `type_cache_ttl_secs` /
+    /// `type_cache_capacity` is zero.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.vendor.trim().is_empty() {
             anyhow::bail!("[usage_collector].vendor must not be empty or whitespace-only");
         }
         self.metrics.validate()?;
+        if self.type_cache_ttl_secs == 0 {
+            anyhow::bail!(
+                "[usage_collector].type_cache_ttl_secs must be greater than 0: \
+                 a zero TTL makes every ingestion a types-registry round-trip"
+            );
+        }
+        if self.type_cache_capacity == 0 {
+            anyhow::bail!("[usage_collector].type_cache_capacity must be greater than 0");
+        }
         Ok(())
     }
 }

@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use futures::StreamExt;
@@ -35,6 +36,8 @@ use usage_collector_sdk::{
 use uuid::Uuid;
 
 use crate::domain::authz::{self, AttributionTupleKey, usage_record, usage_type};
+#[cfg(test)]
+use crate::domain::ports::declarations::DeclarationSource;
 use crate::domain::ports::metrics::{
     DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome, NoopMetrics,
     PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
@@ -44,10 +47,12 @@ use crate::domain::ports::metrics::{
 use crate::domain::query::{
     compose_query_with_scope, require_bounded_time_window, require_op_allowed_for_kind,
 };
+use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
     SemanticsOutcome, validate_record_semantics, validate_submit_record_metadata,
     verify_l1_corrects_id,
 };
+use crate::infra::types_registry_source::TypesRegistryDeclarationSource;
 
 use super::error::DomainError;
 
@@ -517,35 +522,117 @@ pub struct Service {
     // @cpt-dod:cpt-cf-usage-collector-dod-foundation-observability-plugin-host-instruments:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-foundation-observability-pdp-helper-instruments:p1
     metrics: Arc<dyn UsageCollectorMetrics>,
+
+    /// Resolves a meter's GTS type declaration (fold, canonical unit,
+    /// metadata surface) through a local TTL cache in front of
+    /// `types-registry`, so ingestion's own NFRs stay independent of a
+    /// second gear's availability and latency. Constructed here; not yet
+    /// consulted by any dispatch path (that starts in the task that follows
+    /// this one) — see [`crate::domain::type_resolver`].
+    #[allow(dead_code)] // consulted starting the next task in this series
+    type_resolver: Arc<TypeResolver>,
 }
+
+/// Cache defaults used by the convenience constructors ([`Service::new`] and
+/// the test-only [`Service::new_with_declaration_source`]), mirroring
+/// [`crate::config::UsageCollectorConfig`]'s own defaults. Production
+/// bootstrap (`module.rs`) always goes through [`Service::new_with_metrics`]
+/// with the configured values instead — these constants exist only so the
+/// dozens of call sites that build a `Service` without caring about the Type
+/// Resolver (this task's own scope, and pre-existing test coverage of
+/// unrelated paths) don't need to be threaded with cache knobs they have no
+/// reason to vary.
+pub(crate) const DEFAULT_TYPE_CACHE_TTL_SECS: u64 = 300;
+pub(crate) const DEFAULT_TYPE_CACHE_CAPACITY: usize = 10_000;
 
 impl Service {
     /// Storage-plugin resolution is lazy: no `types-registry` query happens
     /// here, it is deferred to the first dispatch.
     ///
     /// Metrics default to a no-op adapter — production wires the real
-    /// OTLP-backed adapter through [`Service::new_with_metrics`].
+    /// OTLP-backed adapter through [`Service::new_with_metrics`]. The Type
+    /// Resolver is built with [`DEFAULT_TYPE_CACHE_TTL_SECS`] /
+    /// [`DEFAULT_TYPE_CACHE_CAPACITY`] — fine here because nothing yet
+    /// consults it; production bootstrap uses the configured values via
+    /// [`Service::new_with_metrics`].
     #[must_use]
     pub fn new(hub: Arc<ClientHub>, vendor: String, enforcer: PolicyEnforcer) -> Self {
-        Self::new_with_metrics(hub, vendor, enforcer, Arc::new(NoopMetrics))
+        Self::new_with_metrics(
+            hub,
+            vendor,
+            enforcer,
+            Arc::new(NoopMetrics),
+            DEFAULT_TYPE_CACHE_TTL_SECS,
+            DEFAULT_TYPE_CACHE_CAPACITY,
+        )
     }
 
-    /// Construct the service with an explicit operational-metrics sink.
-    /// Used at gear bootstrap (`module.rs`) and by emission tests that
-    /// assert on the exported instruments.
+    /// Construct the service with an explicit operational-metrics sink and
+    /// the Type Resolver's cache knobs. Used at gear bootstrap (`module.rs`,
+    /// with the configured `[usage_collector]` values) and by emission tests
+    /// that assert on the exported instruments (with the defaults above).
+    ///
+    /// The `types-registry` adapter is built here, over the same `hub` the
+    /// service already holds, rather than injected — [`Service::resolve_plugin`]
+    /// resolves `dyn TypesRegistryClient` from the same hub the same way, so
+    /// this does not introduce a new dependency edge, only reuses the
+    /// existing one for a second purpose.
     #[must_use]
     pub fn new_with_metrics(
         hub: Arc<ClientHub>,
         vendor: String,
         enforcer: PolicyEnforcer,
         metrics: Arc<dyn UsageCollectorMetrics>,
+        type_cache_ttl_secs: u64,
+        type_cache_capacity: usize,
     ) -> Self {
+        let source = Arc::new(TypesRegistryDeclarationSource::new(Arc::clone(&hub)));
+        let type_resolver = Arc::new(TypeResolver::new(
+            source,
+            TypeResolverConfig {
+                ttl: Duration::from_secs(type_cache_ttl_secs),
+                capacity: type_cache_capacity,
+            },
+        ));
         Self {
             hub,
             vendor,
             selector: GtsPluginSelector::new(),
             enforcer,
             metrics,
+            type_resolver,
+        }
+    }
+
+    /// Test-only: build a `Service` over a caller-supplied declaration
+    /// source, so tests can inject a fake `DeclarationSource` instead of a
+    /// real `types-registry` client. Cache knobs are fixed at
+    /// [`DEFAULT_TYPE_CACHE_TTL_SECS`] / [`DEFAULT_TYPE_CACHE_CAPACITY`] —
+    /// callers exercising the cache policy itself should drive
+    /// [`crate::domain::type_resolver::TypeResolver`] directly instead, the
+    /// way `type_resolver::resolver_tests` already does.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new_with_declaration_source(
+        hub: Arc<ClientHub>,
+        vendor: String,
+        enforcer: PolicyEnforcer,
+        source: Arc<dyn DeclarationSource>,
+    ) -> Self {
+        let type_resolver = Arc::new(TypeResolver::new(
+            source,
+            TypeResolverConfig {
+                ttl: Duration::from_secs(DEFAULT_TYPE_CACHE_TTL_SECS),
+                capacity: DEFAULT_TYPE_CACHE_CAPACITY,
+            },
+        ));
+        Self {
+            hub,
+            vendor,
+            selector: GtsPluginSelector::new(),
+            enforcer,
+            metrics: Arc::new(NoopMetrics),
+            type_resolver,
         }
     }
 

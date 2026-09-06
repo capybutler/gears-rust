@@ -290,6 +290,50 @@ async fn get_plugin_returns_registered_scoped_handle() {
     );
 }
 
+// ── test-only declaration-source injection ─────────────────────────────────
+//
+// `Service::new_with_declaration_source` exists so later tasks (starting
+// with the one that flips the ingestion path onto the Type Resolver) can
+// inject a fake `DeclarationSource`. Nothing consults the resolver yet, so
+// this only proves the constructor wires a `Service` whose unrelated
+// behaviour (plugin-host binding) is exactly as good as the production
+// constructors' — the fake source below panics if it is ever called, which
+// would fail this test immediately if that stopped being true.
+
+/// A [`DeclarationSource`] that panics if invoked — used to prove a code
+/// path never consults it.
+struct UnreachableDeclarationSource;
+
+#[async_trait::async_trait]
+impl DeclarationSource for UnreachableDeclarationSource {
+    async fn fetch(
+        &self,
+        _id: &usage_collector_sdk::MeterTypeId,
+    ) -> Result<types_registry_sdk::GtsTypeSchema, DomainError> {
+        panic!("UnreachableDeclarationSource::fetch must never be called");
+    }
+}
+
+#[tokio::test]
+async fn new_with_declaration_source_builds_a_service_with_working_plugin_binding() {
+    let instance_id = test_instance_id();
+    let hub = hub_with_registry_and_plugin(&instance_id, "cyberfabric", MockPlugin::arc());
+
+    let svc = Service::new_with_declaration_source(
+        hub,
+        "cyberfabric".to_owned(),
+        dummy_enforcer(),
+        Arc::new(UnreachableDeclarationSource),
+    );
+
+    let resolved = svc.get_plugin().await;
+    assert!(
+        resolved.is_ok(),
+        "expected a resolved scoped handle, got: {:?}",
+        resolved.err()
+    );
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  Register UsageType — Phase 4 service body tests
 // ═════════════════════════════════════════════════════════════════════════════
