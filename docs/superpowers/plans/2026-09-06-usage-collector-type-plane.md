@@ -1395,10 +1395,27 @@ impl std::fmt::Debug for CompiledMetadataSchema {
 impl CompiledMetadataSchema {
     /// Compiles the `metadata` property merged across the schema chain.
     ///
-    /// A meter that declares no `metadata` property gets an empty closed
-    /// surface rather than an open one. Defaulting to open would reopen the
-    /// shape the base type only half-closes, and an undeclared key would then
-    /// reach storage.
+    /// **Closure is enforced in code, not delegated to the subschema.**
+    /// `GtsTypeSchema::effective_properties` resolves a key by *override*,
+    /// not by intersection — "this schema wins on key collisions; parent
+    /// fills in inherited keys". The base type always declares an open
+    /// `metadata` (`additionalProperties: {"type": "string"}`), so a meter
+    /// that does not supply its own closing override inherits that open
+    /// definition verbatim, and a lookup for the key is never absent. A
+    /// default that only fires when the key is missing entirely is therefore
+    /// dead code against every real declaration.
+    ///
+    /// So `validate` checks `metadata.keys() ⊆ declared_keys()` itself. The
+    /// invariant then holds by construction, whether or not a schema author
+    /// remembered `additionalProperties: false`, and the admissible key set
+    /// is exactly the one the query surface gates filtering and grouping on
+    /// (Task 12). The compiled validator still enforces per-value
+    /// constraints such as `minLength`.
+    ///
+    /// A meter declaring no `metadata` properties therefore has an empty
+    /// surface and admits no keys at all — fail-closed, and actionable:
+    /// the author sees a rejection naming the key rather than silently
+    /// getting an open extension surface.
     ///
     /// # Errors
     ///
