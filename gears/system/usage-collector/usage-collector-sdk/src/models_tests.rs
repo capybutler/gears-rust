@@ -5,26 +5,21 @@ use std::str::FromStr;
 use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
 use serde_json::json;
-use toolkit_gts::{GTS_ID_PREFIX, gts_id};
+use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::{
-    AggregationBucket, AggregationDimension, AggregationFold, AggregationOp, AggregationResult,
-    AggregationSpec, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, MeterTypeId,
-    ResourceRef, SubjectRef, UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
-    is_keyset_safe_record_field, is_keyset_safe_type_field,
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
+    IdempotencyKey, MetadataFilter, MetadataKey, MeterTypeId, ResourceRef, SubjectRef, UsageRecord,
+    UsageRecordStatus, is_keyset_safe_record_field,
 };
 use crate::error::UsageCollectorError;
 use crate::reason::ValidationReason;
 
 fn metadata_key(value: &str) -> MetadataKey {
     MetadataKey::new(value).expect("test fixture supplies a valid metadata key")
-}
-
-fn metadata_keys<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
-    values.into_iter().map(metadata_key).collect()
 }
 
 fn metadata_map<const N: usize>(entries: [(&str, &str); N]) -> BTreeMap<MetadataKey, String> {
@@ -34,26 +29,11 @@ fn metadata_map<const N: usize>(entries: [(&str, &str); N]) -> BTreeMap<Metadata
         .collect()
 }
 
-const SAMPLE_USAGE_TYPE_ID: &str =
-    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
-
 const SAMPLE_METER_TYPE_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
-fn sample_id() -> UsageTypeGtsId {
-    UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived id")
-}
-
 fn sample_meter_id() -> MeterTypeId {
     MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid usage_record-derived meter type id")
-}
-
-fn sample_usage_type() -> UsageType {
-    UsageType {
-        gts_id: sample_id(),
-        kind: UsageKind::Counter,
-        metadata_fields: metadata_keys(["region", "tier"]),
-    }
 }
 
 fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid>) -> UsageRecord {
@@ -187,339 +167,6 @@ fn into_usage_record_truncates_created_at_to_micros() {
         ),
         "id must be derived from the (us-normalized) 4-tuple",
     );
-}
-
-// ---------------------------------------------------------------------------
-// UsageTypeGtsId — construction validation
-// ---------------------------------------------------------------------------
-
-// UsageTypeGtsId::new enforces derivation from gts.cf.core.uc.usage_record.v1~:
-// every accepted id must left-prefix-match the base AND carry at least one
-// further `~`-separated segment.
-#[test]
-fn usage_type_gts_id_accepts_one_level_derivation() {
-    let input = gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1");
-    let id = UsageTypeGtsId::new(input).expect("one-level derivation accepted");
-    assert_eq!(
-        id.as_ref(),
-        input,
-        "AsRef<str> must preserve the input string"
-    );
-    assert_eq!(
-        id.to_string(),
-        input,
-        "Display must preserve the input string"
-    );
-}
-
-#[test]
-fn usage_type_gts_id_rejects_unknown_base() {
-    let err = UsageTypeGtsId::new(format!("{GTS_ID_PREFIX}cf.core.metric.v1~z"))
-        .expect_err("non-usage_record base must be rejected");
-    assert!(
-        matches!(
-            err,
-            UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::InvalidBaseGtsId,
-                ..
-            }
-        ),
-        "expected InvalidUsageTypeGtsId, got {err:?}"
-    );
-}
-
-#[test]
-fn usage_type_gts_id_rejects_legacy_counter_base() {
-    // The old counter/gauge bases must be rejected explicitly to surface
-    // wire-shape drift if any legacy producer still emits them.
-    let err = UsageTypeGtsId::new(format!("{GTS_ID_PREFIX}cf.core.usage.counter.v1~legacy"))
-        .expect_err("legacy counter base must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn usage_type_gts_id_rejects_empty_id() {
-    let err = UsageTypeGtsId::new("").expect_err("empty id must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// `GtsInstanceId::new` is infallible and concatenates schema_id + segment
-// without validating that the segment is non-empty. `UsageTypeGtsId::new`
-// MUST reject a bare base (no derivation segment after the trailing `~`)
-// so callers never get a structurally-invalid id past the SDK boundary.
-#[test]
-fn usage_type_gts_id_rejects_bare_base() {
-    let err = UsageTypeGtsId::new(UsageTypeGtsId::USAGE_RECORD_BASE)
-        .expect_err("bare base must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// `UsageTypeGtsId` claims to wrap a GTS *instance* id (no trailing `~`).
-// A derivation segment that itself ends with `~` would produce a GTS
-// *type* id, breaking that invariant — the old byte-level `strip_prefix`
-// path accepted it; the GtsId-routed validator rejects it.
-#[test]
-fn usage_type_gts_id_rejects_derived_type_id_with_trailing_tilde() {
-    let err = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~"
-    ))
-    .expect_err("trailing `~` (a type id, not an instance id) must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// Whitespace in the derivation segment is not a valid GTS character. The
-// old `strip_prefix` path treated the segment as opaque text and would
-// have accepted this; the GtsId parser rejects it as a malformed segment.
-#[test]
-fn usage_type_gts_id_rejects_whitespace_in_segment() {
-    let err = UsageTypeGtsId::new(format!(
-        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~cf.compute _.vcpu_hours.v1"
-    ))
-    .expect_err("whitespace in segment must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// A derivation segment that is not itself a syntactically valid GTS
-// segment (missing `v<major>` version suffix, wrong number of dot-separated
-// fields, etc.) must surface as a validation error rather than producing
-// a malformed `GtsInstanceId`. Covers the family of "non-GTS tail" inputs
-// the prior implementation silently let through.
-#[test]
-fn usage_type_gts_id_rejects_malformed_derivation_segment() {
-    let err = UsageTypeGtsId::new(format!(
-        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~not_a_gts_segment"
-    ))
-    .expect_err("non-GTS-shaped derivation segment must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// Empty inner segment (consecutive `~`) is invalid per the GTS chained-id
-// rules. The old `strip_prefix` would return `Some("~foo")` and the
-// non-empty check would let it through; `GtsId::try_new` flags the empty
-// segment between the two tildes.
-#[test]
-fn usage_type_gts_id_rejects_consecutive_tildes() {
-    let err = UsageTypeGtsId::new(format!(
-        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~~foo.bar.v1"
-    ))
-    .expect_err("consecutive tildes must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// Catalog admits *direct* derivation only: a deeper chain like
-// `base~mid.v1~tail.v1` has `get_type_id() == Some("base~mid.v1~")`, which
-// is not the bare `USAGE_RECORD_BASE`, so the parent-chain match at
-// `models.rs:`-the-`get_type_id`-equality-site must reject it. Pins this
-// contract against a future GTS parser change.
-#[test]
-fn usage_type_gts_id_rejects_deep_derivation_chain() {
-    let err = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~cf.compute._.tail.v1"
-    ))
-    .expect_err("deep-derivation chain must be rejected - only direct base derivation is admitted");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// ---------------------------------------------------------------------------
-// UsageTypeGtsId — custom Deserialize routes validation through serde
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_type_gts_id_deserialize_round_trips_valid_string() {
-    let decoded: UsageTypeGtsId =
-        serde_json::from_value(json!(SAMPLE_USAGE_TYPE_ID)).expect("valid gts_id deserializes");
-    assert_eq!(decoded.as_ref(), SAMPLE_USAGE_TYPE_ID);
-}
-
-#[test]
-fn usage_type_gts_id_deserialize_surfaces_validation_as_serde_error() {
-    let err = serde_json::from_value::<UsageTypeGtsId>(json!(format!(
-        "{GTS_ID_PREFIX}cf.core.metric.v1~oops"
-    )))
-    .expect_err("malformed gts_id must surface as a serde error");
-    assert!(
-        err.to_string().contains("usage type gts_id"),
-        "serde error must carry the Validation detail; got {err}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// UsageKind — serde + FromStr
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_kind_serde_round_trips_lowercase() {
-    let counter_json = serde_json::to_string(&UsageKind::Counter).expect("serialize counter");
-    let gauge_json = serde_json::to_string(&UsageKind::Gauge).expect("serialize gauge");
-    assert_eq!(counter_json, "\"counter\"");
-    assert_eq!(gauge_json, "\"gauge\"");
-    let decoded_c: UsageKind = serde_json::from_str("\"counter\"").expect("decode counter");
-    let decoded_g: UsageKind = serde_json::from_str("\"gauge\"").expect("decode gauge");
-    assert_eq!(decoded_c, UsageKind::Counter);
-    assert_eq!(decoded_g, UsageKind::Gauge);
-}
-
-#[test]
-fn usage_kind_rejects_unknown_variant_at_deserialize_boundary() {
-    let err = serde_json::from_str::<UsageKind>("\"histogram\"")
-        .expect_err("unknown variant must be rejected at the serde boundary");
-    assert!(err.to_string().contains("unknown variant"));
-}
-
-#[test]
-fn usage_kind_from_str_accepts_counter_and_gauge() {
-    assert_eq!(
-        UsageKind::from_str("counter").expect("counter"),
-        UsageKind::Counter
-    );
-    assert_eq!(
-        UsageKind::from_str("gauge").expect("gauge"),
-        UsageKind::Gauge
-    );
-}
-
-#[test]
-fn usage_kind_from_str_rejects_unknown_variant_as_validation_error() {
-    let err =
-        UsageKind::from_str("histogram").expect_err("unknown kind must be rejected by FromStr");
-    assert!(
-        matches!(err, UsageCollectorError::InvalidArgument { ref field, ref detail, .. } if field == "kind" && detail.contains("histogram")),
-        "expected InvalidUsageKind, got {err:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// UsageType — wire shape
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_type_serde_round_trip_carries_kind_and_metadata_fields() {
-    let usage_type = sample_usage_type();
-    let value = serde_json::to_value(&usage_type).expect("serialize UsageType");
-    assert_eq!(
-        value,
-        json!({
-            "gts_id": SAMPLE_USAGE_TYPE_ID,
-            "kind": "counter",
-            "metadata_fields": ["region", "tier"],
-        }),
-        "wire shape MUST be exactly {{gts_id, kind, metadata_fields}} with `kind` lowercase",
-    );
-    let decoded: UsageType = serde_json::from_value(value).expect("deserialize UsageType");
-    assert_eq!(usage_type, decoded);
-}
-
-#[test]
-fn usage_type_rejects_unknown_fields() {
-    let payload = json!({
-        "gts_id": gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1"),
-        "kind": "counter",
-        "metadata_fields": [],
-        "legacy_schema_field": {"type": "object"},
-    });
-    let err =
-        serde_json::from_value::<UsageType>(payload).expect_err("unknown field must be rejected");
-    assert!(err.to_string().contains("unknown field"));
-}
-
-#[test]
-fn usage_type_rejects_unknown_kind_at_deserialize_boundary() {
-    let payload = json!({
-        "gts_id": gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1"),
-        "kind": "histogram",
-        "metadata_fields": [],
-    });
-    let err =
-        serde_json::from_value::<UsageType>(payload).expect_err("unknown kind must be rejected");
-    assert!(err.to_string().contains("unknown variant"));
-}
-
-// ---------------------------------------------------------------------------
-// UsageType — kind-classification predicates
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_type_kind_classifier_predicates_match_kind_per_variant() {
-    use UsageKind as K;
-
-    // Compile-time exhaustiveness fence: adding a third UsageKind variant
-    // forces a new arm here and signals the developer to also update
-    // `UsageType::is_counter` / `is_gauge` and the table below.
-    const _FENCE: fn(&UsageKind) = |k| match k {
-        K::Counter | K::Gauge => (),
-    };
-
-    let cases: &[(UsageKind, bool, bool)] = &[
-        // (kind, expected_is_counter, expected_is_gauge)
-        (K::Counter, true, false),
-        (K::Gauge, false, true),
-    ];
-
-    for (kind, expected_counter, expected_gauge) in cases {
-        let usage_type = UsageType {
-            gts_id: sample_id(),
-            kind: *kind,
-            metadata_fields: BTreeSet::new(),
-        };
-        assert_eq!(
-            usage_type.is_counter(),
-            *expected_counter,
-            "is_counter mismatch for {kind:?}",
-        );
-        assert_eq!(
-            usage_type.is_gauge(),
-            *expected_gauge,
-            "is_gauge mismatch for {kind:?}",
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -663,27 +310,8 @@ fn metadata_filter_deserialize_rejects_unknown_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// AggregationOp / AggregationDimension / AggregationSpec — wire shapes
+// AggregationDimension — wire shapes
 // ---------------------------------------------------------------------------
-
-#[test]
-fn aggregation_op_serializes_as_lowercase_strings() {
-    for (op, expected) in [
-        (AggregationOp::Sum, "\"sum\""),
-        (AggregationOp::Count, "\"count\""),
-        (AggregationOp::Min, "\"min\""),
-        (AggregationOp::Max, "\"max\""),
-        (AggregationOp::Avg, "\"avg\""),
-    ] {
-        let s = serde_json::to_string(&op).expect("serialize AggregationOp");
-        assert_eq!(
-            s, expected,
-            "AggregationOp::{op:?} must serialize as {expected}"
-        );
-        let decoded: AggregationOp = serde_json::from_str(&s).expect("round-trip");
-        assert_eq!(decoded, op);
-    }
-}
 
 #[test]
 fn aggregation_dimension_serializes_unit_variants_as_snake_case_strings() {
@@ -706,41 +334,6 @@ fn aggregation_dimension_serializes_metadata_variant_as_tagged_object() {
     assert_eq!(
         decoded,
         AggregationDimension::Metadata(metadata_key("region"))
-    );
-}
-
-#[test]
-fn aggregation_spec_omits_empty_group_by_on_the_wire() {
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: Vec::new(),
-    };
-    let value = serde_json::to_value(&spec).expect("serialize AggregationSpec");
-    assert_eq!(
-        value,
-        json!({"op": "sum"}),
-        "empty group_by must be skipped on the wire; got {value}"
-    );
-    let decoded: AggregationSpec = serde_json::from_value(value).expect("round-trip");
-    assert_eq!(decoded, spec);
-}
-
-#[test]
-fn aggregation_spec_carries_group_by_in_caller_order() {
-    let spec = AggregationSpec {
-        op: AggregationOp::Avg,
-        group_by: vec![
-            AggregationDimension::ResourceType,
-            AggregationDimension::Metadata(metadata_key("region")),
-        ],
-    };
-    let value = serde_json::to_value(&spec).expect("serialize");
-    assert_eq!(
-        value,
-        json!({
-            "op": "avg",
-            "group_by": ["resource_type", {"metadata": "region"}],
-        }),
     );
 }
 
@@ -905,44 +498,6 @@ fn metadata_key_serializes_transparently() {
     let key = MetadataKey::new("region").expect("valid key");
     let value = serde_json::to_value(&key).expect("serialize");
     assert_eq!(value, json!("region"));
-}
-
-// ---------------------------------------------------------------------------
-// UsageType.metadata_fields wire shape (BTreeSet<MetadataKey>)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_type_metadata_fields_deserialize_rejects_empty_member_key() {
-    let payload = json!({
-        "gts_id": SAMPLE_USAGE_TYPE_ID,
-        "kind": "counter",
-        "metadata_fields": [""],
-    });
-    let err = serde_json::from_value::<UsageType>(payload)
-        .expect_err("empty member key must be rejected by MetadataKey::deserialize");
-    assert!(err.to_string().contains("metadata key must not be empty"));
-}
-
-#[test]
-fn usage_type_metadata_fields_deserialize_rejects_duplicate_member_keys() {
-    // The custom `deserialize_metadata_fields` routes the JSON array through
-    // `Vec<MetadataKey>` so duplicate keys are rejected at the SDK wire
-    // boundary instead of silently collapsing into the `BTreeSet`. The error
-    // message carries the offending zero-based index. The REST DTO path
-    // additionally surfaces the typed `UsageCollectorError::InvalidArgument`
-    // via `metadata_fields_from_wire`.
-    let payload = json!({
-        "gts_id": SAMPLE_USAGE_TYPE_ID,
-        "kind": "counter",
-        "metadata_fields": ["region", "tier", "region"],
-    });
-    let err = serde_json::from_value::<UsageType>(payload)
-        .expect_err("duplicate metadata field must be rejected at deserialize");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("duplicate metadata field") && msg.contains("index 2"),
-        "expected duplicate-at-index-2 message, got {msg}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,82 +876,6 @@ fn usage_record_query_filter_surface_rejects_gts_type_id_inside_composite() {
     );
 }
 
-#[test]
-fn aggregation_op_not_allowed_for_kind_builds_invalid_argument() {
-    let gts_type_id = MeterTypeId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~"
-    ))
-    .expect("valid gts_type_id");
-
-    let err = crate::UsageCollectorError::aggregation_op_not_allowed_for_kind(
-        AggregationOp::Sum,
-        UsageKind::Gauge,
-        &gts_type_id,
-    );
-
-    match err {
-        crate::UsageCollectorError::InvalidArgument {
-            field,
-            reason,
-            resource_name,
-            detail,
-            ..
-        } => {
-            assert_eq!(field, "aggregation.op");
-            assert_eq!(reason, crate::reason::ValidationReason::OpNotAllowedForKind);
-            assert_eq!(resource_name.as_deref(), Some(gts_type_id.as_ref()));
-            // `detail` is the user-facing 400 message; a broken op→text or
-            // kind→allowed-set branch would otherwise ship silently. Pin the
-            // offending op, the rejecting kind, and that kind's allowed set.
-            assert!(
-                detail.contains("`sum`"),
-                "detail must name the offending op; got {detail:?}"
-            );
-            assert!(
-                detail.contains("gauge"),
-                "detail must name the rejecting kind; got {detail:?}"
-            );
-            assert!(
-                detail.contains("min, max, avg, count"),
-                "detail must name the gauge allowed-op set; got {detail:?}"
-            );
-        }
-        other => panic!("expected InvalidArgument, got {other:?}"),
-    }
-}
-
-#[test]
-fn aggregation_op_not_allowed_for_kind_counter_detail_names_op_kind_and_allowed_set() {
-    let gts_type_id = MeterTypeId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~"
-    ))
-    .expect("valid gts_type_id");
-
-    // Min on a counter exercises the other kind→allowed-set branch
-    // (counter → {sum, count}) and a distinct op→text mapping (Min → "min").
-    let err = crate::UsageCollectorError::aggregation_op_not_allowed_for_kind(
-        AggregationOp::Min,
-        UsageKind::Counter,
-        &gts_type_id,
-    );
-
-    let crate::UsageCollectorError::InvalidArgument { detail, .. } = err else {
-        panic!("expected InvalidArgument, got {err:?}");
-    };
-    assert!(
-        detail.contains("`min`"),
-        "detail must name the offending op; got {detail:?}"
-    );
-    assert!(
-        detail.contains("counter"),
-        "detail must name the rejecting kind; got {detail:?}"
-    );
-    assert!(
-        detail.contains("sum, count"),
-        "detail must name the counter allowed-op set; got {detail:?}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Keyset-safe (never-null) order-field classification
 // ---------------------------------------------------------------------------
@@ -1443,16 +922,6 @@ fn keyset_safe_record_field_is_fail_closed_for_unknown_names() {
     assert!(!is_keyset_safe_record_field(""));
 }
 
-#[test]
-fn keyset_safe_type_fields_are_the_catalog_not_null_columns() {
-    // Both `usage_type_catalog` columns exposed on the filter surface are
-    // `NOT NULL`, so both are keyset-safe; anything else fails closed.
-    assert!(is_keyset_safe_type_field("gts_id"));
-    assert!(is_keyset_safe_type_field("kind"));
-    assert!(!is_keyset_safe_type_field("metadata_fields"));
-    assert!(!is_keyset_safe_type_field("definitely_not_a_field"));
-}
-
 // ---------------------------------------------------------------------------
 // AggregationFold — declared-fold serde/FromStr surface
 // ---------------------------------------------------------------------------
@@ -1473,8 +942,8 @@ fn aggregation_fold_serde_round_trips_screaming_case() {
 
 #[test]
 fn aggregation_fold_rejects_avg() {
-    // AVG was an AggregationOp. It is not a declared fold: a declaration
-    // naming it must fail resolution rather than silently pick another.
+    // AVG is not a declared fold: a declaration naming it must fail
+    // resolution rather than silently pick another.
     assert!(serde_json::from_str::<AggregationFold>("\"AVG\"").is_err());
 
     let err = "AVG"

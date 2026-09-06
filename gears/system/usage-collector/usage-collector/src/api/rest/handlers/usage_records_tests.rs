@@ -496,12 +496,11 @@ fn sample_persisted_record_with_status(
 #[tokio::test]
 async fn create_records_happy_path_wire_body_reflects_service_returned_record() {
     // Wire the service against a permit-by-default PDP and a
-    // `HappyPathPlugin` that:
-    //   1. returns a `Counter` `UsageType` from `get_usage_type` so
-    //      semantics validation passes, and
-    //   2. returns one `Ok(persisted_record)` from `create_usage_records`
-    //      where `persisted_record.id` is DIFFERENT from the gateway-derived
-    //      dispatched record's id.
+    // `HappyPathPlugin` that returns one `Ok(persisted_record)` from
+    // `create_usage_records` where `persisted_record.id` is DIFFERENT from
+    // the gateway-derived dispatched record's id (the meter's declaration
+    // resolves via the fixture's fake source, so semantics validation
+    // passes without a plugin-owned catalog row).
     // The handler then emits 200 OK; the wire body's `records[0].record.id`
     // MUST be the persisted id — proving the handler composes the
     // response from the SERVICE-RETURNED record, not from the dispatched one.

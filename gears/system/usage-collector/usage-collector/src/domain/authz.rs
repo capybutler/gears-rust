@@ -2,15 +2,10 @@
 //!
 //! Per ADR-0001 (`cpt-cf-usage-collector-adr-pdp-centric-authorization`) the
 //! collector keeps NO local policy table and NO PDP-decision cache; every
-//! decision is delegated to the bound `authz-resolver` client. Catalog
-//! resources are platform-global per ADR-0012 / PRD §5.8 (no owning tenant,
-//! no resource id, no per-row scoping), so catalog authz is subject-only;
-//! the ingestion surface declares per-record attribution attributes
-//! (tenant, optional subject, resource type and id) so policy can reason
-//! over them. The catalog surface opts out of `require_constraints`
-//! (subject-only authz, so an unconstrained `allow_all` permit is the
-//! legitimate happy-path outcome); the per-record ingestion surface runs
-//! under `require_constraints(true)` and gates each record's owning tenant
+//! decision is delegated to the bound `authz-resolver` client. The ingestion
+//! surface declares per-record attribution attributes (tenant, optional
+//! subject, resource type and id) so policy can reason over them, and runs
+//! under `require_constraints(true)`, gating each record's owning tenant
 //! against the PDP-returned row scope, so a tenant-scoped caller cannot
 //! attribute usage to — or read / deactivate a record of — a tenant outside
 //! its closure.
@@ -193,28 +188,6 @@ impl AttributionTupleKey {
     }
 }
 
-/// PEP vocabulary for the `UsageType` catalog.
-///
-/// Platform-global resource (ADR-0012 / PRD §5.8): no owning tenant, no
-/// resource id, no per-`UsageType` scoping. The PDP authorizes the subject
-/// alone and the [`RESOURCE`] declares no attributes.
-pub(crate) mod usage_type {
-    use authz_resolver_sdk::pep::ResourceType;
-    use usage_collector_sdk::USAGE_TYPE_RESOURCE;
-
-    /// PEP resource type for the `UsageType` catalog.
-    pub const RESOURCE: ResourceType = ResourceType::from_static(USAGE_TYPE_RESOURCE, &[]);
-
-    /// `UsageType` action vocabulary. Renaming any of these is a contract
-    /// change against the PDP policy bundle.
-    pub mod actions {
-        pub const CREATE: &str = "create";
-        pub const GET: &str = "get";
-        pub const LIST: &str = "list";
-        pub const DELETE: &str = "delete";
-    }
-}
-
 /// PEP vocabulary for the `UsageRecord` ingestion surface.
 ///
 /// The PDP authorizes the subject together with the caller-supplied
@@ -261,66 +234,6 @@ pub(crate) mod usage_record {
         pub const GET: &str = "get";
         pub const LIST: &str = "list";
     }
-}
-
-/// Run the PDP check for `(resource_type, action)` and lift the outcome into
-/// [`DomainError`].
-///
-/// Subject-only authz: the request carries no resource attributes and opts
-/// out of `require_constraints`, so a permit with no constraints (`allow_all`)
-/// is the legitimate happy-path outcome. Deny / transport failure / compile
-/// failure fail closed through the existing `From<EnforcerError>` mapping.
-///
-/// # Errors
-///
-/// * [`DomainError::AuthorizationDenied`] when the PDP denies or returns an
-///   uncompilable constraint shape.
-/// * [`DomainError::AuthorizationUnavailable`] when the PDP transport fails.
-// @cpt-flow:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1
-// @cpt-algo:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-principle-pdp-centric-authorization:p2
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-principle-fail-closed:p2
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-contract-authz-resolver:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-entity-pdp-decision:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-adr-pdp-centric-authorization:p2
-pub(crate) async fn authorize(
-    enforcer: &PolicyEnforcer,
-    metrics: &dyn UsageCollectorMetrics,
-    op: PdpOp,
-    // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-input
-    ctx: &SecurityContext,
-    resource_type: &ResourceType,
-    action: &str,
-    // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-input
-) -> Result<(), DomainError> {
-    // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-compose-tuple
-    // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-compose
-    // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-resolver-call
-    // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-call
-    // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-return
-    // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-return
-    pdp_scope_with(
-        enforcer,
-        metrics,
-        op,
-        ctx,
-        resource_type,
-        action,
-        None,
-        &AccessRequest::new().require_constraints(false),
-        // Subject-only authz opts out of `require_constraints`, so an
-        // unconstrained (`allow_all`) permit is the legitimate happy-path
-        // outcome: the gate always admits, and the PDP permit is the final
-        // decision recorded by the wrapper.
-        |_scope| Ok(()),
-    )
-    .await
-    // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-return
-    // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-return
-    // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-call
-    // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-resolver-call
-    // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-compose
-    // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-compose-tuple
 }
 
 /// Run the PDP check for `(usage_record, action)` carrying the caller-supplied

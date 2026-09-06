@@ -23,20 +23,9 @@ pub const SEMANTICS_VIOLATION: &str = "SEMANTICS_VIOLATION";
 pub const VALIDATION: &str = "VALIDATION";
 /// Per-record serialized-metadata size cap exceeded.
 pub const METADATA_VALIDATION: &str = "METADATA_VALIDATION";
-/// Ingestion supplied a metadata key not declared in the usage type's
-/// closed `metadata_fields` shape.
+/// Ingestion supplied a metadata key not declared in the resolved meter
+/// declaration's closed `metadata_fields` shape.
 pub const UNKNOWN_METADATA_KEY: &str = "UNKNOWN_METADATA_KEY";
-/// Compensation submitted against a gauge usage type (gauges have no `SUM`).
-pub const GAUGE_COMPENSATION_REJECTED: &str = "GAUGE_COMPENSATION_REJECTED";
-/// Dead: no path emits this any more. It named an aggregation op requested
-/// against a usage kind that does not admit it (`SUM` on a gauge, or
-/// `MIN`/`MAX`/`AVG` on a counter) — a rule the aggregate path enforced by
-/// validating a caller-chosen [`crate::AggregationOp`] against the queried
-/// meter's kind. There is no caller-chosen op any more (the fold is
-/// resolved from the meter's declaration), so the rule this reason named
-/// has nothing left to fire on. Removed with [`crate::AggregationOp`] /
-/// [`crate::AggregationSpec`].
-pub const OP_NOT_ALLOWED_FOR_KIND: &str = "OP_NOT_ALLOWED_FOR_KIND";
 /// A raw / aggregated query omitted the mandatory bounded `created_at`
 /// window (a lower **and** an upper bound on `created_at` as top-level
 /// `$filter` conjuncts), which would force an unbounded full-table scan.
@@ -68,11 +57,6 @@ pub enum ValidationReason {
     MetadataValidation,
     /// See [`UNKNOWN_METADATA_KEY`].
     UnknownMetadataKey,
-    /// See [`GAUGE_COMPENSATION_REJECTED`].
-    GaugeCompensationRejected,
-    /// See [`OP_NOT_ALLOWED_FOR_KIND`]. Dead: no path emits this variant any
-    /// more; removed with [`crate::AggregationOp`] / [`crate::AggregationSpec`].
-    OpNotAllowedForKind,
     /// See [`MISSING_TIME_WINDOW`].
     MissingTimeWindow,
     /// See [`INVALID_BASE_GTS_ID`].
@@ -99,8 +83,6 @@ impl ValidationReason {
             VALIDATION => Self::Validation,
             METADATA_VALIDATION => Self::MetadataValidation,
             UNKNOWN_METADATA_KEY => Self::UnknownMetadataKey,
-            GAUGE_COMPENSATION_REJECTED => Self::GaugeCompensationRejected,
-            OP_NOT_ALLOWED_FOR_KIND => Self::OpNotAllowedForKind,
             MISSING_TIME_WINDOW => Self::MissingTimeWindow,
             INVALID_BASE_GTS_ID => Self::InvalidBaseGtsId,
             INVALID_METADATA_FIELDS_EMPTY_STRING => Self::MetadataFieldEmptyString,
@@ -120,8 +102,6 @@ impl ValidationReason {
             Self::Validation => VALIDATION,
             Self::MetadataValidation => METADATA_VALIDATION,
             Self::UnknownMetadataKey => UNKNOWN_METADATA_KEY,
-            Self::GaugeCompensationRejected => GAUGE_COMPENSATION_REJECTED,
-            Self::OpNotAllowedForKind => OP_NOT_ALLOWED_FOR_KIND,
             Self::MissingTimeWindow => MISSING_TIME_WINDOW,
             Self::InvalidBaseGtsId => INVALID_BASE_GTS_ID,
             Self::MetadataFieldEmptyString => INVALID_METADATA_FIELDS_EMPTY_STRING,
@@ -143,8 +123,6 @@ impl fmt::Display for ValidationReason {
 // ConflictReason — 409 Aborted `context.reason`.
 // ─────────────────────────────────────────────────────────────────────
 
-/// `delete_usage_type` refused: still referenced by usage samples.
-pub const USAGE_TYPE_REFERENCED: &str = "USAGE_TYPE_REFERENCED";
 /// Deactivation targeted a record already `inactive` (one-way latch).
 pub const ALREADY_INACTIVE: &str = "ALREADY_INACTIVE";
 /// Same `idempotency_key`, canonical-field-different payload.
@@ -162,8 +140,6 @@ pub const CORRECTS_ID_INACTIVE: &str = "CORRECTS_ID_INACTIVE";
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConflictReason {
-    /// See [`USAGE_TYPE_REFERENCED`].
-    UsageTypeReferenced,
     /// See [`ALREADY_INACTIVE`].
     AlreadyInactive,
     /// See [`IDEMPOTENCY_CONFLICT`].
@@ -184,7 +160,6 @@ impl ConflictReason {
     #[must_use]
     pub fn from_wire(s: &str) -> Self {
         match s {
-            USAGE_TYPE_REFERENCED => Self::UsageTypeReferenced,
             ALREADY_INACTIVE => Self::AlreadyInactive,
             IDEMPOTENCY_CONFLICT => Self::IdempotencyConflict,
             CORRECTS_ID_TARGETS_COMPENSATION => Self::CorrectsIdTargetsCompensation,
@@ -199,7 +174,6 @@ impl ConflictReason {
     #[must_use]
     pub fn as_wire(&self) -> &str {
         match self {
-            Self::UsageTypeReferenced => USAGE_TYPE_REFERENCED,
             Self::AlreadyInactive => ALREADY_INACTIVE,
             Self::IdempotencyConflict => IDEMPOTENCY_CONFLICT,
             Self::CorrectsIdTargetsCompensation => CORRECTS_ID_TARGETS_COMPENSATION,

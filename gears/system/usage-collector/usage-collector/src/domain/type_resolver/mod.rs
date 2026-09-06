@@ -26,6 +26,7 @@ use usage_collector_sdk::MeterTypeId;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::declarations::DeclarationSource;
+use crate::domain::ports::metrics::{TypeResolutionOutcome, UsageCollectorMetrics};
 
 pub use declaration::ResolvedDeclaration;
 pub use metadata::CompiledMetadataSchema;
@@ -66,6 +67,7 @@ struct CacheEntry {
 pub struct TypeResolver {
     source: Arc<dyn DeclarationSource>,
     config: TypeResolverConfig,
+    metrics: Arc<dyn UsageCollectorMetrics>,
     entries: RwLock<HashMap<MeterTypeId, CacheEntry>>,
     /// One in-flight-fetch gate per key currently being populated. Collapses
     /// concurrent misses so a cold key under load does not fan a burst of
@@ -79,11 +81,19 @@ pub struct TypeResolver {
 
 impl TypeResolver {
     /// Creates a resolver reading through to `source` on a cache miss.
+    ///
+    /// `metrics` records one `uc_type_resolution_total{result}` sample per
+    /// [`Self::resolve`] call (DESIGN §3.11.5) — see [`TypeResolutionOutcome`].
     #[must_use]
-    pub fn new(source: Arc<dyn DeclarationSource>, config: TypeResolverConfig) -> Self {
+    pub fn new(
+        source: Arc<dyn DeclarationSource>,
+        config: TypeResolverConfig,
+        metrics: Arc<dyn UsageCollectorMetrics>,
+    ) -> Self {
         Self {
             source,
             config,
+            metrics,
             entries: RwLock::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
         }
@@ -128,6 +138,8 @@ impl TypeResolver {
     /// whose type it could not validate against.
     pub async fn resolve(&self, id: &MeterTypeId) -> Result<Arc<ResolvedDeclaration>, DomainError> {
         if let Some(entry) = self.fresh_entry(id).await {
+            self.metrics
+                .record_type_resolution(TypeResolutionOutcome::CacheHit);
             return Ok(entry);
         }
 
@@ -139,6 +151,8 @@ impl TypeResolver {
         let _held = gate.lock().await;
 
         let result = if let Some(entry) = self.fresh_entry(id).await {
+            self.metrics
+                .record_type_resolution(TypeResolutionOutcome::CacheHit);
             Ok(entry)
         } else {
             self.populate(id).await
@@ -167,6 +181,8 @@ impl TypeResolver {
                 Ok(declaration) => {
                     let declaration = Arc::new(declaration);
                     self.store(id.clone(), Arc::clone(&declaration)).await;
+                    self.metrics
+                        .record_type_resolution(TypeResolutionOutcome::CacheMiss);
                     Ok(declaration)
                 }
                 // A schema that fetched fine but does not carry what a meter
@@ -178,21 +194,42 @@ impl TypeResolver {
                 // same fail-closed, not-cached path: a corrected declaration
                 // must resolve on the next call, not wait out a negative
                 // TTL, and a parse failure must never be cached as if it
-                // were a resolved success.
-                Err(e) => Err(e),
+                // were a resolved success. `types-registry` answered fine
+                // here — the declaration itself is the problem — so this
+                // records `Unresolved`, not `RegistryError`.
+                Err(e) => {
+                    self.metrics
+                        .record_type_resolution(TypeResolutionOutcome::Unresolved);
+                    Err(e)
+                }
             },
-            Err(e) if e.is_declaration_not_found() => Err(e),
-            Err(e) => match self.stale_entry(id).await {
-                Some(stale) => {
+            // A definite not-found: the registry answered, the type is
+            // simply not there. `Unresolved`, not `RegistryError` — same
+            // reasoning as the incomplete-declaration arm above.
+            Err(e) if e.is_declaration_not_found() => {
+                self.metrics
+                    .record_type_resolution(TypeResolutionOutcome::Unresolved);
+                Err(e)
+            }
+            Err(e) => {
+                if let Some(stale) = self.stale_entry(id).await {
                     tracing::warn!(
                         gts_type_id = %id,
                         error = %e,
                         "serving a stale declaration: types-registry is unavailable"
                     );
+                    self.metrics
+                        .record_type_resolution(TypeResolutionOutcome::ServedStale);
                     Ok(stale)
+                } else {
+                    // The fetch itself failed and nothing cached exists to
+                    // fall back on: the registry failed to answer, no
+                    // verdict on the type was ever reached. `RegistryError`.
+                    self.metrics
+                        .record_type_resolution(TypeResolutionOutcome::RegistryError);
+                    Err(e)
                 }
-                None => Err(e),
-            },
+            }
         }
     }
 

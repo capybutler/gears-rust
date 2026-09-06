@@ -1,6 +1,6 @@
 //! Unit tests for the shape-validation algorithm.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use toolkit_gts::gts_id;
 
@@ -15,17 +15,13 @@ use usage_collector_sdk::{
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_METADATA_SIZE_CAP_BYTES, SemanticsOutcome, metadata_fields_from_wire,
-    validate_record_semantics, validate_submit_record_metadata, verify_l1_corrects_id,
+    DEFAULT_METADATA_SIZE_CAP_BYTES, SemanticsOutcome, validate_record_semantics,
+    validate_submit_record_metadata, verify_l1_corrects_id,
 };
 use crate::domain::type_resolver::ResolvedDeclaration;
 
 fn mk_key(value: &str) -> MetadataKey {
     MetadataKey::new(value).expect("test fixture supplies a valid metadata key")
-}
-
-fn mk_keys<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
-    values.into_iter().map(mk_key).collect()
 }
 
 const SAMPLE_METER_ID: &str = gts_id!("cf.core.uc.usage_record.v1~tenant.example._.foo.v1~");
@@ -98,15 +94,9 @@ fn declaration_with_metadata_keys(keys: &[&str]) -> ResolvedDeclaration {
     ResolvedDeclaration::from_schema(meter_id(), &schema).expect("valid declaration")
 }
 
-#[test]
-fn metadata_fields_from_wire_empty_vec_yields_empty_set() {
-    let set = metadata_fields_from_wire(Vec::new()).expect("empty input accepted");
-    assert!(set.is_empty());
-}
-
 // Repointed at the resolved declaration (Task 9): the closed-shape check now
 // runs against `ResolvedDeclaration::metadata_schema`, not a plugin-owned
-// `UsageType.metadata_fields` set — but the intent this test pins ("an
+// catalog row's `metadata_fields` set — but the intent this test pins ("an
 // undeclared metadata key is rejected") is unchanged.
 #[test]
 fn undeclared_metadata_key_is_rejected_before_persistence() {
@@ -145,74 +135,6 @@ fn declared_metadata_key_is_accepted() {
     metadata.insert(mk_key("region"), "eu-west-1".to_owned());
     validate_submit_record_metadata(&declaration, &metadata, DEFAULT_METADATA_SIZE_CAP_BYTES)
         .expect("a declared key must be accepted");
-}
-
-#[test]
-fn metadata_fields_from_wire_legitimate_passes() {
-    let set =
-        metadata_fields_from_wire(vec!["region".to_owned()]).expect("single declared key accepted");
-    assert_eq!(set, mk_keys(["region"]));
-}
-
-// `inst-algo-shape-invalid-metadata-fields` — duplicate entry at index `2`
-// returns `DuplicateMetadataField` carrying the offending index.
-#[test]
-fn metadata_fields_from_wire_duplicate_returns_metadata_validation_error() {
-    let err = metadata_fields_from_wire(vec![
-        "region".to_owned(),
-        "az".to_owned(),
-        "region".to_owned(),
-    ])
-    .expect_err("duplicate metadata field must be rejected");
-    assert!(
-        matches!(
-            err,
-            UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::MetadataFieldDuplicate,
-                ref field,
-                ..
-            } if field == "metadata_fields[2]"
-        ),
-        "expected DuplicateMetadataField {{ index: 2 }}, got {err:?}"
-    );
-}
-
-// `inst-algo-shape-invalid-metadata-fields` — first empty string at index `1`
-// is rejected before any duplicate-detection pass continues.
-#[test]
-fn metadata_fields_from_wire_empty_string_rejected() {
-    let err = metadata_fields_from_wire(vec!["region".to_owned(), String::new()])
-        .expect_err("empty metadata field must be rejected");
-    match err {
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::MetadataFieldEmptyString,
-            ref field,
-            ..
-        } => {
-            assert_eq!(field, "metadata_fields[1]", "expected index 1, got {field}");
-        }
-        other => panic!("expected InvalidMetadataField, got {other:?}"),
-    }
-}
-
-// `MetadataKey::new` rejects NUL bytes — wire-shape conversion surfaces
-// them as a typed `InvalidMetadataField` alongside the other malformed-key
-// outcomes, with the offending key's index attached.
-#[test]
-fn metadata_fields_from_wire_nul_byte_rejected() {
-    let err = metadata_fields_from_wire(vec!["bad\0key".to_owned()])
-        .expect_err("NUL byte in metadata key must be rejected");
-    assert!(
-        matches!(
-            err,
-            UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::MetadataFieldInvalidKey,
-                ref field,
-                ..
-            } if field == "metadata_fields[0]"
-        ),
-        "expected InvalidMetadataField {{ index: 0, .. }}, got {err:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -318,10 +240,10 @@ fn a_configured_non_default_cap_is_honoured() {
 //
 // Pre-Task-9 this section covered every cell of a four-cell
 // `(MetricSemantics × corrects_id presence)` value matrix keyed off a
-// plugin-owned `UsageType.kind`. That matrix — and the six tests that pinned
-// its gauge/counter value-sign cells — is deleted outright along with the
-// `kind` it was keyed on: `validate_record_semantics` no longer takes a
-// `UsageType` at all, so there is no more (kind, op) disagreement left to
+// plugin-owned catalog row's `kind`. That matrix — and the six tests that
+// pinned its gauge/counter value-sign cells — is deleted outright along with
+// the `kind` it was keyed on: `validate_record_semantics` no longer takes a
+// catalog row at all, so there is no more (kind, op) disagreement left to
 // assert on (see that function's doc comment). What remains is the L1
 // referential check (`verify_l1_corrects_id`, unaffected by this change) plus
 // the two tests below pinning `validate_record_semantics`'s new, simpler

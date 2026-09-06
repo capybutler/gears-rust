@@ -12,8 +12,8 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMete
 use crate::domain::ports::metrics::{
     AuthzDecision, DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome,
     PdpFailureCause, PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind,
-    RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
-    UsageTypeErrorCategory, UsageTypeOp,
+    RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome, TypeResolutionOutcome,
+    UsageCollectorMetrics,
 };
 use crate::infra::metrics::{UcMetricsMeter, build_default_adapter};
 
@@ -227,7 +227,7 @@ fn plugin_call_records_duration_with_buckets() {
 fn plugin_accept_error_counter_carries_labels() {
     let (provider, exporter) = local_provider();
     let m = meter(&provider, TEST_PREFIX);
-    m.record_plugin_accept_error(PluginOp::GetUsageType, PluginErrorCategory::Unready);
+    m.record_plugin_accept_error(PluginOp::GetUsageRecord, PluginErrorCategory::Unready);
     m.record_plugin_accept_error(
         PluginOp::CreateUsageRecord,
         PluginErrorCategory::BackendError,
@@ -285,7 +285,7 @@ fn build_default_adapter_binds_to_global_provider_without_panicking() {
     // construction against the global provider and a record call don't panic.
     let m = build_default_adapter("uc");
     m.set_pdp_ready(true);
-    m.record_plugin_call(PluginOp::ListUsageTypes, 0.001);
+    m.record_plugin_call(PluginOp::ListUsageRecords, 0.001);
     // The constructor hands back a live, uniquely-owned handle ready to share.
     assert_eq!(std::sync::Arc::strong_count(&m), 1);
 }
@@ -457,41 +457,34 @@ fn deactivation_instruments_render_names_and_labels() {
     );
 }
 
-// ── Phase 2: usage-type-catalog instruments ──────────────────────────
+// ── Type Resolver instrument ──────────────────────────────────────────
 
 #[test]
-fn usage_type_instruments_render_names_and_labels() {
+fn type_resolution_counter_renders_name_and_result_labels() {
     let (provider, exporter) = local_provider();
     let m = meter(&provider, TEST_PREFIX);
 
-    m.record_usage_type_request(
-        UsageTypeOp::Create,
-        RequestOutcome::Error,
-        UsageTypeErrorCategory::Conflict,
-    );
-    m.set_usage_types(7);
+    m.record_type_resolution(TypeResolutionOutcome::CacheHit);
+    m.record_type_resolution(TypeResolutionOutcome::CacheMiss);
+    m.record_type_resolution(TypeResolutionOutcome::ServedStale);
+    m.record_type_resolution(TypeResolutionOutcome::Unresolved);
+    m.record_type_resolution(TypeResolutionOutcome::RegistryError);
     provider.force_flush().unwrap();
 
-    assert_eq!(counter_sum(&exporter, "uc_usage_type_requests_total"), 1);
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "operation",
-            "create"
-        ),
-        1,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "error_category",
-            "conflict"
-        ),
-        1,
-    );
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), Some(7));
+    assert_eq!(counter_sum(&exporter, "uc_type_resolution_total"), 5);
+    for result in [
+        "cache_hit",
+        "cache_miss",
+        "served_stale",
+        "unresolved",
+        "registry_error",
+    ] {
+        assert_eq!(
+            counter_sum_with_label(&exporter, "uc_type_resolution_total", "result", result),
+            1,
+            "expected exactly one uc_type_resolution_total{{result=\"{result}\"}} sample",
+        );
+    }
 }
 
 /// Read the summed value of an `i64` `UpDownCounter` series filtered to a

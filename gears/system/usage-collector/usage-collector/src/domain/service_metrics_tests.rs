@@ -7,7 +7,7 @@
 //! series. This proves the shared PDP wrapper in `domain/authz.rs` and the
 //! plugin-SPI dispatch wrapper in `Service` emit per DESIGN §3.11.5.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,25 +15,20 @@ use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_gts::gts_id;
-use toolkit_odata::{CursorV1, ODataQuery, Page as ODataPage, PageInfo, SortDir};
+use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo};
 use usage_collector_sdk::{
     AggregationBucket, AggregationResult, CreateUsageRecord, IdempotencyKey, MetadataKey,
-    MeterTypeId, ResourceRef, UsageCollectorError, UsageKind, UsageRecord, UsageRecordStatus,
-    UsageType, UsageTypeGtsId,
+    MeterTypeId, ResourceRef, UsageCollectorError, UsageRecord, UsageRecordStatus,
 };
 use uuid::Uuid;
 
 use toolkit_security::pep_properties;
 
-use super::{
-    classify_deactivation_plugin_error, classify_query_result, classify_record_error,
-    classify_usage_type_result,
-};
+use super::{classify_deactivation_plugin_error, classify_query_result, classify_record_error};
 use crate::domain::Service;
 use crate::domain::authz::usage_record;
 use crate::domain::ports::metrics::{
     DeactivationErrorCategory, QueryErrorCategory, RecordErrorCategory, RequestOutcome,
-    UsageTypeErrorCategory,
 };
 use crate::domain::test_support::{
     CountingAllowAllResolver, CountingPermitResolver, CountingTenantPermitResolver,
@@ -46,7 +41,6 @@ use crate::domain::test_support::{
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use usage_collector_sdk::UsageCollectorPluginError;
 
-const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1");
 const SAMPLE_METER_TYPE_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1~");
 
@@ -80,41 +74,6 @@ fn sample_create_record() -> CreateUsageRecord {
         idempotency_key: IdempotencyKey::new("idem-1").expect("valid idempotency key"),
         corrects_id: None,
         created_at: OffsetDateTime::UNIX_EPOCH,
-    }
-}
-
-fn sample_usage_type() -> UsageType {
-    UsageType {
-        // A `UsageTypeGtsId` derives from the reserved usage_record base.
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid usage-type gts_id"),
-        kind: UsageKind::Counter,
-        metadata_fields: BTreeSet::new(),
-    }
-}
-
-/// A valid base64url-encoded keyset cursor over `gts_id`, so the gauge
-/// refresh's `CursorV1::decode` succeeds and the pagination loop advances.
-fn encoded_cursor() -> String {
-    CursorV1 {
-        k: vec![gts_id!("cf.core.uc.usage_record.v1~example.usage._.sample.v1").to_owned()],
-        o: SortDir::Asc,
-        s: "gts_id".to_owned(),
-        f: None,
-        d: "fwd".to_owned(),
-    }
-    .encode()
-    .expect("cursor encodes")
-}
-
-/// A page of `n` sample usage types carrying the given `next_cursor`.
-fn type_page(n: usize, next_cursor: Option<String>) -> ODataPage<UsageType> {
-    ODataPage {
-        items: (0..n).map(|_| sample_usage_type()).collect(),
-        page_info: PageInfo {
-            next_cursor,
-            prev_cursor: None,
-            limit: 1000,
-        },
     }
 }
 
@@ -171,251 +130,6 @@ fn create_record_with_metadata(key: &str, value: &str) -> CreateUsageRecord {
         value.to_owned(),
     );
     record
-}
-
-// ── UsageType catalog ────────────────────────────────────────────────
-
-#[tokio::test]
-async fn usage_type_list_deny_records_denied_authz() {
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(Arc::new(DenyAllResolver))
-        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.ut.listdeny.v1");
-
-    let _outcome = service
-        .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
-        .await;
-    provider.force_flush().unwrap();
-
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "operation",
-            "list"
-        ),
-        1,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "outcome",
-            "denied"
-        ),
-        1,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "error_category",
-            "authz",
-        ),
-        1,
-    );
-    // Lifecycle mutations no longer touch the gauge (it is refreshed only by
-    // the periodic serve loop), so a single denied attempt leaves it unset.
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), None);
-}
-
-#[tokio::test]
-async fn usage_type_create_success_records_request() {
-    let plugin = HappyPathPlugin::new();
-    plugin.set_create_usage_type(sample_usage_type());
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin, "test.metrics.ut.create.v1");
-
-    let result = service
-        .create_usage_type(&authenticated_ctx(), sample_usage_type())
-        .await;
-    assert!(result.is_ok(), "create should succeed: {result:?}");
-    provider.force_flush().unwrap();
-
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "operation",
-            "create",
-        ),
-        1,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "outcome",
-            "success"
-        ),
-        1,
-    );
-}
-
-#[tokio::test]
-async fn refresh_usage_types_gauge_sums_across_pages() {
-    // The undercount fix: a two-page catalog must be summed, not truncated to
-    // the first page. Page 1 (2 items) carries a next_cursor; page 2 (1 item)
-    // terminates. Expected total = 3.
-    let plugin = HappyPathPlugin::new();
-    let probe = plugin.clone();
-    plugin.set_list_usage_types_pages(vec![
-        type_page(2, Some(encoded_cursor())),
-        type_page(1, None),
-    ]);
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin, "test.metrics.ut.paginate.v1");
-
-    service.refresh_usage_types_gauge().await;
-    provider.force_flush().unwrap();
-
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), Some(3));
-
-    // Pagination threaded the cursor: two SPI calls, the second carrying the
-    // decoded cursor from page 1's next_cursor.
-    let inputs = probe.list_usage_types_inputs();
-    assert_eq!(inputs.len(), 2, "expected two paginated list calls");
-    assert!(inputs[0].cursor.is_none(), "first call has no cursor");
-    assert!(
-        inputs[1].cursor.is_some(),
-        "second call carries the page cursor"
-    );
-}
-
-#[tokio::test]
-async fn refresh_usage_types_gauge_single_page_sets_true_count() {
-    let plugin = HappyPathPlugin::new();
-    plugin.set_list_usage_types(type_page(4, None));
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin, "test.metrics.ut.singlepage.v1");
-
-    service.refresh_usage_types_gauge().await;
-    provider.force_flush().unwrap();
-
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), Some(4));
-}
-
-#[tokio::test]
-async fn refresh_usage_types_gauge_spi_error_leaves_gauge_unset() {
-    // `list_usage_types` unprogrammed → SPI error → best-effort no-op; the
-    // gauge is never set.
-    let plugin = HappyPathPlugin::new();
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin, "test.metrics.ut.spierr.v1");
-
-    service.refresh_usage_types_gauge().await;
-    provider.force_flush().unwrap();
-
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), None);
-}
-
-#[tokio::test]
-async fn refresh_usage_types_gauge_error_leaves_prior_value() {
-    // First refresh sets a known value from a one-shot queued page; the queue
-    // is then empty, so the second refresh errors (unprogrammed single
-    // response) and MUST leave the prior value intact.
-    let plugin = HappyPathPlugin::new();
-    plugin.set_list_usage_types_pages(vec![type_page(2, None)]);
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin, "test.metrics.ut.priorval.v1");
-
-    service.refresh_usage_types_gauge().await; // -> Some(2)
-    service.refresh_usage_types_gauge().await; // queue empty -> error -> no-op
-    provider.force_flush().unwrap();
-
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), Some(2));
-}
-
-#[tokio::test(start_paused = true)]
-async fn refresh_usage_types_gauge_timeout_leaves_prior_value() {
-    // Seed a known value, then make the SPI hang; the bounded refresh timeout
-    // fires (auto-advanced under start_paused) and leaves the prior value.
-    let plugin = HappyPathPlugin::new();
-    plugin.set_list_usage_types_pages(vec![type_page(5, None)]);
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin.clone(), "test.metrics.ut.pgtimeout.v1");
-
-    service.refresh_usage_types_gauge().await; // -> Some(5)
-    plugin.set_list_usage_types_hang();
-    service.refresh_usage_types_gauge().await; // hangs -> timeout -> no-op
-    provider.force_flush().unwrap();
-
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), Some(5));
-}
-
-#[tokio::test]
-async fn refresh_usage_types_gauge_undecodable_cursor_is_noop() {
-    // A page advertising an undecodable next_cursor: the partial count MUST NOT
-    // be published (a failed pagination is a no-op, not a partial count).
-    let plugin = HappyPathPlugin::new();
-    plugin.set_list_usage_types_pages(vec![type_page(1, Some("not-a-valid-cursor".to_owned()))]);
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin, "test.metrics.ut.badcursor.v1");
-
-    service.refresh_usage_types_gauge().await;
-    provider.force_flush().unwrap();
-
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), None);
-}
-
-#[tokio::test]
-async fn refresh_usage_types_gauge_page_cap_leaves_prior_value() {
-    // A prior refresh seeds a known value. Then the plugin advertises a
-    // never-terminating cursor chain — every page carries a `next_cursor`, so
-    // the walk would run forever were it not for the `USAGE_TYPES_GAUGE_MAX_PAGES`
-    // safety cap. A capped walk is a partial count and MUST NOT be published, so
-    // the gauge keeps its prior value.
-    let plugin = HappyPathPlugin::new();
-    plugin.set_list_usage_types_pages(vec![type_page(6, None)]);
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin.clone(), "test.metrics.ut.pagecap.v1");
-
-    service.refresh_usage_types_gauge().await; // -> Some(6)
-
-    // Queue one page more than the cap, each carrying a next_cursor so the walk
-    // never terminates on its own — the cap is what stops it.
-    plugin.set_list_usage_types_pages(
-        (0..=super::USAGE_TYPES_GAUGE_MAX_PAGES)
-            .map(|_| type_page(1, Some(encoded_cursor())))
-            .collect(),
-    );
-
-    service.refresh_usage_types_gauge().await; // page cap hit -> no-op
-    provider.force_flush().unwrap();
-
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), Some(6));
-}
-
-#[tokio::test]
-async fn refresh_usage_types_gauge_unbound_plugin_is_noop() {
-    // No bound plugin (lazy binding not yet resolved) → early return, gauge
-    // untouched, no panic. `service_with_metrics_unready_plugin` wires a
-    // structurally-unready binding (registry advertises an instance, no
-    // scoped client registered), so there is no plugin instance to pass in.
-    let (service, provider, exporter) = service_with_metrics_unready_plugin(
-        "test.metrics.ut.unbound.v1",
-        CountingAllowAllResolver::new(),
-    );
-
-    service.refresh_usage_types_gauge().await;
-    provider.force_flush().unwrap();
-
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), None);
 }
 
 // ── Deactivation handler ─────────────────────────────────────────────
@@ -603,35 +317,12 @@ async fn ingestion_batch_all_denied_observes_batch_size_and_partial_request() {
 // ── PDP-helper instruments (uc_authz_decisions_total / uc_pdp_failures_total /
 //    uc_pdp_duration_seconds) ──────────────────────────────────────────────
 
-#[tokio::test]
-async fn pdp_permit_emits_permit_decision_and_duration() {
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.pdp.permit.v1");
-
-    // Catalog LIST runs under require_constraints(false); an allow_all permit
-    // is the legitimate happy path. The downstream plugin call may error, but
-    // the PDP decision is recorded regardless.
-    let _outcome = service
-        .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
-        .await;
-    provider.force_flush().unwrap();
-
-    assert_eq!(
-        counter_sum_with_label(&exporter, "uc_authz_decisions_total", "decision", "permit"),
-        1,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_authz_decisions_total",
-            "operation",
-            "usage_type_list",
-        ),
-        1,
-    );
-    assert_eq!(histogram_count(&exporter, "uc_pdp_duration_seconds"), 1);
-}
+// `pdp_permit_emits_permit_decision_and_duration` is gone: its coverage
+// (permit → decision=permit, one duration sample, operation=ingest, no
+// double-count) is subsumed by
+// `per_record_permit_records_exactly_one_permit_no_double_count` below —
+// both drove the check through `list_usage_types`, a catalog operation this
+// gear no longer has (types-registry owns every type declaration now).
 
 #[tokio::test]
 async fn pdp_deny_emits_deny_decision_not_failure() {
@@ -639,8 +330,11 @@ async fn pdp_deny_emits_deny_decision_not_failure() {
         .with_resolver(Arc::new(DenyAllResolver))
         .build_with_metrics(HappyPathPlugin::new(), "test.metrics.pdp.deny.v1");
 
+    // PDP denial short-circuits `create_usage_record_inner` before the plugin
+    // or the Type Resolver are ever reached, so an unprogrammed plugin and
+    // the fixture's default (inert) resolver are fine here.
     let _outcome = service
-        .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
+        .create_usage_record(&authenticated_ctx(), sample_create_record())
         .await;
     provider.force_flush().unwrap();
 
@@ -650,12 +344,7 @@ async fn pdp_deny_emits_deny_decision_not_failure() {
     );
     // A deny is a decision, not a failure.
     assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_pdp_failures_total",
-            "operation",
-            "usage_type_list",
-        ),
+        counter_sum_with_label(&exporter, "uc_pdp_failures_total", "operation", "ingest"),
         0,
     );
 }
@@ -667,7 +356,7 @@ async fn pdp_unreachable_emits_failure_not_decision() {
         .build_with_metrics(HappyPathPlugin::new(), "test.metrics.pdp.unreachable.v1");
 
     let _outcome = service
-        .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
+        .create_usage_record(&authenticated_ctx(), sample_create_record())
         .await;
     provider.force_flush().unwrap();
 
@@ -677,12 +366,7 @@ async fn pdp_unreachable_emits_failure_not_decision() {
     );
     // A transport failure is not a decision.
     assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_authz_decisions_total",
-            "operation",
-            "usage_type_list",
-        ),
+        counter_sum_with_label(&exporter, "uc_authz_decisions_total", "operation", "ingest"),
         0,
     );
     // Failure completions still observe duration.
@@ -834,13 +518,14 @@ async fn per_record_permit_records_exactly_one_permit_no_double_count() {
 #[tokio::test]
 async fn plugin_backend_error_records_duration_counter_and_ready() {
     // AllowAll permits; the unprogrammed HappyPathPlugin returns
-    // `Internal` for `list_usage_types` → a backend-classified fault.
+    // `Internal` for `get_usage_record` (the prefetch runs before PDP) → a
+    // backend-classified fault.
     let (service, provider, exporter) = ServiceFixture::default()
         .with_resolver(CountingAllowAllResolver::new())
         .build_with_metrics(HappyPathPlugin::new(), "test.metrics.plugin.backend.v1");
 
     let _outcome = service
-        .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
+        .get_usage_record(&authenticated_ctx(), Uuid::from_u128(0x01))
         .await;
     provider.force_flush().unwrap();
 
@@ -863,7 +548,7 @@ async fn plugin_backend_error_records_duration_counter_and_ready() {
             &exporter,
             "uc_plugin_accept_errors_total",
             "operation",
-            "list_usage_types",
+            "get_usage_record",
         ),
         1,
     );
@@ -873,18 +558,20 @@ async fn plugin_backend_error_records_duration_counter_and_ready() {
 
 #[tokio::test]
 async fn plugin_domain_typed_error_does_not_increment_accept_counter() {
-    // A domain-typed variant (UsageTypeNotFound) is a caller-visible outcome,
-    // NOT a plugin fault — its duration is still observed, but it MUST NOT
-    // increment uc_plugin_accept_errors_total.
+    // A domain-typed variant (UsageRecordNotFound) is a caller-visible
+    // outcome, NOT a plugin fault — its duration is still observed, but it
+    // MUST NOT increment uc_plugin_accept_errors_total. The prefetch inside
+    // `get_usage_record` runs before PDP, so an unreachable/deny-anything
+    // resolver would never even be reached here.
     let plugin = HappyPathPlugin::new();
-    let gts_id = UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id");
-    plugin.set_get_usage_type_not_found(gts_id.clone());
+    let id = Uuid::from_u128(0x02);
+    plugin.set_get_usage_record_not_found(id);
 
     let (service, provider, exporter) = ServiceFixture::default()
         .with_resolver(CountingAllowAllResolver::new())
         .build_with_metrics(plugin, "test.metrics.plugin.domain.v1");
 
-    let _outcome = service.get_usage_type(&authenticated_ctx(), gts_id).await;
+    let _outcome = service.get_usage_record(&authenticated_ctx(), id).await;
     provider.force_flush().unwrap();
 
     assert_eq!(
@@ -896,7 +583,7 @@ async fn plugin_domain_typed_error_does_not_increment_accept_counter() {
             &exporter,
             "uc_plugin_accept_errors_total",
             "operation",
-            "get_usage_type",
+            "get_usage_record",
         ),
         0,
         "domain-typed plugin errors must not count as accept errors",
@@ -905,13 +592,19 @@ async fn plugin_domain_typed_error_does_not_increment_accept_counter() {
 
 #[tokio::test]
 async fn plugin_unready_increments_unready_counter_and_zeroes_ready() {
+    // The per-record ingestion authorize runs under `require_constraints(true)`
+    // with a per-record attribution gate, so the PDP fake must actually grant
+    // (and the gate admit) `sample_create_record()`'s own tenant for this
+    // structural-unready path to be reached at all — a plain `CountingAllowAllResolver`
+    // (unconstrained permit) would fail the gate before `resolve_plugin_for`
+    // ever runs.
     let (service, provider, exporter) = service_with_metrics_unready_plugin(
         "test.metrics.plugin.unready.v1",
-        CountingAllowAllResolver::new(),
+        CountingTenantPermitResolver::new(),
     );
 
     let _outcome = service
-        .list_usage_types(&authenticated_ctx(), &ODataQuery::default())
+        .create_usage_record(&authenticated_ctx(), sample_create_record())
         .await;
     provider.force_flush().unwrap();
 
@@ -1223,18 +916,12 @@ async fn ingestion_batch_unready_plugin_increments_unready_counter() {
 
 // ── Metric-label classifiers: exhaustive arm coverage (pure fns) ────────────
 //
-// `classify_record_error`, `classify_query_result`, `classify_usage_type_result`
-// and `classify_deactivation_plugin_error` decide the `error_category` /
+// `classify_record_error`, `classify_query_result` and
+// `classify_deactivation_plugin_error` decide the `error_category` /
 // `outcome` labels operators alert on. The end-to-end tests above exercise only
 // the authz / not-found arms; these table-driven unit tests pin EVERY arm of
 // the closed §3.11.5 vocabularies, so a misrouted variant is caught here rather
 // than as a silently-wrong dashboard series.
-
-/// The canonical sample `gts_id` as a typed id, for classifier fixtures
-/// exercising the `UsageType` catalog surface.
-fn gts() -> UsageTypeGtsId {
-    UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id")
-}
 
 /// The canonical sample `gts_type_id` as a typed id, for classifier
 /// fixtures exercising the record / meter-reference surface
@@ -1245,18 +932,21 @@ fn meter_gts() -> MeterTypeId {
     MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id")
 }
 
+/// The `UsageCollectorError::NotFound` an unresolved `gts_type_id` produces —
+/// the Type Resolver's `DomainError::DeclarationNotFound`, lifted through the
+/// same bridge `Service::create_usage_record_inner` /
+/// `query_aggregated_usage_records` use. Exercises the real production path
+/// rather than hand-building the `NotFound` variant, so this fixture cannot
+/// drift from what the resolver actually produces.
+fn unresolved_type_not_found() -> UsageCollectorError {
+    crate::domain::error::DomainError::declaration_not_found(&meter_gts()).into()
+}
+
 /// `(input result, expected (outcome, error_category))` row for the query
 /// classifier table.
 type QueryClassifierCase = (
     Result<(), UsageCollectorError>,
     (RequestOutcome, QueryErrorCategory),
-);
-
-/// `(input result, expected (outcome, error_category))` row for the usage-type
-/// classifier table.
-type UsageTypeClassifierCase = (
-    Result<(), UsageCollectorError>,
-    (RequestOutcome, UsageTypeErrorCategory),
 );
 
 #[test]
@@ -1266,9 +956,10 @@ fn classify_record_error_maps_each_arm() {
             UsageCollectorError::permission_denied("pdp"),
             RecordErrorCategory::Authz,
         ),
-        // Catalog-absent UsageType (usage-type resource) → unknown_usage_type.
+        // An unresolved `gts_type_id` (the Type Resolver's `DeclarationNotFound`)
+        // → unknown_usage_type.
         (
-            UsageCollectorError::usage_type_not_found(&gts()),
+            unresolved_type_not_found(),
             RecordErrorCategory::UnknownUsageType,
         ),
         // A record-resource NotFound (an L1 `corrects_id` reference) stays with
@@ -1333,7 +1024,7 @@ fn classify_query_result_maps_each_arm() {
             (RequestOutcome::Denied, QueryErrorCategory::Authz),
         ),
         (
-            Err(UsageCollectorError::usage_type_not_found(&gts())),
+            Err(unresolved_type_not_found()),
             (RequestOutcome::Error, QueryErrorCategory::UnknownUsageType),
         ),
         // The only service-level InvalidArgument on the query path is the
@@ -1354,53 +1045,6 @@ fn classify_query_result_maps_each_arm() {
     for (result, expected) in cases {
         assert_eq!(
             classify_query_result(&result),
-            expected,
-            "misclassified {result:?}",
-        );
-    }
-}
-
-#[test]
-fn classify_usage_type_result_maps_each_arm() {
-    let cases: Vec<UsageTypeClassifierCase> = vec![
-        (
-            Ok(()),
-            (RequestOutcome::Success, UsageTypeErrorCategory::None),
-        ),
-        (
-            Err(UsageCollectorError::permission_denied("pdp")),
-            (RequestOutcome::Denied, UsageTypeErrorCategory::Authz),
-        ),
-        (
-            Err(UsageCollectorError::usage_type_already_exists(&gts())),
-            (RequestOutcome::Error, UsageTypeErrorCategory::Conflict),
-        ),
-        (
-            Err(UsageCollectorError::usage_type_not_found(&gts())),
-            (RequestOutcome::Error, UsageTypeErrorCategory::NotFound),
-        ),
-        (
-            Err(UsageCollectorError::usage_type_referenced(&gts(), 3)),
-            (RequestOutcome::Error, UsageTypeErrorCategory::Referenced),
-        ),
-        (
-            Err(UsageCollectorError::invalid_usage_kind("bogus")),
-            (RequestOutcome::Error, UsageTypeErrorCategory::Validation),
-        ),
-        // A Conflict whose reason is NOT UsageTypeReferenced is not a named
-        // lifecycle arm — it falls through to the catch-all plugin_error.
-        (
-            Err(UsageCollectorError::already_inactive(Uuid::from_u128(11))),
-            (RequestOutcome::Error, UsageTypeErrorCategory::PluginError),
-        ),
-        (
-            Err(UsageCollectorError::internal("boom")),
-            (RequestOutcome::Error, UsageTypeErrorCategory::PluginError),
-        ),
-    ];
-    for (result, expected) in cases {
-        assert_eq!(
-            classify_usage_type_result(&result),
             expected,
             "misclassified {result:?}",
         );
@@ -1513,6 +1157,7 @@ async fn query_aggregated_success_records_success_rows_and_duration() {
             ttl: Duration::from_mins(1),
             capacity: 16,
         },
+        metrics.clone(),
     ));
     let service = Arc::new(Service::new_with_metrics(
         hub,
@@ -1636,42 +1281,5 @@ async fn ingestion_single_empty_metadata_skips_record_metadata_bytes() {
         histogram_count(&exporter, "uc_record_metadata_bytes"),
         0,
         "an empty-metadata record must record nothing on uc_record_metadata_bytes",
-    );
-}
-
-// ── UsageType gauge: delete-path refresh + refresh-failure isolation ─────────
-
-#[tokio::test]
-async fn usage_type_delete_success_records_request() {
-    let plugin = HappyPathPlugin::new();
-    plugin.set_delete_usage_type_ok();
-
-    let (service, provider, exporter) = ServiceFixture::default()
-        .with_resolver(CountingAllowAllResolver::new())
-        .build_with_metrics(plugin, "test.metrics.ut.delete.v1");
-
-    service
-        .delete_usage_type(&authenticated_ctx(), gts())
-        .await
-        .expect("delete should succeed");
-    provider.force_flush().unwrap();
-
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "operation",
-            "delete",
-        ),
-        1,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "outcome",
-            "success",
-        ),
-        1,
     );
 }

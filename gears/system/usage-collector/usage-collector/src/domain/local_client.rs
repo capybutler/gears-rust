@@ -17,7 +17,7 @@ use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, MeterTypeId,
-    UsageCollectorClientV1, UsageCollectorError, UsageRecord, UsageType, UsageTypeGtsId,
+    UsageCollectorClientV1, UsageCollectorError, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -98,56 +98,6 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
     ) -> Result<(), UsageCollectorError> {
         self.svc.deactivate_usage_record(ctx, id).await
     }
-
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-submit
-    async fn create_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorError> {
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-service-call
-        self.svc.create_usage_type(ctx, usage_type).await
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-service-call
-    }
-    // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-submit
-
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-submit
-    async fn get_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorError> {
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-service-call
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-return
-        self.svc.get_usage_type(ctx, gts_id).await
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-return
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-service-call
-    }
-    // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-submit
-
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-submit
-    async fn list_usage_types(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorError> {
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-service-call
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-return
-        self.svc.list_usage_types(ctx, query).await
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-return
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-service-call
-    }
-    // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-submit
-
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-pdp-authorize
-    async fn delete_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorError> {
-        self.svc.delete_usage_type(ctx, gts_id).await
-    }
-    // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-pdp-authorize
 }
 
 #[cfg(test)]

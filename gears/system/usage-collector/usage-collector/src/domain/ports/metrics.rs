@@ -41,11 +41,15 @@ pub mod key {
     pub const RECORD_KIND: &str = "record_kind";
     /// `query_kind` — aggregated vs raw query.
     pub const QUERY_KIND: &str = "query_kind";
+    /// `result` — Type Resolver call outcome.
+    pub const RESULT: &str = "result";
 }
 
 /// `operation` label for the PDP-helper instruments (`uc_pdp_*`,
-/// `uc_authz_decisions_total`) — the nine-value gateway set from DESIGN
-/// §3.11.5.
+/// `uc_authz_decisions_total`) — the usage-record gateway set. The
+/// usage-type catalog surface (and its four PDP operations) is gone: every
+/// type declaration is now owned by `types-registry` and resolved through
+/// the Type Resolver, which is not a PDP-enforcing component.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdpOp {
@@ -59,14 +63,6 @@ pub enum PdpOp {
     GetRecord,
     /// Deactivate a usage record.
     Deactivate,
-    /// Register a usage type.
-    UsageTypeCreate,
-    /// Read a single usage type.
-    UsageTypeGet,
-    /// List usage types.
-    UsageTypeList,
-    /// Delete a usage type.
-    UsageTypeDelete,
 }
 
 impl PdpOp {
@@ -79,17 +75,15 @@ impl PdpOp {
             Self::QueryAggregated => "query_aggregated",
             Self::GetRecord => "get_record",
             Self::Deactivate => "deactivate",
-            Self::UsageTypeCreate => "usage_type_create",
-            Self::UsageTypeGet => "usage_type_get",
-            Self::UsageTypeList => "usage_type_list",
-            Self::UsageTypeDelete => "usage_type_delete",
         }
     }
 }
 
 /// `operation` label for the plugin-host instruments
 /// (`uc_plugin_call_duration_seconds`, `uc_plugin_accept_errors_total`) —
-/// the ten Plugin SPI method names from DESIGN §3.11.5.
+/// the Plugin SPI method names. The four usage-type catalog SPI methods no
+/// longer exist on [`usage_collector_sdk::UsageCollectorPluginV1`]: storage
+/// plugins are pure usage-record persistence now.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginOp {
@@ -105,14 +99,6 @@ pub enum PluginOp {
     GetUsageRecord,
     /// SPI Method 5.
     DeactivateUsageRecord,
-    /// SPI Method 6.
-    CreateUsageType,
-    /// SPI Method 7.
-    GetUsageType,
-    /// SPI Method 8.
-    ListUsageTypes,
-    /// SPI Method 9.
-    DeleteUsageType,
 }
 
 impl PluginOp {
@@ -126,10 +112,6 @@ impl PluginOp {
             Self::ListUsageRecords => "list_usage_records",
             Self::GetUsageRecord => "get_usage_record",
             Self::DeactivateUsageRecord => "deactivate_usage_record",
-            Self::CreateUsageType => "create_usage_type",
-            Self::GetUsageType => "get_usage_type",
-            Self::ListUsageTypes => "list_usage_types",
-            Self::DeleteUsageType => "delete_usage_type",
         }
     }
 }
@@ -212,9 +194,9 @@ impl PluginErrorCategory {
 
 // ── Phase 2: per-component gateway label vocabularies (DESIGN §3.11.5) ──
 
-/// `outcome` label shared by the query, deactivation, and usage-type request
-/// counters (their §3.11.5 vocabularies are identical: `success` on a
-/// successful return, `denied` on a completed PDP deny, `error` otherwise).
+/// `outcome` label shared by the query and deactivation request counters
+/// (their §3.11.5 vocabularies are identical: `success` on a successful
+/// return, `denied` on a completed PDP deny, `error` otherwise).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestOutcome {
@@ -342,7 +324,8 @@ pub enum RecordErrorCategory {
     None,
     /// PDP deny for this record's attribution tuple.
     Authz,
-    /// Catalog-absent `UsageType` (`NotFound` with the usage-type resource).
+    /// The referenced `gts_type_id` does not resolve to a usable declaration
+    /// (the Type Resolver's `DeclarationNotFound`).
     UnknownUsageType,
     /// Counter/gauge semantics violation or an L1 `corrects_id` referential fault.
     SemanticsViolation,
@@ -401,7 +384,8 @@ pub enum QueryErrorCategory {
     MissingSecurityContext,
     /// PDP deny (or empty-constraint fail-closed) / substrate-unreachable authz exit.
     Authz,
-    /// Unregistered `UsageType` surfaced from the plugin as `NotFound`.
+    /// The referenced `gts_type_id` does not resolve to a usable declaration
+    /// (the Type Resolver's `DeclarationNotFound`).
     UnknownUsageType,
     /// Cursor decode failure (REST-handler boundary; reserved at this seam).
     CursorDecode,
@@ -466,68 +450,65 @@ impl DeactivationErrorCategory {
     }
 }
 
-/// `operation` label for `uc_usage_type_requests_total`.
+/// Outcome of one [`crate::domain::type_resolver::TypeResolver::resolve`]
+/// call, for the failure and staleness instruments DESIGN §3.11.5 requires.
+/// Replaces the deleted catalog-lifecycle instruments
+/// (`uc_usage_type_requests_total`, `uc_usage_types`): the catalog surface
+/// is gone, and every fold / unit / metadata-surface read now goes through
+/// the Type Resolver instead.
+///
+/// DESIGN §3.11.5 documents `uc_type_resolution_total{result}` with a
+/// five-value `result` set: `cache_hit`, `cache_miss`, `served_stale`,
+/// `unresolved`, `registry_error`, plus `restored` — a mirror-table restore
+/// path (§3.7 / ADR-0015) this gear does not implement yet, so no variant
+/// below emits it. This enum names the five values `TypeResolver::resolve`
+/// / `populate` (`domain/type_resolver/mod.rs`) actually emit:
+///
+/// - a fresh cache hit ([`Self::CacheHit`]);
+/// - a successful fetch-and-parse from `types-registry`, whether the key
+///   was cold or past its TTL ([`Self::CacheMiss`]);
+/// - a fetch that failed with a stale cached entry to fall back on
+///   ([`Self::ServedStale`]);
+/// - a definite not-found, **or** an incomplete declaration — a schema that
+///   fetched fine but does not carry what a meter needs (a missing trait, an
+///   unserved fold) ([`Self::Unresolved`]). The two share one variant
+///   deliberately: in both, `types-registry` answered fine and the
+///   *declaration* is the problem, not the registry — the distinction the
+///   alert `PromQL` (DESIGN §3.11.5) keys on to tell "a caller asked for a
+///   type that does not exist" apart from "the registry is unreachable";
+/// - a fetch that failed (registry unreachable, timed out, ...) with
+///   nothing cached to fall back on ([`Self::RegistryError`]). Unlike
+///   [`Self::Unresolved`], here the registry itself failed to answer — no
+///   verdict on the type was ever reached.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageTypeOp {
-    /// Register a usage type.
-    Create,
-    /// Read a single usage type.
-    Get,
-    /// List usage types.
-    List,
-    /// Delete a usage type.
-    Delete,
+pub enum TypeResolutionOutcome {
+    /// Served from a fresh cache entry.
+    CacheHit,
+    /// Fetched from `types-registry` (cold key or past-TTL refresh).
+    CacheMiss,
+    /// Served from a cached entry past its TTL because the registry failed.
+    ServedStale,
+    /// The type does not resolve: a definite not-found, or a declaration
+    /// that fetched fine but is incomplete. The registry answered fine; the
+    /// declaration is simply unusable. The operation is rejected.
+    Unresolved,
+    /// The fetch itself failed (registry unreachable, timed out, ...) and
+    /// nothing cached exists to serve instead — no verdict on the type was
+    /// reached. The operation is rejected.
+    RegistryError,
 }
 
-impl UsageTypeOp {
-    /// The bounded `operation` label value.
+impl TypeResolutionOutcome {
+    /// The bounded `result` label value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Create => "create",
-            Self::Get => "get",
-            Self::List => "list",
-            Self::Delete => "delete",
-        }
-    }
-}
-
-/// `error_category` label for `uc_usage_type_requests_total`.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageTypeErrorCategory {
-    /// `outcome` was `success`.
-    None,
-    /// Reserved/defensive — rejected upstream / unreachable on SDK.
-    MissingSecurityContext,
-    /// PDP deny.
-    Authz,
-    /// Request-shape / kind / shape-validation rejection.
-    Validation,
-    /// Duplicate registration on create (HTTP 409).
-    Conflict,
-    /// `UsageTypeNotFound` on get / delete.
-    NotFound,
-    /// Referentially-unsafe delete rejection (HTTP 409).
-    Referenced,
-    /// Plugin transport / availability / persistence failure.
-    PluginError,
-}
-
-impl UsageTypeErrorCategory {
-    /// The bounded `error_category` label value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::MissingSecurityContext => "missing_security_context",
-            Self::Authz => "authz",
-            Self::Validation => "validation",
-            Self::Conflict => "conflict",
-            Self::NotFound => "not_found",
-            Self::Referenced => "referenced",
-            Self::PluginError => "plugin_error",
+            Self::CacheHit => "cache_hit",
+            Self::CacheMiss => "cache_miss",
+            Self::ServedStale => "served_stale",
+            Self::Unresolved => "unresolved",
+            Self::RegistryError => "registry_error",
         }
     }
 }
@@ -539,7 +520,8 @@ impl UsageTypeErrorCategory {
 /// `uc_plugin_call_duration_seconds`) and the PDP-helper set
 /// (`uc_pdp_ready`, `uc_pdp_failures_total`, `uc_pdp_duration_seconds`,
 /// `uc_authz_decisions_total`). Phase 2 adds the per-component gateway
-/// instruments (ingestion, query, deactivation, usage-type).
+/// instruments (ingestion, query, deactivation) plus the Type Resolver
+/// instrument that replaced the deleted usage-type catalog counters.
 pub trait UsageCollectorMetrics: Send + Sync {
     /// `uc_pdp_ready` gauge — set to `1` while the `authz-resolver` client is
     /// bound in the bootstrap-constructed `PolicyEnforcer`, `0` otherwise.
@@ -642,19 +624,11 @@ pub trait UsageCollectorMetrics: Send + Sync {
         seconds: f64,
     );
 
-    // ── UsageType catalog (usage-type-lifecycle) ──
+    // ── Type Resolver (usage-type-lifecycle successor) ──
 
-    /// Increment `uc_usage_type_requests_total{operation, outcome, error_category}`
-    /// once per completed UsageType-lifecycle attempt.
-    fn record_usage_type_request(
-        &self,
-        op: UsageTypeOp,
-        outcome: RequestOutcome,
-        error_category: UsageTypeErrorCategory,
-    );
-
-    /// Set `uc_usage_types` (no labels) to the current catalog entry count.
-    fn set_usage_types(&self, count: u64);
+    /// Increment `uc_type_resolution_total{result}` once per
+    /// [`crate::domain::type_resolver::TypeResolver::resolve`] call.
+    fn record_type_resolution(&self, outcome: TypeResolutionOutcome);
 }
 
 /// No-op implementation for tests and pre-bootstrap contexts.
@@ -685,12 +659,5 @@ impl UsageCollectorMetrics for NoopMetrics {
     }
     fn record_deactivation_request(&self, _: RequestOutcome, _: DeactivationErrorCategory, _: f64) {
     }
-    fn record_usage_type_request(
-        &self,
-        _: UsageTypeOp,
-        _: RequestOutcome,
-        _: UsageTypeErrorCategory,
-    ) {
-    }
-    fn set_usage_types(&self, _: u64) {}
+    fn record_type_resolution(&self, _: TypeResolutionOutcome) {}
 }

@@ -23,25 +23,24 @@ use futures::stream;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use toolkit_macros::domain_model;
-use toolkit_odata::{CursorV1, ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
 use usage_collector_sdk::{
     AggregationDimension, AggregationResult, ConflictReason, CreateUsageRecord,
-    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, USAGE_TYPE_RESOURCE, UsageCollectorError,
+    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, UsageCollectorError,
     UsageCollectorPluginError, UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord,
-    UsageType, UsageTypeGtsId, ValidationReason,
+    ValidationReason,
 };
 use uuid::Uuid;
 
-use crate::domain::authz::{self, AttributionTupleKey, usage_record, usage_type};
+use crate::domain::authz::{self, AttributionTupleKey, usage_record};
 use crate::domain::ports::declarations::UnavailableDeclarationSource;
 use crate::domain::ports::metrics::{
     DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome, NoopMetrics,
     PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
-    RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics, UsageTypeErrorCategory,
-    UsageTypeOp,
+    RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
 };
 use crate::domain::query::{compose_query_with_scope, require_bounded_time_window};
 use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
@@ -90,24 +89,6 @@ const TYPE_RESOLUTION_FANOUT_CONCURRENCY: usize = 8;
 /// `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`.
 const L1_LOOKUP_FANOUT_CONCURRENCY: usize = 8;
 
-/// Best-effort deadline for the whole paginated `list_usage_types` read
-/// performed by the periodic `serve` gauge-refresh loop (see `crate::module`).
-/// The refresh runs off the gear's lifecycle loop, never on a caller's
-/// `create_usage_type` / `delete_usage_type` path, so a slow/hung storage
-/// plugin cannot stall any request. On timeout (or any error, undecodable
-/// cursor, or page-cap breach) the gauge keeps its prior value and is re-read
-/// on the next interval — losing a single refresh sample is harmless.
-const USAGE_TYPES_GAUGE_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Page size requested per `list_usage_types` dispatch during a gauge refresh.
-/// Sized so realistic catalogs resolve in a single read; the cursor loop only
-/// engages for larger catalogs.
-const USAGE_TYPES_GAUGE_PAGE_LIMIT: u64 = 1000;
-
-/// Safety cap on pages followed in one refresh — a mis-minting plugin whose
-/// `next_cursor` never terminates cannot spin the refresher.
-const USAGE_TYPES_GAUGE_MAX_PAGES: usize = 100;
-
 /// One PDP fan-out outcome: the input indices that share an attribution
 /// tuple plus the `Result<(), DomainError>` returned for that tuple's
 /// representative call. Decision projection (success / deny / unavailable
@@ -117,7 +98,7 @@ type PdpGroupDecision = (Vec<usize>, Result<(), DomainError>);
 /// Cached resolution per distinct meter, lifted into [`DomainError`] so one
 /// resolution outcome projects to every record sharing that type without
 /// re-resolving it. Replaces the pre-Task-9 `CatalogCache`, which cached a
-/// plugin-owned `UsageType` per `gts_id` instead of a resolved declaration.
+/// plugin-owned catalog row per `gts_id` instead of a resolved declaration.
 type DeclarationCache = HashMap<MeterTypeId, Result<Arc<ResolvedDeclaration>, DomainError>>;
 
 /// Cached L1 referential lookup per distinct `corrects_id`, lifted into
@@ -145,7 +126,7 @@ fn invariant_breach(detail: String) -> UsageCollectorError {
 ///
 /// Only backend-classified faults increment the counter:
 /// [`UsageCollectorPluginError::Transient`] / `Internal` → `backend_error`.
-/// The deterministic domain-typed variants (`UsageType*`, `UsageRecord*`,
+/// The deterministic domain-typed variants (`UsageRecord*`,
 /// `IdempotencyConflict`) are caller-visible outcomes, **not** plugin faults,
 /// and MUST NOT increment it (their duration sample is still recorded) per
 /// DESIGN §3.11.5 / `plugin-spi.md` §"Error Taxonomy". A host-side dispatch
@@ -264,12 +245,15 @@ fn observe_metadata_bytes(
 fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
     match err {
         UsageCollectorError::PermissionDenied { .. } => RecordErrorCategory::Authz,
-        // Catalog-absent UsageType vs a `corrects_id` referencing a missing
-        // record are separated ONLY by `resource_type`; the L1 referential
-        // family is kept with semantics_violation, not folded into catalog absence.
-        UsageCollectorError::NotFound { resource_type, .. }
-            if resource_type == USAGE_TYPE_RESOURCE =>
-        {
+        // An unresolved `gts_type_id` (the Type Resolver's `DeclarationNotFound`)
+        // vs a `corrects_id` referencing a missing record are both wire-tagged
+        // `resource_type: USAGE_RECORD_RESOURCE` now that types-registry owns
+        // the catalog — `resource_type` can no longer tell them apart. `name`
+        // still can: a resolved meter's `gts_type_id` never parses as a `Uuid`
+        // and a record's `id` / `corrects_id` always does, so that is the
+        // discriminator here. The L1 referential family stays with
+        // semantics_violation, not folded into unknown_usage_type.
+        UsageCollectorError::NotFound { name, .. } if Uuid::parse_str(name).is_err() => {
             RecordErrorCategory::UnknownUsageType
         }
         UsageCollectorError::NotFound { .. } => RecordErrorCategory::SemanticsViolation,
@@ -315,35 +299,6 @@ fn classify_query_result<T>(
             (RequestOutcome::Error, QueryErrorCategory::QueryBudget)
         }
         Err(_) => (RequestOutcome::Error, QueryErrorCategory::PluginError),
-    }
-}
-
-/// Project a completed UsageType-lifecycle attempt onto `(outcome,
-/// error_category)` for `uc_usage_type_requests_total`. `validation` and
-/// `missing_security_context` are request-shape / handler-boundary categories
-/// (upstream of this seam) and are reserved-not-emitted here.
-fn classify_usage_type_result<T>(
-    result: &Result<T, UsageCollectorError>,
-) -> (RequestOutcome, UsageTypeErrorCategory) {
-    match result {
-        Ok(_) => (RequestOutcome::Success, UsageTypeErrorCategory::None),
-        Err(UsageCollectorError::PermissionDenied { .. }) => {
-            (RequestOutcome::Denied, UsageTypeErrorCategory::Authz)
-        }
-        Err(UsageCollectorError::AlreadyExists { .. }) => {
-            (RequestOutcome::Error, UsageTypeErrorCategory::Conflict)
-        }
-        Err(UsageCollectorError::NotFound { .. }) => {
-            (RequestOutcome::Error, UsageTypeErrorCategory::NotFound)
-        }
-        Err(UsageCollectorError::Conflict {
-            reason: ConflictReason::UsageTypeReferenced,
-            ..
-        }) => (RequestOutcome::Error, UsageTypeErrorCategory::Referenced),
-        Err(UsageCollectorError::InvalidArgument { .. }) => {
-            (RequestOutcome::Error, UsageTypeErrorCategory::Validation)
-        }
-        Err(_) => (RequestOutcome::Error, UsageTypeErrorCategory::PluginError),
     }
 }
 
@@ -497,8 +452,6 @@ async fn resolve_l1_lookups(
 ///
 /// Discovers the bound storage plugin via `types-registry` and delegates
 /// durable state to it. Owns the lazy binding resolution.
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-component-usage-type-catalog:p2
-// @cpt-state:cpt-cf-usage-collector-state-usage-type-lifecycle-usage-type-registration-lifecycle:p2
 // @cpt-state:cpt-cf-usage-collector-state-usage-emission-usage-record-ingestion-lifecycle:p2
 #[domain_model]
 pub struct Service {
@@ -569,18 +522,20 @@ impl Service {
     /// `UsageCollectorConfig::metadata_size_cap_bytes` explicitly instead.
     #[must_use]
     pub fn new(hub: Arc<ClientHub>, vendor: String, enforcer: PolicyEnforcer) -> Self {
+        let metrics: Arc<dyn UsageCollectorMetrics> = Arc::new(NoopMetrics);
         let type_resolver = Arc::new(TypeResolver::new(
             Arc::new(UnavailableDeclarationSource),
             TypeResolverConfig {
                 ttl: Duration::from_secs(1),
                 capacity: 1,
             },
+            Arc::clone(&metrics),
         ));
         Self::new_with_metrics(
             hub,
             vendor,
             enforcer,
-            Arc::new(NoopMetrics),
+            metrics,
             type_resolver,
             DEFAULT_METADATA_SIZE_CAP_BYTES,
         )
@@ -626,93 +581,12 @@ impl Service {
         }
     }
 
-    /// Register a new `UsageType` in the plugin-owned `usage_type_catalog`
-    /// per `cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type`.
-    ///
-    /// # Errors
-    ///
-    /// * [`UsageCollectorError::PermissionDenied`] /
-    ///   [`UsageCollectorError::ServiceUnavailable`] when the PDP denies or is
-    ///   unavailable.
-    /// * [`UsageCollectorError::AlreadyExists`] when the plugin's
-    ///   `UNIQUE(gts_id)` constraint fires.
-    /// * Any other [`UsageCollectorError`] variant lifted from a plugin
-    ///   transport / persistence failure.
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-fr-usage-type-registration:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-seq-register-usage-type:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-entity-usage-type:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-fr-counter-semantics:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-fr-gauge-semantics:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-constraint-no-business-logic:p2
-    pub async fn create_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        input: UsageType,
-    ) -> Result<UsageType, UsageCollectorError> {
-        let result = async move {
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-pdp
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-pdp-deny
-            authz::authorize(
-                &self.enforcer,
-                self.metrics.as_ref(),
-                PdpOp::UsageTypeCreate,
-                ctx,
-                &usage_type::RESOURCE,
-                usage_type::actions::CREATE,
-            )
-            .await
-            .map_err(UsageCollectorError::from)?;
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-pdp-deny
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-pdp
-
-            let plugin = self
-                .resolve_plugin_for(PluginOp::CreateUsageType)
-                .await
-                .map_err(UsageCollectorError::from)?;
-
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-spi-insert
-            // @cpt-begin:cpt-cf-usage-collector-state-usage-type-lifecycle-usage-type-registration-lifecycle:p2:inst-state-usage-type-lifecycle-registered
-            match instrument_spi(
-                self.metrics.as_ref(),
-                PluginOp::CreateUsageType,
-                plugin.create_usage_type(input),
-            )
-            .await
-            {
-                Ok(record) => Ok(record),
-                // @cpt-end:cpt-cf-usage-collector-state-usage-type-lifecycle-usage-type-registration-lifecycle:p2:inst-state-usage-type-lifecycle-registered
-                // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-spi-insert
-                // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-spi-catch
-                Err(plugin_err) => {
-                    Err(match plugin_err {
-                        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-duplicate
-                        UsageCollectorPluginError::UsageTypeAlreadyExists { gts_id } => {
-                            UsageCollectorError::usage_type_already_exists(&gts_id)
-                        }
-                        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-duplicate
-                        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-spi-fail
-                        other => UsageCollectorError::from(DomainError::from(other)),
-                        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-spi-fail
-                    })
-                } // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-spi-catch
-            }
-        }
-        .await;
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-requests-metric
-        let (outcome, error_category) = classify_usage_type_result(&result);
-        self.metrics
-            .record_usage_type_request(UsageTypeOp::Create, outcome, error_category);
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-requests-metric
-        result
-    }
-
     /// Create a single `UsageRecord` through the ingestion path per
     /// `cpt-cf-usage-collector-flow-usage-emission-emit-record`. No
     /// in-process catalog cache — the referenced meter's declaration is
     /// resolved through the Type Resolver on each call (itself
     /// TTL-cached — see [`crate::domain::type_resolver`]), not read from a
-    /// plugin-owned `UsageType` catalog.
+    /// plugin-owned catalog.
     ///
     /// # Errors
     ///
@@ -792,21 +666,17 @@ impl Service {
             .await
             .map_err(UsageCollectorError::from)?;
 
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-catalog-lookup
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-usage-type-not-found
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-catalog-lookup
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-usage-type-not-found
         // Resolve the referenced meter's declaration through the Type
         // Resolver (not the plugin — there is no in-process catalog cache,
-        // and validation no longer reads a plugin-owned `UsageType` at
+        // and validation no longer reads a plugin-owned catalog row at
         // all). An unresolvable type fails closed here, before any plugin
         // dispatch, mirroring `Self::query_aggregated_usage_records`'s
         // identical fail-closed posture on the read path.
         let declaration = self.type_resolver.resolve(&record.gts_type_id).await?;
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-usage-type-not-found
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-catalog-lookup
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-usage-type-not-found
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-catalog-lookup
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-check
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-invalid
@@ -1165,7 +1035,6 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-deny
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-pdp
 
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-catalog
         let distinct_gts_type_ids: HashSet<MeterTypeId> = records
             .iter()
             .enumerate()
@@ -1190,7 +1059,6 @@ impl Service {
             .buffer_unordered(TYPE_RESOLUTION_FANOUT_CONCURRENCY)
             .collect()
             .await;
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-catalog
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-foreach-validate
         for (index, record) in records.into_iter().enumerate() {
@@ -1202,7 +1070,6 @@ impl Service {
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-deny
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-pdp
 
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-catalog
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-unknown-usage-type
             // The declaration pre-pass populated `declaration_cache` with a
             // Clone outcome per distinct gts_type_id; every PDP-allowed
@@ -1226,7 +1093,6 @@ impl Service {
                 }
             };
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-unknown-usage-type
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-catalog
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics-invalid
@@ -1606,121 +1472,6 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-success
     }
 
-    /// Read a single `UsageType` from the bound storage plugin's catalog.
-    ///
-    /// A plugin `UsageTypeNotFound` is surfaced verbatim through the
-    /// dispatch-boundary translation as
-    /// [`UsageCollectorError::NotFound`].
-    ///
-    /// # Errors
-    ///
-    /// * [`UsageCollectorError::PermissionDenied`] /
-    ///   [`UsageCollectorError::ServiceUnavailable`] when the PDP denies or
-    ///   is unavailable.
-    /// * [`UsageCollectorError::NotFound`] when the catalog has no
-    ///   row for `gts_id`.
-    /// * Any other [`UsageCollectorError`] variant lifted from a plugin
-    ///   transport / persistence failure.
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-nfr-availability:p1
-    pub async fn get_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorError> {
-        let result = async move {
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-pdp
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-pdp-deny
-            authz::authorize(
-                &self.enforcer,
-                self.metrics.as_ref(),
-                PdpOp::UsageTypeGet,
-                ctx,
-                &usage_type::RESOURCE,
-                usage_type::actions::GET,
-            )
-            .await
-            .map_err(UsageCollectorError::from)?;
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-pdp-deny
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-pdp
-            let plugin = self
-                .resolve_plugin_for(PluginOp::GetUsageType)
-                .await
-                .map_err(UsageCollectorError::from)?;
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-repo-find-by-id
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-not-found
-            instrument_spi(
-                self.metrics.as_ref(),
-                PluginOp::GetUsageType,
-                plugin.get_usage_type(gts_id),
-            )
-            .await
-            .map_err(|e| UsageCollectorError::from(DomainError::from(e)))
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-not-found
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-repo-find-by-id
-        }
-        .await;
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-requests-metric
-        let (outcome, error_category) = classify_usage_type_result(&result);
-        self.metrics
-            .record_usage_type_request(UsageTypeOp::Get, outcome, error_category);
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-requests-metric
-        result
-    }
-
-    /// List `UsageType` records from the bound storage plugin's catalog.
-    ///
-    /// # Errors
-    ///
-    /// * [`UsageCollectorError::PermissionDenied`] /
-    ///   [`UsageCollectorError::ServiceUnavailable`] when the PDP denies or
-    ///   is unavailable.
-    /// * Any other [`UsageCollectorError`] variant lifted from a plugin
-    ///   transport / persistence failure.
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1
-    pub async fn list_usage_types(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorError> {
-        let result = async move {
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-pdp
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-pdp-deny
-            authz::authorize(
-                &self.enforcer,
-                self.metrics.as_ref(),
-                PdpOp::UsageTypeList,
-                ctx,
-                &usage_type::RESOURCE,
-                usage_type::actions::LIST,
-            )
-            .await
-            .map_err(UsageCollectorError::from)?;
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-pdp-deny
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-pdp
-            let plugin = self
-                .resolve_plugin_for(PluginOp::ListUsageTypes)
-                .await
-                .map_err(UsageCollectorError::from)?;
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-plugin-read
-            instrument_spi(
-                self.metrics.as_ref(),
-                PluginOp::ListUsageTypes,
-                plugin.list_usage_types(query),
-            )
-            .await
-            .map_err(|e| UsageCollectorError::from(DomainError::from(e)))
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-plugin-read
-        }
-        .await;
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-requests-metric
-        let (outcome, error_category) = classify_usage_type_result(&result);
-        self.metrics
-            .record_usage_type_request(UsageTypeOp::List, outcome, error_category);
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-requests-metric
-        result
-    }
-
     /// Keyset-paginated list of `UsageRecord`s from the bound storage
     /// plugin's table, narrowed by the PDP-returned constraints.
     ///
@@ -1983,159 +1734,6 @@ impl Service {
             .record_query_request(QueryKind::Aggregated, outcome, error_category, seconds);
         // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-telemetry-complete
         result
-    }
-
-    /// Delete a `UsageType` row from the bound storage plugin's catalog.
-    ///
-    /// The plugin surfaces FK-rejection as
-    /// [`UsageCollectorError::Conflict`] and a missing target as
-    /// [`UsageCollectorError::NotFound`].
-    ///
-    /// # Errors
-    ///
-    /// * [`UsageCollectorError::PermissionDenied`] /
-    ///   [`UsageCollectorError::ServiceUnavailable`] when the PDP denies or
-    ///   is unavailable.
-    /// * [`UsageCollectorError::NotFound`] when no catalog row
-    ///   matches `gts_id`.
-    /// * [`UsageCollectorError::Conflict`] when active records
-    ///   still reference the target.
-    /// * Any other [`UsageCollectorError`] variant lifted from a plugin
-    ///   transport / persistence failure.
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-fr-usage-type-deletion:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-seq-delete-usage-type:p1
-    pub async fn delete_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorError> {
-        let result = async move {
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-pdp-authorize
-            authz::authorize(
-                &self.enforcer,
-                self.metrics.as_ref(),
-                PdpOp::UsageTypeDelete,
-                ctx,
-                &usage_type::RESOURCE,
-                usage_type::actions::DELETE,
-            )
-            .await
-            .map_err(UsageCollectorError::from)?;
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-pdp-authorize
-            let plugin = self
-                .resolve_plugin_for(PluginOp::DeleteUsageType)
-                .await
-                .map_err(UsageCollectorError::from)?;
-            // The plugin SPI catch is expressed as a composed `From` chain
-            // (`UsageCollectorPluginError` → `DomainError` → `UsageCollectorError`).
-            // Variant-specific routing for `UsageTypeNotFound` and
-            // `UsageTypeReferenced` lives in `infra::sdk_error_mapping`, where
-            // each canonical-lift arm carries its own instruction marker.
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-spi-dispatch
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-spi-catch
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-spi-fail
-            instrument_spi(
-                self.metrics.as_ref(),
-                PluginOp::DeleteUsageType,
-                plugin.delete_usage_type(gts_id),
-            )
-            .await
-            .map_err(|e| UsageCollectorError::from(DomainError::from(e)))?;
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-spi-fail
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-spi-catch
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-spi-dispatch
-            // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-spi-delete-return
-            // @cpt-begin:cpt-cf-usage-collector-state-usage-type-lifecycle-usage-type-registration-lifecycle:p2:inst-state-usage-type-lifecycle-not-registered
-            Ok(())
-            // @cpt-end:cpt-cf-usage-collector-state-usage-type-lifecycle-usage-type-registration-lifecycle:p2:inst-state-usage-type-lifecycle-not-registered
-            // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-spi-delete-return
-        }
-        .await;
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-requests-metric
-        let (outcome, error_category) = classify_usage_type_result(&result);
-        self.metrics
-            .record_usage_type_request(UsageTypeOp::Delete, outcome, error_category);
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-requests-metric
-        result
-    }
-
-    /// Best-effort refresh of the `uc_usage_types` gauge to the true catalog
-    /// entry count, read via full cursor pagination over the Plugin SPI
-    /// `list_usage_types`.
-    ///
-    /// Invoked on a fixed interval by the gear's `serve` lifecycle loop (see
-    /// `crate::module`), NOT on the create/delete caller path — so a slow, hung,
-    /// or failing plugin never touches a committed mutation. Both the plugin
-    /// resolve (whose cold path round-trips `types-registry` with no inner
-    /// timeout) and the paginated read run inside
-    /// [`USAGE_TYPES_GAUGE_REFRESH_TIMEOUT`]; on timeout, SPI error, an
-    /// undecodable `next_cursor`, a page-cap breach, or an unbound plugin the
-    /// gauge is left at its prior value — a failed refresh is a no-op, never a
-    /// reset, and a partial pagination is never published.
-    ///
-    /// Each gear instance reports the whole-catalog count independently, so this
-    /// series MUST be aggregated across replicas with `max`/`last`, never `sum`.
-    ///
-    /// This maintenance read is intentionally NOT routed through `instrument_spi`
-    /// (internal gauge upkeep, not a caller-facing plugin dispatch).
-    pub(crate) async fn refresh_usage_types_gauge(&self) {
-        let counted = tokio::time::timeout(USAGE_TYPES_GAUGE_REFRESH_TIMEOUT, async {
-            // Resolve the plugin inside the bounded region: `get_plugin`'s cold
-            // path runs `resolve_plugin` → `registry.list_instances()` with no
-            // inner timeout, so a hung/slow types-registry resolve is covered
-            // here rather than stalling the refresh loop. An unbound plugin
-            // (lazy binding not yet resolved) is a best-effort no-op.
-            let Ok(plugin) = self.get_plugin().await else {
-                return None;
-            };
-            let mut total: u64 = 0;
-            let mut query = ODataQuery::default().with_limit(USAGE_TYPES_GAUGE_PAGE_LIMIT);
-            for _ in 0..USAGE_TYPES_GAUGE_MAX_PAGES {
-                let page = match plugin.list_usage_types(&query).await {
-                    Ok(page) => page,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "uc_usage_types refresh: list_usage_types failed; gauge unchanged"
-                        );
-                        return None;
-                    }
-                };
-                total = total.saturating_add(u64::try_from(page.items.len()).unwrap_or(u64::MAX));
-                let Some(token) = page.page_info.next_cursor else {
-                    return Some(total);
-                };
-                match CursorV1::decode(&token) {
-                    Ok(cursor) => {
-                        query = ODataQuery::default()
-                            .with_limit(USAGE_TYPES_GAUGE_PAGE_LIMIT)
-                            .with_cursor(cursor);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "uc_usage_types refresh: undecodable next_cursor; gauge unchanged"
-                        );
-                        return None;
-                    }
-                }
-            }
-            tracing::warn!(
-                max_pages = USAGE_TYPES_GAUGE_MAX_PAGES,
-                "uc_usage_types refresh: page cap hit; gauge unchanged"
-            );
-            None
-        })
-        .await;
-        match counted {
-            Ok(Some(total)) => self.metrics.set_usage_types(total),
-            // Best-effort: SPI error / undecodable cursor / page cap — leave the gauge.
-            Ok(None) => {}
-            Err(_elapsed) => {
-                tracing::warn!("uc_usage_types refresh timed out; gauge unchanged");
-            }
-        }
     }
 
     /// Lazily resolves and returns the bound storage-plugin client.

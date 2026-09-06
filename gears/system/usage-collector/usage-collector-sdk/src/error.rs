@@ -21,8 +21,8 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::gts::{USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE};
-use crate::models::{AggregationOp, MeterTypeId, UsageKind, UsageTypeGtsId};
+use crate::gts::USAGE_RECORD_RESOURCE;
+use crate::models::MeterTypeId;
 use crate::reason::{ConflictReason, ValidationReason};
 
 /// Public error envelope for the Usage Collector SDK and REST surfaces.
@@ -43,13 +43,12 @@ pub enum UsageCollectorError {
     /// the attributed request field, `reason` the typed
     /// [`ValidationReason`] discriminator, and `detail` the wire
     /// `field_violations[0].description`. `resource_type` identifies the GTS
-    /// resource the violation is about (a `gts_id`-shaped field violation
-    /// attributes to the usage type even on the ingestion surface);
-    /// `resource_name`, when present, is the offending `gts_id`.
+    /// resource the violation is about (a `gts_type_id`-shaped field
+    /// violation attributes to the referenced meter even on the ingestion
+    /// surface); `resource_name`, when present, is the offending identifier.
     #[error("invalid argument [{field}/{reason}]: {detail}")]
     InvalidArgument {
-        /// GTS resource type — [`USAGE_TYPE_RESOURCE`] or
-        /// [`USAGE_RECORD_RESOURCE`].
+        /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
         /// Offending resource name (`gts_id`), when the violation is about a
         /// specific resource; `None` otherwise.
@@ -63,11 +62,10 @@ pub enum UsageCollectorError {
     },
 
     /// Referenced resource not found (HTTP 404). `resource_type` is the GTS
-    /// type, `name` the raw identifier (`gts_id` or record UUID).
+    /// type, `name` the raw identifier (a `gts_type_id` or a record UUID).
     #[error("not found [{resource_type}]: {detail}")]
     NotFound {
-        /// GTS resource type — [`USAGE_TYPE_RESOURCE`] or
-        /// [`USAGE_RECORD_RESOURCE`].
+        /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
         /// Raw identifier whose row was not present.
         name: String,
@@ -79,7 +77,7 @@ pub enum UsageCollectorError {
     /// resubmission is idempotent and returns the stored row on `Ok`.
     #[error("already exists [{resource_type}]: {detail}")]
     AlreadyExists {
-        /// GTS resource type — [`USAGE_TYPE_RESOURCE`].
+        /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
         /// Raw identifier (`gts_id`) that collided.
         name: String,
@@ -93,8 +91,7 @@ pub enum UsageCollectorError {
     /// `name` identify the row involved.
     #[error("conflict [{reason}]: {detail}")]
     Conflict {
-        /// GTS resource type — [`USAGE_TYPE_RESOURCE`] or
-        /// [`USAGE_RECORD_RESOURCE`].
+        /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
         /// Raw identifier of the row involved (`gts_id` / record UUID).
         name: String,
@@ -187,37 +184,6 @@ impl UsageCollectorError {
         }
     }
 
-    /// `CreateUsageType.metadata_fields[index]` was not a well-formed
-    /// metadata key. `empty` selects the empty-string vs. invalid-key reason.
-    #[must_use]
-    pub fn invalid_metadata_field(index: usize, empty: bool) -> Self {
-        let reason = if empty {
-            ValidationReason::MetadataFieldEmptyString
-        } else {
-            ValidationReason::MetadataFieldInvalidKey
-        };
-        let wire = reason.as_wire().to_owned();
-        Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: None,
-            field: format!("metadata_fields[{index}]"),
-            reason,
-            detail: format!("metadata_fields[{index}] rejected: {wire}"),
-        }
-    }
-
-    /// Duplicate entry in `CreateUsageType.metadata_fields`.
-    #[must_use]
-    pub fn duplicate_metadata_field(index: usize) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: None,
-            field: format!("metadata_fields[{index}]"),
-            reason: ValidationReason::MetadataFieldDuplicate,
-            detail: format!("metadata_fields[{index}] is a duplicate entry"),
-        }
-    }
-
     /// A raw / aggregated query omitted the mandatory bounded `created_at`
     /// window.
     #[must_use]
@@ -253,18 +219,6 @@ impl UsageCollectorError {
         }
     }
 
-    /// `UsageTypeGtsId::new` rejected `raw` — malformed / wrong-base `gts_id`.
-    #[must_use]
-    pub fn invalid_usage_type_gts_id(raw: &str, reason: &str) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "gts_id".to_owned(),
-            reason: ValidationReason::InvalidBaseGtsId,
-            detail: format!("gts_id `{raw}` rejected: {reason}"),
-        }
-    }
-
     /// `MeterTypeId::new` rejected `raw` — malformed, wrong-base, or
     /// multi-segment `gts_type_id`.
     #[must_use]
@@ -278,25 +232,13 @@ impl UsageCollectorError {
         }
     }
 
-    /// `UsageKind::from_str` received a string other than `counter`/`gauge`.
-    #[must_use]
-    pub fn invalid_usage_kind(raw: &str) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "kind".to_owned(),
-            reason: ValidationReason::Validation,
-            detail: format!("unknown usage kind `{raw}`; expected `counter` or `gauge`"),
-        }
-    }
-
     /// `AggregationFold::from_str` received a string outside the declared
     /// set. Raised when a resolved declaration names a fold this major
     /// version does not serve.
     #[must_use]
     pub fn invalid_aggregation_fold(raw: &str) -> Self {
         Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: None,
             field: "aggregation_fold".to_owned(),
             reason: ValidationReason::Validation,
@@ -350,65 +292,13 @@ impl UsageCollectorError {
         Self::newtype_validation("idempotency_key", detail)
     }
 
-    /// Compensation submitted against a gauge meter. Emitted on the
-    /// ingestion surface, so the wire `resource_type` is the usage **record**
-    /// resource, with `resource_name` carrying the offending gauge
-    /// `gts_type_id` (`field` = `corrects_id`).
-    #[must_use]
-    pub fn gauge_compensation_rejected(gts_type_id: &MeterTypeId) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: Some(gts_type_id.as_ref().to_owned()),
-            field: "corrects_id".to_owned(),
-            reason: ValidationReason::GaugeCompensationRejected,
-            detail: format!("compensation against gauge meter {gts_type_id} is rejected"),
-        }
-    }
-
-    /// Dead: no path constructs this any more. It named an aggregation op
-    /// requested against a usage kind that does not admit it (`SUM` on a
-    /// gauge, or `MIN`/`MAX`/`AVG` on a counter), attributed to the
-    /// usage-type resource with the offending `gts_type_id` as `resource_name`
-    /// and the aggregation operator field as `field`. There is no
-    /// caller-chosen op any more — the fold is resolved from the queried
-    /// meter's declaration — so `field: "aggregation.op"` below now names a
-    /// request-body field the aggregate-request DTO no longer carries.
-    /// Removed with [`crate::AggregationOp`] / [`crate::AggregationSpec`].
-    #[must_use]
-    pub fn aggregation_op_not_allowed_for_kind(
-        op: AggregationOp,
-        kind: UsageKind,
-        gts_type_id: &MeterTypeId,
-    ) -> Self {
-        let op_str = match op {
-            AggregationOp::Sum => "sum",
-            AggregationOp::Count => "count",
-            AggregationOp::Min => "min",
-            AggregationOp::Max => "max",
-            AggregationOp::Avg => "avg",
-        };
-        let (kind_str, allowed) = match kind {
-            UsageKind::Counter => ("counter", "sum, count"),
-            UsageKind::Gauge => ("gauge", "min, max, avg, count"),
-        };
-        Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: Some(gts_type_id.as_ref().to_owned()),
-            field: "aggregation.op".to_owned(),
-            reason: ValidationReason::OpNotAllowedForKind,
-            detail: format!(
-                "aggregation op `{op_str}` is not valid for {kind_str} usage type \
-                 {gts_type_id}; {kind_str} allows {{{allowed}}}"
-            ),
-        }
-    }
-
-    /// Ingestion supplied a metadata key not declared in the meter's
-    /// closed `metadata_fields`. Attributes to the usage type resource.
+    /// Ingestion supplied a metadata key not declared in the referenced
+    /// meter's resolved closed `metadata_fields`. Attributed to the record
+    /// resource, with `resource_name` carrying the offending `gts_type_id`.
     #[must_use]
     pub fn unknown_metadata_key(gts_type_id: &MeterTypeId, key: &str) -> Self {
         Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: Some(gts_type_id.as_ref().to_owned()),
             field: "metadata".to_owned(),
             reason: ValidationReason::UnknownMetadataKey,
@@ -417,16 +307,6 @@ impl UsageCollectorError {
     }
 
     // ── NotFound (404) ──────────────────────────────────────────────────
-
-    /// Catalog `gts_id` not present (catalog admin op, ingestion, or query).
-    #[must_use]
-    pub fn usage_type_not_found(gts_id: &UsageTypeGtsId) -> Self {
-        Self::NotFound {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            name: gts_id.as_ref().to_owned(),
-            detail: format!("usage type not found: {gts_id}"),
-        }
-    }
 
     /// Deactivation / get referenced a `UsageRecord.id` that does not exist.
     #[must_use]
@@ -452,33 +332,7 @@ impl UsageCollectorError {
         }
     }
 
-    // ── AlreadyExists (409) ─────────────────────────────────────────────
-
-    /// `create_usage_type` collided with an existing, payload-different row.
-    #[must_use]
-    pub fn usage_type_already_exists(gts_id: &UsageTypeGtsId) -> Self {
-        Self::AlreadyExists {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            name: gts_id.as_ref().to_owned(),
-            detail: format!("usage type already exists: {gts_id}"),
-        }
-    }
-
     // ── Conflict / Aborted (409) ────────────────────────────────────────
-
-    /// `delete_usage_type` refused: still referenced by `sample_ref_count`
-    /// samples (at least `1`).
-    #[must_use]
-    pub fn usage_type_referenced(gts_id: &UsageTypeGtsId, sample_ref_count: u64) -> Self {
-        Self::Conflict {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            name: gts_id.as_ref().to_owned(),
-            reason: ConflictReason::UsageTypeReferenced,
-            detail: format!(
-                "usage type {gts_id} is still referenced by {sample_ref_count} samples"
-            ),
-        }
-    }
 
     /// Deactivation targeted a record whose status was already `Inactive`.
     #[must_use]
@@ -611,7 +465,7 @@ impl UsageCollectorError {
 /// - [`Self::Internal`] — non-retryable unclassified failure (plugin
 ///   invariant broken, uncategorized backend error). Lifts to
 ///   [`UsageCollectorError::Internal`].
-/// - The catalog / record variants below — typed domain outcomes.
+/// - The record variants below — typed domain outcomes.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum UsageCollectorPluginError {
@@ -628,33 +482,6 @@ pub enum UsageCollectorPluginError {
         /// `ServiceUnavailable` envelope's `Retry-After` slot. Plugins
         /// that have no actionable hint pass `None`.
         retry_after_seconds: Option<u64>,
-    },
-
-    /// `get_usage_type` / `delete_usage_type` referenced a `gts_id` absent
-    /// from the catalog.
-    #[error("usage type not found: {gts_id}")]
-    UsageTypeNotFound {
-        /// Catalog `gts_id` that was not found.
-        gts_id: UsageTypeGtsId,
-    },
-
-    /// `create_usage_type` collided with an existing row whose payload
-    /// differs.
-    #[error("usage type already exists: {gts_id}")]
-    UsageTypeAlreadyExists {
-        /// Catalog `gts_id` that collided.
-        gts_id: UsageTypeGtsId,
-    },
-
-    /// `delete_usage_type` was rejected because the usage type is still
-    /// referenced by `sample_ref_count` samples (a bounded count, at
-    /// least `1`).
-    #[error("usage type {gts_id} is still referenced by {sample_ref_count} samples")]
-    UsageTypeReferenced {
-        /// Catalog `gts_id` that could not be deleted.
-        gts_id: UsageTypeGtsId,
-        /// Bounded sample count of referencing rows.
-        sample_ref_count: u64,
     },
 
     /// Idempotency conflict at the persistence boundary: the supplied

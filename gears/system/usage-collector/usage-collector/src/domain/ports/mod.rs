@@ -11,5 +11,5 @@ pub use metrics::{
     AuthzDecision, DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome,
     NoopMetrics, PdpFailureCause, PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory,
     QueryKind, RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome,
-    UsageCollectorMetrics, UsageTypeErrorCategory, UsageTypeOp,
+    TypeResolutionOutcome, UsageCollectorMetrics,
 };

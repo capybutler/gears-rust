@@ -4,12 +4,6 @@ use toolkit::gts::PluginV1;
 use toolkit_gts::gts_id;
 use toolkit_gts::gts_type_schema;
 
-/// Canonical GTS resource type for Usage Type
-/// `resource_type` carried by [`crate::UsageCollectorError`] envelopes about
-/// a usage type (`create` / `get` / `list` / `delete`). Match
-/// [`crate::UsageCollectorError::NotFound::resource_type`] etc. against this.
-pub const USAGE_TYPE_RESOURCE: &str = gts_id!("cf.core.uc.usage_type.v1~");
-
 /// Canonical GTS resource type for the **ingestion** surface — the wire
 /// `resource_type` carried by [`crate::UsageCollectorError`] envelopes about
 /// a usage record (`create` / `deactivate` / `list` / `aggregate`).

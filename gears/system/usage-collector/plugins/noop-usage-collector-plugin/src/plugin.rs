@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use usage_collector_sdk::{
     AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
-    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
+    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 
 #[derive(Debug, Default)]
@@ -76,35 +76,6 @@ impl UsageCollectorPluginV1 for NoopBackend {
 
     async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::UsageRecordNotFound { id })
-    }
-
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1
-    async fn create_usage_type(
-        &self,
-        usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        Ok(usage_type)
-    }
-
-    async fn get_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::UsageTypeNotFound { gts_id })
-    }
-
-    async fn list_usage_types(
-        &self,
-        _query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorPluginError> {
-        Ok(ODataPage::empty(0))
-    }
-
-    async fn delete_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::UsageTypeNotFound { gts_id })
     }
 }
 

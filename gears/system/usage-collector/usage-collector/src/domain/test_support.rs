@@ -31,13 +31,13 @@ use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
     AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
-    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
+    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 use uuid::Uuid;
 
 /// Minimal mock storage-plugin client.
 ///
-/// The `UsageCollectorPluginV1` SPI surface carries nine methods. The mock
+/// The `UsageCollectorPluginV1` SPI surface carries six methods. The mock
 /// here exists purely so the Plugin Host can resolve a concrete
 /// `Arc<dyn UsageCollectorPluginV1>` from `ClientHub` and so cache tests can
 /// assert `Arc::ptr_eq` on the resolved handle. Every method returns a
@@ -102,42 +102,6 @@ impl UsageCollectorPluginV1 for MockPlugin {
     async fn deactivate_usage_record(&self, _id: Uuid) -> Result<(), UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::internal(
             "test_fake: MockPlugin::deactivate_usage_record not implemented",
-        ))
-    }
-
-    async fn create_usage_type(
-        &self,
-        _usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::internal(
-            "test_fake: MockPlugin::create_usage_type not implemented",
-        ))
-    }
-
-    async fn get_usage_type(
-        &self,
-        _gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::internal(
-            "test_fake: MockPlugin::get_usage_type not implemented",
-        ))
-    }
-
-    async fn list_usage_types(
-        &self,
-        _query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::internal(
-            "test_fake: MockPlugin::list_usage_types not implemented",
-        ))
-    }
-
-    async fn delete_usage_type(
-        &self,
-        _gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::internal(
-            "test_fake: MockPlugin::delete_usage_type not implemented",
         ))
     }
 
@@ -510,13 +474,14 @@ use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 /// here rather than the real `types-registry` adapter (that would require
 /// this domain-layer module to import a concrete `infra` type).
 #[must_use]
-fn inert_type_resolver() -> Arc<TypeResolver> {
+fn inert_type_resolver(metrics: Arc<dyn UsageCollectorMetrics>) -> Arc<TypeResolver> {
     Arc::new(TypeResolver::new(
         Arc::new(UnavailableDeclarationSource),
         TypeResolverConfig {
             ttl: std::time::Duration::from_secs(1),
             capacity: 1,
         },
+        metrics,
     ))
 }
 
@@ -690,8 +655,8 @@ fn build_service(
     metrics: Arc<dyn UsageCollectorMetrics>,
 ) -> (Arc<Service>, Arc<dyn AuthZResolverApi>) {
     let type_resolver = match params.source {
-        Some(source) => type_resolver_over(source),
-        None => inert_type_resolver(),
+        Some(source) => type_resolver_over(source, Arc::clone(&metrics)),
+        None => inert_type_resolver(Arc::clone(&metrics)),
     };
     let resolver = params.resolver.unwrap_or_else(|| {
         Arc::clone(&CountingTenantPermitResolver::new()) as Arc<dyn AuthZResolverApi>
@@ -715,13 +680,17 @@ fn build_service(
 /// test's several service calls hit the same cached entry rather than
 /// re-resolving.
 #[must_use]
-fn type_resolver_over(source: Arc<dyn DeclarationSource>) -> Arc<TypeResolver> {
+fn type_resolver_over(
+    source: Arc<dyn DeclarationSource>,
+    metrics: Arc<dyn UsageCollectorMetrics>,
+) -> Arc<TypeResolver> {
     Arc::new(TypeResolver::new(
         source,
         TypeResolverConfig {
             ttl: std::time::Duration::from_mins(1),
             capacity: 16,
         },
+        metrics,
     ))
 }
 
@@ -782,12 +751,13 @@ pub fn service_with_metrics_unready_plugin(
 ) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
     let hub = hub_registry_only(suffix, "cyberfabric");
     let (metrics, provider, exporter) = local_metrics();
+    let type_resolver = inert_type_resolver(Arc::clone(&metrics) as Arc<dyn UsageCollectorMetrics>);
     let service = Arc::new(Service::new_with_metrics(
         hub,
         "cyberfabric".to_owned(),
         enforcer_for(resolver),
         metrics,
-        inert_type_resolver(),
+        type_resolver,
         crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
     ));
     (service, provider, exporter)
@@ -1001,47 +971,19 @@ pub struct HappyPathPlugin {
     create_records_response: Mutex<Option<CreateRecordsBatchResult>>,
     deactivate_response: Mutex<Option<()>>,
     get_record_response: Mutex<Option<UsageRecord>>,
-    create_usage_type_response: Mutex<Option<UsageType>>,
-    get_usage_type_response: Mutex<Option<UsageType>>,
-    /// `gts_id`s that should surface as
-    /// `UsageCollectorPluginError::UsageTypeNotFound` instead of returning
-    /// the default `get_usage_type_response`. Lets tests verify per-record
-    /// not-found projection on the batch path.
-    get_usage_type_not_found: Mutex<std::collections::BTreeSet<UsageTypeGtsId>>,
-    list_usage_types_response: Mutex<Option<ODataPage<UsageType>>>,
-    /// When set, `list_usage_types` never completes (returns a pending future),
-    /// so tests can drive the bounded gauge-refresh timeout under paused time.
-    list_usage_types_hang: Mutex<bool>,
-    /// FIFO of pages returned by successive `list_usage_types` calls; when
-    /// non-empty it takes precedence over `list_usage_types_response`, popping
-    /// one page per call so tests can exercise full cursor pagination.
-    list_usage_types_pages: Mutex<std::collections::VecDeque<ODataPage<UsageType>>>,
     list_usage_records_response: Mutex<Option<ODataPage<UsageRecord>>>,
     query_aggregated_usage_records_response: Mutex<Option<AggregationResult>>,
     /// Every [`AggregationFold`] passed to `query_aggregated_usage_records`,
     /// in call order. `len()` is the call count ([`HappyPathPlugin::calls`])
-    /// and the last entry is [`HappyPathPlugin::last_fold`] — the same
-    /// "inputs" recording shape as `get_usage_type_inputs`, doubling as the
-    /// [`RecordingPlugin`] spy for the declared-fold tests.
+    /// and the last entry is [`HappyPathPlugin::last_fold`] — the
+    /// [`RecordingPlugin`] spy shape for the declared-fold tests.
     query_aggregated_usage_records_folds: Mutex<Vec<AggregationFold>>,
-    delete_usage_type_response: Mutex<Option<()>>,
 
     create_record_input: Mutex<Option<UsageRecord>>,
     create_records_input: Mutex<Option<Vec<UsageRecord>>>,
     deactivate_input: Mutex<Option<Uuid>>,
-    delete_usage_type_input: Mutex<Option<UsageTypeGtsId>>,
-    create_usage_type_input: Mutex<Option<UsageType>>,
-    /// Every `ODataQuery` ever forwarded to `list_usage_types`, in call
-    /// order. Lets handler tests pin that the handler forwarded the
-    /// query unchanged to the service (and hence to the SPI).
-    list_usage_types_inputs: Mutex<Vec<ODataQuery>>,
-    /// Every `gts_id` ever passed to `get_usage_type`, in call order.
-    /// `len()` is the call count; the vec is forensic — tests can
-    /// verify exactly which `gts_id`s the host looked up.
-    get_usage_type_inputs: Mutex<Vec<UsageTypeGtsId>>,
     /// Every record `id` ever passed to `get_usage_record`, in call
-    /// order. Drives the L1-corrects-id dedup tests the same way
-    /// `get_usage_type_inputs` drives the catalog-dedup tests.
+    /// order. Drives the L1-corrects-id dedup tests.
     get_usage_record_inputs: Mutex<Vec<Uuid>>,
     /// Record `id`s that should surface as
     /// `UsageCollectorPluginError::UsageRecordNotFound` instead of
@@ -1057,23 +999,12 @@ impl HappyPathPlugin {
             create_records_response: Mutex::new(None),
             deactivate_response: Mutex::new(None),
             get_record_response: Mutex::new(None),
-            create_usage_type_response: Mutex::new(None),
-            get_usage_type_response: Mutex::new(None),
-            get_usage_type_not_found: Mutex::new(std::collections::BTreeSet::new()),
-            list_usage_types_response: Mutex::new(None),
-            list_usage_types_hang: Mutex::new(false),
-            list_usage_types_pages: Mutex::new(std::collections::VecDeque::new()),
             list_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_folds: Mutex::new(Vec::new()),
-            delete_usage_type_response: Mutex::new(None),
             create_record_input: Mutex::new(None),
             create_records_input: Mutex::new(None),
             deactivate_input: Mutex::new(None),
-            delete_usage_type_input: Mutex::new(None),
-            create_usage_type_input: Mutex::new(None),
-            list_usage_types_inputs: Mutex::new(Vec::new()),
-            get_usage_type_inputs: Mutex::new(Vec::new()),
             get_usage_record_inputs: Mutex::new(Vec::new()),
             get_usage_record_not_found: Mutex::new(std::collections::BTreeSet::new()),
         })
@@ -1098,31 +1029,6 @@ impl HappyPathPlugin {
     pub fn set_get_record(&self, record: UsageRecord) {
         *self.get_record_response.lock().expect("mutex") = Some(record);
     }
-    pub fn set_create_usage_type(&self, ut: UsageType) {
-        *self.create_usage_type_response.lock().expect("mutex") = Some(ut);
-    }
-    pub fn set_get_usage_type(&self, ut: UsageType) {
-        *self.get_usage_type_response.lock().expect("mutex") = Some(ut);
-    }
-    /// Mark `gts_id` so the next (and every subsequent) `get_usage_type`
-    /// call carrying it returns `UsageTypeNotFound` regardless of the
-    /// default `get_usage_type_response`.
-    pub fn set_get_usage_type_not_found(&self, gts_id: UsageTypeGtsId) {
-        self.get_usage_type_not_found
-            .lock()
-            .expect("mutex")
-            .insert(gts_id);
-    }
-    /// Every `gts_id` passed to `get_usage_type`, in call order.
-    #[must_use]
-    pub fn get_usage_type_inputs(&self) -> Vec<UsageTypeGtsId> {
-        self.get_usage_type_inputs.lock().expect("mutex").clone()
-    }
-    /// Total number of `get_usage_type` SPI dispatches so far.
-    #[must_use]
-    pub fn get_usage_type_calls(&self) -> usize {
-        self.get_usage_type_inputs.lock().expect("mutex").len()
-    }
     /// Mark `id` so the next (and every subsequent) `get_usage_record`
     /// call carrying it returns `UsageRecordNotFound` regardless of the
     /// default `get_record_response`.
@@ -1141,23 +1047,6 @@ impl HappyPathPlugin {
     #[must_use]
     pub fn get_usage_record_calls(&self) -> usize {
         self.get_usage_record_inputs.lock().expect("mutex").len()
-    }
-    pub fn set_list_usage_types(&self, page: ODataPage<UsageType>) {
-        *self.list_usage_types_response.lock().expect("mutex") = Some(page);
-    }
-    /// Program a FIFO sequence of pages returned by successive
-    /// `list_usage_types` calls. Takes precedence over the single-page
-    /// `set_list_usage_types` response; used to exercise full cursor
-    /// pagination (and its best-effort exhaustion) in the gauge refresh.
-    pub fn set_list_usage_types_pages(&self, pages: Vec<ODataPage<UsageType>>) {
-        *self.list_usage_types_pages.lock().expect("mutex") = pages.into();
-    }
-    /// Make every subsequent `list_usage_types` call hang forever (a
-    /// never-completing future). Used to drive the bounded gauge-refresh
-    /// timeout in `refresh_usage_types_gauge` without a wall-clock delay
-    /// (pair with `#[tokio::test(start_paused = true)]`).
-    pub fn set_list_usage_types_hang(&self) {
-        *self.list_usage_types_hang.lock().expect("mutex") = true;
     }
     pub fn set_list_usage_records_response(&self, page: ODataPage<UsageRecord>) {
         *self.list_usage_records_response.lock().expect("mutex") = Some(page);
@@ -1187,10 +1076,6 @@ impl HappyPathPlugin {
             .last()
             .copied()
     }
-    pub fn set_delete_usage_type_ok(&self) {
-        *self.delete_usage_type_response.lock().expect("mutex") = Some(());
-    }
-
     pub fn last_create_record_input(&self) -> Option<UsageRecord> {
         self.create_record_input.lock().expect("mutex").clone()
     }
@@ -1199,27 +1084,6 @@ impl HappyPathPlugin {
     }
     pub fn last_deactivate_input(&self) -> Option<Uuid> {
         *self.deactivate_input.lock().expect("mutex")
-    }
-    pub fn last_delete_usage_type_input(&self) -> Option<UsageTypeGtsId> {
-        self.delete_usage_type_input.lock().expect("mutex").clone()
-    }
-    pub fn last_create_usage_type_input(&self) -> Option<UsageType> {
-        self.create_usage_type_input.lock().expect("mutex").clone()
-    }
-    /// Every `ODataQuery` passed to `list_usage_types`, in call order.
-    #[must_use]
-    pub fn list_usage_types_inputs(&self) -> Vec<ODataQuery> {
-        self.list_usage_types_inputs.lock().expect("mutex").clone()
-    }
-    /// The most-recent `ODataQuery` passed to `list_usage_types`, or
-    /// `None` if the SPI was never invoked.
-    #[must_use]
-    pub fn last_list_usage_types_input(&self) -> Option<ODataQuery> {
-        self.list_usage_types_inputs
-            .lock()
-            .expect("mutex")
-            .last()
-            .cloned()
     }
 }
 
@@ -1293,81 +1157,6 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
             .lock()
             .expect("mutex")
             .ok_or_else(|| not_programmed("deactivate_usage_record"))
-    }
-
-    async fn create_usage_type(
-        &self,
-        usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        *self.create_usage_type_input.lock().expect("mutex") = Some(usage_type);
-        self.create_usage_type_response
-            .lock()
-            .expect("mutex")
-            .clone()
-            .ok_or_else(|| not_programmed("create_usage_type"))
-    }
-
-    async fn get_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        self.get_usage_type_inputs
-            .lock()
-            .expect("mutex")
-            .push(gts_id.clone());
-        if self
-            .get_usage_type_not_found
-            .lock()
-            .expect("mutex")
-            .contains(&gts_id)
-        {
-            return Err(UsageCollectorPluginError::UsageTypeNotFound { gts_id });
-        }
-        self.get_usage_type_response
-            .lock()
-            .expect("mutex")
-            .clone()
-            .ok_or_else(|| not_programmed("get_usage_type"))
-    }
-
-    async fn list_usage_types(
-        &self,
-        query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorPluginError> {
-        self.list_usage_types_inputs
-            .lock()
-            .expect("mutex")
-            .push(query.clone());
-        if *self.list_usage_types_hang.lock().expect("mutex") {
-            // Never resolves — under a timeout the caller sees `Elapsed`.
-            std::future::pending::<()>().await;
-        }
-        // Multi-page queue takes precedence (full-pagination tests); pop one
-        // page per call. Falls back to the single programmable response.
-        if let Some(page) = self
-            .list_usage_types_pages
-            .lock()
-            .expect("mutex")
-            .pop_front()
-        {
-            return Ok(page);
-        }
-        self.list_usage_types_response
-            .lock()
-            .expect("mutex")
-            .clone()
-            .ok_or_else(|| not_programmed("list_usage_types"))
-    }
-
-    async fn delete_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorPluginError> {
-        *self.delete_usage_type_input.lock().expect("mutex") = Some(gts_id);
-        self.delete_usage_type_response
-            .lock()
-            .expect("mutex")
-            .ok_or_else(|| not_programmed("delete_usage_type"))
     }
 
     async fn get_usage_record(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {

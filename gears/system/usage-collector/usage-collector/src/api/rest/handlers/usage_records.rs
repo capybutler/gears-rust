@@ -788,8 +788,8 @@ fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsa
 /// (non-object, non-string value, etc.) are already rejected at axum's
 /// JSON boundary by the DTO type; only per-key validation remains here.
 ///
-/// Closed-shape membership against `UsageType.metadata_fields` and the
-/// configurable size cap remain a service-layer check
+/// Closed-shape membership against the resolved meter declaration's
+/// `metadata_fields` and the configurable size cap remain a service-layer check
 /// (`validate_submit_record_metadata`) that runs after this conversion.
 fn metadata_from_wire(
     raw: BTreeMap<String, String>,

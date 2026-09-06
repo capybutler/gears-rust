@@ -7,20 +7,12 @@
 //! error-envelope compaction — the public envelope is terminal — so these
 //! tests exercise the plugin->domain and domain->SDK directions only.
 
-use toolkit_gts::gts_id;
 use usage_collector_sdk::{
-    ConflictReason, MeterTypeId, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError,
-    UsageCollectorPluginError, UsageTypeGtsId, ValidationReason,
+    ConflictReason, MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError,
+    UsageCollectorPluginError, ValidationReason,
 };
 
 use super::*;
-
-const SAMPLE_USAGE_TYPE_ID: &str =
-    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
-
-fn sample_gts_id() -> UsageTypeGtsId {
-    UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived usage-type gts_id")
-}
 
 #[test]
 fn plugin_transient_maps_to_service_unavailable() {
@@ -122,101 +114,6 @@ fn plugin_not_found_maps_to_service_unavailable() {
 }
 
 #[test]
-fn domain_usage_type_not_found_lifts_to_sdk_not_found() {
-    let gts_id = sample_gts_id();
-    let domain = DomainError::UsageTypeNotFound {
-        gts_id: gts_id.clone(),
-    };
-    let sdk: UsageCollectorError = domain.into();
-    match sdk {
-        UsageCollectorError::NotFound {
-            resource_type,
-            name,
-            ..
-        } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
-            assert_eq!(name, gts_id.as_ref());
-        }
-        other => panic!("expected NotFound, got {other:?}"),
-    }
-}
-
-#[test]
-fn plugin_usage_type_not_found_lifts_to_domain_variant() {
-    let gts_id = sample_gts_id();
-    let domain: DomainError = UsageCollectorPluginError::UsageTypeNotFound {
-        gts_id: gts_id.clone(),
-    }
-    .into();
-    assert!(matches!(
-        &domain,
-        DomainError::UsageTypeNotFound { gts_id: g } if g == &gts_id
-    ));
-}
-
-#[test]
-fn domain_usage_type_already_exists_lifts_to_sdk_already_exists() {
-    let gts_id = sample_gts_id();
-    let domain = DomainError::UsageTypeAlreadyExists {
-        gts_id: gts_id.clone(),
-    };
-    let sdk: UsageCollectorError = domain.into();
-    match sdk {
-        UsageCollectorError::AlreadyExists {
-            resource_type,
-            name,
-            ..
-        } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
-            assert_eq!(name, gts_id.as_ref());
-        }
-        other => panic!("expected AlreadyExists, got {other:?}"),
-    }
-}
-
-#[test]
-fn plugin_usage_type_already_exists_lifts_to_domain_variant() {
-    let gts_id = sample_gts_id();
-    let domain: DomainError = UsageCollectorPluginError::UsageTypeAlreadyExists {
-        gts_id: gts_id.clone(),
-    }
-    .into();
-    assert!(matches!(
-        &domain,
-        DomainError::UsageTypeAlreadyExists { gts_id: g } if g == &gts_id
-    ));
-}
-
-#[test]
-fn plugin_usage_type_referenced_lifts_to_sdk_conflict() {
-    let gts_id = sample_gts_id();
-    let domain: DomainError = UsageCollectorPluginError::UsageTypeReferenced {
-        gts_id: gts_id.clone(),
-        sample_ref_count: 42,
-    }
-    .into();
-    assert!(matches!(
-        &domain,
-        DomainError::UsageTypeReferenced { gts_id: g, sample_ref_count: 42 } if g == &gts_id
-    ));
-    let sdk: UsageCollectorError = domain.into();
-    match sdk {
-        UsageCollectorError::Conflict {
-            resource_type,
-            name,
-            reason,
-            detail,
-        } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
-            assert_eq!(name, gts_id.as_ref());
-            assert_eq!(reason, ConflictReason::UsageTypeReferenced);
-            assert!(detail.contains("referenced by 42 samples"));
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
-}
-
-#[test]
 fn domain_unknown_metadata_key_lifts_to_invalid_argument() {
     let gts_type_id = sample_meter_id();
     let key = "unexpected_field".to_owned();
@@ -233,7 +130,7 @@ fn domain_unknown_metadata_key_lifts_to_invalid_argument() {
             detail,
             ..
         } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
+            assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
             assert_eq!(resource_name.as_deref(), Some(gts_type_id.as_ref()));
             assert_eq!(reason, ValidationReason::UnknownMetadataKey);
             assert!(detail.contains(&key));
@@ -369,7 +266,7 @@ fn other_domain_errors_are_not_declaration_not_found() {
 }
 
 #[test]
-fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_type_resource() {
+fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_record_resource() {
     let id = sample_meter_id();
     let domain = DomainError::declaration_not_found(&id);
     let sdk: UsageCollectorError = domain.into();
@@ -379,7 +276,7 @@ fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_type_resource()
             name,
             detail,
         } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
+            assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
             assert_eq!(name, id.as_str());
             assert!(detail.contains(id.as_str()));
             assert!(detail.contains("is not declared"));

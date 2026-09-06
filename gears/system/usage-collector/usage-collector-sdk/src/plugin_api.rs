@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::error::UsageCollectorPluginError;
 use crate::models::{
     AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
-    UsageRecord, UsageType, UsageTypeGtsId,
+    UsageRecord,
 };
 
 /// Backend storage adapter trait implemented by
@@ -74,28 +74,4 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// On `Ok(())`, the targeted record and every active record that
     /// compensates it are atomically flipped to `inactive`.
     async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError>;
-
-    /// Create a usage type.
-    async fn create_usage_type(
-        &self,
-        usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorPluginError>;
-
-    /// Get a usage type by `gts_id`.
-    async fn get_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorPluginError>;
-
-    /// List usage types ordered by `gts_id` ascending.
-    async fn list_usage_types(
-        &self,
-        query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorPluginError>;
-
-    /// Delete a usage type.
-    async fn delete_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorPluginError>;
 }

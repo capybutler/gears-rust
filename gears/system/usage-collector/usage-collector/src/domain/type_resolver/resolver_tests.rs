@@ -17,8 +17,98 @@ use usage_collector_sdk::{AggregationFold, MeterTypeId};
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::declarations::DeclarationSource;
+use crate::domain::ports::metrics::{TypeResolutionOutcome, UsageCollectorMetrics};
 
 use super::{TypeResolver, TypeResolverConfig};
+
+/// Counts `record_type_resolution` calls per [`TypeResolutionOutcome`], so
+/// these cache-policy tests can pin that each of the resolver's real
+/// branches reports the outcome DESIGN §3.11.5's `uc_type_resolution_total`
+/// expects — not just that `resolve` itself returns the right `Result`.
+#[derive(Default)]
+struct RecordingMetrics {
+    cache_hit: AtomicUsize,
+    cache_miss: AtomicUsize,
+    served_stale: AtomicUsize,
+    unresolved: AtomicUsize,
+    registry_error: AtomicUsize,
+}
+
+impl RecordingMetrics {
+    fn arc() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+}
+
+impl UsageCollectorMetrics for RecordingMetrics {
+    fn set_pdp_ready(&self, _: bool) {}
+    fn record_pdp_decision(
+        &self,
+        _: crate::domain::ports::metrics::PdpOp,
+        _: crate::domain::ports::metrics::AuthzDecision,
+        _: f64,
+    ) {
+    }
+    fn record_pdp_failure(
+        &self,
+        _: crate::domain::ports::metrics::PdpOp,
+        _: crate::domain::ports::metrics::PdpFailureCause,
+        _: f64,
+    ) {
+    }
+    fn set_plugin_ready(&self, _: bool) {}
+    fn record_plugin_call(&self, _: crate::domain::ports::metrics::PluginOp, _: f64) {}
+    fn record_plugin_accept_error(
+        &self,
+        _: crate::domain::ports::metrics::PluginOp,
+        _: crate::domain::ports::metrics::PluginErrorCategory,
+    ) {
+    }
+    fn observe_ingestion_batch_size(&self, _: u64) {}
+    fn observe_ingestion_duration(&self, _: f64) {}
+    fn observe_record_metadata_bytes(&self, _: u64) {}
+    fn record_ingestion_record(
+        &self,
+        _: crate::domain::ports::metrics::RecordOutcome,
+        _: crate::domain::ports::metrics::RecordKind,
+        _: crate::domain::ports::metrics::RecordErrorCategory,
+    ) {
+    }
+    fn record_ingestion_request(
+        &self,
+        _: crate::domain::ports::metrics::IngestRequestOutcome,
+        _: crate::domain::ports::metrics::IngestRequestErrorCategory,
+    ) {
+    }
+    fn query_inflight_inc(&self, _: crate::domain::ports::metrics::QueryKind) {}
+    fn query_inflight_dec(&self, _: crate::domain::ports::metrics::QueryKind) {}
+    fn observe_query_result_rows(&self, _: crate::domain::ports::metrics::QueryKind, _: u64) {}
+    fn record_query_request(
+        &self,
+        _: crate::domain::ports::metrics::QueryKind,
+        _: crate::domain::ports::metrics::RequestOutcome,
+        _: crate::domain::ports::metrics::QueryErrorCategory,
+        _: f64,
+    ) {
+    }
+    fn record_deactivation_request(
+        &self,
+        _: crate::domain::ports::metrics::RequestOutcome,
+        _: crate::domain::ports::metrics::DeactivationErrorCategory,
+        _: f64,
+    ) {
+    }
+    fn record_type_resolution(&self, outcome: TypeResolutionOutcome) {
+        let counter = match outcome {
+            TypeResolutionOutcome::CacheHit => &self.cache_hit,
+            TypeResolutionOutcome::CacheMiss => &self.cache_miss,
+            TypeResolutionOutcome::ServedStale => &self.served_stale,
+            TypeResolutionOutcome::Unresolved => &self.unresolved,
+            TypeResolutionOutcome::RegistryError => &self.registry_error,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 const METER: &str = "gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~";
 const BASE: &str = "gts.cf.core.uc.usage_record.v1~";
@@ -136,7 +226,8 @@ fn cfg(ttl: Duration) -> TypeResolverConfig {
 #[tokio::test]
 async fn a_miss_populates_and_a_hit_serves_from_cache() {
     let source = FakeSource::new(vec![Ok(schema("bytes"))]);
-    let resolver = TypeResolver::new(source.clone(), cfg(Duration::from_mins(5)));
+    let metrics = RecordingMetrics::arc();
+    let resolver = TypeResolver::new(source.clone(), cfg(Duration::from_mins(5)), metrics.clone());
 
     let first = resolver.resolve(&meter_id()).await.expect("resolves");
     assert_eq!(first.aggregation_fold, AggregationFold::Sum);
@@ -146,6 +237,16 @@ async fn a_miss_populates_and_a_hit_serves_from_cache() {
     assert_eq!(second.canonical_unit, "bytes");
 
     assert_eq!(source.calls(), 1, "a cache hit must not reach the registry");
+    assert_eq!(
+        metrics.cache_miss.load(Ordering::SeqCst),
+        1,
+        "the cold miss must record CacheMiss exactly once"
+    );
+    assert_eq!(
+        metrics.cache_hit.load(Ordering::SeqCst),
+        1,
+        "the warm hit must record CacheHit exactly once"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -160,6 +261,7 @@ async fn concurrent_misses_make_one_source_call() {
     let resolver = Arc::new(TypeResolver::new(
         source.clone(),
         cfg(Duration::from_mins(5)),
+        RecordingMetrics::arc(),
     ));
 
     let mut handles = Vec::new();
@@ -181,7 +283,11 @@ async fn concurrent_misses_make_one_source_call() {
 #[tokio::test(start_paused = true)]
 async fn an_entry_refreshes_past_the_ttl() {
     let source = FakeSource::new(vec![Ok(schema("bytes")), Ok(schema("count"))]);
-    let resolver = TypeResolver::new(source.clone(), cfg(Duration::from_millis(20)));
+    let resolver = TypeResolver::new(
+        source.clone(),
+        cfg(Duration::from_millis(20)),
+        RecordingMetrics::arc(),
+    );
 
     let first = resolver.resolve(&meter_id()).await.expect("first resolve");
     assert_eq!(first.canonical_unit, "bytes");
@@ -209,7 +315,12 @@ async fn a_registry_error_past_the_ttl_serves_the_stale_entry() {
             "connect refused".to_owned(),
         )),
     ]);
-    let resolver = TypeResolver::new(source.clone(), cfg(Duration::from_millis(20)));
+    let metrics = RecordingMetrics::arc();
+    let resolver = TypeResolver::new(
+        source.clone(),
+        cfg(Duration::from_millis(20)),
+        metrics.clone(),
+    );
 
     resolver.resolve(&meter_id()).await.expect("first resolve");
 
@@ -225,6 +336,12 @@ async fn a_registry_error_past_the_ttl_serves_the_stale_entry() {
         2,
         "the refresh attempt still reaches the registry once"
     );
+    assert_eq!(metrics.cache_miss.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        metrics.served_stale.load(Ordering::SeqCst),
+        1,
+        "the registry-unavailable-past-TTL refresh must record ServedStale"
+    );
 }
 
 #[tokio::test]
@@ -232,7 +349,8 @@ async fn a_registry_error_with_nothing_cached_fails_closed() {
     let source = FakeSource::new(vec![Err(DomainError::TypesRegistryUnavailable(
         "connect refused".to_owned(),
     ))]);
-    let resolver = TypeResolver::new(source, cfg(Duration::from_mins(5)));
+    let metrics = RecordingMetrics::arc();
+    let resolver = TypeResolver::new(source, cfg(Duration::from_mins(5)), metrics.clone());
 
     let err = resolver
         .resolve(&meter_id())
@@ -241,6 +359,17 @@ async fn a_registry_error_with_nothing_cached_fails_closed() {
     assert!(
         matches!(err, DomainError::TypesRegistryUnavailable(ref msg) if msg == "connect refused"),
         "unexpected error variant: {err:?}"
+    );
+    assert_eq!(
+        metrics.registry_error.load(Ordering::SeqCst),
+        1,
+        "a registry error with nothing cached must record RegistryError, not Unresolved: \
+         the registry itself failed to answer, no verdict on the type was reached"
+    );
+    assert_eq!(
+        metrics.unresolved.load(Ordering::SeqCst),
+        0,
+        "a registry-unavailable failure must never record Unresolved"
     );
 }
 
@@ -252,7 +381,8 @@ async fn a_not_found_fails_closed_and_is_not_cached() {
         Err(DomainError::declaration_not_found(&meter_id())),
         Ok(schema("bytes")),
     ]);
-    let resolver = TypeResolver::new(source.clone(), cfg(Duration::from_mins(5)));
+    let metrics = RecordingMetrics::arc();
+    let resolver = TypeResolver::new(source.clone(), cfg(Duration::from_mins(5)), metrics.clone());
 
     let err = resolver
         .resolve(&meter_id())
@@ -269,6 +399,22 @@ async fn a_not_found_fails_closed_and_is_not_cached() {
         .expect("a freshly declared type resolves without waiting out a negative TTL");
     assert_eq!(after.canonical_unit, "bytes");
     assert_eq!(source.calls(), 2);
+    assert_eq!(
+        metrics.unresolved.load(Ordering::SeqCst),
+        1,
+        "a definite not-found must record Unresolved, not RegistryError: the registry \
+         answered fine, the type is simply not there"
+    );
+    assert_eq!(
+        metrics.registry_error.load(Ordering::SeqCst),
+        0,
+        "a definite not-found must never record RegistryError"
+    );
+    assert_eq!(
+        metrics.cache_miss.load(Ordering::SeqCst),
+        1,
+        "the following successful resolve must record CacheMiss"
+    );
 }
 
 #[tokio::test]
@@ -285,7 +431,8 @@ async fn an_incomplete_declaration_fails_closed_and_is_not_cached_as_success() {
     )
     .expect("schema with no declared traits");
     let source = FakeSource::new(vec![Ok(bad), Ok(schema("bytes"))]);
-    let resolver = TypeResolver::new(source.clone(), cfg(Duration::from_mins(5)));
+    let metrics = RecordingMetrics::arc();
+    let resolver = TypeResolver::new(source.clone(), cfg(Duration::from_mins(5)), metrics.clone());
 
     let err = resolver
         .resolve(&meter_id())
@@ -307,6 +454,17 @@ async fn an_incomplete_declaration_fails_closed_and_is_not_cached_as_success() {
         2,
         "the failed parse must not have been cached as a success"
     );
+    assert_eq!(
+        metrics.unresolved.load(Ordering::SeqCst),
+        1,
+        "an incomplete declaration must record Unresolved, not RegistryError: \
+         types-registry answered fine, the declaration itself is unusable"
+    );
+    assert_eq!(
+        metrics.registry_error.load(Ordering::SeqCst),
+        0,
+        "an incomplete declaration must never record RegistryError"
+    );
 }
 
 #[tokio::test]
@@ -320,6 +478,7 @@ async fn capacity_evicts_the_oldest_meter_when_a_new_one_arrives() {
             ttl: Duration::from_mins(5),
             capacity: 2,
         },
+        RecordingMetrics::arc(),
     );
 
     resolver.resolve(&meter_id()).await.expect("resolves a"); // oldest
@@ -368,6 +527,7 @@ async fn refreshing_an_existing_key_at_capacity_does_not_evict_another_entry() {
             ttl: Duration::from_millis(20),
             capacity: 2,
         },
+        RecordingMetrics::arc(),
     );
 
     resolver.resolve(&meter_id()).await.expect("resolves a"); // oldest

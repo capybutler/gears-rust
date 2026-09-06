@@ -3,10 +3,12 @@
 //! - [`UsageCollectorClientV1`] — consumer SDK trait, obtained from `ClientHub`.
 //! - [`UsageCollectorPluginV1`] — storage plugin SPI trait.
 //! - [`UsageCollectorPluginSpecV1`] — GTS plugin spec for discovery/binding.
-//! - Domain models: [`UsageType`], [`UsageTypeGtsId`], [`UsageRecord`],
-//!   [`AggregationResult`], [`ResourceRef`], [`SubjectRef`], and the
-//!   aggregation surface ([`AggregationOp`], [`AggregationDimension`],
-//!   [`AggregationSpec`], [`AggregationBucket`]).
+//! - Domain models: [`UsageRecord`], [`MeterTypeId`], [`AggregationResult`],
+//!   [`ResourceRef`], [`SubjectRef`], and the aggregation surface
+//!   ([`AggregationDimension`], [`AggregationBucket`]). Every meter's fold,
+//!   canonical unit and metadata surface is a declaration owned by
+//!   `types-registry` and resolved by the host — this crate declares no
+//!   usage-type catalog of its own.
 //!   List pagination uses [`toolkit_odata::ODataQuery`]
 //!   / [`toolkit_odata::Page`]. The filterable-field schema for
 //!   `list_usage_records` is declared by [`UsageRecordQuery`] (macro-derived
@@ -29,15 +31,13 @@ pub mod serde_helpers;
 
 pub use api::UsageCollectorClientV1;
 pub use error::{UsageCollectorError, UsageCollectorPluginError};
-pub use gts::{USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorPluginSpecV1};
+pub use gts::{USAGE_RECORD_RESOURCE, UsageCollectorPluginSpecV1};
 pub use id::{USAGE_RECORD_ID_NAMESPACE, created_at_micros, derive_usage_record_id};
 pub use models::{
-    AggregationBucket, AggregationDimension, AggregationFold, AggregationOp, AggregationResult,
-    AggregationSpec, CreateUsageRecord, IdempotencyKey, MAX_AGGREGATION_BUCKETS, MetadataFilter,
-    MetadataKey, MeterTypeId, ResourceRef, SubjectRef, USAGE_RECORD_BASE_TYPE, UsageKind,
-    UsageRecord, UsageRecordFilterField, UsageRecordQuery, UsageRecordStatus, UsageType,
-    UsageTypeFilterField, UsageTypeGtsId, UsageTypeQuery, is_keyset_safe_record_field,
-    is_keyset_safe_type_field,
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
+    IdempotencyKey, MAX_AGGREGATION_BUCKETS, MetadataFilter, MetadataKey, MeterTypeId, ResourceRef,
+    SubjectRef, USAGE_RECORD_BASE_TYPE, UsageRecord, UsageRecordFilterField, UsageRecordQuery,
+    UsageRecordStatus, is_keyset_safe_record_field,
 };
 pub use plugin_api::UsageCollectorPluginV1;
 pub use reason::{ConflictReason, ValidationReason};

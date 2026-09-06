@@ -1,90 +1,32 @@
-//! Pure shape-validation algorithms for the catalog and ingest boundaries.
+//! Pure shape-validation algorithms for the ingest boundary.
 //!
-//! - [`metadata_fields_from_wire`] converts the permissive wire shape
-//!   (`Vec<String>`) supplied by the REST DTO into the SDK's
-//!   [`BTreeSet<MetadataKey>`], surfacing duplicate / empty-string
-//!   violations as the canonical
-//!   `/metadata_fields/{i}: invalid_metadata_fields_*` Problem envelope.
-//!   The SDK type's invariants (no empty key, no NUL bytes, set semantics)
-//!   then make malformed declarations impossible past this conversion.
 //! - [`validate_submit_record_metadata`] enforces the ingest-time closed
 //!   shape membership and the configurable size cap against an already-typed
 //!   `BTreeMap<MetadataKey, String>`, validating against the meter's
-//!   resolved [`ResolvedDeclaration`] rather than a plugin-owned `UsageType`
+//!   resolved [`ResolvedDeclaration`] rather than a plugin-owned catalog row
 //!   (Task 9): the declaration's compiled `metadata_schema` is the closed
 //!   surface, enforced in code per
 //!   [`crate::domain::type_resolver::CompiledMetadataSchema::validate`].
 //!
 //! `gts_type_id` is NOT re-validated here: [`usage_collector_sdk::MeterTypeId`]
 //! is a validating newtype that already rejects empty values, ids missing
-//! the reserved-prefix `~` segment, and ids whose prefix is not one of the
-//! reserved counter / gauge base type ids.
+//! the reserved-prefix `~` segment, and ids that do not derive from the
+//! reserved usage-record base type.
 //!
-//! `metadata_fields = []` is accepted: DESIGN section 3.7 (table
-//! `usage_type_catalog`) describes `metadata_fields` as `text[]` of "unique
-//! non-empty strings" but does NOT require at least one entry — a usage
-//! type may accept no caller-supplied metadata keys, only the mandatory
-//! attribution composites.
-//!
-//! [`validate_record_semantics`] no longer takes a `UsageType`: with usage-type
+//! [`validate_record_semantics`] no longer takes a catalog row: with usage-type
 //! ownership moved to `types-registry`, there is no caller-visible `kind` left
 //! to enforce a gauge/counter value-sign rule against, so those branches are
 //! deleted outright (not relocated). The `corrects_id` / compensation
 //! mechanism itself is unaffected — it is removed in a later slice, not
 //! this one.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use toolkit_macros::domain_model;
 use usage_collector_sdk::{MetadataKey, UsageCollectorError, UsageRecord, UsageRecordStatus};
 use uuid::Uuid;
 
 use crate::domain::type_resolver::ResolvedDeclaration;
-
-/// Convert the wire-permissive `Vec<String>` into the SDK's
-/// [`BTreeSet<MetadataKey>`] per
-/// `cpt-cf-usage-collector-algo-usage-type-lifecycle-usage-type-shape-validation`.
-///
-/// The SDK newtype [`MetadataKey`] enforces non-empty / no-NUL keys at
-/// construction; the set guarantees no duplicates. This function surfaces
-/// per-entry rejections as typed SDK variants
-/// ([`UsageCollectorError::InvalidArgument`] /
-/// [`UsageCollectorError::InvalidArgument`]), each carrying the
-/// offending zero-based `index`.
-///
-/// Duplicate-`gts_id` detection is owned by the plugin's `UNIQUE(gts_id)`
-/// constraint (ADR-0012), surfaced as
-/// [`UsageCollectorError::AlreadyExists`].
-///
-/// # Errors
-///
-/// * [`UsageCollectorError::InvalidArgument`] when an entry is an
-///   empty string or fails [`MetadataKey::new`] (e.g. contains a NUL byte).
-/// * [`UsageCollectorError::InvalidArgument`] when an entry
-///   duplicates an earlier one.
-// @cpt-algo:cpt-cf-usage-collector-algo-usage-type-lifecycle-usage-type-shape-validation:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-fr-data-classification:p1
-pub fn metadata_fields_from_wire(
-    fields: Vec<String>,
-) -> Result<BTreeSet<MetadataKey>, UsageCollectorError> {
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-type-lifecycle-usage-type-shape-validation:p1:inst-algo-shape-invalid-metadata-fields
-    let mut set: BTreeSet<MetadataKey> = BTreeSet::new();
-    for (index, field) in fields.into_iter().enumerate() {
-        if field.is_empty() {
-            return Err(UsageCollectorError::invalid_metadata_field(index, true));
-        }
-        let key = MetadataKey::new(field)
-            .map_err(|_err| UsageCollectorError::invalid_metadata_field(index, false))?;
-        if !set.insert(key) {
-            return Err(UsageCollectorError::duplicate_metadata_field(index));
-        }
-    }
-    // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-usage-type-shape-validation:p1:inst-algo-shape-invalid-metadata-fields
-
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-type-lifecycle-usage-type-shape-validation:p1:inst-algo-shape-return-valid
-    Ok(set)
-    // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-usage-type-shape-validation:p1:inst-algo-shape-return-valid
-}
 
 /// Default per-record metadata payload size cap (8 KiB), enforced on
 /// `create_usage_record` before plugin dispatch when the host has no more
@@ -123,7 +65,6 @@ pub(crate) const DEFAULT_METADATA_SIZE_CAP_BYTES: usize = 8 * 1024;
 /// typed `BTreeMap<MetadataKey|String, String>`, so structural / value-shape
 /// rejections happen at the deserialize boundary and never reach this
 /// function.
-// @cpt-algo:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1
 // @cpt-algo:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-record-metadata:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-entity-record-metadata:p1
@@ -134,7 +75,6 @@ pub fn validate_submit_record_metadata(
     metadata: &BTreeMap<MetadataKey, String>,
     metadata_size_cap_bytes: usize,
 ) -> Result<(), UsageCollectorError> {
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-closed-shape
     // `CompiledMetadataSchema::validate` takes plain `String` keys (it is
     // shared with the read-path query surface, which has no `MetadataKey`
     // newtype of its own); the conversion is a cheap per-entry copy, not a
@@ -144,7 +84,6 @@ pub fn validate_submit_record_metadata(
         .map(|(key, value)| (key.as_str().to_owned(), value.clone()))
         .collect();
     declaration.metadata_schema.validate(&plain_metadata)?;
-    // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-closed-shape
 
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-read-input
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-serialize
@@ -171,18 +110,16 @@ pub fn validate_submit_record_metadata(
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-serialize
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-read-input
 
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-return-valid
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-valid
     Ok(())
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-valid
-    // @cpt-end:cpt-cf-usage-collector-algo-usage-type-lifecycle-ingest-metadata-validation:p1:inst-algo-ingest-validate-return-valid
 }
 
 /// Outcome of the write-path semantics check.
 ///
 /// Pre-Task-9 this was the result of a four-cell `(MetricSemantics ×
 /// corrects_id presence)` value-sign matrix keyed off a plugin-owned
-/// `UsageType.kind`. With usage-type ownership moved to `types-registry`
+/// catalog row's `kind`. With usage-type ownership moved to `types-registry`
 /// there is no caller-visible `kind` left, so the matrix — and the
 /// gauge/counter value-sign rules it enforced — is deleted outright, not
 /// relocated. Only the `corrects_id`-presence half of the check survives:

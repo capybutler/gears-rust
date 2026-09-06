@@ -22,8 +22,8 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use crate::domain::ports::metrics::{
     AuthzDecision, DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome,
     PdpFailureCause, PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind,
-    RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
-    UsageTypeErrorCategory, UsageTypeOp, key,
+    RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome, TypeResolutionOutcome,
+    UsageCollectorMetrics, key,
 };
 
 /// Bucket boundaries (seconds) for `uc_pdp_duration_seconds` — brackets the
@@ -60,7 +60,9 @@ const QUERY_RESULT_ROWS_BUCKETS: [f64; 8] =
 
 /// The full OpenTelemetry instrument set: the foundation-owned plugin-host +
 /// PDP-helper instruments (Phase 1) plus the per-component gateway
-/// instruments for ingestion, query, deactivation, and usage-type (Phase 2).
+/// instruments for ingestion, query, and deactivation (Phase 2), plus the
+/// Type Resolver instrument that replaced the deleted usage-type catalog
+/// counters.
 pub struct UcMetricsMeter {
     // ── Plugin-host (owned by foundation §2.1) ──
     plugin_ready: Gauge<i64>,
@@ -90,9 +92,8 @@ pub struct UcMetricsMeter {
     deactivation_requests: Counter<u64>,
     deactivation_duration_seconds: Histogram<f64>,
 
-    // ── UsageType catalog (§2.2 usage-type-lifecycle) ──
-    usage_type_requests: Counter<u64>,
-    usage_types: Gauge<i64>,
+    // ── Type Resolver (§2.2 usage-type-lifecycle successor) ──
+    type_resolution: Counter<u64>,
 }
 
 impl UcMetricsMeter {
@@ -212,17 +213,13 @@ impl UcMetricsMeter {
                 .with_boundaries(INGESTION_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
 
-            // ── UsageType catalog ──
-            // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-nfr-operational-visibility:p2
-            usage_type_requests: meter
-                .u64_counter(format!("{prefix}_usage_type_requests_total"))
+            // ── Type Resolver ──
+            type_resolution: meter
+                .u64_counter(format!("{prefix}_type_resolution_total"))
                 .with_description(
-                    "Completed UsageType-lifecycle attempts by operation, outcome, error_category",
+                    "Completed Type Resolver calls by result (cache_hit / cache_miss / \
+                     served_stale / unresolved / registry_error)",
                 )
-                .build(),
-            usage_types: meter
-                .i64_gauge(format!("{prefix}_usage_types"))
-                .with_description("Current entry count of the plugin-owned usage_type_catalog")
                 .build(),
         }
     }
@@ -381,27 +378,11 @@ impl UsageCollectorMetrics for UcMetricsMeter {
         );
     }
 
-    // ── UsageType catalog ──
+    // ── Type Resolver ──
 
-    fn record_usage_type_request(
-        &self,
-        op: UsageTypeOp,
-        outcome: RequestOutcome,
-        error_category: UsageTypeErrorCategory,
-    ) {
-        self.usage_type_requests.add(
-            1,
-            &[
-                KeyValue::new(key::OPERATION, op.as_str()),
-                KeyValue::new(key::OUTCOME, outcome.as_str()),
-                KeyValue::new(key::ERROR_CATEGORY, error_category.as_str()),
-            ],
-        );
-    }
-
-    fn set_usage_types(&self, count: u64) {
-        #[allow(clippy::cast_possible_wrap)]
-        self.usage_types.record(count as i64, &[]);
+    fn record_type_resolution(&self, outcome: TypeResolutionOutcome) {
+        self.type_resolution
+            .add(1, &[KeyValue::new(key::RESULT, outcome.as_str())]);
     }
 }
 

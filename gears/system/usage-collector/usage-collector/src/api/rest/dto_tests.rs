@@ -15,18 +15,13 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use toolkit_gts::gts_id;
 use usage_collector_sdk::{
-    IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorError, UsageRecord, UsageRecordStatus,
-    UsageTypeGtsId, ValidationReason,
+    IdempotencyKey, MeterTypeId, ResourceRef, UsageRecord, UsageRecordStatus,
 };
 use uuid::Uuid;
 
 use super::{
-    AggregationBucketDto, CreateUsageRecordRequest, CreateUsageRecordResultDto,
-    CreateUsageTypeRequest, UsageRecordDto,
+    AggregationBucketDto, CreateUsageRecordRequest, CreateUsageRecordResultDto, UsageRecordDto,
 };
-
-const SAMPLE_USAGE_TYPE_ID: &str =
-    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
 const SAMPLE_METER_TYPE_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -76,59 +71,6 @@ fn record_dto_names_the_type_reference_gts_type_id() {
         "wire field is gts_type_id"
     );
     assert!(json.get("gts_id").is_none(), "the old name must be gone");
-}
-
-#[test]
-fn register_request_body_rejects_unknown_fields() {
-    // Pin `#[serde(deny_unknown_fields)]`: an accidental field addition
-    // on the wire must be rejected, not silently dropped.
-    let json = serde_json::json!({
-        "gts_id": SAMPLE_USAGE_TYPE_ID,
-        "kind": "counter",
-        "metadata_fields": ["tenant_id"],
-        "extra": "should be rejected",
-    });
-    let err = serde_json::from_value::<CreateUsageTypeRequest>(json)
-        .expect_err("deny_unknown_fields must reject extra members");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unknown field"),
-        "deserialize error MUST identify it as an `unknown field` (got `{msg}`)",
-    );
-    assert!(
-        msg.contains("extra"),
-        "deserialize error MUST name the offending field (got `{msg}`)",
-    );
-}
-
-#[test]
-fn register_request_body_is_permissive_at_deserialize() {
-    // The DTO's `gts_id` field is a flat `String` so any well-formed
-    // JSON string reaches the handler unchanged; structural /
-    // base-derivation validation happens at the handler boundary via
-    // `UsageTypeGtsId::new`, not at serde time. This test pins that
-    // contract so a future tightening of the DTO field type does not
-    // silently shift the rejection path back to axum's default
-    // `422 text/plain`.
-    let json = serde_json::json!({
-        "gts_id": "not-a-valid-prefix",
-        "kind": "counter",
-        "metadata_fields": [],
-    });
-    let req: CreateUsageTypeRequest =
-        serde_json::from_value(json).expect("DTO must accept any string at deserialize");
-    let err = UsageTypeGtsId::new(req.gts_id)
-        .expect_err("bad base gts_id must be rejected by UsageTypeGtsId::new");
-    assert!(
-        matches!(
-            err,
-            UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::InvalidBaseGtsId,
-                ..
-            }
-        ),
-        "expected InvalidUsageTypeGtsId, got {err:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------

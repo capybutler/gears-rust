@@ -1,15 +1,13 @@
 //! Wire DTOs for the foundation REST surface.
 //!
-//! Two resource families share this module:
-//!
-//! * `UsageType` catalog — per-row response body and the register-request DTO
-//!   for the `/usage-collector/v1/usage-types` catalog routes. List-page
-//!   envelopes use [`toolkit_odata::Page`] directly; `OData` query parameters
-//!   (`limit`, `cursor`) are parsed by the toolkit `OData` extractor and need
-//!   no module-local DTO.
-//! * `UsageRecord` create / deactivation — batch create request /
-//!   response shapes for `POST /usage-collector/v1/records`. Deactivation
-//!   returns no body (HTTP 204 No Content) so it carries no response DTO.
+//! `UsageRecord` create / deactivation — batch create request / response
+//! shapes for `POST /usage-collector/v1/records`. Deactivation returns no
+//! body (HTTP 204 No Content) so it carries no response DTO. List-page
+//! envelopes use [`toolkit_odata::Page`] directly; `OData` query parameters
+//! (`limit`, `cursor`) are parsed by the toolkit `OData` extractor and need
+//! no module-local DTO. Every usage-type declaration is now owned by
+//! `types-registry`; this gear registers no usage-type REST surface and
+//! declares no usage-type DTO.
 //!
 //! Every wire-facing type is declared as a thin DTO with
 //! `#[toolkit_macros::api_dto(...)]` so the emitted OAS references a stable
@@ -24,65 +22,9 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use usage_collector_sdk::{
     AggregationBucket, AggregationDimension, AggregationResult, MetadataKey, ResourceRef,
-    SubjectRef, UsageCollectorError, UsageKind, UsageRecord, UsageRecordStatus, UsageType,
+    SubjectRef, UsageCollectorError, UsageRecord, UsageRecordStatus,
 };
 use uuid::Uuid;
-
-// ---------------------------------------------------------------------------
-// UsageType catalog DTOs
-// ---------------------------------------------------------------------------
-
-/// Wire projection of [`usage_collector_sdk::UsageType`]. `gts_id` is
-/// flattened to `String` so the type can derive `utoipa::ToSchema`
-/// without pulling `utoipa` into the SDK crate (the SDK's
-/// `UsageTypeGtsId` newtype carries the validation semantics). `kind` is
-/// projected to its lowercase string form (`"counter"` / `"gauge"`) for
-/// the same reason — `UsageKind`'s closed-enum serde shape lives in the
-/// SDK; the host-side wire DTO mirrors it via `String`.
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(response)]
-pub struct UsageTypeDto {
-    pub gts_id: String,
-    pub kind: String,
-    pub metadata_fields: Vec<String>,
-}
-
-impl From<UsageType> for UsageTypeDto {
-    fn from(value: UsageType) -> Self {
-        Self {
-            gts_id: value.gts_id.to_string(),
-            kind: match value.kind {
-                UsageKind::Counter => "counter".to_owned(),
-                UsageKind::Gauge => "gauge".to_owned(),
-            },
-            metadata_fields: value
-                .metadata_fields
-                .into_iter()
-                .map(MetadataKey::into_inner)
-                .collect(),
-        }
-    }
-}
-
-/// Register-request body for `POST /usage-collector/v1/usage-types`.
-///
-/// Carries `gts_id` as a permissive `String` rather than the validating
-/// [`usage_collector_sdk::UsageTypeGtsId`] newtype so the handler can
-/// synthesise the canonical `invalid_base_gts_id` `Problem` envelope on
-/// rejection — relying on the newtype's `Deserialize` would surface
-/// bad-base payloads as axum's default `text/plain` 422. `kind` is the
-/// closed counter / gauge discriminator carried as `String` for the same
-/// `utoipa`-isolation reason as `gts_id`; the handler parses it through
-/// the SDK [`usage_collector_sdk::UsageKind`] enum so unknown values are
-/// rejected (per ADR-0012 amendment 2026-06-08).
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(request)]
-#[serde(deny_unknown_fields)]
-pub struct CreateUsageTypeRequest {
-    pub gts_id: String,
-    pub kind: String,
-    pub metadata_fields: Vec<String>,
-}
 
 // ---------------------------------------------------------------------------
 // UsageRecord create DTOs
@@ -141,8 +83,7 @@ impl TryFrom<SubjectRefDto> for SubjectRef {
 }
 
 /// Per-record create payload. Carries `gts_type_id` as a permissive `String`
-/// (same rationale as [`CreateUsageTypeRequest`]) so a bad-prefix value
-/// surfaces as the per-record `Problem` instead of axum's default
+/// so a bad-prefix value surfaces as the per-record `Problem` instead of axum's default
 /// `text/plain` 422 for the entire batch. per-record problem envelopes
 /// still surface for closed-shape membership, size-cap, and key
 /// validation. Intentionally has no identity field: `id` is
@@ -188,10 +129,10 @@ pub struct CreateUsageRecordsRequest {
 }
 
 /// Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_type_id` is
-/// flattened to `String` (same rationale as [`UsageTypeDto`]) so the type
-/// can derive `utoipa::ToSchema` without pulling `utoipa` into the SDK
-/// crate; `created_at` is emitted as RFC 3339 to match the SDK wire shape.
-/// `status` is projected to its lowercase string form for the same reason.
+/// flattened to `String` so the type can derive `utoipa::ToSchema` without
+/// pulling `utoipa` into the SDK crate; `created_at` is emitted as RFC 3339
+/// to match the SDK wire shape. `status` is projected to its lowercase
+/// string form for the same reason.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct UsageRecordDto {

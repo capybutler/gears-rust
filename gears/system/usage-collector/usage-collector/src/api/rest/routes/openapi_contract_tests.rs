@@ -181,8 +181,9 @@ fn harness_sees_the_whole_rest_surface() {
 
     assert_eq!(
         registry_ops(&reg).len(),
-        9,
-        "expected 9 registered operations across both registrars",
+        5,
+        "expected 5 registered operations (usage-record ingestion only; \
+         the usage-type catalog registrar is gone)",
     );
     assert_eq!(yaml_ops(&doc).len(), 7, "expected 7 documented operations");
 }
@@ -309,7 +310,7 @@ fn spec_for<'a>(registered: &'a BTreeMap<String, OperationSpec>, key: &str) -> &
     registered.get(key).unwrap_or_else(|| {
         panic!(
             "{key}: documented in usage-collector-v1.yaml but no route registers it \
-             (see `register_usage_record_routes` / `register_usage_type_routes`)"
+             (see `register_usage_record_routes`)"
         )
     })
 }
@@ -902,8 +903,9 @@ fn yaml_operation_authenticated(doc: &Value, key: &str, op: &Value) -> bool {
 ///
 /// `body_schemas_match` only reaches the components an operation *body*
 /// references, which leaves every nested one — `ResourceRef`,
-/// `AggregationOp`, the element type of each `Page` — free to drift. This
-/// is what makes the `Dto`-suffix rule a rule instead of a comment.
+/// `AggregationDimensionDto`, the element type of each `Page` — free to
+/// drift. This is what makes the `Dto`-suffix rule a rule instead of a
+/// comment.
 ///
 /// Containment is deliberately one-way: the document also declares
 /// documentary refinements (`Timestamp`, `UsageValue`, the two

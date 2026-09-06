@@ -2,12 +2,11 @@
 //!
 //! Each test asserts the DESIGN §3.3 AIP-193 mapping (category -> HTTP status)
 //! plus the module-specific `context.reason` / resource-type carry. The lift is
-//! exposed as two surface-specific free fns
-//! ([`usage_collector_error_to_canonical_for_usage_type`] for the catalog REST
-//! surface and [`usage_collector_error_to_canonical_for_usage_record`] for the
-//! ingestion REST surface); only `PermissionDenied` depends on the surface, so
-//! the two entry points special-case it and share [`super::lift_common`] for
-//! everything else.
+//! exposed as a single free fn
+//! ([`usage_collector_error_to_canonical_for_usage_record`]) — the gear
+//! registers only the ingestion REST surface now that types-registry owns
+//! every type declaration, so there is no catalog-shaped lift entry point to
+//! exercise any more.
 //!
 //! After the error-envelope compaction, the 503 `context.reason` triage codes
 //! (`PLUGIN_READINESS` / `PLUGIN_TRANSIENT` / `AUTHZ_UNAVAILABLE`) and the
@@ -17,24 +16,14 @@
 //! Operator triage for 503s reads the curated `detail` string instead.
 
 use toolkit_canonical_errors::{CanonicalError, Problem};
-use toolkit_gts::{GTS_ID_PREFIX, gts_id};
-use usage_collector_sdk::{
-    MeterTypeId, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageTypeGtsId,
-};
+use toolkit_gts::gts_id;
+use usage_collector_sdk::{MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError};
 use uuid::Uuid;
 
 use super::{
-    UsageRecordResource, UsageTypeResource,
-    usage_collector_error_to_canonical_for_usage_record as lift_record,
-    usage_collector_error_to_canonical_for_usage_type as lift_type, usage_record_error_to_problem,
+    UsageRecordResource, usage_collector_error_to_canonical_for_usage_record as lift_record,
+    usage_record_error_to_problem,
 };
-
-const SAMPLE_USAGE_TYPE_ID: &str =
-    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
-
-fn sample_gts_id() -> UsageTypeGtsId {
-    UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived usage-type gts_id")
-}
 
 fn sample_meter_id() -> MeterTypeId {
     MeterTypeId::new(gts_id!(
@@ -44,32 +33,11 @@ fn sample_meter_id() -> MeterTypeId {
 }
 
 #[test]
-fn usage_type_resource_type_matches_uc_usage_type_marker() {
-    let err: CanonicalError = UsageTypeResource::not_found("x")
-        .with_resource("x")
-        .create();
-    assert_eq!(err.resource_type(), Some(USAGE_TYPE_RESOURCE));
-}
-
-#[test]
 fn usage_record_resource_type_is_record_sibling() {
     let err: CanonicalError = UsageRecordResource::not_found("r")
         .with_resource("r")
         .create();
     assert_eq!(err.resource_type(), Some(USAGE_RECORD_RESOURCE));
-}
-
-// ---------------------------------------------------------------------------
-// PermissionDenied is the only category whose canonical resource depends on the
-// REST surface the call originated from.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn authorization_from_usage_type_surface_uses_usage_type_resource() {
-    let c = lift_type(UsageCollectorError::permission_denied("denied"));
-    assert_eq!(c.status_code(), 403);
-    assert_eq!(c.title(), "Permission Denied");
-    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
 }
 
 #[test]
@@ -81,21 +49,15 @@ fn authorization_from_usage_record_surface_uses_usage_record_resource() {
 }
 
 #[test]
-fn authorization_carries_native_authz_reason_on_both_surfaces() {
-    for problem in [
-        Problem::from(lift_type(UsageCollectorError::permission_denied(
-            "tenant scope mismatch",
-        ))),
-        Problem::from(lift_record(UsageCollectorError::permission_denied(
-            "tenant scope mismatch",
-        ))),
-    ] {
-        assert_eq!(problem.status, Some(403));
-        assert_eq!(
-            problem_context_string(&problem, "reason").as_deref(),
-            Some("AUTHZ")
-        );
-    }
+fn authorization_carries_native_authz_reason() {
+    let problem = Problem::from(lift_record(UsageCollectorError::permission_denied(
+        "tenant scope mismatch",
+    )));
+    assert_eq!(problem.status, Some(403));
+    assert_eq!(
+        problem_context_string(&problem, "reason").as_deref(),
+        Some("AUTHZ")
+    );
 }
 
 #[test]
@@ -114,22 +76,6 @@ fn metadata_size_exceeded_maps_to_400_invalid_argument_with_usage_record_resourc
     assert_eq!(c.status_code(), 400);
     assert_eq!(c.title(), "Invalid Argument");
     assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
-}
-
-#[test]
-fn invalid_metadata_field_maps_to_400_invalid_argument() {
-    let c = lift_type(UsageCollectorError::invalid_metadata_field(1, true));
-    assert_eq!(c.status_code(), 400);
-    assert_eq!(c.title(), "Invalid Argument");
-    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
-}
-
-#[test]
-fn duplicate_metadata_field_maps_to_400_invalid_argument() {
-    let c = lift_type(UsageCollectorError::duplicate_metadata_field(2));
-    assert_eq!(c.status_code(), 400);
-    assert_eq!(c.title(), "Invalid Argument");
-    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
 }
 
 #[test]
@@ -152,17 +98,8 @@ fn unknown_metadata_key_maps_to_invalid_argument() {
         "unexpected",
     ));
     assert_eq!(c.status_code(), 400);
-    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
     assert_eq!(c.resource_name(), Some(gts_type_id.as_ref()));
-}
-
-#[test]
-fn usage_type_not_found_maps_to_404() {
-    let gts_id = sample_gts_id();
-    let c = lift_type(UsageCollectorError::usage_type_not_found(&gts_id));
-    assert_eq!(c.status_code(), 404);
-    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
-    assert_eq!(c.resource_name(), Some(gts_id.as_ref()));
 }
 
 #[test]
@@ -180,14 +117,18 @@ fn declaration_not_found_maps_to_404_naming_the_gts_type_id() {
     // 4's `DeclarationNotFound`) through the `UsageCollectorError` bridge
     // (`domain/error.rs`) to this crate's `CanonicalError` lift, rather than
     // hand-building the intermediate `UsageCollectorError::NotFound`.
+    //
+    // `resource_type` is `USAGE_RECORD_RESOURCE`: a `gts_type_id` derives from
+    // the usage_record base and this gear declares no other GTS resource on
+    // its wire surface now that types-registry owns the catalog.
     let id = usage_collector_sdk::MeterTypeId::new(
         "gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~",
     )
     .expect("valid meter type id");
     let domain_err = crate::domain::DomainError::declaration_not_found(&id);
-    let c = lift_type(UsageCollectorError::from(domain_err));
+    let c = lift_record(UsageCollectorError::from(domain_err));
     assert_eq!(c.status_code(), 404);
-    assert_eq!(c.resource_type(), Some(USAGE_TYPE_RESOURCE));
+    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
     assert_eq!(c.resource_name(), Some(id.as_str()));
 }
 
@@ -205,22 +146,6 @@ fn already_inactive_maps_to_409_aborted_with_already_inactive_reason() {
         Some("ALREADY_INACTIVE"),
         "AlreadyInactive MUST carry context.reason=ALREADY_INACTIVE per the feature spec",
     );
-}
-
-#[test]
-fn usage_type_already_exists_maps_to_409() {
-    let gts_id = sample_gts_id();
-    let c = lift_type(UsageCollectorError::usage_type_already_exists(&gts_id));
-    assert_eq!(c.status_code(), 409);
-    assert_eq!(c.resource_name(), Some(gts_id.as_ref()));
-}
-
-#[test]
-fn usage_type_referenced_maps_to_409_aborted() {
-    let gts_id = sample_gts_id();
-    let c = lift_type(UsageCollectorError::usage_type_referenced(&gts_id, 7));
-    assert_eq!(c.status_code(), 409);
-    assert_eq!(c.resource_name(), Some(gts_id.as_ref()));
 }
 
 #[test]
@@ -262,24 +187,6 @@ fn non_negative_counter_compensation_carries_semantics_violation_reason() {
         first_field_violation_string(&problem, "reason").as_deref(),
         Some("SEMANTICS_VIOLATION"),
         "NonNegativeCounterCompensation routes to the SEMANTICS_VIOLATION wire reason",
-    );
-}
-
-#[test]
-fn gauge_compensation_rejected_maps_to_invalid_argument_with_reason() {
-    let gts_type_id = MeterTypeId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~tenant.example._.cpu_seconds.v1~"
-    ))
-    .expect("gauge meter type id");
-    let c = lift_record(UsageCollectorError::gauge_compensation_rejected(
-        &gts_type_id,
-    ));
-    assert_eq!(c.status_code(), 400);
-    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
-    let problem = Problem::from(c);
-    assert_eq!(
-        first_field_violation_string(&problem, "reason").as_deref(),
-        Some("GAUGE_COMPENSATION_REJECTED"),
     );
 }
 
@@ -359,13 +266,9 @@ fn corrects_id_inactive_maps_to_409_aborted_with_reason() {
 }
 
 #[test]
-fn plugin_unavailable_maps_to_503_on_both_surfaces() {
-    for c in [
-        lift_type(UsageCollectorError::plugin_unavailable()),
-        lift_record(UsageCollectorError::plugin_unavailable()),
-    ] {
-        assert_eq!(c.status_code(), 503);
-    }
+fn plugin_unavailable_maps_to_503() {
+    let c = lift_record(UsageCollectorError::plugin_unavailable());
+    assert_eq!(c.status_code(), 503);
 }
 
 #[test]
@@ -414,76 +317,6 @@ fn first_field_violation_string(problem: &Problem, key: &str) -> Option<String> 
 }
 
 #[test]
-fn invalid_base_gts_id_envelope_carries_field_violation_discriminator() {
-    let raw = format!("{GTS_ID_PREFIX}cf.core.metric.histogram.v1~bogus");
-    let reason = "usage type gts_id must derive from the reserved base \
-                  `gts.cf.core.uc.usage_record.v1~`"
-        .to_owned();
-    let problem = Problem::from(lift_type(UsageCollectorError::invalid_usage_type_gts_id(
-        &raw, &reason,
-    )));
-    assert_eq!(problem.status, Some(400));
-    assert_eq!(
-        first_field_violation_string(&problem, "field").as_deref(),
-        Some("gts_id")
-    );
-    assert_eq!(
-        first_field_violation_string(&problem, "reason").as_deref(),
-        Some("INVALID_BASE_GTS_ID")
-    );
-    let description = first_field_violation_string(&problem, "description").unwrap_or_default();
-    assert!(
-        description.contains(raw.as_str()),
-        "field_violations[0].description MUST echo the rejected raw value (got `{description}`)",
-    );
-}
-
-#[test]
-fn create_usage_type_already_exists_envelope_carries_resource_identity() {
-    let gts_id = sample_gts_id();
-    let canonical = lift_type(UsageCollectorError::usage_type_already_exists(&gts_id));
-    assert_eq!(canonical.status_code(), 409);
-    assert_eq!(canonical.resource_type(), Some(USAGE_TYPE_RESOURCE));
-    assert_eq!(canonical.resource_name(), Some(gts_id.as_ref()));
-}
-
-#[test]
-fn duplicate_metadata_field_envelope_carries_indexed_field_path() {
-    let problem = Problem::from(lift_type(UsageCollectorError::duplicate_metadata_field(1)));
-    assert_eq!(problem.status, Some(400));
-    assert_eq!(
-        first_field_violation_string(&problem, "field").as_deref(),
-        Some("metadata_fields[1]")
-    );
-    assert_eq!(
-        first_field_violation_string(&problem, "reason").as_deref(),
-        Some("INVALID_METADATA_FIELDS_DUPLICATE")
-    );
-}
-
-#[test]
-fn empty_string_metadata_field_envelope_carries_indexed_field_path() {
-    let problem = Problem::from(lift_type(UsageCollectorError::invalid_metadata_field(
-        0, true,
-    )));
-    assert_eq!(problem.status, Some(400));
-    assert_eq!(
-        first_field_violation_string(&problem, "field").as_deref(),
-        Some("metadata_fields[0]")
-    );
-    assert_eq!(
-        first_field_violation_string(&problem, "reason").as_deref(),
-        Some("INVALID_METADATA_FIELDS_EMPTY_STRING")
-    );
-}
-
-#[test]
-fn plugin_unavailable_lifts_to_service_unavailable_envelope() {
-    let problem = Problem::from(lift_type(UsageCollectorError::plugin_unavailable()));
-    assert_eq!(problem.status, Some(503));
-}
-
-#[test]
 fn invalid_metadata_key_uses_usage_record_resource() {
     let c = lift_record(UsageCollectorError::invalid_metadata_key(
         "metadata key must not be empty",
@@ -493,28 +326,11 @@ fn invalid_metadata_key_uses_usage_record_resource() {
 }
 
 // ---------------------------------------------------------------------------
-// Exhaustiveness fences: drive every variant that can fire on a given surface
-// through that surface's lift and assert an in-range status. A future variant
-// added without a corresponding `lift_common` arm trips the `debug_assert!`.
+// Exhaustiveness fence: drive every variant that can fire on the (sole
+// remaining) ingestion surface through its lift and assert an in-range
+// status. A future variant added without a corresponding `lift_common` arm
+// trips the `debug_assert!`.
 // ---------------------------------------------------------------------------
-
-fn every_usage_type_surface_variant() -> Vec<UsageCollectorError> {
-    let gts_id = sample_gts_id();
-    vec![
-        UsageCollectorError::permission_denied("denied"),
-        UsageCollectorError::invalid_metadata_field(0, true),
-        UsageCollectorError::duplicate_metadata_field(1),
-        UsageCollectorError::invalid_usage_type_gts_id("bad", "r"),
-        UsageCollectorError::invalid_usage_kind("x"),
-        UsageCollectorError::usage_type_not_found(&gts_id),
-        UsageCollectorError::usage_type_already_exists(&gts_id),
-        UsageCollectorError::usage_type_referenced(&gts_id, 3),
-        UsageCollectorError::plugin_unavailable(),
-        UsageCollectorError::types_registry_unavailable(),
-        UsageCollectorError::service_unavailable("x", None),
-        UsageCollectorError::internal("x"),
-    ]
-}
 
 fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
     use rust_decimal::Decimal;
@@ -532,12 +348,10 @@ fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
         UsageCollectorError::invalid_resource_ref("r"),
         UsageCollectorError::invalid_subject_ref("r"),
         UsageCollectorError::invalid_idempotency_key("r"),
-        UsageCollectorError::invalid_usage_type_gts_id("bad", "r"),
         UsageCollectorError::unknown_metadata_key(&gts_type_id, "k"),
         UsageCollectorError::usage_record_not_found(uuid),
         UsageCollectorError::already_inactive(uuid),
         UsageCollectorError::idempotency_conflict("idem-fence", uuid),
-        UsageCollectorError::gauge_compensation_rejected(&gts_type_id),
         UsageCollectorError::corrects_id_not_found(uuid),
         UsageCollectorError::corrects_id_targets_compensation(uuid),
         UsageCollectorError::corrects_id_wrong_scope(uuid),
@@ -547,19 +361,6 @@ fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
         UsageCollectorError::service_unavailable("x", None),
         UsageCollectorError::internal("x"),
     ]
-}
-
-#[test]
-fn lift_type_covers_every_usage_type_surface_variant() {
-    for err in every_usage_type_surface_variant() {
-        let label = format!("{err:?}");
-        let problem = Problem::from(lift_type(err));
-        assert!(
-            (400..=599).contains(&problem.status.unwrap_or(500)),
-            "lift_type({label}) produced an out-of-range status {:?}",
-            problem.status,
-        );
-    }
 }
 
 #[test]

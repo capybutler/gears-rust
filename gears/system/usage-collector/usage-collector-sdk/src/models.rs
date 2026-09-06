@@ -1,7 +1,7 @@
 //! Foundation domain models for the Usage Collector SDK.
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
@@ -10,48 +10,9 @@ use serde::{Deserialize, Serialize};
 use toolkit_odata_macros::ODataFilterable;
 use uuid::Uuid;
 
-use gts::{GtsId, GtsIdSegment, GtsInstanceId, GtsTypeId};
+use gts::GtsTypeId;
 
 use crate::error::UsageCollectorError;
-
-// ---------------------------------------------------------------------------
-// Usage-kind discriminator
-// ---------------------------------------------------------------------------
-
-/// Closed classification axis for usage types.
-///
-/// `Counter` and `Gauge` are CF-platform-internal kinds with no vendor
-/// extensibility. Serde `deny_unknown_fields` on [`UsageType`] plus the
-/// closed-enum serde shape rejects any other value at the deserialize
-/// boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UsageKind {
-    /// Append-only counter semantics. Compensations (negative deltas with
-    /// `corrects_id` set) are accepted.
-    Counter,
-    /// Snapshot-overwrite semantics. Compensations are rejected; the only
-    /// correction for a gauge is deactivation.
-    Gauge,
-}
-
-impl std::str::FromStr for UsageKind {
-    type Err = UsageCollectorError;
-
-    /// Mirrors the serde wire shape — `#[serde(rename_all = "lowercase")]`
-    /// on the enum — without paying the `serde_json::Value` allocation per
-    /// call. Both surfaces are pinned in `models_tests.rs` by
-    /// `usage_kind_serde_round_trips_lowercase` and
-    /// `usage_kind_from_str_accepts_counter_and_gauge`; the two
-    /// assertions catch any future `rename_all` drift between them.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "counter" => Ok(Self::Counter),
-            "gauge" => Ok(Self::Gauge),
-            _ => Err(UsageCollectorError::invalid_usage_kind(s)),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // MetadataKey
@@ -59,21 +20,20 @@ impl std::str::FromStr for UsageKind {
 
 /// Validating newtype over a metadata key string.
 ///
-/// Every site in the SDK that names a declared metadata key — the keys in
-/// [`UsageType::metadata_fields`], the keys of [`UsageRecord::metadata`],
-/// the key of a [`MetadataFilter`], and the payload of
-/// [`AggregationDimension::Metadata`] — carries this type rather than a bare
-/// `String`, so a malformed key cannot reach any consumer past the SDK
-/// boundary.
+/// Every site in the SDK that names a declared metadata key — the keys of
+/// [`UsageRecord::metadata`], the key of a [`MetadataFilter`], and the
+/// payload of [`AggregationDimension::Metadata`] — carries this type rather
+/// than a bare `String`, so a malformed key cannot reach any consumer past
+/// the SDK boundary.
 ///
 /// Validation rules are intentionally minimal: keys are domain-opaque
 /// (operators choose them) so the SDK refuses to encode casing or charset
 /// policy.
 ///
-/// Closed-shape membership — every key on a record MUST be in the referenced
-/// usage type's `metadata_fields` — remains a gateway-time check; it cannot
-/// be expressed at the type level without the catalog context, and the
-/// gateway is its single owner.
+/// Closed-shape membership — every key on a record MUST be in the resolved
+/// meter declaration's `metadata_fields` — remains a gateway-time check; it
+/// cannot be expressed at the type level without the resolved-declaration
+/// context, and the gateway is its single owner.
 ///
 /// # Validation
 ///
@@ -432,144 +392,15 @@ impl<'de> Deserialize<'de> for IdempotencyKey {
 }
 
 // ---------------------------------------------------------------------------
-// UsageType identity
-// ---------------------------------------------------------------------------
-
-/// Deployment-unique usage-type human identifier.
-///
-/// Validating newtype over [`gts::GtsInstanceId`]: the id MUST derive from
-/// the reserved abstract base [`Self::USAGE_RECORD_BASE`] with at least one
-/// further `~`-separated segment. Counter / gauge classification is carried
-/// separately by [`UsageType::kind`]; the id does not encode kind.
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-principle-semantics-enforcement:p2
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-pub struct UsageTypeGtsId(GtsInstanceId);
-
-impl UsageTypeGtsId {
-    /// Reserved abstract base type id for usage records.
-    ///
-    /// Every catalog `gts_id` MUST left-prefix-match this value and carry at
-    /// least one further `~`-separated derivation segment. The base itself
-    /// is abstract and rejected as a bare value.
-    pub const USAGE_RECORD_BASE: &'static str = crate::gts::USAGE_RECORD_RESOURCE;
-
-    /// Creates a `UsageTypeGtsId` after validating that the input is a
-    /// well-formed GTS instance id deriving from [`Self::USAGE_RECORD_BASE`].
-    ///
-    /// Validation routes through [`gts::GtsId::try_new`], which enforces the GTS
-    /// per-segment grammar (`vendor.package.namespace.type.v<major>[.<minor>]`),
-    /// the allowed character set, terminator semantics, and the chained-id
-    /// rules. That is the same validator other gears use for catalog-key
-    /// GTS strings, so a
-    /// malformed id surfaces with the canonical GTS error chain instead of a
-    /// raw `strip_prefix` miss.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`UsageCollectorError::InvalidArgument`] when the input
-    /// is not a syntactically valid GTS id, is a GTS *type* id (trailing
-    /// `~`) rather than an instance id, or does not derive from
-    /// [`Self::USAGE_RECORD_BASE`] (the base must appear as the first
-    /// segment of the parsed chain).
-    pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
-        let raw = value.into();
-        let parsed = GtsId::try_new(&raw).map_err(|e| {
-            UsageCollectorError::invalid_usage_type_gts_id(
-                &raw,
-                &format!("usage type gts_id `{raw}` is not a valid GTS id: {e}"),
-            )
-        })?;
-        if parsed.is_type() {
-            return Err(UsageCollectorError::invalid_usage_type_gts_id(
-                &raw,
-                &format!(
-                    "usage type gts_id `{raw}` must be a GTS instance id (no trailing `~`), \
-                     not a type id"
-                ),
-            ));
-        }
-        // Parent-chain match at GTS-segment granularity (not byte
-        // granularity). `get_type_id()` returns the prefix up to and
-        // including the last `~`, which for the canonical
-        // `base~concrete` shape is exactly `USAGE_RECORD_BASE`. Any other
-        // base, or a deeper chain whose immediate parent is not the
-        // usage-record base, fails this check — only direct derivation
-        // from the reserved base is admitted into the catalog.
-        if parsed.get_type_id().as_deref() != Some(Self::USAGE_RECORD_BASE) {
-            return Err(UsageCollectorError::invalid_usage_type_gts_id(
-                &raw,
-                &format!(
-                    "usage type gts_id `{raw}` must derive from the reserved base `{base}`",
-                    base = Self::USAGE_RECORD_BASE,
-                ),
-            ));
-        }
-        // The last parsed segment is the derivation tail. The `let Some`
-        // fall-through is structurally unreachable — `get_type_id()`
-        // returning `Some(base)` implies `gts_id_segments.len() >= 2` —
-        // but is kept as a graceful error rather than `expect` to satisfy
-        // the workspace `clippy::expect_used` rule.
-        let Some(segment) = parsed.segments().last().map(GtsIdSegment::raw) else {
-            return Err(UsageCollectorError::invalid_usage_type_gts_id(
-                &raw,
-                &format!("usage type gts_id `{raw}` is missing a derivation segment"),
-            ));
-        };
-        Ok(Self(GtsInstanceId::new(Self::USAGE_RECORD_BASE, segment)))
-    }
-
-    /// Borrows the validated GTS instance id.
-    #[must_use]
-    pub fn as_instance_id(&self) -> &GtsInstanceId {
-        &self.0
-    }
-}
-
-impl AsRef<str> for UsageTypeGtsId {
-    fn as_ref(&self) -> &str {
-        self.0.as_ref()
-    }
-}
-
-impl std::fmt::Display for UsageTypeGtsId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.as_ref())
-    }
-}
-
-impl PartialOrd for UsageTypeGtsId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for UsageTypeGtsId {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.as_ref().cmp(other.0.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for UsageTypeGtsId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        UsageTypeGtsId::new(raw).map_err(serde::de::Error::custom)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // MeterTypeId
 // ---------------------------------------------------------------------------
 
 /// The GTS base type every meter derives from.
 ///
-/// Alias of [`crate::gts::USAGE_RECORD_RESOURCE`] (also the value behind
-/// [`UsageTypeGtsId::USAGE_RECORD_BASE`]) — the same string, not a new
-/// identifier. It exists as its own constant so a meter-type call site can
-/// name the base in meter-type terms rather than reaching for the resource
-/// constant or the instance-id newtype's associated constant.
+/// Alias of [`crate::gts::USAGE_RECORD_RESOURCE`] — the same string, not a
+/// new identifier. It exists as its own constant so a meter-type call site
+/// can name the base in meter-type terms rather than reaching for the
+/// resource constant directly.
 pub const USAGE_RECORD_BASE_TYPE: &str = crate::gts::USAGE_RECORD_RESOURCE;
 
 /// Ceiling on the wire length of a meter type identifier, from
@@ -579,10 +410,9 @@ const MAX_METER_TYPE_ID_LEN: usize = 512;
 /// Reference to the GTS type declaration a ledger entry is metered against.
 ///
 /// A meter is a derived **type** of [`USAGE_RECORD_BASE_TYPE`] with exactly
-/// one further segment — not an instance — so this wraps [`GtsTypeId`]
-/// rather than the `GtsInstanceId` that [`UsageTypeGtsId`] wraps. The
-/// declaration it names is owned by `types-registry`; this gear resolves it
-/// and mints none.
+/// one further segment — not an instance — so this wraps a [`GtsTypeId`].
+/// The declaration it names is owned by `types-registry`; this gear resolves
+/// it and mints none.
 ///
 /// The gear infers no metering meaning from the shape of the identifier.
 /// Fold, canonical unit, and metadata surface come from the resolved
@@ -591,7 +421,7 @@ const MAX_METER_TYPE_ID_LEN: usize = 512;
 /// Deliberately implements neither `Ord` nor `PartialOrd`: the wrapped
 /// [`GtsTypeId`] implements neither. A caller that needs this as a
 /// `BTreeMap`/`BTreeSet` key must add manual impls delegating to the string
-/// form, the way [`UsageTypeGtsId`] does for its own non-`Ord` wrapped type.
+/// form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct MeterTypeId(GtsTypeId);
@@ -717,119 +547,6 @@ impl<'de> Deserialize<'de> for MeterTypeId {
 }
 
 // ---------------------------------------------------------------------------
-// UsageType catalog row
-// ---------------------------------------------------------------------------
-
-/// Usage-type catalog row exchanged across SDK, plugin SPI, and REST surfaces.
-///
-/// The row carries `gts_id`, the closed `kind: UsageKind` discriminator
-/// (counter vs gauge), and the closed `metadata_fields` list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UsageType {
-    /// Catalog primary key; `usage_records.gts_id` references this value.
-    pub gts_id: UsageTypeGtsId,
-    /// Counter / gauge classification. Serde `deny_unknown_fields` plus the
-    /// closed-enum shape rejects any other value at the deserialize boundary.
-    pub kind: UsageKind,
-    /// Closed set of declared metadata keys. Every key on a record's
-    /// `metadata` map MUST be a member; values are typed as `String`;
-    /// undeclared keys are rejected at the gateway. Each key is a
-    /// validated [`MetadataKey`] (non-empty, no NUL bytes) so malformed
-    /// declarations cannot land here, and the field is deserialized
-    /// through [`deserialize_metadata_fields`] so duplicate keys are
-    /// rejected at the wire boundary instead of silently collapsing.
-    #[serde(deserialize_with = "deserialize_metadata_fields")]
-    pub metadata_fields: BTreeSet<MetadataKey>,
-}
-
-/// Deserialize `metadata_fields` through a `Vec<MetadataKey>` so the SDK
-/// boundary rejects duplicate keys instead of silently collapsing them
-/// into the `BTreeSet`. The REST DTO path additionally surfaces the
-/// typed [`UsageCollectorError::InvalidArgument`] via
-/// `metadata_fields_from_wire`; this function provides the same
-/// duplicate-rejection guarantee for any non-REST wire entry point
-/// (config loader, alternate IPC, plugin SPI replay).
-fn deserialize_metadata_fields<'de, D>(d: D) -> Result<BTreeSet<MetadataKey>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Vec::<MetadataKey>::deserialize(d)?;
-    let mut set = BTreeSet::new();
-    for (index, key) in raw.into_iter().enumerate() {
-        if !set.insert(key) {
-            return Err(serde::de::Error::custom(format!(
-                "duplicate metadata field at index {index}"
-            )));
-        }
-    }
-    Ok(set)
-}
-
-impl UsageType {
-    /// `true` when this usage type carries counter semantics.
-    #[must_use]
-    pub fn is_counter(&self) -> bool {
-        matches!(self.kind, UsageKind::Counter)
-    }
-
-    /// `true` when this usage type carries gauge semantics.
-    #[must_use]
-    pub fn is_gauge(&self) -> bool {
-        matches!(self.kind, UsageKind::Gauge)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Filter surface for `list_usage_types`
-// ---------------------------------------------------------------------------
-//
-// `UsageTypeQuery` declares the filterable-field schema for the OData
-// surface of `list_usage_types`. The struct is never constructed at
-// runtime; it exists solely to feed `#[derive(ODataFilterable)]`, which
-// generates [`UsageTypeQueryFilterField`] and its
-// [`toolkit_odata::filter::FilterField`] impl, mirroring the
-// `UsageRecordQuery` / `UsageRecordQueryFilterField` pattern used by the
-// records surface.
-//
-// `metadata_fields` (a closed set) is intentionally absent — OData has no
-// natural filter shape for `BTreeSet<String>` in this workspace and there
-// is no operator demand for it.
-
-/// Filterable-field schema for `list_usage_types`'s `ODataQuery` argument.
-///
-/// Never constructed at runtime. The `dead_code` allow is intentional —
-/// the struct is a derive-only artifact (see module comment above for
-/// rationale).
-#[derive(ODataFilterable)]
-#[allow(dead_code)]
-pub struct UsageTypeQuery {
-    /// `usage_type_catalog.gts_id`. Supports `eq`, `ne`, `contains`,
-    /// `startswith`, `endswith`, `in`.
-    #[odata(filter(kind = "String"))]
-    pub gts_id: String,
-    /// `usage_type_catalog.kind` (`"counter"` / `"gauge"`). Plugins
-    /// translate to their storage representation via
-    /// `FieldToColumn::map_value`.
-    #[odata(filter(kind = "String"))]
-    pub kind: String,
-}
-
-pub use UsageTypeQueryFilterField as UsageTypeFilterField;
-
-/// Usage-type filter fields that are sound to use as a keyset-pagination
-/// ordering key. Both `usage_type_catalog` columns on the filter surface
-/// (`gts_id`, the primary key, and `kind`) are `NOT NULL`, so both are
-/// keyset-safe. The catalog list only ever orders by `gts_id`, but this is
-/// the type-surface analogue of [`is_keyset_safe_record_field`] so the
-/// plugin's shared keyset builder can enforce the never-null invariant on
-/// both surfaces. Fail-closed: an unknown field is unsafe.
-#[must_use]
-pub fn is_keyset_safe_type_field(name: &str) -> bool {
-    matches!(name, "gts_id" | "kind")
-}
-
-// ---------------------------------------------------------------------------
 // Usage-record exchange types
 // ---------------------------------------------------------------------------
 
@@ -883,9 +600,10 @@ pub struct UsageRecord {
     /// and persisted as Postgres `NUMERIC`. The wire encoding is a JSON
     /// string (`"42.5"`) — never a JSON number — so client/server number
     /// representations cannot round-trip through float and silently lose
-    /// precision. The permitted sign is jointly governed by the usage
-    /// type's [`UsageKind`] and the presence of `corrects_id` per the
-    /// four-cell value matrix.
+    /// precision. The permitted sign is jointly governed by the meter's
+    /// counter/gauge semantics (resolved via `types-registry`, not carried by
+    /// this SDK) and the presence of `corrects_id` per the four-cell value
+    /// matrix.
     #[serde(with = "rust_decimal::serde::str")]
     pub value: Decimal,
     /// Mandatory caller-supplied key for at-least-once-with-dedup semantics.
@@ -1009,45 +727,6 @@ impl CreateUsageRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Aggregated-query surface
-// ---------------------------------------------------------------------------
-
-/// Aggregation function applied to the filtered `UsageRecord.value` stream.
-///
-/// No aggregate-path request carries this as a parameter any longer: the
-/// fold served is resolved from the queried meter's declaration
-/// ([`AggregationFold`]), never chosen by a caller, so there is no
-/// per-`UsageKind` compatibility rule to enforce here. This type is kept
-/// only for the surfaces that have not yet migrated off it.
-///
-/// # Compensation handling
-///
-/// `SUM` nets across all active rows regardless of `corrects_id` (counter
-/// compensations reduce the total). Every other op operates over
-/// `corrects_id IS NULL` rows only. That partition is load-bearing only for
-/// `Count`-on-counter; `Min`/`Max`/`Avg` only ever apply to gauges, and
-/// gauges never carry compensations, so the filter is a structural no-op
-/// for them.
-///
-/// `Count` counts matched rows and is well-defined for any value shape. The
-/// other variants require a numeric `value`; non-numeric values surface as a
-/// validation error from the plugin at execution time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AggregationOp {
-    /// Sum of matched values. Compensation rows contribute their signed value.
-    Sum,
-    /// Count of matched rows.
-    Count,
-    /// Minimum matched value.
-    Min,
-    /// Maximum matched value.
-    Max,
-    /// Mean of matched values.
-    Avg,
-}
-
-// ---------------------------------------------------------------------------
 // Declared aggregation fold
 // ---------------------------------------------------------------------------
 
@@ -1142,25 +821,13 @@ pub enum AggregationDimension {
     Metadata(MetadataKey),
 }
 
-/// Aggregation specification: what to compute and how to slice it.
-///
-/// `op` is the aggregation function; `group_by` is the ordered list of
-/// dimensions. An empty `group_by` yields a single result bucket with an
-/// empty key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregationSpec {
-    pub op: AggregationOp,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub group_by: Vec<AggregationDimension>,
-}
-
-/// Single aggregated bucket. One entry per element in
-/// [`AggregationSpec::group_by`], in the same order; empty when `group_by`
-/// was empty.
+/// Single aggregated bucket. One entry per element in the query's
+/// `group_by` dimensions, in the same order; empty when `group_by` was
+/// empty.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AggregationBucket {
-    /// Dimension key values in [`AggregationSpec::group_by`] order. Each
-    /// entry is the string form of the corresponding [`AggregationDimension`]:
+    /// Dimension key values in `group_by` order. Each entry is the string
+    /// form of the corresponding [`AggregationDimension`]:
     ///
     /// - [`AggregationDimension::TenantId`] — `Uuid::to_string()`, the
     ///   canonical lowercase hyphenated form
@@ -1172,7 +839,7 @@ pub struct AggregationBucket {
     ///   identifier or type string verbatim.
     /// - [`AggregationDimension::Metadata`] — the metadata value at the
     ///   declared key, which is already a `String` (or string-coercible)
-    ///   per the [`UsageType::metadata_fields`] closed-shape rule.
+    ///   per the resolved meter declaration's closed-shape metadata rule.
     ///
     /// Plugins own this string-form contract at bucket-construction time;
     /// the SDK does not transform values at the boundary. Empty when

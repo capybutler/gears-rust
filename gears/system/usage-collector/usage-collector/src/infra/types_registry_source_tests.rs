@@ -14,6 +14,7 @@ use types_registry_sdk::{GtsTypeId, GtsTypeSchema, TypesRegistryClient};
 use usage_collector_sdk::MeterTypeId;
 
 use crate::domain::ports::declarations::DeclarationSource;
+use crate::domain::ports::metrics::NoopMetrics;
 
 use super::{TypesRegistryDeclarationSource, build_default_resolver};
 
@@ -120,7 +121,7 @@ async fn build_default_resolver_wires_a_working_resolver_over_the_hub() {
     // it constructs without panicking.
     let hub = hub_with(MockTypesRegistryClient::new().with_type_schemas([registered_schema()]));
 
-    let resolver = build_default_resolver(hub, 300, 10_000);
+    let resolver = build_default_resolver(hub, 300, 10_000, Arc::new(NoopMetrics));
 
     let declaration = resolver.resolve(&meter_id()).await.expect("resolves");
     assert_eq!(declaration.gts_type_id.as_str(), METER);

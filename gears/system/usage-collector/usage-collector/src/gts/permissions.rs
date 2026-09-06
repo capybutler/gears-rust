@@ -5,11 +5,12 @@
 //! invocation submits an [`InventoryInstance`] to the process-wide
 //! `toolkit-gts` inventory; `types-registry::init()` aggregates them at boot.
 //!
-//! `resource_type` values are the concrete catalog / ingestion type ids from
-//! the `usage_collector_sdk` resource consts — exact ids, not wildcards, since
-//! these are flat platform-global (`usage_type`) and ingestion (`usage_record`)
-//! resources with no derived subtypes. `action` values come from
-//! `crate::domain::authz::{usage_type, usage_record}::actions` — the same
+//! `resource_type` is the concrete ingestion type id from the
+//! `usage_collector_sdk` resource const — an exact id, not a wildcard, since
+//! `usage_record` is a flat resource with no derived subtypes. There is no
+//! usage-type catalog permission family any more: every type declaration is
+//! owned by `types-registry`, which authorizes its own surface. `action`
+//! values come from `crate::domain::authz::usage_record::actions` — the same
 //! constants the `PolicyEnforcer` gate passes — so the catalog cannot drift
 //! from what the REST surface actually enforces.
 //!
@@ -20,44 +21,9 @@
 //! [`gts_instance!`]: toolkit_gts::gts_instance
 
 use toolkit_gts::{AuthzPermissionV1, gts_instance};
-use usage_collector_sdk::{USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE};
+use usage_collector_sdk::USAGE_RECORD_RESOURCE;
 
-use crate::domain::authz::{usage_record, usage_type};
-
-// ---- usage_type (gts.cf.core.uc.usage_type.v1~) ---------------------------
-
-gts_instance! {
-    AuthzPermissionV1 {
-        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_type_create.v1"),
-        resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-        action: usage_type::actions::CREATE.to_owned(),
-        display_name: "Create usage type".to_owned(),
-    }
-}
-gts_instance! {
-    AuthzPermissionV1 {
-        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_type_get.v1"),
-        resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-        action: usage_type::actions::GET.to_owned(),
-        display_name: "Get usage type".to_owned(),
-    }
-}
-gts_instance! {
-    AuthzPermissionV1 {
-        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_type_list.v1"),
-        resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-        action: usage_type::actions::LIST.to_owned(),
-        display_name: "List usage types".to_owned(),
-    }
-}
-gts_instance! {
-    AuthzPermissionV1 {
-        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_type_delete.v1"),
-        resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-        action: usage_type::actions::DELETE.to_owned(),
-        display_name: "Delete usage type".to_owned(),
-    }
-}
+use crate::domain::authz::usage_record;
 
 // ---- usage_record (gts.cf.core.uc.usage_record.v1~) -----------------------
 
@@ -110,10 +76,6 @@ mod tests {
     /// One per `(resource_type, action)` the usage-collector REST/PEP surface
     /// enforces.
     const EXPECTED_PERMISSION_IDS: &[&str] = &[
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_type_create.v1"),
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_type_get.v1"),
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_type_list.v1"),
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_type_delete.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_create.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_get.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_list.v1"),

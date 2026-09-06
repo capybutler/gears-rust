@@ -24,6 +24,7 @@ use usage_collector_sdk::MeterTypeId;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::declarations::DeclarationSource;
+use crate::domain::ports::metrics::UsageCollectorMetrics;
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 
 /// Reads declarations from `types-registry` through `ClientHub`.
@@ -88,7 +89,9 @@ fn map_registry_error(id: &MeterTypeId, err: CanonicalError) -> DomainError {
 /// This is the bootstrap-layer construction point — called from `module.rs`
 /// with the configured `[usage_collector]` cache knobs, the same way
 /// [`crate::infra::metrics::build_default_adapter`] builds the metrics
-/// adapter from `cfg.metrics.effective_prefix()`. The returned resolver is
+/// adapter from `cfg.metrics.effective_prefix()`. `module.rs` passes that
+/// very adapter in as `metrics`, so `uc_type_resolution_total` shares one
+/// instrument set with the rest of the gear. The returned resolver is
 /// injected into `Service::new_with_metrics` as a finished object; nothing
 /// about how it was built leaks into the domain layer.
 #[must_use]
@@ -96,6 +99,7 @@ pub fn build_default_resolver(
     hub: Arc<ClientHub>,
     ttl_secs: u64,
     capacity: usize,
+    metrics: Arc<dyn UsageCollectorMetrics>,
 ) -> Arc<TypeResolver> {
     let source = Arc::new(TypesRegistryDeclarationSource::new(hub));
     Arc::new(TypeResolver::new(
@@ -104,6 +108,7 @@ pub fn build_default_resolver(
             ttl: Duration::from_secs(ttl_secs),
             capacity,
         },
+        metrics,
     ))
 }
 

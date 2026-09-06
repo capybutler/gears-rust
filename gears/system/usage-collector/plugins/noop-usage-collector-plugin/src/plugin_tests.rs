@@ -1,30 +1,15 @@
 //! Tests for the no-op storage backend's [`UsageCollectorPluginV1`] surface.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 use usage_collector_sdk::{
-    IdempotencyKey, MetadataKey, MeterTypeId, ResourceRef, UsageCollectorPluginError,
-    UsageCollectorPluginV1, UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
+    IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorPluginError, UsageCollectorPluginV1,
+    UsageRecord, UsageRecordStatus,
 };
 use uuid::Uuid;
 
 use super::NoopBackend;
-
-fn sample_id(suffix: &str) -> UsageTypeGtsId {
-    UsageTypeGtsId::new(format!(
-        "{prefix}{suffix}",
-        prefix = UsageTypeGtsId::USAGE_RECORD_BASE,
-    ))
-    .expect("usage_record-derived gts_id must parse")
-}
-
-fn keyset<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
-    values
-        .into_iter()
-        .map(|v| MetadataKey::new(v).expect("valid metadata key fixture"))
-        .collect()
-}
 
 fn sample_record(id: &str, idempotency_key: &str) -> UsageRecord {
     UsageRecord {
@@ -42,69 +27,6 @@ fn sample_record(id: &str, idempotency_key: &str) -> UsageRecord {
         corrects_id: None,
         status: UsageRecordStatus::Active,
         created_at: time::OffsetDateTime::from_unix_timestamp(0).expect("epoch fixture"),
-    }
-}
-
-#[tokio::test]
-async fn create_usage_type_echoes_input() {
-    let backend = NoopBackend::new();
-    let gts_id = sample_id("test.uc.phase01.echo.v1");
-    let metadata_fields = keyset(["region", "az"]);
-    let input = UsageType {
-        gts_id: gts_id.clone(),
-        kind: UsageKind::Counter,
-        metadata_fields: metadata_fields.clone(),
-    };
-
-    let record = backend
-        .create_usage_type(input.clone())
-        .await
-        .expect("noop create_usage_type must echo input");
-
-    assert_eq!(record.gts_id, gts_id);
-    assert_eq!(record.kind, input.kind);
-    assert_eq!(record.metadata_fields, metadata_fields);
-}
-
-#[tokio::test]
-async fn get_usage_type_returns_not_found_with_target_id() {
-    let backend = NoopBackend::new();
-    let gts_id = sample_id("test.uc.phase01.getmiss.v1");
-
-    let err = backend
-        .get_usage_type(gts_id.clone())
-        .await
-        .expect_err("noop backend MUST surface UsageTypeNotFound");
-
-    match err {
-        UsageCollectorPluginError::UsageTypeNotFound { gts_id: returned } => {
-            assert_eq!(
-                returned, gts_id,
-                "the not-found variant MUST echo the supplied gts_id",
-            );
-        }
-        other => panic!("expected UsageTypeNotFound, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn delete_usage_type_returns_not_found_with_target_id() {
-    let backend = NoopBackend::new();
-    let gts_id = sample_id("test.uc.phase01.delmiss.v1");
-
-    let err = backend
-        .delete_usage_type(gts_id.clone())
-        .await
-        .expect_err("noop backend MUST surface UsageTypeNotFound");
-
-    match err {
-        UsageCollectorPluginError::UsageTypeNotFound { gts_id: returned } => {
-            assert_eq!(
-                returned, gts_id,
-                "the not-found variant MUST echo the supplied gts_id",
-            );
-        }
-        other => panic!("expected UsageTypeNotFound, got {other:?}"),
     }
 }
 

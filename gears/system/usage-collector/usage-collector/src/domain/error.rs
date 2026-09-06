@@ -6,16 +6,17 @@
 //! `Problem` lift lives on the REST surface — this module only normalizes
 //! failures.
 //!
-//! The catalog error vocabulary is keyed by `gts_id: UsageTypeGtsId`
-//! end-to-end (no UUID derivation; `gts_id` is the catalog PK).
-//! Validation failures (typed SDK variants — `NegativeCounterValue`,
-//! `InvalidUsageTypeGtsId`, `InvalidResourceRef`, etc.) flow back to the
-//! caller verbatim and are not re-classified through `DomainError`.
+//! There is no catalog error vocabulary any more: every type declaration is
+//! owned by `types-registry` and resolved through the Type Resolver, whose
+//! unresolvable outcome is [`DomainError::DeclarationNotFound`]. Validation
+//! failures (typed SDK variants — `NegativeCounterValue`, `InvalidResourceRef`,
+//! etc.) flow back to the caller verbatim and are not re-classified through
+//! `DomainError`.
 
 use toolkit_macros::domain_model;
 use usage_collector_sdk::{
-    MeterTypeId, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError,
-    UsageCollectorPluginError, UsageTypeGtsId, ValidationReason,
+    MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
+    ValidationReason,
 };
 use uuid::Uuid;
 
@@ -70,26 +71,6 @@ pub enum DomainError {
     /// `cpt-cf-usage-collector-principle-pdp-centric-authorization`.
     #[error("authorization service unavailable: {0}")]
     AuthorizationUnavailable(String),
-
-    /// The referenced `gts_id` is absent from the plugin-owned catalog
-    /// (catalog-admin op, ingestion, or aggregated-query reference) per
-    /// ADR-0012.
-    #[error("usage type not found: {gts_id}")]
-    UsageTypeNotFound { gts_id: UsageTypeGtsId },
-
-    /// `create_usage_type` was called with a `gts_id` whose row is already
-    /// present in `usage_type_catalog` and whose payload differs from the
-    /// stored row.
-    #[error("usage type already exists: {gts_id}")]
-    UsageTypeAlreadyExists { gts_id: UsageTypeGtsId },
-
-    /// `delete_usage_type` rejected because the usage type is still
-    /// referenced by usage samples (ADR-0012 §"Consequences").
-    #[error("usage type {gts_id} is still referenced by {sample_ref_count} samples")]
-    UsageTypeReferenced {
-        gts_id: UsageTypeGtsId,
-        sample_ref_count: u64,
-    },
 
     /// Ingestion supplied a `metadata` map carrying a key that is not a
     /// member of the referenced meter's declared `metadata_fields` list
@@ -310,19 +291,6 @@ impl From<UsageCollectorPluginError> for DomainError {
             UsageCollectorPluginError::Internal(detail) => Self::Internal(detail),
             // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-fail
             // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-catch
-            UsageCollectorPluginError::UsageTypeNotFound { gts_id } => {
-                Self::UsageTypeNotFound { gts_id }
-            }
-            UsageCollectorPluginError::UsageTypeAlreadyExists { gts_id } => {
-                Self::UsageTypeAlreadyExists { gts_id }
-            }
-            UsageCollectorPluginError::UsageTypeReferenced {
-                gts_id,
-                sample_ref_count,
-            } => Self::UsageTypeReferenced {
-                gts_id,
-                sample_ref_count,
-            },
             UsageCollectorPluginError::IdempotencyConflict {
                 idempotency_key,
                 existing_id,
@@ -347,9 +315,6 @@ fn is_plugin_error_exhaustive_today(e: &UsageCollectorPluginError) -> bool {
         e,
         UsageCollectorPluginError::Transient { .. }
             | UsageCollectorPluginError::Internal(_)
-            | UsageCollectorPluginError::UsageTypeNotFound { .. }
-            | UsageCollectorPluginError::UsageTypeAlreadyExists { .. }
-            | UsageCollectorPluginError::UsageTypeReferenced { .. }
             | UsageCollectorPluginError::IdempotencyConflict { .. }
             | UsageCollectorPluginError::UsageRecordNotFound { .. }
             | UsageCollectorPluginError::UsageRecordAlreadyInactive { .. }
@@ -377,17 +342,9 @@ impl From<DomainError> for UsageCollectorError {
             DomainError::AuthorizationUnavailable(reason) => {
                 Self::service_unavailable(reason, None)
             }
-            DomainError::UsageTypeNotFound { gts_id } => Self::usage_type_not_found(&gts_id),
-            DomainError::UsageTypeAlreadyExists { gts_id } => {
-                Self::usage_type_already_exists(&gts_id)
-            }
             DomainError::UnknownMetadataKey { gts_type_id, key } => {
                 Self::unknown_metadata_key(&gts_type_id, &key)
             }
-            DomainError::UsageTypeReferenced {
-                gts_id,
-                sample_ref_count,
-            } => Self::usage_type_referenced(&gts_id, sample_ref_count),
             DomainError::IdempotencyConflict {
                 idempotency_key,
                 existing_id,
@@ -399,13 +356,18 @@ impl From<DomainError> for UsageCollectorError {
             // Type Resolver rejected an incomplete declaration for it — both
             // reach this same arm because both build
             // `DomainError::DeclarationNotFound` (see its doc comment).
+            //
+            // `resource_type` is `USAGE_RECORD_RESOURCE`, not a usage-type
+            // marker: `gts_type_id` is a `usage_record`-derived meter type,
+            // and this gear declares no other GTS resource on its wire
+            // surface now that types-registry owns the catalog.
             DomainError::DeclarationNotFound {
                 gts_type_id,
                 reason,
             } => {
                 let detail = format!("GTS type `{gts_type_id}` {reason}");
                 Self::NotFound {
-                    resource_type: USAGE_TYPE_RESOURCE.to_owned(),
+                    resource_type: USAGE_RECORD_RESOURCE.to_owned(),
                     name: gts_type_id,
                     detail,
                 }

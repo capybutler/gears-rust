@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::error::UsageCollectorError;
 use crate::models::{
     AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, MeterTypeId,
-    UsageRecord, UsageType, UsageTypeGtsId,
+    UsageRecord,
 };
 
 /// Consumer-facing API for Usage Collector operations.
@@ -84,32 +84,4 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<(), UsageCollectorError>;
     // @cpt-end:cpt-cf-usage-collector-state-event-deactivation-record-lifecycle:p1:inst-state-no-reactivation
-
-    /// Create a usage type.
-    async fn create_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorError>;
-
-    /// Get a usage type by `gts_id`.
-    async fn get_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorError>;
-
-    /// List usage types, paginated.
-    async fn list_usage_types(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorError>;
-
-    /// Delete a usage type.
-    async fn delete_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorError>;
 }
