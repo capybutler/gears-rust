@@ -2,21 +2,23 @@
 //! rejects raw / aggregated queries whose `$filter` does not pin a bounded
 //! `created_at` window (a lower **and** an upper bound as top-level
 //! conjuncts), preventing an unbounded full-table scan / aggregation —
-//! and for [`reject_reserved_filter_fields`] / [`require_dimensions_declared`],
-//! the Spec §3.11 gate on the admissible `$filter` / `group_by` surface.
+//! and for [`reject_reserved_filter_fields`] / [`require_dimensions_declared`]
+//! / [`require_metadata_filter_keys_declared`], the Spec §3.11 gate on the
+//! admissible `$filter` / `group_by` / `metadata_filter` surface.
 
 use std::collections::BTreeSet;
 
 use toolkit_odata::{ODataQuery, ast};
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use usage_collector_sdk::{
-    AggregationDimension, MetadataKey, MeterTypeId, UsageCollectorError, ValidationReason,
+    AggregationDimension, MetadataFilter, MetadataKey, MeterTypeId, UsageCollectorError,
+    ValidationReason,
 };
 use uuid::Uuid;
 
 use super::{
     compose_query_with_scope, reject_reserved_filter_fields, require_bounded_time_window,
-    require_dimensions_declared,
+    require_dimensions_declared, require_metadata_filter_keys_declared,
 };
 
 /// Build an [`ODataQuery`] whose `$filter` is the parsed `filter` string.
@@ -415,4 +417,79 @@ fn reserved_field_match_is_case_insensitive() {
         ));
         assert_reserved_field(err, field);
     }
+}
+
+// ---------------------------------------------------------------------------
+// require_metadata_filter_keys_declared — Spec §3.11: `metadata_filter` is
+// the dynamic-key side channel `$filter` cannot express a JSON-map key
+// predicate through (that's precisely why it exists as a separate
+// parameter), so it needs its own declared-keys gate, recomputed per
+// request exactly like `group_by`'s.
+// ---------------------------------------------------------------------------
+
+/// Build a `MetadataFilter` for `key` with a single candidate value.
+fn metadata_filter(key: &str) -> MetadataFilter {
+    MetadataFilter::new(key, ["x".to_owned()]).expect("valid metadata filter")
+}
+
+/// Assert `err` is the canonical unknown-metadata-key rejection —
+/// `ValidationReason::UnknownMetadataKey`, `resource_name` carrying the
+/// queried meter (the same [`UsageCollectorError::unknown_metadata_key`]
+/// shape ingestion uses) — and that its `detail` names the offending key.
+fn assert_unknown_metadata_key(err: UsageCollectorError, key: &str) {
+    match err {
+        UsageCollectorError::InvalidArgument {
+            resource_name,
+            reason,
+            detail,
+            ..
+        } => {
+            assert_eq!(reason, ValidationReason::UnknownMetadataKey);
+            assert_eq!(
+                resource_name.as_deref(),
+                Some(meter_id().as_str()),
+                "resource_name must carry the queried meter",
+            );
+            assert!(
+                detail.contains(key),
+                "detail must name the offending key '{key}': {detail}"
+            );
+        }
+        other => panic!("expected InvalidArgument/UnknownMetadataKey, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_declared_metadata_filter_key_is_accepted() {
+    let filters = [metadata_filter("region")];
+    require_metadata_filter_keys_declared(
+        &filters,
+        &declared(&["region", "storage_class"]),
+        &meter_id(),
+    )
+    .expect("a declared key is admissible");
+}
+
+#[test]
+fn an_undeclared_metadata_filter_key_is_rejected_and_named() {
+    let filters = [metadata_filter("tier")];
+    let err = require_metadata_filter_keys_declared(&filters, &declared(&["region"]), &meter_id())
+        .expect_err("an undeclared key must not be admissible");
+    assert_unknown_metadata_key(err, "tier");
+}
+
+#[test]
+fn metadata_filter_admissibility_is_recomputed_per_request() {
+    // Same key, same call site — only the declared-keys argument differs
+    // between invocations, exactly the `group_by` proof mirrored onto
+    // `metadata_filter`: nothing about admissibility is cached at the
+    // wrong layer.
+    let filters = [metadata_filter("region")];
+
+    require_metadata_filter_keys_declared(&filters, &declared(&[]), &meter_id())
+        .expect_err("not yet declared: must be rejected");
+    require_metadata_filter_keys_declared(&filters, &declared(&["region"]), &meter_id())
+        .expect("declared a moment later: must now be admissible, without a restart");
+    require_metadata_filter_keys_declared(&filters, &declared(&[]), &meter_id())
+        .expect_err("withdrawn: must be rejected again on the next call");
 }

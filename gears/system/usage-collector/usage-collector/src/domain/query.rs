@@ -14,18 +14,25 @@
 //! * `require_dimensions_declared` — checks a `group_by` list only names
 //!   the fixed dimensions or a metadata key the queried meter's resolved
 //!   declaration actually declares.
+//! * `require_metadata_filter_keys_declared` — the same check for
+//!   `metadata_filter`, the dynamic-key side channel that exists precisely
+//!   because the `toolkit-odata` grammar cannot express filters over JSON
+//!   map keys, so it never flows through `$filter` at all.
 //!
-//! Per Spec §3.11, the admissible `$filter` / `group_by` surface is the
-//! fixed fields plus the queried meter's declared metadata keys,
-//! recomputed per request from the resolved declaration — never cached
-//! independently of it, so a property declared a moment ago is usable on
-//! the very next call.
+//! Per Spec §3.11, the admissible filter and grouping surface is the fixed
+//! fields (via `$filter`, gated by [`reject_reserved_filter_fields`]) plus
+//! the queried meter's declared metadata keys (via `group_by` and
+//! `metadata_filter`, gated by [`require_dimensions_declared`] and
+//! [`require_metadata_filter_keys_declared`] respectively) — recomputed
+//! per request from the resolved declaration, never cached independently
+//! of it, so a property declared a moment ago is usable on the very next
+//! call.
 
 use std::collections::BTreeSet;
 
 use toolkit_odata::{ODataQuery, ast};
 use toolkit_security::AccessScope;
-use usage_collector_sdk::{AggregationDimension, MeterTypeId, UsageCollectorError};
+use usage_collector_sdk::{AggregationDimension, MetadataFilter, MeterTypeId, UsageCollectorError};
 
 use crate::domain::authz;
 
@@ -244,6 +251,40 @@ pub(crate) fn require_dimensions_declared(
                 gts_type_id,
                 key.as_str(),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks every `metadata_filter` entry names a metadata key
+/// `declared_keys` actually declares.
+///
+/// `metadata_filter` is the dynamic-key side channel that exists precisely
+/// because the `toolkit-odata` grammar cannot express a filter over a JSON
+/// map key — it never flows through `$filter` at all, so
+/// [`reject_reserved_filter_fields`] and this check gate two disjoint
+/// surfaces. Without this check an undeclared key would silently narrow
+/// the result set to nothing (a plugin equality-filters on a column /
+/// property that no row carries) rather than fail with an actionable 400.
+///
+/// `declared_keys` is read from the resolved declaration fresh for this
+/// request, never cached independently of it — so a property declared a
+/// moment ago is usable on the very next call, per Spec §3.11.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorError::InvalidArgument`] (via
+/// [`UsageCollectorError::unknown_metadata_key`]) naming the first
+/// undeclared key.
+pub(crate) fn require_metadata_filter_keys_declared(
+    metadata_filter: &[MetadataFilter],
+    declared_keys: &BTreeSet<String>,
+    gts_type_id: &MeterTypeId,
+) -> Result<(), UsageCollectorError> {
+    for filter in metadata_filter {
+        let key = filter.key().as_str();
+        if !declared_keys.contains(key) {
+            return Err(UsageCollectorError::unknown_metadata_key(gts_type_id, key));
         }
     }
     Ok(())

@@ -3147,15 +3147,16 @@ mod query_admissibility_tests {
     use toolkit_odata::{ODataQuery, ast};
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
-        AggregationDimension, AggregationResult, MetadataKey, MeterTypeId, UsageCollectorError,
-        UsageCollectorPluginV1, ValidationReason,
+        AggregationDimension, AggregationResult, MetadataFilter, MetadataKey, MeterTypeId,
+        UsageCollectorError, UsageCollectorPluginV1, ValidationReason,
     };
 
     use crate::domain::Service;
     use crate::domain::ports::declarations::DeclarationSource;
     use crate::domain::test_support::{
         RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
-        fake_declaration_source_with_metadata, recording_plugin_resolver,
+        fake_declaration_source_not_found, fake_declaration_source_with_metadata,
+        recording_plugin_resolver,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -3351,5 +3352,151 @@ mod query_admissibility_tests {
             .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
             .await
             .expect("declared a moment later: must now be admissible, without a restart");
+    }
+
+    // ── metadata_filter admissibility (Spec §3.11's third gated surface) ───
+    //
+    // `metadata_filter` is the dynamic-key side channel that exists precisely
+    // because `toolkit-odata`'s grammar cannot express a filter over a JSON
+    // map key — it never flows through `$filter`, so it needs its own
+    // declared-keys gate on both read paths, wired at the same point as the
+    // `$filter` / `group_by` checks above.
+
+    /// Build a `MetadataFilter` for `key` with a single candidate value.
+    fn metadata_filter(key: &str) -> MetadataFilter {
+        MetadataFilter::new(key, ["x".to_owned()]).expect("valid metadata filter")
+    }
+
+    #[tokio::test]
+    async fn list_rejects_an_undeclared_metadata_filter_key() {
+        let (svc, _spy) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&["region"]));
+
+        let filters = [metadata_filter("tier")];
+        let err = svc
+            .list_usage_records(&ctx(), meter_id(), &bounded_window(), &filters)
+            .await
+            .expect_err("an undeclared metadata_filter key must be rejected");
+        assert!(
+            err.to_string().contains("tier"),
+            "the rejection must name the offending key: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_accepts_a_declared_metadata_filter_key() {
+        use toolkit_odata::{Page as ODataPage, PageInfo};
+
+        let (svc, spy) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&["region"]));
+        spy.set_list_usage_records_response(ODataPage {
+            items: vec![],
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 1000,
+            },
+        });
+
+        let filters = [metadata_filter("region")];
+        svc.list_usage_records(&ctx(), meter_id(), &bounded_window(), &filters)
+            .await
+            .expect("a declared metadata_filter key must be accepted, reaching the plugin");
+    }
+
+    #[tokio::test]
+    async fn aggregate_rejects_an_undeclared_metadata_filter_key() {
+        let (svc, spy) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&["region"]));
+
+        let filters = [metadata_filter("tier")];
+        let err = svc
+            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &filters, &[])
+            .await
+            .expect_err("an undeclared metadata_filter key must be rejected");
+        assert!(
+            err.to_string().contains("tier"),
+            "the rejection must name the offending key: {err}",
+        );
+        assert_eq!(
+            spy.calls(),
+            0,
+            "a rejected metadata_filter must never reach the plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_accepts_a_declared_metadata_filter_key() {
+        let (svc, spy) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&["region"]));
+        spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
+
+        let filters = [metadata_filter("region")];
+        svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &filters, &[])
+            .await
+            .expect("a declared metadata_filter key must be accepted");
+        assert_eq!(
+            spy.calls(),
+            1,
+            "an accepted metadata_filter must reach the plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_filter_admissibility_is_recomputed_per_request() {
+        // Two independently-resolved declarations for the same meter id,
+        // one declaring `region` and one not: the SAME `metadata_filter` key
+        // is rejected against the first and accepted against the second —
+        // the `group_by` recomputation proof mirrored onto the third gated
+        // surface. Exercised on the list path since that's the surface
+        // whose declaration resolution is new in this task.
+        use toolkit_odata::{Page as ODataPage, PageInfo};
+
+        let filters = [metadata_filter("region")];
+
+        let (svc_before, _spy_before) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&[]));
+        let err = svc_before
+            .list_usage_records(&ctx(), meter_id(), &bounded_window(), &filters)
+            .await
+            .expect_err("not yet declared: must be rejected");
+        assert!(err.to_string().contains("region"));
+
+        let (svc_after, spy_after) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&["region"]));
+        spy_after.set_list_usage_records_response(ODataPage {
+            items: vec![],
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 1000,
+            },
+        });
+        svc_after
+            .list_usage_records(&ctx(), meter_id(), &bounded_window(), &filters)
+            .await
+            .expect("declared a moment later: must now be admissible, without a restart");
+    }
+
+    #[tokio::test]
+    async fn list_now_fails_closed_when_the_type_does_not_resolve() {
+        // Behavioural change introduced by this task: `list_usage_records`
+        // previously resolved no declaration at all (it has no `group_by`),
+        // so an unresolvable `gts_type_id` reached the plugin unchecked.
+        // Gating `metadata_filter` against the declared keys requires
+        // resolving one, so an unresolvable type now fails closed here as a
+        // pre-dispatch 404 — mirrors
+        // `aggregate_fails_closed_when_the_type_does_not_resolve` in
+        // `aggregate_declared_fold_tests`.
+        let (svc, _spy) = service_with_recording_plugin(fake_declaration_source_not_found());
+
+        let err = svc
+            .list_usage_records(&ctx(), meter_id(), &bounded_window(), &[])
+            .await
+            .expect_err("an unresolvable type must not reach the plugin");
+        assert!(
+            matches!(err, UsageCollectorError::NotFound { .. }),
+            "expected NotFound, got {err:?}",
+        );
     }
 }

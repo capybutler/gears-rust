@@ -44,7 +44,7 @@ use crate::domain::ports::metrics::{
 };
 use crate::domain::query::{
     compose_query_with_scope, reject_reserved_filter_fields, require_bounded_time_window,
-    require_dimensions_declared,
+    require_dimensions_declared, require_metadata_filter_keys_declared,
 };
 use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
@@ -1511,7 +1511,7 @@ impl Service {
     /// Keyset-paginated list of `UsageRecord`s from the bound storage
     /// plugin's table, narrowed by the PDP-returned constraints.
     ///
-    /// Three responsibilities live here per
+    /// Four responsibilities live here per
     /// `cpt-cf-usage-collector-flow-usage-query-query-raw`:
     ///
     /// 1. **Authorize** the request via [`authz::authorize_list_usage_records`].
@@ -1524,7 +1524,22 @@ impl Service {
     ///    `allow_all`); a degenerate unconstrained permit is denied in
     ///    composition by [`authz::scope_to_odata_filter`], not read as "all
     ///    tenants".
-    /// 2. **Compose** the PDP constraints into the user-supplied `OData`
+    /// 2. **Resolve** the queried meter's declaration through
+    ///    [`TypeResolver::resolve`], fail-closed, so the admissible-metadata
+    ///    gate in step 3 has a declared-keys set to check against. This is
+    ///    a behavioural change from before Spec §3.11 gating landed: an
+    ///    unresolvable type now surfaces here as a pre-dispatch 404, where
+    ///    previously this path never resolved a declaration and dispatched
+    ///    straight to the plugin regardless of whether the type was known
+    ///    to `types-registry`.
+    /// 3. **Gate** the query surface on that declaration (Spec §3.11):
+    ///    [`reject_reserved_filter_fields`] rejects a `$filter` naming
+    ///    `gts_type_id` or a covered-period bound, and
+    ///    [`require_metadata_filter_keys_declared`] rejects a
+    ///    `metadata_filter` entry naming a metadata key the declaration
+    ///    does not declare (this path takes no `group_by`, so
+    ///    [`require_dimensions_declared`] does not apply here).
+    /// 4. **Compose** the PDP constraints into the user-supplied `OData`
     ///    filter via [`authz::scope_to_odata_filter`]. The composition is
     ///    intersection-only (`composed = user_filter AND constraints`) per
     ///    `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`
@@ -1533,7 +1548,7 @@ impl Service {
     ///    through `query.filter` as a `created_at` predicate (see
     ///    [`usage_collector_sdk::UsageRecordFilterField`]); the gateway
     ///    no longer accepts a separate `TimeWindow`.
-    /// 3. **Delegate** to the bound storage plugin's
+    /// 5. **Delegate** to the bound storage plugin's
     ///    `list_usage_records` SPI with the composed filter.
     ///
     /// # Errors
@@ -1543,6 +1558,12 @@ impl Service {
     ///   or is unavailable, or when the PDP returns a constraint shape
     ///   this gear cannot honour (tree predicates on a flat resource,
     ///   unknown PEP property, type mismatch on a value).
+    /// * [`UsageCollectorError::NotFound`] when `gts_type_id` does not
+    ///   resolve to a declaration (never declared, or an incomplete
+    ///   declaration) — new as of the declaration-resolution step above.
+    /// * [`UsageCollectorError::InvalidArgument`] when `$filter` names a
+    ///   reserved field or `metadata_filter` names an undeclared metadata
+    ///   key.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
     ///   transport / persistence failure.
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-raw:p1
@@ -1586,15 +1607,32 @@ impl Service {
             // is denied regardless of window shape).
             require_bounded_time_window(query)?;
 
-            // Reject a `$filter` naming a reserved field (`gts_type_id`, the
-            // covered-period bounds) before composition — each already
+            // Resolve the queried meter's declaration so the admissibility
+            // gate below has a declared-keys set to check `metadata_filter`
+            // against. Behavioural change: this path did not resolve a
+            // declaration before Spec §3.11 gating landed here, so an
+            // unresolvable type now fails closed as a pre-dispatch 404
+            // where it previously reached the plugin regardless.
+            let declaration = self.type_resolver.resolve(&gts_type_id).await?;
+
+            // Gate the query surface on the resolved declaration (Spec
+            // §3.11): `$filter` may not name a reserved field
+            // (`gts_type_id`, the covered-period bounds — each already
             // travels as a typed parameter, so a predicate over one would
-            // be a second, possibly contradictory, constraint (Spec §3.11).
-            // `list_usage_records` takes no `group_by`, so only the filter
-            // gate applies on this path.
+            // be a second, possibly contradictory, constraint), and
+            // `metadata_filter` may not name a metadata key the
+            // declaration does not declare, recomputed here per request so
+            // a property declared a moment ago is usable on this very
+            // call. `list_usage_records` takes no `group_by`, so
+            // `require_dimensions_declared` does not apply on this path.
             if let Some(filter) = query.filter() {
                 reject_reserved_filter_fields(filter)?;
             }
+            require_metadata_filter_keys_declared(
+                metadata_filter,
+                declaration.metadata_schema.declared_keys(),
+                &gts_type_id,
+            )?;
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-constraint-composition
             let composed = compose_query_with_scope(query, &scope)?;
@@ -1721,17 +1759,27 @@ impl Service {
             let declaration = self.type_resolver.resolve(&gts_type_id).await?;
 
             // Gate the query surface on the resolved declaration (Spec
-            // §3.11): the admissible `$filter` / `group_by` set is the fixed
-            // fields plus the queried meter's declared metadata keys,
-            // recomputed here per request so a property declared a moment
-            // ago is usable on this very call. Runs after resolving the
-            // declaration (there is nothing to check `group_by` against
+            // §3.11): `$filter` may not name a reserved field
+            // (`gts_type_id`, the covered-period bounds), and `group_by` /
+            // `metadata_filter` may not name a metadata key the
+            // declaration does not declare — three checks over two
+            // disjoint channels, since `metadata_filter` is the
+            // dynamic-key side channel `$filter` cannot express a JSON-map
+            // key predicate through. All three are recomputed here per
+            // request so a property declared a moment ago is usable on
+            // this very call. Runs after resolving the declaration (there
+            // is nothing to check `group_by` / `metadata_filter` against
             // before then) and before composing the PDP scope.
             if let Some(filter) = query.filter() {
                 reject_reserved_filter_fields(filter)?;
             }
             require_dimensions_declared(
                 group_by,
+                declaration.metadata_schema.declared_keys(),
+                &gts_type_id,
+            )?;
+            require_metadata_filter_keys_declared(
+                metadata_filter,
                 declaration.metadata_schema.declared_keys(),
                 &gts_type_id,
             )?;

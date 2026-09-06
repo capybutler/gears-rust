@@ -2167,8 +2167,8 @@ mod handle_list_usage_records_tests {
     use super::{HAPPY_RECORD_GTS_ID, sample_persisted_record};
     use crate::domain::Service;
     use crate::domain::test_support::{
-        CountingPermitResolver, CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx,
-        enforcer_for, hub_with_plugin,
+        CountingPermitResolver, CountingUnreachableResolver, HappyPathPlugin, ServiceFixture,
+        authenticated_ctx, enforcer_for, fake_declaration_source_with_fold,
     };
 
     fn service_no_plugin() -> Arc<Service> {
@@ -2178,18 +2178,24 @@ mod handle_list_usage_records_tests {
         Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
     }
 
+    /// A `Service` bound to `plugin` under a permit that pins the caller's
+    /// tenant, with a `DeclarationSource` that resolves every meter —
+    /// `list_usage_records` now resolves the queried meter's declaration
+    /// (Spec §3.11 `metadata_filter` gating), so the default
+    /// `UnavailableDeclarationSource` a bare `Service::new` carries would
+    /// turn every happy-path call here into a `ServiceUnavailable` before
+    /// ever reaching the plugin.
     fn service_with_permit_plugin(plugin: &Arc<HappyPathPlugin>, suffix: &str) -> Arc<Service> {
-        let hub = hub_with_plugin(
-            Arc::clone(plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-            suffix,
-            "cyberfabric",
-        );
-        let resolver = CountingPermitResolver::new(
-            pep_properties::OWNER_TENANT_ID,
-            Uuid::from_u128(2).to_string(),
-        );
-        let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+        ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .with_resolver(CountingPermitResolver::new(
+                pep_properties::OWNER_TENANT_ID,
+                Uuid::from_u128(2).to_string(),
+            ))
+            .build(
+                Arc::clone(plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+                suffix,
+            )
     }
 
     #[tokio::test]

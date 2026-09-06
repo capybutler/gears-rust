@@ -1107,7 +1107,13 @@ async fn query_raw_success_records_success_rows_and_duration() {
     let plugin = HappyPathPlugin::new();
     plugin.set_list_usage_records_response(record_page(3));
 
+    // `list_usage_records` now resolves the queried meter's declaration
+    // (Spec §3.11 `metadata_filter` gating), so a success-path test needs a
+    // `DeclarationSource` that actually resolves — the default
+    // `UnavailableDeclarationSource` would turn this into a
+    // `ServiceUnavailable` before ever reaching the plugin.
     let (service, provider, exporter) = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
         .with_resolver(tenant_scoped_permit())
         .build_with_metrics(plugin, "test.metrics.query.rawok.v1");
 
