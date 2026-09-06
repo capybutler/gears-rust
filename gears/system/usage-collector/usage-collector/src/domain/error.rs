@@ -14,8 +14,8 @@
 
 use toolkit_macros::domain_model;
 use usage_collector_sdk::{
-    MeterTypeId, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
-    UsageTypeGtsId,
+    MeterTypeId, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError,
+    UsageCollectorPluginError, UsageTypeGtsId, ValidationReason,
 };
 use uuid::Uuid;
 
@@ -141,6 +141,14 @@ pub enum DomainError {
         reason: String,
     },
 
+    /// A submitted entry's `metadata` falls outside the meter's declared
+    /// closed surface: an undeclared key, or a value violating a declared
+    /// constraint (`CompiledMetadataSchema::validate`). `0` joins every
+    /// violation `jsonschema` reports, not just the first, so a caller
+    /// correcting a payload sees all of them at once.
+    #[error("metadata does not match the declared schema: {0}")]
+    InvalidMetadata(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -183,6 +191,16 @@ impl DomainError {
     #[must_use]
     pub fn is_declaration_not_found(&self) -> bool {
         matches!(self, Self::DeclarationNotFound { .. })
+    }
+
+    /// Metadata outside the meter's declared closed surface.
+    ///
+    /// `detail` is the `"; "`-joined text of every violation
+    /// `CompiledMetadataSchema::validate` collected, not just the first —
+    /// see its doc comment for why.
+    #[must_use]
+    pub fn invalid_metadata(detail: impl Into<String>) -> Self {
+        Self::InvalidMetadata(detail.into())
     }
 }
 
@@ -392,6 +410,16 @@ impl From<DomainError> for UsageCollectorError {
             DomainError::InvalidPluginInstance { gts_id, reason } => {
                 Self::internal(format!("invalid plugin instance '{gts_id}': {reason}"))
             }
+            // Attributed to the record surface (not a specific `gts_id`):
+            // `CompiledMetadataSchema::validate` has no usage-type identity
+            // in scope, only the entry's own metadata map.
+            DomainError::InvalidMetadata(detail) => Self::InvalidArgument {
+                resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+                resource_name: None,
+                field: "metadata".to_owned(),
+                reason: ValidationReason::MetadataValidation,
+                detail,
+            },
             DomainError::TypesRegistryUnavailable(_) => Self::types_registry_unavailable(),
             DomainError::Internal(reason) => Self::internal(reason),
         }

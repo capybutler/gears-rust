@@ -32,6 +32,10 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Compiles a meter's declared `metadata` subschema once per declaration and
+# validates entries against it (`domain::type_resolver::metadata`). Already a
+# workspace dependency shared by five other gears.
+jsonschema = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }

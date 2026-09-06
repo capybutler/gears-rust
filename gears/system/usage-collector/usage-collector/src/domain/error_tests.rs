@@ -387,3 +387,40 @@ fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_type_resource()
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// DomainError::invalid_metadata / InvalidMetadata (task 5): the closed
+// metadata surface a meter declares. `CompiledMetadataSchema::validate` has
+// no `gts_id` in scope (only the entry's own metadata map), so — unlike
+// `UnknownMetadataKey` above — this lifts attributed to the record surface,
+// not a specific resource name.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn invalid_metadata_carries_the_joined_detail() {
+    let err = DomainError::invalid_metadata("'tier' was unexpected; \"\" is too short");
+    assert!(matches!(&err, DomainError::InvalidMetadata(detail) if detail.contains("tier")));
+    assert!(err.to_string().contains("tier"));
+}
+
+#[test]
+fn invalid_metadata_lifts_to_invalid_argument_on_the_record_resource() {
+    let domain = DomainError::invalid_metadata("'tier' was unexpected");
+    let sdk: UsageCollectorError = domain.into();
+    match sdk {
+        UsageCollectorError::InvalidArgument {
+            resource_type,
+            resource_name,
+            field,
+            reason,
+            detail,
+        } => {
+            assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
+            assert_eq!(resource_name, None);
+            assert_eq!(field, "metadata");
+            assert_eq!(reason, ValidationReason::MetadataValidation);
+            assert!(detail.contains("tier"));
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}

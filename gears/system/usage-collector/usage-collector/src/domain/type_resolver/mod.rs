@@ -5,9 +5,10 @@
 //! this gear's ingestion NFRs contingent on a second gear. A local cache of
 //! resolved declarations (Task 6) keeps those obligations self-contained.
 //!
-//! This module currently holds only the parsing half — [`ResolvedDeclaration`]
-//! and the [`CompiledMetadataSchema`] key extraction it depends on. The cache
-//! and the `DeclarationSource`-backed resolver service arrive in later tasks.
+//! This module currently holds the parsing and validation halves —
+//! [`ResolvedDeclaration`] and the [`CompiledMetadataSchema`] key extraction
+//! and per-entry validation it depends on. The cache and the
+//! `DeclarationSource`-backed resolver service arrive in later tasks.
 
 mod declaration;
 mod metadata;
