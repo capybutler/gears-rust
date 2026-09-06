@@ -141,15 +141,30 @@ fn invariant_breach(detail: String) -> UsageCollectorError {
 /// Converts a catalog `gts_id` into the [`MeterTypeId`] the Type Resolver
 /// keys its cache on.
 ///
+/// Scaffolding, not a permanent conversion utility: `UsageTypeGtsId` is the
+/// wire-level type-reference parameter only until Task 10 swaps every such
+/// surface to `MeterTypeId` directly. Once that lands, callers already hold
+/// a `MeterTypeId` and this function — along with the validation gap it
+/// hedges below — is deleted with it.
+///
 /// `UsageTypeGtsId` wraps a GTS *instance* id (no trailing `~`) already
 /// validated by [`UsageTypeGtsId::new`] to derive from the reserved usage
 /// base with exactly one further segment; `MeterTypeId` wraps the
 /// corresponding GTS *type* id — the identical string, `~`-terminated.
 /// Appending the terminator is therefore the only difference between the
 /// two wire forms for a value that already passed that validation, so this
-/// conversion is not expected to fail against one. Surfaced as a typed
-/// `Internal` (never a panic) so a host-invariant breach here still returns
-/// an error rather than crashing the request thread.
+/// conversion is not expected to fail against one in practice — but the
+/// two validators do not share a length ceiling: `UsageTypeGtsId::new`
+/// delegates to `gts_id`'s `GtsId::try_new`, capped at 1024 bytes, while
+/// `MeterTypeId::new` caps at 512. A `gts_id` between those two bounds
+/// therefore passes the former and fails the latter here, surfacing as a
+/// 500 rather than the 400 an over-long identifier should be. That gap is
+/// exactly what the `Result` (not an `.expect()`) below is for, and it
+/// closes on its own once `MeterTypeId` becomes the boundary type and this
+/// validation moves to the surface that first parses the identifier.
+/// Surfaced as a typed `Internal` (never a panic) so a host-invariant
+/// breach here still returns an error rather than crashing the request
+/// thread.
 fn meter_type_id_of(gts_id: &UsageTypeGtsId) -> Result<MeterTypeId, UsageCollectorError> {
     MeterTypeId::new(format!("{gts_id}~")).map_err(|e| {
         invariant_breach(format!(

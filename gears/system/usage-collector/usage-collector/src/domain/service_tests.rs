@@ -4086,7 +4086,7 @@ mod aggregate_declared_fold_tests {
         // The request carries no aggregation parameter. Whatever fold reaches
         // the plugin must have come from the resolved declaration.
         let source = fake_declaration_source_with_fold("MAX");
-        let (svc, spy) = service_with_recording_plugin(source).await;
+        let (svc, spy) = service_with_recording_plugin(source);
         spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
 
         svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
@@ -4109,7 +4109,7 @@ mod aggregate_declared_fold_tests {
             AggregationFold::Latest,
         ] {
             let source = fake_declaration_source_with_fold(fold.as_str());
-            let (svc, spy) = service_with_recording_plugin(source).await;
+            let (svc, spy) = service_with_recording_plugin(source);
             spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
 
             svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
@@ -4127,7 +4127,7 @@ mod aggregate_declared_fold_tests {
     #[tokio::test]
     async fn aggregate_fails_closed_when_the_type_does_not_resolve() {
         let source = fake_declaration_source_not_found();
-        let (svc, spy) = service_with_recording_plugin(source).await;
+        let (svc, spy) = service_with_recording_plugin(source);
 
         let err = svc
             .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
@@ -4164,7 +4164,7 @@ mod aggregate_declared_fold_tests {
         // One bucket over the cap — exactly what the plugin's `LIMIT cap + 1`
         // yields on overflow — must lift to a client-fixable 400, not a page.
         let source = fake_declaration_source_with_fold("COUNT");
-        let (svc, spy) = service_with_recording_plugin(source).await;
+        let (svc, spy) = service_with_recording_plugin(source);
         spy.set_query_aggregated_usage_records_response(result_with_buckets(
             MAX_AGGREGATION_BUCKETS + 1,
         ));
@@ -4184,7 +4184,7 @@ mod aggregate_declared_fold_tests {
     async fn at_cap_bucket_count_is_allowed() {
         // Exactly at the cap is the boundary — `>` must not reject it.
         let source = fake_declaration_source_with_fold("COUNT");
-        let (svc, spy) = service_with_recording_plugin(source).await;
+        let (svc, spy) = service_with_recording_plugin(source);
         spy.set_query_aggregated_usage_records_response(result_with_buckets(
             MAX_AGGREGATION_BUCKETS,
         ));

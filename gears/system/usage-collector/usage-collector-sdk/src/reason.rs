@@ -28,8 +28,14 @@ pub const METADATA_VALIDATION: &str = "METADATA_VALIDATION";
 pub const UNKNOWN_METADATA_KEY: &str = "UNKNOWN_METADATA_KEY";
 /// Compensation submitted against a gauge usage type (gauges have no `SUM`).
 pub const GAUGE_COMPENSATION_REJECTED: &str = "GAUGE_COMPENSATION_REJECTED";
-/// Aggregation op requested against a usage kind that does not admit it
-/// (`SUM` on a gauge, or `MIN`/`MAX`/`AVG` on a counter).
+/// Dead: no path emits this any more. It named an aggregation op requested
+/// against a usage kind that does not admit it (`SUM` on a gauge, or
+/// `MIN`/`MAX`/`AVG` on a counter) — a rule the aggregate path enforced by
+/// validating a caller-chosen [`crate::AggregationOp`] against the queried
+/// meter's kind. There is no caller-chosen op any more (the fold is
+/// resolved from the meter's declaration), so the rule this reason named
+/// has nothing left to fire on. Removed with [`crate::AggregationOp`] /
+/// [`crate::AggregationSpec`].
 pub const OP_NOT_ALLOWED_FOR_KIND: &str = "OP_NOT_ALLOWED_FOR_KIND";
 /// A raw / aggregated query omitted the mandatory bounded `created_at`
 /// window (a lower **and** an upper bound on `created_at` as top-level
@@ -64,7 +70,8 @@ pub enum ValidationReason {
     UnknownMetadataKey,
     /// See [`GAUGE_COMPENSATION_REJECTED`].
     GaugeCompensationRejected,
-    /// See [`OP_NOT_ALLOWED_FOR_KIND`].
+    /// See [`OP_NOT_ALLOWED_FOR_KIND`]. Dead: no path emits this variant any
+    /// more; removed with [`crate::AggregationOp`] / [`crate::AggregationSpec`].
     OpNotAllowedForKind,
     /// See [`MISSING_TIME_WINDOW`].
     MissingTimeWindow,

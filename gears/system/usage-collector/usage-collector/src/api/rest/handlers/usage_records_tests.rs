@@ -2389,7 +2389,7 @@ mod handle_query_aggregated_usage_records_tests {
         // this wires a working Type Resolver rather than the plugin-side
         // catalog the pre-Task-8 test used.
         let source = fake_declaration_source_with_fold("SUM");
-        let (service, plugin) = service_with_recording_plugin(source).await;
+        let (service, plugin) = service_with_recording_plugin(source);
         plugin.set_query_aggregated_usage_records_response(AggregationResult {
             buckets: vec![
                 AggregationBucket {

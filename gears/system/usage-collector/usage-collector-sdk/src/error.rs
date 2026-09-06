@@ -365,10 +365,15 @@ impl UsageCollectorError {
         }
     }
 
-    /// Aggregation op requested against a usage kind that does not admit it
-    /// (`SUM` on a gauge, or `MIN`/`MAX`/`AVG` on a counter). Attributes to
-    /// the usage-type resource with the offending `gts_id` as `resource_name`
-    /// and the aggregation operator field as `field`.
+    /// Dead: no path constructs this any more. It named an aggregation op
+    /// requested against a usage kind that does not admit it (`SUM` on a
+    /// gauge, or `MIN`/`MAX`/`AVG` on a counter), attributed to the
+    /// usage-type resource with the offending `gts_id` as `resource_name`
+    /// and the aggregation operator field as `field`. There is no
+    /// caller-chosen op any more — the fold is resolved from the queried
+    /// meter's declaration — so `field: "aggregation.op"` below now names a
+    /// request-body field the aggregate-request DTO no longer carries.
+    /// Removed with [`crate::AggregationOp`] / [`crate::AggregationSpec`].
     #[must_use]
     pub fn aggregation_op_not_allowed_for_kind(
         op: AggregationOp,

@@ -1445,13 +1445,12 @@ pub(crate) fn fake_declaration_source_counting() -> Arc<CountingDeclarationSourc
 /// built directly over `source` (bypassing [`Service::new`]'s inert default)
 /// makes declaration resolution actually exercised.
 ///
-/// `async` for call-site uniformity with the other `Service`-builder
-/// helpers callers `.await` — the construction itself is synchronous.
-#[allow(
-    clippy::unused_async,
-    reason = "uniform async Service-builder signature"
-)]
-pub(crate) async fn service_with_recording_plugin(
+/// Synchronous, like every other `Service`-builder helper in this module
+/// (`service_with_permit`, `service_with_counting_permit`,
+/// `service_with_metrics`, `service_with_metrics_unready_plugin`) — none of
+/// them await anything either, so this one does not introduce an
+/// inconsistent shape by staying sync too.
+pub(crate) fn service_with_recording_plugin(
     source: Arc<dyn DeclarationSource>,
 ) -> (Service, Arc<RecordingPlugin>) {
     let plugin = RecordingPlugin::new();
