@@ -83,9 +83,12 @@ references a crate that no longer compiles.
 
 **Files:**
 - Modify: `Cargo.toml:142`
+- Modify: `Cargo.lock` (regenerated — include it in the commit)
 - Modify: `apps/cf-gears-example-server/Cargo.toml:52,123`
 - Modify: `apps/cf-gears-example-server/src/registered_gears.rs:101-102`
-- Modify: `Makefile:27,669,718-722`
+- Modify: `Makefile:27,669,718-722` and the `ci:` prerequisite list
+- Modify: `.github/workflows/ci.yml`
+- Modify: `.github/workflows/e2e.yml`
 - Modify: `testing/e2e/suites/usage_collector/e2e.yaml`
 - Modify: `testing/e2e/suites/usage_collector/config.yaml`
 
@@ -143,15 +146,29 @@ unwired it would run against the noop backend, which stores nothing, so every
 round-trip assertion fails for a reason unrelated to the code under test.
 Disable the suite for the duration of the rewrite rather than leaving it red.
 
-In `testing/e2e/suites/usage_collector/e2e.yaml`, remove the
-`- timescaledb-usage-collector` feature line and add a disable marker at the top:
+`tools/scripts/run_e2e.py` reads each manifest with a plain `yaml.safe_load`
+and recognizes no disable key, so there is no in-manifest way to switch a suite
+off. The step that invokes it is the only real control.
+
+In `.github/workflows/e2e.yml`, delete the step and its comment:
 
 ```yaml
-# DISABLED for the type-plane rewrite. The suite asserts persistence
-# round-trips, and the only persisting plugin is unwired from the build
-# (see docs/superpowers/plans/2026-09-06-usage-collector-type-plane.md,
-# Task 1). Re-enable together with the TimescaleDB plugin port.
-disabled: true
+      # Self-managed suite (launcher: pytest): starts its own server plus a
+      # TimescaleDB container, so it needs a reachable Docker daemon.
+      - name: Run usage-collector E2E tests (TimescaleDB container)
+        run: make e2e-usage-collector
+```
+
+In `testing/e2e/suites/usage_collector/e2e.yaml`, remove the
+`- timescaledb-usage-collector` feature line and record why the suite is no
+longer wired, without claiming a mechanism the runner does not have:
+
+```yaml
+# NOT RUN IN CI during the type-plane rewrite: the step that invoked this
+# suite has been removed from .github/workflows/e2e.yml. The suite asserts
+# persistence round-trips, and the only persisting plugin is unwired from
+# the build (Task 1 of this plan). `make e2e-usage-collector` still runs it
+# locally and is expected to fail until the TimescaleDB plugin is ported.
 suite: usage-collector
 features:
   - usage-collector
@@ -160,9 +177,23 @@ features:
   - static-authz
 ```
 
+Do **not** teach `run_e2e.py` a `disabled:` key. It is shared tooling behind
+every suite, and a new manifest key is well outside this task.
+
 In `testing/e2e/suites/usage_collector/config.yaml`, delete the whole
-`timescaledb-usage-collector-plugin:` block (the key and every indented line
-under it, through `pool_size_min`).
+`timescaledb-usage-collector-plugin:` block — the key and every indented line
+under it, to the end of the block.
+
+`.github/workflows/ci.yml` also invokes the Makefile target deleted in Step 4.
+Delete that step too, or CI fails with "No rule to make target":
+
+```yaml
+      - name: Test timescaledb usage-collector plugin (pg integration)
+        run: make test-usage-collector-pg
+```
+
+The `ci:` Makefile target names `test-usage-collector-pg` as a prerequisite as
+well. Remove it from that list.
 
 - [ ] **Step 6: Verify the workspace builds without it**
 
