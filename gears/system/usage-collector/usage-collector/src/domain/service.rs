@@ -42,7 +42,10 @@ use crate::domain::ports::metrics::{
     PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
     RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
 };
-use crate::domain::query::{compose_query_with_scope, require_bounded_time_window};
+use crate::domain::query::{
+    compose_query_with_scope, reject_reserved_filter_fields, require_bounded_time_window,
+    require_dimensions_declared,
+};
 use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
     DEFAULT_METADATA_SIZE_CAP_BYTES, SemanticsOutcome, validate_record_semantics,
@@ -1550,6 +1553,16 @@ impl Service {
             // is denied regardless of window shape).
             require_bounded_time_window(query)?;
 
+            // Reject a `$filter` naming a reserved field (`gts_type_id`, the
+            // covered-period bounds) before composition — each already
+            // travels as a typed parameter, so a predicate over one would
+            // be a second, possibly contradictory, constraint (Spec §3.11).
+            // `list_usage_records` takes no `group_by`, so only the filter
+            // gate applies on this path.
+            if let Some(filter) = query.filter() {
+                reject_reserved_filter_fields(filter)?;
+            }
+
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-constraint-composition
             let composed = compose_query_with_scope(query, &scope)?;
             // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-constraint-composition
@@ -1673,6 +1686,22 @@ impl Service {
             // here as a pre-dispatch 404, so the plugin stays pure
             // persistence and never sees a type it cannot resolve.
             let declaration = self.type_resolver.resolve(&gts_type_id).await?;
+
+            // Gate the query surface on the resolved declaration (Spec
+            // §3.11): the admissible `$filter` / `group_by` set is the fixed
+            // fields plus the queried meter's declared metadata keys,
+            // recomputed here per request so a property declared a moment
+            // ago is usable on this very call. Runs after resolving the
+            // declaration (there is nothing to check `group_by` against
+            // before then) and before composing the PDP scope.
+            if let Some(filter) = query.filter() {
+                reject_reserved_filter_fields(filter)?;
+            }
+            require_dimensions_declared(
+                group_by,
+                declaration.metadata_schema.declared_keys(),
+                &gts_type_id,
+            )?;
 
             let plugin = self
                 .resolve_plugin_for(PluginOp::QueryAggregatedUsageRecords)

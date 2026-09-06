@@ -306,6 +306,48 @@ impl UsageCollectorError {
         }
     }
 
+    /// A `$filter` predicate named a field reserved to a typed parameter
+    /// (`gts_type_id`, or the covered-period bounds `window_start` /
+    /// `window_end`). Each already travels as a typed parameter alongside
+    /// `$filter`, so a predicate naming one in `$filter` would express a
+    /// second, possibly contradictory, constraint on something already
+    /// fixed — rejected rather than silently honored. Attributed to
+    /// `$filter`.
+    #[must_use]
+    pub fn reserved_filter_field(field: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "$filter".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "'{field}' is reserved and cannot be named in $filter: it travels \
+                 as a typed parameter, not a filterable property"
+            ),
+        }
+    }
+
+    /// A `group_by` dimension named a metadata key the queried meter's
+    /// resolved declaration does not declare. The admissible `group_by`
+    /// surface is recomputed per request from the declaration (Spec §3.11),
+    /// so this can never be satisfied by adjusting a stale cache — only by
+    /// naming a key the declaration actually carries. Attributed to
+    /// `group_by`, with `resource_name` carrying the offending
+    /// `gts_type_id` — the same operator-log shape as
+    /// [`Self::unknown_metadata_key`].
+    #[must_use]
+    pub fn undeclared_metadata_dimension(gts_type_id: &MeterTypeId, key: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: Some(gts_type_id.as_ref().to_owned()),
+            field: "group_by".to_owned(),
+            reason: ValidationReason::UnknownMetadataKey,
+            detail: format!(
+                "unknown metadata key '{key}' in group_by for meter {gts_type_id}: not declared"
+            ),
+        }
+    }
+
     // ── NotFound (404) ──────────────────────────────────────────────────
 
     /// Deactivation / get referenced a `UsageRecord.id` that does not exist.

@@ -8,10 +8,24 @@
 //!   [`AccessScope`] into the caller's `$filter`.
 //! * `require_bounded_time_window` — rejects an unbounded `created_at`
 //!   window before composition / dispatch.
+//! * `reject_reserved_filter_fields` — rejects a `$filter` naming a field
+//!   reserved to a typed parameter (`gts_type_id`, the covered-period
+//!   bounds), wherever in the AST it appears.
+//! * `require_dimensions_declared` — checks a `group_by` list only names
+//!   the fixed dimensions or a metadata key the queried meter's resolved
+//!   declaration actually declares.
+//!
+//! Per Spec §3.11, the admissible `$filter` / `group_by` surface is the
+//! fixed fields plus the queried meter's declared metadata keys,
+//! recomputed per request from the resolved declaration — never cached
+//! independently of it, so a property declared a moment ago is usable on
+//! the very next call.
+
+use std::collections::BTreeSet;
 
 use toolkit_odata::{ODataQuery, ast};
 use toolkit_security::AccessScope;
-use usage_collector_sdk::UsageCollectorError;
+use usage_collector_sdk::{AggregationDimension, MeterTypeId, UsageCollectorError};
 
 use crate::domain::authz;
 
@@ -136,6 +150,103 @@ fn visit_top_level_conjuncts(expr: &ast::Expr, visit: &mut impl FnMut(&ast::Expr
         }
         other => visit(other),
     }
+}
+
+/// Field names a caller may never name in a `$filter`.
+///
+/// `gts_type_id` travels as a typed parameter and the covered period as a
+/// typed time range (`window_start` / `window_end`, landing with the
+/// record-model slice after this plan — reserved here regardless, so the
+/// name is guarded against ever becoming filterable), so a predicate over
+/// any of the three would express a second, possibly contradictory,
+/// constraint on something already fixed.
+const RESERVED_FILTER_FIELDS: &[&str] = &["gts_type_id", "window_start", "window_end"];
+
+/// `true` when `name` names a [`RESERVED_FILTER_FIELDS`] entry, ignoring
+/// ASCII case.
+///
+/// Case-insensitive to match [`require_bounded_time_window`]'s own
+/// `created_at` identifier match (`name.eq_ignore_ascii_case(...)`) — the
+/// identical kind of AST-identifier comparison — rather than a bare
+/// `contains`. Not exploitable today (`window_start` / `window_end` are not
+/// yet filterable-schema fields, and `gts_type_id` case-varied would
+/// dead-end as `toolkit_odata`'s own case-insensitive `UnknownField`
+/// downstream), but `window_start` / `window_end` become real filterable
+/// fields in the record-model slice after this plan, at which point a
+/// case-varied spelling would otherwise resolve as a legitimate field
+/// instead of hitting this reservation.
+fn is_reserved_filter_field(name: &str) -> bool {
+    RESERVED_FILTER_FIELDS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+/// Rejects a `$filter` naming a [`RESERVED_FILTER_FIELDS`] identifier,
+/// wherever in the AST it appears.
+///
+/// Walks the **whole** tree rather than only top-level conjuncts: a
+/// reserved identifier nested under an `or` (or a `not`, or an `in` list)
+/// is just as much a constraint on the reserved field as one at the top
+/// level, so a top-level-only check would let it through.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorError::InvalidArgument`] naming the offending
+/// field.
+pub(crate) fn reject_reserved_filter_fields(filter: &ast::Expr) -> Result<(), UsageCollectorError> {
+    match filter {
+        ast::Expr::Identifier(name) if is_reserved_filter_field(name) => {
+            Err(UsageCollectorError::reserved_filter_field(name))
+        }
+        ast::Expr::Identifier(_) | ast::Expr::Value(_) => Ok(()),
+        ast::Expr::Not(inner) => reject_reserved_filter_fields(inner),
+        ast::Expr::And(left, right) | ast::Expr::Or(left, right) => {
+            reject_reserved_filter_fields(left)?;
+            reject_reserved_filter_fields(right)
+        }
+        ast::Expr::Compare(left, _op, right) => {
+            reject_reserved_filter_fields(left)?;
+            reject_reserved_filter_fields(right)
+        }
+        ast::Expr::In(left, items) => {
+            reject_reserved_filter_fields(left)?;
+            items.iter().try_for_each(reject_reserved_filter_fields)
+        }
+        ast::Expr::Function(_name, args) => args.iter().try_for_each(reject_reserved_filter_fields),
+    }
+}
+
+/// Checks every `group_by` dimension is either a fixed field (no
+/// declaration needed) or a metadata property `declared_keys` actually
+/// declares.
+///
+/// `declared_keys` is read from the resolved declaration fresh for this
+/// request (see [`crate::domain::type_resolver::CompiledMetadataSchema::declared_keys`]),
+/// never cached independently of it — so a property declared a moment ago
+/// is usable on the very next call, per Spec §3.11. `gts_type_id` is the
+/// queried meter, carried onto the error for operator-log parity with
+/// [`UsageCollectorError::unknown_metadata_key`].
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorError::InvalidArgument`] naming the first
+/// undeclared metadata dimension.
+pub(crate) fn require_dimensions_declared(
+    dimensions: &[AggregationDimension],
+    declared_keys: &BTreeSet<String>,
+    gts_type_id: &MeterTypeId,
+) -> Result<(), UsageCollectorError> {
+    for dim in dimensions {
+        if let AggregationDimension::Metadata(key) = dim
+            && !declared_keys.contains(key.as_str())
+        {
+            return Err(UsageCollectorError::undeclared_metadata_dimension(
+                gts_type_id,
+                key.as_str(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

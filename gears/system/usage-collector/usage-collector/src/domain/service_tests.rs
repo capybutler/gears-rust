@@ -3076,3 +3076,224 @@ mod ingestion_declared_type_tests {
         );
     }
 }
+
+// Task 12: `CompiledMetadataSchema::declared_keys()` gates the read paths'
+// `$filter` / `group_by` surface (Spec §3.11). The pure-function coverage
+// (every `ast::Expr` variant, nested-`or`/`not`/`in` rejection, recomputation
+// across differing declared-key sets) lives in `query_tests.rs`; this module
+// proves the two checks are actually wired into `Service::list_usage_records`
+// / `Service::query_aggregated_usage_records` — right position (before
+// dispatch), right arguments (the resolved declaration's `declared_keys`).
+mod query_admissibility_tests {
+    use std::sync::Arc;
+
+    use toolkit_gts::gts_id;
+    use toolkit_odata::{ODataQuery, ast};
+    use toolkit_security::SecurityContext;
+    use usage_collector_sdk::{
+        AggregationDimension, AggregationResult, MetadataKey, MeterTypeId, UsageCollectorError,
+        UsageCollectorPluginV1, ValidationReason,
+    };
+
+    use crate::domain::Service;
+    use crate::domain::ports::declarations::DeclarationSource;
+    use crate::domain::test_support::{
+        RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
+        fake_declaration_source_with_metadata, recording_plugin_resolver,
+    };
+
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+    fn meter_id() -> MeterTypeId {
+        MeterTypeId::new(GTS_ID).expect("valid gts_type_id")
+    }
+
+    fn ctx() -> SecurityContext {
+        authenticated_ctx()
+    }
+
+    /// A minimal bounded `created_at` window — the only `$filter` content a
+    /// raw/aggregated query needs to clear `require_bounded_time_window`
+    /// before reaching the admissibility gate under test here.
+    fn bounded_window() -> ODataQuery {
+        let expr = toolkit_odata::parse_filter_string(
+            "created_at ge 2026-01-01T00:00:00Z and created_at lt 2026-02-01T00:00:00Z",
+        )
+        .expect("filter parses")
+        .into_expr();
+        ODataQuery::from(Some(expr))
+    }
+
+    /// [`bounded_window`] AND-ed with a bare `reserved_field eq 'x'`
+    /// predicate — still bounded (clears `require_bounded_time_window`), so
+    /// whatever it is rejected for is the admissibility gate under test.
+    fn bounded_window_naming(reserved_field: &str) -> ODataQuery {
+        let bounded = bounded_window()
+            .into_filter()
+            .expect("bounded_window() carries a filter");
+        let reserved = ast::Expr::Compare(
+            Box::new(ast::Expr::Identifier(reserved_field.to_owned())),
+            ast::CompareOperator::Eq,
+            Box::new(ast::Expr::Value(ast::Value::String("x".to_owned()))),
+        );
+        ODataQuery::from(Some(bounded.and(reserved)))
+    }
+
+    /// Build a `Service` + [`RecordingPlugin`] spy over `source`, wired
+    /// against the fixed-tenant PDP fake both read paths require (see
+    /// [`recording_plugin_resolver`]).
+    fn service_with_recording_plugin(
+        source: Arc<dyn DeclarationSource>,
+    ) -> (Arc<Service>, Arc<RecordingPlugin>) {
+        let plugin = RecordingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(source)
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                RECORDING_PLUGIN_SUFFIX,
+            );
+        (service, plugin)
+    }
+
+    /// Assert `err` is the canonical reserved-filter-field rejection.
+    fn assert_reserved_field_rejection(err: &UsageCollectorError) {
+        match err {
+            UsageCollectorError::InvalidArgument { field, reason, .. } => {
+                assert_eq!(field, "$filter", "attributes to $filter");
+                assert_eq!(*reason, ValidationReason::Validation);
+            }
+            other => panic!("expected InvalidArgument/Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_rejects_a_filter_naming_gts_type_id() {
+        let (svc, spy) = service_with_recording_plugin(fake_declaration_source_with_metadata(&[]));
+
+        let err = svc
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                &bounded_window_naming("gts_type_id"),
+                &[],
+            )
+            .await
+            .expect_err("a $filter naming gts_type_id must be rejected");
+        assert_reserved_field_rejection(&err);
+        assert_eq!(
+            spy.calls(),
+            0,
+            "a rejected filter must never reach the plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_accepts_a_filter_naming_no_reserved_field() {
+        use toolkit_odata::{Page as ODataPage, PageInfo};
+
+        let (svc, spy) = service_with_recording_plugin(fake_declaration_source_with_metadata(&[]));
+        spy.set_list_usage_records_response(ODataPage {
+            items: vec![],
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 1000,
+            },
+        });
+
+        svc.list_usage_records(&ctx(), meter_id(), &bounded_window(), &[])
+            .await
+            .expect("no reserved field named: the plugin must be reached");
+    }
+
+    #[tokio::test]
+    async fn aggregate_rejects_a_filter_naming_a_window_bound() {
+        let (svc, spy) = service_with_recording_plugin(fake_declaration_source_with_metadata(&[]));
+
+        let err = svc
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                &bounded_window_naming("window_start"),
+                &[],
+                &[],
+            )
+            .await
+            .expect_err("a $filter naming window_start must be rejected");
+        assert_reserved_field_rejection(&err);
+        assert_eq!(
+            spy.calls(),
+            0,
+            "a rejected filter must never reach the plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_rejects_an_undeclared_group_by_dimension() {
+        let (svc, spy) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&["region"]));
+
+        let dims = [AggregationDimension::Metadata(
+            MetadataKey::new("tier").expect("valid key"),
+        )];
+        let err = svc
+            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
+            .await
+            .expect_err("an undeclared group_by dimension must be rejected");
+        assert!(
+            err.to_string().contains("tier"),
+            "the rejection must name the offending key: {err}",
+        );
+        assert_eq!(
+            spy.calls(),
+            0,
+            "a rejected group_by must never reach the plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_accepts_a_declared_group_by_dimension() {
+        let (svc, spy) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&["region"]));
+        spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
+
+        let dims = [AggregationDimension::Metadata(
+            MetadataKey::new("region").expect("valid key"),
+        )];
+        svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
+            .await
+            .expect("a declared group_by dimension must be accepted");
+        assert_eq!(spy.calls(), 1, "an accepted group_by must reach the plugin");
+    }
+
+    #[tokio::test]
+    async fn aggregate_group_by_admissibility_is_recomputed_per_request() {
+        // Two independently-resolved declarations for the same meter id,
+        // one declaring `region` and one not: the SAME dimension is
+        // rejected against the first and accepted against the second,
+        // proving the admissible set comes from the declaration resolved
+        // for *this* request rather than anything fixed at service
+        // construction (or cached independently of the declaration).
+        let dims = [AggregationDimension::Metadata(
+            MetadataKey::new("region").expect("valid key"),
+        )];
+
+        let (svc_before, _spy_before) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&[]));
+        let err = svc_before
+            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
+            .await
+            .expect_err("not yet declared: must be rejected");
+        assert!(err.to_string().contains("region"));
+
+        let (svc_after, spy_after) =
+            service_with_recording_plugin(fake_declaration_source_with_metadata(&["region"]));
+        spy_after
+            .set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
+        svc_after
+            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
+            .await
+            .expect("declared a moment later: must now be admissible, without a restart");
+    }
+}
