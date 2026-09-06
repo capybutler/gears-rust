@@ -1,7 +1,7 @@
 //! Port for reading GTS type declarations.
 //!
 //! The Type Resolver depends on this one method rather than on the whole
-//! `TypesRegistryClient` (14 methods and growing), so the resolver's caching
+//! `TypesRegistryClient` (13 methods and growing), so the resolver's caching
 //! policy can be exercised in tests against a trivial fake and the real
 //! registry adapter stays in `infra` — the same `domain/ports/` shape the
 //! gear already uses for metrics.
@@ -24,8 +24,8 @@ pub trait DeclarationSource: Send + Sync + 'static {
     ///
     /// - [`DomainError::DeclarationNotFound`] (via
     ///   [`DomainError::declaration_not_found`]) when the registry gives a
-    ///   definite not-found answer. This is a resolvable fact, and the
-    ///   resolver caches nothing for it.
+    ///   definite not-found answer — a conclusive fact, not a possibly-stale
+    ///   read — so the resolver caches nothing for it.
     /// - [`DomainError::TypesRegistryUnavailable`] for any other failure.
     ///   The resolver may serve a stale cached declaration for this, because
     ///   it cannot tell an unavailable registry from a slow one.

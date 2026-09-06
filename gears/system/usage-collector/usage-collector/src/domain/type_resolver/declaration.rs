@@ -34,6 +34,48 @@ pub struct ResolvedDeclaration {
     pub nominal_sampling_interval: Option<String>,
 }
 
+/// Names the JSON type of a value for a diagnostic. Never the value's own
+/// content: it may be arbitrarily large, and the point is only to tell an
+/// operator what shape they wrote instead of what was expected.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Reads a required string-valued trait, distinguishing "absent" from
+/// "present but not a string" so the diagnostic names the actual defect.
+///
+/// `traits.get(key)` collapsing both cases into one "declares no `{key}`"
+/// message would send an operator who wrote e.g. `"aggregation_fold": 5`
+/// hunting for a missing key that is not the problem — fail-closed only
+/// earns its keep when the failure is actionable.
+fn require_trait_str<'a>(
+    traits: &'a serde_json::Value,
+    key: &str,
+    gts_type_id: &MeterTypeId,
+) -> Result<&'a str, DomainError> {
+    match traits.get(key) {
+        None => Err(DomainError::declaration_incomplete(
+            gts_type_id,
+            &format!("declares no `{key}`"),
+        )),
+        Some(serde_json::Value::String(s)) => Ok(s.as_str()),
+        Some(other) => Err(DomainError::declaration_incomplete(
+            gts_type_id,
+            &format!(
+                "declares `{key}` as {}, not a string",
+                json_type_name(other)
+            ),
+        )),
+    }
+}
+
 impl ResolvedDeclaration {
     /// Parses a declaration out of a registered type schema.
     ///
@@ -43,22 +85,19 @@ impl ResolvedDeclaration {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError`] when a mandatory trait is missing, when the
-    /// fold is outside the set this major version serves, or when the
-    /// metadata subschema does not compile. Every case fails closed: the gear
-    /// never substitutes a default for a declared attribute.
+    /// Returns [`DomainError`] when a mandatory trait is missing, is present
+    /// but not a string, or names a fold this major version does not serve.
+    /// Every case fails closed: the gear never substitutes a default for a
+    /// declared attribute. Also returns whatever
+    /// [`CompiledMetadataSchema::compile`] returns — infallible today; Task 5
+    /// adds metadata-subschema compilation and its own failure mode there.
     pub fn from_schema(
         gts_type_id: MeterTypeId,
         schema: &GtsTypeSchema,
     ) -> Result<Self, DomainError> {
         let traits = schema.effective_traits();
 
-        let fold_raw = traits
-            .get("aggregation_fold")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                DomainError::declaration_incomplete(&gts_type_id, "declares no `aggregation_fold`")
-            })?;
+        let fold_raw = require_trait_str(&traits, "aggregation_fold", &gts_type_id)?;
         let aggregation_fold: AggregationFold = fold_raw.parse().map_err(|_| {
             DomainError::declaration_incomplete(
                 &gts_type_id,
@@ -69,13 +108,7 @@ impl ResolvedDeclaration {
             )
         })?;
 
-        let canonical_unit = traits
-            .get("canonical_unit")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                DomainError::declaration_incomplete(&gts_type_id, "declares no `canonical_unit`")
-            })?
-            .to_owned();
+        let canonical_unit = require_trait_str(&traits, "canonical_unit", &gts_type_id)?.to_owned();
 
         let nominal_sampling_interval = traits
             .get("nominal_sampling_interval")

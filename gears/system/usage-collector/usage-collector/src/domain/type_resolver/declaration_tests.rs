@@ -14,22 +14,22 @@ const BASE: &str = "gts.cf.core.uc.usage_record.v1~";
 /// Builds a base + derived chain exercising the same trait-merge path
 /// production does: [`GtsTypeSchema::effective_traits`].
 ///
-/// Two deliberate departures from the literal shape of
+/// Departures from the literal shape of
 /// `docs/schemas/example.stored_volume.v1.schema.json`:
 ///
 /// - `GtsTypeId` has no `FromStr`/`parse()` impl in the `gts` crate, so ids
 ///   are built with `GtsTypeId::try_new` rather than the `.parse()` calls
 ///   sketched in the task plan.
-/// - `x-gts-traits` sits at the top level of the derived document rather
-///   than nested inside its `allOf` overlay branch (the doc example's
-///   shape). `GtsTypeSchema::extract_traits` — and so
-///   `effective_traits()`, which walks each chain member's own `traits`
-///   field populated once at construction — reads `x-gts-traits` from the
-///   top level only; it does not recurse into `allOf` the way gts-rust's
-///   admission-side `collect_traits_from_value` does. Confirmed against
-///   `types-registry-sdk`'s own `models_tests.rs`, which never nests
-///   `x-gts-traits` inside `allOf` either. See this task's final report for
-///   why that is flagged as a concern rather than silently worked around.
+/// - The `metadata` property override sits in this fixture's top-level
+///   `properties`, rather than nested inside `allOf[1].properties` the way
+///   the doc example places it. This one is harmless:
+///   `GtsTypeSchema::effective_properties()` walks non-`$ref` `allOf` items
+///   as well as the top level (unlike `extract_traits`, which does not), so
+///   either placement merges the same way. `x-gts-traits` itself is *not* a
+///   departure — both this fixture and the doc example place it at the top
+///   level, which is the placement `extract_traits`/`effective_traits()`
+///   actually reads (see the task 4 report for the history: the doc example
+///   used to nest it in `allOf` and was fixed in a follow-up commit).
 fn schema_with_traits(traits: serde_json::Value) -> GtsTypeSchema {
     let base = GtsTypeSchema::try_new(
         GtsTypeId::try_new(BASE).expect("base type id"),
@@ -136,6 +136,43 @@ fn rejects_a_declaration_with_no_fold() {
     let err = ResolvedDeclaration::from_schema(MeterTypeId::new(METER).unwrap(), &schema)
         .expect_err("a declaration with no aggregation_fold must not resolve");
     assert!(err.to_string().contains("aggregation_fold"));
+}
+
+#[test]
+fn rejects_a_fold_of_the_wrong_json_type_naming_the_type_found() {
+    // A trait present but not a string must not collapse into the same
+    // "declares no `aggregation_fold`" diagnostic as a genuinely absent one
+    // — an operator who wrote a number is hunting for the wrong defect.
+    let schema = schema_with_traits(json!({
+        "aggregation_fold": 5,
+        "canonical_unit": "bytes",
+        "retention": "P125D"
+    }));
+
+    let err = ResolvedDeclaration::from_schema(MeterTypeId::new(METER).unwrap(), &schema)
+        .expect_err("a non-string aggregation_fold must not resolve");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("aggregation_fold") && msg.contains("a number") && !msg.contains("no `"),
+        "diagnostic must say the trait is present but not a string, naming the type found, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_a_canonical_unit_of_the_wrong_json_type_naming_the_type_found() {
+    let schema = schema_with_traits(json!({
+        "aggregation_fold": "SUM",
+        "canonical_unit": ["bytes"],
+        "retention": "P125D"
+    }));
+
+    let err = ResolvedDeclaration::from_schema(MeterTypeId::new(METER).unwrap(), &schema)
+        .expect_err("a non-string canonical_unit must not resolve");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("canonical_unit") && msg.contains("an array") && !msg.contains("no `"),
+        "diagnostic must say the trait is present but not a string, naming the type found, got: {err}"
+    );
 }
 
 #[test]

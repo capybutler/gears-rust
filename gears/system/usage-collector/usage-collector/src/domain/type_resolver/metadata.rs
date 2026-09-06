@@ -3,6 +3,14 @@
 //! Task 5 adds schema compilation and per-entry validation here. This
 //! version holds only the key-extraction half: which property names a
 //! meter's `metadata` object declares, merged across its inheritance chain.
+//!
+//! No sibling `metadata_tests.rs` exists yet: `compile`/`declared_keys` are
+//! exercised only transitively today, through `declaration_tests.rs`'s
+//! `ResolvedDeclaration::from_schema` tests. That is adequate for this thin,
+//! infallible extraction, but Task 5's validation logic (and its new
+//! failure mode) is substantial enough to need its own dedicated test file —
+//! add one then, following the crate's `#[path = "..."]` sibling-file
+//! convention.
 
 use std::collections::BTreeSet;
 
