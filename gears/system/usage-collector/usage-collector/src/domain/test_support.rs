@@ -499,6 +499,25 @@ use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 use usage_collector_sdk::UsageCollectorPluginSpecV1;
 
 use crate::domain::Service;
+use crate::domain::ports::declarations::UnavailableDeclarationSource;
+use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
+
+/// A Type Resolver with no working backend, for `Service` test builders in
+/// this module that don't exercise type resolution at all (the plugin-host /
+/// PDP / metrics paths). Mirrors `Service::new`'s own default — see
+/// [`UnavailableDeclarationSource`] for why a domain-only placeholder is used
+/// here rather than the real `types-registry` adapter (that would require
+/// this domain-layer module to import a concrete `infra` type).
+#[must_use]
+fn inert_type_resolver() -> Arc<TypeResolver> {
+    Arc::new(TypeResolver::new(
+        Arc::new(UnavailableDeclarationSource),
+        TypeResolverConfig {
+            ttl: std::time::Duration::from_secs(1),
+            capacity: 1,
+        },
+    ))
+}
 
 /// Build a usage-collector storage-plugin instance id under the schema
 /// prefix advertised by [`UsageCollectorPluginSpecV1`], with `suffix` as
@@ -609,13 +628,16 @@ pub fn service_with_metrics(
 ) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
     let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
     let (metrics, provider, exporter) = local_metrics();
+    // These tests assert on emitted PDP/plugin instruments, not on type
+    // resolution, so the resolver is inert here (see `inert_type_resolver`)
+    // the same way `Service::new`'s own default is — no reason for this
+    // domain-layer test helper to reach into `infra` for one.
     let service = Arc::new(Service::new_with_metrics(
         hub,
         "cyberfabric".to_owned(),
         enforcer_for(resolver),
         metrics,
-        crate::domain::service::DEFAULT_TYPE_CACHE_TTL_SECS,
-        crate::domain::service::DEFAULT_TYPE_CACHE_CAPACITY,
+        inert_type_resolver(),
     ));
     (service, provider, exporter)
 }
@@ -649,8 +671,7 @@ pub fn service_with_metrics_unready_plugin(
         "cyberfabric".to_owned(),
         enforcer_for(resolver),
         metrics,
-        crate::domain::service::DEFAULT_TYPE_CACHE_TTL_SECS,
-        crate::domain::service::DEFAULT_TYPE_CACHE_CAPACITY,
+        inert_type_resolver(),
     ));
     (service, provider, exporter)
 }

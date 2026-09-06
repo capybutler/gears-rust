@@ -31,3 +31,31 @@ pub trait DeclarationSource: Send + Sync + 'static {
     ///   it cannot tell an unavailable registry from a slow one.
     async fn fetch(&self, id: &MeterTypeId) -> Result<GtsTypeSchema, DomainError>;
 }
+
+/// [`DeclarationSource`] with no working backend.
+///
+/// Mirrors [`crate::domain::ports::metrics::NoopMetrics`]'s role for the
+/// metrics port: a domain-owned placeholder for contexts that need *a*
+/// implementation to construct a [`crate::domain::type_resolver::TypeResolver`]
+/// but have no real adapter to give it. Every call reports the registry as
+/// unavailable rather than panicking, so it fails safely rather than
+/// violently if that ever stops being true.
+///
+/// Used only by [`crate::domain::service::Service::new`]'s convenience
+/// default: that constructor cannot reach into `infra` to build the real
+/// `types-registry` adapter without reintroducing the domain → infra edge
+/// this port exists to prevent. Production bootstrap (`module.rs`) always
+/// builds a genuine adapter-backed resolver instead (see
+/// `crate::infra::types_registry_source::build_default_resolver`) and injects
+/// it through [`crate::domain::service::Service::new_with_metrics`].
+#[allow(dead_code)] // constructed only by Service::new's convenience default
+pub struct UnavailableDeclarationSource;
+
+#[async_trait]
+impl DeclarationSource for UnavailableDeclarationSource {
+    async fn fetch(&self, _id: &MeterTypeId) -> Result<GtsTypeSchema, DomainError> {
+        Err(DomainError::TypesRegistryUnavailable(
+            "Service::new has no types-registry adapter wired".to_owned(),
+        ))
+    }
+}

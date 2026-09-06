@@ -4,8 +4,17 @@
 //! startup free of an eager `types-registry` dependency, matching how the
 //! storage-plugin binding resolves lazily on first dispatch
 //! ([`crate::domain::service::Service::resolve_plugin`]).
+//!
+//! [`build_default_resolver`] is the bootstrap-layer entry point: it builds
+//! this adapter and the [`TypeResolver`] around it, mirroring how
+//! [`crate::infra::metrics::build_default_adapter`] builds the metrics
+//! adapter. `module.rs` calls it and injects the finished, domain-typed
+//! `Arc<TypeResolver>` into `Service::new_with_metrics` — the domain layer
+//! never needs to name this adapter type, only the `DeclarationSource` port
+//! it implements.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use toolkit::client_hub::ClientHub;
@@ -15,6 +24,7 @@ use usage_collector_sdk::MeterTypeId;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::declarations::DeclarationSource;
+use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 
 /// Reads declarations from `types-registry` through `ClientHub`.
 pub struct TypesRegistryDeclarationSource {
@@ -70,6 +80,31 @@ fn map_registry_error(id: &MeterTypeId, err: CanonicalError) -> DomainError {
         CanonicalError::NotFound { .. } => DomainError::declaration_not_found(id),
         other => DomainError::TypesRegistryUnavailable(other.to_string()),
     }
+}
+
+/// Builds the production Type Resolver: a [`TypesRegistryDeclarationSource`]
+/// over `hub`, wrapped in the cache policy `ttl_secs` / `capacity` describe.
+///
+/// This is the bootstrap-layer construction point — called from `module.rs`
+/// with the configured `[usage_collector]` cache knobs, the same way
+/// [`crate::infra::metrics::build_default_adapter`] builds the metrics
+/// adapter from `cfg.metrics.effective_prefix()`. The returned resolver is
+/// injected into `Service::new_with_metrics` as a finished object; nothing
+/// about how it was built leaks into the domain layer.
+#[must_use]
+pub fn build_default_resolver(
+    hub: Arc<ClientHub>,
+    ttl_secs: u64,
+    capacity: usize,
+) -> Arc<TypeResolver> {
+    let source = Arc::new(TypesRegistryDeclarationSource::new(hub));
+    Arc::new(TypeResolver::new(
+        source,
+        TypeResolverConfig {
+            ttl: Duration::from_secs(ttl_secs),
+            capacity,
+        },
+    ))
 }
 
 #[cfg(test)]

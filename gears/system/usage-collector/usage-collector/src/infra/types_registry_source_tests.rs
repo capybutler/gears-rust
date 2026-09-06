@@ -15,7 +15,7 @@ use usage_collector_sdk::MeterTypeId;
 
 use crate::domain::ports::declarations::DeclarationSource;
 
-use super::TypesRegistryDeclarationSource;
+use super::{TypesRegistryDeclarationSource, build_default_resolver};
 
 const METER: &str = "gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~";
 const BASE: &str = "gts.cf.core.uc.usage_record.v1~";
@@ -110,4 +110,18 @@ async fn a_missing_registry_client_is_not_a_not_found() {
         ),
         "expected TypesRegistryUnavailable, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn build_default_resolver_wires_a_working_resolver_over_the_hub() {
+    // Bootstrap-layer smoke test: `module.rs` calls this to build the
+    // production Type Resolver. Proves the wiring — adapter over `hub`,
+    // wrapped in the given cache policy — actually resolves, not just that
+    // it constructs without panicking.
+    let hub = hub_with(MockTypesRegistryClient::new().with_type_schemas([registered_schema()]));
+
+    let resolver = build_default_resolver(hub, 300, 10_000);
+
+    let declaration = resolver.resolve(&meter_id()).await.expect("resolves");
+    assert_eq!(declaration.gts_type_id.as_str(), METER);
 }

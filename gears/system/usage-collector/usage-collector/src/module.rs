@@ -102,14 +102,17 @@ impl Gear for UsageCollectorModule {
         //    catalog SPI calls through
         //    `ClientHub::try_get_scoped::<dyn UsageCollectorPluginV1>`.
         let hub = ctx.client_hub();
-        let svc = Service::new_with_metrics(
-            hub,
-            cfg.vendor,
-            enforcer,
-            metrics,
+        // The Type Resolver's `types-registry` adapter is built here, at the
+        // bootstrap layer, and injected as a finished `Arc<TypeResolver>` —
+        // the same shape `metrics` above already uses (`build_default_adapter`
+        // built from config, then passed into `new_with_metrics`) — so the
+        // domain layer never needs to name the concrete adapter type.
+        let type_resolver = crate::infra::types_registry_source::build_default_resolver(
+            Arc::clone(&hub),
             cfg.type_cache_ttl_secs,
             cfg.type_cache_capacity,
         );
+        let svc = Service::new_with_metrics(hub, cfg.vendor, enforcer, metrics, type_resolver);
 
         let svc = Arc::new(svc);
         self.service

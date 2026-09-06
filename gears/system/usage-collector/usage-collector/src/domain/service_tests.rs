@@ -25,6 +25,7 @@ use types_registry_sdk::testing::{
 use usage_collector_sdk::{UsageCollectorPluginSpecV1, UsageCollectorPluginV1};
 
 use super::*;
+use crate::domain::ports::declarations::DeclarationSource;
 use crate::domain::test_support::{MockPlugin, UnreachableResolver, enforcer_for};
 
 /// Dummy enforcer for tests that never reach the PDP path
@@ -290,15 +291,19 @@ async fn get_plugin_returns_registered_scoped_handle() {
     );
 }
 
-// ── test-only declaration-source injection ─────────────────────────────────
+// ── injecting a resolver built over a fake declaration source ──────────────
 //
-// `Service::new_with_declaration_source` exists so later tasks (starting
-// with the one that flips the ingestion path onto the Type Resolver) can
-// inject a fake `DeclarationSource`. Nothing consults the resolver yet, so
-// this only proves the constructor wires a `Service` whose unrelated
-// behaviour (plugin-host binding) is exactly as good as the production
-// constructors' — the fake source below panics if it is ever called, which
-// would fail this test immediately if that stopped being true.
+// `new_with_metrics` takes a pre-built `Arc<TypeResolver>` rather than a
+// `DeclarationSource` or raw cache knobs, so a later task's test wanting a
+// fake source just builds a `TypeResolver` over it and passes the resolver
+// straight in — no separate wrapper constructor is needed (an earlier
+// `Service::new_with_declaration_source` did that job; it became redundant
+// once the resolver itself is the injection point, so it was removed rather
+// than kept alongside this). Nothing consults the resolver yet, so this only
+// proves `new_with_metrics` wires a `Service` whose unrelated behaviour
+// (plugin-host binding) is unaffected by what backs the resolver — the fake
+// source below panics if it is ever called, which would fail this test
+// immediately if that stopped being true.
 
 /// A [`DeclarationSource`] that panics if invoked — used to prove a code
 /// path never consults it.
@@ -315,15 +320,23 @@ impl DeclarationSource for UnreachableDeclarationSource {
 }
 
 #[tokio::test]
-async fn new_with_declaration_source_builds_a_service_with_working_plugin_binding() {
+async fn new_with_metrics_accepts_a_resolver_built_over_a_fake_source() {
     let instance_id = test_instance_id();
     let hub = hub_with_registry_and_plugin(&instance_id, "cyberfabric", MockPlugin::arc());
 
-    let svc = Service::new_with_declaration_source(
+    let type_resolver = Arc::new(TypeResolver::new(
+        Arc::new(UnreachableDeclarationSource),
+        TypeResolverConfig {
+            ttl: Duration::from_mins(5),
+            capacity: 10_000,
+        },
+    ));
+    let svc = Service::new_with_metrics(
         hub,
         "cyberfabric".to_owned(),
         dummy_enforcer(),
-        Arc::new(UnreachableDeclarationSource),
+        Arc::new(NoopMetrics),
+        type_resolver,
     );
 
     let resolved = svc.get_plugin().await;
