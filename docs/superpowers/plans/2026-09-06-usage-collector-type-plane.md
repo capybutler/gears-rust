@@ -2727,6 +2727,20 @@ Mechanical but wide. Do it as one commit so no surface is left half-swapped.
 Run: `rg -n 'UsageTypeGtsId' gears/system/usage-collector apps/`
 Expected: a list to work through. Record the count before you start.
 
+**Close the length window while you are here.** Task 8 introduced a
+temporary `meter_type_id_of` bridge in `domain/service.rs` converting
+`UsageTypeGtsId` to `MeterTypeId` by appending `~`. The two types carry
+different length ceilings — `gts-id` caps a whole identifier at 1024 bytes and
+`MeterTypeId` at 512, from the JSON schema's `maxLength`. So an identifier can
+pass `UsageTypeGtsId::new` and then fail `MeterTypeId::new`, which today
+surfaces as a 500 on the aggregate path rather than a 400 at the boundary.
+
+Making `MeterTypeId` the parameter type removes that window by construction:
+validation moves to the wire boundary and a too-long identifier is rejected
+once, as a validation error. Delete `meter_type_id_of` with the swap, and add
+a test that an over-long identifier is rejected as `InvalidArgument` rather
+than reaching a handler.
+
 - [ ] **Step 2: Write a failing test pinning the wire name**
 
 In `usage-collector/src/api/rest/dto_tests.rs`:
