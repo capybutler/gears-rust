@@ -16,8 +16,8 @@ use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, CreateUsageRecord, MetadataFilter, UsageCollectorClientV1,
-    UsageCollectorError, UsageRecord, UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter,
+    UsageCollectorClientV1, UsageCollectorError, UsageRecord, UsageType, UsageTypeGtsId,
 };
 use uuid::Uuid;
 
@@ -69,10 +69,10 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
         gts_id: UsageTypeGtsId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        aggregation: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorError> {
         self.svc
-            .query_aggregated_usage_records(ctx, gts_id, query, metadata_filter, aggregation)
+            .query_aggregated_usage_records(ctx, gts_id, query, metadata_filter, group_by)
             .await
     }
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received

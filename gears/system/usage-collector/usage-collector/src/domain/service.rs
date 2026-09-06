@@ -28,10 +28,10 @@ use toolkit_security::SecurityContext;
 use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, ConflictReason, CreateUsageRecord, MAX_AGGREGATION_BUCKETS,
-    MetadataFilter, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
-    UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
-    ValidationReason,
+    AggregationDimension, AggregationResult, ConflictReason, CreateUsageRecord,
+    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, USAGE_TYPE_RESOURCE, UsageCollectorError,
+    UsageCollectorPluginError, UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord,
+    UsageType, UsageTypeGtsId, ValidationReason,
 };
 use uuid::Uuid;
 
@@ -43,9 +43,7 @@ use crate::domain::ports::metrics::{
     RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics, UsageTypeErrorCategory,
     UsageTypeOp,
 };
-use crate::domain::query::{
-    compose_query_with_scope, require_bounded_time_window, require_op_allowed_for_kind,
-};
+use crate::domain::query::{compose_query_with_scope, require_bounded_time_window};
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
     SemanticsOutcome, validate_record_semantics, validate_submit_record_metadata,
@@ -138,6 +136,26 @@ type PendingL1Lookup = (usize, UsageRecord, Uuid);
 fn invariant_breach(detail: String) -> UsageCollectorError {
     tracing::error!(detail = %detail, "usage-collector host-invariant breach");
     UsageCollectorError::internal(detail)
+}
+
+/// Converts a catalog `gts_id` into the [`MeterTypeId`] the Type Resolver
+/// keys its cache on.
+///
+/// `UsageTypeGtsId` wraps a GTS *instance* id (no trailing `~`) already
+/// validated by [`UsageTypeGtsId::new`] to derive from the reserved usage
+/// base with exactly one further segment; `MeterTypeId` wraps the
+/// corresponding GTS *type* id — the identical string, `~`-terminated.
+/// Appending the terminator is therefore the only difference between the
+/// two wire forms for a value that already passed that validation, so this
+/// conversion is not expected to fail against one. Surfaced as a typed
+/// `Internal` (never a panic) so a host-invariant breach here still returns
+/// an error rather than crashing the request thread.
+fn meter_type_id_of(gts_id: &UsageTypeGtsId) -> Result<MeterTypeId, UsageCollectorError> {
+    MeterTypeId::new(format!("{gts_id}~")).map_err(|e| {
+        invariant_breach(format!(
+            "usage-type gts_id `{gts_id}` did not convert to a meter type id: {e}"
+        ))
+    })
 }
 
 /// Classify a Plugin SPI error for `uc_plugin_accept_errors_total`.
@@ -524,10 +542,9 @@ pub struct Service {
     /// Resolves a meter's GTS type declaration (fold, canonical unit,
     /// metadata surface) through a local TTL cache in front of
     /// `types-registry`, so ingestion's own NFRs stay independent of a
-    /// second gear's availability and latency. Constructed here; not yet
-    /// consulted by any dispatch path (that starts in the task that follows
-    /// this one) — see [`crate::domain::type_resolver`].
-    #[allow(dead_code)] // consulted starting the next task in this series
+    /// second gear's availability and latency. Consulted by
+    /// [`Self::query_aggregated_usage_records`] to serve the declared fold
+    /// — see [`crate::domain::type_resolver`].
     type_resolver: Arc<TypeResolver>,
 }
 
@@ -1839,7 +1856,7 @@ impl Service {
     /// Aggregated read over `UsageRecord`s, narrowed by the PDP-returned
     /// constraints and executed server-side by the bound storage plugin.
     ///
-    /// Mirrors [`Self::list_usage_records`] in posture — the same three
+    /// Mirrors [`Self::list_usage_records`] in posture — the same
     /// responsibilities live here per
     /// `cpt-cf-usage-collector-flow-usage-query-query-aggregated`:
     ///
@@ -1849,16 +1866,20 @@ impl Service {
     ///    narrowing). A constrained permit narrows the user filter; a
     ///    degenerate unconstrained permit is denied in composition by
     ///    [`authz::scope_to_odata_filter`], not left unscoped across tenants.
-    /// 2. **Compose** the PDP constraints into the user-supplied `OData`
+    /// 2. **Resolve** the queried meter's declaration through
+    ///    [`TypeResolver::resolve`], fail-closed. There is no caller-chosen
+    ///    aggregation: the fold served is exactly the one the declaration
+    ///    names, so no request can name a different one. Runs before any
+    ///    plugin dispatch, so an unresolvable type never reaches the SPI.
+    /// 3. **Compose** the PDP constraints into the user-supplied `OData`
     ///    filter via [`compose_query_with_scope`]. The composition is
     ///    intersection-only per
     ///    `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`.
-    /// 3. **Delegate** to the bound storage plugin's
+    /// 4. **Delegate** to the bound storage plugin's
     ///    `query_aggregated_usage_records` SPI with the composed filter,
-    ///    the typed `gts_id`, the metadata side-channel, and the
-    ///    [`AggregationSpec`]. The plugin executes `SUM` / `COUNT` /
-    ///    `MIN` / `MAX` / `AVG` and any `group_by` dimensions
-    ///    server-side per `plugin-spi.md` Method 3.
+    ///    the typed `gts_id`, the metadata side-channel, the declared
+    ///    `usage_collector_sdk::AggregationFold`, and any `group_by`
+    ///    dimensions, executed server-side per `plugin-spi.md` Method 3.
     ///
     /// # Errors
     ///
@@ -1867,6 +1888,8 @@ impl Service {
     ///   or is unavailable, or when the PDP returns a constraint shape
     ///   this gear cannot honour (tree predicates on a flat resource,
     ///   unknown PEP property, type mismatch on a value).
+    /// * [`UsageCollectorError::NotFound`] when the queried `gts_id` does
+    ///   not resolve to a usable declaration.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
     ///   transport / persistence failure.
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1
@@ -1877,7 +1900,7 @@ impl Service {
         gts_id: UsageTypeGtsId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        aggregation: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorError> {
         let start = std::time::Instant::now();
         let result = async move {
@@ -1906,23 +1929,20 @@ impl Service {
             // its only scan bound. Runs after authz (PDP-first posture).
             require_bounded_time_window(query)?;
 
+            // Resolve the queried meter's declaration before any plugin
+            // dispatch: a meter declares exactly one fold, and this gear
+            // serves that fold and no other — there is no request-supplied
+            // aggregation to validate against a kind. An unresolvable type
+            // (never declared, or an incomplete declaration) fails closed
+            // here as a pre-dispatch 404, so the plugin stays pure
+            // persistence and never sees a type it cannot resolve.
+            let meter_id = meter_type_id_of(&gts_id)?;
+            let declaration = self.type_resolver.resolve(&meter_id).await?;
+
             let plugin = self
-                .resolve_plugin_for(PluginOp::GetUsageType)
+                .resolve_plugin_for(PluginOp::QueryAggregatedUsageRecords)
                 .await
                 .map_err(UsageCollectorError::from)?;
-
-            // Resolve the queried usage type before dispatch: existence (an
-            // unregistered `gts_id` lifts the plugin's `UsageTypeNotFound` to a
-            // pre-dispatch `404`) AND `kind`, so a mismatched `(op, kind)` pair is
-            // rejected as a typed `400` here and the plugin stays pure-persistence.
-            let usage_type = instrument_spi(
-                self.metrics.as_ref(),
-                PluginOp::GetUsageType,
-                plugin.get_usage_type(gts_id.clone()),
-            )
-            .await
-            .map_err(|e| UsageCollectorError::from(DomainError::from(e)))?;
-            require_op_allowed_for_kind(aggregation.op, usage_type.kind, &gts_id)?;
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-constraint-composition
             let composed = compose_query_with_scope(query, &scope)?;
@@ -1936,9 +1956,10 @@ impl Service {
                 PluginOp::QueryAggregatedUsageRecords,
                 plugin.query_aggregated_usage_records(
                     gts_id,
+                    declaration.aggregation_fold,
                     &composed,
                     metadata_filter,
-                    aggregation,
+                    group_by,
                 ),
             )
             .await

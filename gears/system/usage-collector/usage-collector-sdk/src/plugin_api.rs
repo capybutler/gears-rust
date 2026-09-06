@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use crate::error::UsageCollectorPluginError;
 use crate::models::{
-    AggregationResult, AggregationSpec, MetadataFilter, UsageRecord, UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, UsageRecord,
+    UsageType, UsageTypeGtsId,
 };
 
 /// Backend storage adapter trait implemented by
@@ -40,17 +41,20 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// Get a single usage record by its `id`.
     async fn get_usage_record(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError>;
 
-    /// Aggregated query over usage records.
+    /// Compute the given fold over the authorized scope.
     ///
-    /// The time window is expressed inside `query.filter` as a
+    /// The fold arrives as a parameter: declarations never reach the SPI,
+    /// so the plugin stays pure persistence and never resolves a type
+    /// itself. The time window is expressed inside `query.filter` as a
     /// `created_at ge … and created_at lt …` predicate; there is no
     /// separate typed parameter.
     async fn query_aggregated_usage_records(
         &self,
         gts_id: UsageTypeGtsId,
+        fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        aggregation: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError>;
 
     /// Keyset-paginated list of usage records.

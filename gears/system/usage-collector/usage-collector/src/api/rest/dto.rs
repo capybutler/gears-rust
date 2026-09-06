@@ -23,9 +23,8 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use usage_collector_sdk::{
-    AggregationBucket, AggregationDimension, AggregationOp, AggregationResult, AggregationSpec,
-    MetadataKey, ResourceRef, SubjectRef, UsageCollectorError, UsageKind, UsageRecord,
-    UsageRecordStatus, UsageType,
+    AggregationBucket, AggregationDimension, AggregationResult, MetadataKey, ResourceRef,
+    SubjectRef, UsageCollectorError, UsageKind, UsageRecord, UsageRecordStatus, UsageType,
 };
 use uuid::Uuid;
 
@@ -282,45 +281,6 @@ pub struct CreateUsageRecordsResponse {
 // Aggregated-query DTOs
 // ---------------------------------------------------------------------------
 
-/// Wire projection of [`usage_collector_sdk::AggregationOp`]. Identical
-/// lowercase encoding — the wrapper exists so the OAS can pin the closed
-/// enum schema without pulling `utoipa` into the SDK. (The macro-applied
-/// `rename_all = "snake_case"` collapses to the same single-token form
-/// as the SDK's `rename_all = "lowercase"` for these variants.)
-#[derive(Debug, Clone, Copy)]
-#[toolkit_macros::api_dto(request, response)]
-pub enum AggregationOpDto {
-    Sum,
-    Count,
-    Min,
-    Max,
-    Avg,
-}
-
-impl From<AggregationOpDto> for AggregationOp {
-    fn from(value: AggregationOpDto) -> Self {
-        match value {
-            AggregationOpDto::Sum => AggregationOp::Sum,
-            AggregationOpDto::Count => AggregationOp::Count,
-            AggregationOpDto::Min => AggregationOp::Min,
-            AggregationOpDto::Max => AggregationOp::Max,
-            AggregationOpDto::Avg => AggregationOp::Avg,
-        }
-    }
-}
-
-impl From<AggregationOp> for AggregationOpDto {
-    fn from(value: AggregationOp) -> Self {
-        match value {
-            AggregationOp::Sum => AggregationOpDto::Sum,
-            AggregationOp::Count => AggregationOpDto::Count,
-            AggregationOp::Min => AggregationOpDto::Min,
-            AggregationOp::Max => AggregationOpDto::Max,
-            AggregationOp::Avg => AggregationOpDto::Avg,
-        }
-    }
-}
-
 /// Wire projection of [`usage_collector_sdk::AggregationDimension`]. The
 /// closed dimensions are encoded as snake-case bare strings; the
 /// `metadata` form carries the declared key inline as
@@ -374,29 +334,36 @@ impl From<AggregationDimension> for AggregationDimensionDto {
 /// `POST /usage-collector/v1/records/aggregate`. The typed `gts_id`, the
 /// `OData` `$filter`, and the `metadata.<key>` side-channel remain query
 /// parameters (mirroring `GET /usage-collector/v1/records`); only the
-/// aggregation spec (operator + group-by dimensions) ships in the body.
+/// group-by dimensions ship in the body. Carries no aggregation parameter
+/// (matches `AggregationRequest` in `docs/usage-collector-v1.yaml`): the
+/// fold is resolved from the queried type's declaration, so no request is
+/// well-formed and semantically wrong.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct QueryAggregatedUsageRecordsRequest {
-    pub op: AggregationOpDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_by: Vec<AggregationDimensionDto>,
 }
 
-impl TryFrom<QueryAggregatedUsageRecordsRequest> for AggregationSpec {
-    type Error = UsageCollectorError;
-
-    fn try_from(value: QueryAggregatedUsageRecordsRequest) -> Result<Self, Self::Error> {
-        let group_by = value
-            .group_by
+impl QueryAggregatedUsageRecordsRequest {
+    /// Projects the wire `group_by` dimensions into their typed SDK form.
+    ///
+    /// A free method rather than a `TryFrom` impl: the target,
+    /// `Vec<AggregationDimension>`, is foreign to this crate (both `Vec`
+    /// and `AggregationDimension` live outside it), so a blanket
+    /// `TryFrom<QueryAggregatedUsageRecordsRequest> for Vec<AggregationDimension>`
+    /// would violate the orphan rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorError`] when a `Metadata` dimension carries a
+    /// key [`MetadataKey::new`] rejects (e.g. empty or oversized).
+    pub fn into_group_by(self) -> Result<Vec<AggregationDimension>, UsageCollectorError> {
+        self.group_by
             .into_iter()
             .map(AggregationDimension::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(AggregationSpec {
-            op: value.op.into(),
-            group_by,
-        })
+            .collect()
     }
 }
 

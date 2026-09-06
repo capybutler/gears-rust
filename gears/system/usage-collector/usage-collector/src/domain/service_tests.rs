@@ -380,9 +380,10 @@ mod create_usage_type_tests {
     use types_registry_sdk::TypesRegistryClient;
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use usage_collector_sdk::{
-        AggregationResult, AggregationSpec, MetadataFilter, MetadataKey, UsageCollectorClientV1,
-        UsageCollectorError, UsageCollectorPluginError, UsageCollectorPluginSpecV1,
-        UsageCollectorPluginV1, UsageKind, UsageRecord, UsageType, UsageTypeGtsId,
+        AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MetadataKey,
+        UsageCollectorClientV1, UsageCollectorError, UsageCollectorPluginError,
+        UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageKind, UsageRecord, UsageType,
+        UsageTypeGtsId,
     };
     use uuid::Uuid;
 
@@ -469,9 +470,10 @@ mod create_usage_type_tests {
         async fn query_aggregated_usage_records(
             &self,
             _gts_id: UsageTypeGtsId,
+            _fold: AggregationFold,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
-            _aggregation: AggregationSpec,
+            _group_by: &[AggregationDimension],
         ) -> Result<AggregationResult, UsageCollectorPluginError> {
             Err(UsageCollectorPluginError::internal(
                 "test_fake: RegisterStubPlugin: query_aggregated_usage_records must not be called",
@@ -893,8 +895,8 @@ mod catalog_dispatch_tests {
     use types_registry_sdk::TypesRegistryClient;
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use usage_collector_sdk::{
-        AggregationResult, AggregationSpec, ConflictReason, MetadataFilter, MetadataKey,
-        USAGE_TYPE_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
+        AggregationDimension, AggregationFold, AggregationResult, ConflictReason, MetadataFilter,
+        MetadataKey, USAGE_TYPE_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
         UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageKind, UsageRecord, UsageType,
         UsageTypeGtsId,
     };
@@ -1015,9 +1017,10 @@ mod catalog_dispatch_tests {
         async fn query_aggregated_usage_records(
             &self,
             _gts_id: UsageTypeGtsId,
+            _fold: AggregationFold,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
-            _aggregation: AggregationSpec,
+            _group_by: &[AggregationDimension],
         ) -> Result<AggregationResult, UsageCollectorPluginError> {
             Err(UsageCollectorPluginError::internal(
                 "test_fake: CatalogStubPlugin: query_aggregated_usage_records must not be called",
@@ -1502,9 +1505,9 @@ mod deactivate_usage_record_tests {
     use types_registry_sdk::TypesRegistryClient;
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use usage_collector_sdk::{
-        AggregationResult, AggregationSpec, ConflictReason, MetadataFilter, USAGE_RECORD_RESOURCE,
-        UsageCollectorError, UsageCollectorPluginError, UsageCollectorPluginSpecV1,
-        UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
+        AggregationDimension, AggregationFold, AggregationResult, ConflictReason, MetadataFilter,
+        USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
+        UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
     };
     use uuid::Uuid;
 
@@ -1636,9 +1639,10 @@ mod deactivate_usage_record_tests {
         async fn query_aggregated_usage_records(
             &self,
             _gts_id: UsageTypeGtsId,
+            _fold: AggregationFold,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
-            _aggregation: AggregationSpec,
+            _group_by: &[AggregationDimension],
         ) -> Result<AggregationResult, UsageCollectorPluginError> {
             Err(UsageCollectorPluginError::internal(
                 "test_fake: DeactivateStubPlugin: query_aggregated_usage_records must not be called",
@@ -3172,9 +3176,10 @@ mod get_usage_record_tests {
             async fn query_aggregated_usage_records(
                 &self,
                 _gts_id: usage_collector_sdk::UsageTypeGtsId,
+                _fold: usage_collector_sdk::AggregationFold,
                 _query: &toolkit_odata::ODataQuery,
                 _metadata_filter: &[usage_collector_sdk::MetadataFilter],
-                _aggregation: usage_collector_sdk::AggregationSpec,
+                _group_by: &[usage_collector_sdk::AggregationDimension],
             ) -> Result<usage_collector_sdk::AggregationResult, UsageCollectorPluginError>
             {
                 Err(UsageCollectorPluginError::internal(
@@ -4030,127 +4035,114 @@ mod derived_id_stamp_tests {
     }
 }
 
-mod aggregate_op_kind_enforcement_tests {
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-
+// The kind/op compatibility rule (`require_op_allowed_for_kind` /
+// `AggregationOp::is_allowed_for`) is gone, not relocated: a meter declares
+// exactly one fold and a caller cannot choose one at all, so there is no
+// (op, kind) pair left to validate. This module replaces
+// `aggregate_op_kind_enforcement_tests`: the fold-serving and fail-closed
+// tests below are the ones the task plan calls for; the bucket-cap tests
+// are carried over (reworked onto the resolver-backed builder) because
+// `MAX_AGGREGATION_BUCKETS` enforcement is an unrelated concern that
+// survives this change unchanged.
+mod aggregate_declared_fold_tests {
     use toolkit_gts::gts_id;
-    use toolkit_security::pep_properties;
+    use toolkit_odata::ODataQuery;
+    use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
-        AggregationBucket, AggregationOp, AggregationResult, AggregationSpec,
-        MAX_AGGREGATION_BUCKETS, UsageCollectorError, UsageCollectorPluginV1, UsageKind, UsageType,
-        UsageTypeGtsId, ValidationReason,
+        AggregationBucket, AggregationFold, AggregationResult, MAX_AGGREGATION_BUCKETS,
+        UsageCollectorError, UsageTypeGtsId, ValidationReason,
     };
-    use uuid::Uuid;
 
-    use crate::domain::Service;
     use crate::domain::test_support::{
-        CountingPermitResolver, HappyPathPlugin, authenticated_ctx, enforcer_for, hub_with_plugin,
+        authenticated_ctx, fake_declaration_source_not_found, fake_declaration_source_with_fold,
+        service_with_recording_plugin,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
-    fn gts_id() -> UsageTypeGtsId {
+    fn meter_id() -> UsageTypeGtsId {
         UsageTypeGtsId::new(GTS_ID).expect("valid gts_id")
     }
 
-    fn usage_type(kind: UsageKind) -> UsageType {
-        UsageType {
-            gts_id: gts_id(),
-            kind,
-            metadata_fields: BTreeSet::new(),
-        }
+    fn ctx() -> SecurityContext {
+        authenticated_ctx()
     }
 
-    fn spec(op: AggregationOp) -> AggregationSpec {
-        AggregationSpec {
-            op,
-            group_by: Vec::new(),
-        }
-    }
-
-    // Mirrors the proven aggregate-path handler-test wiring: a permit scoped to
-    // the request's OWNER_TENANT_ID (uuid 2, matching `authenticated_ctx`), so
-    // authz permits AND PDP-constraint composition succeeds — allowed pairs
-    // reach the plugin dispatch.
-    fn service_with_plugin(plugin: &Arc<HappyPathPlugin>, suffix: &str) -> Arc<Service> {
-        let hub = hub_with_plugin(
-            Arc::clone(plugin) as Arc<dyn UsageCollectorPluginV1>,
-            suffix,
-            "cyberfabric",
-        );
-        let resolver = CountingPermitResolver::new(
-            pep_properties::OWNER_TENANT_ID,
-            Uuid::from_u128(2).to_string(),
-        );
-        let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
-    }
-
-    fn bounded_window() -> toolkit_odata::ODataQuery {
+    // The aggregate path has no `$top` ceiling — the bounded `created_at`
+    // window is its only scan bound, and `require_bounded_time_window` runs
+    // before declaration resolution, so every test here needs one to reach
+    // the fold-resolution / dispatch logic under test.
+    fn bounded_window() -> ODataQuery {
         let expr = toolkit_odata::parse_filter_string(
             "created_at ge 2026-01-01T00:00:00Z and created_at lt 2026-02-01T00:00:00Z",
         )
         .expect("filter parses")
         .into_expr();
-        toolkit_odata::ODataQuery::from(Some(expr))
+        ODataQuery::from(Some(expr))
     }
 
-    async fn run(
-        kind: UsageKind,
-        op: AggregationOp,
-    ) -> Result<AggregationResult, UsageCollectorError> {
-        let plugin = HappyPathPlugin::new();
-        plugin.set_get_usage_type(usage_type(kind));
-        plugin.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
-        let service = service_with_plugin(&plugin, "test.aggregate.opkind.guard.v1");
-        service
-            .query_aggregated_usage_records(
-                &authenticated_ctx(),
-                gts_id(),
-                &bounded_window(),
-                &[],
-                spec(op),
-            )
+    #[tokio::test]
+    async fn aggregate_serves_the_fold_the_declaration_names() {
+        // The request carries no aggregation parameter. Whatever fold reaches
+        // the plugin must have come from the resolved declaration.
+        let source = fake_declaration_source_with_fold("MAX");
+        let (svc, spy) = service_with_recording_plugin(source).await;
+        spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
+
+        svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
             .await
-    }
+            .expect("aggregates");
 
-    fn assert_op_not_allowed(result: Result<AggregationResult, UsageCollectorError>) {
-        match result {
-            Err(UsageCollectorError::InvalidArgument { reason, .. }) => {
-                assert_eq!(reason, ValidationReason::OpNotAllowedForKind);
-            }
-            other => panic!("expected OP_NOT_ALLOWED_FOR_KIND 400, got {other:?}"),
-        }
+        assert_eq!(spy.last_fold(), Some(AggregationFold::Max));
     }
 
     #[tokio::test]
-    async fn sum_on_gauge_is_rejected() {
-        assert_op_not_allowed(run(UsageKind::Gauge, AggregationOp::Sum).await);
-    }
-
-    #[tokio::test]
-    async fn min_max_avg_on_counter_are_rejected() {
-        for op in [AggregationOp::Min, AggregationOp::Max, AggregationOp::Avg] {
-            assert_op_not_allowed(run(UsageKind::Counter, op).await);
-        }
-    }
-
-    #[tokio::test]
-    async fn allowed_pairs_dispatch_to_plugin() {
-        // COUNT on both kinds; SUM on counter; MIN/MAX/AVG on gauge → dispatched.
-        for (kind, op) in [
-            (UsageKind::Counter, AggregationOp::Sum),
-            (UsageKind::Counter, AggregationOp::Count),
-            (UsageKind::Gauge, AggregationOp::Count),
-            (UsageKind::Gauge, AggregationOp::Min),
-            (UsageKind::Gauge, AggregationOp::Max),
-            (UsageKind::Gauge, AggregationOp::Avg),
+    async fn aggregate_serves_every_declared_fold_not_a_hard_coded_one() {
+        // Covers more than one fold value so a service hard-coded to always
+        // push `AggregationFold::Sum` cannot pass: every fold a declaration
+        // can name must reach the plugin unchanged, not just one of them.
+        for fold in [
+            AggregationFold::Sum,
+            AggregationFold::Count,
+            AggregationFold::Max,
+            AggregationFold::Min,
+            AggregationFold::Latest,
         ] {
-            run(kind, op)
+            let source = fake_declaration_source_with_fold(fold.as_str());
+            let (svc, spy) = service_with_recording_plugin(source).await;
+            spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
+
+            svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
                 .await
-                .unwrap_or_else(|e| panic!("({kind:?}, {op:?}) MUST dispatch, got {e:?}"));
+                .unwrap_or_else(|e| panic!("fold {fold:?} MUST dispatch, got {e:?}"));
+
+            assert_eq!(
+                spy.last_fold(),
+                Some(fold),
+                "the fold reaching the plugin must be the one the declaration names",
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn aggregate_fails_closed_when_the_type_does_not_resolve() {
+        let source = fake_declaration_source_not_found();
+        let (svc, spy) = service_with_recording_plugin(source).await;
+
+        let err = svc
+            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
+            .await
+            .expect_err("an unresolvable type must not reach the plugin");
+
+        assert!(
+            matches!(err, UsageCollectorError::NotFound { .. }),
+            "expected NotFound, got {err:?}",
+        );
+        assert_eq!(
+            spy.calls(),
+            0,
+            "the plugin must not be dispatched for an unresolvable type",
+        );
     }
 
     // Build an `AggregationResult` with exactly `n` empty-key buckets. Mirrors
@@ -4167,34 +4159,19 @@ mod aggregate_op_kind_enforcement_tests {
         }
     }
 
-    async fn run_with_buckets(
-        n: usize,
-        suffix: &str,
-    ) -> Result<AggregationResult, UsageCollectorError> {
-        let plugin = HappyPathPlugin::new();
-        plugin.set_get_usage_type(usage_type(UsageKind::Counter));
-        plugin.set_query_aggregated_usage_records_response(result_with_buckets(n));
-        let service = service_with_plugin(&plugin, suffix);
-        service
-            .query_aggregated_usage_records(
-                &authenticated_ctx(),
-                gts_id(),
-                &bounded_window(),
-                &[],
-                spec(AggregationOp::Count),
-            )
-            .await
-    }
-
     #[tokio::test]
     async fn over_cap_bucket_count_is_rejected() {
         // One bucket over the cap — exactly what the plugin's `LIMIT cap + 1`
         // yields on overflow — must lift to a client-fixable 400, not a page.
-        match run_with_buckets(
+        let source = fake_declaration_source_with_fold("COUNT");
+        let (svc, spy) = service_with_recording_plugin(source).await;
+        spy.set_query_aggregated_usage_records_response(result_with_buckets(
             MAX_AGGREGATION_BUCKETS + 1,
-            "test.aggregate.overcap.guard.v1",
-        )
-        .await
+        ));
+
+        match svc
+            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
+            .await
         {
             Err(UsageCollectorError::InvalidArgument { reason, .. }) => {
                 assert_eq!(reason, ValidationReason::AggregationResultTooLarge);
@@ -4206,29 +4183,16 @@ mod aggregate_op_kind_enforcement_tests {
     #[tokio::test]
     async fn at_cap_bucket_count_is_allowed() {
         // Exactly at the cap is the boundary — `>` must not reject it.
-        let result = run_with_buckets(MAX_AGGREGATION_BUCKETS, "test.aggregate.atcap.guard.v1")
+        let source = fake_declaration_source_with_fold("COUNT");
+        let (svc, spy) = service_with_recording_plugin(source).await;
+        spy.set_query_aggregated_usage_records_response(result_with_buckets(
+            MAX_AGGREGATION_BUCKETS,
+        ));
+
+        let result = svc
+            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
             .await
             .expect("a result exactly at the cap must be returned");
         assert_eq!(result.buckets.len(), MAX_AGGREGATION_BUCKETS);
-    }
-
-    #[tokio::test]
-    async fn unregistered_gts_id_is_not_found_before_dispatch() {
-        let plugin = HappyPathPlugin::new();
-        plugin.set_get_usage_type_not_found(gts_id());
-        let service = service_with_plugin(&plugin, "test.aggregate.notfound.guard.v1");
-        let result = service
-            .query_aggregated_usage_records(
-                &authenticated_ctx(),
-                gts_id(),
-                &bounded_window(),
-                &[],
-                spec(AggregationOp::Sum),
-            )
-            .await;
-        assert!(
-            matches!(result, Err(UsageCollectorError::NotFound { .. })),
-            "unregistered gts_id MUST surface as a pre-dispatch 404, got {result:?}",
-        );
     }
 }

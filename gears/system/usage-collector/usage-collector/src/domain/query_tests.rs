@@ -154,54 +154,6 @@ fn compose_preserves_user_filter_hash_when_scope_narrows() {
     );
 }
 
-mod require_op_allowed_for_kind_tests {
-    use toolkit_gts::gts_id;
-    use usage_collector_sdk::{
-        AggregationOp, UsageCollectorError, UsageKind, UsageTypeGtsId, ValidationReason,
-    };
-
-    use super::super::require_op_allowed_for_kind;
-
-    fn gts_id() -> UsageTypeGtsId {
-        UsageTypeGtsId::new(gts_id!(
-            "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
-        ))
-        .expect("valid gts_id")
-    }
-
-    #[test]
-    fn allowed_pairs_pass() {
-        for (op, kind) in [
-            (AggregationOp::Sum, UsageKind::Counter),
-            (AggregationOp::Count, UsageKind::Counter),
-            (AggregationOp::Count, UsageKind::Gauge),
-            (AggregationOp::Min, UsageKind::Gauge),
-            (AggregationOp::Max, UsageKind::Gauge),
-            (AggregationOp::Avg, UsageKind::Gauge),
-        ] {
-            require_op_allowed_for_kind(op, kind, &gts_id())
-                .unwrap_or_else(|_| panic!("({op:?}, {kind:?}) MUST be allowed"));
-        }
-    }
-
-    #[test]
-    fn mismatched_pairs_reject_with_typed_400() {
-        for (op, kind) in [
-            (AggregationOp::Sum, UsageKind::Gauge),
-            (AggregationOp::Min, UsageKind::Counter),
-            (AggregationOp::Max, UsageKind::Counter),
-            (AggregationOp::Avg, UsageKind::Counter),
-        ] {
-            match require_op_allowed_for_kind(op, kind, &gts_id()) {
-                Err(UsageCollectorError::InvalidArgument { reason, .. }) => {
-                    assert_eq!(reason, ValidationReason::OpNotAllowedForKind);
-                }
-                other => panic!("({op:?}, {kind:?}) MUST reject with a typed 400, got {other:?}"),
-            }
-        }
-    }
-}
-
 #[test]
 fn compose_unconstrained_scope_is_denied_fail_closed() {
     // An `allow_all` scope on the LIST/aggregate path is a degenerate

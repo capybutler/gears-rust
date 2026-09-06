@@ -12,8 +12,8 @@ use toolkit_odata::{ODataQuery, Page as ODataPage};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, MetadataFilter, UsageCollectorPluginError,
-    UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter,
+    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
 };
 
 #[derive(Debug, Default)]
@@ -55,9 +55,10 @@ impl UsageCollectorPluginV1 for NoopBackend {
     async fn query_aggregated_usage_records(
         &self,
         _gts_id: UsageTypeGtsId,
+        _fold: AggregationFold,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
-        _aggregation: AggregationSpec,
+        _group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
         Ok(AggregationResult {
             buckets: Vec::new(),

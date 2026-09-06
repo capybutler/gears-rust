@@ -2239,15 +2239,15 @@ mod handle_list_usage_records_tests {
 // handle_query_aggregated_usage_records — wire validation + body projection
 //
 // The aggregate handler shares the metadata + gts_id surface with list,
-// but its allowlist is stricter (no `$top`, no `cursor`) and it ships
-// the `AggregationSpec` in the body. The tests here pin only what list
-// tests can't: the stricter allowlist, the body lift through
-// `TryFrom<QueryAggregatedUsageRecordsRequest>`, and the result
+// but its allowlist is stricter (no `$top`, no `cursor`) and it ships only
+// group-by dimensions in the body — no aggregation parameter; the fold is
+// resolved from the queried type's declaration. The tests here pin only
+// what list tests can't: the stricter allowlist, the body lift through
+// `QueryAggregatedUsageRecordsRequest::into_group_by`, and the result
 // projection through `AggregationResultDto`.
 // ---------------------------------------------------------------------------
 
 mod handle_query_aggregated_usage_records_tests {
-    use std::collections::BTreeSet;
     use std::sync::Arc;
     use toolkit_gts::gts_id;
 
@@ -2259,20 +2259,15 @@ mod handle_query_aggregated_usage_records_tests {
     use toolkit::api::canonical_prelude::OData;
     use toolkit::client_hub::ClientHub;
     use toolkit_odata::ODataQuery;
-    use toolkit_security::{SecurityContext, pep_properties};
-    use usage_collector_sdk::{
-        AggregationBucket, AggregationResult, UsageKind, UsageType, UsageTypeGtsId,
-    };
-    use uuid::Uuid;
+    use toolkit_security::SecurityContext;
+    use usage_collector_sdk::{AggregationBucket, AggregationResult};
 
     use super::super::handle_query_aggregated_usage_records;
-    use crate::api::rest::dto::{
-        AggregationDimensionDto, AggregationOpDto, QueryAggregatedUsageRecordsRequest,
-    };
+    use crate::api::rest::dto::{AggregationDimensionDto, QueryAggregatedUsageRecordsRequest};
     use crate::domain::Service;
     use crate::domain::test_support::{
-        CountingPermitResolver, CountingUnreachableResolver, HappyPathPlugin, authenticated_ctx,
-        enforcer_for, hub_with_plugin,
+        CountingUnreachableResolver, authenticated_ctx, enforcer_for,
+        fake_declaration_source_with_fold, service_with_recording_plugin,
     };
 
     const VALID_GTS_ID: &str =
@@ -2285,23 +2280,8 @@ mod handle_query_aggregated_usage_records_tests {
         Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
     }
 
-    fn service_with_permit_plugin(plugin: &Arc<HappyPathPlugin>, suffix: &str) -> Arc<Service> {
-        let hub = hub_with_plugin(
-            Arc::clone(plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-            suffix,
-            "cyberfabric",
-        );
-        let resolver = CountingPermitResolver::new(
-            pep_properties::OWNER_TENANT_ID,
-            Uuid::from_u128(2).to_string(),
-        );
-        let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
-    }
-
-    fn sum_no_group() -> QueryAggregatedUsageRecordsRequest {
+    fn no_group() -> QueryAggregatedUsageRecordsRequest {
         QueryAggregatedUsageRecordsRequest {
-            op: AggregationOpDto::Sum,
             group_by: Vec::new(),
         }
     }
@@ -2318,7 +2298,7 @@ mod handle_query_aggregated_usage_records_tests {
             Extension(service),
             Query(Vec::new()),
             OData(ODataQuery::new()),
-            Json(sum_no_group()),
+            Json(no_group()),
         )
         .await
         .into_response();
@@ -2338,7 +2318,7 @@ mod handle_query_aggregated_usage_records_tests {
             Extension(service),
             Query(vec![("gts_id".to_owned(), "not-a-valid-prefix".to_owned())]),
             OData(ODataQuery::new()),
-            Json(sum_no_group()),
+            Json(no_group()),
         )
         .await
         .into_response();
@@ -2361,7 +2341,7 @@ mod handle_query_aggregated_usage_records_tests {
                 ("cursor".to_owned(), "any-blob".to_owned()),
             ]),
             OData(ODataQuery::new()),
-            Json(sum_no_group()),
+            Json(no_group()),
         )
         .await
         .into_response();
@@ -2373,9 +2353,9 @@ mod handle_query_aggregated_usage_records_tests {
     async fn aggregation_body_with_invalid_metadata_key_lifts_through_tryfrom() {
         // `AggregationDimension::Metadata` carries a typed
         // `MetadataKey` — an empty / oversized key in the body MUST
-        // surface through `AggregationSpec::try_from`'s host-side
-        // canonical lift, NOT bypass the typed boundary. Pinned with
-        // the empty-string key, which the SDK rejects on
+        // surface through `QueryAggregatedUsageRecordsRequest::into_group_by`'s
+        // host-side canonical lift, NOT bypass the typed boundary. Pinned
+        // with the empty-string key, which the SDK rejects on
         // `MetadataKey::new`.
         let service = service_no_plugin();
 
@@ -2385,7 +2365,6 @@ mod handle_query_aggregated_usage_records_tests {
             Query(vec![("gts_id".to_owned(), VALID_GTS_ID.to_owned())]),
             OData(ODataQuery::new()),
             Json(QueryAggregatedUsageRecordsRequest {
-                op: AggregationOpDto::Sum,
                 group_by: vec![AggregationDimensionDto::Metadata(String::new())],
             }),
         )
@@ -2405,13 +2384,12 @@ mod handle_query_aggregated_usage_records_tests {
         // MUST surface a 200 OK body whose `buckets` array projects
         // each bucket through `AggregationBucketDto` — `key` carried
         // verbatim, `value` serialised as a decimal string per the
-        // `bigdecimal_str_option` contract.
-        let plugin = HappyPathPlugin::new();
-        plugin.set_get_usage_type(UsageType {
-            gts_id: UsageTypeGtsId::new(VALID_GTS_ID).expect("valid gts_id"),
-            kind: UsageKind::Counter,
-            metadata_fields: BTreeSet::new(),
-        });
+        // `bigdecimal_str_option` contract. The service resolves the fold
+        // from the declaration (there is no `op` on the wire any more), so
+        // this wires a working Type Resolver rather than the plugin-side
+        // catalog the pre-Task-8 test used.
+        let source = fake_declaration_source_with_fold("SUM");
+        let (service, plugin) = service_with_recording_plugin(source).await;
         plugin.set_query_aggregated_usage_records_response(AggregationResult {
             buckets: vec![
                 AggregationBucket {
@@ -2424,8 +2402,7 @@ mod handle_query_aggregated_usage_records_tests {
                 },
             ],
         });
-
-        let service = service_with_permit_plugin(&plugin, "test.handler.aggregate.happy.v1");
+        let service = Arc::new(service);
 
         let response = handle_query_aggregated_usage_records(
             Extension(authenticated_ctx()),
@@ -2433,7 +2410,6 @@ mod handle_query_aggregated_usage_records_tests {
             Query(vec![("gts_id".to_owned(), VALID_GTS_ID.to_owned())]),
             OData(super::bounded_window_query()),
             Json(QueryAggregatedUsageRecordsRequest {
-                op: AggregationOpDto::Sum,
                 group_by: vec![AggregationDimensionDto::ResourceType],
             }),
         )

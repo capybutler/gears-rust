@@ -30,8 +30,8 @@ use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, MetadataFilter, UsageCollectorPluginError,
-    UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter,
+    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
 };
 use uuid::Uuid;
 
@@ -78,9 +78,10 @@ impl UsageCollectorPluginV1 for MockPlugin {
     async fn query_aggregated_usage_records(
         &self,
         _gts_id: UsageTypeGtsId,
+        _fold: AggregationFold,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
-        _aggregation: AggregationSpec,
+        _group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::internal(
             "test_fake: MockPlugin::query_aggregated_usage_records not implemented",
@@ -901,6 +902,12 @@ pub struct HappyPathPlugin {
     list_usage_types_pages: Mutex<std::collections::VecDeque<ODataPage<UsageType>>>,
     list_usage_records_response: Mutex<Option<ODataPage<UsageRecord>>>,
     query_aggregated_usage_records_response: Mutex<Option<AggregationResult>>,
+    /// Every [`AggregationFold`] passed to `query_aggregated_usage_records`,
+    /// in call order. `len()` is the call count ([`HappyPathPlugin::calls`])
+    /// and the last entry is [`HappyPathPlugin::last_fold`] — the same
+    /// "inputs" recording shape as `get_usage_type_inputs`, doubling as the
+    /// [`RecordingPlugin`] spy for the declared-fold tests.
+    query_aggregated_usage_records_folds: Mutex<Vec<AggregationFold>>,
     delete_usage_type_response: Mutex<Option<()>>,
 
     create_record_input: Mutex<Option<UsageRecord>>,
@@ -942,6 +949,7 @@ impl HappyPathPlugin {
             list_usage_types_pages: Mutex::new(std::collections::VecDeque::new()),
             list_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_response: Mutex::new(None),
+            query_aggregated_usage_records_folds: Mutex::new(Vec::new()),
             delete_usage_type_response: Mutex::new(None),
             create_record_input: Mutex::new(None),
             create_records_input: Mutex::new(None),
@@ -1044,6 +1052,25 @@ impl HappyPathPlugin {
             .lock()
             .expect("mutex") = Some(result);
     }
+    /// Total number of `query_aggregated_usage_records` SPI dispatches so
+    /// far — the [`RecordingPlugin`] spy's call counter.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.query_aggregated_usage_records_folds
+            .lock()
+            .expect("mutex")
+            .len()
+    }
+    /// The most-recent [`AggregationFold`] passed to
+    /// `query_aggregated_usage_records`, or `None` if it was never invoked.
+    #[must_use]
+    pub fn last_fold(&self) -> Option<AggregationFold> {
+        self.query_aggregated_usage_records_folds
+            .lock()
+            .expect("mutex")
+            .last()
+            .copied()
+    }
     pub fn set_delete_usage_type_ok(&self) {
         *self.delete_usage_type_response.lock().expect("mutex") = Some(());
     }
@@ -1115,10 +1142,15 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
     async fn query_aggregated_usage_records(
         &self,
         _gts_id: UsageTypeGtsId,
+        fold: AggregationFold,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
-        _aggregation: AggregationSpec,
+        _group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
+        self.query_aggregated_usage_records_folds
+            .lock()
+            .expect("mutex")
+            .push(fold);
         self.query_aggregated_usage_records_response
             .lock()
             .expect("mutex")
@@ -1238,4 +1270,214 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
             .clone()
             .ok_or_else(|| not_programmed("get_usage_record"))
     }
+}
+
+/// Spy alias over [`HappyPathPlugin`] for the declared-fold aggregate tests
+/// (Tasks 8, 9, 12, 13): [`HappyPathPlugin::calls`] and
+/// [`HappyPathPlugin::last_fold`] already record every
+/// `query_aggregated_usage_records` dispatch, so this is a naming alias
+/// rather than a second spy type.
+pub(crate) type RecordingPlugin = HappyPathPlugin;
+
+// ── DeclarationSource fakes: fold / metadata / not-found / counting ────────
+
+use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
+use usage_collector_sdk::{MeterTypeId, USAGE_RECORD_BASE_TYPE};
+
+use crate::domain::error::DomainError;
+use crate::domain::ports::declarations::DeclarationSource;
+use crate::domain::ports::metrics::NoopMetrics;
+
+/// Builds a base + single-derived-meter `GtsTypeSchema` pair for `id`,
+/// declaring `x-gts-traits` at the schema's **top level** (never nested in
+/// `allOf` — that is the placement `GtsTypeSchema::effective_traits` reads;
+/// see `type_resolver::declaration_tests` for the history) with
+/// `aggregation_fold: fold`, `canonical_unit: "bytes"`, and a closed
+/// `metadata` surface admitting exactly `metadata_keys`.
+fn fake_meter_schema(id: &MeterTypeId, fold: &str, metadata_keys: &[String]) -> GtsTypeSchema {
+    let base = GtsTypeSchema::try_new(
+        GtsTypeId::try_new(USAGE_RECORD_BASE_TYPE).expect("base type id"),
+        serde_json::json!({
+            "type": "object",
+            "x-gts-abstract": true,
+            "properties": {
+                "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
+            }
+        }),
+        None,
+        None,
+    )
+    .expect("base schema");
+
+    let properties: serde_json::Map<String, serde_json::Value> = metadata_keys
+        .iter()
+        .map(|key| (key.clone(), serde_json::json!({ "type": "string" })))
+        .collect();
+
+    GtsTypeSchema::try_new(
+        id.as_gts().clone(),
+        serde_json::json!({
+            "allOf": [{ "$ref": format!("gts://{USAGE_RECORD_BASE_TYPE}") }],
+            "x-gts-traits": {
+                "aggregation_fold": fold,
+                "canonical_unit": "bytes"
+            },
+            "properties": {
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": properties
+                }
+            }
+        }),
+        None,
+        Some(Arc::new(base)),
+    )
+    .expect("derived schema")
+}
+
+/// A [`DeclarationSource`] that always resolves — regardless of the `id` it
+/// is asked to `fetch` — to a meter declaring `fold`, unit `bytes`, and the
+/// given closed `metadata_keys` surface.
+struct FakeDeclarationSource {
+    fold: String,
+    metadata_keys: Vec<String>,
+}
+
+#[async_trait]
+impl DeclarationSource for FakeDeclarationSource {
+    async fn fetch(&self, id: &MeterTypeId) -> Result<GtsTypeSchema, DomainError> {
+        Ok(fake_meter_schema(id, &self.fold, &self.metadata_keys))
+    }
+}
+
+/// A `DeclarationSource` that always resolves to a meter declaring `fold`,
+/// unit `bytes` and no metadata properties.
+#[must_use]
+pub(crate) fn fake_declaration_source_with_fold(fold: &str) -> Arc<dyn DeclarationSource> {
+    Arc::new(FakeDeclarationSource {
+        fold: fold.to_owned(),
+        metadata_keys: Vec::new(),
+    })
+}
+
+/// A `DeclarationSource` resolving to a meter whose metadata surface declares
+/// exactly `keys`.
+#[must_use]
+#[allow(dead_code)] // consumed starting Task 9 (ingestion metadata validation)
+pub(crate) fn fake_declaration_source_with_metadata(keys: &[&str]) -> Arc<dyn DeclarationSource> {
+    Arc::new(FakeDeclarationSource {
+        fold: "SUM".to_owned(),
+        metadata_keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+    })
+}
+
+/// A [`DeclarationSource`] that always answers a definite not-found —
+/// [`DomainError::is_declaration_not_found`] reports `true` for it, so the
+/// Type Resolver fails closed immediately rather than treating it as a
+/// possibly-transient miss.
+struct NotFoundDeclarationSource;
+
+#[async_trait]
+impl DeclarationSource for NotFoundDeclarationSource {
+    async fn fetch(&self, id: &MeterTypeId) -> Result<GtsTypeSchema, DomainError> {
+        Err(DomainError::declaration_not_found(id))
+    }
+}
+
+/// A `DeclarationSource` that always answers a definite not-found.
+#[must_use]
+pub(crate) fn fake_declaration_source_not_found() -> Arc<dyn DeclarationSource> {
+    Arc::new(NotFoundDeclarationSource)
+}
+
+/// A [`DeclarationSource`] counting its `fetch` calls, so a batch test can
+/// assert one resolution per distinct meter rather than one per record.
+/// Resolves every `id` the same way [`FakeDeclarationSource`] does (fold
+/// `SUM`, unit `bytes`, no metadata properties).
+#[allow(dead_code)] // constructed starting Task 12/13 (batch dedup tests)
+pub(crate) struct CountingDeclarationSource {
+    inner: FakeDeclarationSource,
+    calls: AtomicUsize,
+}
+
+impl CountingDeclarationSource {
+    /// Total number of `fetch` calls observed so far.
+    #[must_use]
+    #[allow(dead_code)] // consumed starting Task 12/13 (batch dedup tests)
+    pub(crate) fn fetch_calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl DeclarationSource for CountingDeclarationSource {
+    async fn fetch(&self, id: &MeterTypeId) -> Result<GtsTypeSchema, DomainError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch(id).await
+    }
+}
+
+/// A `DeclarationSource` counting its calls, so a batch test can assert one
+/// resolution per distinct meter rather than one per record.
+#[must_use]
+#[allow(dead_code)] // consumed starting Task 12/13 (batch dedup tests)
+pub(crate) fn fake_declaration_source_counting() -> Arc<CountingDeclarationSource> {
+    Arc::new(CountingDeclarationSource {
+        inner: FakeDeclarationSource {
+            fold: "SUM".to_owned(),
+            metadata_keys: Vec::new(),
+        },
+        calls: AtomicUsize::new(0),
+    })
+}
+
+/// Builds a [`Service`] over `source` and a plugin spy that records every
+/// dispatch.
+///
+/// The aggregate path's PDP request carries no per-instance resource
+/// properties (it authorizes pre-row, under `require_constraints(true)`),
+/// so the enforcer is wired with [`CountingPermitResolver`] — a fixed
+/// `OWNER_TENANT_ID` constraint returned regardless of the request shape —
+/// rather than [`CountingTenantPermitResolver`] (which reads the constraint
+/// back out of the request and would see no tenant key here, falling back to
+/// an allow-all permit the aggregate gate then denies). A [`TypeResolver`]
+/// built directly over `source` (bypassing [`Service::new`]'s inert default)
+/// makes declaration resolution actually exercised.
+///
+/// `async` for call-site uniformity with the other `Service`-builder
+/// helpers callers `.await` — the construction itself is synchronous.
+#[allow(
+    clippy::unused_async,
+    reason = "uniform async Service-builder signature"
+)]
+pub(crate) async fn service_with_recording_plugin(
+    source: Arc<dyn DeclarationSource>,
+) -> (Service, Arc<RecordingPlugin>) {
+    let plugin = RecordingPlugin::new();
+    let hub = hub_with_plugin(
+        Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+        "test.usage_collector.recording.plugin.v1",
+        "cyberfabric",
+    );
+    let resolver = CountingPermitResolver::new(
+        pep_properties::OWNER_TENANT_ID,
+        Uuid::from_u128(2).to_string(),
+    );
+    let enforcer = enforcer_for(Arc::clone(&resolver) as Arc<dyn AuthZResolverApi>);
+    let type_resolver = Arc::new(TypeResolver::new(
+        source,
+        TypeResolverConfig {
+            ttl: std::time::Duration::from_mins(1),
+            capacity: 16,
+        },
+    ));
+    let service = Service::new_with_metrics(
+        hub,
+        "cyberfabric".to_owned(),
+        enforcer,
+        Arc::new(NoopMetrics),
+        type_resolver,
+    );
+    (service, plugin)
 }

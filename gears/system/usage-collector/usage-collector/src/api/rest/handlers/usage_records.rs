@@ -14,8 +14,9 @@ use toolkit_canonical_errors::Problem;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    AggregationSpec, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, ResourceRef,
-    SubjectRef, UsageCollectorError, UsageRecord, UsageTypeGtsId, is_keyset_safe_record_field,
+    AggregationDimension, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey,
+    ResourceRef, SubjectRef, UsageCollectorError, UsageRecord, UsageTypeGtsId,
+    is_keyset_safe_record_field,
 };
 use uuid::Uuid;
 
@@ -242,19 +243,19 @@ pub async fn handle_list_usage_records(
 /// mandatory typed query parameter, the `OData` `$filter` (carrying the
 /// `[from, to)` time window as a `created_at` predicate) and the
 /// `metadata.<key>=<value>` typed side-channel flow through query
-/// parameters, and only the [`AggregationSpec`] (operator + group-by
-/// dimensions) ships in the JSON body. `$orderby`, `$top` /
-/// `limit`, and `cursor` are intentionally NOT accepted here — the
-/// aggregation result is not paginated (the SDK contract emits one
-/// `AggregationResult` per call).
+/// parameters, and only the group-by dimensions ship in the JSON body —
+/// there is no aggregation parameter: the fold is resolved from the
+/// queried type's declaration. `$orderby`, `$top` / `limit`, and `cursor`
+/// are intentionally NOT accepted here — the aggregation result is not
+/// paginated (the SDK contract emits one `AggregationResult` per call).
 ///
-/// PDP authorization, PDP-constraint composition into the `OData` filter,
-/// and the plugin SPI dispatch all happen inside
+/// PDP authorization, declaration resolution, PDP-constraint composition
+/// into the `OData` filter, and the plugin SPI dispatch all happen inside
 /// [`Service::query_aggregated_usage_records`]; this handler is a thin
 /// wrapper that parses the typed query parameters, lifts the
-/// [`QueryAggregatedUsageRecordsRequest`] body into an [`AggregationSpec`],
-/// dispatches to the service, and projects the result to the wire
-/// [`AggregationResultDto`] shape.
+/// [`QueryAggregatedUsageRecordsRequest`] body into typed group-by
+/// dimensions, dispatches to the service, and projects the result to the
+/// wire [`AggregationResultDto`] shape.
 // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-query-fr-query-aggregation:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-query-api-post-records-aggregate:p1
@@ -268,12 +269,12 @@ pub async fn handle_query_aggregated_usage_records(
     Json(req): Json<QueryAggregatedUsageRecordsRequest>,
 ) -> ApiResult<Json<AggregationResultDto>> {
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
-    let (gts_id, metadata_filter, query, aggregation) =
+    let (gts_id, metadata_filter, query, group_by) =
         prepare_aggregate_request(&params, query, req)?;
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
 
     let result = service
-        .query_aggregated_usage_records(&ctx, gts_id, &query, &metadata_filter, aggregation)
+        .query_aggregated_usage_records(&ctx, gts_id, &query, &metadata_filter, &group_by)
         .await
         .map_err(usage_collector_error_to_canonical)?;
 
@@ -287,13 +288,13 @@ type PreparedAggregateRequest = (
     UsageTypeGtsId,
     Vec<MetadataFilter>,
     ODataQuery,
-    AggregationSpec,
+    Vec<AggregationDimension>,
 );
 
 /// Bundle of every aggregate-path pre-service validator: parameter
 /// allowlist, typed `gts_id`, metadata filters, and the body-shape
-/// projection into a typed [`AggregationSpec`]. Propagates the canonical
-/// envelope verbatim on the first failing validator.
+/// projection into typed [`AggregationDimension`]s. Propagates the
+/// canonical envelope verbatim on the first failing validator.
 fn prepare_aggregate_request(
     params: &[(String, String)],
     query: ODataQuery,
@@ -302,8 +303,10 @@ fn prepare_aggregate_request(
     reject_unknown_aggregate_params(params)?;
     let gts_id = parse_required_gts_id(params)?;
     let metadata_filter = parse_metadata_filters(params)?;
-    let aggregation = AggregationSpec::try_from(req).map_err(usage_collector_error_to_canonical)?;
-    Ok((gts_id, metadata_filter, query, aggregation))
+    let group_by = req
+        .into_group_by()
+        .map_err(usage_collector_error_to_canonical)?;
+    Ok((gts_id, metadata_filter, query, group_by))
 }
 
 /// `$`-prefixed `OData` parameters accepted on the aggregate path. `$top`

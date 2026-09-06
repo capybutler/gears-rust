@@ -11,7 +11,7 @@
 
 use toolkit_odata::{ODataQuery, ast};
 use toolkit_security::AccessScope;
-use usage_collector_sdk::{AggregationOp, UsageCollectorError, UsageKind, UsageTypeGtsId};
+use usage_collector_sdk::UsageCollectorError;
 
 use crate::domain::authz;
 
@@ -121,27 +121,6 @@ pub(crate) fn require_bounded_time_window(query: &ODataQuery) -> Result<(), Usag
         Ok(())
     } else {
         Err(UsageCollectorError::missing_time_window())
-    }
-}
-
-/// Reject an aggregation `op` that is not semantically valid for the queried
-/// usage `kind` (`SUM` on a gauge, or `MIN`/`MAX`/`AVG` on a counter) with a
-/// typed [`UsageCollectorError::aggregation_op_not_allowed_for_kind`] (`400`).
-///
-/// The op-per-kind matrix is owned by [`AggregationOp::is_allowed_for`]; this
-/// gateway guard is its enforcement point, run before plugin dispatch so the
-/// storage plugin only ever receives an allowed `(op, kind)` pair.
-pub(crate) fn require_op_allowed_for_kind(
-    op: AggregationOp,
-    kind: UsageKind,
-    gts_id: &UsageTypeGtsId,
-) -> Result<(), UsageCollectorError> {
-    if op.is_allowed_for(kind) {
-        Ok(())
-    } else {
-        Err(UsageCollectorError::aggregation_op_not_allowed_for_kind(
-            op, kind, gts_id,
-        ))
     }
 }
 

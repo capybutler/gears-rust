@@ -121,7 +121,11 @@ pub(super) fn register_usage_record_routes(
     router = OperationBuilder::post("/usage-collector/v1/records/aggregate")
         .operation_id("usage_collector.query_aggregated_usage_records")
         .summary("Query server-side aggregated usage")
-        .description("Server-side aggregation (`SUM` / `COUNT` / `MIN` / `MAX` / `AVG`) over the persisted usage records.")
+        .description(
+            "Server-side aggregation over the persisted usage records. Carries no \
+             aggregation parameter: the fold (`SUM` / `COUNT` / `MAX` / `MIN` / \
+             `LATEST`) is resolved from the queried type's declaration.",
+        )
         .tag(USAGE_RECORDS_TAG)
         .query_param("gts_id", true, "Usage-type GTS instance id (mandatory)")
         .query_param(
@@ -135,7 +139,7 @@ pub(super) fn register_usage_record_routes(
         .no_license_required()
         .json_request::<dto::QueryAggregatedUsageRecordsRequest>(
             openapi,
-            "Aggregation operator + optional group-by dimensions",
+            "Optional group-by dimensions",
         )
         .handler(handlers::handle_query_aggregated_usage_records)
         .json_response_with_schema::<dto::AggregationResultDto>(

@@ -1314,26 +1314,6 @@ fn usage_record_query_filter_surface_rejects_gts_id_inside_composite() {
 }
 
 #[test]
-fn aggregation_op_is_allowed_for_counter() {
-    // Counter allows {SUM, COUNT}; rejects MIN/MAX/AVG.
-    assert!(AggregationOp::Sum.is_allowed_for(UsageKind::Counter));
-    assert!(AggregationOp::Count.is_allowed_for(UsageKind::Counter));
-    assert!(!AggregationOp::Min.is_allowed_for(UsageKind::Counter));
-    assert!(!AggregationOp::Max.is_allowed_for(UsageKind::Counter));
-    assert!(!AggregationOp::Avg.is_allowed_for(UsageKind::Counter));
-}
-
-#[test]
-fn aggregation_op_is_allowed_for_gauge() {
-    // Gauge allows {MIN, MAX, AVG, COUNT}; rejects SUM.
-    assert!(!AggregationOp::Sum.is_allowed_for(UsageKind::Gauge));
-    assert!(AggregationOp::Count.is_allowed_for(UsageKind::Gauge));
-    assert!(AggregationOp::Min.is_allowed_for(UsageKind::Gauge));
-    assert!(AggregationOp::Max.is_allowed_for(UsageKind::Gauge));
-    assert!(AggregationOp::Avg.is_allowed_for(UsageKind::Gauge));
-}
-
-#[test]
 fn aggregation_op_not_allowed_for_kind_builds_invalid_argument() {
     let gts_id = UsageTypeGtsId::new(gts_id!(
         "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"

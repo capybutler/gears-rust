@@ -23,9 +23,7 @@ use crate::error::UsageCollectorError;
 /// `Counter` and `Gauge` are CF-platform-internal kinds with no vendor
 /// extensibility. Serde `deny_unknown_fields` on [`UsageType`] plus the
 /// closed-enum serde shape rejects any other value at the deserialize
-/// boundary. The allowed aggregation ops per kind are defined by
-/// [`AggregationOp::is_allowed_for`]: `Counter` admits `{Sum, Count}`;
-/// `Gauge` admits `{Min, Max, Avg, Count}`.
+/// boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UsageKind {
@@ -1012,28 +1010,19 @@ impl CreateUsageRecord {
 
 /// Aggregation function applied to the filtered `UsageRecord.value` stream.
 ///
-/// # Op-per-kind matrix
-///
-/// Each op is valid only for the usage [`UsageKind`] for which it is
-/// semantically meaningful. The gateway enforces this with a typed `400`
-/// (`UsageCollectorError::aggregation_op_not_allowed_for_kind`) before
-/// plugin dispatch — see [`AggregationOp::is_allowed_for`].
-///
-/// | Op                | Counter | Gauge |
-/// |-------------------|:-------:|:-----:|
-/// | `Sum`             |   ✅    |  ❌   |
-/// | `Min`/`Max`/`Avg` |   ❌    |  ✅   |
-/// | `Count`           |   ✅    |  ✅   |
-///
-/// Counter allows `{Sum, Count}`; gauge allows `{Min, Max, Avg, Count}`.
+/// No aggregate-path request carries this as a parameter any longer: the
+/// fold served is resolved from the queried meter's declaration
+/// ([`AggregationFold`]), never chosen by a caller, so there is no
+/// per-`UsageKind` compatibility rule to enforce here. This type is kept
+/// only for the surfaces that have not yet migrated off it.
 ///
 /// # Compensation handling
 ///
 /// `SUM` nets across all active rows regardless of `corrects_id` (counter
 /// compensations reduce the total). Every other op operates over
-/// `corrects_id IS NULL` rows only. Under the matrix that partition is
-/// load-bearing only for `Count`-on-counter; `Min`/`Max`/`Avg` are gauge-only
-/// and gauges never carry compensations, so the filter is a structural no-op
+/// `corrects_id IS NULL` rows only. That partition is load-bearing only for
+/// `Count`-on-counter; `Min`/`Max`/`Avg` only ever apply to gauges, and
+/// gauges never carry compensations, so the filter is a structural no-op
 /// for them.
 ///
 /// `Count` counts matched rows and is well-defined for any value shape. The
@@ -1052,23 +1041,6 @@ pub enum AggregationOp {
     Max,
     /// Mean of matched values.
     Avg,
-}
-
-impl AggregationOp {
-    /// Returns `true` when this op is semantically valid for `kind`.
-    ///
-    /// Counter allows `{Sum, Count}`; gauge allows `{Min, Max, Avg, Count}`
-    /// (see the type-level matrix). This is the single source of truth the
-    /// gateway consults before dispatch.
-    #[must_use]
-    pub fn is_allowed_for(self, kind: UsageKind) -> bool {
-        matches!(
-            (self, kind),
-            (Self::Count, _)
-                | (Self::Sum, UsageKind::Counter)
-                | (Self::Min | Self::Max | Self::Avg, UsageKind::Gauge)
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------

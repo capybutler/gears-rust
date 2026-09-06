@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::error::UsageCollectorError;
 use crate::models::{
-    AggregationResult, AggregationSpec, CreateUsageRecord, MetadataFilter, UsageRecord, UsageType,
-    UsageTypeGtsId,
+    AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, UsageRecord,
+    UsageType, UsageTypeGtsId,
 };
 
 /// Consumer-facing API for Usage Collector operations.
@@ -49,14 +49,19 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<UsageRecord, UsageCollectorError>;
 
-    /// Aggregated query over usage records.
+    /// Aggregated query over one meter.
+    ///
+    /// Carries no aggregation parameter: the fold is resolved from the
+    /// queried type's declaration, so no request is well-formed and
+    /// semantically wrong. A withdrawn record and its invalidation each
+    /// contribute nothing.
     async fn query_aggregated_usage_records(
         &self,
         ctx: &SecurityContext,
         gts_id: UsageTypeGtsId,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        aggregation: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorError>;
 
     /// Keyset-paginated list of usage records.

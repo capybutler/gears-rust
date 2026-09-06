@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
@@ -16,9 +17,9 @@ use time::OffsetDateTime;
 use toolkit_gts::gts_id;
 use toolkit_odata::{CursorV1, ODataQuery, Page as ODataPage, PageInfo, SortDir};
 use usage_collector_sdk::{
-    AggregationBucket, AggregationOp, AggregationResult, AggregationSpec, CreateUsageRecord,
-    IdempotencyKey, MetadataKey, ResourceRef, UsageCollectorError, UsageKind, UsageRecord,
-    UsageRecordStatus, UsageType, UsageTypeGtsId,
+    AggregationBucket, AggregationResult, CreateUsageRecord, IdempotencyKey, MetadataKey,
+    ResourceRef, UsageCollectorError, UsageKind, UsageRecord, UsageRecordStatus, UsageType,
+    UsageTypeGtsId,
 };
 use uuid::Uuid;
 
@@ -28,6 +29,7 @@ use super::{
     classify_deactivation_plugin_error, classify_query_result, classify_record_error,
     classify_usage_type_result,
 };
+use crate::domain::Service;
 use crate::domain::authz::usage_record;
 use crate::domain::ports::metrics::{
     DeactivationErrorCategory, QueryErrorCategory, RecordErrorCategory, RequestOutcome,
@@ -36,9 +38,11 @@ use crate::domain::ports::metrics::{
 use crate::domain::test_support::{
     CountingAllowAllResolver, CountingPermitResolver, CountingTenantPermitResolver,
     DenyAllResolver, HappyPathPlugin, UnreachableResolver, authenticated_ctx,
-    counter_sum_with_label, gauge_last, histogram_count, histogram_count_with_label, histogram_sum,
-    histogram_sum_with_label, service_with_metrics, service_with_metrics_unready_plugin,
+    counter_sum_with_label, enforcer_for, fake_declaration_source_with_fold, gauge_last,
+    histogram_count, histogram_count_with_label, histogram_sum, histogram_sum_with_label,
+    hub_with_plugin, local_metrics, service_with_metrics, service_with_metrics_unready_plugin,
 };
+use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use usage_collector_sdk::UsageCollectorPluginError;
 
 const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~example.usage._.bytes_in.v1");
@@ -1557,28 +1561,31 @@ async fn query_raw_success_records_success_rows_and_duration() {
 async fn query_aggregated_success_records_success_rows_and_duration() {
     let plugin = HappyPathPlugin::new();
     plugin.set_query_aggregated_usage_records_response(single_bucket_aggregation());
-    // The aggregated path now resolves the usage type pre-dispatch (the
-    // op-per-kind guard): `Sum` is admitted for a counter, so the guard passes
-    // and the aggregate dispatch is reached.
-    plugin.set_get_usage_type(sample_usage_type());
 
-    let (service, provider, exporter) = service_with_metrics(
-        plugin,
-        "test.metrics.query.aggok.v1",
-        tenant_scoped_permit(),
-    );
+    // Unlike `service_with_metrics` (whose Type Resolver is inert — see
+    // `test_support::inert_type_resolver`), the aggregate path now resolves
+    // the queried meter's declaration before dispatch, so this test wires
+    // its own resolver over a fake source declaring a fold, rather than
+    // going through that shared builder.
+    let hub = hub_with_plugin(plugin, "test.metrics.query.aggok.v1", "cyberfabric");
+    let (metrics, provider, exporter) = local_metrics();
+    let type_resolver = Arc::new(TypeResolver::new(
+        fake_declaration_source_with_fold("SUM"),
+        TypeResolverConfig {
+            ttl: Duration::from_mins(1),
+            capacity: 16,
+        },
+    ));
+    let service = Arc::new(Service::new_with_metrics(
+        hub,
+        "cyberfabric".to_owned(),
+        enforcer_for(tenant_scoped_permit()),
+        metrics,
+        type_resolver,
+    ));
 
     let result = service
-        .query_aggregated_usage_records(
-            &authenticated_ctx(),
-            gts(),
-            &bounded_query(),
-            &[],
-            AggregationSpec {
-                op: AggregationOp::Sum,
-                group_by: Vec::new(),
-            },
-        )
+        .query_aggregated_usage_records(&authenticated_ctx(), gts(), &bounded_query(), &[], &[])
         .await
         .expect("a permitted, bounded aggregation succeeds");
     assert_eq!(result.buckets.len(), 1);
