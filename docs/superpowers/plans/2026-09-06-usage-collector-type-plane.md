@@ -3321,6 +3321,24 @@ not-yet-implemented list. The §3.3 plugin contract suite scaffolded in
 `usage-collector-sdk` against the noop plugin, without
 `feed-snapshot-and-replay`.
 
+**Add a scope-enforcement case to that suite.** Task 13's review found that no
+test anywhere — service-level or plugin-contract-level — exercises a plugin
+*filtering out* a real stored row that fails a non-trivial compiled scope.
+Every test double either ignores the `scope` argument or is not-found by
+construction.
+
+That matters because Task 13 retired the point lookup's in-process per-record
+attribution check, per DESIGN §3.2 and §3.3, which put GET on the same
+scope-as-filter posture as the raw and aggregate paths. The "exists but not
+yours reads as `NotFound`" guarantee now rests entirely on each storage plugin
+intersecting the filter it is handed. That is the same trust boundary the other
+two read paths already operate under — but GET previously had a second layer
+and no longer does.
+
+The case: a plugin MUST NOT return a row that fails its own scope filter,
+exercised against a test double that genuinely filters rather than one that
+ignores the argument. One case closes the gap for all three read paths at once.
+
 ## Out of scope for every slice above
 
 The usage feed, reconciliation, the ADR-0015 declaration mirror, ingestion
