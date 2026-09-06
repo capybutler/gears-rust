@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationOp, AggregationResult,
-    AggregationSpec, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, ResourceRef,
-    SubjectRef, UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
+    AggregationSpec, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, MeterTypeId,
+    ResourceRef, SubjectRef, UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
     is_keyset_safe_record_field, is_keyset_safe_type_field,
 };
 use crate::error::UsageCollectorError;
@@ -1525,4 +1525,143 @@ fn aggregation_fold_as_str_matches_the_wire_spelling() {
 #[test]
 fn aggregation_fold_display_matches_as_str() {
     assert_eq!(AggregationFold::Latest.to_string(), "LATEST");
+}
+
+// ---------------------------------------------------------------------------
+// MeterTypeId — construction validation, serde routing, FromStr, Display
+// ---------------------------------------------------------------------------
+
+const VALID_METER: &str = "gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~";
+
+#[test]
+fn meter_type_id_accepts_a_single_derivation_of_the_base() {
+    let id = MeterTypeId::new(VALID_METER).expect("valid meter type id");
+    assert_eq!(id.as_str(), VALID_METER);
+}
+
+#[test]
+fn meter_type_id_rejects_the_bare_base_type() {
+    // The base is abstract. A meter must add exactly one segment.
+    assert!(MeterTypeId::new("gts.cf.core.uc.usage_record.v1~").is_err());
+}
+
+#[test]
+fn meter_type_id_rejects_a_type_outside_the_base() {
+    assert!(MeterTypeId::new("gts.cf.core.uc.usage_type.v1~foo.bar._.baz.v1~").is_err());
+}
+
+#[test]
+fn meter_type_id_rejects_a_missing_terminator() {
+    // No trailing `~` makes it an instance id, not a type id.
+    assert!(
+        MeterTypeId::new("gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1")
+            .is_err()
+    );
+}
+
+// A meter is a leaf: exactly one derivation segment on top of the base. A
+// second segment (`base~mid.v1~tail.v1~`, a two-level chain) has the right
+// prefix and the right terminator, so only the interior-`~` check inside the
+// stripped segment catches it — this is the case a plain `strip_prefix`
+// check would let through.
+#[test]
+fn meter_type_id_rejects_a_deep_derivation_chain() {
+    let err = MeterTypeId::new("gts.cf.core.uc.usage_record.v1~a.b._.c.v1~d.e._.f.v1~")
+        .expect_err("a meter is a leaf; a second derivation segment must be rejected");
+    assert!(matches!(
+        err,
+        UsageCollectorError::InvalidArgument {
+            reason: ValidationReason::InvalidBaseGtsId,
+            ..
+        }
+    ));
+}
+
+// Empty inner segment (consecutive `~`) must also be rejected: stripping the
+// base prefix leaves the bare terminator `~` with nothing before it, and the
+// `segment.is_empty()` check after stripping that trailing `~` is what
+// catches it.
+#[test]
+fn meter_type_id_rejects_consecutive_tildes() {
+    let err = MeterTypeId::new("gts.cf.core.uc.usage_record.v1~~")
+        .expect_err("consecutive tildes (empty derivation segment) must be rejected");
+    assert!(matches!(
+        err,
+        UsageCollectorError::InvalidArgument {
+            reason: ValidationReason::InvalidBaseGtsId,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn meter_type_id_rejects_control_characters() {
+    // ADR-0007 concatenates this value under a 0x1F separator, so a control
+    // character would break the injectivity the identifier derivation needs.
+    let with_us = "gts.cf.core.uc.usage_record.v1~exa\u{1F}mple._.m.v1~";
+    assert!(MeterTypeId::new(with_us).is_err());
+    let with_del = "gts.cf.core.uc.usage_record.v1~exa\u{7F}mple._.m.v1~";
+    assert!(MeterTypeId::new(with_del).is_err());
+}
+
+#[test]
+fn meter_type_id_rejects_an_over_long_identifier() {
+    let long = format!("gts.cf.core.uc.usage_record.v1~{}.v1~", "a".repeat(600));
+    assert!(MeterTypeId::new(long).is_err());
+}
+
+#[test]
+fn meter_type_id_deserialize_routes_through_validation() {
+    let bad = serde_json::json!("gts.cf.core.uc.usage_record.v1~");
+    assert!(serde_json::from_value::<MeterTypeId>(bad).is_err());
+
+    let good = serde_json::json!(VALID_METER);
+    let parsed: MeterTypeId = serde_json::from_value(good).expect("valid");
+    assert_eq!(parsed.as_str(), VALID_METER);
+}
+
+#[test]
+fn meter_type_id_rejects_control_characters_as_validation_error_naming_the_value() {
+    // Pins the concrete variant, the attributed field, and that `detail`
+    // names the offending value rather than a generic GTS parse error —
+    // matching usage_kind_from_str_rejects_unknown_variant_as_validation_error.
+    let with_us = "gts.cf.core.uc.usage_record.v1~exa\u{1F}mple._.m.v1~";
+    let err = MeterTypeId::new(with_us).expect_err("control character must be rejected");
+    assert!(
+        matches!(
+            err,
+            UsageCollectorError::InvalidArgument {
+                ref field,
+                ref reason,
+                ref detail,
+                ..
+            } if field == "gts_type_id"
+                && matches!(reason, ValidationReason::InvalidBaseGtsId)
+                && detail.contains(with_us)
+        ),
+        "expected InvalidArgument[gts_type_id/InvalidBaseGtsId] naming the offending value, got {err:?}"
+    );
+}
+
+#[test]
+fn meter_type_id_as_str_and_display_match_the_wire_string() {
+    let id = MeterTypeId::new(VALID_METER).expect("valid meter type id");
+    assert_eq!(id.as_str(), VALID_METER);
+    assert_eq!(id.to_string(), VALID_METER);
+}
+
+#[test]
+fn meter_type_id_from_str_routes_through_new() {
+    let id: MeterTypeId = VALID_METER
+        .parse()
+        .expect("valid meter type id via FromStr");
+    assert_eq!(id.as_str(), VALID_METER);
+
+    let err = "gts.cf.core.uc.usage_record.v1~"
+        .parse::<MeterTypeId>()
+        .expect_err("bare base must be rejected by FromStr");
+    assert!(matches!(
+        err,
+        UsageCollectorError::InvalidArgument { ref field, .. } if field == "gts_type_id"
+    ));
 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use toolkit_odata_macros::ODataFilterable;
 use uuid::Uuid;
 
-use gts::{GtsId, GtsIdSegment, GtsInstanceId};
+use gts::{GtsId, GtsIdSegment, GtsInstanceId, GtsTypeId};
 
 use crate::error::UsageCollectorError;
 
@@ -558,6 +558,163 @@ impl<'de> Deserialize<'de> for UsageTypeGtsId {
     {
         let raw = String::deserialize(deserializer)?;
         UsageTypeGtsId::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MeterTypeId
+// ---------------------------------------------------------------------------
+
+/// The GTS base type every meter derives from.
+///
+/// Alias of [`crate::gts::USAGE_RECORD_RESOURCE`] (also the value behind
+/// [`UsageTypeGtsId::USAGE_RECORD_BASE`]) — the same string, not a new
+/// identifier. It exists as its own constant so a meter-type call site can
+/// name the base in meter-type terms rather than reaching for the resource
+/// constant or the instance-id newtype's associated constant.
+pub const USAGE_RECORD_BASE_TYPE: &str = crate::gts::USAGE_RECORD_RESOURCE;
+
+/// Ceiling on the wire length of a meter type identifier, from
+/// `docs/schemas/usage_record.v1.schema.json`'s `gts_type_id` property.
+const MAX_METER_TYPE_ID_LEN: usize = 512;
+
+/// Reference to the GTS type declaration a ledger entry is metered against.
+///
+/// A meter is a derived **type** of [`USAGE_RECORD_BASE_TYPE`] with exactly
+/// one further segment — not an instance — so this wraps [`GtsTypeId`]
+/// rather than the `GtsInstanceId` that [`UsageTypeGtsId`] wraps. The
+/// declaration it names is owned by `types-registry`; this gear resolves it
+/// and mints none.
+///
+/// The gear infers no metering meaning from the shape of the identifier.
+/// Fold, canonical unit, and metadata surface come from the resolved
+/// declaration alone.
+///
+/// Deliberately implements neither `Ord` nor `PartialOrd`: the wrapped
+/// [`GtsTypeId`] implements neither. A caller that needs this as a
+/// `BTreeMap`/`BTreeSet` key must add manual impls delegating to the string
+/// form, the way [`UsageTypeGtsId`] does for its own non-`Ord` wrapped type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct MeterTypeId(GtsTypeId);
+
+impl MeterTypeId {
+    /// Creates a [`MeterTypeId`] after validating it against the base type's
+    /// published pattern
+    /// (`^gts\.cf\.core\.uc\.usage_record\.v1~[^\x00-\x1F\x7F~]+~$`,
+    /// `maxLength: 512`).
+    ///
+    /// Length and control characters are checked before the value is handed
+    /// to [`GtsTypeId::try_new`], so the diagnostic names the real problem
+    /// rather than surfacing a generic GTS parse error. The control-character
+    /// exclusion is load-bearing, not cosmetic: ADR-0007's entry-identifier
+    /// derivation concatenates this value with the other dedup-identity
+    /// inputs under a `0x1F` separator, and a control character inside it
+    /// would let two distinct dedup identities collapse to the same
+    /// pre-image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorError::InvalidArgument`] when the value is
+    /// longer than 512 bytes, carries an ASCII control character (including
+    /// DEL), does not derive from [`USAGE_RECORD_BASE_TYPE`], is not
+    /// `~`-terminated, does not add exactly one further derivation segment
+    /// (empty, or containing an interior `~`) to the base, or — having
+    /// passed all of the above — fails the per-segment GTS grammar enforced
+    /// by the delegated [`GtsTypeId::try_new`] call.
+    pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
+        let raw = value.into();
+
+        if raw.len() > MAX_METER_TYPE_ID_LEN {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must be at most 512 bytes",
+            ));
+        }
+
+        // `char::is_ascii_control()` already covers U+007F (DEL) alongside
+        // U+0000..=U+001F, so no separate DEL check is needed.
+        if raw.chars().any(|c| c.is_ascii_control()) {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must not contain ASCII control characters",
+            ));
+        }
+
+        let Some(suffix) = raw.strip_prefix(USAGE_RECORD_BASE_TYPE) else {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must derive from `gts.cf.core.uc.usage_record.v1~`",
+            ));
+        };
+
+        // Exactly one further segment: non-empty, `~`-terminated, and with
+        // no interior `~` that would make it two.
+        if suffix.is_empty() {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must add exactly one derivation segment to the base type",
+            ));
+        }
+        let Some(segment) = suffix.strip_suffix('~') else {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must end with `~`",
+            ));
+        };
+        if segment.is_empty() || segment.contains('~') {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must add exactly one derivation segment to the base type",
+            ));
+        }
+
+        let parsed = GtsTypeId::try_new(&raw)
+            .map_err(|e| UsageCollectorError::invalid_meter_type_id(&raw, &e.to_string()))?;
+
+        Ok(Self(parsed))
+    }
+
+    /// Borrows the wire string, terminator included.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    /// Borrows the underlying GTS type identifier.
+    #[must_use]
+    pub fn as_gts(&self) -> &GtsTypeId {
+        &self.0
+    }
+}
+
+impl AsRef<str> for MeterTypeId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for MeterTypeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MeterTypeId {
+    type Err = UsageCollectorError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for MeterTypeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        MeterTypeId::new(raw).map_err(serde::de::Error::custom)
     }
 }
 

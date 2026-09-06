@@ -265,6 +265,19 @@ impl UsageCollectorError {
         }
     }
 
+    /// `MeterTypeId::new` rejected `raw` — malformed, wrong-base, or
+    /// multi-segment `gts_type_id`.
+    #[must_use]
+    pub fn invalid_meter_type_id(raw: &str, reason: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "gts_type_id".to_owned(),
+            reason: ValidationReason::InvalidBaseGtsId,
+            detail: format!("gts_type_id `{raw}` rejected: {reason}"),
+        }
+    }
+
     /// `UsageKind::from_str` received a string other than `counter`/`gauge`.
     #[must_use]
     pub fn invalid_usage_kind(raw: &str) -> Self {
