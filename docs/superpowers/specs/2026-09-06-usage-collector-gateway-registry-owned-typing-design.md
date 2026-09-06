@@ -269,7 +269,7 @@ backfill route.
 | `live_future_tolerance` | 5 min | Live path upper bound on `window_end` |
 | `live_past_tolerance` | 48 h | Live path lower bound on `window_end` |
 | `backfill_window` | 90 d | Beyond it, backfill needs elevated authorization |
-| `metadata_size_cap` | 4 KiB | Cap on the serialized metadata map |
+| `metadata_size_cap` | 8 KiB | Cap on the serialized metadata map. Matches the value `domain/validation.rs` already hard-codes, so replacing the constant with the config value changes no behaviour. |
 | `type_cache_ttl` | 5 min | Type Resolver refresh interval |
 | `type_cache_capacity` | 10 000 | Type Resolver entry ceiling |
 

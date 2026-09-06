@@ -2111,7 +2111,7 @@ In `Default`:
 ```rust
             type_cache_ttl_secs: 300,
             type_cache_capacity: 10_000,
-            metadata_size_cap_bytes: 4096,
+            metadata_size_cap_bytes: 8192,
 ```
 
 If `usage-collector/src/domain/validation.rs` already enforces a hard-coded
