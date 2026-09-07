@@ -1822,6 +1822,8 @@ Update every `(created_at, id)` mention in `prepare_list_query`'s inline comment
 
 - [ ] **Step 5: Bring the reserved-field guard's comment up to date**
 
+Task 3 left this deliberately and flagged it: `RESERVED_FILTER_FIELDS`'s doc says the covered period travels "as a typed time range (`window_start` / `window_end`, landing with the record-model slice after this plan)". Task 3 made the first half true and the parenthetical definitively wrong — the record fields landed in task 2 and the typed range in task 3, so nothing is "landing after this plan" any more. Task 3 also had to drop an intra-doc link to `require_bounded_time_window` from that doc, since the item no longer exists. `is_reserved_filter_field`'s sibling prediction ("become real filterable fields in the record-model slice after this plan") is the one this task finally makes true.
+
 `usage-collector/src/domain/query.rs`'s `RESERVED_FILTER_FIELDS` doc says the covered-period bounds are "landing with the record-model slice after this plan — reserved here regardless", and `is_reserved_filter_field`'s doc says they "become real filterable fields in the record-model slice after this plan, at which point a case-varied spelling would otherwise resolve as a legitimate field". Both predictions came true in this commit. Rewrite them in the present tense: the bounds *are* filterable-schema fields now, which is exactly why the case-insensitive reservation is load-bearing rather than theoretical.
 
 - [ ] **Step 6: Run the tests to verify they pass**
@@ -1992,17 +1994,33 @@ The range's canonical rendering goes on `TimeRange` itself, in the SDK, rather t
     /// under the first.
     #[must_use]
     pub fn canonical_form(self) -> String {
+        // Full nanosecond resolution, NOT `id::canonical_period_bound`'s
+        // fixed microsecond form: that truncates, and `TimeRange::new`
+        // applies no precision check, so truncating here would collapse
+        // two ranges differing only below the microsecond onto one
+        // fingerprint — and a cursor minted under either would validate
+        // against the other. Injectivity over what the caller sent is this
+        // function's requirement; a frozen width over what is persisted is
+        // the derivation's. They are not the same requirement.
+        // `unix_timestamp_nanos()` returns `i128` and is instant-based, so
+        // it is offset-invariant as well as lossless — two spellings of one
+        // instant fingerprint identically, which is the same equivalence
+        // `TimeRange::new`'s UTC normalization already establishes.
         format!(
             "{}~{}",
-            crate::id::canonical_period_bound(self.from),
-            crate::id::canonical_period_bound(self.to),
+            self.from.unix_timestamp_nanos(),
+            self.to.unix_timestamp_nanos(),
         )
     }
 ```
 
 This is the same "two spellings of one rule" hazard `contains_window_end` guards against, one level up: the fingerprint is compared across requests, so its rendering has to be a single function. Add a test pinning the exact string for a known range, and one asserting two ranges differing only in their upper bound render differently.
 
-**One thing to check rather than inherit.** `canonical_period_bound` carries a `debug_assert!` that its year is in `0..=9999`, justified on the grounds that the RFC 3339 wire codec cannot express anything else. That justification was written for the *ingestion* path. Calling it from here extends it to the read path, and `TimeRange::new` validates ordering only — it does not bound the year. On REST both bounds are RFC 3339-parsed so the claim still holds, but an in-process caller can construct a `TimeRange` outside the range and would now hit a debug-only panic on a cursor path. Decide deliberately: either widen `TimeRange::new` to reject it (making the range's own invariant carry the guarantee `canonical_form` depends on), or narrow the assert's stated justification so it does not claim more than it can. Do not leave the current wording covering a path it was not reasoned about.
+**`canonical_form` MUST NOT reuse `canonical_period_bound`'s truncation.** Task 3's review found the hole: `canonical_period_bound` truncates below the microsecond (that is its whole job — the identity derivation reads a fixed six-digit fraction), while `TimeRange::new` applies **no** precision check, because a read range has no identity to derive and rejecting a caller who passed `now()` with nanoseconds would be hostile for no gain. Compose the two naively and two ranges differing only in their sub-microsecond digits render to one fingerprint — so a cursor minted under range A validates against range B, which defeats the exact protection this task exists to add.
+
+Render the fingerprint at **full precision** instead: the bounds' own nanosecond resolution, not the derivation's microsecond form. The fingerprint needs injectivity over what the caller sent; the derivation needs a frozen width over what is persisted. Those are different requirements and they must not share a function. Pin it with a test: two ranges differing only below the microsecond must produce different fingerprints, and a cursor minted under one must be rejected for the other. Do **not** close this by adding a precision check to `TimeRange::new` — that trades a wire-visible rejection for an internal implementation detail of the cursor.
+
+Rendering at full precision has a second payoff worth knowing about, because an earlier draft of this task got it wrong in the other direction. `canonical_period_bound` carries a `debug_assert!` that its year is in `0..=9999`, justified on the grounds that the RFC 3339 wire codec cannot express anything else — a claim reasoned about the *ingestion* path. Calling it from the read path would have extended that justification to a surface nobody checked it against, since `TimeRange::new` validates ordering only and an in-process caller can construct a range outside the year range. Keeping the two renderings separate means the assert keeps covering exactly the path it was argued for, and this task inherits no claim it would have to re-justify. If you find yourself reaching for `canonical_period_bound` here anyway, that is the signal to re-read the paragraph above.
 
 `prepare_list_query(mut query: ODataQuery, time_range: TimeRange)` sets
 
