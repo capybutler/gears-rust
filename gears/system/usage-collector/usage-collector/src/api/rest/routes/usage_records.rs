@@ -70,7 +70,11 @@ pub(super) fn register_usage_record_routes(
         .summary("List usage records")
         .description("Keyset-paginated raw read over the persisted usage records.")
         .tag(USAGE_RECORDS_TAG)
-        .query_param("gts_id", true, "Usage-type GTS instance id (mandatory)")
+        .query_param(
+            "gts_type_id",
+            true,
+            "Usage-type GTS instance id (mandatory)",
+        )
         // The covered-period range is a first-class parameter on this path,
         // never a `$filter` conjunct: an entry is selected when its period
         // end falls in `[from, to)`. A `GET` has no body, so the raw path
@@ -79,12 +83,14 @@ pub(super) fn register_usage_record_routes(
         .query_param(
             "from",
             true,
-            "Inclusive lower bound of the covered-period range (RFC 3339 UTC, mandatory)",
+            "Inclusive lower bound of the covered-period range (mandatory; RFC 3339 \
+             with an offset, normalized to UTC)",
         )
         .query_param(
             "to",
             true,
-            "Exclusive upper bound of the covered-period range (RFC 3339 UTC, mandatory)",
+            "Exclusive upper bound of the covered-period range (mandatory; RFC 3339 \
+             with an offset, normalized to UTC)",
         )
         .query_param(
             "metadata.<key>",
@@ -142,7 +148,11 @@ pub(super) fn register_usage_record_routes(
              `LATEST`) is resolved from the queried type's declaration.",
         )
         .tag(USAGE_RECORDS_TAG)
-        .query_param("gts_id", true, "Usage-type GTS instance id (mandatory)")
+        .query_param(
+            "gts_type_id",
+            true,
+            "Usage-type GTS instance id (mandatory)",
+        )
         .query_param(
             "metadata.<key>",
             false,

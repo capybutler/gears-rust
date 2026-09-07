@@ -55,15 +55,13 @@ pub(crate) fn projected(submission: &CreateUsageRecord) -> UsageRecord {
 /// The mandatory read-path range the domain read-path tests hand to
 /// `list_usage_records` / `query_aggregated_usage_records`.
 ///
-/// One hour from the epoch. The two bounds differ, so a surface that
-/// swapped or dropped one of them fails rather than passing by symmetry,
-/// and the range is narrow enough that a throwaway "all time" range
-/// substituted anywhere on the way to the SPI is not equal to it.
+/// One hour from the epoch — narrow enough that a throwaway "all time"
+/// range substituted anywhere on the way to the SPI is not equal to it.
 #[must_use]
 pub(crate) fn test_time_range() -> TimeRange {
     TimeRange::new(
         time::OffsetDateTime::UNIX_EPOCH,
-        time::OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::hours(1)),
+        time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     )
     .expect("a one-hour range from the epoch is a valid TimeRange")
 }

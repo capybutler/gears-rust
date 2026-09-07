@@ -274,11 +274,18 @@ impl UsageCollectorError {
         Self::InvalidArgument {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: None,
+            // `field` names the range as a whole rather than either bound:
+            // both parsed, and the ordering between them is what failed.
+            // The constructor is shared by both read paths and cannot know
+            // which carrier the caller used, so the detail names both —
+            // `field` alone would name nothing a raw-path caller sent.
             field: "time_range".to_owned(),
             reason: ValidationReason::Validation,
             detail: format!(
                 "time range requires from < to (got from={from}, to={to}); supply a \
-                 lower bound strictly before the upper bound"
+                 lower bound strictly before the upper bound. The range arrives as \
+                 the `from` / `to` query parameters on the raw path and as \
+                 `time_range` in the aggregate request body"
             ),
         }
     }

@@ -477,14 +477,22 @@ const RANGE_FROM: &str = "1970-01-01T00:00:00Z";
 const RANGE_TO: &str = "1970-01-01T01:00:00Z";
 
 /// The mandatory `from` / `to` query parameters every raw-path read
-/// carries. A single helper rather than two literals per call site: the
-/// range is mandatory on every list request, so every one of them would
-/// otherwise repeat the pair.
-fn range_params() -> Vec<(String, String)> {
-    vec![
-        ("from".to_owned(), RANGE_FROM.to_owned()),
-        ("to".to_owned(), RANGE_TO.to_owned()),
-    ]
+/// carries, plus whatever `extra` the call site needs.
+///
+/// The range is mandatory on every list request, so every call site would
+/// otherwise repeat the pair — and a call site that assembled the two
+/// halves itself would be longer than the literals it replaced. Tests
+/// whose subject *is* a missing, duplicated or malformed bound build their
+/// parameter list by hand instead.
+fn list_params(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    extra
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .chain([
+            ("from".to_owned(), RANGE_FROM.to_owned()),
+            ("to".to_owned(), RANGE_TO.to_owned()),
+        ])
+        .collect()
 }
 
 /// The same range in the aggregate path's carrier — its request body.
@@ -2277,7 +2285,14 @@ mod parse_required_time_range_tests {
             p("to", "1970-01-01T00:00:00.000001Z"),
         ])
         .expect("the narrowest non-empty range is valid");
-        assert!(range.upper_exclusive() > range.lower_inclusive());
+        // Not `upper > lower` — that holds for every constructible
+        // `TimeRange` and so asserts nothing. The exact width additionally
+        // pins that the RFC 3339 parser kept the fractional second instead
+        // of rounding it away.
+        assert_eq!(
+            range.upper_exclusive() - range.lower_inclusive(),
+            time::Duration::microseconds(1),
+        );
     }
 }
 
@@ -2669,13 +2684,20 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(super::range_params()),
+            Query(super::list_params(&[])),
             OData(ODataQuery::new()),
         )
         .await
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("gts_type_id"),
+            "the 400 MUST blame this test's own subject: a status-only \
+             assertion would stay green if the validator order flipped and a \
+             different parameter became the blamed one",
+        );
     }
 
     #[tokio::test]
@@ -2689,19 +2711,20 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(
-                [
-                    vec![("gts_type_id".to_owned(), "not-a-valid-prefix".to_owned())],
-                    super::range_params(),
-                ]
-                .concat(),
-            ),
+            Query(super::list_params(&[("gts_type_id", "not-a-valid-prefix")])),
             OData(ODataQuery::new()),
         )
         .await
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("gts_type_id"),
+            "the 400 MUST blame this test's own subject: a status-only \
+             assertion would stay green if the validator order flipped and a \
+             different parameter became the blamed one",
+        );
     }
 
     #[tokio::test]
@@ -2715,22 +2738,23 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(
-                [
-                    vec![
-                        ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
-                        ("totally_unknown".to_owned(), "x".to_owned()),
-                    ],
-                    super::range_params(),
-                ]
-                .concat(),
-            ),
+            Query(super::list_params(&[
+                ("gts_type_id", HAPPY_RECORD_GTS_ID),
+                ("totally_unknown", "x"),
+            ])),
             OData(ODataQuery::new()),
         )
         .await
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("totally_unknown"),
+            "the 400 MUST blame this test's own subject: a status-only \
+             assertion would stay green if the validator order flipped and a \
+             different parameter became the blamed one",
+        );
     }
 
     #[tokio::test]
@@ -2753,13 +2777,7 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(
-                [
-                    vec![("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())],
-                    super::range_params(),
-                ]
-                .concat(),
-            ),
+            Query(super::list_params(&[("gts_type_id", HAPPY_RECORD_GTS_ID)])),
             OData(q),
         )
         .await
@@ -2905,26 +2923,13 @@ mod handle_list_usage_records_tests {
         // dropped or substituted it would still answer `200` with a page,
         // so the assertion is on what the plugin was handed.
         let plugin = HappyPathPlugin::new();
-        plugin.set_list_usage_records_response(ODataPage::new(
-            vec![],
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit: 1000,
-            },
-        ));
+        plugin.set_list_usage_records_response(ODataPage::empty(0));
         let service = service_with_permit_plugin(&plugin, "test.handler.list_records.range.v1");
 
         let response = handle_list_usage_records(
             Extension(authenticated_ctx()),
             Extension(service),
-            Query(
-                [
-                    vec![("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())],
-                    super::range_params(),
-                ]
-                .concat(),
-            ),
+            Query(super::list_params(&[("gts_type_id", HAPPY_RECORD_GTS_ID)])),
             OData(ODataQuery::new()),
         )
         .await
@@ -2973,13 +2978,7 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(authenticated_ctx()),
             Extension(service),
-            Query(
-                [
-                    vec![("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())],
-                    super::range_params(),
-                ]
-                .concat(),
-            ),
+            Query(super::list_params(&[("gts_type_id", HAPPY_RECORD_GTS_ID)])),
             OData(ODataQuery::new()),
         )
         .await
@@ -3115,6 +3114,10 @@ mod handle_query_aggregated_usage_records_tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("gts_type_id"),
+        );
     }
 
     #[tokio::test]
@@ -3161,6 +3164,12 @@ mod handle_query_aggregated_usage_records_tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("cursor"),
+            "the 400 MUST blame `cursor` rather than some other parameter \
+             this request also carries",
+        );
     }
 
     #[tokio::test]

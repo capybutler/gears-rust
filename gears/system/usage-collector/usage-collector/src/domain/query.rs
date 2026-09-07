@@ -117,13 +117,13 @@ const RESERVED_FILTER_FIELDS: &[&str] = &["gts_type_id", "window_start", "window
 /// rather than a gear-wide convention — the `$orderby` guards next door
 /// ([`usage_collector_sdk::is_keyset_safe_record_field`] and
 /// `toolkit_odata::ODataOrderBy::ensure_tiebreaker`) both match exactly.
-/// Not exploitable today (`window_start` / `window_end` are
-/// not yet filterable-schema fields, and `gts_type_id` case-varied would
+///
+/// Not exploitable today: `window_start` / `window_end` are not yet
+/// filterable-schema fields, and a case-varied `gts_type_id` would
 /// dead-end as `toolkit_odata`'s own case-insensitive `UnknownField`
-/// downstream), but `window_start` / `window_end` become real filterable
-/// fields in the record-model slice after this plan, at which point a
-/// case-varied spelling would otherwise resolve as a legitimate field
-/// instead of hitting this reservation.
+/// downstream. They become filterable-schema fields later in this slice
+/// though, at which point a case-varied spelling would otherwise resolve
+/// as a legitimate field instead of hitting this reservation.
 fn is_reserved_filter_field(name: &str) -> bool {
     RESERVED_FILTER_FIELDS
         .iter()

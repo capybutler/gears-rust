@@ -317,14 +317,13 @@ fn reserved_field_match_is_case_insensitive() {
     // check rather than a gear-wide convention — the `$orderby` guards next
     // door (`is_keyset_safe_record_field`, `ensure_tiebreaker`) both match
     // exactly.
-    // Not exploitable today (`window_start` /
-    // `window_end` are not yet
-    // filterable-schema fields, and a case-varied `gts_type_id` would dead-
-    // end as `toolkit_odata`'s own case-insensitive `UnknownField`
-    // downstream) — but `window_start` / `window_end` become real
-    // filterable fields in the record-model slice after this plan, at which
-    // point a case-varied spelling must still hit this reservation rather
-    // than resolving as a legitimate field.
+    //
+    // Not exploitable today: `window_start` / `window_end` are not yet
+    // filterable-schema fields, and a case-varied `gts_type_id` would
+    // dead-end as `toolkit_odata`'s own case-insensitive `UnknownField`
+    // downstream. They become filterable-schema fields later in this slice
+    // though, at which point a case-varied spelling must still hit this
+    // reservation rather than resolving as a legitimate field.
     for field in ["GTS_TYPE_ID", "Window_Start", "WINDOW_END"] {
         let filter = eq_predicate(field);
         let err = reject_reserved_filter_fields(&filter).expect_err(&format!(

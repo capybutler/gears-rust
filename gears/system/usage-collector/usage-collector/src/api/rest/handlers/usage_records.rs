@@ -189,13 +189,13 @@ pub async fn handle_get_usage_record(
 ///   `Problem`. The decoded `CursorV1` flows to the plugin via
 ///   `ODataQuery.cursor` unchanged.
 /// * **`$orderby` normalization** — the gateway always appends the
-///   canonical unique `(time key, id)` suffix to the effective order so
-///   the plugin has a stable, gap-free keyset. When the
-///   caller supplies an `$orderby` lacking a unique final key, the missing
-///   tiebreaker key is appended in the caller's sort direction so
-///   pagination cannot drop rows tied on the boundary value. That suffix
-///   still names the retired instant field rather than the covered-period
-///   end the range selects on; a later commit in this slice repoints it.
+///   canonical unique `(created_at, id)` suffix to the effective order so
+///   the plugin has a stable, gap-free keyset. When the caller omits
+///   `$orderby` this yields `(created_at asc, id asc)`; when the caller
+///   supplies an `$orderby` lacking a unique final key (e.g.
+///   `$orderby=created_at`), the missing tiebreaker key is appended in the
+///   caller's sort direction so pagination cannot drop rows tied on the
+///   boundary value.
 ///
 /// Per-key metadata filtering is the typed side-channel
 /// [`MetadataFilter`] from the SDK — `toolkit-odata` has no surface for
@@ -227,7 +227,12 @@ pub async fn handle_list_usage_records(
     OData(query): OData,
 ) -> ApiResult<Json<ODataPage<UsageRecordDto>>> {
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
-    let (gts_type_id, time_range, metadata_filter, query) = prepare_list_request(&params, query)?;
+    let PreparedListRequest {
+        gts_type_id,
+        time_range,
+        metadata_filter,
+        query,
+    } = prepare_list_request(&params, query)?;
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
 
     let page = service
@@ -286,8 +291,13 @@ pub async fn handle_query_aggregated_usage_records(
     Json(req): Json<QueryAggregatedUsageRecordsRequest>,
 ) -> ApiResult<Json<AggregationResultDto>> {
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
-    let (gts_type_id, time_range, metadata_filter, query, group_by) =
-        prepare_aggregate_request(&params, query, req)?;
+    let PreparedAggregateRequest {
+        gts_type_id,
+        time_range,
+        metadata_filter,
+        query,
+        group_by,
+    } = prepare_aggregate_request(&params, query, req)?;
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
 
     let result = service
@@ -307,14 +317,22 @@ pub async fn handle_query_aggregated_usage_records(
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-return
 }
 
-/// Result of every aggregate-path pre-service validator.
-type PreparedAggregateRequest = (
-    MeterTypeId,
-    TimeRange,
-    Vec<MetadataFilter>,
-    ODataQuery,
-    Vec<AggregationDimension>,
-);
+/// Everything the aggregate path's pre-service validators produce.
+///
+/// A struct rather than a tuple. Every element type happens to be distinct
+/// today, so a positional swap would not compile — but that is an accident
+/// of the current field set, and the first field added alongside a
+/// same-typed sibling takes the accident away silently. Named fields make
+/// the swap impossible instead of merely inconvenient, which matters most
+/// for `time_range`: a range crossed with another parameter is an
+/// unbounded or wrong-window scan that still answers `200`.
+struct PreparedAggregateRequest {
+    gts_type_id: MeterTypeId,
+    time_range: TimeRange,
+    metadata_filter: Vec<MetadataFilter>,
+    query: ODataQuery,
+    group_by: Vec<AggregationDimension>,
+}
 
 /// Bundle of every aggregate-path pre-service validator: parameter
 /// allowlist, typed `gts_type_id`, metadata filters, and the body-shape
@@ -340,7 +358,13 @@ fn prepare_aggregate_request(
     let group_by = req
         .into_group_by()
         .map_err(usage_collector_error_to_canonical)?;
-    Ok((gts_type_id, time_range, metadata_filter, query, group_by))
+    Ok(PreparedAggregateRequest {
+        gts_type_id,
+        time_range,
+        metadata_filter,
+        query,
+        group_by,
+    })
 }
 
 /// `$`-prefixed `OData` parameters accepted on the aggregate path. `$top`
@@ -379,9 +403,14 @@ fn reject_unknown_aggregate_params(params: &[(String, String)]) -> Result<(), Ca
     Ok(())
 }
 
-/// Result of every pre-service validator, returned as a typed tuple
-/// so the handler can propagate the canonical envelope verbatim.
-type PreparedListRequest = (MeterTypeId, TimeRange, Vec<MetadataFilter>, ODataQuery);
+/// Everything the raw path's pre-service validators produce — see
+/// [`PreparedAggregateRequest`] for why this is a struct and not a tuple.
+struct PreparedListRequest {
+    gts_type_id: MeterTypeId,
+    time_range: TimeRange,
+    metadata_filter: Vec<MetadataFilter>,
+    query: ODataQuery,
+}
 
 /// Bundle of every pre-service validator: parameter allowlist, typed
 /// `gts_type_id`, the typed `from` / `to` range, metadata filters, and the
@@ -396,7 +425,12 @@ fn prepare_list_request(
     let time_range = parse_required_time_range(params)?;
     let metadata_filter = parse_metadata_filters(params)?;
     let query = prepare_list_query(query)?;
-    Ok((gts_type_id, time_range, metadata_filter, query))
+    Ok(PreparedListRequest {
+        gts_type_id,
+        time_range,
+        metadata_filter,
+        query,
+    })
 }
 
 /// Maximum number of records the gateway will request from the plugin
@@ -453,16 +487,17 @@ const TYPED_AGGREGATE_PARAMS: &[&str] = &["gts_type_id"];
 const METADATA_PREFIX: &str = "metadata.";
 
 /// The canonical unique keyset suffix appended to every raw-list order.
-/// The leading entry is the primary time key and `id` the globally-unique
-/// final tiebreaker; the pair is the canonical cursor keyset. Appended (via
+/// `created_at` is the primary time key and `id` the globally-unique final
+/// tiebreaker; the pair is the canonical cursor keyset. Appended (via
 /// [`toolkit_odata::ODataOrderBy::ensure_tiebreaker`]) in the caller order's
-/// direction, so an empty `$orderby` normalizes to the pair and any
-/// explicit `$orderby` gains the same unique suffix — see
+/// direction, so an empty `$orderby` normalizes to `(created_at, id)` and
+/// any explicit `$orderby` gains the same unique suffix — see
 /// [`prepare_list_query`].
 ///
-/// The time key here is still the retired instant field, not the
+/// The time key is still the retired instant field rather than the
 /// covered-period end the mandatory range selects on; a later commit in
-/// this slice repoints it.
+/// this slice repoints it. Every other keyset spelling in this file is
+/// left concrete on purpose, so that repoint is one grep.
 const CANONICAL_TIEBREAKER_FIELDS: &[&str] = &["created_at", "id"];
 
 /// Apply gateway-side guards on the parsed [`ODataQuery`]:
@@ -690,7 +725,10 @@ fn parse_range_bound(
         UsageRecordResource::invalid_argument()
             .with_field_violation(
                 key,
-                format!("`{key}` must be an RFC 3339 timestamp with an offset: {err}"),
+                format!(
+                    "query parameter `{key}` must be an RFC 3339 timestamp with an \
+                     offset (e.g. `1970-01-01T00:00:00Z`): {err}"
+                ),
                 "VALIDATION",
             )
             .create()

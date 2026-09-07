@@ -378,8 +378,8 @@ mod deactivate_usage_record_tests {
     use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
     use usage_collector_sdk::{
         AggregationDimension, AggregationFold, AggregationResult, ConflictReason, MetadataFilter,
-        MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
-        UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord,
+        MeterTypeId, TimeRange, USAGE_RECORD_RESOURCE, UsageCollectorError,
+        UsageCollectorPluginError, UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord,
     };
     use uuid::Uuid;
 
@@ -512,7 +512,7 @@ mod deactivate_usage_record_tests {
         async fn query_aggregated_usage_records(
             &self,
             _gts_type_id: MeterTypeId,
-            _time_range: usage_collector_sdk::TimeRange,
+            _time_range: TimeRange,
             _fold: AggregationFold,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
@@ -526,7 +526,7 @@ mod deactivate_usage_record_tests {
         async fn list_usage_records(
             &self,
             _gts_type_id: MeterTypeId,
-            _time_range: usage_collector_sdk::TimeRange,
+            _time_range: TimeRange,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
         ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
@@ -3821,7 +3821,7 @@ mod read_path_time_range_tests {
     use std::sync::Arc;
 
     use toolkit_gts::gts_id;
-    use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo};
+    use toolkit_odata::{ODataQuery, Page as ODataPage};
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{AggregationResult, MeterTypeId, TimeRange, UsageCollectorPluginV1};
 
@@ -3856,21 +3856,10 @@ mod read_path_time_range_tests {
         (service, plugin)
     }
 
-    fn empty_page() -> ODataPage<usage_collector_sdk::UsageRecord> {
-        ODataPage {
-            items: vec![],
-            page_info: PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit: 1000,
-            },
-        }
-    }
-
     #[tokio::test]
     async fn list_forwards_the_typed_time_range_to_the_plugin() {
         let (svc, spy) = svc_and_spy();
-        spy.set_list_usage_records_response(empty_page());
+        spy.set_list_usage_records_response(ODataPage::empty(0));
 
         let range = test_time_range();
         svc.list_usage_records(&ctx(), meter_id(), range, &ODataQuery::default(), &[])
@@ -3926,13 +3915,13 @@ mod read_path_time_range_tests {
         .expect("the adjacent hour is a valid range");
         assert_ne!(first, second, "precondition: the two ranges differ");
 
-        spy.set_list_usage_records_response(empty_page());
+        spy.set_list_usage_records_response(ODataPage::empty(0));
         svc.list_usage_records(&ctx(), meter_id(), first, &ODataQuery::default(), &[])
             .await
             .expect("first list succeeds");
         assert_eq!(spy.last_list_time_range(), Some(first));
 
-        spy.set_list_usage_records_response(empty_page());
+        spy.set_list_usage_records_response(ODataPage::empty(0));
         svc.list_usage_records(&ctx(), meter_id(), second, &ODataQuery::default(), &[])
             .await
             .expect("second list succeeds");
@@ -3944,27 +3933,41 @@ mod read_path_time_range_tests {
         );
     }
 
+    /// A `$filter` that constrains something other than time — the shape a
+    /// caller wanting both a predicate and a range now sends. The
+    /// forwarding tests above pass `ODataQuery::default()`, so between them
+    /// the pair covers both "no `$filter` at all" and "a `$filter` naming
+    /// no time predicate". Before this slice the second was a 400 too,
+    /// because the retired guard read the window out of this same slot.
+    fn filter_without_a_time_predicate() -> ODataQuery {
+        ODataQuery::from(Some(
+            toolkit_odata::parse_filter_string("resource_id eq 'r1'")
+                .expect("filter parses")
+                .into_expr(),
+        ))
+    }
+
     #[tokio::test]
     async fn list_needs_no_time_window_inside_the_filter() {
-        // The window is a typed parameter, so an absent `$filter` is a
-        // complete request. Before this slice the same call was a 400
-        // naming a missing time window.
         let (svc, spy) = svc_and_spy();
-        spy.set_list_usage_records_response(empty_page());
+        spy.set_list_usage_records_response(ODataPage::empty(0));
 
+        let range = test_time_range();
         svc.list_usage_records(
             &ctx(),
             meter_id(),
-            test_time_range(),
-            &ODataQuery::default(),
+            range,
+            &filter_without_a_time_predicate(),
             &[],
         )
         .await
-        .expect("an empty $filter is a complete list request");
+        .expect("a $filter naming no time predicate is a complete list request");
 
-        assert!(
-            spy.last_list_time_range().is_some(),
-            "the request must have reached the SPI, not short-circuited",
+        assert_eq!(
+            spy.last_list_time_range(),
+            Some(range),
+            "a non-empty $filter must not disturb the typed range on its way \
+             to the SPI",
         );
     }
 
@@ -3973,21 +3976,23 @@ mod read_path_time_range_tests {
         let (svc, spy) = svc_and_spy();
         spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
 
+        let range = test_time_range();
         svc.query_aggregated_usage_records(
             &ctx(),
             meter_id(),
-            test_time_range(),
-            &ODataQuery::default(),
+            range,
+            &filter_without_a_time_predicate(),
             &[],
             &[],
         )
         .await
-        .expect("an empty $filter is a complete aggregate request");
+        .expect("a $filter naming no time predicate is a complete aggregate request");
 
         assert_eq!(
-            spy.calls(),
-            1,
-            "the request must have reached the SPI, not short-circuited",
+            spy.last_aggregate_time_range(),
+            Some(range),
+            "a non-empty $filter must not disturb the typed range on its way \
+             to the SPI",
         );
     }
 }

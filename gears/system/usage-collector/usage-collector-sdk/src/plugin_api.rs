@@ -95,12 +95,15 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// page continuation is built from, so ignoring it drops rows across a
     /// page boundary.
     ///
-    /// Non-empty is guaranteed only on the REST path, where the gateway
-    /// appends the canonical unique tiebreaker suffix in the caller's sort
-    /// direction. An in-process SDK caller reaches the service directly and
-    /// may pass an [`ODataQuery`] carrying no order at all, so a plugin
-    /// MUST NOT assume the slot is populated — it applies its own
-    /// deterministic keyset when the slot is empty.
+    /// `query.order` is still normalized on the REST path only, where the
+    /// gateway appends the canonical unique `(created_at, id)` suffix in
+    /// the caller's sort direction; an in-process caller reaches the
+    /// service directly and may pass an [`ODataQuery`] carrying no order at
+    /// all, so a plugin cannot yet rely on the slot being populated and
+    /// falls back to its own deterministic keyset when it is empty. A
+    /// later commit in this slice moves that normalization behind the
+    /// service, making the guarantee unconditional for every caller — as
+    /// DESIGN §3.3 states it, without a per-path caveat.
     async fn list_usage_records(
         &self,
         gts_type_id: MeterTypeId,
