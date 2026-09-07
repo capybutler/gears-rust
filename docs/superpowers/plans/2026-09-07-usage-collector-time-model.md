@@ -43,6 +43,8 @@ These carry the target model. Read the sections named, not the whole corpus.
    Never an inline `mod tests`.
 4. **Deletions need a per-test verdict.** This slice deletes and repoints many tests. For every test you delete, state in your report: the test name, what it pinned, and why that question no longer exists. "Deleted the failing test" and "deleted the test whose question no longer exists" look identical in a diff.
 5. **Comments must survive a grep.** When you rename a thing, grep for its old name in prose too. Three separate slice-1/2 reviews caught a comment naming something that had moved or vanished.
+   - **Cite an ADR by its id, not its number**, in anything that ships: `cpt-cf-usage-collector-adr-record-identity-derivation`, not `ADR-0007`. That is how the rest of the gear cites them, and a number is exactly the reference that silently retargets when a document is renumbered — which already happened here, where 0014 used to be the identity ADR and is now the selection one. Numbers are fine in this plan and in commit messages; they are not fine in a doc comment or a test comment. (This plan's own sketches violate the rule in places. Fix it as you copy them, and say so.)
+   - **A hedge about what a later task changes is a claim about the code, and it expires.** Where you must write one, phrase it so the grep set in task 6 finds it: prefer naming the state ("the read paths still carry the window as a `$filter` conjunct") over naming a plan task number, which no reader outside this plan can resolve. Task 6 removes every hedge in this slice, so none of them may survive the slice.
 6. **Commits** are Conventional Commits with a `Signed-off-by: capybutler <capybutler@gmail.com>` trailer and a body that explains *why*, not what. A breaking change takes `!` in the subject and a `BREAKING CHANGE:` trailer. Do **not** bump crate versions — `chore: release` commits do that.
 
 ### Verification bar (every task ends here)
@@ -2000,6 +2002,8 @@ The range's canonical rendering goes on `TimeRange` itself, in the SDK, rather t
 
 This is the same "two spellings of one rule" hazard `contains_window_end` guards against, one level up: the fingerprint is compared across requests, so its rendering has to be a single function. Add a test pinning the exact string for a known range, and one asserting two ranges differing only in their upper bound render differently.
 
+**One thing to check rather than inherit.** `canonical_period_bound` carries a `debug_assert!` that its year is in `0..=9999`, justified on the grounds that the RFC 3339 wire codec cannot express anything else. That justification was written for the *ingestion* path. Calling it from here extends it to the read path, and `TimeRange::new` validates ordering only — it does not bound the year. On REST both bounds are RFC 3339-parsed so the claim still holds, but an in-process caller can construct a `TimeRange` outside the range and would now hit a debug-only panic on a cursor path. Decide deliberately: either widen `TimeRange::new` to reject it (making the range's own invariant carry the guarantee `canonical_form` depends on), or narrow the assert's stated justification so it does not claim more than it can. Do not leave the current wording covering a path it was not reasoned about.
+
 `prepare_list_query(mut query: ODataQuery, time_range: TimeRange)` sets
 
 ```rust
@@ -2066,15 +2070,31 @@ grep -rn "MISSING_TIME_WINDOW\|MissingTimeWindow\|missing_time_window" --include
 # 3. The retired identity shape.
 grep -rn "4-tuple\|created_at_micros\|into_usage_record\b" --include='*.rs' usage-collector usage-collector-sdk
 
-# 4. Wrong ADR references: 0007 is the identity derivation, 0014 is
-#    window-end selection. Every ADR-0014 citation about identity is stale.
-grep -rn "ADR-0014\|ADR-0007" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
+# 4. ADR references by number. 0007 is the identity derivation, 0014 is
+#    window-end selection, and citing either by number is what this slice
+#    stopped doing. Scope: convert what this slice introduced; leave the
+#    rest.
+grep -rnE "ADR-00[0-9]{2}" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
 
 # 5. Prose that describes the old model.
 grep -rniE "record creation timestamp|TimeWindow|time window .*filter|unbounded (full-table )?scan" --include='*.rs' usage-collector usage-collector-sdk
+
+# 6. Self-dating prose. Every hedge this slice wrote about what a later
+#    task changes has now expired: the later task landed. Unlike a stale
+#    tense, these assert a state of the code that is now false.
+grep -rniE "at this commit|in this slice|a later commit|later in this slice|not yet wired" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
+
+# 7. Plan task numbers in shipped prose. A reader outside the plan cannot
+#    resolve "Task 3". Pre-existing sites are out of scope; anything this
+#    slice added is not.
+grep -rnE "Task [0-9]+" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
+
+# 8. A doc reference to a file that does not exist. Pre-existing, and the
+#    three in-scope `.rs` sites are this slice's to clear.
+find . -name plugin-spi.md; grep -rn "plugin-spi.md" --include='*.rs' usage-collector usage-collector-sdk
 ```
 
-Expected end state: (1) (2) (3) return nothing; (4) returns only citations that name the right document for what the surrounding code does — prefer the `cpt-cf-usage-collector-adr-*` id over the number, which is how the rest of the gear cites ADRs; (5) returns nothing that claims the window is a filter conjunct.
+Expected end state: (1) (2) (3) return nothing; (4) returns only citations that name the right document for what the surrounding code does, and prefers the `cpt-cf-usage-collector-adr-*` id over the number — convert any number this slice introduced, including the three in `time_range_tests.rs`; (5) returns nothing that claims the window is a filter conjunct; (6) returns nothing at all — the whole slice has landed, so no hedge about a later task can still be true; (7) returns only sites that predate this slice (there are roughly 25; leave them); (8) `find` returns nothing and the three `service.rs` citations are gone — the file does not exist anywhere in the repo, so every citation of it is dead, and this slice already removed one of them as a side effect.
 
 - [ ] **Step 2: Confirm the out-of-scope boundaries held**
 
@@ -2122,6 +2142,16 @@ State, explicitly:
 5. The residual divergences from the target contract this slice knowingly leaves: `accepted_at` / `acceptance_sequence` absent, `value` not yet renamed to `quantity`, and the aggregate path still carrying `gts_type_id` / `$filter` / `metadata.<key>` as query parameters where `AggregationRequest` puts them in the body.
 
 ---
+
+## Follow-ups this slice deliberately does not take
+
+Recorded here so they are decisions rather than oversights. None of them belongs to a task above.
+
+- **Extract `authorize_batch` from `create_usage_records_inner`.** Task 2's review found the function at ~290 lines, past the point a reader holds it in context, with a seam that costs nothing: the `inst-emit-batch-pdp` marker region (tuple grouping → bounded fan-out → `pdp_allowed` projection) is already contiguous and `fn`-shaped, and the declaration pre-pass after it is a second such region. That would leave ~190 lines and follow the pattern `resolve_l1_lookups` set in the same file. Deliberately not folded into task 2, which was already the largest change in the slice — it deserves its own reviewable commit rather than riding along with documentation fixes.
+- **The byte-versus-code-point cap divergence.** `IdempotencyKey` caps at 256 *bytes* while the OAS `maxLength: 256` counts code points, so a 200-character multi-byte key is valid per the published schema and rejected by the gear. `MeterTypeId` carries the identical divergence against its `maxLength: 512`, pre-existing from slice 2. Both fail closed, so nothing is unsafe. Fixing it properly means touching both newtypes and deciding which side is authoritative — the contract owner's call, not this slice's.
+- **A newtype for the batch path's carried input index.** With the invariant named once and three uses inside 130 lines, an `InputIndex(usize)` is more ceremony than the risk warrants. Revisit if a fourth pass appears: at that point the newtype makes the invariant type-checked instead of remembered.
+- **Six pre-existing docs that still describe the usage-type catalog as plugin-owned.** `usage-collector/src/{config.rs:6, lib.rs:5, lib.rs:15, config_tests.rs:5}`, `infra/sdk_error_mapping.rs:6` and `domain/error.rs:77` all cite `ADR-0012` for a catalog that slices 1-2 moved to the `types-registry` gear. Found while checking this slice's own ADR citations; the claim is stale, not merely numbered. It belongs to whoever finishes the slice-1/2 doc debt, not to the time model — but it is the same failure mode this slice keeps correcting, and nothing else is watching for it.
+- **The `@cpt-flow` / `@cpt-algo` / `@cpt-dod` / `@cpt-state` markers that resolve to nothing.** The DESIGN rework dropped whole categories of traceability id — `flow`, `algo`, `dod`, `state`, `component` — while the gear's source is dense with markers naming ids in exactly those categories. A "does every marker resolve" gate would fail across the whole crate today. It needs a decision (regenerate those id categories in the docs, or strip the retired marker classes) and it is explicitly out of scope until asked.
 
 ## Self-review
 
