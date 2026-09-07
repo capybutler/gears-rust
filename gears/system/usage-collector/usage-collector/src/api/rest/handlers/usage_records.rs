@@ -17,7 +17,6 @@ use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     AggregationDimension, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey,
     MeterTypeId, ResourceRef, SubjectRef, TimeRange, UsageCollectorError, UsageRecord,
-    is_keyset_safe_record_field,
 };
 use uuid::Uuid;
 
@@ -27,6 +26,7 @@ use crate::api::rest::dto::{
     UsageRecordDto,
 };
 use crate::domain::Service;
+use crate::domain::query::ensure_admissible_keyset_order;
 use crate::domain::service::MAX_BATCH_RECORDS;
 use crate::infra::sdk_error_mapping::{
     UsageRecordResource,
@@ -188,14 +188,17 @@ pub async fn handle_get_usage_record(
 ///   the canonical `cursor_decode` / `order_mismatch` / `filter_mismatch`
 ///   `Problem`. The decoded `CursorV1` flows to the plugin via
 ///   `ODataQuery.cursor` unchanged.
-/// * **`$orderby` normalization** — the gateway always appends the
-///   canonical unique `(created_at, id)` suffix to the effective order so
-///   the plugin has a stable, gap-free keyset. When the caller omits
-///   `$orderby` this yields `(created_at asc, id asc)`; when the caller
-///   supplies an `$orderby` lacking a unique final key (e.g.
-///   `$orderby=created_at`), the missing tiebreaker key is appended in the
-///   caller's sort direction so pagination cannot drop rows tied on the
-///   boundary value.
+/// * **`$orderby` admissibility and normalization** — a caller order is
+///   refused here, naming `$orderby`, when it mixes sort directions or
+///   names a key that is not a mandatory record attribute; an admissible
+///   one then gains the canonical unique `(window_end, id)` suffix in its
+///   own sort direction, so an omitted `$orderby` yields
+///   `(window_end asc, id asc)` and an `$orderby=window_end` yields
+///   `(window_end asc, id asc)` too. Both halves are
+///   [`ensure_admissible_keyset_order`]: the invariant is owned in the
+///   domain so that an in-process caller gets it too, and mirrored here so
+///   the caller's own input is blamed by name. Same arrangement as the
+///   batch-size gate on the create surface above.
 ///
 /// Per-key metadata filtering is the typed side-channel
 /// [`MetadataFilter`] from the SDK — `toolkit-odata` has no surface for
@@ -486,35 +489,23 @@ const TYPED_AGGREGATE_PARAMS: &[&str] = &["gts_type_id"];
 /// (`metadata.<key>=<value>`, repeatable).
 const METADATA_PREFIX: &str = "metadata.";
 
-/// The canonical unique keyset suffix appended to every raw-list order.
-/// `created_at` is the primary time key and `id` the globally-unique final
-/// tiebreaker; the pair is the canonical cursor keyset. Appended (via
-/// [`toolkit_odata::ODataOrderBy::ensure_tiebreaker`]) in the caller order's
-/// direction, so an empty `$orderby` normalizes to `(created_at, id)` and
-/// any explicit `$orderby` gains the same unique suffix — see
-/// [`prepare_list_query`].
-///
-/// The time key is still the retired instant field rather than the
-/// covered-period end the mandatory range selects on; a later commit in
-/// this slice repoints it. Every other keyset spelling in this file is
-/// left concrete on purpose, so that repoint is one grep.
-const CANONICAL_TIEBREAKER_FIELDS: &[&str] = &["created_at", "id"];
-
 /// Apply gateway-side guards on the parsed [`ODataQuery`]:
 /// 1. reject `$top > MAX_PAGE_SIZE` as `InvalidArgument` (no silent
 ///    clamp; a caller asking for more rows than the page-size cap MUST
 ///    be told so they can paginate explicitly);
-/// 2. normalize `$orderby` so the effective order always ends in the
-///    canonical unique `(created_at, id)` suffix — on the empty-order
-///    path this defaults to `(created_at asc, id asc)`, and on an
-///    explicit `$orderby` it appends whichever of `created_at` / `id`
-///    the caller did not already name;
-/// 3. validate the optional cursor against the (now-normalized) order
-///    and the parsed filter hash.
+/// 2. run the domain's keyset floor [`ensure_admissible_keyset_order`] on
+///    the caller's `$orderby`, which refuses a mixed-direction or
+///    non-mandatory order key and otherwise appends the canonical unique
+///    `(window_end, id)` suffix in the caller's direction;
+/// 3. validate the optional cursor against the order derived from its own
+///    signed tokens and the parsed filter hash.
 ///
-/// The normalization is applied BEFORE cursor validation so a cursor
-/// minted against the normalized keyset continues to validate on
-/// subsequent calls.
+/// Step 2 exists here, and not only behind the service, so a caller's own
+/// input is refused where it is parsed and the `400` blames `$orderby` —
+/// the wire parameter they actually sent — before any authorization or
+/// plugin work happens. The floor itself is the domain's, and the service
+/// applies it again before dispatch; it is idempotent, so the second
+/// application is a no-op on this path.
 // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-odata-parse
 // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-cursor-validate
 fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalError> {
@@ -542,23 +533,15 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
         None => query.limit = Some(MAX_PAGE_SIZE),
     }
 
-    // 2. $orderby normalization: ensure a unique keyset suffix.
-    //
-    // On every non-cursor request — whether the caller omitted `$orderby`
-    // entirely or supplied one — append the canonical `(created_at, id)`
-    // suffix so the effective order always ends in a globally-unique key.
-    // A non-unique final sort key (e.g. `$orderby=created_at`) would let the
-    // plugin's keyset predicate skip rows that share the boundary value but
-    // did not fit on the previous page — silent data loss across page
-    // boundaries. `ensure_tiebreaker` is a no-op for a
-    // field the order already names, so an order ending in `id` (or the
-    // canonical default) is left untouched.
-    //
-    // Direction-aware: the storage plugin's keyset supports only
-    // uniform-direction tuples, so the suffix is appended in the order's
-    // existing direction (its trailing key's, or `Asc` for an empty order)
-    // — never pairing a descending caller order with an ascending
-    // tiebreaker, which the plugin rejects as a mixed-direction keyset.
+    // 2. $orderby admissibility + the canonical keyset suffix, both from
+    // the domain's keyset floor. It refuses a mixed-direction order and an
+    // order key that is not a mandatory record attribute — `created_at` is
+    // one such name now, so a stale caller order fails closed rather than
+    // resolving — and otherwise appends `(window_end, id)` in the caller's
+    // own direction so the effective order ends in a globally-unique key.
+    // Without that suffix the plugin's keyset predicate would skip rows
+    // sharing the boundary value that did not fit on the previous page:
+    // silent data loss across page boundaries.
     //
     // Skipped when a cursor is present: the toolkit OData extractor leaves
     // `order` empty on a cursor request (and rejects `$orderby` + `cursor`
@@ -566,70 +549,7 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
     // cursor's signed tokens in step 3 instead — and those tokens already
     // carry the suffix minted into the cursor on the first page.
     if query.cursor.is_none() {
-        // Reject a mixed-direction caller order up front. The storage
-        // plugin's keyset supports only uniform-direction tuples, so an
-        // order like `$orderby=created_at asc, value desc` can never compose
-        // into a valid keyset — appending the tiebreaker would only forward a
-        // non-uniform tuple to the plugin, which rejects it with a late,
-        // non-specific keyset error. Surface a typed `400` here that names
-        // the real cause (mixed sort directions) instead.
-        if let Some(first) = query.order.0.first() {
-            let first_dir = first.dir;
-            if query.order.0.iter().any(|key| key.dir != first_dir) {
-                return Err(UsageRecordResource::invalid_argument()
-                    .with_field_violation(
-                        "$orderby",
-                        "$orderby must use a single sort direction across all keys; \
-                         mixing `asc` and `desc` is unsupported because keyset \
-                         pagination requires a uniform-direction order",
-                        "VALIDATION",
-                    )
-                    .create());
-            }
-        }
-
-        // Reject a caller order on a nullable (domain-optional) field. Every
-        // caller-supplied key is a *leading* key of the effective keyset (the
-        // canonical `(created_at, id)` suffix is appended after this), and the
-        // plugin's keyset continuation is a row-value tuple comparison
-        // `(c1, …) > ($…)` that is only sound when every column is NOT NULL: a
-        // NULL leading key makes the tuple compare as NULL, silently dropping
-        // NULL-keyed rows from the page (and 500-ing on a page that ends at a
-        // NULL row, which cannot encode a cursor). Fields backed by
-        // `subject_ref: Option<_>` / `corrects_id: Option<_>` are the nullable
-        // ones — see [`is_keyset_safe_record_field`]. Surface a typed `400`
-        // here that names the real cause instead of forwarding an unsound
-        // order to the plugin.
-        if let Some(bad) = query
-            .order
-            .0
-            .iter()
-            .find(|key| !is_keyset_safe_record_field(&key.field))
-        {
-            return Err(UsageRecordResource::invalid_argument()
-                .with_field_violation(
-                    "$orderby",
-                    format!(
-                        "$orderby key `{}` is not supported: keyset pagination requires an \
-                         always-present sort key, so ordering by an optional field \
-                         (subject_id, subject_type, corrects_id) is not allowed",
-                        bad.field
-                    ),
-                    "VALIDATION",
-                )
-                .create());
-        }
-
-        let dir = query
-            .order
-            .0
-            .last()
-            .map_or(toolkit_odata::SortDir::Asc, |key| key.dir);
-        let mut order = std::mem::take(&mut query.order);
-        for &field in CANONICAL_TIEBREAKER_FIELDS {
-            order = order.ensure_tiebreaker(field, dir);
-        }
-        query.order = order;
+        ensure_admissible_keyset_order(&mut query).map_err(usage_collector_error_to_canonical)?;
     }
 
     // 3. Cursor validation + order materialization. When a cursor is

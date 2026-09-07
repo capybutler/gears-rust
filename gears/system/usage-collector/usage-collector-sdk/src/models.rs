@@ -673,10 +673,10 @@ pub struct UsageRecord {
     /// (`cpt-cf-usage-collector-adr-window-end-selection`, the reference
     /// spelling being [`crate::TimeRange::contains_window_end`]). Reading
     /// the end alone is what makes adjacent ranges sum without double
-    /// counting. Both read paths now take that range as a typed parameter
-    /// and select on this bound; their keyset page order still ends in the
-    /// retired instant field's tiebreaker, which a later commit in this
-    /// slice repoints onto this one.
+    /// counting. Both read paths take that range as a typed parameter and
+    /// select on this bound, and the raw path's keyset page order leads on
+    /// it too — so the column the range selects on and the column the page
+    /// orders by are one column, and one index serves both.
     #[serde(with = "time::serde::rfc3339")]
     pub window_end: time::OffsetDateTime,
 }
@@ -1022,11 +1022,17 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 // `FilterError::UnknownField`, so neither plugins nor the gateway need a
 // runtime reject path.
 //
-// `created_at` and `id` ARE on the schema: the gateway treats the
-// `[from, to)` time window as an ordinary `created_at ge … and
-// created_at lt …` predicate inside `$filter` (no separate `TimeWindow`
-// typed parameter), and `id` is the canonical cursor tiebreaker the
-// gateway substitutes into `$orderby` when the caller omits one.
+// The covered-period bounds and `id` ARE on the schema, and none of the
+// three is reachable from a `$filter`. That is not a contradiction: this
+// schema is two vocabularies at once — the plugin's field-to-column
+// mapping and the `$orderby` surface. `window_end` has to be nameable for
+// the canonical `(window_end, id)` keyset, and for a cursor's signed
+// tokens, to resolve to a column at all; `id` is that keyset's final
+// tiebreaker. What keeps a predicate off the bounds is the host crate's
+// `reject_reserved_filter_fields` guard, not their absence from here: the
+// read range travels as a typed `TimeRange` parameter, so a `$filter`
+// conjunct naming a bound would be a second, possibly contradictory,
+// constraint on something the range already fixes.
 //
 // Nested attribution composites (`resource_ref`, `subject_ref`) are
 // flattened to their leaf identifiers (`resource_id`, `resource_type`,
@@ -1053,17 +1059,27 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 pub struct UsageRecordQuery {
     /// `usage_records.id` (record primary key). Carried on the filter
     /// surface so the gateway can use it as the canonical cursor
-    /// tiebreaker (`(created_at, id)`) and so callers can pin a
+    /// tiebreaker (`(window_end, id)`) and so callers can pin a
     /// specific record via `$filter`.
     #[odata(filter(kind = "Uuid"))]
     pub id: Uuid,
-    /// `usage_records.created_at` (record creation timestamp). The
-    /// `[from, to)` time-window is expressed as
-    /// `created_at ge X and created_at lt Y` inside `$filter`; the
-    /// plugin SPI receives that AST and is responsible for honouring
-    /// it (server-side time-bounded read).
+    /// `usage_records.window_start` — the inclusive start of the covered
+    /// period. Here so a plugin has a column mapping for it and a caller
+    /// can order by it; **not** filterable, because the read range travels
+    /// as a typed parameter and `reject_reserved_filter_fields` rejects any
+    /// predicate naming it.
     #[odata(filter(kind = "DateTimeUtc"))]
-    pub created_at: time::OffsetDateTime,
+    pub window_start: time::OffsetDateTime,
+    /// `usage_records.window_end` — the exclusive end of the covered
+    /// period, and the column every read path selects on
+    /// (`from <= window_end < to`, per
+    /// `cpt-cf-usage-collector-adr-window-end-selection`). It is also the
+    /// leading key of the raw path's `(window_end, id)` keyset, so
+    /// selection and page order name one column and one index serves both.
+    /// Reserved on the `$filter` surface for the same reason as
+    /// [`Self::window_start`].
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub window_end: time::OffsetDateTime,
     /// `usage_records.tenant_id` (owning tenant). Supports `eq` and `in`.
     #[odata(filter(kind = "Uuid"))]
     pub tenant_id: Uuid,
@@ -1109,8 +1125,10 @@ pub use UsageRecordQueryFilterField as UsageRecordFilterField;
 /// - `subject_id` / `subject_type` come from `subject_ref: Option<SubjectRef>`
 ///   and `corrects_id` is `Option<Uuid>` — all three are domain-optional, so
 ///   they are **not** keyset-safe.
-/// - `id`, `created_at`, `tenant_id`, `resource_id`, `resource_type`, `status`
-///   are mandatory on every record, so they are keyset-safe.
+/// - `id`, both covered-period bounds, `tenant_id`, `resource_id`,
+///   `resource_type` and `status` are mandatory on every record, so they
+///   are keyset-safe. `window_end` is additionally the leading key of the
+///   canonical keyset, because it is the bound the read range selects on.
 ///
 /// This is a domain-optionality fact (an SDK concern), not a storage-column
 /// fact — the gateway rejects a caller `$orderby` on a non-keyset-safe field
@@ -1121,7 +1139,12 @@ pub use UsageRecordQueryFilterField as UsageRecordFilterField;
 pub fn is_keyset_safe_record_field(name: &str) -> bool {
     matches!(
         name,
-        "id" | "created_at" | "tenant_id" | "resource_id" | "resource_type" | "status"
+        "id" | "window_start"
+            | "window_end"
+            | "tenant_id"
+            | "resource_id"
+            | "resource_type"
+            | "status"
     )
 }
 

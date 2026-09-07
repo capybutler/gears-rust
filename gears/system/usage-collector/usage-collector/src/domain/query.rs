@@ -16,6 +16,10 @@
 //!   `metadata_filter`, the dynamic-key side channel that exists precisely
 //!   because the `toolkit-odata` grammar cannot express filters over JSON
 //!   map keys, so it never flows through `$filter` at all.
+//! * `ensure_admissible_keyset_order` — the raw path's keyset floor: it
+//!   guarantees every dispatch carries the non-empty, uniform-direction,
+//!   never-null order the Plugin SPI promises, whichever surface the call
+//!   came in on.
 //!
 //! Per Spec §3.11, the admissible filter and grouping surface is the fixed
 //! fields (via `$filter`, gated by [`reject_reserved_filter_fields`]) plus
@@ -28,9 +32,12 @@
 
 use std::collections::BTreeSet;
 
-use toolkit_odata::{ODataQuery, ast};
+use toolkit_odata::{ODataQuery, SortDir, ast};
 use toolkit_security::AccessScope;
-use usage_collector_sdk::{AggregationDimension, MetadataFilter, MeterTypeId, UsageCollectorError};
+use usage_collector_sdk::{
+    AggregationDimension, MetadataFilter, MeterTypeId, UsageCollectorError, WINDOW_END_FIELD,
+    is_keyset_safe_record_field,
+};
 
 use crate::domain::authz;
 
@@ -100,11 +107,17 @@ pub(crate) fn compose_query_with_scope(
 /// Field names a caller may never name in a `$filter`.
 ///
 /// `gts_type_id` travels as a typed parameter and the covered period as a
-/// typed time range (`window_start` / `window_end`, landing with the
-/// record-model slice after this plan — reserved here regardless, so the
-/// name is guarded against ever becoming filterable), so a predicate over
+/// typed [`TimeRange`](usage_collector_sdk::TimeRange), so a predicate over
 /// any of the three would express a second, possibly contradictory,
 /// constraint on something already fixed.
+///
+/// Both covered-period bounds *are* filterable-schema fields
+/// ([`usage_collector_sdk::UsageRecordFilterField`]) — that schema doubles
+/// as the plugin's field-to-column mapping and the `$orderby` vocabulary,
+/// and `window_end` has to resolve to a column for the canonical
+/// `(window_end, id)` keyset to mean anything. This guard, not their
+/// absence from the schema, is the whole reason a `$filter` cannot reach
+/// them.
 const RESERVED_FILTER_FIELDS: &[&str] = &["gts_type_id", "window_start", "window_end"];
 
 /// `true` when `name` names a [`RESERVED_FILTER_FIELDS`] entry, ignoring
@@ -118,12 +131,13 @@ const RESERVED_FILTER_FIELDS: &[&str] = &["gts_type_id", "window_start", "window
 /// ([`usage_collector_sdk::is_keyset_safe_record_field`] and
 /// `toolkit_odata::ODataOrderBy::ensure_tiebreaker`) both match exactly.
 ///
-/// Not exploitable today: `window_start` / `window_end` are not yet
-/// filterable-schema fields, and a case-varied `gts_type_id` would
-/// dead-end as `toolkit_odata`'s own case-insensitive `UnknownField`
-/// downstream. They become filterable-schema fields later in this slice
-/// though, at which point a case-varied spelling would otherwise resolve
-/// as a legitimate field instead of hitting this reservation.
+/// The case-insensitivity is load-bearing rather than theoretical:
+/// `window_start` / `window_end` are filterable-schema fields, so a
+/// case-varied spelling of one resolves as a legitimate field and would
+/// reach a plugin as a real predicate if this comparison were exact.
+/// (A case-varied `gts_type_id` would additionally dead-end downstream as
+/// `toolkit_odata`'s own case-insensitive `UnknownField`, since that name
+/// is off the schema entirely — but the bounds have no such second net.)
 fn is_reserved_filter_field(name: &str) -> bool {
     RESERVED_FILTER_FIELDS
         .iter()
@@ -163,6 +177,85 @@ pub(crate) fn reject_reserved_filter_fields(filter: &ast::Expr) -> Result<(), Us
         }
         ast::Expr::Function(_name, args) => args.iter().try_for_each(reject_reserved_filter_fields),
     }
+}
+
+/// The canonical unique keyset suffix every raw-list order ends in.
+///
+/// `window_end` is the primary time key — the same column the read range
+/// selects on (`cpt-cf-usage-collector-adr-window-end-selection`), so one
+/// index serves both the selection and the page order — and `id` is the
+/// globally-unique final tiebreaker that stops a page boundary landing
+/// inside a run of rows sharing a `window_end`.
+const CANONICAL_KEYSET_SUFFIX: &[&str] = &[WINDOW_END_FIELD, "id"];
+
+/// Guarantees `query.order` is the keyset the Plugin SPI promises: a
+/// non-empty, uniform-direction, never-null order ending in
+/// [`CANONICAL_KEYSET_SUFFIX`].
+///
+/// This is the raw path's keyset **floor**, and it lives here rather than
+/// in the REST handler because DESIGN §3.1 allocates order admissibility
+/// to the Query Gateway, which §3.2 exists to keep uniform across the SDK
+/// and REST. An in-process caller reaches
+/// [`Service::list_usage_records`](crate::domain::Service::list_usage_records)
+/// with an [`ODataQuery`] of their own construction — an empty order, most
+/// of the time — so a normalization that only ran at the REST edge left
+/// the SPI's order slot unpopulated on exactly the surface no REST test
+/// can reach.
+///
+/// Two properties have to hold before the suffix can be appended at all,
+/// and neither can be repaired by appending:
+///
+/// * **One direction.** The plugin's continuation is a row-value tuple
+///   comparison (`(c1, c2, …) > ($…)`), which has no meaning across mixed
+///   directions.
+/// * **No nullable key.** A tuple whose leading column is NULL compares as
+///   NULL in SQL's three-valued logic, so every NULL-keyed row silently
+///   drops out of the page and a page ending on one cannot encode a
+///   cursor at all. [`is_keyset_safe_record_field`] is the fail-closed
+///   classification, so an unrecognised name is refused on the same
+///   branch.
+///
+/// The suffix is then appended in the order's own direction (`Asc` for an
+/// empty order) via [`toolkit_odata::ODataOrderBy::ensure_tiebreaker`],
+/// which skips a field the order already names — so this is idempotent,
+/// and applying it after REST has validated an order is a no-op rather
+/// than a double append.
+///
+/// `prepare_list_query` calls this too, on the caller's `$orderby` before
+/// any authorization or plugin work happens, so a wire request is refused
+/// where its input is parsed and the `400` blames the parameter the caller
+/// actually sent. That mirroring is the point of the idempotence: the same
+/// rule, stated once, applied at the edge for the message and again here
+/// for the guarantee.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorError::InvalidArgument`] when the order mixes
+/// sort directions, or names a key that is not a mandatory record
+/// attribute.
+pub(crate) fn ensure_admissible_keyset_order(
+    query: &mut ODataQuery,
+) -> Result<(), UsageCollectorError> {
+    let keys = &query.order.0;
+    if let Some(first) = keys.first()
+        && keys.iter().any(|key| key.dir != first.dir)
+    {
+        return Err(UsageCollectorError::mixed_direction_order());
+    }
+    if let Some(bad) = keys
+        .iter()
+        .find(|key| !is_keyset_safe_record_field(&key.field))
+    {
+        return Err(UsageCollectorError::inadmissible_order_key(&bad.field));
+    }
+
+    let dir = keys.last().map_or(SortDir::Asc, |key| key.dir);
+    let mut order = std::mem::take(&mut query.order);
+    for &field in CANONICAL_KEYSET_SUFFIX {
+        order = order.ensure_tiebreaker(field, dir);
+    }
+    query.order = order;
+    Ok(())
 }
 
 /// Checks every `group_by` dimension is either a fixed field (no

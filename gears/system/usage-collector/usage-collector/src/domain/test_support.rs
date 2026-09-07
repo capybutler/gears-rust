@@ -1046,6 +1046,12 @@ pub fn authenticated_ctx() -> SecurityContext {
 
 use std::sync::Mutex;
 
+/// The keyset order an SPI dispatch was handed, as `(field, direction)`
+/// pairs. Recorded rather than the whole `ODataOrderBy` so an assertion is
+/// a plain `assert_eq!` on comparable values — `OrderKey` carries no
+/// `PartialEq`.
+pub type RecordedOrder = Vec<(String, toolkit_odata::SortDir)>;
+
 /// Per-record outcome shape for a `create_usage_records` SPI batch
 /// response — `Ok(persisted_record)` or
 /// `Err(UsageCollectorPluginError)`. Factored out so the
@@ -1098,6 +1104,13 @@ pub struct HappyPathPlugin {
     list_time_range: Mutex<Option<TimeRange>>,
     /// The same recorder for `query_aggregated_usage_records`.
     aggregate_time_range: Mutex<Option<TimeRange>>,
+    /// The `query.order` the most-recent `list_usage_records` dispatch was
+    /// handed, as `(field, direction)` pairs. The SPI documents this slot
+    /// as a populated, uniform-direction, never-null keyset on every
+    /// surface, and nothing in a returned page would show an order the
+    /// gateway failed to floor — an unfloored order is a keyset the plugin
+    /// cannot continue, or silently drops rows from.
+    list_order: Mutex<Option<RecordedOrder>>,
 }
 
 impl HappyPathPlugin {
@@ -1119,6 +1132,7 @@ impl HappyPathPlugin {
             last_get_scope: Mutex::new(None),
             list_time_range: Mutex::new(None),
             aggregate_time_range: Mutex::new(None),
+            list_order: Mutex::new(None),
         })
     }
 
@@ -1212,6 +1226,14 @@ impl HappyPathPlugin {
     pub fn last_aggregate_time_range(&self) -> Option<TimeRange> {
         *self.aggregate_time_range.lock().expect("mutex")
     }
+    /// The keyset order handed to the most-recent `list_usage_records`
+    /// dispatch as `(field, direction)` pairs, or `None` if it was never
+    /// invoked. Proves the gateway floored the order the SPI requires,
+    /// rather than merely that the read returned `Ok`.
+    #[must_use]
+    pub fn last_list_order(&self) -> Option<RecordedOrder> {
+        self.list_order.lock().expect("mutex").clone()
+    }
     pub fn last_create_record_input(&self) -> Option<UsageRecord> {
         self.create_record_input.lock().expect("mutex").clone()
     }
@@ -1280,10 +1302,18 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
         &self,
         _gts_type_id: MeterTypeId,
         time_range: TimeRange,
-        _query: &ODataQuery,
+        query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
         *self.list_time_range.lock().expect("mutex") = Some(time_range);
+        *self.list_order.lock().expect("mutex") = Some(
+            query
+                .order
+                .0
+                .iter()
+                .map(|key| (key.field.clone(), key.dir))
+                .collect(),
+        );
         self.list_usage_records_response
             .lock()
             .expect("mutex")

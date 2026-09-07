@@ -1560,10 +1560,14 @@ mod prepare_list_query_tests {
 
     #[test]
     fn empty_orderby_and_no_cursor_defaults_to_canonical_keyset() {
+        // `(window_end asc, id asc)`: the column the mandatory range
+        // selects on is the column the page orders by, so one index serves
+        // both. The floor itself is the domain's — this pins that the wire
+        // path reaches it.
         let out = prepare_list_query(ODataQuery::new()).expect("ok");
         assert_order_keys(
             &out.order,
-            &[("created_at", SortDir::Asc), ("id", SortDir::Asc)],
+            &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
         );
     }
 
@@ -1571,7 +1575,7 @@ mod prepare_list_query_tests {
     fn supplied_orderby_gets_unique_tiebreaker_appended() {
         // The caller's explicit `$orderby` is preserved as
         // the leading sort key, but the gateway MUST append the canonical
-        // `(created_at, id)` suffix so the effective order ends in a
+        // `(window_end, id)` suffix so the effective order ends in a
         // globally-unique key. Without it the plugin keys against a
         // non-unique boundary and silently drops the tied rows that did not
         // fit on the previous page.
@@ -1588,28 +1592,48 @@ mod prepare_list_query_tests {
             &out.order,
             &[
                 ("resource_id", SortDir::Desc),
-                ("created_at", SortDir::Desc),
+                ("window_end", SortDir::Desc),
                 ("id", SortDir::Desc),
             ],
         );
     }
 
     #[test]
-    fn explicit_orderby_created_at_gets_id_tiebreaker() {
-        // The exact reproduction: `$orderby=created_at` (no unique
-        // final key). The gateway must append `id` so a page boundary at a
-        // tied `created_at` cannot drop rows. `created_at` is already the
-        // leading key, so `ensure_tiebreaker("created_at", …)` is a no-op and
-        // only `id` is appended.
+    fn an_order_on_the_covered_period_end_is_accepted() {
+        // `$orderby=window_end` names the leading suffix key but no unique
+        // final one, so the gateway must append `id` — a page boundary at a
+        // run of entries sharing a `window_end` would otherwise drop the
+        // tied rows that did not fit on the previous page. `window_end` is
+        // already named, so only `id` is appended.
         let mut q = ODataQuery::new();
         q.order = ODataOrderBy(vec![OrderKey {
-            field: "created_at".into(),
+            field: "window_end".into(),
             dir: SortDir::Asc,
         }]);
         let out = prepare_list_query(q).expect("ok");
         assert_order_keys(
             &out.order,
-            &[("created_at", SortDir::Asc), ("id", SortDir::Asc)],
+            &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
+        );
+    }
+
+    #[test]
+    fn an_order_on_created_at_is_rejected() {
+        // `created_at` is no longer a record attribute, so a caller order
+        // naming it must fail closed with a `400` rather than resolve to
+        // the covered period or to nothing. The message is deliberately
+        // not asserted: the rejection may come from the keyset-safety
+        // classification or from the OData layer as an unknown field, and
+        // either is a correct fail-closed outcome.
+        let mut q = ODataQuery::new();
+        q.order = ODataOrderBy(vec![OrderKey {
+            field: "created_at".into(),
+            dir: SortDir::Asc,
+        }]);
+        let err = prepare_list_query(q).expect_err("a retired order key must be rejected");
+        assert!(
+            matches!(err, CanonicalError::InvalidArgument { .. }),
+            "$orderby=created_at must surface as InvalidArgument, got {err:?}",
         );
     }
 
@@ -1617,18 +1641,18 @@ mod prepare_list_query_tests {
     fn descending_orderby_appends_tiebreaker_in_same_direction() {
         // Direction handling: this plugin's keyset only supports
         // uniform-direction tuples, so the appended tiebreaker must follow
-        // the caller's direction. A `created_at desc` order must normalize to
-        // `(created_at desc, id desc)` — never `(created_at desc, id
+        // the caller's direction. A `window_end desc` order must normalize
+        // to `(window_end desc, id desc)` — never `(window_end desc, id
         // asc)`, which the plugin would reject as a mixed-direction keyset.
         let mut q = ODataQuery::new();
         q.order = ODataOrderBy(vec![OrderKey {
-            field: "created_at".into(),
+            field: "window_end".into(),
             dir: SortDir::Desc,
         }]);
         let out = prepare_list_query(q).expect("ok");
         assert_order_keys(
             &out.order,
-            &[("created_at", SortDir::Desc), ("id", SortDir::Desc)],
+            &[("window_end", SortDir::Desc), ("id", SortDir::Desc)],
         );
     }
 
@@ -1636,19 +1660,25 @@ mod prepare_list_query_tests {
     fn mixed_direction_orderby_is_rejected_as_invalid_argument() {
         // The storage plugin's keyset supports only uniform-direction
         // tuples. A caller order that mixes ascending and descending keys
-        // (e.g. `$orderby=created_at asc, value desc`) can only ever compose
-        // into a mixed-direction keyset the plugin rejects downstream with a
-        // late, non-specific error. Reject it up front with a typed 400 that
-        // names the real cause (mixed sort directions) instead of leaking a
-        // plugin-internal keyset error to the caller.
+        // (e.g. `$orderby=window_end asc,status desc`) can only ever
+        // compose into a mixed-direction keyset the plugin rejects
+        // downstream with a late, non-specific error. Reject it up front
+        // with a typed 400 that names the real cause (mixed sort
+        // directions) instead of leaking a plugin-internal keyset error to
+        // the caller.
+        //
+        // Both keys are deliberately keyset-safe. With a non-mandatory
+        // second key the order would be refused anyway, for the other
+        // reason, and this test would stay green with the direction rule
+        // deleted.
         let mut q = ODataQuery::new();
         q.order = ODataOrderBy(vec![
             OrderKey {
-                field: "created_at".into(),
+                field: "window_end".into(),
                 dir: SortDir::Asc,
             },
             OrderKey {
-                field: "value".into(),
+                field: "status".into(),
                 dir: SortDir::Desc,
             },
         ]);
@@ -1697,7 +1727,7 @@ mod prepare_list_query_tests {
     fn orderby_on_a_mandatory_field_other_than_the_tiebreaker_is_accepted() {
         // Guard against over-rejection: `tenant_id` / `status` are mandatory
         // (NOT NULL) columns, so ordering by them is a valid keyset and must
-        // still gain the canonical `(created_at, id)` suffix.
+        // still gain the canonical `(window_end, id)` suffix.
         for field in ["tenant_id", "status"] {
             let mut q = ODataQuery::new();
             q.order = ODataOrderBy(vec![OrderKey {
@@ -1710,7 +1740,7 @@ mod prepare_list_query_tests {
                 &out.order,
                 &[
                     (field, SortDir::Asc),
-                    ("created_at", SortDir::Asc),
+                    ("window_end", SortDir::Asc),
                     ("id", SortDir::Asc),
                 ],
             );
@@ -1730,7 +1760,7 @@ mod prepare_list_query_tests {
                 dir: SortDir::Desc,
             },
             OrderKey {
-                field: "created_at".into(),
+                field: "window_end".into(),
                 dir: SortDir::Desc,
             },
         ]);
@@ -1739,7 +1769,7 @@ mod prepare_list_query_tests {
             &out.order,
             &[
                 ("resource_id", SortDir::Desc),
-                ("created_at", SortDir::Desc),
+                ("window_end", SortDir::Desc),
                 ("id", SortDir::Desc),
             ],
         );
@@ -1761,7 +1791,7 @@ mod prepare_list_query_tests {
         q.cursor = Some(CursorV1 {
             k: vec!["2026-06-12T00:00:00Z".into(), uuid::Uuid::nil().to_string()],
             o: SortDir::Asc,
-            s: "+created_at,+id".to_owned(),
+            s: "+window_end,+id".to_owned(),
             f: None,
             d: "fwd".to_owned(),
         });
@@ -1769,7 +1799,7 @@ mod prepare_list_query_tests {
         let out = prepare_list_query(q).expect("cursor-driven request validates");
         assert_order_keys(
             &out.order,
-            &[("created_at", SortDir::Asc), ("id", SortDir::Asc)],
+            &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
         );
     }
 
@@ -1796,7 +1826,7 @@ mod prepare_list_query_tests {
         q.cursor = Some(CursorV1 {
             k: vec!["x".into()],
             o: SortDir::Asc,
-            s: "+created_at,+id".to_owned(),
+            s: "+window_end,+id".to_owned(),
             f: Some("hash_DIFFERENT".into()),
             d: "fwd".to_owned(),
         });
@@ -1834,7 +1864,7 @@ mod prepare_list_query_tests {
         q.cursor = Some(CursorV1 {
             k: vec!["k".into(), "u".into()],
             o: SortDir::Asc,
-            s: "+created_at,+id".to_owned(),
+            s: "+window_end,+id".to_owned(),
             f: Some("h0".into()),
             d: "fwd".to_owned(),
         });
@@ -1844,7 +1874,7 @@ mod prepare_list_query_tests {
         // so the storage plugin can build the ORDER BY / keyset predicate.
         assert_order_keys(
             &out.order,
-            &[("created_at", SortDir::Asc), ("id", SortDir::Asc)],
+            &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
         );
     }
 }
@@ -2769,7 +2799,7 @@ mod handle_list_usage_records_tests {
         q.cursor = Some(CursorV1 {
             k: vec!["k".into()],
             o: SortDir::Asc,
-            s: "+created_at,+id".to_owned(),
+            s: "+window_end,+id".to_owned(),
             f: Some("hash_DIFFERENT".into()),
             d: "fwd".to_owned(),
         });

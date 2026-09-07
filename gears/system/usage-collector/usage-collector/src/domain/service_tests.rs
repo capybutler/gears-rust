@@ -3476,6 +3476,36 @@ mod query_admissibility_tests {
     }
 
     #[tokio::test]
+    async fn list_rejects_a_filter_naming_a_covered_period_bound() {
+        // Both bounds are filterable-schema fields — they have to be, for
+        // the `(window_end, id)` keyset and the cursor tokens to resolve to
+        // a column — so the reserved-field guard is the only thing between
+        // a `$filter` predicate and the plugin. A case-varied spelling now
+        // resolves as a legitimate field rather than dead-ending as an
+        // unknown one, which is why the guard compares case-insensitively.
+        for field in ["window_start", "window_end", "WINDOW_END", "Window_Start"] {
+            let (svc, spy) =
+                service_with_recording_plugin(fake_declaration_source_with_metadata(&[]));
+
+            let err = svc
+                .list_usage_records(
+                    &ctx(),
+                    meter_id(),
+                    test_time_range(),
+                    &filter_naming(field),
+                    &[],
+                )
+                .await
+                .expect_err("a $filter naming a covered-period bound must be rejected");
+            assert_reserved_field_rejection(&err);
+            assert!(
+                spy.last_list_time_range().is_none(),
+                "a rejected filter must never reach the plugin: {field}",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn list_accepts_a_filter_naming_no_reserved_field() {
         use toolkit_odata::{Page as ODataPage, PageInfo};
 
@@ -3994,5 +4024,174 @@ mod read_path_time_range_tests {
             "a non-empty $filter must not disturb the typed range on its way \
              to the SPI",
         );
+    }
+}
+
+// DESIGN §3.1 "Order admissibility" allocates the keyset to the Query
+// Gateway so the plugin *always* receives a gap-free, uniform-direction,
+// never-null order — §3.2's whole reason for a single gateway is that
+// enforcement is uniform across the SDK and REST. These tests cover the
+// surface no REST test can reach: a caller who holds a `Service` and hands
+// it an `ODataQuery` of their own construction. An unfloored order is not
+// visible in a status code — it is a keyset the plugin cannot continue, or
+// one that silently drops rows at a page boundary — so every assertion
+// here is on the order the plugin received.
+mod read_path_keyset_floor_tests {
+    use std::sync::Arc;
+
+    use toolkit_gts::gts_id;
+    use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, Page as ODataPage, SortDir};
+    use toolkit_security::SecurityContext;
+    use usage_collector_sdk::{MeterTypeId, UsageCollectorError, UsageCollectorPluginV1};
+
+    use crate::domain::Service;
+    use crate::domain::test_support::{
+        RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
+        fake_declaration_source_with_metadata, recording_plugin_resolver, test_time_range,
+    };
+
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+    fn meter_id() -> MeterTypeId {
+        MeterTypeId::new(GTS_ID).expect("valid gts_type_id")
+    }
+
+    fn ctx() -> SecurityContext {
+        authenticated_ctx()
+    }
+
+    /// Same shape as `read_path_time_range_tests`: a `Service` over the
+    /// [`RecordingPlugin`] spy, a declaration declaring no metadata keys,
+    /// and the fixed-tenant PDP fake both read paths require.
+    fn svc_and_spy() -> (Arc<Service>, Arc<RecordingPlugin>) {
+        let plugin = RecordingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_metadata(&[]))
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                RECORDING_PLUGIN_SUFFIX,
+            );
+        (service, plugin)
+    }
+
+    /// An [`ODataQuery`] whose order is exactly `keys`.
+    fn query_ordered_by(keys: &[(&str, SortDir)]) -> ODataQuery {
+        let mut query = ODataQuery::new();
+        query.order = ODataOrderBy(
+            keys.iter()
+                .map(|(field, dir)| OrderKey {
+                    field: (*field).to_owned(),
+                    dir: *dir,
+                })
+                .collect(),
+        );
+        query
+    }
+
+    /// The order the spy last received, as owned `(field, direction)` pairs.
+    fn received_order(spy: &RecordingPlugin) -> Vec<(String, SortDir)> {
+        spy.last_list_order()
+            .expect("the plugin MUST have been dispatched")
+    }
+
+    fn expected(keys: &[(&str, SortDir)]) -> Vec<(String, SortDir)> {
+        keys.iter()
+            .map(|(field, dir)| ((*field).to_owned(), *dir))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_in_process_caller_with_no_order_still_reaches_the_plugin_with_the_canonical_keyset()
+    {
+        // The case no REST test can reach, and the reason the floor is in
+        // the domain rather than in `prepare_list_query`: an in-process
+        // caller hands the service an `ODataQuery::default()`, whose order
+        // is empty. The SPI documents `query.order` as populated, so
+        // without a domain-side floor the plugin would receive a slot the
+        // contract says is filled.
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+
+        svc.list_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &[],
+        )
+        .await
+        .expect("an empty order is a complete in-process list request");
+
+        assert_eq!(
+            received_order(&spy),
+            expected(&[("window_end", SortDir::Asc), ("id", SortDir::Asc)]),
+            "the plugin MUST receive the canonical keyset, not the caller's \
+             empty order",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_process_caller_order_keeps_its_keys_and_gains_the_suffix() {
+        // The floor is a floor, not a substitution: a sound caller order
+        // survives and only gains the canonical suffix, in its own
+        // direction so the row-value comparison stays uniform.
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+
+        svc.list_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &query_ordered_by(&[("resource_id", SortDir::Desc)]),
+            &[],
+        )
+        .await
+        .expect("a uniform order on a mandatory attribute is admissible");
+
+        assert_eq!(
+            received_order(&spy),
+            expected(&[
+                ("resource_id", SortDir::Desc),
+                ("window_end", SortDir::Desc),
+                ("id", SortDir::Desc),
+            ]),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_process_order_the_floor_cannot_repair_never_reaches_the_plugin() {
+        // Mixed directions and a nullable leading key are both unsound
+        // keysets that appending a suffix cannot fix, so the service
+        // refuses before dispatch rather than forwarding them. `created_at`
+        // is in the same bucket now: it is not a record attribute, and the
+        // classification is a fail-closed allowlist.
+        for order in [
+            vec![("resource_id", SortDir::Asc), ("status", SortDir::Desc)],
+            vec![("subject_id", SortDir::Asc)],
+            vec![("created_at", SortDir::Asc)],
+        ] {
+            let (svc, spy) = svc_and_spy();
+            spy.set_list_usage_records_response(ODataPage::empty(0));
+
+            let err = svc
+                .list_usage_records(
+                    &ctx(),
+                    meter_id(),
+                    test_time_range(),
+                    &query_ordered_by(&order),
+                    &[],
+                )
+                .await
+                .expect_err("an unsound keyset must be refused before dispatch");
+            assert!(
+                matches!(err, UsageCollectorError::InvalidArgument { .. }),
+                "expected InvalidArgument for {order:?}, got {err:?}",
+            );
+            assert!(
+                spy.last_list_order().is_none(),
+                "a refused order MUST NOT reach the plugin: {order:?}",
+            );
+        }
     }
 }

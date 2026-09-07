@@ -171,9 +171,8 @@ pub struct UsageRecordDto {
     pub window_start: OffsetDateTime,
     /// Exclusive end of the covered period — the bound the read paths
     /// select on, via the mandatory `from` / `to` range
-    /// (`cpt-cf-usage-collector-adr-window-end-selection`). The keyset page
-    /// order still ends in the retired instant field's tiebreaker, which a
-    /// later commit in this slice repoints onto this bound.
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`), and the
+    /// leading key of the raw path's `(window_end, id)` page order.
     #[serde(with = "time::serde::rfc3339")]
     pub window_end: OffsetDateTime,
 }

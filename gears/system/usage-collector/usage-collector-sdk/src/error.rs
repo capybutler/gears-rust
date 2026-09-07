@@ -417,6 +417,49 @@ impl UsageCollectorError {
         }
     }
 
+    /// A caller order mixed sort directions across its keys. The keyset
+    /// continuation is a row-value tuple comparison, which only composes
+    /// over a single direction, so a mixed-direction order can never
+    /// become a usable keyset — it is refused rather than forwarded to a
+    /// plugin that would reject it late and unspecifically. Attributed to
+    /// `$orderby`, the surface a caller names an order on.
+    #[must_use]
+    pub fn mixed_direction_order() -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "$orderby".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: "order keys must all share one sort direction: keyset \
+                     pagination is a row-value tuple comparison and cannot \
+                     compose a mixed-direction tuple"
+                .to_owned(),
+        }
+    }
+
+    /// A caller order named a key that is not sound to paginate on —
+    /// either a domain-optional attribute or a name that is not a record
+    /// attribute at all. Every caller key leads the effective keyset, and
+    /// a row-value tuple whose leading column is NULL compares as NULL,
+    /// so NULL-keyed rows would silently drop out of the page. The
+    /// classification is [`crate::is_keyset_safe_record_field`], which is
+    /// a fail-closed allowlist — hence the same rejection for an unknown
+    /// name. Attributed to `$orderby`.
+    #[must_use]
+    pub fn inadmissible_order_key(field: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "$orderby".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "order key '{field}' is not supported: keyset pagination needs an \
+                 always-present record attribute, so an optional attribute or an \
+                 unrecognised name is refused"
+            ),
+        }
+    }
+
     /// A `group_by` dimension named a metadata key the queried meter's
     /// resolved declaration does not declare. The admissible `group_by`
     /// surface is recomputed per request from the declaration (Spec §3.11),

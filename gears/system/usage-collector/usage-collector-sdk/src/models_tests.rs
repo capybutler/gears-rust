@@ -1081,10 +1081,14 @@ fn usage_record_query_filter_surface_rejects_gts_type_id_inside_composite() {
 #[test]
 fn keyset_safe_record_fields_are_exactly_the_mandatory_columns() {
     // The mandatory (never-null) record attributes are sound leading keys for
-    // the plugin's row-value tuple keyset comparison.
+    // the plugin's row-value tuple keyset comparison. Both covered-period
+    // bounds are mandatory on every entry, so both qualify — `window_end`
+    // is the one the canonical keyset actually leads on, because it is the
+    // bound the read range selects on.
     for field in [
         "id",
-        "created_at",
+        "window_start",
+        "window_end",
         "tenant_id",
         "resource_id",
         "resource_type",
@@ -1094,6 +1098,51 @@ fn keyset_safe_record_fields_are_exactly_the_mandatory_columns() {
             is_keyset_safe_record_field(field),
             "`{field}` is a mandatory attribute and must be keyset-safe",
         );
+    }
+}
+
+#[test]
+fn created_at_is_no_longer_a_record_field() {
+    // An entry carries a covered period, not a creation instant, so
+    // `created_at` has to fail closed on both halves of the read surface
+    // rather than resolve to something: it is not an admissible order key,
+    // and it is not on the filterable-field schema at all. A stale
+    // `$orderby=created_at` must be rejected, never silently reinterpreted.
+    assert!(
+        !is_keyset_safe_record_field("created_at"),
+        "`created_at` is not a record attribute and must not be an order key",
+    );
+    let err = toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(
+        "created_at eq 2026-01-01T00:00:00Z",
+    )
+    .expect_err("created_at is no longer on the filterable-field schema");
+    assert!(
+        matches!(
+            &err,
+            toolkit_odata::filter::FilterError::UnknownField(name) if name == "created_at"
+        ),
+        "expected UnknownField(\"created_at\"), got {err:?}",
+    );
+}
+
+#[test]
+fn the_covered_period_bounds_resolve_on_the_filterable_field_schema() {
+    // The bounds are on this schema although a `$filter` may never name
+    // them, because the schema is also the plugin's field-to-column
+    // mapping and the `$orderby` / cursor-token vocabulary: `window_end`
+    // has to resolve to a column for the canonical `(window_end, id)`
+    // keyset to mean anything. Parsing succeeding here is therefore the
+    // intended state, and the host crate's reserved-filter-field guard —
+    // not an `UnknownField` from this schema — is what keeps a predicate
+    // off them.
+    for expr in [
+        "window_start eq 2026-01-01T00:00:00Z",
+        "window_end eq 2026-01-01T00:00:00Z",
+    ] {
+        toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(expr)
+            .unwrap_or_else(|e| {
+                panic!("`{expr}` must resolve against the filterable-field schema: {e:?}")
+            });
     }
 }
 
@@ -1118,6 +1167,11 @@ fn keyset_safe_record_field_is_fail_closed_for_unknown_names() {
     assert!(!is_keyset_safe_record_field("value"));
     assert!(!is_keyset_safe_record_field("definitely_not_a_field"));
     assert!(!is_keyset_safe_record_field(""));
+    // Exact match, not a prefix or case-folded one: the allowlist is the
+    // whole gate on the `$orderby` surface.
+    assert!(!is_keyset_safe_record_field("window_en"));
+    assert!(!is_keyset_safe_record_field("window_endd"));
+    assert!(!is_keyset_safe_record_field("WINDOW_END"));
 }
 
 // ---------------------------------------------------------------------------

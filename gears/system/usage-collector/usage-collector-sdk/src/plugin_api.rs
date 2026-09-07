@@ -91,19 +91,15 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// obligation as [`Self::query_aggregated_usage_records`], and is
     /// likewise absent from `query.filter`.
     ///
-    /// A non-empty `query.order` MUST be honoured: it is the keyset the
-    /// page continuation is built from, so ignoring it drops rows across a
-    /// page boundary.
-    ///
-    /// `query.order` is still normalized on the REST path only, where the
-    /// gateway appends the canonical unique `(created_at, id)` suffix in
-    /// the caller's sort direction; an in-process caller reaches the
-    /// service directly and may pass an [`ODataQuery`] carrying no order at
-    /// all, so a plugin cannot yet rely on the slot being populated and
-    /// falls back to its own deterministic keyset when it is empty. A
-    /// later commit in this slice moves that normalization behind the
-    /// service, making the guarantee unconditional for every caller — as
-    /// DESIGN §3.3 states it, without a per-path caveat.
+    /// `query.order` MUST be honoured: it is the keyset the page
+    /// continuation is built from, so ignoring it drops rows across a page
+    /// boundary. The gateway guarantees the slot is usable on every
+    /// surface — REST, the in-process client, and a direct service call
+    /// alike: `query.order` is non-empty, uses one sort direction
+    /// throughout, names only never-null record attributes, and ends in
+    /// the canonical unique `(window_end, id)` suffix. A plugin therefore
+    /// needs no fallback keyset of its own, and an empty order is a
+    /// gateway breach rather than a case to paper over.
     async fn list_usage_records(
         &self,
         gts_type_id: MeterTypeId,

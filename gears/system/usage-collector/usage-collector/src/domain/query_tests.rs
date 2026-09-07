@@ -1,7 +1,8 @@
-//! Unit tests for [`compose_query_with_scope`] and for
+//! Unit tests for [`compose_query_with_scope`], for
 //! [`reject_reserved_filter_fields`] / [`require_dimensions_declared`] /
-//! [`require_metadata_filter_keys_declared`], the Spec §3.11 gate on the
-//! admissible `$filter` / `group_by` / `metadata_filter` surface.
+//! [`require_metadata_filter_keys_declared`] — the Spec §3.11 gate on the
+//! admissible `$filter` / `group_by` / `metadata_filter` surface — and for
+//! [`ensure_admissible_keyset_order`], the raw path's keyset floor.
 //!
 //! There is no bounded-window guard to test: the mandatory read range is a
 //! typed [`usage_collector_sdk::TimeRange`] parameter on both read paths
@@ -10,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use toolkit_odata::{ODataQuery, ast};
+use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir, ast};
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use usage_collector_sdk::{
     AggregationDimension, MetadataFilter, MetadataKey, MeterTypeId, UsageCollectorError,
@@ -19,8 +20,8 @@ use usage_collector_sdk::{
 use uuid::Uuid;
 
 use super::{
-    compose_query_with_scope, reject_reserved_filter_fields, require_dimensions_declared,
-    require_metadata_filter_keys_declared,
+    compose_query_with_scope, ensure_admissible_keyset_order, reject_reserved_filter_fields,
+    require_dimensions_declared, require_metadata_filter_keys_declared,
 };
 
 /// Build an [`ODataQuery`] whose `$filter` is the parsed `filter` string.
@@ -318,12 +319,14 @@ fn reserved_field_match_is_case_insensitive() {
     // door (`is_keyset_safe_record_field`, `ensure_tiebreaker`) both match
     // exactly.
     //
-    // Not exploitable today: `window_start` / `window_end` are not yet
-    // filterable-schema fields, and a case-varied `gts_type_id` would
-    // dead-end as `toolkit_odata`'s own case-insensitive `UnknownField`
-    // downstream. They become filterable-schema fields later in this slice
-    // though, at which point a case-varied spelling must still hit this
-    // reservation rather than resolving as a legitimate field.
+    // Load-bearing, not theoretical: `window_start` / `window_end` are
+    // filterable-schema fields, so a case-varied spelling of one resolves
+    // as a legitimate field and would reach a plugin as a real predicate
+    // if this comparison were exact. A case-varied `gts_type_id` has a
+    // second net downstream (`toolkit_odata`'s own case-insensitive
+    // `UnknownField`, since that name is off the schema); the bounds do
+    // not, so this reservation is the only thing between `WINDOW_END` in a
+    // `$filter` and the plugin.
     for field in ["GTS_TYPE_ID", "Window_Start", "WINDOW_END"] {
         let filter = eq_predicate(field);
         let err = reject_reserved_filter_fields(&filter).expect_err(&format!(
@@ -406,4 +409,190 @@ fn metadata_filter_admissibility_is_recomputed_per_request() {
         .expect("declared a moment later: must now be admissible, without a restart");
     require_metadata_filter_keys_declared(&filters, &declared(&[]), &meter_id())
         .expect_err("withdrawn: must be rejected again on the next call");
+}
+
+// ---------------------------------------------------------------------------
+// ensure_admissible_keyset_order — the raw path's keyset floor.
+//
+// DESIGN §3.1 "Order admissibility" allocates this to the Query Gateway so
+// the plugin *always* receives a gap-free, uniform-direction, never-null
+// keyset. It lives in the domain rather than in the REST handler for that
+// reason: an in-process caller reaches `Service::list_usage_records`
+// directly with an `ODataQuery` of their own construction, and a
+// normalization at the REST edge alone left the SPI's order slot empty on
+// exactly that surface.
+// ---------------------------------------------------------------------------
+
+/// The order `query` carries, as `(field, direction)` pairs.
+fn order_of(query: &ODataQuery) -> Vec<(String, SortDir)> {
+    query
+        .order
+        .0
+        .iter()
+        .map(|key| (key.field.clone(), key.dir))
+        .collect()
+}
+
+/// An [`ODataQuery`] whose order is exactly `keys`.
+fn query_ordered_by(keys: &[(&str, SortDir)]) -> ODataQuery {
+    let mut query = ODataQuery::new();
+    query.order = ODataOrderBy(
+        keys.iter()
+            .map(|(field, dir)| OrderKey {
+                field: (*field).to_owned(),
+                dir: *dir,
+            })
+            .collect(),
+    );
+    query
+}
+
+/// Assert `query`'s order is exactly `expected`.
+fn assert_order(query: &ODataQuery, expected: &[(&str, SortDir)]) {
+    let actual = order_of(query);
+    let expected: Vec<(String, SortDir)> = expected
+        .iter()
+        .map(|(f, d)| ((*f).to_owned(), *d))
+        .collect();
+    assert_eq!(actual, expected, "effective keyset order");
+}
+
+/// Assert `err` is the canonical `$orderby` rejection.
+fn assert_orderby_rejection(err: UsageCollectorError) {
+    match err {
+        UsageCollectorError::InvalidArgument { field, reason, .. } => {
+            assert_eq!(field, "$orderby", "the rejection must blame the order");
+            assert_eq!(reason, ValidationReason::Validation);
+        }
+        other => panic!("expected InvalidArgument on $orderby, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_absent_orderby_normalizes_to_the_canonical_keyset() {
+    // `(window_end asc, id asc)`: the column the range selects on is the
+    // column the page orders by, so one index serves both, and `id` closes
+    // the run of rows that share a `window_end`.
+    let mut query = ODataQuery::new();
+    ensure_admissible_keyset_order(&mut query).expect("an empty order is floorable");
+    assert_order(
+        &query,
+        &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
+    );
+}
+
+#[test]
+fn a_descending_caller_order_gains_the_suffix_in_its_own_direction() {
+    // Row-value keyset comparison needs a uniform direction; pairing a
+    // descending caller order with an ascending suffix cannot compose.
+    let mut query = query_ordered_by(&[("resource_id", SortDir::Desc)]);
+    ensure_admissible_keyset_order(&mut query).expect("a uniform desc order is floorable");
+    assert_order(
+        &query,
+        &[
+            ("resource_id", SortDir::Desc),
+            ("window_end", SortDir::Desc),
+            ("id", SortDir::Desc),
+        ],
+    );
+}
+
+#[test]
+fn an_order_on_the_covered_period_end_gains_only_the_missing_tiebreaker() {
+    // `$orderby=window_end` already names the leading suffix key, so only
+    // `id` is appended — `ensure_tiebreaker` skips a field the order names.
+    let mut query = query_ordered_by(&[("window_end", SortDir::Asc)]);
+    ensure_admissible_keyset_order(&mut query).expect("ordering on the period end is admissible");
+    assert_order(
+        &query,
+        &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
+    );
+}
+
+#[test]
+fn the_floor_is_idempotent() {
+    // This is what makes a service-level floor safe on the REST path,
+    // where the handler has already applied it: a second application must
+    // be a no-op, not a second append.
+    let mut query = ODataQuery::new();
+    ensure_admissible_keyset_order(&mut query).expect("first application");
+    let once = order_of(&query);
+    ensure_admissible_keyset_order(&mut query).expect("second application");
+    assert_eq!(
+        order_of(&query),
+        once,
+        "re-flooring an already-floored order must not append a second suffix",
+    );
+}
+
+#[test]
+fn an_order_on_created_at_is_rejected() {
+    // `created_at` is not a record attribute any more. The floor's
+    // classification is a fail-closed allowlist, so a stale order key is
+    // refused rather than resolving to the covered period or to nothing.
+    let mut query = query_ordered_by(&[("created_at", SortDir::Asc)]);
+    let err = ensure_admissible_keyset_order(&mut query)
+        .expect_err("a retired order key must fail closed");
+    assert_orderby_rejection(err);
+}
+
+#[test]
+fn an_order_on_a_domain_optional_attribute_is_rejected() {
+    // A row-value tuple whose leading column is NULL compares as NULL, so
+    // every NULL-keyed row would silently drop out of the page.
+    for field in ["subject_id", "subject_type", "corrects_id"] {
+        let mut query = query_ordered_by(&[(field, SortDir::Asc)]);
+        let err = ensure_admissible_keyset_order(&mut query)
+            .expect_err(&format!("ordering on optional `{field}` must be refused"));
+        assert_orderby_rejection(err);
+    }
+}
+
+#[test]
+fn a_mixed_direction_order_is_rejected() {
+    // Appending a suffix cannot repair this: no direction makes a
+    // mixed-direction tuple comparison meaningful.
+    let mut query = query_ordered_by(&[("resource_id", SortDir::Asc), ("status", SortDir::Desc)]);
+    let err = ensure_admissible_keyset_order(&mut query)
+        .expect_err("a mixed-direction order must be refused");
+    assert_orderby_rejection(err);
+}
+
+#[test]
+fn a_uniform_multi_key_order_on_mandatory_attributes_is_accepted() {
+    // Guards the two rejections against over-rejecting: a uniform
+    // multi-key order over mandatory attributes is a sound keyset and must
+    // survive with the suffix appended in its own direction.
+    let mut query = query_ordered_by(&[("tenant_id", SortDir::Desc), ("status", SortDir::Desc)]);
+    ensure_admissible_keyset_order(&mut query).expect("a uniform mandatory-key order is sound");
+    assert_order(
+        &query,
+        &[
+            ("tenant_id", SortDir::Desc),
+            ("status", SortDir::Desc),
+            ("window_end", SortDir::Desc),
+            ("id", SortDir::Desc),
+        ],
+    );
+}
+
+#[test]
+fn the_floor_touches_nothing_but_the_order() {
+    // The floor runs after PDP composition, so it must not disturb the
+    // composed `$filter`, the `filter_hash` the cursor is validated
+    // against, or the page size.
+    let mut query = query_with_filter("resource_id eq 'r1'");
+    query.filter_hash = Some("h0".to_owned());
+    query.limit = Some(7);
+    let filter_before = format!("{:?}", query.filter);
+
+    ensure_admissible_keyset_order(&mut query).expect("floorable");
+
+    assert_eq!(
+        format!("{:?}", query.filter),
+        filter_before,
+        "$filter must be untouched",
+    );
+    assert_eq!(query.filter_hash.as_deref(), Some("h0"));
+    assert_eq!(query.limit, Some(7));
 }
