@@ -191,14 +191,15 @@ pub async fn handle_get_usage_record(
 /// * **`$orderby` admissibility and normalization** — a caller order is
 ///   refused here, naming `$orderby`, when it mixes sort directions or
 ///   names a key that is not a mandatory record attribute; an admissible
-///   one then gains the canonical unique `(window_end, id)` suffix in its
-///   own sort direction, so an omitted `$orderby` yields
-///   `(window_end asc, id asc)` and an `$orderby=window_end` yields
-///   `(window_end asc, id asc)` too. Both halves are
-///   [`ensure_admissible_keyset_order`]: the invariant is owned in the
-///   domain so that an in-process caller gets it too, and mirrored here so
-///   the caller's own input is blamed by name. Same arrangement as the
-///   batch-size gate on the create surface above.
+///   one then gains whichever of `window_end` / `id` it does not already
+///   name, in its own sort direction, so the sort tuple is unique. An
+///   omitted `$orderby` yields `(window_end asc, id asc)`; an
+///   `$orderby=id` yields `(id asc, window_end asc)`, because the missing
+///   key is appended and a named one is left where the caller put it. Both
+///   halves are [`ensure_admissible_keyset_order`]: the invariant is owned
+///   in the domain so that an in-process caller gets it too, and mirrored
+///   here so the caller's own input is blamed by name. Same arrangement as
+///   the batch-size gate on the create surface above.
 ///
 /// Per-key metadata filtering is the typed side-channel
 /// [`MetadataFilter`] from the SDK — `toolkit-odata` has no surface for
@@ -495,8 +496,8 @@ const METADATA_PREFIX: &str = "metadata.";
 ///    be told so they can paginate explicitly);
 /// 2. run the domain's keyset floor [`ensure_admissible_keyset_order`] on
 ///    the caller's `$orderby`, which refuses a mixed-direction or
-///    non-mandatory order key and otherwise appends the canonical unique
-///    `(window_end, id)` suffix in the caller's direction;
+///    non-mandatory order key and otherwise appends whichever of
+///    `window_end` / `id` the caller did not name, in their direction;
 /// 3. validate the optional cursor against the order derived from its own
 ///    signed tokens and the parsed filter hash.
 ///
@@ -533,21 +534,22 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
         None => query.limit = Some(MAX_PAGE_SIZE),
     }
 
-    // 2. $orderby admissibility + the canonical keyset suffix, both from
+    // 2. $orderby admissibility + the canonical keyset fields, both from
     // the domain's keyset floor. It refuses a mixed-direction order and an
     // order key that is not a mandatory record attribute — `created_at` is
     // one such name now, so a stale caller order fails closed rather than
-    // resolving — and otherwise appends `(window_end, id)` in the caller's
-    // own direction so the effective order ends in a globally-unique key.
-    // Without that suffix the plugin's keyset predicate would skip rows
-    // sharing the boundary value that did not fit on the previous page:
-    // silent data loss across page boundaries.
+    // resolving — and otherwise appends whichever of `window_end` / `id`
+    // the caller did not name, in their own direction, so the sort tuple
+    // is globally unique. Without both names the plugin's keyset predicate
+    // would skip rows sharing the boundary value that did not fit on the
+    // previous page: silent data loss across page boundaries.
     //
     // Skipped when a cursor is present: the toolkit OData extractor leaves
     // `order` empty on a cursor request (and rejects `$orderby` + `cursor`
-    // together), so the effective keyset order is reconstructed from the
-    // cursor's signed tokens in step 3 instead — and those tokens already
-    // carry the suffix minted into the cursor on the first page.
+    // together), so there is no caller order to floor yet — the effective
+    // one is reconstructed from the token's signed keys in step 3. The
+    // floor still sees it, behind the service, where it is required to
+    // already be a sound keyset rather than extended into one.
     if query.cursor.is_none() {
         ensure_admissible_keyset_order(&mut query).map_err(usage_collector_error_to_canonical)?;
     }

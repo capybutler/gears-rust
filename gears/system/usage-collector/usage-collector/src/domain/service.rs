@@ -1587,9 +1587,11 @@ impl Service {
     ///    bound is rejected in step 3 rather than merged in here.
     /// 5. **Floor the keyset** via [`ensure_admissible_keyset_order`], so
     ///    the plugin always receives the non-empty, uniform-direction,
-    ///    never-null `(window_end, id)`-terminated order its SPI promises
-    ///    — on this in-process surface exactly as on REST, which is the
-    ///    point of doing it here rather than in the handler.
+    ///    never-null order naming both `window_end` and `id` that its SPI
+    ///    promises — on this in-process surface exactly as on REST, which
+    ///    is the point of doing it here rather than in the handler. On a
+    ///    cursor request the reconstructed order is required to satisfy
+    ///    that already, and refused if it does not.
     /// 6. **Delegate** to the bound storage plugin's
     ///    `list_usage_records` SPI with the composed filter, the floored
     ///    order, and the typed `time_range`, which the plugin resolves as
@@ -1610,7 +1612,9 @@ impl Service {
     ///   reserved field, `metadata_filter` names an undeclared metadata
     ///   key, or the caller's order is not floorable into a sound keyset
     ///   (mixed sort directions, or a key that is not a mandatory record
-    ///   attribute). A malformed range cannot surface here: `time_range` arrives
+    ///   attribute) — and, on a cursor request, when the order the token
+    ///   was minted under is not one a conforming plugin could have
+    ///   produced. A malformed range cannot surface here: `time_range` arrives
     ///   already validated, because [`TimeRange`] has no public fields and
     ///   `TimeRange::new` is its only constructor.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
@@ -1683,14 +1687,17 @@ impl Service {
             // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-constraint-composition
 
             // The keyset floor: the SPI documents `query.order` as a
-            // non-empty, uniform-direction, never-null keyset, and this is
-            // the one place every caller passes through — REST, the
-            // in-process client, and a direct `Service` call alike. The
-            // REST handler validates a caller's `$orderby` before it gets
-            // here and the append is idempotent, so on that path this is a
-            // no-op; on every other path it is what makes the SPI's
-            // promise true. Composition above only rewrites `filter`, so
-            // flooring after it sees the caller's order unchanged.
+            // non-empty, uniform-direction, never-null keyset naming both
+            // canonical fields, and this is the one place every caller
+            // passes through — REST, the in-process client, and a direct
+            // `Service` call alike. The REST handler validates a caller's
+            // `$orderby` before it gets here and the floor is idempotent,
+            // so on that path this is a no-op; on every other path it is
+            // what makes the SPI's promise true. It is also the only place
+            // a cursor-reconstructed order is checked, since the handler
+            // skips the floor on that path. Composition above only
+            // rewrites `filter`, so flooring after it sees the order
+            // unchanged.
             ensure_admissible_keyset_order(&mut composed)?;
 
             let plugin = self

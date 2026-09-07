@@ -4040,9 +4040,11 @@ mod read_path_keyset_floor_tests {
     use std::sync::Arc;
 
     use toolkit_gts::gts_id;
-    use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, Page as ODataPage, SortDir};
+    use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page as ODataPage, SortDir};
     use toolkit_security::SecurityContext;
-    use usage_collector_sdk::{MeterTypeId, UsageCollectorError, UsageCollectorPluginV1};
+    use usage_collector_sdk::{
+        MeterTypeId, UsageCollectorError, UsageCollectorPluginV1, ValidationReason,
+    };
 
     use crate::domain::Service;
     use crate::domain::test_support::{
@@ -4134,8 +4136,9 @@ mod read_path_keyset_floor_tests {
     #[tokio::test]
     async fn an_in_process_caller_order_keeps_its_keys_and_gains_the_suffix() {
         // The floor is a floor, not a substitution: a sound caller order
-        // survives and only gains the canonical suffix, in its own
-        // direction so the row-value comparison stays uniform.
+        // survives and only gains the canonical fields it does not name —
+        // both, here — in its own direction, so the row-value comparison
+        // stays uniform.
         let (svc, spy) = svc_and_spy();
         spy.set_list_usage_records_response(ODataPage::empty(0));
 
@@ -4167,7 +4170,7 @@ mod read_path_keyset_floor_tests {
         // is in the same bucket now: it is not a record attribute, and the
         // classification is a fail-closed allowlist.
         for order in [
-            vec![("resource_id", SortDir::Asc), ("status", SortDir::Desc)],
+            vec![("resource_id", SortDir::Asc), ("tenant_id", SortDir::Desc)],
             vec![("subject_id", SortDir::Asc)],
             vec![("created_at", SortDir::Asc)],
         ] {
@@ -4193,5 +4196,95 @@ mod read_path_keyset_floor_tests {
                 "a refused order MUST NOT reach the plugin: {order:?}",
             );
         }
+    }
+
+    /// A continuation request as the REST handler hands it to the service:
+    /// `keys` is the order `prepare_list_query` reconstructed from the
+    /// token's signed keys, and the token is still attached.
+    fn cursor_request_ordered_by(keys: &[(&str, SortDir)]) -> ODataQuery {
+        let mut query = query_ordered_by(keys);
+        query.cursor = Some(CursorV1 {
+            k: keys.iter().map(|_| "boundary".to_owned()).collect(),
+            o: keys.first().map_or(SortDir::Asc, |(_, dir)| *dir),
+            s: query.order.to_signed_tokens(),
+            f: None,
+            d: "fwd".to_owned(),
+        });
+        query
+    }
+
+    #[tokio::test]
+    async fn a_conforming_continuation_reaches_the_plugin_with_the_order_it_was_minted_under() {
+        // No test drove a cursor request past `prepare_list_query` before,
+        // so nothing pinned that the floor leaves a continuation alone.
+        // The order here is what a conforming plugin mints: a floored
+        // order, round-tripped through the token's signed keys. The floor
+        // must be a genuine no-op — same keys, same directions, same width
+        // as the token's boundary values, which is what keeps the
+        // continuation predicate aligned.
+        let keys = [
+            ("resource_id", SortDir::Desc),
+            ("window_end", SortDir::Desc),
+            ("id", SortDir::Desc),
+        ];
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+
+        svc.list_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &cursor_request_ordered_by(&keys),
+            &[],
+        )
+        .await
+        .expect("a conforming continuation is a complete request");
+
+        assert_eq!(
+            received_order(&spy),
+            expected(&keys),
+            "a continuation MUST reach the plugin exactly as the token \
+             bound it: a widened order no longer lines up with the \
+             boundary values the token carries",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_continuation_the_floor_would_have_to_widen_never_reaches_the_plugin() {
+        // The deliberate choice this pins: on a cursor request the order is
+        // required to already be a sound keyset, not extended into one.
+        // Appending `window_end` to a one-key token would hand the plugin
+        // a two-key order against one boundary value — a misaligned
+        // continuation, which is a silently wrong page. Refusing is the
+        // observable failure. Only a forged token or a non-conforming
+        // plugin gets here.
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+
+        let err = svc
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &cursor_request_ordered_by(&[("resource_id", SortDir::Asc)]),
+                &[],
+            )
+            .await
+            .expect_err("a token bound to a non-unique keyset must be refused");
+        match err {
+            UsageCollectorError::InvalidArgument { field, reason, .. } => {
+                assert_eq!(
+                    field, "cursor",
+                    "the 400 must blame the token, not an $orderby the caller \
+                     cannot send alongside a cursor",
+                );
+                assert_eq!(reason, ValidationReason::InvalidCursor);
+            }
+            other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+        }
+        assert!(
+            spy.last_list_order().is_none(),
+            "a refused continuation MUST NOT reach the plugin",
+        );
     }
 }

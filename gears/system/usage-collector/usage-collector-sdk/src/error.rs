@@ -460,6 +460,31 @@ impl UsageCollectorError {
         }
     }
 
+    /// A continuation token's bound order is not a usable keyset.
+    ///
+    /// A cursor request carries its keyset in the token, so by the time the
+    /// read path sees it there is nothing left to normalize: the order
+    /// either already is the keyset the page was minted under, or the token
+    /// did not come from a conforming plugin. Appending a missing key would
+    /// leave the order wider than the boundary values the token carries and
+    /// hand the plugin a misaligned continuation — a silently wrong page,
+    /// where refusing is merely a refused one. Attributed to `cursor`, the
+    /// parameter the caller actually supplied, with `INVALID_CURSOR` — the
+    /// same field and code `toolkit_odata`'s own decode failures use.
+    #[must_use]
+    pub fn inadmissible_cursor_keyset(defect: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "cursor".to_owned(),
+            reason: ValidationReason::InvalidCursor,
+            detail: format!(
+                "the cursor's bound order is not a usable keyset ({defect}); \
+                 it was not minted by a conforming plugin"
+            ),
+        }
+    }
+
     /// A `group_by` dimension named a metadata key the queried meter's
     /// resolved declaration does not declare. The admissible `group_by`
     /// surface is recomputed per request from the declaration (Spec §3.11),

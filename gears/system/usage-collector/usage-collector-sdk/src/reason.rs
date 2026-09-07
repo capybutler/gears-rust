@@ -34,6 +34,11 @@ pub const INVALID_METADATA_FIELDS_EMPTY_STRING: &str = "INVALID_METADATA_FIELDS_
 pub const INVALID_METADATA_FIELDS_INVALID_KEY: &str = "INVALID_METADATA_FIELDS_INVALID_KEY";
 /// Duplicate `metadata_fields[i]` entry.
 pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUPLICATE";
+/// A continuation token was refused: malformed, or bound to an order that
+/// is not a usable keyset. Emitted by `toolkit_odata`'s own cursor decode
+/// path and by the read path's keyset floor, and enumerated on the wire as
+/// one of the `cursor` field violations in `usage-collector-v1.yaml`.
+pub const INVALID_CURSOR: &str = "INVALID_CURSOR";
 /// An aggregated query produced more distinct groups than
 /// [`crate::MAX_AGGREGATION_BUCKETS`] — typically a high-cardinality `group_by`
 /// (e.g. a per-record metadata key) over a wide range. Narrow the read-path
@@ -63,6 +68,8 @@ pub enum ValidationReason {
     MetadataFieldDuplicate,
     /// See [`AGGREGATION_RESULT_TOO_LARGE`].
     AggregationResultTooLarge,
+    /// See [`INVALID_CURSOR`].
+    InvalidCursor,
     /// Unmodeled / future reason — preserves the raw wire string.
     Unknown(String),
 }
@@ -82,6 +89,7 @@ impl ValidationReason {
             INVALID_METADATA_FIELDS_INVALID_KEY => Self::MetadataFieldInvalidKey,
             INVALID_METADATA_FIELDS_DUPLICATE => Self::MetadataFieldDuplicate,
             AGGREGATION_RESULT_TOO_LARGE => Self::AggregationResultTooLarge,
+            INVALID_CURSOR => Self::InvalidCursor,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -100,6 +108,7 @@ impl ValidationReason {
             Self::MetadataFieldInvalidKey => INVALID_METADATA_FIELDS_INVALID_KEY,
             Self::MetadataFieldDuplicate => INVALID_METADATA_FIELDS_DUPLICATE,
             Self::AggregationResultTooLarge => AGGREGATION_RESULT_TOO_LARGE,
+            Self::InvalidCursor => INVALID_CURSOR,
             Self::Unknown(s) => s.as_str(),
         }
     }

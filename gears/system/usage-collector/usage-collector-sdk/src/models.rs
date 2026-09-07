@@ -674,9 +674,10 @@ pub struct UsageRecord {
     /// spelling being [`crate::TimeRange::contains_window_end`]). Reading
     /// the end alone is what makes adjacent ranges sum without double
     /// counting. Both read paths take that range as a typed parameter and
-    /// select on this bound, and the raw path's keyset page order leads on
-    /// it too — so the column the range selects on and the column the page
-    /// orders by are one column, and one index serves both.
+    /// select on this bound, and every raw-path page order names it — so
+    /// the column the range selects on is also a sort column, and with no
+    /// caller `$orderby` it is the leading one, letting a single index
+    /// serve both.
     #[serde(with = "time::serde::rfc3339")]
     pub window_end: time::OffsetDateTime,
 }

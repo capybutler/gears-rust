@@ -18,8 +18,8 @@
 //!   map keys, so it never flows through `$filter` at all.
 //! * `ensure_admissible_keyset_order` — the raw path's keyset floor: it
 //!   guarantees every dispatch carries the non-empty, uniform-direction,
-//!   never-null order the Plugin SPI promises, whichever surface the call
-//!   came in on.
+//!   never-null order naming both canonical keyset fields that the Plugin
+//!   SPI promises, whichever surface the call came in on.
 //!
 //! Per Spec §3.11, the admissible filter and grouping surface is the fixed
 //! fields (via `$filter`, gated by [`reject_reserved_filter_fields`]) plus
@@ -114,8 +114,8 @@ pub(crate) fn compose_query_with_scope(
 /// Both covered-period bounds *are* filterable-schema fields
 /// ([`usage_collector_sdk::UsageRecordFilterField`]) — that schema doubles
 /// as the plugin's field-to-column mapping and the `$orderby` vocabulary,
-/// and `window_end` has to resolve to a column for the canonical
-/// `(window_end, id)` keyset to mean anything. This guard, not their
+/// and `window_end` has to resolve to a column for the canonical keyset to
+/// mean anything. This guard, not their
 /// absence from the schema, is the whole reason a `$filter` cannot reach
 /// them.
 const RESERVED_FILTER_FIELDS: &[&str] = &["gts_type_id", "window_start", "window_end"];
@@ -179,18 +179,27 @@ pub(crate) fn reject_reserved_filter_fields(filter: &ast::Expr) -> Result<(), Us
     }
 }
 
-/// The canonical unique keyset suffix every raw-list order ends in.
+/// The two fields every raw-list order must name for its sort tuple to be
+/// a sound keyset.
 ///
 /// `window_end` is the primary time key — the same column the read range
 /// selects on (`cpt-cf-usage-collector-adr-window-end-selection`), so one
-/// index serves both the selection and the page order — and `id` is the
-/// globally-unique final tiebreaker that stops a page boundary landing
-/// inside a run of rows sharing a `window_end`.
-const CANONICAL_KEYSET_SUFFIX: &[&str] = &[WINDOW_END_FIELD, "id"];
+/// index serves both the selection and the page order. `id` is unique per
+/// row, so an order naming it can never leave a page boundary inside a run
+/// of rows sharing every other key.
+///
+/// These are *membership* requirements, not positions. The floor appends
+/// whichever is missing, so an order naming neither ends in
+/// `(window_end, id)` — but a caller order that already names `id` keeps
+/// it where it put it (`$orderby=id` floors to `(id, window_end)`). What
+/// is guaranteed downstream is that both names are present, which is what
+/// makes the tuple unique; where they sit is not.
+const CANONICAL_KEYSET_FIELDS: &[&str] = &[WINDOW_END_FIELD, "id"];
 
 /// Guarantees `query.order` is the keyset the Plugin SPI promises: a
-/// non-empty, uniform-direction, never-null order ending in
-/// [`CANONICAL_KEYSET_SUFFIX`].
+/// non-empty, uniform-direction, never-null order that names every field
+/// in [`CANONICAL_KEYSET_FIELDS`], and so sorts on a globally unique
+/// tuple.
 ///
 /// This is the raw path's keyset **floor**, and it lives here rather than
 /// in the REST handler because DESIGN §3.1 allocates order admissibility
@@ -202,8 +211,8 @@ const CANONICAL_KEYSET_SUFFIX: &[&str] = &[WINDOW_END_FIELD, "id"];
 /// the SPI's order slot unpopulated on exactly the surface no REST test
 /// can reach.
 ///
-/// Two properties have to hold before the suffix can be appended at all,
-/// and neither can be repaired by appending:
+/// Two properties have to hold before a missing field can be appended at
+/// all, and neither can be repaired by appending:
 ///
 /// * **One direction.** The plugin's continuation is a row-value tuple
 ///   comparison (`(c1, c2, …) > ($…)`), which has no meaning across mixed
@@ -215,11 +224,35 @@ const CANONICAL_KEYSET_SUFFIX: &[&str] = &[WINDOW_END_FIELD, "id"];
 ///   classification, so an unrecognised name is refused on the same
 ///   branch.
 ///
-/// The suffix is then appended in the order's own direction (`Asc` for an
-/// empty order) via [`toolkit_odata::ODataOrderBy::ensure_tiebreaker`],
-/// which skips a field the order already names — so this is idempotent,
-/// and applying it after REST has validated an order is a no-op rather
-/// than a double append.
+/// Whichever canonical field the order does not already name is then
+/// appended in the order's own direction (`Asc` for an empty order) via
+/// [`toolkit_odata::ODataOrderBy::ensure_tiebreaker`], which skips a field
+/// the order already names — so this is idempotent, and applying it after
+/// REST has validated an order is a no-op rather than a double append. It
+/// is also why the guarantee is about membership and not position: a
+/// caller order already naming `id` keeps it where it is and gains only
+/// `window_end` after it.
+///
+/// # A cursor request is checked, never extended
+///
+/// When `query.cursor` is set the order does not come from the caller: it
+/// has been reconstructed from the token's own signed keys, and the
+/// token's boundary values line up with it one for one. There is nothing
+/// left to normalize — the order either already is the keyset the page was
+/// minted under, or the token did not come from a conforming plugin.
+/// Appending to it would widen the sort tuple past the boundary values the
+/// token carries and hand the plugin a misaligned continuation, which is a
+/// silently wrong page where refusing is merely a refused one. So on that
+/// path the same three properties are *required* rather than established,
+/// and a shortfall is [`UsageCollectorError::inadmissible_cursor_keyset`]
+/// against `cursor` — the parameter the caller actually sent, since they
+/// send no `$orderby` alongside a cursor.
+///
+/// A conforming plugin cannot trip this. It mints `next_cursor` from the
+/// order it was handed, which is a floored one, and
+/// `to_signed_tokens` / `from_signed_tokens` round-trip field names and
+/// directions exactly — so the reconstructed order passes all three checks
+/// and this call is a genuine no-op.
 ///
 /// `prepare_list_query` calls this too, on the caller's `$orderby` before
 /// any authorization or plugin work happens, so a wire request is refused
@@ -231,27 +264,59 @@ const CANONICAL_KEYSET_SUFFIX: &[&str] = &[WINDOW_END_FIELD, "id"];
 /// # Errors
 ///
 /// Returns [`UsageCollectorError::InvalidArgument`] when the order mixes
-/// sort directions, or names a key that is not a mandatory record
-/// attribute.
+/// sort directions or names a key that is not a mandatory record
+/// attribute; and, on a cursor request only, when it does not already name
+/// every [`CANONICAL_KEYSET_FIELDS`] entry.
 pub(crate) fn ensure_admissible_keyset_order(
     query: &mut ODataQuery,
 ) -> Result<(), UsageCollectorError> {
+    // A cursor request's order was reconstructed from the token, so it is
+    // checked as-is; a caller's own order is normalized. The two paths
+    // share the rules and differ only in whether a shortfall is repaired
+    // and which parameter a refusal blames.
+    let from_cursor = query.cursor.is_some();
     let keys = &query.order.0;
+
     if let Some(first) = keys.first()
         && keys.iter().any(|key| key.dir != first.dir)
     {
-        return Err(UsageCollectorError::mixed_direction_order());
+        return Err(if from_cursor {
+            UsageCollectorError::inadmissible_cursor_keyset(
+                "its keys do not share one sort direction",
+            )
+        } else {
+            UsageCollectorError::mixed_direction_order()
+        });
     }
     if let Some(bad) = keys
         .iter()
         .find(|key| !is_keyset_safe_record_field(&key.field))
     {
-        return Err(UsageCollectorError::inadmissible_order_key(&bad.field));
+        return Err(if from_cursor {
+            UsageCollectorError::inadmissible_cursor_keyset(&format!(
+                "its key '{}' is not a mandatory record attribute",
+                bad.field
+            ))
+        } else {
+            UsageCollectorError::inadmissible_order_key(&bad.field)
+        });
+    }
+
+    if from_cursor {
+        if let Some(missing) = CANONICAL_KEYSET_FIELDS
+            .iter()
+            .find(|field| !keys.iter().any(|key| key.field == **field))
+        {
+            return Err(UsageCollectorError::inadmissible_cursor_keyset(&format!(
+                "it does not name '{missing}'"
+            )));
+        }
+        return Ok(());
     }
 
     let dir = keys.last().map_or(SortDir::Asc, |key| key.dir);
     let mut order = std::mem::take(&mut query.order);
-    for &field in CANONICAL_KEYSET_SUFFIX {
+    for &field in CANONICAL_KEYSET_FIELDS {
         order = order.ensure_tiebreaker(field, dir);
     }
     query.order = order;

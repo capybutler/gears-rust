@@ -96,10 +96,15 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// boundary. The gateway guarantees the slot is usable on every
     /// surface — REST, the in-process client, and a direct service call
     /// alike: `query.order` is non-empty, uses one sort direction
-    /// throughout, names only never-null record attributes, and ends in
-    /// the canonical unique `(window_end, id)` suffix. A plugin therefore
-    /// needs no fallback keyset of its own, and an empty order is a
-    /// gateway breach rather than a case to paper over.
+    /// throughout, names only never-null record attributes, and names both
+    /// `window_end` and `id`, so the sort tuple is globally unique. A
+    /// plugin therefore needs no fallback keyset of its own, and an empty
+    /// order is a gateway breach rather than a case to paper over.
+    ///
+    /// Those two names are guaranteed to be *present*, not to be last: a
+    /// caller ordering by `id` is handed on as `(id, window_end)`. A
+    /// plugin MUST read the order it is given rather than assume a
+    /// position for either key.
     async fn list_usage_records(
         &self,
         gts_type_id: MeterTypeId,

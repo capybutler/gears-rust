@@ -11,11 +11,11 @@
 
 use std::collections::BTreeSet;
 
-use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir, ast};
+use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir, ast};
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use usage_collector_sdk::{
     AggregationDimension, MetadataFilter, MetadataKey, MeterTypeId, UsageCollectorError,
-    ValidationReason,
+    ValidationReason, is_keyset_safe_record_field,
 };
 use uuid::Uuid;
 
@@ -457,6 +457,42 @@ fn assert_order(query: &ODataQuery, expected: &[(&str, SortDir)]) {
     assert_eq!(actual, expected, "effective keyset order");
 }
 
+/// Assert `query.order` satisfies every property the Plugin SPI documents:
+/// non-empty, one sort direction throughout, only never-null keys, and
+/// both canonical keyset fields named.
+///
+/// Position is deliberately NOT asserted. The guarantee is membership —
+/// `ensure_tiebreaker` appends only what is missing, so a caller order
+/// already naming `id` keeps it leading — and asserting a shape here would
+/// re-import the positional claim the tests below exist to disprove. The
+/// two field names are spelled out rather than read from
+/// `CANONICAL_KEYSET_FIELDS` so that repointing the constant cannot make
+/// this check agree with itself vacuously.
+fn assert_keyset_guarantee(query: &ODataQuery) {
+    let keys = &query.order.0;
+    assert!(!keys.is_empty(), "the keyset must not be empty");
+    let dir = keys[0].dir;
+    assert!(
+        keys.iter().all(|key| key.dir == dir),
+        "the keyset must use one sort direction: {:?}",
+        order_of(query),
+    );
+    for key in keys {
+        assert!(
+            is_keyset_safe_record_field(&key.field),
+            "keyset key `{}` is not a never-null record attribute",
+            key.field,
+        );
+    }
+    for field in ["window_end", "id"] {
+        assert!(
+            keys.iter().any(|key| key.field == field),
+            "the keyset must name `{field}`, so the sort tuple is unique: {:?}",
+            order_of(query),
+        );
+    }
+}
+
 /// Assert `err` is the canonical `$orderby` rejection.
 fn assert_orderby_rejection(err: UsageCollectorError) {
     match err {
@@ -479,6 +515,7 @@ fn an_absent_orderby_normalizes_to_the_canonical_keyset() {
         &query,
         &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
     );
+    assert_keyset_guarantee(&query);
 }
 
 #[test]
@@ -495,6 +532,7 @@ fn a_descending_caller_order_gains_the_suffix_in_its_own_direction() {
             ("id", SortDir::Desc),
         ],
     );
+    assert_keyset_guarantee(&query);
 }
 
 #[test]
@@ -507,6 +545,62 @@ fn an_order_on_the_covered_period_end_gains_only_the_missing_tiebreaker() {
         &query,
         &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
     );
+    assert_keyset_guarantee(&query);
+}
+
+// The three cases below are the shape the guarantee is NOT: a caller order
+// that already names `id` keeps it where it is, so the floored order does
+// not end in `(window_end, id)`. Every other happy-path test here starts
+// from an order naming neither canonical field, which is why the whole
+// suite — and fifteen mutations of it — was blind to this until a spec
+// review read the claim literally.
+
+#[test]
+fn an_order_already_naming_the_tiebreaker_gains_only_the_period_end() {
+    // `$orderby=id`. `id` is on the filterable schema and keyset-safe, so
+    // this is reachable on both surfaces. `ensure_tiebreaker` skips a
+    // field the order names and appends the missing one at the end, so the
+    // result leads on `id` — and is still globally unique, which is the
+    // property that actually matters.
+    let mut query = query_ordered_by(&[("id", SortDir::Asc)]);
+    ensure_admissible_keyset_order(&mut query).expect("ordering on id is admissible");
+    assert_order(
+        &query,
+        &[("id", SortDir::Asc), ("window_end", SortDir::Asc)],
+    );
+    assert_keyset_guarantee(&query);
+}
+
+#[test]
+fn an_order_naming_both_canonical_fields_is_left_exactly_as_it_came() {
+    // `$orderby=id,window_end` — both names present, in the caller's own
+    // sequence. Nothing is appended and nothing is reordered: the floor
+    // adds names, it never rearranges them.
+    let mut query = query_ordered_by(&[("id", SortDir::Desc), ("window_end", SortDir::Desc)]);
+    ensure_admissible_keyset_order(&mut query).expect("both canonical fields named");
+    assert_order(
+        &query,
+        &[("id", SortDir::Desc), ("window_end", SortDir::Desc)],
+    );
+    assert_keyset_guarantee(&query);
+}
+
+#[test]
+fn a_caller_tiebreaker_in_the_middle_keeps_its_position() {
+    // `$orderby=tenant_id,id` floors to `(tenant_id, id, window_end)`:
+    // `window_end` lands *after* the tiebreaker, so neither canonical
+    // field is last and the sort tuple is unique regardless.
+    let mut query = query_ordered_by(&[("tenant_id", SortDir::Asc), ("id", SortDir::Asc)]);
+    ensure_admissible_keyset_order(&mut query).expect("a mandatory-key order is admissible");
+    assert_order(
+        &query,
+        &[
+            ("tenant_id", SortDir::Asc),
+            ("id", SortDir::Asc),
+            ("window_end", SortDir::Asc),
+        ],
+    );
+    assert_keyset_guarantee(&query);
 }
 
 #[test]
@@ -552,7 +646,8 @@ fn an_order_on_a_domain_optional_attribute_is_rejected() {
 fn a_mixed_direction_order_is_rejected() {
     // Appending a suffix cannot repair this: no direction makes a
     // mixed-direction tuple comparison meaningful.
-    let mut query = query_ordered_by(&[("resource_id", SortDir::Asc), ("status", SortDir::Desc)]);
+    let mut query =
+        query_ordered_by(&[("resource_id", SortDir::Asc), ("tenant_id", SortDir::Desc)]);
     let err = ensure_admissible_keyset_order(&mut query)
         .expect_err("a mixed-direction order must be refused");
     assert_orderby_rejection(err);
@@ -562,18 +657,23 @@ fn a_mixed_direction_order_is_rejected() {
 fn a_uniform_multi_key_order_on_mandatory_attributes_is_accepted() {
     // Guards the two rejections against over-rejecting: a uniform
     // multi-key order over mandatory attributes is a sound keyset and must
-    // survive with the suffix appended in its own direction.
-    let mut query = query_ordered_by(&[("tenant_id", SortDir::Desc), ("status", SortDir::Desc)]);
+    // survive, gaining both canonical fields (it names neither) in its own
+    // direction.
+    let mut query = query_ordered_by(&[
+        ("tenant_id", SortDir::Desc),
+        ("resource_type", SortDir::Desc),
+    ]);
     ensure_admissible_keyset_order(&mut query).expect("a uniform mandatory-key order is sound");
     assert_order(
         &query,
         &[
             ("tenant_id", SortDir::Desc),
-            ("status", SortDir::Desc),
+            ("resource_type", SortDir::Desc),
             ("window_end", SortDir::Desc),
             ("id", SortDir::Desc),
         ],
     );
+    assert_keyset_guarantee(&query);
 }
 
 #[test]
@@ -595,4 +695,149 @@ fn the_floor_touches_nothing_but_the_order() {
     );
     assert_eq!(query.filter_hash.as_deref(), Some("h0"));
     assert_eq!(query.limit, Some(7));
+}
+
+// ---------------------------------------------------------------------------
+// The cursor path: an order that arrived reconstructed from a token is
+// checked, never extended.
+//
+// The token's boundary values (`CursorV1::k`) line up one for one with the
+// keys it was minted under, so appending a key would widen the sort tuple
+// past the values available to compare against and hand the plugin a
+// misaligned continuation — a silently wrong page, where refusing is merely
+// a refused one. A conforming plugin cannot trip any of this: it mints
+// `next_cursor` from a floored order and the signed-token round-trip
+// preserves names and directions, so the checks pass and the call is a
+// no-op. Everything refused below is a forged token or a non-conforming
+// plugin.
+// ---------------------------------------------------------------------------
+
+/// A continuation request: `keys` as the reconstructed order, plus the
+/// cursor that order came from — the shape `prepare_list_query` hands the
+/// service on a follow-up page.
+fn cursor_request_ordered_by(keys: &[(&str, SortDir)]) -> ODataQuery {
+    let mut query = query_ordered_by(keys);
+    query.cursor = Some(CursorV1 {
+        k: keys.iter().map(|_| "boundary".to_owned()).collect(),
+        o: keys.first().map_or(SortDir::Asc, |(_, dir)| *dir),
+        s: query.order.to_signed_tokens(),
+        f: None,
+        d: "fwd".to_owned(),
+    });
+    query
+}
+
+/// Assert `err` blames `cursor` — the parameter a continuation request
+/// actually carries — with the wire code the contract enumerates for a
+/// refused token. Blaming `$orderby` here would name a parameter the
+/// caller cannot send alongside a cursor.
+fn assert_cursor_rejection(err: UsageCollectorError) {
+    match err {
+        UsageCollectorError::InvalidArgument { field, reason, .. } => {
+            assert_eq!(
+                field, "cursor",
+                "a continuation defect must blame the token"
+            );
+            assert_eq!(reason, ValidationReason::InvalidCursor);
+        }
+        other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_conforming_cursor_order_passes_through_untouched() {
+    // The default keyset, round-tripped through a token.
+    let mut query =
+        cursor_request_ordered_by(&[("window_end", SortDir::Asc), ("id", SortDir::Asc)]);
+    ensure_admissible_keyset_order(&mut query).expect("a conforming continuation is admissible");
+    assert_order(
+        &query,
+        &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
+    );
+    assert_keyset_guarantee(&query);
+}
+
+#[test]
+fn a_conforming_cursor_order_carrying_caller_keys_passes_through_untouched() {
+    // A caller `$orderby` floored on page one, then minted into the token.
+    // Arity must survive: the token carries one boundary value per key.
+    let keys = [
+        ("resource_id", SortDir::Desc),
+        ("window_end", SortDir::Desc),
+        ("id", SortDir::Desc),
+    ];
+    let mut query = cursor_request_ordered_by(&keys);
+    let arity = query.cursor.as_ref().expect("cursor").k.len();
+    ensure_admissible_keyset_order(&mut query).expect("a conforming continuation is admissible");
+    assert_order(&query, &keys);
+    assert_eq!(
+        query.order.0.len(),
+        arity,
+        "the order must stay the same width as the token's boundary values",
+    );
+    assert_keyset_guarantee(&query);
+}
+
+#[test]
+fn a_cursor_order_missing_a_canonical_field_is_refused_not_extended() {
+    // The case that would otherwise misalign: appending `window_end` here
+    // would leave a two-key order against one boundary value.
+    let mut query = cursor_request_ordered_by(&[("resource_id", SortDir::Asc)]);
+    let err = ensure_admissible_keyset_order(&mut query)
+        .expect_err("a token bound to a non-unique keyset must be refused");
+    assert_cursor_rejection(err);
+    assert_order(&query, &[("resource_id", SortDir::Asc)]);
+}
+
+#[test]
+fn a_cursor_order_missing_only_the_tiebreaker_is_refused() {
+    // `+window_end` alone: unique-enough-looking, but a page boundary
+    // inside a run of equal `window_end`s drops the rest of the run.
+    let mut query = cursor_request_ordered_by(&[("window_end", SortDir::Asc)]);
+    let err = ensure_admissible_keyset_order(&mut query)
+        .expect_err("a token missing the tiebreaker must be refused");
+    assert_cursor_rejection(err);
+}
+
+#[test]
+fn an_empty_cursor_order_is_refused_rather_than_defaulted() {
+    // An in-process caller can set a cursor with no order at all. The
+    // non-cursor path would default it to the canonical keyset; here that
+    // would invent a keyset the token was never minted under.
+    let mut query = ODataQuery::new();
+    query.cursor = Some(CursorV1 {
+        k: vec!["boundary".to_owned()],
+        o: SortDir::Asc,
+        s: "+window_end,+id".to_owned(),
+        f: None,
+        d: "fwd".to_owned(),
+    });
+    let err = ensure_admissible_keyset_order(&mut query)
+        .expect_err("an empty continuation order must be refused");
+    assert_cursor_rejection(err);
+    assert!(
+        query.order.0.is_empty(),
+        "a refused continuation must not be normalized on the way out",
+    );
+}
+
+#[test]
+fn a_cursor_order_naming_a_retired_key_is_refused_as_a_cursor_defect() {
+    // `+created_at,+id` — a token minted before the covered period landed.
+    // Refused either way; the point is the attribution, which must be the
+    // token rather than an `$orderby` the caller never sent.
+    let mut query =
+        cursor_request_ordered_by(&[("created_at", SortDir::Asc), ("id", SortDir::Asc)]);
+    let err = ensure_admissible_keyset_order(&mut query)
+        .expect_err("a token bound to a retired key must be refused");
+    assert_cursor_rejection(err);
+}
+
+#[test]
+fn a_mixed_direction_cursor_order_is_refused_as_a_cursor_defect() {
+    let mut query =
+        cursor_request_ordered_by(&[("window_end", SortDir::Asc), ("id", SortDir::Desc)]);
+    let err = ensure_admissible_keyset_order(&mut query)
+        .expect_err("a token bound to a mixed-direction keyset must be refused");
+    assert_cursor_rejection(err);
 }

@@ -1573,12 +1573,14 @@ mod prepare_list_query_tests {
 
     #[test]
     fn supplied_orderby_gets_unique_tiebreaker_appended() {
-        // The caller's explicit `$orderby` is preserved as
-        // the leading sort key, but the gateway MUST append the canonical
-        // `(window_end, id)` suffix so the effective order ends in a
-        // globally-unique key. Without it the plugin keys against a
-        // non-unique boundary and silently drops the tied rows that did not
-        // fit on the previous page.
+        // The caller's explicit `$orderby` is preserved as the leading
+        // sort key, and because it names neither canonical field the
+        // gateway appends both — so this fixture does end in
+        // `(window_end, id)`. What is guaranteed in general is only that
+        // both names are present; the domain's floor tests carry the
+        // orders where they land elsewhere. Without both, the plugin keys
+        // against a non-unique boundary and silently drops the tied rows
+        // that did not fit on the previous page.
         let mut q = ODataQuery::new();
         q.order = ODataOrderBy(vec![OrderKey {
             field: "resource_id".into(),
@@ -1660,7 +1662,7 @@ mod prepare_list_query_tests {
     fn mixed_direction_orderby_is_rejected_as_invalid_argument() {
         // The storage plugin's keyset supports only uniform-direction
         // tuples. A caller order that mixes ascending and descending keys
-        // (e.g. `$orderby=window_end asc,status desc`) can only ever
+        // (e.g. `$orderby=window_end asc,tenant_id desc`) can only ever
         // compose into a mixed-direction keyset the plugin rejects
         // downstream with a late, non-specific error. Reject it up front
         // with a typed 400 that names the real cause (mixed sort
@@ -1670,7 +1672,8 @@ mod prepare_list_query_tests {
         // Both keys are deliberately keyset-safe. With a non-mandatory
         // second key the order would be refused anyway, for the other
         // reason, and this test would stay green with the direction rule
-        // deleted.
+        // deleted. `tenant_id` rather than `status` so the fixture outlives
+        // `status` leaving the filterable schema.
         let mut q = ODataQuery::new();
         q.order = ODataOrderBy(vec![
             OrderKey {
@@ -1678,7 +1681,7 @@ mod prepare_list_query_tests {
                 dir: SortDir::Asc,
             },
             OrderKey {
-                field: "status".into(),
+                field: "tenant_id".into(),
                 dir: SortDir::Desc,
             },
         ]);
