@@ -126,7 +126,7 @@ Purely additive: nothing calls `TimeRange` yet. Task 3 threads it through.
 
 Two design points to preserve, because both are load-bearing:
 
-- The accessors are named `from_inclusive()` and `to_exclusive()`. Not `from()` / `to()` — an inherent method named `from` invites `clippy::should_implement_trait`, and the inclusivity is exactly the thing an off-by-one gets wrong. Encode it in the name.
+- The accessors are named `lower_inclusive()` and `upper_exclusive()`, both taking `self` by value (the type is `Copy`). Three names were rejected, each for a reason worth keeping: `from()` / `to()` mirror the wire parameters but a bare `from` collides with the `From` trait convention, and neither name says which end is inclusive — the thing an off-by-one gets wrong. `from_inclusive()` / `to_exclusive()` fix the second problem and trip `clippy::wrong_self_convention`, which reads `from_*` as a constructor prefix; suppressing it would also force an asymmetric `&self` / `self` pair, because clippy rules the two prefixes differently. `start_*` / `end_*` are lint-clean but reuse the entry's `window_start` / `window_end` vocabulary for a *query range*, which is the conflation this slice most needs to avoid — the range is not an entry's period, and it selects on `window_end` alone. `lower` / `upper` are lint-clean, symmetric, and unambiguous.
 - `contains_window_end` is the **only** place the predicate `from <= window_end < to` is spelled in the workspace. Test doubles and (in slice 6) the plugin contract suite call it rather than re-deriving it.
 
 - [ ] **Step 1: Write the failing tests**
@@ -146,8 +146,8 @@ fn at(secs: i64) -> OffsetDateTime {
 #[test]
 fn new_accepts_an_ordered_range() {
     let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("ordered range");
-    assert_eq!(range.from_inclusive(), at(1_700_000_000));
-    assert_eq!(range.to_exclusive(), at(1_700_003_600));
+    assert_eq!(range.lower_inclusive(), at(1_700_000_000));
+    assert_eq!(range.upper_exclusive(), at(1_700_003_600));
 }
 
 #[test]
@@ -177,10 +177,12 @@ fn new_normalizes_both_bounds_to_utc() {
         at(1_700_003_600).to_offset(offset),
     )
     .expect("ordered range");
-    assert_eq!(range.from_inclusive().offset(), UtcOffset::UTC);
-    assert_eq!(range.to_exclusive().offset(), UtcOffset::UTC);
-    // Normalization moves the offset, never the instant.
-    assert_eq!(range.from_inclusive(), at(1_700_000_000));
+    assert_eq!(range.lower_inclusive().offset(), UtcOffset::UTC);
+    assert_eq!(range.upper_exclusive().offset(), UtcOffset::UTC);
+    // Normalization moves the offset, never the instant — asserted for both
+    // bounds, because the two share a code path today and will not forever.
+    assert_eq!(range.lower_inclusive(), at(1_700_000_000));
+    assert_eq!(range.upper_exclusive(), at(1_700_003_600));
 }
 
 #[test]
@@ -214,7 +216,7 @@ fn an_entry_wider_than_the_range_is_selected_by_neither_side() {
     // [range.from - 1h, range.to + 1h) is invisible to the range, and to
     // the range before it.
     let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
-    let wide_entry_end = range.to_exclusive() + Duration::hours(1);
+    let wide_entry_end = range.upper_exclusive() + Duration::hours(1);
     assert!(!range.contains_window_end(wide_entry_end));
 
     let earlier = TimeRange::new(at(1_699_996_400), at(1_700_000_000)).expect("range");
@@ -319,14 +321,22 @@ impl TimeRange {
     }
 
     /// The inclusive lower bound, in UTC.
+    ///
+    /// Named for the bound rather than for the `from` wire parameter it
+    /// carries: a bare `from` reads as the `From` trait's constructor, and
+    /// neither wire name says which end is inclusive — which is the thing a
+    /// boundary predicate gets wrong. `lower` / `upper` also keep the query
+    /// range verbally distinct from an entry's own
+    /// `window_start` / `window_end`; the two are not the same interval.
     #[must_use]
-    pub fn from_inclusive(&self) -> OffsetDateTime {
+    pub fn lower_inclusive(self) -> OffsetDateTime {
         self.from
     }
 
-    /// The exclusive upper bound, in UTC.
+    /// The exclusive upper bound, in UTC. See [`Self::lower_inclusive`] for
+    /// why the pair is not named for the wire parameters.
     #[must_use]
-    pub fn to_exclusive(&self) -> OffsetDateTime {
+    pub fn upper_exclusive(self) -> OffsetDateTime {
         self.to
     }
 
@@ -1906,8 +1916,8 @@ fn effective_filter_hash(query: &ODataQuery, time_range: TimeRange) -> String {
     let filter = toolkit_odata::short_filter_hash(query.filter()).unwrap_or_default();
     format!(
         "{filter}~{}~{}",
-        usage_collector_sdk::id::canonical_period_bound(time_range.from_inclusive()),
-        usage_collector_sdk::id::canonical_period_bound(time_range.to_exclusive()),
+        usage_collector_sdk::id::canonical_period_bound(time_range.lower_inclusive()),
+        usage_collector_sdk::id::canonical_period_bound(time_range.upper_exclusive()),
     )
 }
 ```
@@ -2056,4 +2066,4 @@ Two additions beyond the handoff's bullet list, both stated with their reasons i
 
 **Placeholders** — none. Every code step carries the code; test steps that adapt to an existing fixture say which fixture and what to assert.
 
-**Type consistency** — `TimeRange::new` / `from_inclusive` / `to_exclusive` / `contains_window_end`, `canonical_period_bound`, `derive_usage_record_id(tenant, &gts, &key, window_start, window_end)`, `try_into_usage_record`, `effective_filter_hash(&query, time_range)`, `TYPED_LIST_PARAMS` / `TYPED_AGGREGATE_PARAMS`, `last_list_time_range` / `last_aggregate_time_range` are spelled identically in every task that names them.
+**Type consistency** — `TimeRange::new` / `lower_inclusive` / `upper_exclusive` / `contains_window_end`, `canonical_period_bound`, `derive_usage_record_id(tenant, &gts, &key, window_start, window_end)`, `try_into_usage_record`, `effective_filter_hash(&query, time_range)`, `TYPED_LIST_PARAMS` / `TYPED_AGGREGATE_PARAMS`, `last_list_time_range` / `last_aggregate_time_range` are spelled identically in every task that names them.
