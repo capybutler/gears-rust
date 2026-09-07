@@ -2151,14 +2151,23 @@ No production behaviour changes here. This exists because renaming across a larg
 ```bash
 cd gears/system/usage-collector
 
-# 1. The retired field name, anywhere in the live crates.
+# 1. The retired field name, anywhere in the live crates. This does NOT
+#    return nothing, and must not: a suite that pins a field's retirement
+#    has to name it. Read each hit and confirm it is a negative assertion
+#    (`created_at_is_no_longer_a_record_field`, `an_order_on_created_at_is_rejected`,
+#    a `json.get("created_at").is_none()`, a deliberately stale cursor
+#    token). Deleting the string would delete the guard.
 grep -rn "created_at" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
 
 # 2. The retired reason code.
 grep -rn "MISSING_TIME_WINDOW\|MissingTimeWindow\|missing_time_window" --include='*.rs' .
 
 # 3. The retired identity shape.
-grep -rn "4-tuple\|created_at_micros\|into_usage_record\b" --include='*.rs' usage-collector usage-collector-sdk
+#    `into_usage_record` must be anchored at the FRONT: unanchored it
+#    matches the replacement `try_into_usage_record` as a substring and
+#    reports every call site as a false positive.
+grep -rniE "4[- ]tuple|four[- ]tuple|created_at_micros" --include='*.rs' usage-collector usage-collector-sdk
+grep -rnE "(^|[^_a-zA-Z])into_usage_record\b" --include='*.rs' usage-collector usage-collector-sdk
 
 # 4. ADR references by number. 0007 is the identity derivation, 0014 is
 #    window-end selection, and citing either by number is what this slice
@@ -2184,7 +2193,7 @@ grep -rniE "at this commit|in this slice|later commit|not yet wired|after this p
 #    some, so this grep is not decoration: `query_tests.rs` names "slice
 #    6's plugin contract suite" and `time_range_tests.rs` cites ADR-0014
 #    by number where ground rule 5 requires the id.
-grep -rniE "task [0-9]+|slice [0-9]+" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
+grep -rniE "task [0-9]+|slice[-_ ][0-9]+" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
 
 # 8. A doc reference to a file that does not exist. Pre-existing, and the
 #    three in-scope `.rs` sites are this slice's to clear.
