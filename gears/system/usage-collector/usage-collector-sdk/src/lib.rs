@@ -14,6 +14,11 @@
 //!   `list_usage_records` is declared by [`UsageRecordQuery`] (macro-derived
 //!   via `ODataFilterable`); dynamic metadata-key filtering rides a typed
 //!   [`MetadataFilter`] side channel.
+//! - [`TimeRange`] — the validated `[from, to)` read-path range. Not a
+//!   domain model: a read-path query parameter, never a persisted entity,
+//!   which is exactly the distinction its accessor names
+//!   (`lower_inclusive` / `upper_exclusive`, not `window_start` /
+//!   `window_end`) keep separate from a record's covered period.
 //! - [`UsageCollectorError`] / [`UsageCollectorPluginError`] — flat error envelopes.
 //!   This crate does NOT depend on `toolkit-canonical-errors`; the host crate
 //!   owns the lift to RFC-9457 `Problem` on the REST surface.
@@ -28,6 +33,7 @@ pub mod models;
 pub mod plugin_api;
 pub mod reason;
 pub mod serde_helpers;
+pub mod time_range;
 
 pub use api::UsageCollectorClientV1;
 pub use error::{UsageCollectorError, UsageCollectorPluginError};
@@ -41,3 +47,4 @@ pub use models::{
 };
 pub use plugin_api::UsageCollectorPluginV1;
 pub use reason::{ConflictReason, ValidationReason};
+pub use time_range::TimeRange;

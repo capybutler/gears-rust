@@ -19,6 +19,8 @@
 
 use rust_decimal::Decimal;
 use thiserror::Error;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::gts::USAGE_RECORD_RESOURCE;
@@ -181,6 +183,35 @@ impl UsageCollectorError {
             field: "metadata".to_owned(),
             reason: ValidationReason::MetadataValidation,
             detail: format!("metadata size {size} bytes exceeds cap {cap} bytes"),
+        }
+    }
+
+    /// A read-path time range was empty or inverted (`to <= from`).
+    ///
+    /// Once Task 3 threads [`crate::TimeRange`] onto every read path, it
+    /// will select an entry when `from <= window_end < to`
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`), so a range that
+    /// is not strictly ordered would select nothing whatever is stored.
+    /// Rejecting it here names the caller's mistake instead of reporting an
+    /// empty result that would read as "no usage".
+    #[must_use]
+    pub fn invalid_time_range(from: OffsetDateTime, to: OffsetDateTime) -> Self {
+        // RFC 3339, matching the wire `Timestamp` contract: `OffsetDateTime`'s
+        // `Display` is space-separated, unpadded, and offset-suffixed rather
+        // than `Z`, so it echoes back neither what the caller sent nor
+        // anything they could resubmit. The `format` error is unreachable
+        // for a well-known descriptor; `to_string()` is a harmless fallback.
+        let from = from.format(&Rfc3339).unwrap_or_else(|_| from.to_string());
+        let to = to.format(&Rfc3339).unwrap_or_else(|_| to.to_string());
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "time_range".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "time range requires from < to (got from={from}, to={to}); supply a \
+                 lower bound strictly before the upper bound"
+            ),
         }
     }
 
