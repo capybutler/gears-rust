@@ -32,6 +32,7 @@ These carry the target model. Read the sections named, not the whole corpus.
 1. **Distrust every code sketch in this plan.** Sketches were written against the tree at `add59d9b8` and are a starting point, not a specification. Verify each API against the real source before using it. If a sketch does not match reality, **push back and say so in your report** — do not bend code to make a sketch compile. Three of the defects found in slices 1-2 originated in plan sketches.
 2. **Falsify every task before reporting done.** After the tests pass: deliberately weaken the branch the task exists to protect, confirm the corresponding test fails, restore, force a genuine rebuild, re-verify. Report the falsification honestly, including anything that did *not* fail when you expected it to.
    - Restoring with `mv` preserves mtime, so cargo skips the rebuild and your falsification silently passes. Use `cp`, then `touch` the file, and confirm a `Compiling cf-gears-…` line in the output before you trust the result. This produced one false pass in slice 2.
+   - **A `Compiling` line is necessary but not sufficient.** Task 3 hit a second false-pass mechanism: its mutation was applied by a script using a **relative** path, the working directory had reset between tool calls, the edit silently landed nowhere — and the `Compiling` line appeared anyway, because the preceding `touch` had already invalidated the artifact. The tests passed and looked like a surviving mutation. Use absolute paths in any script that edits a file, and confirm the mutation is actually present in the file (`grep` the mutated line, or `git diff --stat` showing the expected file) **before** believing a pass. A falsification that reports "mutation survived" is the single most misleading result you can produce, because it argues for deleting a test that is in fact working.
    - **Falsify more than the mutation this plan names.** A named mutation proves one test earns its place; it says nothing about what the suite as a whole would miss. For any predicate or boundary rule, enumerate the mutations a careless edit would actually produce — drop one conjunct, relax one comparison to its non-strict form, collapse a range to an equality — and check that each is caught. Task 1's review found two surviving mutations of an eight-test suite that covered both bounds and nothing between or below them, while the plan's own falsification step happened to name a mutation the suite already caught.
 3. **Tests live in a sibling `*_tests.rs` file**, hooked with
    ```rust
@@ -1699,7 +1700,9 @@ BODY
 
 **Files:**
 - Modify: `usage-collector-sdk/src/models.rs`, `.../models_tests.rs`
+- Modify: `usage-collector-sdk/src/plugin_api.rs`
 - Modify: `usage-collector/src/domain/query.rs`, `.../query_tests.rs`
+- Modify: `usage-collector/src/domain/service.rs`, `.../service_tests.rs`
 - Modify: `usage-collector/src/api/rest/handlers/usage_records.rs`, `.../usage_records_tests.rs`
 
 The range is typed now, but the filter/order surface still names `created_at`: it is a filterable field on a schema whose record no longer has it, it is the keyset-safe primary time key, and the gateway appends it as the canonical tiebreaker. All three move to `window_end`.
@@ -1820,24 +1823,38 @@ const CANONICAL_TIEBREAKER_FIELDS: &[&str] = &["window_end", "id"];
 
 Update every `(created_at, id)` mention in `prepare_list_query`'s inline comments and in the handler doc comment.
 
-- [ ] **Step 5: Bring the reserved-field guard's comment up to date**
+- [ ] **Step 5: Make the keyset guarantee unconditional, not REST-only**
+
+Task 3's review found that the Plugin SPI's order-slot guarantee is false on the in-process path, and that this contradicts the design. `DESIGN.md:587` ("Order admissibility") says the gateway appends the tiebreaker in the caller's direction "so the plugin **always** receives a gap-free, uniform-direction, never-null keyset", and allocates that to the Query Gateway — the component §3.2 exists to keep enforcement "uniform across SDK and REST". But the normalization lives in `prepare_list_query`, a REST handler helper. An in-process caller reaches `Service` directly, hands it an `ODataQuery` with an empty order, and the plugin receives a slot the SPI doc promises is populated. Five of task 3's own tests do exactly that.
+
+Two consequences make this task's problem rather than a later one's: the SPI doc currently carries a hedge saying the guarantee is REST-only, which slice 6 would otherwise encode into the plugin contract suite as the real contract; and task 5 adds the cursor fingerprint to `prepare_list_query`, which makes the handler location harder to leave afterwards.
+
+Move the keyset floor into the domain:
+
+- Add a domain function — `domain/query.rs` is its natural home, alongside the other admissibility gates — that takes an `ODataQuery` and guarantees a non-empty, uniform-direction, never-null keyset ending in the canonical `(window_end, id)` suffix. `ODataOrderBy::ensure_tiebreaker` is idempotent, so applying it in the service when REST has already done so is a no-op rather than a double append. Call it on the raw read path in `Service::list_usage_records`, before dispatch.
+- Leave at the REST edge the parts that are genuinely wire concerns: rejecting a caller's mixed-direction `$orderby`, rejecting a caller's order on a nullable field, and the cursor's order reconstruction. Those produce `400`s naming wire parameters (`$orderby`), and a caller-input rejection belongs where the caller's input is parsed. The service provides the floor; REST validates the request.
+- Then collapse the SPI paragraph to one unconditional `MUST`: `query.order` is non-empty and is a uniform-direction, never-null keyset, on every surface. Delete the hedge — this is the commit that makes it true.
+
+Pin it with a service-level test that passes `ODataQuery::default()` (empty order) straight to `Service::list_usage_records` and asserts the plugin received `(window_end asc, id asc)`. That test is the whole point: it is the case no REST test can reach.
+
+- [ ] **Step 6: Bring the reserved-field guard's comment up to date**
 
 Task 3 left this deliberately and flagged it: `RESERVED_FILTER_FIELDS`'s doc says the covered period travels "as a typed time range (`window_start` / `window_end`, landing with the record-model slice after this plan)". Task 3 made the first half true and the parenthetical definitively wrong — the record fields landed in task 2 and the typed range in task 3, so nothing is "landing after this plan" any more. Task 3 also had to drop an intra-doc link to `require_bounded_time_window` from that doc, since the item no longer exists. `is_reserved_filter_field`'s sibling prediction ("become real filterable fields in the record-model slice after this plan") is the one this task finally makes true.
 
 `usage-collector/src/domain/query.rs`'s `RESERVED_FILTER_FIELDS` doc says the covered-period bounds are "landing with the record-model slice after this plan — reserved here regardless", and `is_reserved_filter_field`'s doc says they "become real filterable fields in the record-model slice after this plan, at which point a case-varied spelling would otherwise resolve as a legitimate field". Both predictions came true in this commit. Rewrite them in the present tense: the bounds *are* filterable-schema fields now, which is exactly why the case-insensitive reservation is load-bearing rather than theoretical.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 7: Run the tests to verify they pass**
 
 ```bash
 cargo nextest run -p cf-gears-usage-collector -p cf-gears-usage-collector-sdk -p cf-gears-noop-usage-collector-plugin
 ```
 
-- [ ] **Step 7: Falsify**
+- [ ] **Step 8: Falsify**
 
 1. Add `"window_end"` back to a bare `contains`-style check by weakening `is_reserved_filter_field` to a case-sensitive comparison, then assert a `$filter` naming `WINDOW_END` is still rejected. Confirm the reserved-field test fails. Restore.
 2. Revert `CANONICAL_TIEBREAKER_FIELDS` to `["created_at", "id"]` and confirm `an_absent_orderby_normalizes_to_the_canonical_keyset` fails.
 
-- [ ] **Step 8: Verification bar and commit**
+- [ ] **Step 9: Verification bar and commit**
 
 ```bash
 git commit -s -m "feat(usage-collector)!: select and paginate on the covered-period end" -m "$(cat <<'BODY'
