@@ -1893,51 +1893,62 @@ BODY
 
 **Files:**
 - Modify: `usage-collector-sdk/src/time_range.rs`, `.../time_range_tests.rs`
+- Modify: `usage-collector/src/domain/query.rs`, `.../query_tests.rs`
+- Modify: `usage-collector/src/domain/service.rs`, `.../service_tests.rs`
 - Modify: `usage-collector/src/api/rest/handlers/usage_records.rs`, `.../usage_records_tests.rs`
 
-Why this task exists: `CursorV1.f` and `ODataQuery.filter_hash` exist so that a caller who changes their `$filter` between pages is rejected with `FILTER_MISMATCH` instead of being served a keyset continuation minted over a different row set. Until this slice the mandatory window lived *inside* `$filter`, so the fingerprint covered it for free. Task 3 moved the range out, which silently dropped that protection: a page-2 request can now carry the same cursor with a different `from` / `to` and be served. Restoring the property is one function.
+Why this task exists: `CursorV1.f` and `ODataQuery.filter_hash` exist so that a caller who changes their query between pages is rejected instead of being served a keyset continuation minted over a different row set. Until this slice the mandatory window lived *inside* `$filter`, so the fingerprint covered it for free. Task 3 moved the range out, which silently dropped that protection: a page-2 request can carry the same cursor with a different `from` / `to` and be served.
 
-This is a gateway concern, so it lives where cursor validation already lives — the REST handler. In-process SDK callers own their own cursor discipline, exactly as they do today; nothing in the service validates a cursor.
+**The fingerprint belongs behind the service, not at the REST edge.** An earlier draft of this task put it in `prepare_list_query`, which is the REST-only placement task 4's step 5 argued against for the keyset — and the argument transfers verbatim, only worse. `ODataQuery.filter_hash` is `None` for an in-process caller, and `validate_cursor_against` skips the hash comparison whenever either side is `None`, so **in-process cursor validation is already a no-op today**. Binding the range at the edge would leave an in-process caller able to hand the service a cursor minted under a different range and receive a silently wrong page — the same failure class task 4's continuation refusal exists to prevent, one layer down, and undetectable because a wrong page is a `200`.
+
+So the service owns the fingerprint end to end, and there is exactly one owner:
+
+- The service computes the fingerprint from the **caller's** filter and the range, and does so **before** `compose_query_with_scope` — composition AND-merges the server-injected PDP scope into `$filter` while deliberately preserving the caller's `filter_hash`, and hashing the composed filter would embed a value the next request's recomputation can never reproduce. `compose_query_with_scope`'s existing doc explains why at length; read it before writing this.
+- On a cursor request the service compares `cursor.f` against the fingerprint it just computed and refuses a mismatch. On any request it assigns the fingerprint onto the query it dispatches, so the plugin mints it into `next_cursor`.
+- **The REST edge stops passing `filter_hash` to `validate_cursor_against`** — pass `None` and keep only its signed-token order check. This is not optional bookkeeping: the extractor's `filter_hash` is a hash of the `$filter` alone, so leaving the edge to compare it against a cursor the plugin minted from the *filter-plus-range* fingerprint would reject every legitimate page two. Two fingerprints for one property is the bug, not the redundancy.
+
+Task 4 set the precedent this follows: the domain establishes and enforces, the edge decodes wire artifacts and rejects caller input in wire vocabulary.
 
 - [ ] **Step 1: Write the failing tests**
 
-In `usage-collector/src/api/rest/handlers/usage_records_tests.rs`, in the module that already tests `prepare_list_query` and builds `CursorV1` by hand:
+The behavioural tests belong at the **service** level, in `usage-collector/src/domain/service_tests.rs`, because the service is the owner and the in-process path is the one an edge test cannot reach. Task 4 left the fixtures you need there: `read_path_keyset_floor_tests` builds a cursor-bearing `ODataQuery` by hand and `HappyPathPlugin::last_list_order()` / `last_list_time_range()` report what the plugin received. Reuse that shape rather than inventing a fixture.
 
 ```rust
-#[test]
-fn a_cursor_minted_under_a_different_range_is_rejected() {
-    // The keyset continuation is only meaningful over the row set that
-    // minted it. Since the range left $filter it has to enter the
-    // fingerprint explicitly, or page 2 of a January query happily
-    // continues from a cursor minted over February.
-    let range_a = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
-    let range_b = TimeRange::new(at(1_800_000_000), at(1_800_003_600)).expect("range");
-
-    let mut minted = ODataQuery::default();
-    minted.filter_hash = Some(effective_filter_hash(&minted, range_a));
-
-    let mut follow_up = ODataQuery::default();
-    follow_up.cursor = Some(CursorV1 {
-        k: vec!["2023-11-14T23:13:20.000000Z".into()],
-        o: SortDir::Asc,
-        s: "+window_end,+id".into(),
-        f: minted.filter_hash.clone(),
-        d: "fwd".into(),
-    });
-
-    let err = prepare_list_query(follow_up, range_b)
-        .expect_err("a cursor from another range must be refused");
-    // assert the canonical reason is the filter-mismatch envelope, using
-    // whatever assertion the neighbouring
-    // `cursor_filter_hash_mismatch_surfaces_filter_mismatch_reason` test uses.
+#[tokio::test]
+async fn a_cursor_minted_under_a_different_range_never_reaches_the_plugin() {
+    // The continuation is only meaningful over the row set that minted it.
+    // Since the range left $filter it has to enter the fingerprint
+    // explicitly, or page 2 of a January query happily continues from a
+    // cursor minted over February — and a wrong page is a 200, so nothing
+    // else in the stack will notice.
+    //
+    // Asserted through the service, not the handler: filter_hash is None
+    // for an in-process caller and validate_cursor_against skips its
+    // comparison when either side is None, so this is exactly the caller
+    // an edge-only check leaves unprotected.
+    //
+    // Assert the plugin was never dispatched (`last_list_order().is_none()`),
+    // not merely that an Err came back.
 }
 
-#[test]
-fn a_cursor_minted_under_the_same_range_is_accepted() {
-    // …same construction, one range, expect Ok, and assert the returned
-    // query carries the reconstructed (window_end, id) order.
+#[tokio::test]
+async fn a_cursor_minted_under_the_same_range_is_served() {
+    // The other half, and the one a careless "just refuse every cursor"
+    // edit would break: same filter, same range, expect Ok and assert the
+    // plugin received the range and the reconstructed order.
 }
 
+#[tokio::test]
+async fn a_cursor_differing_only_below_the_microsecond_is_rejected() {
+    // The truncation hole the plan caught before the code existed: if the
+    // range rendering truncated to microseconds, these two ranges would
+    // fingerprint identically and this cursor would be served.
+}
+```
+
+Then a pure unit test for the fingerprint itself, next to the function in `domain/query_tests.rs`:
+
+```rust
 #[test]
 fn the_fingerprint_covers_both_the_filter_and_the_range() {
     let range_a = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
@@ -1946,18 +1957,18 @@ fn the_fingerprint_covers_both_the_filter_and_the_range() {
     let filtered = query_with_filter("tenant_id eq 11111111-1111-1111-1111-111111111111");
 
     assert_ne!(
-        effective_filter_hash(&plain, range_a),
-        effective_filter_hash(&plain, range_b),
+        read_fingerprint(&plain, range_a),
+        read_fingerprint(&plain, range_b),
         "the range must move the fingerprint",
     );
     assert_ne!(
-        effective_filter_hash(&plain, range_a),
-        effective_filter_hash(&filtered, range_a),
+        read_fingerprint(&plain, range_a),
+        read_fingerprint(&filtered, range_a),
         "the filter must move the fingerprint",
     );
     assert_eq!(
-        effective_filter_hash(&filtered, range_a),
-        effective_filter_hash(&filtered, range_a),
+        read_fingerprint(&filtered, range_a),
+        read_fingerprint(&filtered, range_a),
         "and it must be stable",
     );
 }
@@ -1971,44 +1982,81 @@ Build the `$filter`-carrying query with whatever helper the file already has for
 cargo nextest run -p cf-gears-usage-collector cursor
 ```
 
-Expected: compilation failure — `effective_filter_hash` does not exist and `prepare_list_query` takes one argument.
+Expected: compilation failure — `read_fingerprint` does not exist.
 
 - [ ] **Step 3: Implement**
 
+In `usage-collector/src/domain/query.rs`, alongside the other read-path helpers:
+
 ```rust
-/// The effective filter fingerprint a cursor is validated against, and the
-/// value the plugin mints into the next cursor.
+/// The fingerprint a keyset continuation is bound to: the caller's filter
+/// and the read range together.
 ///
 /// `CursorV1.f` exists so that a caller who changes their query between
-/// pages is refused rather than served a keyset continuation minted over a
+/// pages is refused rather than served a continuation minted over a
 /// different row set. Until the covered period became a typed parameter the
 /// mandatory window lived inside `$filter`, so
 /// `toolkit_odata::short_filter_hash` covered it for free. It no longer
 /// does, so the range enters the fingerprint here — otherwise a page-2
 /// request carrying the same cursor with a different `from` / `to` is
-/// served a continuation that means nothing over its own row set.
+/// served a continuation that means nothing over its own row set, as a
+/// `200`.
 ///
-/// The range contributes its canonical rendering rather than a second
-/// hash: the value is opaque to callers, and one fewer hashing primitive is
-/// one fewer thing that can disagree with itself. The PDP scope is
-/// deliberately absent — it is server-injected, not caller-controlled, and
-/// `compose_query_with_scope` documents why it must stay out.
-fn effective_filter_hash(query: &ODataQuery, time_range: TimeRange) -> String {
-    let filter = toolkit_odata::short_filter_hash(query.filter()).unwrap_or_default();
+/// Computed from the **caller's** query, never the composed one. The PDP
+/// scope is AND-merged into `$filter` downstream and is server-injected
+/// rather than caller-controlled, so hashing the composed filter would
+/// embed a value the next request's recomputation can never reproduce —
+/// see [`compose_query_with_scope`], which documents the same reasoning for
+/// why it preserves the caller's `filter_hash` rather than re-hashing.
+///
+/// The range contributes its canonical rendering rather than a second hash:
+/// the value is opaque to callers, and one fewer hashing primitive is one
+/// fewer thing that can disagree with itself.
+pub(crate) fn read_fingerprint(user_query: &ODataQuery, time_range: TimeRange) -> String {
+    let filter = toolkit_odata::short_filter_hash(user_query.filter()).unwrap_or_default();
     format!("{filter}~{}", time_range.canonical_form())
 }
 ```
 
+Then in `Service::list_usage_records`, before composition:
+
+```rust
+    // One owner for this property, on every surface. `filter_hash` is
+    // `None` for an in-process caller and `validate_cursor_against` skips
+    // its comparison when either side is `None`, so an edge-only check
+    // would leave an in-process caller able to continue a cursor under a
+    // different range and receive a silently wrong page.
+    let fingerprint = read_fingerprint(query, time_range);
+```
+
+and after composition, alongside the keyset floor:
+
+```rust
+    if let Some(cursor) = composed.cursor.as_ref()
+        && cursor.f.as_deref() != Some(fingerprint.as_str())
+    {
+        return Err(UsageCollectorError::cursor_query_mismatch());
+    }
+    composed.filter_hash = Some(fingerprint);
+```
+
+Order matters and should be commented: the mismatch check runs before the assignment, or it compares the fingerprint against itself.
+
+**The REST edge gives up its half.** In `prepare_list_query`, pass `None` as `validate_cursor_against`'s third argument and keep only its signed-token order check. The extractor's `filter_hash` is a hash of `$filter` alone, so an edge that kept comparing it would reject every legitimate page two the moment the plugin started minting the filter-plus-range fingerprint. Delete the edge's reliance on it rather than teaching it to compute the same value — two fingerprints for one property is the defect, not the redundancy. Say so in the comment, and name the service as the owner.
+
+A caller-facing reason code: the contract enumerates `FILTER_MISMATCH` for the `cursor` field, and a changed range is a changed query from the caller's perspective, so reuse it rather than minting a code the contract does not name. Check what `usage-collector-v1.yaml` says about the `cursor` parameter's violations before deciding, and check whether task 4 already added a `ValidationReason` you should extend rather than duplicate.
+
 The range's canonical rendering goes on `TimeRange` itself, in the SDK, rather than being composed from two `canonical_period_bound` calls at this call site:
 
 ```rust
-    /// The range's canonical text form, `<from>~<to>`, with each bound in
-    /// the fixed-width UTC form the identity derivation uses
-    /// ([`crate::id::canonical_period_bound`]).
+    /// The range's canonical text form, `<from>~<to>`, each bound at full
+    /// nanosecond resolution — deliberately **not**
+    /// [`crate::id::canonical_period_bound`]'s fixed microsecond form; see
+    /// the comment below.
     ///
     /// One spelling, because this value ends up inside an opaque
-    /// pagination cursor: the gateway folds it into the fingerprint a
-    /// cursor is validated against, so a second spelling that ordered or
+    /// pagination cursor: the service folds it into the fingerprint a
+    /// continuation is bound to, so a second spelling that ordered or
     /// padded the bounds differently would reject every cursor minted
     /// under the first.
     #[must_use]
@@ -2041,25 +2089,30 @@ Render the fingerprint at **full precision** instead: the bounds' own nanosecond
 
 Rendering at full precision has a second payoff worth knowing about, because an earlier draft of this task got it wrong in the other direction. `canonical_period_bound` carries a `debug_assert!` that its year is in `0..=9999`, justified on the grounds that the RFC 3339 wire codec cannot express anything else — a claim reasoned about the *ingestion* path. Calling it from the read path would have extended that justification to a surface nobody checked it against, since `TimeRange::new` validates ordering only and an in-process caller can construct a range outside the year range. Keeping the two renderings separate means the assert keeps covering exactly the path it was argued for, and this task inherits no claim it would have to re-justify. If you find yourself reaching for `canonical_period_bound` here anyway, that is the signal to re-read the paragraph above.
 
-`prepare_list_query(mut query: ODataQuery, time_range: TimeRange)` sets
+Verify the round trip and say so in the function doc: `compose_query_with_scope` clones `filter_hash` through to the plugin, the plugin mints `CursorV1.f` from it, and the next request recomputes the same string — so the fingerprint is self-consistent across a page boundary on both surfaces.
 
-```rust
-    query.filter_hash = Some(effective_filter_hash(&query, time_range));
-```
-
-**before** the cursor-validation block (step 3 in that function), so `validate_cursor_against` compares against the range-bound value. `prepare_list_request` passes the range it just parsed.
-
-Check the round trip while you are here: `compose_query_with_scope` clones `filter_hash` through to the plugin, the plugin mints `CursorV1.f` from it, and the next request recomputes the same string — so the fingerprint is self-consistent across a page boundary. Say so in the function doc.
+Task 4 moved the keyset floor into this same region of the service and split it into an establish-versus-require pair on the cursor branch. Read what is actually there and place the fingerprint work consistently with it rather than beside it; if the two want to be one cursor-admissibility step, say so in your report rather than assuming either shape.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-cargo nextest run -p cf-gears-usage-collector cursor
+cargo nextest run -p cf-gears-usage-collector -p cf-gears-usage-collector-sdk -p cf-gears-noop-usage-collector-plugin --no-fail-fast
 ```
 
 - [ ] **Step 5: Falsify**
 
-Drop the range from `effective_filter_hash` (return the bare `short_filter_hash`). Confirm `a_cursor_minted_under_a_different_range_is_rejected` fails. Restore with `cp` + `touch`, confirm a `Compiling` line, re-run.
+Enumerate the input shapes first, then the mutations — task 4 lost a guarantee to a fixture space that never exercised the distinguishing shape, and fifteen mutations could not substitute for it. The shapes here are: no filter and no cursor; a filter with no cursor; a cursor whose fingerprint matches; a cursor whose fingerprint differs only in the filter; a cursor whose fingerprint differs only in the range; and a cursor differing only below the microsecond in one bound.
+
+At minimum these mutations, each of which must fail at least one test:
+
+1. Drop the range from `read_fingerprint` — the whole point of the task.
+2. Drop the filter from `read_fingerprint` — proves the range did not quietly replace the property it was added to.
+3. Compute the fingerprint from the **composed** query instead of the caller's — the failure mode `compose_query_with_scope` documents, and it is silent until a PDP scope appears.
+4. Assign `filter_hash` before comparing it — the fingerprint then matches itself and every mismatch is admitted.
+5. Truncate the range rendering to microseconds — the hole the plan already caught once, and it needs a test rather than a comment.
+6. Restore the edge's `filter_hash` argument to `validate_cursor_against` — must break a legitimate page-two request, not just a malicious one.
+
+Absolute paths, confirm the mutation is present in the file before believing a pass, and report the unfiltered `--no-fail-fast` count for each.
 
 - [ ] **Step 6: Verification bar and commit**
 
@@ -2215,4 +2268,4 @@ Two additions beyond the handoff's bullet list, both stated with their reasons i
 
 **Placeholders** — none. Every code step carries the code; test steps that adapt to an existing fixture say which fixture and what to assert.
 
-**Type consistency** — `TimeRange::new` / `lower_inclusive` / `upper_exclusive` / `contains_window_end` / `canonical_form`, `canonical_period_bound`, `rfc3339`, `derive_usage_record_id(tenant, &gts, &key, window_start, window_end)`, `try_into_usage_record`, `effective_filter_hash(&query, time_range)`, `TYPED_LIST_PARAMS` / `TYPED_AGGREGATE_PARAMS`, `last_list_time_range` / `last_aggregate_time_range` are spelled identically in every task that names them.
+**Type consistency** — `TimeRange::new` / `lower_inclusive` / `upper_exclusive` / `contains_window_end` / `canonical_form`, `canonical_period_bound`, `rfc3339`, `derive_usage_record_id(tenant, &gts, &key, window_start, window_end)`, `try_into_usage_record`, `read_fingerprint(&query, time_range)`, `TYPED_LIST_PARAMS` / `TYPED_AGGREGATE_PARAMS`, `last_list_time_range` / `last_aggregate_time_range` are spelled identically in every task that names them.
