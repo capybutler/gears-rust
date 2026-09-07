@@ -1236,17 +1236,20 @@ impl HappyPathPlugin {
     pub fn last_aggregate_time_range(&self) -> Option<TimeRange> {
         *self.aggregate_time_range.lock().expect("mutex")
     }
+    /// The whole [`ODataQuery`] handed to the most-recent
+    /// `list_usage_records` dispatch, or `None` if it was never invoked.
+    /// See [`HappyPathPlugin::list_query`] for why the projections next
+    /// door are not enough.
+    #[must_use]
+    pub fn last_list_query(&self) -> Option<ODataQuery> {
+        self.list_query.lock().expect("mutex").clone()
+    }
+
     /// The keyset order handed to the most-recent `list_usage_records`
     /// dispatch as `(field, direction)` pairs, or `None` if it was never
     /// invoked. Proves the gateway floored the order the SPI requires,
     /// rather than merely that the read returned `Ok`.
     #[must_use]
-    /// The [`ODataQuery`] the most-recent `list_usage_records` dispatch
-    /// received. See [`HappyPathPlugin::list_query`].
-    pub fn last_list_query(&self) -> Option<ODataQuery> {
-        self.list_query.lock().expect("mutex").clone()
-    }
-
     pub fn last_list_order(&self) -> Option<RecordedOrder> {
         self.list_order.lock().expect("mutex").clone()
     }

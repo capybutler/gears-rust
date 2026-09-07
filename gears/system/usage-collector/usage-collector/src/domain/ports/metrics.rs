@@ -391,13 +391,19 @@ pub enum QueryErrorCategory {
     CursorDecode,
     /// Cursor `$orderby` mismatch (REST-handler boundary; reserved at this seam).
     OrderMismatch,
-    /// Cursor `$filter` mismatch (REST-handler boundary; reserved at this seam).
+    /// A continuation refused because the cursor was minted over a
+    /// different query than the request carrying it — a changed `$filter`
+    /// or a changed typed parameter (`gts_type_id`, the read range, a
+    /// `metadata.<key>` filter). Emitted at the service seam, which owns
+    /// that comparison on every surface.
     FilterMismatch,
     /// Scan-scope budget guard: a `$filter` naming a field reserved to a
     /// typed parameter, an undeclared `group_by` / `metadata_filter` key,
     /// or an aggregate result over the declared bucket cap. The mandatory
     /// read range never lands here — it is a typed parameter validated at
-    /// the edge, before the service is entered.
+    /// the edge, before the service is entered. A continuation whose bound
+    /// order is not a keyset also folds in here for want of a category
+    /// that describes it.
     QueryBudget,
     /// Plugin transport / readiness / backend failure.
     PluginError,

@@ -352,6 +352,12 @@ fn metadata_filter(key: &str) -> MetadataFilter {
     MetadataFilter::new(key, ["x".to_owned()]).expect("valid metadata filter")
 }
 
+/// A [`MetadataFilter`] on `key` over an explicit value set, for the
+/// fingerprint tests, where the values are the subject.
+fn filter_on(key: &str, values: &[&str]) -> MetadataFilter {
+    MetadataFilter::new(key, values.iter().copied()).expect("valid metadata filter")
+}
+
 /// Assert `err` is the canonical unknown-metadata-key rejection —
 /// `ValidationReason::UnknownMetadataKey`, `resource_name` carrying the
 /// queried meter (the same [`UsageCollectorError::unknown_metadata_key`]
@@ -963,6 +969,13 @@ fn a_mixed_direction_continuation_is_refused_as_a_cursor_defect() {
 // the property it was added to.
 // ---------------------------------------------------------------------------
 
+/// [`read_fingerprint`] over a fixed meter and no metadata filter, for the
+/// tests whose subject is the `$filter` or the range. The meter and the
+/// metadata filter have their own tests below.
+fn fingerprint(query: &ODataQuery, range: usage_collector_sdk::TimeRange) -> String {
+    read_fingerprint(&meter_id(), range, query, &[])
+}
+
 /// A range starting at `secs` past the epoch and running one hour.
 fn hour_from(secs: i64) -> usage_collector_sdk::TimeRange {
     let from = time::OffsetDateTime::from_unix_timestamp(secs).expect("in-range timestamp");
@@ -977,18 +990,18 @@ fn the_fingerprint_covers_both_the_filter_and_the_range() {
     let filtered = query_with_filter("resource_id eq 'r1'");
 
     assert_ne!(
-        read_fingerprint(&plain, range_a),
-        read_fingerprint(&plain, range_b),
+        fingerprint(&plain, range_a),
+        fingerprint(&plain, range_b),
         "the range must move the fingerprint",
     );
     assert_ne!(
-        read_fingerprint(&filtered, range_a),
-        read_fingerprint(&plain, range_a),
+        fingerprint(&filtered, range_a),
+        fingerprint(&plain, range_a),
         "the filter must move the fingerprint",
     );
     assert_eq!(
-        read_fingerprint(&filtered, range_a),
-        read_fingerprint(&filtered, range_a),
+        fingerprint(&filtered, range_a),
+        fingerprint(&filtered, range_a),
         "and it must be stable, or no cursor would ever validate",
     );
 }
@@ -1001,7 +1014,7 @@ fn the_fingerprint_of_a_filterless_query_still_carries_the_range() {
     // drop the range for exactly the callers who send no `$filter`.
     let plain = ODataQuery::default();
     assert!(
-        read_fingerprint(&plain, hour_from(1_700_000_000))
+        fingerprint(&plain, hour_from(1_700_000_000))
             .contains(&hour_from(1_700_000_000).canonical_form()),
         "a filterless query's fingerprint must still carry the range",
     );
@@ -1024,19 +1037,16 @@ fn the_fingerprint_separates_ranges_differing_only_below_the_microsecond() {
     .expect("range");
     let query = query_with_filter("resource_id eq 'r1'");
 
-    assert_ne!(
-        read_fingerprint(&query, coarse),
-        read_fingerprint(&query, nudged),
-    );
+    assert_ne!(fingerprint(&query, coarse), fingerprint(&query, nudged),);
 }
 
 #[test]
 fn a_cursor_carrying_the_same_fingerprint_is_accepted() {
-    let fingerprint = read_fingerprint(&ODataQuery::default(), hour_from(1_700_000_000));
+    let bound = fingerprint(&ODataQuery::default(), hour_from(1_700_000_000));
     let mut query = continuation_ordered_by(&[("window_end", SortDir::Asc), ("id", SortDir::Asc)]);
-    query.cursor.as_mut().expect("cursor").f = Some(fingerprint.clone());
+    query.cursor.as_mut().expect("cursor").f = Some(bound.clone());
 
-    require_cursor_fingerprint(query.cursor.as_ref().expect("cursor"), &fingerprint)
+    require_cursor_fingerprint(query.cursor.as_ref().expect("cursor"), &bound)
         .expect("a cursor minted over this very query must be accepted");
 }
 
@@ -1044,14 +1054,14 @@ fn a_cursor_carrying_the_same_fingerprint_is_accepted() {
 fn a_cursor_carrying_a_different_fingerprint_is_refused_as_a_query_mismatch() {
     let query = continuation_ordered_by(&[("window_end", SortDir::Asc), ("id", SortDir::Asc)]);
     let mut cursor = query.cursor.expect("cursor");
-    cursor.f = Some(read_fingerprint(
+    cursor.f = Some(fingerprint(
         &ODataQuery::default(),
         hour_from(1_800_000_000),
     ));
 
     let err = require_cursor_fingerprint(
         &cursor,
-        &read_fingerprint(&ODataQuery::default(), hour_from(1_700_000_000)),
+        &fingerprint(&ODataQuery::default(), hour_from(1_700_000_000)),
     )
     .expect_err("a cursor minted over another query must be refused");
     assert_query_mismatch_rejection(err);
@@ -1073,7 +1083,7 @@ fn a_cursor_carrying_no_fingerprint_at_all_is_refused() {
 
     let err = require_cursor_fingerprint(
         &cursor,
-        &read_fingerprint(&ODataQuery::default(), hour_from(1_700_000_000)),
+        &fingerprint(&ODataQuery::default(), hour_from(1_700_000_000)),
     )
     .expect_err("an unbound cursor must be refused rather than admitted");
     assert_query_mismatch_rejection(err);
@@ -1091,5 +1101,161 @@ fn assert_query_mismatch_rejection(err: UsageCollectorError) {
             assert_eq!(reason, ValidationReason::FilterMismatch);
         }
         other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_fingerprint_covers_the_meter() {
+    // `gts_type_id` is a typed parameter, so no filter hash has ever
+    // covered it. Without it here a caller can continue a cursor against
+    // another meter entirely and be served rows from a table the token
+    // knows nothing about — the widest version of the wrong-page failure,
+    // and still a `200`.
+    let range = hour_from(1_700_000_000);
+    let other = MeterTypeId::new(toolkit_gts::gts_id!(
+        "cf.core.uc.usage_record.v1~cf.mini_chat._.other_meter.v1~"
+    ))
+    .expect("valid gts_type_id");
+    assert_ne!(meter_id(), other, "precondition: two different meters");
+
+    assert_ne!(
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), &[]),
+        read_fingerprint(&other, range, &ODataQuery::default(), &[]),
+    );
+}
+
+#[test]
+fn the_fingerprint_covers_the_metadata_filter() {
+    // The other typed row-selector, and the one the `toolkit-odata` grammar
+    // cannot express at all — so it never travels through `$filter` and no
+    // filter hash can reach it.
+    let range = hour_from(1_700_000_000);
+    let plain: &[MetadataFilter] = &[];
+    let region_eu = [filter_on("region", &["eu"])];
+    let region_us = [filter_on("region", &["us"])];
+
+    assert_ne!(
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), plain),
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), &region_eu),
+        "adding a metadata filter must move the fingerprint",
+    );
+    assert_ne!(
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), &region_eu),
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), &region_us),
+        "and so must changing one of its values",
+    );
+}
+
+#[test]
+fn the_fingerprint_ignores_how_a_metadata_filter_was_spelled() {
+    // The over-rejection half, and it is not theoretical: a REST caller's
+    // repeated `metadata.<key>` parameters reach `MetadataFilter::values`
+    // in query-string order with duplicates intact, and an in-process
+    // caller can hand over the entries in any order. All four spellings
+    // below are the same query — OR within a key, AND across keys — so a
+    // rendering that read the slice verbatim would refuse a perfectly
+    // valid page two for a caller who merely re-ordered their own query
+    // string.
+    let range = hour_from(1_700_000_000);
+    let canonical = [
+        filter_on("region", &["eu", "us"]),
+        filter_on("tier", &["gold"]),
+    ];
+    let equivalents = [
+        // Entries in the other order.
+        vec![
+            filter_on("tier", &["gold"]),
+            filter_on("region", &["eu", "us"]),
+        ],
+        // Values in the other order.
+        vec![
+            filter_on("region", &["us", "eu"]),
+            filter_on("tier", &["gold"]),
+        ],
+        // A repeated value: `?metadata.region=eu&metadata.region=eu&…`.
+        vec![
+            filter_on("region", &["eu", "us", "eu"]),
+            filter_on("tier", &["gold"]),
+        ],
+    ];
+
+    let expected = read_fingerprint(&meter_id(), range, &ODataQuery::default(), &canonical);
+    for (i, spelling) in equivalents.iter().enumerate() {
+        assert_eq!(
+            read_fingerprint(&meter_id(), range, &ODataQuery::default(), spelling),
+            expected,
+            "spelling {i} means the same query and MUST fingerprint the same",
+        );
+    }
+}
+
+#[test]
+fn the_fingerprint_separates_two_filters_on_one_key_from_one_merged_filter() {
+    // Normalization must not go so far as to merge same-key entries:
+    // `region in {eu} AND region in {us}` selects nothing, while
+    // `region in {eu, us}` selects both. Two different queries, so two
+    // different fingerprints — a merge here would let a cursor minted
+    // under the second be served against the first.
+    let range = hour_from(1_700_000_000);
+    let two = [filter_on("region", &["eu"]), filter_on("region", &["us"])];
+    let merged = [filter_on("region", &["eu", "us"])];
+
+    assert_ne!(
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), &two),
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), &merged),
+    );
+}
+
+#[test]
+fn the_fingerprint_is_injective_across_field_boundaries() {
+    // Why the rendering is length-prefixed rather than separator-joined.
+    // A metadata key is domain-opaque — `MetadataKey::new` rejects only the
+    // empty string and NUL — and a value is unconstrained, so a field's
+    // content can contain whatever separator the rendering picks. A field
+    // whose content imitates a boundary makes two different queries render
+    // alike, and a cursor minted under one then validates against the
+    // other.
+    //
+    // The first pair is a REAL collision under `field + sep` joining, and
+    // finding it meant constructing against that mutant rather than
+    // guessing: the `("a", ["bc"])` / `("ab", ["c"])` pair further down
+    // does NOT collide, because the rendering interleaves a value count
+    // between key and value and the two counts disagree. A separator-join
+    // mutation survived the whole suite until this pair existed. With `~`
+    // as the separator both sides here render `…~x~2~1~a~`: on the left the
+    // key `x~2` splits into exactly the two tokens the right side builds
+    // from a key and its value count.
+    let range = hour_from(1_700_000_000);
+    let fp = |metadata: &[MetadataFilter]| {
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), metadata)
+    };
+
+    for (left, right) in [
+        // Collides under a `~` join — the GTS terminator, and
+        // `canonical_form`'s own join between its two bounds.
+        (
+            vec![filter_on("x~2", &["a"])],
+            vec![filter_on("x", &["1", "a"])],
+        ),
+        // The same construction against a `:` join, the character the
+        // length prefix itself uses, so a "just swap the delimiter" edit
+        // is covered too.
+        (
+            vec![filter_on("x:2", &["a"])],
+            vec![filter_on("x", &["1", "a"])],
+        ),
+        // Different queries whether or not a given join happens to
+        // collide on them.
+        (vec![filter_on("a", &["bc"])], vec![filter_on("ab", &["c"])]),
+        (
+            vec![filter_on("k", &["a~b"])],
+            vec![filter_on("k~a", &["b"])],
+        ),
+    ] {
+        assert_ne!(
+            fp(&left),
+            fp(&right),
+            "{left:?} and {right:?} are different queries",
+        );
     }
 }

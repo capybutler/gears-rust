@@ -4225,7 +4225,12 @@ mod read_path_keyset_floor_tests {
                 .collect(),
             o: query.order.0[0].dir,
             s: signed,
-            f: Some(read_fingerprint(&query, test_time_range())),
+            f: Some(read_fingerprint(
+                &meter_id(),
+                test_time_range(),
+                &query,
+                &[],
+            )),
             d: "fwd".to_owned(),
         });
         query
@@ -4332,7 +4337,8 @@ mod read_path_cursor_fingerprint_tests {
     use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, Page as ODataPage, SortDir};
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
-        MeterTypeId, TimeRange, UsageCollectorError, UsageCollectorPluginV1, ValidationReason,
+        MetadataFilter, MeterTypeId, TimeRange, UsageCollectorError, UsageCollectorPluginV1,
+        ValidationReason,
     };
 
     use crate::domain::Service;
@@ -4354,15 +4360,37 @@ mod read_path_cursor_fingerprint_tests {
 
     /// Same shape as `read_path_keyset_floor_tests`.
     fn svc_and_spy() -> (Arc<Service>, Arc<RecordingPlugin>) {
+        svc_and_spy_declaring(&[])
+    }
+
+    /// The same, over a declaration declaring exactly `declared` metadata
+    /// keys — a `metadata_filter` naming an undeclared key is refused by
+    /// the query-surface gate long before the fingerprint is compared, so
+    /// the metadata shapes need their keys declared to reach the subject.
+    fn svc_and_spy_declaring(declared: &[&str]) -> (Arc<Service>, Arc<RecordingPlugin>) {
         let plugin = RecordingPlugin::new();
         let service = ServiceFixture::default()
-            .with_source(fake_declaration_source_with_metadata(&[]))
+            .with_source(fake_declaration_source_with_metadata(declared))
             .with_resolver(recording_plugin_resolver())
             .build(
                 Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
                 RECORDING_PLUGIN_SUFFIX,
             );
         (service, plugin)
+    }
+
+    /// A second meter, so a cursor can be replayed against another one.
+    /// `FakeDeclarationSource` resolves every id alike, so both are usable.
+    fn other_meter_id() -> MeterTypeId {
+        MeterTypeId::new(gts_id!(
+            "cf.core.uc.usage_record.v1~cf.mini_chat._.other_meter.v1~"
+        ))
+        .expect("valid gts_type_id")
+    }
+
+    /// A [`MetadataFilter`] on `key` over `values`.
+    fn filter_on(key: &str, values: &[&str]) -> MetadataFilter {
+        MetadataFilter::new(key, values.iter().copied()).expect("valid metadata filter")
     }
 
     /// A range one hour wide, `offset` nanoseconds past the epoch.
@@ -4386,10 +4414,16 @@ mod read_path_cursor_fingerprint_tests {
     /// dispatch rather than a `read_fingerprint` call so the value under
     /// test is the one the service actually put on the wire to the plugin.
     /// A conforming plugin copies it into `next_cursor.f`.
-    async fn mint_fingerprint(query: &ODataQuery, range: TimeRange) -> String {
-        let (svc, spy) = svc_and_spy();
+    async fn mint_fingerprint(
+        meter: &MeterTypeId,
+        range: TimeRange,
+        query: &ODataQuery,
+        metadata: &[MetadataFilter],
+        declared: &[&str],
+    ) -> String {
+        let (svc, spy) = svc_and_spy_declaring(declared);
         spy.set_list_usage_records_response(ODataPage::empty(0));
-        svc.list_usage_records(&ctx(), meter_id(), range, query, &[])
+        svc.list_usage_records(&ctx(), meter.clone(), range, query, metadata)
             .await
             .expect("page one is a complete request");
         spy.last_list_query()
@@ -4451,7 +4485,7 @@ mod read_path_cursor_fingerprint_tests {
         // string from its own `$filter` and range.
         let caller = query_with_filter("resource_id eq 'r1'");
         let range = test_time_range();
-        let fingerprint = mint_fingerprint(&caller, range).await;
+        let fingerprint = mint_fingerprint(&meter_id(), range, &caller, &[], &[]).await;
 
         let (svc, spy) = svc_and_spy();
         spy.set_list_usage_records_response(ODataPage::empty(0));
@@ -4506,7 +4540,7 @@ mod read_path_cursor_fingerprint_tests {
         let january = test_time_range();
         let february = range_at(60 * 60 * 24 * 31 * 1_000_000_000);
         assert_ne!(january, february, "precondition: two different ranges");
-        let fingerprint = mint_fingerprint(&caller, january).await;
+        let fingerprint = mint_fingerprint(&meter_id(), january, &caller, &[], &[]).await;
 
         let (svc, spy) = svc_and_spy();
         spy.set_list_usage_records_response(ODataPage::empty(0));
@@ -4538,7 +4572,7 @@ mod read_path_cursor_fingerprint_tests {
         let caller = query_with_filter("resource_id eq 'r1'");
         let coarse = range_at(0);
         let nudged = range_at(1);
-        let fingerprint = mint_fingerprint(&caller, coarse).await;
+        let fingerprint = mint_fingerprint(&meter_id(), coarse, &caller, &[], &[]).await;
 
         let (svc, spy) = svc_and_spy();
         spy.set_list_usage_records_response(ODataPage::empty(0));
@@ -4564,7 +4598,14 @@ mod read_path_cursor_fingerprint_tests {
         // implementation that fingerprinted the range alone would lose it
         // silently while every range test above stayed green.
         let range = test_time_range();
-        let fingerprint = mint_fingerprint(&query_with_filter("resource_id eq 'r1'"), range).await;
+        let fingerprint = mint_fingerprint(
+            &meter_id(),
+            range,
+            &query_with_filter("resource_id eq 'r1'"),
+            &[],
+            &[],
+        )
+        .await;
         let page_two = query_with_filter("resource_id eq 'r2'");
 
         let (svc, spy) = svc_and_spy();
@@ -4608,6 +4649,122 @@ mod read_path_cursor_fingerprint_tests {
     }
 
     #[tokio::test]
+    async fn a_cursor_minted_against_another_meter_never_reaches_the_plugin() {
+        // The widest version of the wrong-page failure: `gts_type_id` is a
+        // typed parameter, so no filter hash ever covered it, and without
+        // it in the fingerprint a caller can continue a cursor against a
+        // different meter and be served rows from a set the token knows
+        // nothing about.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+        let fingerprint = mint_fingerprint(&meter_id(), range, &caller, &[], &[]).await;
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(
+                &ctx(),
+                other_meter_id(),
+                range,
+                &continuation_of(&caller, &fingerprint),
+                &[],
+            )
+            .await
+            .expect_err("a cursor minted against another meter must be refused");
+
+        assert_query_mismatch(&err);
+        assert!(
+            spy.last_list_order().is_none(),
+            "a refused continuation MUST NOT reach the plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_minted_under_a_different_metadata_filter_never_reaches_the_plugin() {
+        // The other typed row-selector, and the one `$filter` cannot even
+        // express — the `toolkit-odata` grammar has no surface for a
+        // dynamic JSON-map key, which is why `metadata_filter` is a
+        // parameter of its own and why a filter hash reaches none of it.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+        let declared = ["region"];
+        let fingerprint = mint_fingerprint(
+            &meter_id(),
+            range,
+            &caller,
+            &[filter_on("region", &["eu"])],
+            &declared,
+        )
+        .await;
+
+        let (svc, spy) = svc_and_spy_declaring(&declared);
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                range,
+                &continuation_of(&caller, &fingerprint),
+                &[filter_on("region", &["us"])],
+            )
+            .await
+            .expect_err("a cursor minted under another metadata filter must be refused");
+
+        assert_query_mismatch(&err);
+        assert!(
+            spy.last_list_order().is_none(),
+            "a refused continuation MUST NOT reach the plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_filter_respelled_the_same_way_still_paginates() {
+        // The over-rejection guard, at the service rather than in a
+        // rendering unit test: a REST caller's repeated `metadata.<key>`
+        // parameters arrive in query-string order with duplicates intact,
+        // so page two of an unchanged query can legitimately carry the
+        // same value set in a different spelling. That is the same query
+        // and MUST still be served — a fingerprint that read the slice
+        // verbatim would refuse it.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+        let declared = ["region", "tier"];
+        let fingerprint = mint_fingerprint(
+            &meter_id(),
+            range,
+            &caller,
+            &[
+                filter_on("region", &["eu", "us"]),
+                filter_on("tier", &["gold"]),
+            ],
+            &declared,
+        )
+        .await;
+
+        let (svc, spy) = svc_and_spy_declaring(&declared);
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        svc.list_usage_records(
+            &ctx(),
+            meter_id(),
+            range,
+            &continuation_of(&caller, &fingerprint),
+            // Entries swapped, values re-ordered, and one value repeated —
+            // all three are things a caller's own query string does.
+            &[
+                filter_on("tier", &["gold"]),
+                filter_on("region", &["us", "eu", "us"]),
+            ],
+        )
+        .await
+        .expect("a re-spelled but identical metadata filter MUST still paginate");
+
+        assert!(
+            spy.last_list_order().is_some(),
+            "the continuation MUST have reached the plugin",
+        );
+    }
+
+    #[tokio::test]
     async fn the_dispatched_fingerprint_is_computed_from_the_callers_filter_not_the_composed_one() {
         // `compose_query_with_scope` AND-merges the server-injected PDP
         // scope into `$filter` and deliberately preserves the caller's
@@ -4638,7 +4795,7 @@ mod read_path_cursor_fingerprint_tests {
         );
         assert_eq!(
             dispatched.filter_hash,
-            Some(read_fingerprint(&caller, range)),
+            Some(read_fingerprint(&meter_id(), range, &caller, &[])),
             "the fingerprint the plugin mints MUST be the caller's filter \
              and range, never the composed filter",
         );

@@ -506,18 +506,20 @@ impl UsageCollectorError {
     /// `CursorV1::f` exists so a caller who changes their query between
     /// pages is refused rather than served a keyset continuation that means
     /// nothing over their new row set — and a wrong page is a `200`, so
-    /// nothing else in the stack would notice. The bound query is the
-    /// caller's `$filter` **and** the read range together: the range is a
-    /// typed parameter rather than a `$filter` conjunct, so it has to enter
-    /// the fingerprint explicitly or a page-2 request could carry the same
-    /// cursor with a different `from` / `to` and be served.
+    /// nothing else in the stack would notice. The bound query is every
+    /// input that selects rows: the caller's `$filter` and the three typed
+    /// parameters — `gts_type_id`, the read range, and `metadata_filter`.
+    /// None of the three is a `$filter` conjunct, so each has to enter the
+    /// fingerprint explicitly; otherwise a page-2 request could carry the
+    /// same cursor against a different meter, range or metadata filter and
+    /// be served.
     ///
     /// Attributed to `cursor` with `FILTER_MISMATCH` — the code
     /// `usage-collector-v1.yaml` already enumerates for that parameter, and
     /// the one `toolkit_odata`'s own filter-hash comparison emits, because
-    /// a changed range is a changed query from the caller's side. Minting a
-    /// new code for the range would split one caller-visible condition
-    /// across two.
+    /// a changed range, meter or metadata filter is a changed query from
+    /// the caller's side. Minting a new code per typed parameter would
+    /// split one caller-visible condition across four.
     ///
     /// The detail names the recovery rather than the mismatching value: the
     /// fingerprint is opaque and a caller can do nothing with either half
@@ -529,7 +531,11 @@ impl UsageCollectorError {
             resource_name: None,
             field: "cursor".to_owned(),
             reason: ValidationReason::FilterMismatch,
-            detail: "the cursor was minted over a different query: continue a page by                      resending the same request, cursor apart, or restart pagination                      without a cursor. Both $filter and the from / to range are bound                      into the cursor, so changing either invalidates it"
+            detail: "the cursor was minted over a different query: continue a page by \
+                     resending the same request, cursor apart, or restart pagination \
+                     without a cursor. The cursor binds gts_type_id, the from / to \
+                     range, $filter and every metadata.<key> filter, so changing any \
+                     of them invalidates it"
                 .to_owned(),
         }
     }

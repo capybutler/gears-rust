@@ -278,11 +278,15 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
 /// Project a completed query attempt onto `(outcome, error_category)` for
 /// `uc_query_requests_total` per usage-query.md `inst-*-telemetry-complete`.
 ///
-/// **Seam note:** the finer REST-handler categories (`cursor_decode`,
-/// `order_mismatch`, `filter_mismatch`, `missing_security_context`) surface
-/// only at the REST boundary (parsing / cursor validation), upstream of this
-/// service seam, so they are reserved-not-emitted here (as the doc specifies).
-/// A PDP-transport failure and a plugin fault both surface as
+/// **Seam note:** `cursor_decode`, `order_mismatch` and
+/// `missing_security_context` surface only at the REST boundary (token
+/// decoding, parsing), upstream of this service seam, so they stay
+/// reserved-not-emitted here. `filter_mismatch` is **not** one of them any
+/// more: the query a continuation is bound to is compared behind the
+/// service, by [`require_cursor_fingerprint`], and the REST edge passes
+/// `toolkit_odata::validate_cursor_against` no filter hash at all — so this
+/// seam is now the only place that category can arise, and it is emitted
+/// here. A PDP-transport failure and a plugin fault both surface as
 /// `ServiceUnavailable` at this seam and both map to `plugin_error`; the
 /// authoritative PDP-unavailability signal is the foundation-owned
 /// `uc_pdp_failures_total`.
@@ -297,15 +301,35 @@ fn classify_query_result<T>(
         Err(UsageCollectorError::NotFound { .. }) => {
             (RequestOutcome::Error, QueryErrorCategory::UnknownUsageType)
         }
-        // Every service-level `InvalidArgument` on the query path is a
-        // query-budget / query-surface rejection: a `$filter` naming a
-        // reserved field, an undeclared `group_by` / `metadata_filter` key,
-        // or an over-cap aggregate result. The mandatory range cannot land
-        // here — it is validated where the typed parameter is parsed, at
-        // the edge, before the service is entered at all.
-        Err(UsageCollectorError::InvalidArgument { .. }) => {
-            (RequestOutcome::Error, QueryErrorCategory::QueryBudget)
-        }
+        // `InvalidArgument` covers two unrelated conditions on the query
+        // path, so it discriminates on the typed reason rather than
+        // collapsing both into one label.
+        //
+        // `FILTER_MISMATCH` is a continuation refused because the cursor
+        // was minted over a different query: not a budget or surface
+        // rejection at all, and it has its own category. Everything else
+        // is a query-budget / query-surface rejection — a `$filter` naming
+        // a reserved field, an undeclared `group_by` / `metadata_filter`
+        // key, or an over-cap aggregate result.
+        //
+        // One known imprecision, inherited rather than introduced: a
+        // continuation whose bound ORDER is not a keyset arrives as
+        // `INVALID_CURSOR` and folds into `query_budget` too, which it is
+        // not either. Neither `cursor_decode` (a decode failure, genuinely
+        // edge-only) nor `order_mismatch` (a caller `$orderby` against the
+        // token, which the extractor rejects upstream) describes it, so it
+        // needs a category the label vocabulary does not yet carry.
+        //
+        // The mandatory range cannot land here at all — it is validated
+        // where the typed parameter is parsed, at the edge, before the
+        // service is entered.
+        Err(UsageCollectorError::InvalidArgument { reason, .. }) => (
+            RequestOutcome::Error,
+            match reason {
+                ValidationReason::FilterMismatch => QueryErrorCategory::FilterMismatch,
+                _ => QueryErrorCategory::QueryBudget,
+            },
+        ),
         Err(_) => (RequestOutcome::Error, QueryErrorCategory::PluginError),
     }
 }
@@ -1699,8 +1723,12 @@ impl Service {
                 &gts_type_id,
             )?;
 
-            // The query a keyset continuation is bound to, computed from the
-            // CALLER's `$filter` and range — before composition AND-merges
+            // The query a keyset continuation is bound to: the CALLER's
+            // `$filter` plus every typed parameter that decides which rows
+            // the page came from — the meter, the range and the metadata
+            // filter, none of which is a `$filter` conjunct, so a filter
+            // hash alone covers none of them. Computed before composition
+            // AND-merges
             // the server-injected PDP scope into `$filter`, which is a
             // value the next request's recomputation could never
             // reproduce (`compose_query_with_scope` documents the same
@@ -1714,7 +1742,7 @@ impl Service {
             // would leave an in-process caller able to continue a cursor
             // minted under a different range and be served a silently
             // wrong page.
-            let fingerprint = read_fingerprint(query, time_range);
+            let fingerprint = read_fingerprint(&gts_type_id, time_range, query, metadata_filter);
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-constraint-composition
             let mut composed = compose_query_with_scope(query, &scope)?;

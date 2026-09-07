@@ -1033,16 +1033,27 @@ fn classify_query_result_maps_each_arm() {
             Err(unresolved_type_not_found()),
             (RequestOutcome::Error, QueryErrorCategory::UnknownUsageType),
         ),
-        // Every service-level InvalidArgument on the query path is a
-        // query-budget / query-surface rejection; the over-cap aggregate
-        // result stands in for the family. The mandatory read range never
-        // lands here: it is validated at the edge, where the typed
-        // parameter is parsed, before the service is entered.
+        // `InvalidArgument` splits on the typed reason. The over-cap
+        // aggregate result stands in for the query-budget / query-surface
+        // family: a `$filter` naming a reserved field, an undeclared
+        // `group_by` / `metadata_filter` key, or this. The mandatory read
+        // range never lands here at all — it is validated at the edge,
+        // where the typed parameter is parsed, before the service is
+        // entered.
         (
             Err(UsageCollectorError::aggregation_result_too_large(
                 usage_collector_sdk::MAX_AGGREGATION_BUCKETS,
             )),
             (RequestOutcome::Error, QueryErrorCategory::QueryBudget),
+        ),
+        // The other arm, and the reason the classifier reads the reason at
+        // all: a continuation refused because its cursor was minted over a
+        // different query is not a budget rejection, so collapsing both
+        // onto `query_budget` would make the metric unable to tell a
+        // caller paging wrongly from a caller scanning too widely.
+        (
+            Err(UsageCollectorError::cursor_query_mismatch()),
+            (RequestOutcome::Error, QueryErrorCategory::FilterMismatch),
         ),
         (
             Err(UsageCollectorError::internal("boom")),

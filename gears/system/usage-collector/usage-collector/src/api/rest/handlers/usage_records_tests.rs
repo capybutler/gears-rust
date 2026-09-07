@@ -502,7 +502,8 @@ fn list_range() -> usage_collector_sdk::TimeRange {
 }
 
 /// The fingerprint the service binds a continuation to for a request
-/// carrying `query`'s `$filter` over the standard [`list_params`] range.
+/// carrying `query`'s `$filter` over the standard [`list_params`] range,
+/// against the happy-path meter and with no metadata filter.
 ///
 /// A continuation whose `f` is anything else — absent included — is
 /// refused, so a full-stack cursor test has to mint the real value. It
@@ -510,7 +511,9 @@ fn list_range() -> usage_collector_sdk::TimeRange {
 /// spelling at the edge is the very defect the fingerprint's single owner
 /// exists to prevent.
 fn list_fingerprint(query: &toolkit_odata::ODataQuery) -> String {
-    crate::domain::query::read_fingerprint(query, list_range())
+    let meter = usage_collector_sdk::MeterTypeId::new(HAPPY_RECORD_GTS_ID)
+        .expect("the happy-path gts_type_id is valid");
+    crate::domain::query::read_fingerprint(&meter, list_range(), query, &[])
 }
 
 /// The same range in the aggregate path's carrier — its request body.

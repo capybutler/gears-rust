@@ -17,9 +17,10 @@
 //!   because the `toolkit-odata` grammar cannot express filters over JSON
 //!   map keys, so it never flows through `$filter` at all.
 //! * `read_fingerprint` / `require_cursor_fingerprint` — the query a
-//!   keyset continuation is bound to (the caller's `$filter` and the read
-//!   range together), and the refusal of a cursor minted over a different
-//!   one.
+//!   keyset continuation is bound to (the caller's `$filter` plus all
+//!   three typed parameters: `gts_type_id`, the read range and
+//!   `metadata_filter`), and the refusal of a cursor minted over a
+//!   different one.
 //! * `establish_keyset_order` / `require_continuation_keyset` — the raw
 //!   path's keyset floor, in its two modes. Between them they guarantee
 //!   every dispatch carries the non-empty, uniform-direction, never-null
@@ -63,7 +64,7 @@ use crate::domain::authz;
 /// `$filter` AST — and `gts_type_id` and the read range are typed
 /// parameters that no [`ODataQuery`] carries as a predicate, so composition
 /// cannot narrow, widen, or drop either of them. (The read path does fold
-/// the range's canonical rendering into `filter_hash` afterwards, via
+/// both, and the metadata filter, into `filter_hash` afterwards via
 /// [`read_fingerprint`], but that is an opaque pagination fingerprint and
 /// not a row constraint.)
 ///
@@ -108,7 +109,8 @@ pub(crate) fn compose_query_with_scope(
     //
     // What the read path then dispatches is not that value: it overwrites
     // `filter_hash` with [`read_fingerprint`], which binds the caller's
-    // `$filter` AND the read range, and the plugin mints that into
+    // `$filter` and every typed parameter that selects rows, and the
+    // plugin mints that into
     // `next_cursor.f`. The rule here is the same rule stated one layer
     // down — compute the bound value from the caller's query, never the
     // composed one — which is why the preservation still has to hold: a
@@ -380,18 +382,23 @@ pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), Usag
     Err(UsageCollectorError::inadmissible_cursor_keyset(defect))
 }
 
-/// The fingerprint a keyset continuation is bound to: the caller's
-/// `$filter` and the read range, together.
+/// The fingerprint a keyset continuation is bound to: every input that
+/// decides which rows the page came from.
+///
+/// That is the caller's `$filter` plus all three typed parameters —
+/// `gts_type_id`, the read range, and `metadata_filter`. None of the three
+/// is a `$filter` conjunct, so `toolkit_odata::short_filter_hash` sees none
+/// of them and each has to enter here explicitly.
 ///
 /// `CursorV1::f` and [`ODataQuery::filter_hash`] exist so a caller who
 /// changes their query between pages is refused rather than served a
 /// continuation minted over a different row set. While the mandatory
-/// window lived inside `$filter`, `toolkit_odata::short_filter_hash`
-/// covered it for free; the window is a typed
-/// [`TimeRange`] parameter now, so it enters the fingerprint here — or a
-/// page-2 request carrying the same cursor with a different `from` / `to`
-/// is served a continuation that means nothing over its own row set, as a
-/// `200` nothing downstream can notice.
+/// window lived inside `$filter` the hash covered it for free; it does not
+/// any more, and it never covered the meter or the metadata filter. Without
+/// all four a page-2 request can carry the same cursor against a different
+/// range, a different `metadata.<key>` value, or **another meter entirely**
+/// and be served a continuation that means nothing over its own row set —
+/// as a `200` nothing downstream can notice.
 ///
 /// Computed from the **caller's** query, never the composed one. The PDP
 /// scope is AND-merged into `$filter` by [`compose_query_with_scope`] and
@@ -406,19 +413,81 @@ pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), Usag
 /// composed query it dispatches — replacing the caller's own `filter_hash`
 /// that [`compose_query_with_scope`] preserved — a conforming plugin mints
 /// it into `next_cursor.f`, and the follow-up request recomputes the same
-/// string from its own `$filter` and `from` / `to`.
+/// string from its own parameters.
 ///
 /// The range contributes [`TimeRange::canonical_form`] rather than a second
 /// hash: the whole fingerprint is opaque to callers, so a second hashing
 /// primitive would buy nothing and add one more thing that can disagree
 /// with itself.
-pub(crate) fn read_fingerprint(user_query: &ODataQuery, time_range: TimeRange) -> String {
+///
+/// `metadata_filter` is **normalized** before it is rendered, because the
+/// fingerprint has to be a function of the query's meaning and not of how
+/// the caller happened to spell it. A REST caller's repeated
+/// `metadata.<key>` parameters reach `MetadataFilter::values` in
+/// query-string order, duplicates included (`parse_metadata_filters` groups
+/// through a `BTreeMap`, so it sorts keys but pushes values as they
+/// arrive), and an in-process caller can build the slice in any order at
+/// all. Since the semantics are OR within a key and AND across keys, two
+/// spellings that differ only in order or in a repeated value are the same
+/// query — so values are sorted and deduplicated, and entries sorted by
+/// key. Two entries on the *same* key are deliberately left as two: `k in
+/// {a} AND k in {b}` is not `k in {a, b}`.
+pub(crate) fn read_fingerprint(
+    gts_type_id: &MeterTypeId,
+    time_range: TimeRange,
+    user_query: &ODataQuery,
+    metadata_filter: &[MetadataFilter],
+) -> String {
     // `short_filter_hash` returns `None` for an absent filter, and an
     // absent filter is a legitimate complete request — so it folds in as
-    // the empty string rather than short-circuiting the range out of the
+    // the empty string rather than short-circuiting the rest out of the
     // fingerprint.
     let filter = toolkit_odata::short_filter_hash(user_query.filter()).unwrap_or_default();
-    format!("{filter}~{}", time_range.canonical_form())
+
+    let mut entries: Vec<(&str, Vec<&str>)> = metadata_filter
+        .iter()
+        .map(|filter| {
+            let mut values: Vec<&str> = filter.values().iter().map(String::as_str).collect();
+            values.sort_unstable();
+            values.dedup();
+            (filter.key().as_str(), values)
+        })
+        .collect();
+    entries.sort_unstable();
+
+    let mut out = String::new();
+    push_fingerprint_field(&mut out, gts_type_id.as_str());
+    push_fingerprint_field(&mut out, &filter);
+    push_fingerprint_field(&mut out, &time_range.canonical_form());
+    push_fingerprint_field(&mut out, &entries.len().to_string());
+    for (key, values) in entries {
+        push_fingerprint_field(&mut out, key);
+        push_fingerprint_field(&mut out, &values.len().to_string());
+        for value in values {
+            push_fingerprint_field(&mut out, value);
+        }
+    }
+    out
+}
+
+/// Append one length-prefixed `<len>:<bytes>` field to a fingerprint.
+///
+/// Length-prefixed rather than separator-joined because none of the fields
+/// is separator-free. A GTS type reference carries `~` as its own
+/// terminator, [`TimeRange::canonical_form`] already joins its two bounds
+/// with `~`, and a metadata key or value is domain-opaque —
+/// `MetadataKey::new` rejects only the empty string and NUL, so a key may
+/// contain any other byte, and a value is unconstrained. Whatever single
+/// character were chosen, one field's content could imitate a field
+/// boundary and two different queries would fingerprint identically: a
+/// cursor minted under one would then validate against the other, which is
+/// the failure the fingerprint exists to prevent. A decimal length makes
+/// the concatenation self-delimiting, so injectivity holds for arbitrary
+/// content instead of resting on a claim about what callers send.
+fn push_fingerprint_field(out: &mut String, field: &str) {
+    out.push_str(&field.len().to_string());
+    out.push(':');
+    out.push_str(field);
 }
 
 /// Requires a continuation token to have been minted over the query now

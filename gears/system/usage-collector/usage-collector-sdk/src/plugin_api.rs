@@ -120,17 +120,23 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// than the boundary values the token carries, which is a silently
     /// wrong page rather than a refused one.
     ///
-    /// A `next_cursor` MUST also carry `query.filter_hash` through
-    /// verbatim as its `f`. That value is the gateway's fingerprint of the
-    /// query the page was read under — the caller's `$filter` and the
-    /// `time_range` together, since the range is a typed parameter and so
-    /// no longer inside `$filter` where a filter hash would cover it. The
-    /// gateway recomputes the same string from the follow-up request and
-    /// refuses a token carrying a different one, or none, as
-    /// `FILTER_MISMATCH` against `cursor`. A plugin that dropped or
-    /// recomputed it would therefore break pagination for its own pages,
-    /// and it MUST NOT interpret the value: it is opaque, and its shape is
-    /// the gateway's to change.
+    /// `query.filter_hash` is likewise guaranteed on this SPI: the gateway
+    /// always populates it, on every surface and on a first page as much as
+    /// a continuation, so a plugin never has to handle `None` and an absent
+    /// value is a gateway breach rather than a case to paper over — the
+    /// same posture as the `query.order` guarantee above.
+    ///
+    /// A `next_cursor` MUST carry that value through verbatim as its `f`.
+    /// It is the gateway's fingerprint of the query the page was read
+    /// under: the caller's `$filter` together with all three typed
+    /// parameters — `gts_type_id`, `time_range` and `metadata_filter` —
+    /// none of which is a `$filter` conjunct, so a hash of `$filter` alone
+    /// would cover none of them. The gateway recomputes the same string
+    /// from the follow-up request and refuses a token carrying a different
+    /// one, or none, as `FILTER_MISMATCH` against `cursor`. A plugin that
+    /// dropped or recomputed it would therefore break pagination for its
+    /// own pages, and it MUST NOT interpret the value: it is opaque, and
+    /// its shape is the gateway's to change.
     async fn list_usage_records(
         &self,
         gts_type_id: MeterTypeId,
