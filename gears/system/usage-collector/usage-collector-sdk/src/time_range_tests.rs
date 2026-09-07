@@ -59,9 +59,9 @@ fn selection_is_inclusive_at_the_lower_bound() {
 
 #[test]
 fn selection_is_exclusive_at_the_upper_bound() {
-    // ADR-0014: an entry whose period ends exactly on the upper bound
-    // belongs to the NEXT range. This is what makes adjacent ranges sum
-    // without double counting.
+    // Per `cpt-cf-usage-collector-adr-window-end-selection`: an entry whose
+    // period ends exactly on the upper bound belongs to the NEXT range. This
+    // is what makes adjacent ranges sum without double counting.
     let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
     assert!(!range.contains_window_end(at(1_700_003_600)));
 }
@@ -87,8 +87,9 @@ fn an_entry_ending_before_the_lower_bound_is_not_selected() {
 fn an_entry_wider_than_the_range_is_selected_by_exactly_one_range() {
     // The predicate reads window_end and nothing else, so an entry covering
     // [range.from - 1h, range.to + 1h) is invisible to `range` and to the
-    // range before it — but ADR-0014's partition property means some range
-    // does select it: the one whose upper bound reaches its window_end.
+    // range before it — but the partition property in
+    // `cpt-cf-usage-collector-adr-window-end-selection` means some range does
+    // select it: the one whose upper bound reaches its window_end.
     let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
     let wide_entry_end = range.upper_exclusive() + Duration::hours(1);
     assert!(!range.contains_window_end(wide_entry_end));

@@ -128,8 +128,9 @@ impl TimeRange {
     /// The reference spelling of `from <= window_end < to`: every
     /// in-process implementation calls this rather than re-deriving it, a
     /// SQL-backed plugin restates the same predicate in its own `WHERE`
-    /// clause (it cannot call a Rust method), and the slice-6 Plugin SPI
-    /// contract suite is what holds the two spellings to the same boundary.
+    /// clause (it cannot call a Rust method), and the `window-end-selection`
+    /// plugin contract test DESIGN §3.3 "Plugin SPI" requires of every
+    /// conforming plugin is what holds the two spellings to one boundary.
     ///
     /// Comparison is instant-based: [`OffsetDateTime`]'s `Ord` normalizes
     /// its operand into the receiver's offset first, so `window_end` in any

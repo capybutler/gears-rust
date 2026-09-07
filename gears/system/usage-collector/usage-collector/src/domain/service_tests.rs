@@ -3967,8 +3967,9 @@ mod read_path_time_range_tests {
     /// caller wanting both a predicate and a range now sends. The
     /// forwarding tests above pass `ODataQuery::default()`, so between them
     /// the pair covers both "no `$filter` at all" and "a `$filter` naming
-    /// no time predicate". Before this slice the second was a 400 too,
-    /// because the retired guard read the window out of this same slot.
+    /// no time predicate". Before the range became a typed parameter the
+    /// second was a 400 too, because the retired guard read the window out
+    /// of this same slot.
     fn filter_without_a_time_predicate() -> ODataQuery {
         ODataQuery::from(Some(
             toolkit_odata::parse_filter_string("resource_id eq 'r1'")
@@ -4565,9 +4566,9 @@ mod read_path_cursor_fingerprint_tests {
 
     #[tokio::test]
     async fn a_cursor_minted_under_a_different_range_never_reaches_the_plugin() {
-        // The whole reason this task exists. Same caller, same `$filter`,
-        // a different range — which used to be a `$filter` conjunct and so
-        // was covered by the hash for free.
+        // The whole reason the range is in the fingerprint. Same caller,
+        // same `$filter`, a different range — which used to be a `$filter`
+        // conjunct and so was covered by the hash for free.
         let caller = query_with_filter("resource_id eq 'r1'");
         let january = test_time_range();
         let february = range_at(60 * 60 * 24 * 31 * 1_000_000_000);
@@ -4597,8 +4598,8 @@ mod read_path_cursor_fingerprint_tests {
 
     #[tokio::test]
     async fn a_cursor_differing_only_below_the_microsecond_is_rejected() {
-        // The truncation hole the plan caught before the code existed: if
-        // the range rendering reused the identity derivation's fixed
+        // The truncation hole `TimeRange::canonical_form` exists to avoid:
+        // if the range rendering reused the identity derivation's fixed
         // six-digit-microsecond form, these two ranges would fingerprint
         // identically and this cursor would be served.
         let caller = query_with_filter("resource_id eq 'r1'");
@@ -4626,7 +4627,7 @@ mod read_path_cursor_fingerprint_tests {
     #[tokio::test]
     async fn a_cursor_minted_under_a_different_filter_never_reaches_the_plugin() {
         // The property the range was added to, not a replacement for it.
-        // `$filter` was already covered before this slice, and an
+        // `$filter` was already covered before the range joined it, and an
         // implementation that fingerprinted the range alone would lose it
         // silently while every range test above stayed green.
         let range = test_time_range();

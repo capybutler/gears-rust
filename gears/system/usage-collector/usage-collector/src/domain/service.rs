@@ -132,9 +132,9 @@ fn invariant_breach(detail: String) -> UsageCollectorError {
 /// [`UsageCollectorPluginError::Transient`] / `Internal` → `backend_error`.
 /// The deterministic domain-typed variants (`UsageRecord*`,
 /// `IdempotencyConflict`) are caller-visible outcomes, **not** plugin faults,
-/// and MUST NOT increment it (their duration sample is still recorded) per
-/// DESIGN §3.11.5 / `plugin-spi.md` §"Error Taxonomy". A host-side dispatch
-/// deadline (→ `timeout`) does not exist in v1.
+/// and MUST NOT increment it (their duration sample is still recorded): the
+/// counter's `error_category` vocabulary in DESIGN §3.11.5 has no value for
+/// them. A host-side dispatch deadline (→ `timeout`) does not exist in v1.
 fn backend_error_category(err: &UsageCollectorPluginError) -> Option<PluginErrorCategory> {
     match err {
         UsageCollectorPluginError::Transient { .. } | UsageCollectorPluginError::Internal(_) => {
@@ -1876,7 +1876,7 @@ impl Service {
     ///    the typed `gts_type_id`, the typed `time_range`, the metadata
     ///    side-channel, the declared
     ///    `usage_collector_sdk::AggregationFold`, and any `group_by`
-    ///    dimensions, executed server-side per `plugin-spi.md` Method 3.
+    ///    dimensions, executed server-side per DESIGN §3.3 "Plugin SPI".
     ///
     /// # Errors
     ///
@@ -1987,7 +1987,8 @@ impl Service {
             // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-plugin-dispatch
         }
         .await;
-        // Enforce the declared aggregate-bucket cap (plugin-spi.md §Method 3).
+        // Enforce the declared aggregate-bucket cap (`AggregationResult.buckets`
+        // `maxItems` in `usage-collector-v1.yaml`).
         // The plugin bounds its own scan to `MAX_AGGREGATION_BUCKETS + 1` rows
         // (its memory guard), so an over-cap result surfaces here as strictly
         // more than the cap — reject it as the client-fixable 400 it is rather

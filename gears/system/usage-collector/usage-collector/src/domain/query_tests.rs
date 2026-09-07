@@ -484,7 +484,8 @@ fn assert_order(query: &ODataQuery, expected: &[(&str, SortDir)]) {
 /// the shape-free table-driven tests, where the input shapes outnumber the
 /// exact shapes anyone would write out and it is the only thing that can
 /// fail. Keeping it is worth it anyway: it is the SPI contract as
-/// executable code, and slice 6's plugin contract suite starts here.
+/// executable code, and the plugin contract suite DESIGN §3.3 "Plugin SPI"
+/// requires of every conforming plugin starts here.
 ///
 /// The two field names are spelled out rather than read from
 /// [`CANONICAL_KEYSET_FIELDS`] because an assertion that reads the
