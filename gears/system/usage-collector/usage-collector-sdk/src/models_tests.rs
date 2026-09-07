@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use super::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
     IdempotencyKey, MetadataFilter, MetadataKey, MeterTypeId, ResourceRef, SubjectRef, UsageRecord,
-    UsageRecordStatus, is_keyset_safe_record_field,
+    UsageRecordStatus, WINDOW_START_FIELD, is_keyset_safe_record_field,
 };
 use crate::error::UsageCollectorError;
 use crate::reason::ValidationReason;
@@ -36,6 +36,13 @@ fn sample_meter_id() -> MeterTypeId {
     MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid usage_record-derived meter type id")
 }
 
+/// `1970-01-01T00:00:00Z` — the inclusive start of the fixture period.
+const SAMPLE_WINDOW_START: time::OffsetDateTime = time::OffsetDateTime::UNIX_EPOCH;
+/// `1970-01-01T01:00:00Z` — one hour later, so the two bounds are distinct
+/// and a test that confused them would fail rather than pass by symmetry.
+const SAMPLE_WINDOW_END: time::OffsetDateTime =
+    SAMPLE_WINDOW_START.saturating_add(time::Duration::hours(1));
+
 fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid>) -> UsageRecord {
     UsageRecord {
         id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("record id"),
@@ -48,7 +55,8 @@ fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid
         idempotency_key: IdempotencyKey::new("k-1").expect("valid idempotency key"),
         corrects_id,
         status: UsageRecordStatus::Active,
-        created_at: time::OffsetDateTime::from_unix_timestamp(0).expect("epoch"),
+        window_start: SAMPLE_WINDOW_START,
+        window_end: SAMPLE_WINDOW_END,
     }
 }
 
@@ -65,36 +73,31 @@ fn sample_create_usage_record(
         value: Decimal::from(42),
         idempotency_key: IdempotencyKey::new("k-1").expect("valid idempotency key"),
         corrects_id,
-        created_at: time::OffsetDateTime::from_unix_timestamp(0).expect("epoch"),
+        window_start: SAMPLE_WINDOW_START,
+        window_end: SAMPLE_WINDOW_END,
     }
 }
 
 // ---------------------------------------------------------------------------
-// CreateUsageRecord::into_usage_record — identity stamp on create
+// CreateUsageRecord::try_into_usage_record — period validation and the
+// identity stamp on create
 // ---------------------------------------------------------------------------
 
-// `into_usage_record` is the single point where a submission acquires its
-// identity: it stamps the deterministic derived `id`, initializes `status`
-// to `Active`, and forwards every caller-supplied field verbatim.
+// `try_into_usage_record` is the single point where a submission acquires its
+// identity: it validates the covered period, stamps the deterministic derived
+// `id`, initializes `status` to `Active`, and forwards every caller-supplied
+// field verbatim.
 #[test]
-fn into_usage_record_stamps_derived_id_and_active_status() {
+fn try_into_usage_record_stamps_derived_id_and_active_status() {
     let subject = SubjectRef::new("sub-1", Some("user".to_owned())).expect("valid subject ref");
     let corrects = Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("corrects uuid");
     let input = sample_create_usage_record(Some(subject), Some(corrects));
 
-    let expected_id = crate::id::derive_usage_record_id(
-        input.tenant_id,
-        &input.gts_type_id,
-        &input.idempotency_key,
-        input.created_at,
-    );
+    let record = input
+        .clone()
+        .try_into_usage_record()
+        .expect("the fixture period is valid");
 
-    let record = input.clone().into_usage_record();
-
-    assert_eq!(
-        record.id, expected_id,
-        "id must be the deterministic derivation of the dedup key",
-    );
     assert_eq!(
         record.status,
         UsageRecordStatus::Active,
@@ -109,73 +112,221 @@ fn into_usage_record_stamps_derived_id_and_active_status() {
     assert_eq!(record.value, input.value);
     assert_eq!(record.idempotency_key, input.idempotency_key);
     assert_eq!(record.corrects_id, input.corrects_id);
-    assert_eq!(record.created_at, input.created_at);
+    assert_eq!(record.window_start, input.window_start);
+    assert_eq!(record.window_end, input.window_end);
 }
 
-// A submission whose dedup key matches an existing `UsageRecord` projects to
-// the SAME `id` that record carries — the derivation is a pure function of
-// `(tenant_id, gts_type_id, idempotency_key, created_at)`, so the create input
-// and the persisted shape agree on identity without the caller ever supplying
-// it.
 #[test]
-fn into_usage_record_id_matches_full_record_with_same_dedup_key() {
+fn try_into_usage_record_derives_the_id_over_the_five_tuple() {
+    let submission = sample_create_usage_record(None, None);
+    let expected = crate::id::derive_usage_record_id(
+        submission.tenant_id,
+        &submission.gts_type_id,
+        &submission.idempotency_key,
+        submission.window_start,
+        submission.window_end,
+    );
+    let record = submission
+        .try_into_usage_record()
+        .expect("the fixture period is valid");
+    assert_eq!(record.id, expected);
+}
+
+// A submission whose dedup identity matches an existing `UsageRecord`
+// projects to the SAME `id` that record carries — the derivation is a pure
+// function of the 5-tuple, so the create input and the persisted shape agree
+// on identity without the caller ever supplying it.
+#[test]
+fn try_into_usage_record_id_matches_full_record_with_same_dedup_identity() {
     let input = sample_create_usage_record(None, None);
     let persisted = sample_usage_record(None, None);
-    // `sample_usage_record` shares the same tenant / gts_type_id / idempotency_key.
+    // `sample_usage_record` shares the whole dedup identity.
     assert_eq!(input.tenant_id, persisted.tenant_id);
     assert_eq!(input.gts_type_id, persisted.gts_type_id);
     assert_eq!(input.idempotency_key, persisted.idempotency_key);
+    assert_eq!(input.window_start, persisted.window_start);
+    assert_eq!(input.window_end, persisted.window_end);
 
     assert_eq!(
-        input.into_usage_record().id,
+        input
+            .try_into_usage_record()
+            .expect("the fixture period is valid")
+            .id,
         crate::id::derive_usage_record_id(
             persisted.tenant_id,
             &persisted.gts_type_id,
             &persisted.idempotency_key,
-            persisted.created_at,
+            persisted.window_start,
+            persisted.window_end,
         ),
-        "the create-input identity must equal the derivation of the same dedup key",
+        "the create-input identity must equal the derivation of the same dedup identity",
     );
 }
 
-// `into_usage_record` canonicalizes `created_at` to microsecond precision (what
-// Postgres `timestamptz` stores) on the returned record, and derives the id from
-// that same normalized value, so the persisted timestamp / dedup key / id agree.
 #[test]
-fn into_usage_record_truncates_created_at_to_micros() {
-    let sub_us = time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789)
-        .expect("valid instant");
-    let mut input = sample_create_usage_record(None, None);
-    input.created_at = sub_us;
+fn try_into_usage_record_rejects_a_sub_microsecond_window_start() {
+    // `cpt-cf-usage-collector-adr-record-identity-derivation`: a bound finer
+    // than the microsecond is REJECTED, not truncated. Truncating would
+    // persist a period whose read-back derives
+    // an id different from the one the entry carries, which breaks offline
+    // reproduction at the point an emitter needs it.
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_start = submission.window_start.replace_nanosecond(500).unwrap();
+    let err = submission
+        .try_into_usage_record()
+        .expect_err("sub-microsecond bound must be rejected");
+    let UsageCollectorError::InvalidArgument { field, .. } = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(field, "window_start");
+}
 
-    let record = input.clone().into_usage_record();
+#[test]
+fn try_into_usage_record_rejects_a_sub_microsecond_window_end() {
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_end = submission.window_end.replace_nanosecond(1).unwrap();
+    let err = submission
+        .try_into_usage_record()
+        .expect_err("sub-microsecond bound must be rejected");
+    let UsageCollectorError::InvalidArgument { field, .. } = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(field, "window_end");
+}
 
-    let expected_created_at =
-        time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_000)
-            .expect("valid instant");
-    assert_eq!(
-        record.created_at, expected_created_at,
-        "returned created_at must be truncated to microsecond precision",
+#[test]
+fn a_sub_microsecond_rejection_reads_the_same_in_every_offset() {
+    // Two claims in one, both about the hoisted UTC normalization that runs
+    // BEFORE the precision checks.
+    //
+    // Behaviour: the same instant submitted in three offsets is rejected
+    // all three times — normalization moves the offset, never the
+    // nanosecond, so it cannot change what the check accepts.
+    //
+    // Diagnostics: all three rejections echo ONE rendering. Before the
+    // hoist, this bound echoed the caller's offset while the sibling
+    // inverted-period error echoed UTC, and an offset carrying non-zero
+    // seconds (which RFC 3339 cannot express) fell through to
+    // `OffsetDateTime`'s space-separated `Display`. Comparing the details
+    // to each other rather than to a literal pins the property without
+    // pinning the wording.
+    let sub_us = SAMPLE_WINDOW_START.replace_nanosecond(500).unwrap();
+    let details: Vec<String> = [
+        time::UtcOffset::UTC,
+        time::UtcOffset::from_hms(5, 30, 0).unwrap(),
+        time::UtcOffset::from_hms(5, 30, 30).unwrap(),
+    ]
+    .into_iter()
+    .map(|offset| {
+        let mut submission = sample_create_usage_record(None, None);
+        submission.window_start = sub_us.to_offset(offset);
+        let err = submission
+            .try_into_usage_record()
+            .expect_err("a sub-microsecond bound must be rejected in ANY offset");
+        let UsageCollectorError::InvalidArgument { field, detail, .. } = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert_eq!(field, WINDOW_START_FIELD);
+        detail
+    })
+    .collect();
+
+    assert!(
+        details.windows(2).all(|pair| pair[0] == pair[1]),
+        "one instant must produce one diagnostic whatever offset it arrived \
+         in; got {details:#?}",
     );
-    assert_eq!(
-        record.id,
-        crate::id::derive_usage_record_id(
-            input.tenant_id,
-            &input.gts_type_id,
-            &input.idempotency_key,
-            sub_us,
-        ),
-        "id must be derived from the (us-normalized) 4-tuple",
+    assert!(
+        details[0].contains("Z,"),
+        "the echoed bound must be the UTC rendering, not the caller's \
+         offset; got {}",
+        details[0],
     );
+}
+
+#[test]
+fn try_into_usage_record_accepts_a_whole_microsecond_bound() {
+    // The ceiling is the microsecond, not the millisecond or the second: a
+    // bound carrying a non-zero microsecond is ordinary valid input. Without
+    // this, relaxing the precondition to a coarser unit would pass every
+    // other test in the file, because the fixture bounds land on whole
+    // seconds.
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_start = submission.window_start.replace_nanosecond(1_000).unwrap();
+    submission.window_end = submission
+        .window_end
+        .replace_nanosecond(999_999_000)
+        .unwrap();
+    let record = submission
+        .try_into_usage_record()
+        .expect("whole-microsecond bounds are valid");
+    assert_eq!(record.window_start.nanosecond(), 1_000);
+    assert_eq!(record.window_end.nanosecond(), 999_999_000);
+}
+
+#[test]
+fn try_into_usage_record_accepts_equal_bounds_as_a_point_event() {
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_end = submission.window_start;
+    let record = submission
+        .try_into_usage_record()
+        .expect("point event is valid input");
+    assert_eq!(record.window_start, record.window_end);
+}
+
+#[test]
+fn try_into_usage_record_rejects_an_inverted_covered_period() {
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_end = submission.window_start - time::Duration::seconds(1);
+    let err = submission
+        .try_into_usage_record()
+        .expect_err("window_end < window_start must be rejected");
+    let UsageCollectorError::InvalidArgument { field, .. } = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(field, "window_end");
+}
+
+#[test]
+fn try_into_usage_record_normalizes_both_bounds_to_utc() {
+    let offset = time::UtcOffset::from_hms(-7, 0, 0).unwrap();
+    let mut submission = sample_create_usage_record(None, None);
+    let start = submission.window_start;
+    let end = submission.window_end;
+    submission.window_start = start.to_offset(offset);
+    submission.window_end = end.to_offset(offset);
+    let record = submission
+        .try_into_usage_record()
+        .expect("the fixture period is valid");
+    assert_eq!(record.window_start.offset(), time::UtcOffset::UTC);
+    assert_eq!(record.window_end.offset(), time::UtcOffset::UTC);
+    // Normalization moves the offset, never the instant, and it must not
+    // move either bound onto the other.
+    assert_eq!(record.window_start, start);
+    assert_eq!(record.window_end, end);
+}
+
+#[test]
+fn one_instant_in_two_offsets_derives_one_id() {
+    // The retry invariant: an emitter that resends the same period in a
+    // different offset must not surface a false IdempotencyConflict.
+    let offset = time::UtcOffset::from_hms(2, 0, 0).unwrap();
+    let utc = sample_create_usage_record(None, None)
+        .try_into_usage_record()
+        .expect("valid");
+    let mut shifted = sample_create_usage_record(None, None);
+    shifted.window_start = shifted.window_start.to_offset(offset);
+    shifted.window_end = shifted.window_end.to_offset(offset);
+    assert_eq!(utc.id, shifted.try_into_usage_record().expect("valid").id,);
 }
 
 // ---------------------------------------------------------------------------
-// UsageRecord — wire shape (RFC-3339 `created_at`, optional skipping,
+// UsageRecord — wire shape (RFC-3339 period bounds, optional skipping,
 // `status` defaulting)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_created_at() {
+fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_period_bounds() {
     let record = sample_usage_record(None, None);
     let value = serde_json::to_value(&record).expect("serialize UsageRecord");
     let object = value
@@ -189,10 +340,20 @@ fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_created_a
         !object.contains_key("corrects_id"),
         "corrects_id must be omitted when None; got {object:?}"
     );
+    assert!(
+        !object.contains_key("created_at"),
+        "the single instant is gone: an entry carries a covered period and \
+         no other emitter-supplied time attribution; got {object:?}"
+    );
     assert_eq!(
-        object.get("created_at").and_then(|v| v.as_str()),
+        object.get("window_start").and_then(|v| v.as_str()),
         Some("1970-01-01T00:00:00Z"),
-        "created_at must serialize in RFC-3339 form with `Z` UTC marker; got {object:?}"
+        "window_start must serialize in RFC-3339 form with `Z` UTC marker; got {object:?}"
+    );
+    assert_eq!(
+        object.get("window_end").and_then(|v| v.as_str()),
+        Some("1970-01-01T01:00:00Z"),
+        "window_end must serialize in RFC-3339 form with `Z` UTC marker; got {object:?}"
     );
     assert_eq!(
         object.get("status").and_then(|v| v.as_str()),
@@ -201,6 +362,28 @@ fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_created_a
     );
     let round_tripped: UsageRecord = serde_json::from_value(value).expect("UsageRecord round-trip");
     assert_eq!(record, round_tripped);
+}
+
+#[test]
+fn usage_record_deserialize_requires_both_period_bounds() {
+    // Neither bound is optional and neither has a serde default: a payload
+    // missing one is a malformed entry, not a point event. A `#[serde(
+    // default)]` slipped onto either would silently fabricate the epoch.
+    let full = serde_json::to_value(sample_usage_record(None, None)).expect("serialize");
+    for missing in ["window_start", "window_end"] {
+        let mut value = full.clone();
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove(missing)
+            .expect("fixture carries the field");
+        let err = serde_json::from_value::<UsageRecord>(value)
+            .expect_err("a missing period bound must be rejected");
+        assert!(
+            err.to_string().contains(missing),
+            "deserialize error MUST name the missing bound `{missing}`; got {err}"
+        );
+    }
 }
 
 #[test]
@@ -588,6 +771,21 @@ fn idempotency_key_new_rejects_nul_byte() {
         err,
         UsageCollectorError::InvalidArgument { ref field, .. } if field.as_str() == "idempotency_key"
     ));
+}
+
+#[test]
+fn idempotency_key_rejects_a_unit_separator_del_and_an_over_long_key() {
+    // A confirmation of
+    // `cpt-cf-usage-collector-adr-record-identity-derivation`: the derivation
+    // concatenates the key under a
+    // 0x1F separator and the key is not the final field, so a key carrying
+    // that byte would inject a separator mid-pre-image. Rejected at
+    // construction, before any derivation can run. DEL and the 256-byte
+    // ceiling come from the same wire schema pattern.
+    IdempotencyKey::new("idem\u{1f}1").expect_err("0x1F in a key must be rejected");
+    IdempotencyKey::new("idem\u{7f}1").expect_err("DEL in a key must be rejected");
+    IdempotencyKey::new("a".repeat(257)).expect_err("over-long key must be rejected");
+    IdempotencyKey::new("a".repeat(256)).expect("256 bytes is the ceiling, not past it");
 }
 
 #[test]

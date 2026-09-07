@@ -1,81 +1,129 @@
-//! Deterministic derivation of the usage-record identity.
+//! Deterministic derivation of the ledger-entry identity.
 //!
-//! The record `id` is not an independent field: it is a deterministic
-//! projection of the dedup key `(tenant_id, gts_type_id, idempotency_key, created_at)`
-//! (ADR-0014). The gateway derives it on every create; a client MAY reproduce
-//! the same value locally with this function (e.g. to reference a not-yet-acked
-//! record via `corrects_id` without a round-trip), provided it supplies the same
-//! `created_at` (at microsecond precision).
+//! The entry `id` is not an independent field: it is a deterministic
+//! projection of the dedup identity
+//! `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+//! (`cpt-cf-usage-collector-adr-record-identity-derivation`). The
+//! Ingestion Gateway derives it at one choke point for every surface, and an
+//! emitter reproduces the same value offline — which is what lets a
+//! correction name its target before submission, with no round-trip.
+//!
+//! The identity and the dedup identity read the same five inputs, so the two
+//! can never disagree about what one entry is. Entry type is deliberately
+//! excluded: admitting it would let one idempotency key stand for both a
+//! measurement and its withdrawal, so an emitter defect that reused a key
+//! would produce both entries silently instead of surfacing a conflict.
 
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::models::{IdempotencyKey, MeterTypeId};
 
-/// Fixed namespace for deterministic usage-record `id` derivation (`UUIDv5`).
+/// Fixed namespace for the entry-identity derivation (`UUIDv5`).
 ///
-/// NEVER change this value: changing it re-maps every dedup key to a new
-/// `id`, breaking idempotency and every stored `corrects_id` reference.
+/// NEVER change this value: it admits no rotation, no per-deployment value
+/// and no versioned variant, because each of those re-maps every identifier
+/// the gear has ever issued.
 pub const USAGE_RECORD_ID_NAMESPACE: Uuid =
     Uuid::from_u128(0x5631_3026_863b_4de8_b32b_1f96_b673_06ed);
 
-/// ASCII unit separator between the dedup-key fields. `tenant_id`
-/// (hex + hyphen), `gts_type_id` (GTS grammar), and `created_at_micros` (ASCII
-/// digits, optional leading `-`) cannot contain it, and `idempotency_key` is
-/// the final field (consumes the remainder), so the encoding is injective even
-/// when a key itself contains `0x1F`.
+/// ASCII unit separator between the dedup-identity fields.
+///
+/// The concatenation stays injective only while no input carries this byte.
+/// Three inputs cannot carry it by construction: the tenant is a UUID and
+/// both bounds are fixed-width timestamps. The other two are
+/// caller-supplied, and both newtypes reject every ASCII control character
+/// ([`MeterTypeId::new`], [`IdempotencyKey::new`]) — which is what keeps two
+/// distinct dedup identities from concatenating to one pre-image.
 const FIELD_SEPARATOR: u8 = 0x1F;
 
-/// Derive the deterministic record id from the 4-tuple dedup key:
-/// `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_type_id ⟨0x1F⟩ created_at_micros ⟨0x1F⟩ idempotency_key)`,
-/// where `tenant_id` is its canonical lowercase-hyphenated string form,
-/// `gts_type_id` / `idempotency_key` are their UTF-8 bytes, and `created_at_micros`
-/// is the event timestamp as integer microseconds-since-epoch (decimal ASCII).
+/// Renders a covered-period bound in the canonical 27-character form
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
 ///
-/// `created_at` is canonicalized to microseconds — the precision Postgres
-/// `timestamptz` stores and the active plugin dedups on — so a sub-microsecond
-/// difference between an original submission and its retry cannot derive a
-/// different id (which would surface as a false `IdempotencyConflict`). The
-/// canonicalization is the shared [`created_at_micros`] primitive.
+/// The form is frozen with the namespace constant: a change to the fraction
+/// width, the case of `T` / `Z`, or the text encoding re-maps every
+/// identifier the gear has issued. Six digits is the microsecond, and it is
+/// the precision ceiling of the derivation — a caller that sends
+/// `12:00:00Z`, `12:00:00.000Z` or `13:00:00+01:00` reaches one canonical
+/// form here.
+///
+/// This function **truncates** anything below the microsecond, and callers
+/// MUST NOT hand it a finer value: the ingestion path rejects one before the
+/// derivation runs ([`crate::CreateUsageRecord::try_into_usage_record`]), so
+/// inside the gear the two can never disagree. Truncating an unvalidated
+/// bound would make a read-back entry derive an identifier different from
+/// the one it carries.
+///
+/// The 27-character width holds for a year in `0..=9999`. Every bound that
+/// arrives over REST is RFC 3339-parsed, and no RFC 3339 timestamp can
+/// express a year outside that range, so on the wire path the width is
+/// guaranteed. An in-process caller is not so constrained: `time` is
+/// declared without `large-dates`, so a year down to `-9999` is
+/// constructible, and `{:04}` renders `-1` as `-001` — still 27 characters,
+/// but not the canonical form. The `debug_assert!` below catches that in
+/// every debug and test build; a release build still renders the
+/// non-canonical bound, so the assert narrows the window rather than
+/// closing it.
+#[must_use]
+pub fn canonical_period_bound(bound: OffsetDateTime) -> String {
+    let utc = bound.to_offset(UtcOffset::UTC);
+    // An assert rather than a `Result`: every bound that reaches here over
+    // REST was RFC 3339-parsed and so is already in range, which makes the
+    // function infallible on the path that carries caller data. Returning a
+    // `Result` would push a `?` into the derivation, and from there onto
+    // every caller, to carry an error only a same-crate caller can trigger.
+    debug_assert!(
+        (0..=9999).contains(&utc.year()),
+        "canonical_period_bound requires a year in 0..=9999 for the fixed \
+         27-character form; got {}",
+        utc.year(),
+    );
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+        utc.microsecond(),
+    )
+}
+
+/// Derives the entry identity from the 5-tuple dedup identity:
+/// `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_type_id ⟨0x1F⟩ idempotency_key ⟨0x1F⟩ window_start ⟨0x1F⟩ window_end)`.
+///
+/// `tenant_id` enters in its lowercase hyphenated 36-character form,
+/// `gts_type_id` and `idempotency_key` byte-exact (terminator `~`
+/// included), and both bounds in the canonical form
+/// [`canonical_period_bound`] renders. `NS` enters as its 16 raw bytes, per
+/// RFC 4122.
+///
+/// The two bounds enter in start-then-end order, so the digest is not
+/// order-blind: an order-blind one would collapse two legitimate periods
+/// that mirror each other around a shared instant.
+///
+/// A point event derives over a zero-length period, where the two bounds
+/// are equal; the derivation needs no separate case for it.
 #[must_use]
 pub fn derive_usage_record_id(
     tenant_id: Uuid,
     gts_type_id: &MeterTypeId,
     idempotency_key: &IdempotencyKey,
-    created_at: OffsetDateTime,
+    window_start: OffsetDateTime,
+    window_end: OffsetDateTime,
 ) -> Uuid {
-    let micros = created_at_micros(created_at);
-
     let mut input = Vec::new();
     input.extend_from_slice(tenant_id.to_string().as_bytes());
     input.push(FIELD_SEPARATOR);
-    input.extend_from_slice(gts_type_id.as_ref().as_bytes());
-    input.push(FIELD_SEPARATOR);
-    input.extend_from_slice(micros.to_string().as_bytes());
+    input.extend_from_slice(gts_type_id.as_str().as_bytes());
     input.push(FIELD_SEPARATOR);
     input.extend_from_slice(idempotency_key.as_str().as_bytes());
+    input.push(FIELD_SEPARATOR);
+    input.extend_from_slice(canonical_period_bound(window_start).as_bytes());
+    input.push(FIELD_SEPARATOR);
+    input.extend_from_slice(canonical_period_bound(window_end).as_bytes());
     Uuid::new_v5(&USAGE_RECORD_ID_NAMESPACE, &input)
-}
-
-/// Canonical projection of an event timestamp to its integer
-/// microseconds-since-epoch count — the single source of truth for the µs
-/// canonicalization the identity contract relies on.
-///
-/// Postgres `timestamptz` stores microsecond precision, so both the derived
-/// [`derive_usage_record_id`] and the active plugin's dedup-equality check MUST
-/// project `created_at` through *this* function: two timestamps that differ only
-/// below microsecond precision project to the same value (and thus the same id /
-/// the same dedup key), so an exact retry never surfaces as a false
-/// `IdempotencyConflict`. Keeping the projection here — rather than re-deriving
-/// `unix_timestamp() * 1_000_000 + microsecond()` per crate — is what keeps a
-/// future precision change from silently diverging the two.
-///
-/// Built from the whole-second unix timestamp plus the sub-second microsecond
-/// component (no integer division), so it is exact for pre-epoch (negative
-/// unix-timestamp) instants too.
-#[must_use]
-pub fn created_at_micros(created_at: OffsetDateTime) -> i128 {
-    i128::from(created_at.unix_timestamp()) * 1_000_000 + i128::from(created_at.microsecond())
 }
 
 #[cfg(test)]

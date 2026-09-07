@@ -468,7 +468,8 @@ mod deactivate_usage_record_tests {
             idempotency_key: IdempotencyKey::new("idem-stub").expect("valid idempotency key"),
             corrects_id: None,
             status: UsageRecordStatus::Active,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -875,7 +876,6 @@ mod pdp_dedup_tests {
 
     use crate::domain::test_support::{
         HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
-        permit_scoped_to_request_tenant,
     };
 
     const HAPPY_GTS_ID: &str =
@@ -908,14 +908,15 @@ mod pdp_dedup_tests {
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             corrects_id: None,
             status: UsageRecordStatus::Active,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
     fn input_record(tenant_id: Uuid, resource_id: &str, idem: &str) -> CreateUsageRecord {
         // Distinct `idem` values keep records distinct even when they share an
         // attribution tuple; the create surface is identity-free (the id is
-        // derived from the dedup key inside the service).
+        // derived from the dedup identity inside the service).
         CreateUsageRecord {
             gts_type_id: MeterTypeId::new(HAPPY_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
@@ -925,7 +926,8 @@ mod pdp_dedup_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -1083,59 +1085,8 @@ mod pdp_dedup_tests {
     /// for permits.
     #[tokio::test]
     async fn create_usage_records_projects_pdp_deny_across_shared_tuple_groups() {
-        use async_trait::async_trait;
-        use authz_resolver_sdk::AuthZResolverApi;
-        use authz_resolver_sdk::models::{
-            DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
-        };
-        use toolkit::api::canonical_prelude::CanonicalError;
-
-        use crate::domain::authz::usage_record::PROP_RESOURCE_ID;
         use crate::domain::service::Service;
-        use crate::domain::test_support::{enforcer_for, hub_with_plugin};
-        use toolkit_security::PlatformSecurityContext;
-
-        /// Resolver that denies every evaluate request whose composed
-        /// `resource_id` matches `deny_resource_id` and permits all others.
-        /// The PEP composer at `domain/authz.rs` populates the request's
-        /// resource properties with `PROP_RESOURCE_ID` from the attribution
-        /// tuple, so this resolver discriminates per-tuple.
-        struct DenyOneResourceResolver {
-            deny_resource_id: String,
-        }
-
-        #[async_trait]
-        impl AuthZResolverApi for DenyOneResourceResolver {
-            async fn evaluate(
-                &self,
-                _ctx: PlatformSecurityContext,
-                request: EvaluationRequest,
-            ) -> Result<EvaluationResponse, CanonicalError> {
-                let matches_deny = request
-                    .resource
-                    .properties
-                    .get(PROP_RESOURCE_ID)
-                    .and_then(serde_json::Value::as_str)
-                    == Some(self.deny_resource_id.as_str());
-                if matches_deny {
-                    return Ok(EvaluationResponse {
-                        decision: false,
-                        context: EvaluationResponseContext {
-                            constraints: Vec::new(),
-                            deny_reason: Some(DenyReason {
-                                error_code: "test-deny".to_owned(),
-                                details: None,
-                            }),
-                        },
-                    });
-                }
-                // Permit: scope the grant to the record's own tenant so the
-                // per-record gate (`require_constraints(true)`) admits it,
-                // rather than an empty-constraints permit that would now fail
-                // closed as `CompileFailed`.
-                Ok(permit_scoped_to_request_tenant(&request))
-            }
-        }
+        use crate::domain::test_support::{DenyOneResourceResolver, enforcer_for, hub_with_plugin};
 
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0xEE);
@@ -1170,9 +1121,7 @@ mod pdp_dedup_tests {
             "test.pdp_dedup.deny_projection.records.v1",
             "cyberfabric",
         );
-        let enforcer = enforcer_for(Arc::new(DenyOneResourceResolver {
-            deny_resource_id: "rsc-DENY".to_owned(),
-        }));
+        let enforcer = enforcer_for(DenyOneResourceResolver::new("rsc-DENY"));
         let type_resolver = std::sync::Arc::new(crate::domain::type_resolver::TypeResolver::new(
             fake_declaration_source_with_fold("SUM"),
             crate::domain::type_resolver::TypeResolverConfig {
@@ -1310,7 +1259,8 @@ mod gts_type_id_dedup_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -1326,7 +1276,8 @@ mod gts_type_id_dedup_tests {
             idempotency_key: input.idempotency_key.clone(),
             corrects_id: input.corrects_id,
             status: UsageRecordStatus::Active,
-            created_at: input.created_at,
+            window_start: input.window_start,
+            window_end: input.window_end,
         }
     }
 
@@ -1496,6 +1447,7 @@ mod corrects_id_dedup_tests {
     use crate::domain::Service;
     use crate::domain::test_support::{
         HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
+        projected,
     };
 
     const COUNTER_GTS_ID: &str =
@@ -1528,7 +1480,8 @@ mod corrects_id_dedup_tests {
             idempotency_key: IdempotencyKey::new("idem-original").expect("valid idempotency key"),
             corrects_id: None,
             status: UsageRecordStatus::Active,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -1542,7 +1495,8 @@ mod corrects_id_dedup_tests {
             value: rust_decimal::Decimal::from(-1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             corrects_id: Some(corrects_id),
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -1556,14 +1510,9 @@ mod corrects_id_dedup_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
-    }
-
-    // The plugin echo just needs a valid persisted `UsageRecord`; the create
-    // input projects to one via the same derivation the service applies.
-    fn persisted_echo(record: &CreateUsageRecord) -> UsageRecord {
-        record.clone().into_usage_record()
     }
 
     /// Five compensations sharing one `corrects_id` MUST collapse to a
@@ -1579,7 +1528,7 @@ mod corrects_id_dedup_tests {
             .map(|i| compensation_for(tenant_id, corrects_id, &format!("idem-comp-{i}")))
             .collect();
 
-        plugin.set_create_records(input.iter().map(|r| Ok(persisted_echo(r))).collect());
+        plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
@@ -1623,7 +1572,7 @@ mod corrects_id_dedup_tests {
             compensation_for(tenant_id, corrects_id_c, "idem-C"),
         ];
 
-        plugin.set_create_records(input.iter().map(|r| Ok(persisted_echo(r))).collect());
+        plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
@@ -1664,7 +1613,7 @@ mod corrects_id_dedup_tests {
             .map(|i| ordinary_record(tenant_id, &format!("idem-ord-{i}")))
             .collect();
 
-        plugin.set_create_records(input.iter().map(|r| Ok(persisted_echo(r))).collect());
+        plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
@@ -1709,7 +1658,7 @@ mod corrects_id_dedup_tests {
 
         // Only the known-good record reaches the persist SPI; program one
         // accepted response.
-        plugin.set_create_records(vec![Ok(persisted_echo(&input[1]))]);
+        plugin.set_create_records(vec![Ok(projected(&input[1]))]);
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
@@ -1817,7 +1766,8 @@ mod get_usage_record_tests {
             idempotency_key: IdempotencyKey::new("idem-happy").expect("valid idempotency key"),
             corrects_id: None,
             status: UsageRecordStatus::Active,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -2200,7 +2150,7 @@ mod create_usage_record_path_tests {
     use crate::domain::Service;
     use crate::domain::test_support::{
         DenyAllResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx, enforcer_for,
-        fake_declaration_source_with_fold, hub_with_plugin,
+        fake_declaration_source_with_fold, hub_with_plugin, projected,
     };
 
     const COUNTER_GTS_ID: &str =
@@ -2224,7 +2174,8 @@ mod create_usage_record_path_tests {
             value: rust_decimal::Decimal::from(value),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -2396,7 +2347,8 @@ mod create_usage_record_path_tests {
             idempotency_key: IdempotencyKey::new("idem-referenced").expect("valid idempotency key"),
             corrects_id: None,
             status: UsageRecordStatus::Active,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         };
         plugin.set_get_record(referenced);
 
@@ -2441,8 +2393,11 @@ mod create_usage_record_path_tests {
     async fn create_usage_record_happy_path_returns_persisted_echo() {
         let plugin = HappyPathPlugin::new();
 
-        let mut persisted =
-            counter_record(Uuid::from_u128(0xCAFE), 1, "idem-happy-persist").into_usage_record();
+        let mut persisted = projected(&counter_record(
+            Uuid::from_u128(0xCAFE),
+            1,
+            "idem-happy-persist",
+        ));
         // Distinguish persisted from input — the plugin's persisted echo
         // carries a different id than the record the service derives and
         // dispatches.
@@ -2510,7 +2465,8 @@ mod batch_size_cap_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -2584,9 +2540,10 @@ mod batch_size_cap_tests {
 // The create surface is identity-free (`CreateUsageRecord`): callers never
 // supply an `id`. The domain `Service` is the single, guaranteed point where a
 // submission acquires its identity — via
-// `CreateUsageRecord::into_usage_record`, which derives the `id` from the dedup
-// key. These tests drive the `Service` create methods directly (NOT through the
-// REST handler) and assert the record the plugin RECEIVED carries the
+// `CreateUsageRecord::try_into_usage_record`, which validates the covered
+// period and then derives the `id` from the 5-tuple dedup identity. These
+// tests drive the `Service` create methods directly (NOT through the REST
+// handler) and assert the record the plugin RECEIVED carries the
 // deterministic derivation, pinning that the service stamps the derived id on
 // the dispatch path.
 #[cfg(test)]
@@ -2605,6 +2562,7 @@ mod derived_id_stamp_tests {
     use crate::domain::Service;
     use crate::domain::test_support::{
         HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
+        projected,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -2617,10 +2575,10 @@ mod derived_id_stamp_tests {
             .build(plugin, suffix)
     }
 
-    /// Build a create submission with a known dedup key
-    /// (`tenant_id` / `gts_type_id` / `idempotency_key` / `created_at`), so a
-    /// passing assertion can only mean the service derived the dispatched
-    /// record's id from it.
+    /// Build a create submission with a known dedup identity
+    /// (`tenant_id` / `gts_type_id` / `idempotency_key` / `window_start` /
+    /// `window_end`), so a passing assertion can only mean the service
+    /// derived the dispatched record's id from it.
     fn input_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
             gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
@@ -2631,7 +2589,8 @@ mod derived_id_stamp_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -2647,12 +2606,13 @@ mod derived_id_stamp_tests {
             input.tenant_id,
             &input.gts_type_id,
             &input.idempotency_key,
-            input.created_at,
+            input.window_start,
+            input.window_end,
         );
 
         // The plugin echoes back the record it was dispatched, so the persist
         // SPI succeeds; the assertion reads the CAPTURED dispatched record.
-        plugin.set_create_record(input.clone().into_usage_record());
+        plugin.set_create_record(projected(&input));
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
@@ -2670,9 +2630,9 @@ mod derived_id_stamp_tests {
         assert_eq!(
             dispatched.id, expected,
             "the SERVICE MUST stamp the dispatched record's id with \
-             derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, created_at) - this \
-             guards the in-process (non-REST) caller path independently of the \
-             handler",
+             derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, \
+             window_start, window_end) - this guards the in-process (non-REST) \
+             caller path independently of the handler",
         );
     }
 
@@ -2694,18 +2654,13 @@ mod derived_id_stamp_tests {
                     r.tenant_id,
                     &r.gts_type_id,
                     &r.idempotency_key,
-                    r.created_at,
+                    r.window_start,
+                    r.window_end,
                 )
             })
             .collect();
 
-        plugin.set_create_records(
-            input
-                .iter()
-                .cloned()
-                .map(|r| Ok(r.into_usage_record()))
-                .collect(),
-        );
+        plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
@@ -2725,9 +2680,276 @@ mod derived_id_stamp_tests {
         assert_eq!(
             dispatched_ids, expected,
             "the SERVICE MUST stamp each dispatched record's id with its own \
-             derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, created_at), \
-             overwriting the caller-supplied ids - this guards the in-process \
-             (non-REST) batch caller path independently of the handler",
+             derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, \
+             window_start, window_end), overwriting the caller-supplied ids - \
+             this guards the in-process (non-REST) batch caller path \
+             independently of the handler",
+        );
+    }
+}
+
+// ── Covered-period preconditions on the batch path ─────────────────────────
+//
+// The identity derivation is per-submission and fallible, so a rejected
+// covered period is a PER-RECORD outcome routed to its own input index —
+// never a batch-level failure, and never a slot shifted onto a neighbour.
+// The batch path's surviving vector is no longer index-aligned with the
+// input, which is exactly the mistake these tests exist to catch.
+#[cfg(test)]
+mod covered_period_batch_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use time::OffsetDateTime;
+    use toolkit_gts::gts_id;
+    use usage_collector_sdk::{
+        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorError,
+        UsageCollectorPluginV1,
+    };
+    use uuid::Uuid;
+
+    use crate::domain::Service;
+    use crate::domain::test_support::{
+        DenyOneResourceResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx,
+        fake_declaration_source_with_fold, projected,
+    };
+
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+    fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
+        ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build(plugin, suffix)
+    }
+
+    /// Tenant `2` clears the fixture PDP; distinct `idem` values keep the
+    /// submissions distinct without changing their attribution tuple, so the
+    /// batch takes ONE PDP decision and every record shares it. That is the
+    /// arrangement in which a mis-routed index is invisible unless the
+    /// per-record outcomes are asserted individually.
+    fn submission(idem: &str) -> CreateUsageRecord {
+        submission_for("rsc-period", idem)
+    }
+
+    fn submission_for(resource_id: &str, idem: &str) -> CreateUsageRecord {
+        CreateUsageRecord {
+            gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
+            tenant_id: Uuid::from_u128(2),
+            resource_ref: ResourceRef::new(resource_id, "compute.vm").expect("valid resource ref"),
+            subject_ref: None,
+            metadata: BTreeMap::new(),
+            value: rust_decimal::Decimal::from(1),
+            idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
+            corrects_id: None,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        }
+    }
+
+    fn rejected_field(
+        result: &Result<usage_collector_sdk::UsageRecord, UsageCollectorError>,
+    ) -> &str {
+        match result {
+            Err(UsageCollectorError::InvalidArgument { field, .. }) => field.as_str(),
+            other => panic!("expected an InvalidArgument rejection, got {other:?}"),
+        }
+    }
+
+    /// A batch of [valid, inverted-period, valid]: the middle submission is
+    /// rejected at its OWN index and the two valid ones still reach the
+    /// plugin, in input order.
+    #[tokio::test]
+    async fn a_rejected_period_surfaces_at_its_own_input_index() {
+        let plugin = HappyPathPlugin::new();
+        let good_0 = submission("idem-period-0");
+        let mut bad = submission("idem-period-1");
+        bad.window_end = bad.window_start - time::Duration::seconds(1);
+        let good_2 = submission("idem-period-2");
+
+        // The plugin echoes back only the two records that survive the
+        // precondition; a batch that dispatched three (or the wrong two)
+        // would trip the service's dispatched-vs-returned length invariant.
+        plugin.set_create_records(vec![Ok(projected(&good_0)), Ok(projected(&good_2))]);
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.batch.period_mixed.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(
+                &authenticated_ctx(),
+                vec![good_0.clone(), bad, good_2.clone()],
+            )
+            .await
+            .expect("a per-record period rejection MUST NOT fail the batch");
+
+        assert_eq!(results.len(), 3, "one result slot per input submission");
+        assert!(results[0].is_ok(), "index 0 must be accepted: {results:?}");
+        assert_eq!(
+            rejected_field(&results[1]),
+            "window_end",
+            "the rejection must land at index 1, attributed to window_end",
+        );
+        assert!(results[2].is_ok(), "index 2 must be accepted: {results:?}");
+
+        let dispatched = plugin
+            .last_create_records_input()
+            .expect("plugin received the surviving batch");
+        assert_eq!(
+            dispatched
+                .iter()
+                .map(|r| r.idempotency_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["idem-period-0", "idem-period-2"],
+            "only the two valid submissions reach the plugin, in input order",
+        );
+    }
+
+    /// A sub-microsecond bound is the other precondition, and it is rejected
+    /// per-record on the batch path too — attributed to whichever bound
+    /// carried it.
+    #[tokio::test]
+    async fn a_sub_microsecond_bound_surfaces_at_its_own_input_index() {
+        let plugin = HappyPathPlugin::new();
+        let mut bad = submission("idem-period-sub-us");
+        bad.window_start = bad.window_start.replace_nanosecond(1).expect("valid nanos");
+        let good = submission("idem-period-clean");
+
+        plugin.set_create_records(vec![Ok(projected(&good))]);
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.batch.period_sub_us.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), vec![bad, good.clone()])
+            .await
+            .expect("a per-record period rejection MUST NOT fail the batch");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(rejected_field(&results[0]), "window_start");
+        assert!(results[1].is_ok(), "index 1 must be accepted: {results:?}");
+    }
+
+    /// Every submission rejected: the batch still returns `Ok` with a filled
+    /// slot per input, and the plugin is never dispatched.
+    ///
+    /// `HappyPathPlugin` is deliberately left UNPROGRAMMED here — an empty
+    /// dispatch would surface as a batch-level `Err`, so `Ok(..)` is direct
+    /// evidence the SPI was skipped rather than called with nothing. It also
+    /// pins that the tail's "every slot populated" guard is satisfied by a
+    /// converted-and-rejected slot, not by an invariant-breach `Internal`.
+    #[tokio::test]
+    async fn an_all_rejected_batch_returns_per_record_errors_without_dispatching() {
+        let plugin = HappyPathPlugin::new();
+        let mut first = submission("idem-period-all-0");
+        first.window_end = first.window_start - time::Duration::seconds(1);
+        let mut second = submission("idem-period-all-1");
+        second.window_end = second
+            .window_start
+            .replace_nanosecond(7)
+            .expect("valid nanos");
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.batch.period_all_rejected.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), vec![first, second])
+            .await
+            .expect("an all-rejected batch is still an Ok batch");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(rejected_field(&results[0]), "window_end");
+        assert_eq!(rejected_field(&results[1]), "window_end");
+        assert!(
+            plugin.last_create_records_input().is_none(),
+            "no submission survived, so the persist SPI must not be dispatched",
+        );
+    }
+
+    /// All three per-record outcomes in ONE batch — accepted,
+    /// period-rejected, PDP-denied — deliberately interleaved so the
+    /// rejected slot sits BETWEEN the other two.
+    ///
+    /// The interleaving is the whole point. The period-rejected submission
+    /// never enters `derived`, so any pass that re-`enumerate()`s the
+    /// surviving vector shifts the denial from input index 2 onto index 1 —
+    /// a slot that is already populated with the period error. A grouped
+    /// layout would let the shifted denial land on an empty tail slot and
+    /// surface only as an invariant breach; here it OVERWRITES a populated
+    /// slot and promotes the denied record to accepted, which is what the
+    /// per-index assertions below distinguish.
+    #[tokio::test]
+    async fn all_three_per_record_outcomes_coexist_at_their_own_input_indices() {
+        let plugin = HappyPathPlugin::new();
+
+        // Index 0: valid, permitted. Index 1: valid tuple but an inverted
+        // period. Index 2: valid period, denied tuple (`rsc-DENY`).
+        let accepted = submission_for("rsc-OK", "idem-three-way-accepted");
+        let mut bad_period = submission_for("rsc-OK", "idem-three-way-period");
+        bad_period.window_end = bad_period.window_start - time::Duration::seconds(1);
+        let denied = submission_for("rsc-DENY", "idem-three-way-denied");
+
+        // Exactly ONE record survives to the SPI. Programming one response
+        // is itself a guard: a batch that dispatched two would trip the
+        // service's dispatched-vs-returned length invariant and fail the
+        // `expect` below rather than reach the assertions.
+        plugin.set_create_records(vec![Ok(projected(&accepted))]);
+
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .with_resolver(DenyOneResourceResolver::new("rsc-DENY"))
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.batch.period_three_way.records.v1",
+            );
+
+        let expected_accepted_id = projected(&accepted).id;
+        let results = service
+            .create_usage_records(&authenticated_ctx(), vec![accepted, bad_period, denied])
+            .await
+            .expect("a mixed batch is still an Ok batch");
+
+        assert_eq!(
+            results.len(),
+            3,
+            "one result slot per input submission, whatever each outcome was",
+        );
+        assert_eq!(
+            results[0]
+                .as_ref()
+                .expect("index 0 is permitted and well-formed")
+                .id,
+            expected_accepted_id,
+            "index 0 must carry its OWN derived id",
+        );
+        assert_eq!(
+            rejected_field(&results[1]),
+            "window_end",
+            "index 1 must carry the period rejection naming the offending \
+             bound - not the denial that follows it in the input",
+        );
+        assert!(
+            matches!(
+                results[2],
+                Err(UsageCollectorError::PermissionDenied { .. })
+            ),
+            "index 2 must carry the PDP denial, not an acceptance: {:?}",
+            results[2],
+        );
+
+        let dispatched = plugin
+            .last_create_records_input()
+            .expect("the one surviving submission reached the plugin");
+        assert_eq!(
+            dispatched
+                .iter()
+                .map(|r| r.idempotency_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["idem-three-way-accepted"],
+            "neither the rejected period nor the denied tuple may be dispatched",
         );
     }
 }
@@ -2941,7 +3163,7 @@ mod ingestion_declared_type_tests {
     use crate::domain::test_support::{
         RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
         fake_declaration_source_counting, fake_declaration_source_not_found,
-        fake_declaration_source_with_metadata, recording_plugin_resolver,
+        fake_declaration_source_with_metadata, projected, recording_plugin_resolver,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -2996,7 +3218,8 @@ mod ingestion_declared_type_tests {
             idempotency_key: IdempotencyKey::new(format!("idem-{}", Uuid::new_v4()))
                 .expect("valid idempotency key"),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
@@ -3039,7 +3262,7 @@ mod ingestion_declared_type_tests {
             MetadataKey::new("region").expect("valid key"),
             "eu-west-1".to_owned(),
         );
-        spy.set_create_record(record.clone().into_usage_record());
+        spy.set_create_record(projected(&record));
 
         svc.create_usage_record(&ctx(), record)
             .await
@@ -3080,13 +3303,7 @@ mod ingestion_declared_type_tests {
             valid_create_record(),
             valid_create_record(),
         ];
-        spy.set_create_records(
-            records
-                .iter()
-                .cloned()
-                .map(|r| Ok(r.into_usage_record()))
-                .collect(),
-        );
+        spy.set_create_records(records.iter().map(|r| Ok(projected(r))).collect());
 
         let results = svc
             .create_usage_records(&ctx(), records)

@@ -24,8 +24,31 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::gts::USAGE_RECORD_RESOURCE;
-use crate::models::MeterTypeId;
+use crate::models::{MeterTypeId, WINDOW_END_FIELD};
 use crate::reason::{ConflictReason, ValidationReason};
+
+/// Renders an instant the way a caller-facing `detail` must echo it: RFC
+/// 3339, matching the wire `Timestamp` contract.
+///
+/// [`OffsetDateTime`]'s own `Display` is space-separated, unpadded, and
+/// offset-suffixed rather than `Z` (`2023-11-15 1:43:20.0 +00:00:00`), so it
+/// echoes back neither what the caller sent nor anything they could
+/// resubmit. Every timestamp-bearing constructor below routes through here
+/// so no single one can drift back onto `Display`.
+///
+/// Formatting can fail, and on the *value* rather than the descriptor:
+/// [`Rfc3339`] rejects a year outside `0..10_000` and an offset carrying
+/// non-zero seconds, both of which an in-process caller can construct even
+/// though no RFC 3339 wire payload can express either. So the fallback is a
+/// genuine last resort, not dead code — it trades a panic for a `Display`
+/// rendering that is at least self-consistent. Callers reduce how often it
+/// can be reached by normalizing to UTC before constructing the error,
+/// which is what [`crate::CreateUsageRecord::try_into_usage_record`] does.
+fn rfc3339(instant: OffsetDateTime) -> String {
+    instant
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| instant.to_string())
+}
 
 /// Public error envelope for the Usage Collector SDK and REST surfaces.
 #[derive(Debug, Error)]
@@ -186,6 +209,56 @@ impl UsageCollectorError {
         }
     }
 
+    /// A covered-period bound carried finer than microsecond precision.
+    ///
+    /// The `detail` names the offending bound, echoes it back in a form the
+    /// caller can resubmit, and states the remedy, because the caller's
+    /// only route forward is to round the value themselves — the gear
+    /// deliberately will not do it for them.
+    #[must_use]
+    pub fn sub_microsecond_period_bound(field: &str, bound: OffsetDateTime) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: field.to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "covered-period bound `{field}` requires at most microsecond \
+                 precision (got {}, carrying {} ns); round the bound to the \
+                 microsecond before submitting — the entry identity \
+                 derivation reads a fixed-width microsecond form, so a finer \
+                 value is rejected rather than truncated",
+                rfc3339(bound),
+                bound.nanosecond(),
+            ),
+        }
+    }
+
+    /// The covered period was inverted (`window_end < window_start`).
+    ///
+    /// Attributed to `window_end` rather than to the period as a whole: the
+    /// period is not a wire field, and the end is the bound a caller
+    /// computes from the start.
+    #[must_use]
+    pub fn inverted_covered_period(
+        window_start: OffsetDateTime,
+        window_end: OffsetDateTime,
+    ) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: WINDOW_END_FIELD.to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "covered period requires window_start <= window_end (got \
+                 window_start={}, window_end={}); equal bounds are a point \
+                 event and are valid",
+                rfc3339(window_start),
+                rfc3339(window_end),
+            ),
+        }
+    }
+
     /// A read-path time range was empty or inverted (`to <= from`).
     ///
     /// Once Task 3 threads [`crate::TimeRange`] onto every read path, it
@@ -196,13 +269,8 @@ impl UsageCollectorError {
     /// empty result that would read as "no usage".
     #[must_use]
     pub fn invalid_time_range(from: OffsetDateTime, to: OffsetDateTime) -> Self {
-        // RFC 3339, matching the wire `Timestamp` contract: `OffsetDateTime`'s
-        // `Display` is space-separated, unpadded, and offset-suffixed rather
-        // than `Z`, so it echoes back neither what the caller sent nor
-        // anything they could resubmit. The `format` error is unreachable
-        // for a well-known descriptor; `to_string()` is a harmless fallback.
-        let from = from.format(&Rfc3339).unwrap_or_else(|_| from.to_string());
-        let to = to.format(&Rfc3339).unwrap_or_else(|_| to.to_string());
+        let from = rfc3339(from);
+        let to = rfc3339(to);
         Self::InvalidArgument {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: None,

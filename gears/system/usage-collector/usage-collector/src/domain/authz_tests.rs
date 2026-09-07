@@ -58,7 +58,8 @@ fn record_with(subject: Option<SubjectRef>) -> UsageRecord {
         idempotency_key: IdempotencyKey::new("idem-eq").expect("valid idempotency key"),
         corrects_id: None,
         status: UsageRecordStatus::Active,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
 }
 
@@ -150,9 +151,14 @@ async fn key_and_record_compose_byte_identical_pdp_requests_with_full_subject() 
 /// Two records that hash-equal under `AttributionTupleKey` MUST always
 /// produce equal PDP requests -- even when their *non*-tuple fields
 /// (`id`, `gts_type_id`, `value`, `idempotency_key`, `metadata`,
-/// `corrects_id`, `created_at`) differ wildly. This pins the
-/// projection-correctness premise of the dedup directly: "share the
+/// `corrects_id`, and both covered-period bounds) differ wildly. This pins
+/// the projection-correctness premise of the dedup directly: "share the
 /// tuple => share the PDP payload".
+///
+/// Both period bounds are varied, and independently of each other, because
+/// the tuple key must be blind to the covered period as a whole: a key that
+/// admitted either bound would split one PDP decision into two and defeat
+/// the dedup.
 #[tokio::test]
 async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_differ() {
     let record_a = UsageRecord {
@@ -166,7 +172,8 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         idempotency_key: IdempotencyKey::new("idem-A").expect("valid idempotency key"),
         corrects_id: None,
         status: UsageRecordStatus::Active,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     };
     let record_b = UsageRecord {
         // Same tuple-key fields …
@@ -181,7 +188,8 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         idempotency_key: IdempotencyKey::new("idem-B-different").expect("valid idempotency key"),
         corrects_id: Some(Uuid::from_u128(0xCCCC)),
         status: UsageRecordStatus::Active,
-        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
+        window_start: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(72),
     };
 
     let key_a = AttributionTupleKey::from_record(&record_a, usage_record::actions::CREATE);

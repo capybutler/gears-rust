@@ -55,7 +55,8 @@ fn sample_record() -> UsageRecord {
         idempotency_key: IdempotencyKey::new("idem-1").expect("valid idempotency key"),
         corrects_id: None,
         status: UsageRecordStatus::Active,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
 }
 
@@ -72,7 +73,8 @@ fn sample_create_record() -> CreateUsageRecord {
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-1").expect("valid idempotency key"),
         corrects_id: None,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
 }
 

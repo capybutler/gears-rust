@@ -23,17 +23,34 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::Constraint;
 use authz_resolver_sdk::models::{
-    EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
-    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
-    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
+    AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord, MetadataFilter,
+    MeterTypeId, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 use uuid::Uuid;
+
+/// Projects a create submission into its persisted shape, for a plugin echo
+/// fixture that must agree with the service on the derived `id`.
+///
+/// Routing through the real
+/// [`CreateUsageRecord::try_into_usage_record`] rather than hand-building a
+/// [`UsageRecord`] is the point: a stub that invented its own `id` would
+/// pass even if the service stopped deriving one. Every fixture in these
+/// tests supplies a valid covered period, so the projection cannot fail —
+/// and if one ever does, the `expect` names the fixture as the defect
+/// rather than letting a bogus record reach the assertion.
+pub(crate) fn projected(submission: &CreateUsageRecord) -> UsageRecord {
+    submission
+        .clone()
+        .try_into_usage_record()
+        .expect("test fixture supplies a valid covered period")
+}
 
 /// Minimal mock storage-plugin client.
 ///
@@ -172,6 +189,64 @@ pub fn permit_scoped_to_request_tenant(request: &EvaluationRequest) -> Evaluatio
                 deny_reason: None,
             },
         },
+    }
+}
+
+/// PDP fake that denies every request whose composed `resource_id` equals
+/// `deny_resource_id` and permits every other, scoping each permit to the
+/// request's own tenant (see [`permit_scoped_to_request_tenant`]).
+///
+/// The PEP composer at `domain/authz.rs` populates the request's resource
+/// properties with `PROP_RESOURCE_ID` from the attribution tuple, so this
+/// resolver discriminates **per attribution tuple** — which is what lets a
+/// batch test mix permitted and denied records in one call and assert the
+/// per-index outcomes.
+#[derive(Debug)]
+pub struct DenyOneResourceResolver {
+    deny_resource_id: String,
+}
+
+impl DenyOneResourceResolver {
+    /// Denies the attribution tuple whose `resource_id` is
+    /// `deny_resource_id`; permits every other.
+    #[must_use]
+    pub fn new(deny_resource_id: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            deny_resource_id: deny_resource_id.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for DenyOneResourceResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let matches_deny = request
+            .resource
+            .properties
+            .get(crate::domain::authz::usage_record::PROP_RESOURCE_ID)
+            .and_then(serde_json::Value::as_str)
+            == Some(self.deny_resource_id.as_str());
+        if matches_deny {
+            return Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext {
+                    constraints: Vec::new(),
+                    deny_reason: Some(DenyReason {
+                        error_code: "test-deny".to_owned(),
+                        details: None,
+                    }),
+                },
+            });
+        }
+        // Permit: scope the grant to the record's own tenant so the
+        // per-record gate (`require_constraints(true)`) admits it, rather
+        // than an empty-constraints permit that would fail closed as
+        // `CompileFailed`.
+        Ok(permit_scoped_to_request_tenant(&request))
     }
 }
 

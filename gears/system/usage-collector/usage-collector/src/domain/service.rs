@@ -626,9 +626,12 @@ impl Service {
     ///   is unavailable.
     /// * [`UsageCollectorError::NotFound`] when the referenced `gts_type_id`
     ///   does not resolve to a usable declaration.
-    /// * [`UsageCollectorError::InvalidArgument`] /
-    ///   [`UsageCollectorError::InvalidArgument`] on a malformed
-    ///   `metadata` payload.
+    /// * [`UsageCollectorError::InvalidArgument`] on a rejected covered
+    ///   period — a bound finer than microsecond precision, or an inverted
+    ///   period. This is raised by the projection in the first statement of
+    ///   the body, so it outranks every other failure here.
+    /// * [`UsageCollectorError::InvalidArgument`] on a malformed `metadata`
+    ///   payload or a semantics violation.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
     ///   transport / persistence failure.
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1
@@ -667,12 +670,15 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-submit
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-missing-ctx
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-submit
-        // The service is the guaranteed choke point for every caller
-        // (REST + in-process). The create surface is identity-free
-        // (`CreateUsageRecord`); the record acquires its deterministic
-        // dedup-key-derived `id` and its initial `Active` status HERE, before
-        // authorization or dispatch — the single point of derivation.
-        let record = record.into_usage_record();
+        // The service is the guaranteed choke point for every caller (REST +
+        // in-process). The create surface is identity-free
+        // (`CreateUsageRecord`); the entry acquires its deterministic
+        // dedup-identity-derived `id` and its initial `Active` status HERE,
+        // and only after its covered period has been validated —
+        // `cpt-cf-usage-collector-adr-record-identity-derivation` requires
+        // both period preconditions to be rejected before the derivation
+        // runs.
+        let record = record.try_into_usage_record()?;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-pdp-deny
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-attrib-authz
@@ -808,9 +814,9 @@ impl Service {
     /// # Errors
     ///
     /// Surfaces the same [`UsageCollectorError`] variants as
-    /// [`Self::create_usage_record_inner`] — PDP denial, an unresolvable
-    /// declaration, semantics / metadata validation, idempotency conflict,
-    /// or plugin fault.
+    /// [`Self::create_usage_record_inner`] — a rejected covered period, PDP
+    /// denial, an unresolvable declaration, semantics / metadata
+    /// validation, idempotency conflict, or plugin fault.
     pub async fn create_usage_record(
         &self,
         ctx: &SecurityContext,
@@ -926,13 +932,16 @@ impl Service {
     ///
     /// Per-record stages mirror [`Self::create_usage_record`] and run
     /// independently for each input; eligible records carry their
-    /// caller-supplied `created_at` through to persistence, where
-    /// `into_usage_record` truncates it to microsecond precision (ADR-0014),
-    /// and are dispatched together. Per-record validation /
-    /// SPI failures surface in the result vector at their input index —
-    /// the outer `Err` is reserved for batch-level failures (plugin
-    /// handle resolution, outer SPI dispatch, and the structural batch-size
-    /// cap below).
+    /// caller-supplied covered period through to persistence UTC-normalized
+    /// but otherwise unchanged — nothing is quantized or truncated — and
+    /// are dispatched together. Per-record validation / SPI failures
+    /// surface in the result vector at their input index — including a
+    /// rejected covered period, which
+    /// `cpt-cf-usage-collector-adr-record-identity-derivation` makes a
+    /// per-submission precondition of the identity derivation rather than a
+    /// batch-level one. The outer `Err` is reserved for batch-level
+    /// failures (plugin handle resolution, outer SPI dispatch, and the
+    /// structural batch-size cap below).
     ///
     /// The SDK-facing batch cap of `1..=`[`MAX_BATCH_RECORDS`] is enforced
     /// here (not at the REST handler, which is a thin wrapper over this
@@ -950,10 +959,10 @@ impl Service {
     /// * Any other [`UsageCollectorError`] variant lifted from a batch-level
     ///   plugin transport / persistence failure.
     ///
-    /// Per-record failures (authorization denial, an unresolvable
-    /// declaration, malformed metadata, SPI errors against individual
-    /// records) surface in the per-index `Result` entries of the returned
-    /// vector rather than the outer `Err`.
+    /// Per-record failures (a rejected covered period, authorization
+    /// denial, an unresolvable declaration, malformed metadata, SPI errors
+    /// against individual records) surface in the per-index `Result`
+    /// entries of the returned vector rather than the outer `Err`.
     ///
     /// # Post-condition
     ///
@@ -980,37 +989,62 @@ impl Service {
         // `create_usage_records` wrapper (before the batch-size observation),
         // so callers of the inner path are already in range.
 
-        // The service is the guaranteed choke point for every caller
-        // (REST + in-process). The create surface is identity-free
-        // (`CreateUsageRecord`); each record acquires its deterministic
-        // dedup-key-derived `id` and its initial `Active` status HERE, before
-        // authorization or dispatch — the single point of derivation.
-        let records: Vec<UsageRecord> = records
-            .into_iter()
-            .map(CreateUsageRecord::into_usage_record)
-            .collect();
+        let submission_count = records.len();
+        let mut results: Vec<Option<Result<UsageRecord, UsageCollectorError>>> =
+            (0..submission_count).map(|_| None).collect();
+        // Per-input-index admissibility, cleared by any pass that finishes a
+        // slot: the covered-period conversion below and the PDP projection
+        // further down.
+        let mut pdp_allowed: Vec<bool> = vec![true; submission_count];
+
+        // The service is the guaranteed choke point for every caller (REST +
+        // in-process). The create surface is identity-free
+        // (`CreateUsageRecord`); each entry acquires its deterministic
+        // dedup-identity-derived `id` and its initial `Active` status HERE,
+        // before authorization or dispatch — the single point of derivation.
+        //
+        // The derivation is per-submission and fallible (the covered-period
+        // preconditions of
+        // `cpt-cf-usage-collector-adr-record-identity-derivation`), so a bad
+        // period surfaces at its own input index instead of failing the
+        // batch. Every later pass carries the input index explicitly rather
+        // than re-`enumerate()`ing, because the surviving vector is no
+        // longer index-aligned with the input.
+        let mut derived: Vec<(usize, UsageRecord)> = Vec::with_capacity(submission_count);
+        for (index, submission) in records.into_iter().enumerate() {
+            match submission.try_into_usage_record() {
+                Ok(record) => derived.push((index, record)),
+                Err(e) => {
+                    results[index] = Some(Err(e));
+                    // Redundant today — every later pass walks `derived`, so
+                    // it cannot reach this index anyway — but "this slot is
+                    // finished" must not be spelled two different ways. A
+                    // pass added later that consults `pdp_allowed` alone
+                    // would otherwise read a rejected slot as admissible.
+                    pdp_allowed[index] = false;
+                }
+            }
+        }
 
         let plugin = self
             .resolve_plugin_for(PluginOp::CreateUsageRecords)
             .await
             .map_err(UsageCollectorError::from)?;
 
-        let mut results: Vec<Option<Result<UsageRecord, UsageCollectorError>>> =
-            (0..records.len()).map(|_| None).collect();
         let mut eligible: Vec<(usize, UsageRecord)> = Vec::new();
         let mut pending_l1: Vec<PendingL1Lookup> = Vec::new();
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-pdp
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-dedup-tuple-key
         let mut distinct_tuples: HashMap<AttributionTupleKey, Vec<usize>> = HashMap::new();
-        for (index, record) in records.iter().enumerate() {
+        for (index, record) in &derived {
             distinct_tuples
                 .entry(AttributionTupleKey::from_record(
                     record,
                     usage_record::actions::CREATE,
                 ))
                 .or_default()
-                .push(index);
+                .push(*index);
         }
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-dedup-tuple-key
 
@@ -1048,7 +1082,6 @@ impl Service {
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-deny
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-allow
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-pdp-projected-deny
-        let mut pdp_allowed: Vec<bool> = vec![true; records.len()];
         for (indices, decision) in pdp_decisions {
             if let Err(e) = decision {
                 // A PDP-transport failure (`AuthorizationUnavailable`) and a
@@ -1066,9 +1099,8 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-deny
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-pdp
 
-        let distinct_gts_type_ids: HashSet<MeterTypeId> = records
+        let distinct_gts_type_ids: HashSet<MeterTypeId> = derived
             .iter()
-            .enumerate()
             .filter(|(idx, _)| pdp_allowed[*idx])
             .map(|(_, r)| r.gts_type_id.clone())
             .collect();
@@ -1092,7 +1124,7 @@ impl Service {
             .await;
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-foreach-validate
-        for (index, record) in records.into_iter().enumerate() {
+        for (index, record) in derived {
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-pdp
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-deny
             if !pdp_allowed[index] {
@@ -1161,8 +1193,10 @@ impl Service {
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-metadata-closed-shape
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-eligible
-            // (caller-supplied `record.created_at` is carried onto the persisted
-            // record, truncated to microsecond precision by `into_usage_record` per ADR-0014)
+            // (the caller-supplied covered period is carried onto the
+            // persisted entry verbatim — `try_into_usage_record` normalized
+            // both bounds to UTC and rejected anything finer than the
+            // microsecond, so nothing is truncated here or downstream)
             eligible.push((index, record));
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-eligible
         }
@@ -1227,10 +1261,10 @@ impl Service {
         }
 
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-return
-        // Every per-record slot is filled by the PDP / catalog / semantics
-        // / metadata / SPI-fanout passes above; an empty slot here is a
-        // host-invariant breach. Yield a typed `Internal` for that slot so
-        // the request thread cannot panic.
+        // Every per-record slot is filled by the period / PDP / catalog /
+        // semantics / metadata / SPI-fanout passes above; an empty slot here
+        // is a host-invariant breach. Yield a typed `Internal` for that slot
+        // so the request thread cannot panic.
         Ok(results
             .into_iter()
             .enumerate()

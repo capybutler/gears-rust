@@ -26,7 +26,8 @@ fn sample_record(id: &str, idempotency_key: &str) -> UsageRecord {
             .expect("valid idempotency key fixture"),
         corrects_id: None,
         status: UsageRecordStatus::Active,
-        created_at: time::OffsetDateTime::from_unix_timestamp(0).expect("epoch fixture"),
+        window_start: time::OffsetDateTime::UNIX_EPOCH,
+        window_end: time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
 }
 

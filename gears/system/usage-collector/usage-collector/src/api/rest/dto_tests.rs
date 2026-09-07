@@ -26,7 +26,8 @@ use super::{
 const SAMPLE_METER_TYPE_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
-const SAMPLE_RECORD_RFC3339: &str = "2026-06-11T12:34:56Z";
+const SAMPLE_WINDOW_START_RFC3339: &str = "2026-06-11T12:34:56Z";
+const SAMPLE_WINDOW_END_RFC3339: &str = "2026-06-11T13:34:56Z";
 const SAMPLE_RECORD_VALUE: &str = "42.5";
 const SAMPLE_IDEMPOTENCY_KEY: &str = "idem-dto-tests-1";
 
@@ -50,12 +51,14 @@ fn sample_persisted_record(status: UsageRecordStatus) -> UsageRecord {
         idempotency_key: IdempotencyKey::new(SAMPLE_IDEMPOTENCY_KEY).expect("valid idem key"),
         corrects_id: None,
         status,
-        created_at: OffsetDateTime::parse(
-            SAMPLE_RECORD_RFC3339,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .expect("RFC 3339 fixture parses"),
+        window_start: parse_rfc3339(SAMPLE_WINDOW_START_RFC3339),
+        window_end: parse_rfc3339(SAMPLE_WINDOW_END_RFC3339),
     }
+}
+
+fn parse_rfc3339(raw: &str) -> OffsetDateTime {
+    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .expect("RFC 3339 fixture parses")
 }
 
 fn sample_usage_record_dto() -> UsageRecordDto {
@@ -79,7 +82,7 @@ fn record_dto_names_the_type_reference_gts_type_id() {
 // The handler tests in `handlers::usage_records_tests` construct
 // `CreateUsageRecordRequest` directly with Rust values, bypassing serde — so a
 // regression that drops `deny_unknown_fields`, flips `value` to numeric
-// deserialization, drops the RFC 3339 wrapper on `created_at`, or removes the
+// deserialization, drops the RFC 3339 wrapper on a period bound, or removes the
 // `Option<…>` / `BTreeMap::is_empty` defaults would still pass CI. These tests
 // pin each of those serde attributes directly against the wire shape.
 // ---------------------------------------------------------------------------
@@ -94,7 +97,8 @@ fn minimal_create_record_json() -> serde_json::Value {
         },
         "value": SAMPLE_RECORD_VALUE,
         "idempotency_key": SAMPLE_IDEMPOTENCY_KEY,
-        "created_at": SAMPLE_RECORD_RFC3339,
+        "window_start": SAMPLE_WINDOW_START_RFC3339,
+        "window_end": SAMPLE_WINDOW_END_RFC3339,
     })
 }
 
@@ -125,7 +129,8 @@ fn create_request_rejects_client_supplied_id() {
         "resource_ref": { "resource_id": "r1", "resource_type": "compute.vm" },
         "value": "1",
         "idempotency_key": "idem-1",
-        "created_at": "2026-07-07T00:00:00Z"
+        "window_start": "2026-07-07T00:00:00Z",
+        "window_end": "2026-07-07T01:00:00Z"
     });
     let err = serde_json::from_value::<super::CreateUsageRecordRequest>(json).unwrap_err();
     assert!(err.to_string().contains("unknown field"), "got: {err}");
@@ -158,32 +163,53 @@ fn create_usage_record_request_deserialises_value_as_string_only() {
 }
 
 #[test]
-fn create_usage_record_request_deserialises_created_at_as_rfc3339_only() {
-    // Pin `#[serde(with = "time::serde::rfc3339")]` on `created_at`: the wire
-    // carries the timestamp as a JSON string in RFC 3339 form. A regression
-    // that swapped this for the default `OffsetDateTime` serde codec would
-    // accept a numeric Unix timestamp and break every existing client.
+fn create_usage_record_request_deserialises_both_period_bounds_as_rfc3339_only() {
+    // Pin `#[serde(with = "time::serde::rfc3339")]` on each covered-period
+    // bound: the wire carries both as JSON strings in RFC 3339 form. A
+    // regression that swapped either for the default `OffsetDateTime` serde
+    // codec would accept a numeric Unix timestamp and break every existing
+    // client. Both bounds are checked, because the attribute is per-field
+    // and a copy-paste that dropped it from one would not surface anywhere
+    // else.
     let req: CreateUsageRecordRequest = serde_json::from_value(minimal_create_record_json())
-        .expect("RFC 3339 string for `created_at` parses");
-    let expected = OffsetDateTime::parse(
-        SAMPLE_RECORD_RFC3339,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .expect("fixture parses");
-    assert_eq!(req.created_at, expected);
+        .expect("RFC 3339 strings for both bounds parse");
+    assert_eq!(req.window_start, parse_rfc3339(SAMPLE_WINDOW_START_RFC3339));
+    assert_eq!(req.window_end, parse_rfc3339(SAMPLE_WINDOW_END_RFC3339));
 
-    let mut numeric_json = minimal_create_record_json();
-    numeric_json.as_object_mut().expect("object").insert(
-        "created_at".to_owned(),
-        serde_json::json!(1_700_000_000_i64),
-    );
-    let err = serde_json::from_value::<CreateUsageRecordRequest>(numeric_json)
-        .expect_err("non-string `created_at` MUST be rejected");
-    assert!(
-        err.to_string().contains("RFC3339"),
-        "deserialize error MUST identify the RFC 3339 codec the field expected \
-         (got `{err}`)",
-    );
+    for bound in ["window_start", "window_end"] {
+        let mut numeric_json = minimal_create_record_json();
+        numeric_json
+            .as_object_mut()
+            .expect("object")
+            .insert(bound.to_owned(), serde_json::json!(1_700_000_000_i64));
+        let err = serde_json::from_value::<CreateUsageRecordRequest>(numeric_json)
+            .expect_err("a non-string period bound MUST be rejected");
+        assert!(
+            err.to_string().contains("RFC3339"),
+            "deserialize error for `{bound}` MUST identify the RFC 3339 codec \
+             the field expected (got `{err}`)",
+        );
+    }
+}
+
+#[test]
+fn create_usage_record_request_requires_both_period_bounds() {
+    // Neither bound is optional: a submission missing one carries no
+    // well-formed covered period, and there is no default that could stand
+    // in for it. Pins that no `#[serde(default)]` slipped onto either.
+    for missing in ["window_start", "window_end"] {
+        let mut json = minimal_create_record_json();
+        json.as_object_mut()
+            .expect("object")
+            .remove(missing)
+            .expect("fixture carries the field");
+        let err = serde_json::from_value::<CreateUsageRecordRequest>(json)
+            .expect_err("a missing period bound MUST be rejected");
+        assert!(
+            err.to_string().contains(missing),
+            "deserialize error MUST name the missing bound `{missing}` (got `{err}`)",
+        );
+    }
 }
 
 #[test]
@@ -233,7 +259,7 @@ fn create_usage_record_request_optional_corrects_id_defaults_to_none() {
 //
 // `UsageRecordDto` is the response projection of `UsageRecord`. The handler
 // tests assert the persisted-record UUID makes it through but never check the
-// status / value / created_at / metadata projections — a regression in any of
+// status / value / period-bound / metadata projections — a regression in any of
 // `serde(with = "rust_decimal::serde::str")`, `serde(with =
 // "time::serde::rfc3339")`, the status `"active"` / `"inactive"` mapping, or
 // the empty-metadata skip would not fail any existing test. The pins below
@@ -265,7 +291,7 @@ fn usage_record_dto_serialises_inactive_status_as_lowercase_string() {
 }
 
 #[test]
-fn usage_record_dto_serialises_value_as_string_and_created_at_as_rfc3339() {
+fn usage_record_dto_serialises_value_as_string_and_period_bounds_as_rfc3339() {
     let dto = UsageRecordDto::from(sample_persisted_record(UsageRecordStatus::Active));
     let json = serde_json::to_value(&dto).expect("UsageRecordDto serialises");
     assert_eq!(
@@ -274,9 +300,18 @@ fn usage_record_dto_serialises_value_as_string_and_created_at_as_rfc3339() {
         "`value` MUST be emitted as a JSON string (not a number)",
     );
     assert_eq!(
-        json.get("created_at").and_then(serde_json::Value::as_str),
-        Some(SAMPLE_RECORD_RFC3339),
-        "`created_at` MUST be emitted as an RFC 3339 string",
+        json.get("window_start").and_then(serde_json::Value::as_str),
+        Some(SAMPLE_WINDOW_START_RFC3339),
+        "`window_start` MUST be emitted as an RFC 3339 string",
+    );
+    assert_eq!(
+        json.get("window_end").and_then(serde_json::Value::as_str),
+        Some(SAMPLE_WINDOW_END_RFC3339),
+        "`window_end` MUST be emitted as an RFC 3339 string",
+    );
+    assert!(
+        json.get("created_at").is_none(),
+        "the single instant is gone from the response projection; got {json:?}",
     );
 }
 

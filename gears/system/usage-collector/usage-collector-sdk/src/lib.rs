@@ -38,12 +38,12 @@ pub mod time_range;
 pub use api::UsageCollectorClientV1;
 pub use error::{UsageCollectorError, UsageCollectorPluginError};
 pub use gts::{USAGE_RECORD_RESOURCE, UsageCollectorPluginSpecV1};
-pub use id::{USAGE_RECORD_ID_NAMESPACE, created_at_micros, derive_usage_record_id};
+pub use id::{USAGE_RECORD_ID_NAMESPACE, canonical_period_bound, derive_usage_record_id};
 pub use models::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
     IdempotencyKey, MAX_AGGREGATION_BUCKETS, MetadataFilter, MetadataKey, MeterTypeId, ResourceRef,
     SubjectRef, USAGE_RECORD_BASE_TYPE, UsageRecord, UsageRecordFilterField, UsageRecordQuery,
-    UsageRecordStatus, is_keyset_safe_record_field,
+    UsageRecordStatus, WINDOW_END_FIELD, WINDOW_START_FIELD, is_keyset_safe_record_field,
 };
 pub use plugin_api::UsageCollectorPluginV1;
 pub use reason::{ConflictReason, ValidationReason};

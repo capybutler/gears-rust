@@ -104,9 +104,11 @@ pub struct CreateUsageRecordRequest {
     pub value: Decimal,
     /// Mandatory caller-supplied idempotency key per
     /// `cpt-cf-usage-collector-dod-usage-emission-fr-idempotency`. The
-    /// plugin SPI dedups every persisted record on
-    /// `(tenant_id, gts_type_id, idempotency_key, created_at)` (ADR-0014); a
-    /// missing key surfaces as a request-deserialization failure.
+    /// dedup identity is the 5-tuple
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+    /// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so one
+    /// stable per-meter key covers many periods; a missing key surfaces as
+    /// a request-deserialization failure.
     pub idempotency_key: String,
     /// When set, marks this submission as a counter compensation
     /// referencing a previously emitted ordinary usage row. Absent on
@@ -115,9 +117,14 @@ pub struct CreateUsageRecordRequest {
     /// `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corrects_id: Option<Uuid>,
-    /// Caller-supplied measurement timestamp (RFC 3339 UTC).
+    /// Inclusive start of the covered period this submission measures (RFC
+    /// 3339, offset mandatory).
     #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
+    pub window_start: OffsetDateTime,
+    /// Exclusive end of the covered period (RFC 3339, offset mandatory).
+    /// Equal bounds submit a point event.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: OffsetDateTime,
 }
 
 /// Batch create request body for `POST /usage-collector/v1/records`.
@@ -130,9 +137,9 @@ pub struct CreateUsageRecordsRequest {
 
 /// Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_type_id` is
 /// flattened to `String` so the type can derive `utoipa::ToSchema` without
-/// pulling `utoipa` into the SDK crate; `created_at` is emitted as RFC 3339
-/// to match the SDK wire shape. `status` is projected to its lowercase
-/// string form for the same reason.
+/// pulling `utoipa` into the SDK crate; both covered-period bounds are
+/// emitted as RFC 3339 to match the SDK wire shape. `status` is projected to
+/// its lowercase string form for the same reason.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct UsageRecordDto {
@@ -159,8 +166,16 @@ pub struct UsageRecordDto {
     /// Lifecycle status: `"active"` on a fresh insert, `"inactive"` after a
     /// depth-1 deactivation cascade.
     pub status: String,
+    /// Inclusive start of the covered period the entry measures.
     #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
+    pub window_start: OffsetDateTime,
+    /// Exclusive end of the covered period — the bound the read *contract*
+    /// selects on (`cpt-cf-usage-collector-adr-window-end-selection`).
+    /// The read paths still carry their window as a `$filter` conjunct over
+    /// the retired instant field; threading them onto this bound is a later
+    /// commit in this slice.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: OffsetDateTime,
 }
 
 impl From<UsageRecord> for UsageRecordDto {
@@ -183,7 +198,8 @@ impl From<UsageRecord> for UsageRecordDto {
                 UsageRecordStatus::Active => "active".to_owned(),
                 UsageRecordStatus::Inactive => "inactive".to_owned(),
             },
-            created_at: value.created_at,
+            window_start: value.window_start,
+            window_end: value.window_end,
         }
     }
 }

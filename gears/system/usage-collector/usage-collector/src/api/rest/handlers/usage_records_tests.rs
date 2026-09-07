@@ -72,7 +72,8 @@ async fn create_with_only_bad_gts_type_id_records_short_circuits_to_207_without_
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-bad-prefix-1".to_owned(),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: EPOCH_PLUS_ONE_HOUR,
         }],
     };
 
@@ -190,7 +191,8 @@ async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_no
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-over-long-1".to_owned(),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: EPOCH_PLUS_ONE_HOUR,
         }],
     };
 
@@ -457,6 +459,12 @@ use usage_collector_sdk::{
 const HAPPY_RECORD_GTS_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
+/// The exclusive end of the fixture covered period, one hour after the
+/// epoch start. Distinct from the start so a test that confused the two
+/// bounds fails rather than passing by symmetry.
+const EPOCH_PLUS_ONE_HOUR: OffsetDateTime =
+    OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::hours(1));
+
 fn sample_persisted_record(id: Uuid, tenant_id: Uuid) -> UsageRecord {
     sample_persisted_record_with_status(id, tenant_id, UsageRecordStatus::Active)
 }
@@ -489,7 +497,8 @@ fn sample_persisted_record_with_status(
         idempotency_key: IdempotencyKey::new("idem-happy").expect("valid idempotency key"),
         corrects_id: None,
         status,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: EPOCH_PLUS_ONE_HOUR,
     }
 }
 
@@ -513,6 +522,7 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
         &gts_id,
         &idempotency_key,
         OffsetDateTime::UNIX_EPOCH,
+        EPOCH_PLUS_ONE_HOUR,
     );
     let persisted_uuid = Uuid::new_v4();
     assert_ne!(derived_id, persisted_uuid, "test premise");
@@ -538,7 +548,8 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-happy".to_owned(),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: EPOCH_PLUS_ONE_HOUR,
         }],
     };
 
@@ -595,8 +606,10 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
 
 #[tokio::test]
 async fn create_stamps_derived_id() {
-    // The gateway MUST derive the dispatched record's id from the dedup key
-    // `(tenant_id, gts_type_id, idempotency_key, created_at)` rather than accept a
+    // The gateway MUST derive the dispatched record's id from the 5-tuple
+    // dedup identity
+    // `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+    // rather than accept a
     // caller-chosen value — pin both that the dispatched id matches
     // `derive_usage_record_id` AND that a same-key resubmit derives the
     // identical id (determinism).
@@ -609,6 +622,7 @@ async fn create_stamps_derived_id() {
         &gts_id,
         &idempotency_key,
         OffsetDateTime::UNIX_EPOCH,
+        EPOCH_PLUS_ONE_HOUR,
     );
 
     let service = ServiceFixture::default()
@@ -631,7 +645,8 @@ async fn create_stamps_derived_id() {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-derive-1".to_owned(),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: EPOCH_PLUS_ONE_HOUR,
         }],
     };
 
@@ -653,7 +668,8 @@ async fn create_stamps_derived_id() {
     assert_eq!(
         forwarded[0].id, expected,
         "gateway MUST stamp the dispatched record's id with \
-         derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, created_at)",
+         derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, \
+         window_start, window_end)",
     );
 
     // Same-key resubmit: the derived id MUST be identical.
@@ -678,70 +694,236 @@ async fn create_stamps_derived_id() {
 }
 
 #[tokio::test]
-async fn create_same_key_different_created_at_derives_distinct_ids() {
-    // ADR-0014: `created_at` is part of the identity. Two submissions sharing
-    // `(tenant_id, gts_type_id, idempotency_key)` but carrying different `created_at`
-    // values MUST be dispatched with DISTINCT ids (previously they collided on
-    // one derived id).
+async fn create_same_key_different_covered_periods_derives_distinct_ids() {
+    // `cpt-cf-usage-collector-adr-record-identity-derivation`: both
+    // covered-period bounds are part of the identity. Three
+    // submissions sharing `(tenant_id, gts_type_id, idempotency_key)` but
+    // covering different periods MUST be dispatched with DISTINCT ids — that
+    // is what lets one stable per-meter key cover many periods instead of
+    // collapsing them onto one entry. The third submission moves only
+    // `window_end`, so a derivation that read the start alone would collide
+    // it with the first.
     let plugin = HappyPathPlugin::new();
     let tenant_id = Uuid::from_u128(2);
     let service = ServiceFixture::default()
         .with_source(fake_declaration_source_with_fold("SUM"))
         .build(
             Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-            "test.handler.create_records.distinct_created_at.v1",
+            "test.handler.create_records.distinct_periods.v1",
         );
 
-    let build_req = |created_at: OffsetDateTime| CreateUsageRecordsRequest {
-        records: vec![CreateUsageRecordRequest {
-            gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
-            tenant_id,
-            resource_ref: ResourceRefDto {
-                resource_id: "rsc-happy".to_owned(),
-                resource_type: "compute.vm".to_owned(),
-            },
-            subject_ref: None,
-            metadata: BTreeMap::new(),
-            value: rust_decimal::Decimal::from(1),
-            idempotency_key: "idem-distinct".to_owned(),
-            corrects_id: None,
-            created_at,
+    let build_req =
+        |window_start: OffsetDateTime, window_end: OffsetDateTime| CreateUsageRecordsRequest {
+            records: vec![CreateUsageRecordRequest {
+                gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
+                tenant_id,
+                resource_ref: ResourceRefDto {
+                    resource_id: "rsc-happy".to_owned(),
+                    resource_type: "compute.vm".to_owned(),
+                },
+                subject_ref: None,
+                metadata: BTreeMap::new(),
+                value: rust_decimal::Decimal::from(1),
+                idempotency_key: "idem-distinct".to_owned(),
+                corrects_id: None,
+                window_start,
+                window_end,
+            }],
+        };
+
+    let mut dispatched_ids = Vec::new();
+    for (window_start, window_end) in [
+        (OffsetDateTime::UNIX_EPOCH, EPOCH_PLUS_ONE_HOUR),
+        (
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            EPOCH_PLUS_ONE_HOUR,
+        ),
+        (
+            OffsetDateTime::UNIX_EPOCH,
+            EPOCH_PLUS_ONE_HOUR + time::Duration::seconds(1),
+        ),
+    ] {
+        plugin.set_create_records(vec![Ok(sample_persisted_record(Uuid::new_v4(), tenant_id))]);
+        let response = handle_create_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(Arc::clone(&service)),
+            Json(build_req(window_start, window_end)),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        dispatched_ids.push(
+            plugin
+                .last_create_records_input()
+                .expect("batch dispatched")[0]
+                .id,
+        );
+    }
+
+    let distinct: std::collections::HashSet<Uuid> = dispatched_ids.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        dispatched_ids.len(),
+        "one idempotency key + three distinct covered periods MUST derive three \
+         distinct ids; got {dispatched_ids:?}",
+    );
+}
+
+/// A one-record batch request built from the wire, so the RFC 3339 codec
+/// (not a Rust `OffsetDateTime` literal) decides what the period bounds
+/// become. `time::Time` cannot represent second 60 at all, so a leap-second
+/// bound is only expressible this way.
+fn create_request_json(window_start: &str, window_end: &str) -> serde_json::Value {
+    serde_json::json!({
+        "records": [{
+            "gts_type_id": HAPPY_RECORD_GTS_ID,
+            "tenant_id": Uuid::from_u128(2).to_string(),
+            "resource_ref": { "resource_id": "rsc-happy", "resource_type": "compute.vm" },
+            "value": "1",
+            "idempotency_key": "idem-period",
+            "window_start": window_start,
+            "window_end": window_end,
         }],
-    };
+    })
+}
 
+/// Dispatches a wire-built one-record batch and returns the response's
+/// status plus the single `results[0]` entry.
+async fn dispatch_one_record_batch(
+    suffix: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req: CreateUsageRecordsRequest =
+        serde_json::from_value(body).expect("the request body deserializes");
+    let plugin = HappyPathPlugin::new();
+    // Programmed unconditionally: a record whose covered period is rejected
+    // never reaches the SPI, so the response goes unused there — but an
+    // unprogrammed plugin would fail the whole batch with a 503 and hide
+    // whichever per-record outcome the test is actually about.
+    let tenant_id = Uuid::from_u128(2);
     plugin.set_create_records(vec![Ok(sample_persisted_record(Uuid::new_v4(), tenant_id))]);
-    let response = handle_create_usage_records(
-        Extension(authenticated_ctx()),
-        Extension(Arc::clone(&service)),
-        Json(build_req(OffsetDateTime::UNIX_EPOCH)),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::OK);
-    let id_a = plugin
-        .last_create_records_input()
-        .expect("first batch dispatched")[0]
-        .id;
-
-    plugin.set_create_records(vec![Ok(sample_persisted_record(Uuid::new_v4(), tenant_id))]);
+    let service = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            suffix,
+        );
     let response = handle_create_usage_records(
         Extension(authenticated_ctx()),
         Extension(service),
-        Json(build_req(
-            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
-        )),
+        Json(req),
     )
     .await
     .into_response();
-    assert_eq!(response.status(), StatusCode::OK);
-    let id_b = plugin
-        .last_create_records_input()
-        .expect("second batch dispatched")[0]
-        .id;
+    let status = response.status();
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collected");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("body is JSON");
+    let item = body
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .cloned()
+        .expect("response carries results[0]");
+    (status, item)
+}
 
-    assert_ne!(
-        id_a, id_b,
-        "same dedup key + different created_at MUST derive distinct ids",
+/// Reads `field_violations[0].field` off a `rejected` batch entry.
+fn rejected_violation_field(item: &serde_json::Value) -> String {
+    assert_eq!(
+        item.get("outcome").and_then(serde_json::Value::as_str),
+        Some("rejected"),
+        "expected a rejected entry; got {item:?}",
+    );
+    item.get("error")
+        .and_then(|problem| problem.get("context"))
+        .and_then(|c| c.get("field_violations"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("field"))
+        .and_then(serde_json::Value::as_str)
+        .expect("rejected entry carries field_violations[0].field")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_leap_second_period_bound_is_rejected() {
+    // `time`'s RFC 3339 parser renders 23:59:60 at a valid stand-in
+    // position as 23:59:59.999999999, so a leap second reaches the gear as
+    // a sub-microsecond bound and the precision precondition rejects it
+    // (`cpt-cf-usage-collector-adr-record-identity-derivation`: "A second
+    // value of 60 is rejected on the same path, so no leap second enters the
+    // derivation"). `time::Time` cannot represent
+    // second 60 at all, so this is the only place the rule can be observed.
+    // A `:60` anywhere else fails at the parser instead — see the sibling
+    // below.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.leap_second.v1",
+        create_request_json("2016-12-31T22:00:00Z", "2016-12-31T23:59:60Z"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "an all-rejected batch MUST surface as 207 Multi-Status",
+    );
+    assert_eq!(
+        rejected_violation_field(&item),
+        "window_end",
+        "the rejection MUST attribute to the offending period bound",
+    );
+}
+
+#[test]
+fn a_second_sixty_outside_a_leap_position_is_rejected_at_deserialization() {
+    // The other half of the rule: `time` admits `:60` only at a valid
+    // leap-second stand-in position and rejects it everywhere else, so a
+    // request carrying one never reaches the gear's own precondition at
+    // all. Pinning both halves is what keeps "no leap second enters the
+    // derivation" true regardless of which of the two paths a caller trips.
+    let err = serde_json::from_value::<CreateUsageRecordsRequest>(create_request_json(
+        "2026-05-29T11:00:00Z",
+        "2026-05-29T12:00:60Z",
+    ))
+    .expect_err("a :60 second outside a leap position MUST be rejected");
+    assert!(
+        err.to_string().contains("second"),
+        "the deserialization error MUST name the out-of-range second; got {err}",
+    );
+}
+
+#[tokio::test]
+async fn an_inverted_covered_period_is_rejected_per_record() {
+    // The second period precondition, end to end: `window_end` before
+    // `window_start` is a validation error at the ingestion choke point,
+    // lifted into the same per-record `Problem` envelope every other
+    // per-record rejection uses.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.inverted_period.v1",
+        create_request_json("2026-05-29T13:00:00Z", "2026-05-29T12:00:00Z"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert_eq!(rejected_violation_field(&item), "window_end");
+}
+
+#[tokio::test]
+async fn a_point_event_is_accepted_per_record() {
+    // The boundary on the other side of the ordering check: equal bounds
+    // are a point event, not an inverted period. Without this, tightening
+    // the check to `window_end <= window_start` would pass every other
+    // handler test.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.point_event.v1",
+        create_request_json("2026-05-29T12:00:00Z", "2026-05-29T12:00:00Z"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        item.get("outcome").and_then(serde_json::Value::as_str),
+        Some("accepted"),
+        "a zero-length covered period MUST be accepted; got {item:?}",
     );
 }
 
@@ -783,7 +965,8 @@ async fn create_records_happy_path_wire_body_projects_inactive_status_as_lowerca
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-happy".to_owned(),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: EPOCH_PLUS_ONE_HOUR,
         }],
     };
 
@@ -832,12 +1015,14 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         &gts_id,
         &IdempotencyKey::new("idem-mixed-0").expect("valid idempotency key"),
         OffsetDateTime::UNIX_EPOCH,
+        EPOCH_PLUS_ONE_HOUR,
     );
     let derived_id_2 = derive_usage_record_id(
         tenant_id,
         &gts_id,
         &IdempotencyKey::new("idem-mixed-2").expect("valid idempotency key"),
         OffsetDateTime::UNIX_EPOCH,
+        EPOCH_PLUS_ONE_HOUR,
     );
     let persisted_uuid_0 = Uuid::new_v4();
     let persisted_uuid_2 = Uuid::new_v4();
@@ -865,7 +1050,8 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         value: rust_decimal::Decimal::from(1),
         idempotency_key: idem.to_owned(),
         corrects_id: None,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: EPOCH_PLUS_ONE_HOUR,
     };
 
     let req = CreateUsageRecordsRequest {
@@ -883,7 +1069,8 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
                 value: rust_decimal::Decimal::from(1),
                 idempotency_key: "idem-mixed-1".to_owned(),
                 corrects_id: None,
-                created_at: OffsetDateTime::UNIX_EPOCH,
+                window_start: OffsetDateTime::UNIX_EPOCH,
+                window_end: EPOCH_PLUS_ONE_HOUR,
             },
             valid_record("idem-mixed-2"),
         ],
@@ -2093,7 +2280,8 @@ async fn create_with_batch_above_cap_rejects_without_iterating_records() {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: format!("idem-oversize-{i}"),
             corrects_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
+            window_start: OffsetDateTime::UNIX_EPOCH,
+            window_end: EPOCH_PLUS_ONE_HOUR,
         })
         .collect();
 

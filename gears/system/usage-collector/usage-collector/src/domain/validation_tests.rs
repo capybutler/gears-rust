@@ -264,7 +264,8 @@ fn ordinary_counter_record(value: Decimal) -> UsageRecord {
             .expect("valid idempotency key"),
         corrects_id: None,
         status: UsageRecordStatus::Active,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
 }
 

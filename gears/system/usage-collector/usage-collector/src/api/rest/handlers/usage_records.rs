@@ -745,11 +745,12 @@ pub async fn handle_deactivate_usage_record(
 
 /// Convert one per-record submission into the identity-free domain create
 /// input, lifting `gts_type_id`-, attribution-, `idempotency_key`-, and
-/// metadata-shape failures into per-record `Problem` envelopes. `created_at`
-/// is caller-supplied and forwarded verbatim. The record's `id` and initial
-/// `status` are NOT set here: they are stamped once, authoritatively, inside
-/// [`Service::create_usage_records`] via
-/// [`usage_collector_sdk::CreateUsageRecord::into_usage_record`].
+/// metadata-shape failures into per-record `Problem` envelopes. The covered
+/// period is caller-supplied and forwarded verbatim; it is validated — and
+/// rejected, never truncated — where it is read, inside
+/// [`usage_collector_sdk::CreateUsageRecord::try_into_usage_record`], which
+/// is also where the record's `id` and initial `status` are stamped once,
+/// authoritatively, inside [`Service::create_usage_records`].
 #[allow(clippy::result_large_err)]
 fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsageRecord, Problem> {
     let gts_type_id = MeterTypeId::new(req.gts_type_id)
@@ -779,7 +780,8 @@ fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsa
         value: req.value,
         idempotency_key,
         corrects_id: req.corrects_id,
-        created_at: req.created_at,
+        window_start: req.window_start,
+        window_end: req.window_end,
     })
 }
 

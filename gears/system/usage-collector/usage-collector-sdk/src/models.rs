@@ -308,31 +308,39 @@ impl<'de> Deserialize<'de> for SubjectRef {
 // Idempotency key
 // ---------------------------------------------------------------------------
 
+/// Ceiling on the wire length of an idempotency key, from the
+/// `IdempotencyKey` schema in `docs/usage-collector-v1.yaml`.
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
+
 /// Validating newtype over the caller-supplied idempotency key string.
 ///
 /// Every [`UsageRecord::idempotency_key`] carries this type rather than a
-/// bare `String`. The plugin SPI dedups on
-/// `(tenant_id, gts_type_id, idempotency_key)` per `plugin-spi.md`,
-/// and the key is declared mandatory on every record — the newtype
-/// enforces that "mandatory" at the type level so an SDK consumer cannot
-/// build a record with an empty key.
+/// bare `String`, and the key is declared mandatory on every record — the
+/// newtype enforces that "mandatory" at the type level so an SDK consumer
+/// cannot build a record with an empty key. The key is one of the five
+/// inputs to the dedup identity, so a malformed one must not reach the
+/// derivation at all.
 ///
 /// # Validation
 ///
 /// - Non-empty.
-/// - No NUL bytes (Postgres `text` column requirement).
+/// - At most 256 bytes (`MAX_IDEMPOTENCY_KEY_LEN`).
+/// - No ASCII control characters, DEL included — the wire contract's
+///   `^[^\x00-\x1F\x7F]+$`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct IdempotencyKey(String);
 
 impl IdempotencyKey {
-    /// Creates an [`IdempotencyKey`] after validating the value is non-empty
-    /// and contains no NUL bytes.
+    /// Creates an [`IdempotencyKey`] after validating it against the wire
+    /// contract's `IdempotencyKey` schema (`minLength: 1`,
+    /// `maxLength: 256`, `pattern: ^[^\x00-\x1F\x7F]+$`).
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorError::InvalidArgument`] when the input
-    /// is empty or contains a NUL byte.
+    /// Returns [`UsageCollectorError::InvalidArgument`] when the input is
+    /// empty, longer than 256 bytes, or carries an ASCII control character
+    /// (including DEL).
     pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
         let raw = value.into();
         if raw.is_empty() {
@@ -340,9 +348,21 @@ impl IdempotencyKey {
                 "idempotency_key must not be empty",
             ));
         }
-        if raw.contains('\0') {
+        if raw.len() > MAX_IDEMPOTENCY_KEY_LEN {
             return Err(UsageCollectorError::invalid_idempotency_key(
-                "idempotency_key must not contain NUL bytes",
+                "idempotency_key must be at most 256 bytes",
+            ));
+        }
+        // `char::is_ascii_control()` covers U+007F (DEL) alongside
+        // U+0000..=U+001F. The exclusion is load-bearing rather than
+        // cosmetic: the entry-identity derivation concatenates this value
+        // with the other dedup-identity inputs under a `0x1F` separator
+        // (`cpt-cf-usage-collector-adr-record-identity-derivation`), and the
+        // key is no longer the final field, so a control character inside it
+        // would inject a separator into the middle of the pre-image.
+        if raw.chars().any(|c| c.is_ascii_control()) {
+            return Err(UsageCollectorError::invalid_idempotency_key(
+                "idempotency_key must not contain ASCII control characters",
             ));
         }
         Ok(Self(raw))
@@ -550,6 +570,20 @@ impl<'de> Deserialize<'de> for MeterTypeId {
 // Usage-record exchange types
 // ---------------------------------------------------------------------------
 
+/// Wire name of the covered period's inclusive start bound.
+///
+/// The two bound names are wire vocabulary rather than Rust field names:
+/// they appear in a validation error's `field` (so a caller can map the
+/// violation back to what they sent), and the read surface reserves and
+/// orders on them. Naming them once keeps a typo at one of those sites from
+/// silently splitting the vocabulary in two — the same reason the host
+/// crate's query module keeps its own predicate field name in a constant.
+pub const WINDOW_START_FIELD: &str = "window_start";
+
+/// Wire name of the covered period's exclusive end bound. See
+/// [`WINDOW_START_FIELD`] for why both are constants.
+pub const WINDOW_END_FIELD: &str = "window_end";
+
 /// Lifecycle status of a stored [`UsageRecord`]. Defaults to `Active`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -569,12 +603,15 @@ pub enum UsageRecordStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageRecord {
-    /// Deterministic gateway-derived record identity: `UUIDv5` of the 4-tuple
-    /// dedup key `(tenant_id, gts_type_id, idempotency_key, created_at)` (see
-    /// [`crate::derive_usage_record_id`]; ADR-0014). Stamped by
-    /// [`CreateUsageRecord::into_usage_record`] on create and authoritative on
-    /// read / return. The identity cannot be caller-supplied: the create
-    /// surface takes the identity-free [`CreateUsageRecord`], not this type.
+    /// Deterministic gateway-derived entry identity: `UUIDv5` of the 5-tuple
+    /// dedup identity
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+    /// (see [`crate::derive_usage_record_id`];
+    /// `cpt-cf-usage-collector-adr-record-identity-derivation`). Stamped by
+    /// [`CreateUsageRecord::try_into_usage_record`] on create and
+    /// authoritative on read / return. The identity cannot be
+    /// caller-supplied: the create surface takes the identity-free
+    /// [`CreateUsageRecord`], not this type.
     pub id: Uuid,
     /// Meter this record attaches to — the derived GTS type declaration
     /// (`gts.cf.core.uc.usage_record.v1~<segment>~`) resolved through
@@ -606,8 +643,10 @@ pub struct UsageRecord {
     /// matrix.
     #[serde(with = "rust_decimal::serde::str")]
     pub value: Decimal,
-    /// Mandatory caller-supplied key for at-least-once-with-dedup semantics.
-    /// The plugin SPI dedups on `(tenant_id, gts_type_id, idempotency_key)`.
+    /// Mandatory caller-supplied key for at-least-once-with-dedup
+    /// semantics. One of the five inputs to the dedup identity, so a single
+    /// stable per-meter key covers many periods without collapsing them
+    /// onto one entry.
     pub idempotency_key: IdempotencyKey,
     /// When set, marks this row as a counter compensation referencing a
     /// previously emitted ordinary usage row. The four-cell value matrix
@@ -618,11 +657,27 @@ pub struct UsageRecord {
     /// Record lifecycle status.
     #[serde(default)]
     pub status: UsageRecordStatus,
-    /// Record creation timestamp (RFC 3339 on the wire). Persisted at
-    /// microsecond precision (matching `timestamptz` storage); see
-    /// [`CreateUsageRecord::into_usage_record`].
+    /// Inclusive start of the emitter-supplied covered period (RFC 3339
+    /// on the wire). The covered period is the only emitter-supplied time
+    /// attribution an entry carries. Persisted at microsecond precision,
+    /// UTC-normalized by
+    /// [`CreateUsageRecord::try_into_usage_record`].
     #[serde(with = "time::serde::rfc3339")]
-    pub created_at: time::OffsetDateTime,
+    pub window_start: time::OffsetDateTime,
+    /// Exclusive end of the covered period. At or after
+    /// [`Self::window_start`]; equal bounds mark a point event, not an
+    /// error.
+    ///
+    /// This is the bound the read contract selects on —
+    /// `from <= window_end < to`, whatever the length of the period
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`, the reference
+    /// spelling being [`crate::TimeRange::contains_window_end`]). Reading
+    /// the end alone is what makes adjacent ranges sum without double
+    /// counting. Threading the read paths onto it — and retiring the
+    /// pre-slice `$filter` window they still carry at this commit — is a
+    /// later commit in this slice.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: time::OffsetDateTime,
 }
 
 /// Identity-free create submission — the input to every create surface
@@ -630,8 +685,9 @@ pub struct UsageRecord {
 /// [`crate::UsageCollectorClientV1::create_usage_records`]).
 ///
 /// This mirrors [`UsageRecord`] minus the two fields a caller cannot own on
-/// create: `id` (a deterministic projection of the 4-tuple dedup key — see
-/// [`Self::into_usage_record`]) and `status` (always [`UsageRecordStatus::Active`]
+/// create: `id` (a deterministic projection of the 5-tuple dedup identity —
+/// see [`Self::try_into_usage_record`]) and `status` (always
+/// [`UsageRecordStatus::Active`]
 /// on a fresh insert). Encoding "id is derived, not supplied" in the type —
 /// rather than a doc-comment on a full [`UsageRecord`] — is what keeps a
 /// caller from constructing a meaningless identity the gateway would only
@@ -666,51 +722,83 @@ pub struct CreateUsageRecord {
     /// previously emitted ordinary usage row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corrects_id: Option<Uuid>,
-    /// Record creation timestamp (RFC 3339 on the wire). Forwarded to the
-    /// persisted record at microsecond precision (canonicalized by
-    /// [`Self::into_usage_record`] to match `timestamptz` storage); it is part
-    /// of the dedup identity, so it also feeds the derived `id`.
+    /// Inclusive start of the covered period this submission measures (RFC
+    /// 3339 on the wire; the codec requires an offset, so an
+    /// offset-less timestamp never reaches the projection). Part of the
+    /// dedup identity, so it feeds the derived `id`.
     #[serde(with = "time::serde::rfc3339")]
-    pub created_at: time::OffsetDateTime,
+    pub window_start: time::OffsetDateTime,
+    /// Exclusive end of the covered period. Must be at or after
+    /// [`Self::window_start`]; equal bounds submit a point event. Part of
+    /// the dedup identity, so it feeds the derived `id` — which is why an
+    /// emitter that recomputes its bounds on retry derives a different
+    /// identifier, and why deterministic bounds are an emitter obligation.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: time::OffsetDateTime,
 }
 
 impl CreateUsageRecord {
-    /// Project this create submission into the persisted [`UsageRecord`] shape.
+    /// Projects this submission into the persisted [`UsageRecord`] shape,
+    /// validating the covered period first.
     ///
-    /// This is the single point at which a submission acquires its identity:
-    /// `id` is stamped as the deterministic `UUIDv5` derivation of the 4-tuple
-    /// dedup key `(tenant_id, gts_type_id, idempotency_key, created_at)` (see
-    /// [`crate::derive_usage_record_id`]; ADR-0014), `created_at` is normalized
-    /// to microsecond precision, and `status` is initialized to
-    /// [`UsageRecordStatus::Active`]. Every other field is forwarded verbatim.
-    /// Because the identity is a pure projection of caller-supplied fields it
-    /// cannot be supplied independently — which is exactly why the create
-    /// surface takes this identity-free type rather than a full
-    /// [`UsageRecord`].
-    #[must_use]
-    pub fn into_usage_record(self) -> UsageRecord {
-        // Canonicalize `created_at` to microsecond precision (what Postgres
-        // `timestamptz` stores) so the persisted timestamp, the 4-tuple dedup
-        // key, and the derived `id` are consistent by construction — independent
-        // of any backend's rounding. This truncation MUST agree with the µs
-        // count [`crate::id::created_at_micros`] projects (the shared primitive
-        // `derive_usage_record_id` below and the plugin's dedup check both use):
-        // it drops exactly the sub-microsecond nanos that projection ignores, so
-        // the id derived here matches one a client reproduces from the same
-        // instant. `replace_nanosecond` cannot fail here (`microsecond() * 1000`
-        // is always a valid nanosecond count); the `unwrap_or` is a lint-safe
-        // no-op fallback.
-        let created_at = self
-            .created_at
-            .replace_nanosecond(self.created_at.microsecond() * 1_000)
-            .unwrap_or(self.created_at);
+    /// This is the single point at which a submission acquires its identity,
+    /// and the validation is inseparable from it:
+    /// `cpt-cf-usage-collector-adr-record-identity-derivation` requires both
+    /// period preconditions to be rejected **before** the derivation runs,
+    /// so the projection is fallible rather than the caller's obligation.
+    ///
+    /// In order: both bounds are normalized to UTC, each must then carry at
+    /// most microsecond precision, the period must be ordered
+    /// (`window_start <= window_end`, equal bounds being a point event), and
+    /// only then is `id` derived over
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
+    /// `status` is initialized to [`UsageRecordStatus::Active`] and every
+    /// other field is forwarded verbatim. Because the identity is a pure
+    /// projection of caller-supplied fields it cannot be supplied
+    /// independently — which is exactly why the create surface takes this
+    /// identity-free type rather than a full [`UsageRecord`].
+    ///
+    /// Neither precondition truncates. A truncated bound would be persisted
+    /// under an `id` derived from the truncated value while the emitter
+    /// reproduces the id it submitted, so the two would disagree about the
+    /// same entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorError::InvalidArgument`] when a bound is
+    /// finer than microsecond precision, or when the period is inverted.
+    pub fn try_into_usage_record(self) -> Result<UsageRecord, UsageCollectorError> {
+        // Normalization runs before the preconditions, not after, and that
+        // ordering is safe rather than merely convenient: `UtcOffset` holds
+        // whole seconds, so the nanosecond component is invariant under the
+        // conversion and moving it earlier cannot change what the precision
+        // check accepts. What it does change is the diagnostics — both
+        // rejections below now echo the bound in one rendering instead of
+        // one echoing the caller's offset and the other UTC — and it keeps
+        // an offset carrying non-zero seconds out of the RFC 3339 formatter
+        // in `crate::error`, which cannot render one.
+        let window_start = self.window_start.to_offset(time::UtcOffset::UTC);
+        let window_end = self.window_end.to_offset(time::UtcOffset::UTC);
+
+        require_microsecond_precision(WINDOW_START_FIELD, window_start)?;
+        require_microsecond_precision(WINDOW_END_FIELD, window_end)?;
+
+        if window_end < window_start {
+            return Err(UsageCollectorError::inverted_covered_period(
+                window_start,
+                window_end,
+            ));
+        }
+
         let id = crate::id::derive_usage_record_id(
             self.tenant_id,
             &self.gts_type_id,
             &self.idempotency_key,
-            created_at,
+            window_start,
+            window_end,
         );
-        UsageRecord {
+
+        Ok(UsageRecord {
             id,
             gts_type_id: self.gts_type_id,
             tenant_id: self.tenant_id,
@@ -721,8 +809,37 @@ impl CreateUsageRecord {
             idempotency_key: self.idempotency_key,
             corrects_id: self.corrects_id,
             status: UsageRecordStatus::Active,
-            created_at,
-        }
+            window_start,
+            window_end,
+        })
+    }
+}
+
+/// Rejects a covered-period bound carrying finer than microsecond
+/// precision.
+///
+/// The microsecond is the precision ceiling of the identity derivation
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation` fixes the
+/// canonical bound form as a six-digit fraction), so a finer value has no
+/// representation there. [`crate::canonical_period_bound`] is the other
+/// half of that ceiling — it renders the six digits, and it truncates
+/// rather than rejects — so the two must agree on where the ceiling is;
+/// there is no shared constant to hold them together, only this pair of
+/// references. A leap second arrives here as the same failure:
+/// `time`'s RFC 3339 parser renders a `:60` second at a valid stand-in
+/// position as `59.999999999`, and [`time::Time`] cannot represent second
+/// 60 at all, so this one check is where the ADR's leap-second rejection
+/// lands. There is no separate branch for it.
+fn require_microsecond_precision(
+    field: &'static str,
+    bound: time::OffsetDateTime,
+) -> Result<(), UsageCollectorError> {
+    if bound.nanosecond().is_multiple_of(1_000) {
+        Ok(())
+    } else {
+        Err(UsageCollectorError::sub_microsecond_period_bound(
+            field, bound,
+        ))
     }
 }
 
