@@ -2178,10 +2178,13 @@ grep -rniE "record creation timestamp|TimeWindow|time window .*filter|unbounded 
 #    comments, so any multi-word grep over prose undercounts.
 grep -rniE "at this commit|in this slice|later commit|not yet wired|after this plan" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
 
-# 7. Plan task numbers in shipped prose. A reader outside the plan cannot
-#    resolve "Task 3". Pre-existing sites are out of scope; anything this
-#    slice added is not.
-grep -rnE "Task [0-9]+" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
+# 7. Plan coordinates in shipped prose. A reader outside the plan cannot
+#    resolve "Task 3" or "slice 6". Pre-existing sites are out of scope;
+#    anything this slice added is not — and two of its own tasks added
+#    some, so this grep is not decoration: `query_tests.rs` names "slice
+#    6's plugin contract suite" and `time_range_tests.rs` cites ADR-0014
+#    by number where ground rule 5 requires the id.
+grep -rniE "task [0-9]+|slice [0-9]+" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
 
 # 8. A doc reference to a file that does not exist. Pre-existing, and the
 #    three in-scope `.rs` sites are this slice's to clear.
@@ -2243,6 +2246,7 @@ Recorded here so they are decisions rather than oversights. None of them belongs
 
 - **Extract `authorize_batch` from `create_usage_records_inner`.** Task 2's review found the function at ~290 lines, past the point a reader holds it in context, with a seam that costs nothing: the `inst-emit-batch-pdp` marker region (tuple grouping → bounded fan-out → `pdp_allowed` projection) is already contiguous and `fn`-shaped, and the declaration pre-pass after it is a second such region. That would leave ~190 lines and follow the pattern `resolve_l1_lookups` set in the same file. Deliberately not folded into task 2, which was already the largest change in the slice — it deserves its own reviewable commit rather than riding along with documentation fixes.
 - **The byte-versus-code-point cap divergence.** `IdempotencyKey` caps at 256 *bytes* while the OAS `maxLength: 256` counts code points, so a 200-character multi-byte key is valid per the published schema and rejected by the gear. `MeterTypeId` carries the identical divergence against its `maxLength: 512`, pre-existing from slice 2. Both fail closed, so nothing is unsafe. Fixing it properly means touching both newtypes and deciding which side is authoritative — the contract owner's call, not this slice's.
+- **One `ReadSelection { gts_type_id, time_range, query, metadata_filter }` shared by the paginated read SPI and the cursor fingerprint.** Today the correspondence between what the plugin selects on and what the fingerprint binds is *conventional*: `read_fingerprint`'s parameter list mirrors `list_usage_records`'s by hand, so a future fifth row-selecting parameter can be threaded to the plugin without appearing in the fingerprint — silently reopening exactly the hole task 5 closed, and reopening it as a `200` with wrong rows. A struct makes adding a field force the fingerprint to be revisited. Declined here only because it is a third change to the SPI signature inside one slice, and the churn is worth its own reviewable commit.
 - **A newtype for the batch path's carried input index.** With the invariant named once and three uses inside 130 lines, an `InputIndex(usize)` is more ceremony than the risk warrants. Revisit if a fourth pass appears: at that point the newtype makes the invariant type-checked instead of remembered.
 - **Six pre-existing docs that still describe the usage-type catalog as plugin-owned.** `usage-collector/src/{config.rs:6, lib.rs:5, lib.rs:15, config_tests.rs:5}`, `infra/sdk_error_mapping.rs:6` and `domain/error.rs:77` all cite `ADR-0012` for a catalog that slices 1-2 moved to the `types-registry` gear. Found while checking this slice's own ADR citations; the claim is stale, not merely numbered. It belongs to whoever finishes the slice-1/2 doc debt, not to the time model — but it is the same failure mode this slice keeps correcting, and nothing else is watching for it.
 - **The `@cpt-flow` / `@cpt-algo` / `@cpt-dod` / `@cpt-state` markers that resolve to nothing.** The DESIGN rework dropped whole categories of traceability id — `flow`, `algo`, `dod`, `state`, `component` — while the gear's source is dense with markers naming ids in exactly those categories. A "does every marker resolve" gate would fail across the whole crate today. It needs a decision (regenerate those id categories in the docs, or strip the retired marker classes) and it is explicitly out of scope until asked.
