@@ -16,6 +16,10 @@
 //!   `metadata_filter`, the dynamic-key side channel that exists precisely
 //!   because the `toolkit-odata` grammar cannot express filters over JSON
 //!   map keys, so it never flows through `$filter` at all.
+//! * `read_fingerprint` / `require_cursor_fingerprint` — the query a
+//!   keyset continuation is bound to (the caller's `$filter` and the read
+//!   range together), and the refusal of a cursor minted over a different
+//!   one.
 //! * `establish_keyset_order` / `require_continuation_keyset` — the raw
 //!   path's keyset floor, in its two modes. Between them they guarantee
 //!   every dispatch carries the non-empty, uniform-direction, never-null
@@ -35,11 +39,11 @@
 
 use std::collections::BTreeSet;
 
-use toolkit_odata::{ODataOrderBy, ODataQuery, SortDir, ast};
+use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, SortDir, ast};
 use toolkit_security::AccessScope;
 use usage_collector_sdk::{
-    AggregationDimension, MetadataFilter, MeterTypeId, RECORD_ID_FIELD, UsageCollectorError,
-    WINDOW_END_FIELD, is_keyset_safe_record_field,
+    AggregationDimension, MetadataFilter, MeterTypeId, RECORD_ID_FIELD, TimeRange,
+    UsageCollectorError, WINDOW_END_FIELD, is_keyset_safe_record_field,
 };
 
 use crate::domain::authz;
@@ -57,8 +61,11 @@ use crate::domain::authz;
 /// request. The order / limit / cursor / select projections on
 /// [`ODataQuery`] flow through verbatim — the composition only touches the
 /// `$filter` AST — and `gts_type_id` and the read range are typed
-/// parameters that never enter an [`ODataQuery`] at all, so composition
-/// cannot narrow, widen, or drop either of them.
+/// parameters that no [`ODataQuery`] carries as a predicate, so composition
+/// cannot narrow, widen, or drop either of them. (The read path does fold
+/// the range's canonical rendering into `filter_hash` afterwards, via
+/// [`read_fingerprint`], but that is an opaque pagination fingerprint and
+/// not a row constraint.)
 ///
 /// Per `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`:
 /// composition is intersection-only (no widening). PDP constraint
@@ -88,19 +95,25 @@ pub(crate) fn compose_query_with_scope(
     // @cpt-end:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-intersect
 
     let mut composed = user_query.clone();
-    // Preserve the caller's `filter_hash` (the hash of the *user* `$filter`,
-    // computed by the gateway) — do NOT re-hash the AND-merged filter. The
-    // keyset cursor's `f` field exists to detect the *user* changing their
-    // `$filter` between paginated requests; the PDP scope AND-merged here is
-    // server-injected and not user-controlled, so it MUST be excluded from the
-    // hash. Both cursor validators (the gateway, pre-composition, and the
-    // plugin's `cursor.f == query.filter_hash` check) compare against the
-    // user-filter hash, and the plugin embeds `query.filter_hash` into the
-    // next_cursor. Re-hashing to `hash(user AND scope)` here would embed a hash
-    // the gateway's `hash(user)` can never match on the follow-up request —
+    // Preserve the incoming `filter_hash` — do NOT re-hash the AND-merged
+    // filter. The keyset cursor's `f` field exists to detect the *caller*
+    // changing their query between paginated requests; the PDP scope
+    // AND-merged here is server-injected and not caller-controlled, so it
+    // MUST stay out. Re-hashing to `hash(user AND scope)` would embed a
+    // value the follow-up request's own recomputation can never reproduce,
     // breaking keyset pagination with a spurious `FILTER_MISMATCH` 400 the
     // moment PDP returns any row scope (latent until LIST began requiring
-    // constraints). `composed` keeps `user_query.filter_hash` from the clone.
+    // constraints). `composed` keeps `user_query.filter_hash` from the
+    // clone.
+    //
+    // What the read path then dispatches is not that value: it overwrites
+    // `filter_hash` with [`read_fingerprint`], which binds the caller's
+    // `$filter` AND the read range, and the plugin mints that into
+    // `next_cursor.f`. The rule here is the same rule stated one layer
+    // down — compute the bound value from the caller's query, never the
+    // composed one — which is why the preservation still has to hold: a
+    // re-hash here would be the composed filter leaking into the
+    // fingerprint by the back door.
     composed.filter = Some(Box::new(composed_filter));
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-return
     Ok(composed)
@@ -310,8 +323,10 @@ pub(crate) fn establish_keyset_order(query: &mut ODataQuery) -> Result<(), Usage
 /// token carries and hand the plugin a misaligned continuation, which is a
 /// silently wrong page where refusing is merely a refused one. Nothing
 /// downstream would catch it either:
-/// [`toolkit_odata::validate_cursor_against`] compares signed tokens and
-/// the filter hash and never checks the token's width against the order's.
+/// [`toolkit_odata::validate_cursor_against`] never checks the token's
+/// width against the order's, and this gear hands it no filter hash at all
+/// — whether a token belongs to this query is
+/// [`require_cursor_fingerprint`]'s question, not the toolkit's.
 ///
 /// Taking `&ODataQuery` rather than `&mut` is the point — the signature is
 /// what says this path appends nothing.
@@ -363,6 +378,80 @@ pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), Usag
         "usage-collector refused a continuation token whose bound order is not a keyset"
     );
     Err(UsageCollectorError::inadmissible_cursor_keyset(defect))
+}
+
+/// The fingerprint a keyset continuation is bound to: the caller's
+/// `$filter` and the read range, together.
+///
+/// `CursorV1::f` and [`ODataQuery::filter_hash`] exist so a caller who
+/// changes their query between pages is refused rather than served a
+/// continuation minted over a different row set. While the mandatory
+/// window lived inside `$filter`, `toolkit_odata::short_filter_hash`
+/// covered it for free; the window is a typed
+/// [`TimeRange`] parameter now, so it enters the fingerprint here — or a
+/// page-2 request carrying the same cursor with a different `from` / `to`
+/// is served a continuation that means nothing over its own row set, as a
+/// `200` nothing downstream can notice.
+///
+/// Computed from the **caller's** query, never the composed one. The PDP
+/// scope is AND-merged into `$filter` by [`compose_query_with_scope`] and
+/// is server-injected rather than caller-controlled, so hashing the
+/// composed filter would embed a value the next request's recomputation can
+/// never reproduce — the same reasoning that function documents for why it
+/// preserves the caller's `filter_hash` rather than re-hashing it, and just
+/// as silent until a PDP scope actually appears.
+///
+/// The value round-trips across a page boundary on every surface: the read
+/// path computes it here from the caller's query, then assigns it onto the
+/// composed query it dispatches — replacing the caller's own `filter_hash`
+/// that [`compose_query_with_scope`] preserved — a conforming plugin mints
+/// it into `next_cursor.f`, and the follow-up request recomputes the same
+/// string from its own `$filter` and `from` / `to`.
+///
+/// The range contributes [`TimeRange::canonical_form`] rather than a second
+/// hash: the whole fingerprint is opaque to callers, so a second hashing
+/// primitive would buy nothing and add one more thing that can disagree
+/// with itself.
+pub(crate) fn read_fingerprint(user_query: &ODataQuery, time_range: TimeRange) -> String {
+    // `short_filter_hash` returns `None` for an absent filter, and an
+    // absent filter is a legitimate complete request — so it folds in as
+    // the empty string rather than short-circuiting the range out of the
+    // fingerprint.
+    let filter = toolkit_odata::short_filter_hash(user_query.filter()).unwrap_or_default();
+    format!("{filter}~{}", time_range.canonical_form())
+}
+
+/// Requires a continuation token to have been minted over the query now
+/// carrying it.
+///
+/// Refuses a token whose `f` is absent as well as one that differs.
+/// [`toolkit_odata::validate_cursor_against`] skips its own comparison
+/// whenever either side is `None`, which is exactly the hole this exists to
+/// close: the cursor is caller-supplied JSON, so "no fingerprint recorded"
+/// is not evidence of a matching query, and a conforming plugin always has
+/// one to mint — the read path assigns [`read_fingerprint`] onto every
+/// query it dispatches, first page included.
+///
+/// Separate from [`require_continuation_keyset`] because the two answer
+/// different questions about the same token and are actionable differently:
+/// that one asks whether the token's order could be a keyset at all
+/// (structure, `INVALID_CURSOR`), this one whether the token belongs to
+/// this query (relevance, `FILTER_MISMATCH`). Both run on the continuation
+/// branch, structure first.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorError::InvalidArgument`] against `cursor`, with
+/// `FILTER_MISMATCH`, when the token carries no fingerprint or a different
+/// one.
+pub(crate) fn require_cursor_fingerprint(
+    cursor: &CursorV1,
+    fingerprint: &str,
+) -> Result<(), UsageCollectorError> {
+    if cursor.f.as_deref() == Some(fingerprint) {
+        return Ok(());
+    }
+    Err(UsageCollectorError::cursor_query_mismatch())
 }
 
 /// Checks every `group_by` dimension is either a fixed field (no

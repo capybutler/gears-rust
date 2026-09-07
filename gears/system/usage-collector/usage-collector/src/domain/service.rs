@@ -43,9 +43,9 @@ use crate::domain::ports::metrics::{
     RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
 };
 use crate::domain::query::{
-    compose_query_with_scope, establish_keyset_order, reject_reserved_filter_fields,
-    require_continuation_keyset, require_dimensions_declared,
-    require_metadata_filter_keys_declared,
+    compose_query_with_scope, establish_keyset_order, read_fingerprint,
+    reject_reserved_filter_fields, require_continuation_keyset, require_cursor_fingerprint,
+    require_dimensions_declared, require_metadata_filter_keys_declared,
 };
 use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
@@ -1596,10 +1596,21 @@ impl Service {
     ///    [`require_continuation_keyset`] *requires* it to be one already
     ///    and refuses it otherwise, because appending to it would widen
     ///    the sort tuple past the boundary values the token carries.
-    /// 6. **Delegate** to the bound storage plugin's
+    /// 6. **Bind the cursor to its query.** [`read_fingerprint`] renders
+    ///    the caller's `$filter` and read range into the value a
+    ///    continuation is bound to, and every dispatch carries it on
+    ///    `filter_hash` so a conforming plugin mints it into
+    ///    `next_cursor.f`. On a continuation,
+    ///    [`require_cursor_fingerprint`] refuses a token that carries a
+    ///    different one — or none. This is the only place the property is
+    ///    enforced: `filter_hash` is `None` for an in-process caller and
+    ///    `toolkit_odata::validate_cursor_against` skips its comparison
+    ///    when either side is `None`, so the REST edge deliberately passes
+    ///    it `None` and keeps only its signed-token order check.
+    /// 7. **Delegate** to the bound storage plugin's
     ///    `list_usage_records` SPI with the composed filter, the floored
-    ///    order, and the typed `time_range`, which the plugin resolves as
-    ///    `from <= window_end < to`
+    ///    order, the bound fingerprint, and the typed `time_range`, which
+    ///    the plugin resolves as `from <= window_end < to`
     ///    (`cpt-cf-usage-collector-adr-window-end-selection`).
     ///
     /// # Errors
@@ -1618,7 +1629,9 @@ impl Service {
     ///   (mixed sort directions, or a key that is not a mandatory record
     ///   attribute) — and, on a cursor request, when the order the token
     ///   was minted under is not one a conforming plugin could have
-    ///   produced. A malformed range cannot surface here: `time_range` arrives
+    ///   produced, or the token was minted over a different `$filter` or
+    ///   range than the request carrying it. A malformed range cannot
+    ///   surface here: `time_range` arrives
     ///   already validated, because [`TimeRange`] has no public fields and
     ///   `TimeRange::new` is its only constructor.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
@@ -1686,6 +1699,23 @@ impl Service {
                 &gts_type_id,
             )?;
 
+            // The query a keyset continuation is bound to, computed from the
+            // CALLER's `$filter` and range — before composition AND-merges
+            // the server-injected PDP scope into `$filter`, which is a
+            // value the next request's recomputation could never
+            // reproduce (`compose_query_with_scope` documents the same
+            // reasoning for why it preserves the caller's `filter_hash`).
+            //
+            // It lives behind the service rather than at the REST edge
+            // because there is one owner for the property on every
+            // surface: `filter_hash` is `None` for an in-process caller
+            // and `toolkit_odata::validate_cursor_against` skips its own
+            // comparison when either side is `None`, so an edge-only check
+            // would leave an in-process caller able to continue a cursor
+            // minted under a different range and be served a silently
+            // wrong page.
+            let fingerprint = read_fingerprint(query, time_range);
+
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-constraint-composition
             let mut composed = compose_query_with_scope(query, &scope)?;
             // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-constraint-composition
@@ -1705,10 +1735,35 @@ impl Service {
             // is checked at all, since the handler skips the floor on that
             // path. Composition above only rewrites `filter`, so flooring
             // after it sees the order unchanged.
-            match composed.cursor {
-                Some(_) => require_continuation_keyset(&composed)?,
+            match composed.cursor.as_ref() {
+                Some(cursor) => {
+                    require_continuation_keyset(&composed)?;
+                    // Structure first, then relevance: whether the token's
+                    // order could be a keyset at all, then whether the
+                    // token belongs to this query.
+                    //
+                    // The comparison takes the freshly computed value as
+                    // an argument rather than reading `composed.filter_hash`
+                    // back after the assignment below. That is deliberate,
+                    // and it is what makes the two statements
+                    // order-independent: reading it back would compare
+                    // against whichever of the two values happened to be
+                    // there, which is the caller's own filter-only hash
+                    // before the assignment (`compose_query_with_scope`
+                    // preserves it) and so would refuse every legitimate
+                    // page two.
+                    require_cursor_fingerprint(cursor, &fingerprint)?;
+                }
                 None => establish_keyset_order(&mut composed)?,
             }
+
+            // Every dispatch carries the fingerprint — a continuation's
+            // as much as a first page's, since a conforming plugin mints
+            // `next_cursor.f` from whatever it was handed. Assigning it on
+            // the first-page branch alone would leave page two dispatching
+            // the caller's own filter-only hash, and page *three* would
+            // then be refused for a mismatch nobody caused.
+            composed.filter_hash = Some(fingerprint);
 
             let plugin = self
                 .resolve_plugin_for(PluginOp::ListUsageRecords)

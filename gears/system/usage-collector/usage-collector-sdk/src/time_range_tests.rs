@@ -100,3 +100,72 @@ fn an_entry_wider_than_the_range_is_selected_by_exactly_one_range() {
         .expect("range");
     assert!(next.contains_window_end(wide_entry_end));
 }
+
+#[test]
+fn canonical_form_pins_the_exact_rendering() {
+    // The string is compared across a page boundary — the follow-up
+    // request renders it again from its own `from` / `to` and the two have
+    // to be byte-identical — so the rendering is a wire-visible constant
+    // and not an implementation detail. Pinned literally: a "reasonable"
+    // reformat (padding, a different separator, seconds instead of
+    // nanoseconds) refuses every cursor minted under the old spelling, and
+    // a test that only compared two `canonical_form` calls to each other
+    // would stay green through all of it.
+    let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
+    assert_eq!(
+        range.canonical_form(),
+        "1700000000000000000~1700003600000000000",
+    );
+}
+
+#[test]
+fn canonical_form_separates_ranges_differing_only_in_one_bound() {
+    // Both bounds have to reach the string. A rendering that dropped
+    // either would fingerprint two different ranges identically, which is
+    // exactly the cursor confusion the fingerprint exists to prevent.
+    let base = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
+    let later_upper = TimeRange::new(at(1_700_000_000), at(1_700_007_200)).expect("range");
+    let later_lower = TimeRange::new(at(1_700_000_001), at(1_700_003_600)).expect("range");
+
+    assert_ne!(base.canonical_form(), later_upper.canonical_form());
+    assert_ne!(base.canonical_form(), later_lower.canonical_form());
+}
+
+#[test]
+fn canonical_form_separates_ranges_differing_only_below_the_microsecond() {
+    // The truncation hole. `id::canonical_period_bound` renders a fixed
+    // six-digit microsecond fraction, and `TimeRange::new` applies no
+    // precision check, so composing the two here would collapse these two
+    // ranges onto one string — and a cursor minted under either would then
+    // validate against the other.
+    let plain = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
+    let nudged = TimeRange::new(
+        at(1_700_000_000),
+        at(1_700_003_600) + Duration::nanoseconds(1),
+    )
+    .expect("range");
+
+    assert_ne!(
+        plain.canonical_form(),
+        nudged.canonical_form(),
+        "a sub-microsecond difference must survive the rendering",
+    );
+}
+
+#[test]
+fn canonical_form_is_the_same_for_two_spellings_of_one_instant() {
+    // The other half of injectivity: the rendering must not manufacture a
+    // difference either. `13:00:00+01:00` and `12:00:00Z` are one instant,
+    // so a caller who paged with the first and continued with the second
+    // must not be refused — the same equivalence `TimeRange::new`'s UTC
+    // normalization establishes, restated where it becomes wire-visible.
+    let offset = UtcOffset::from_hms(1, 0, 0).expect("valid offset");
+    let utc = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
+    let shifted = TimeRange::new(
+        at(1_700_000_000).to_offset(offset),
+        at(1_700_003_600).to_offset(offset),
+    )
+    .expect("range");
+
+    assert_eq!(utc.canonical_form(), shifted.canonical_form());
+}

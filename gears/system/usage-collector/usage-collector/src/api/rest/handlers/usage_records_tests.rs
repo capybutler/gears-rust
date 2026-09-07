@@ -495,6 +495,24 @@ fn list_params(extra: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The typed range `list_params` spells on the wire.
+fn list_range() -> usage_collector_sdk::TimeRange {
+    usage_collector_sdk::TimeRange::new(OffsetDateTime::UNIX_EPOCH, EPOCH_PLUS_ONE_HOUR)
+        .expect("a one-hour range from the epoch is valid")
+}
+
+/// The fingerprint the service binds a continuation to for a request
+/// carrying `query`'s `$filter` over the standard [`list_params`] range.
+///
+/// A continuation whose `f` is anything else — absent included — is
+/// refused, so a full-stack cursor test has to mint the real value. It
+/// comes from the domain rather than being restated here: a second
+/// spelling at the edge is the very defect the fingerprint's single owner
+/// exists to prevent.
+fn list_fingerprint(query: &toolkit_odata::ODataQuery) -> String {
+    crate::domain::query::read_fingerprint(query, list_range())
+}
+
 /// The same range in the aggregate path's carrier — its request body.
 fn range_body() -> crate::api::rest::dto::TimeRangeDto {
     crate::api::rest::dto::TimeRangeDto {
@@ -1817,9 +1835,20 @@ mod prepare_list_query_tests {
     // is needed for an unreachable branch.
 
     #[test]
-    fn cursor_filter_hash_mismatch_surfaces_filter_mismatch_reason() {
+    fn the_edge_leaves_the_query_fingerprint_comparison_to_the_service() {
+        // The extractor's `filter_hash` is a hash of `$filter` alone,
+        // while the fingerprint a continuation is bound to is the
+        // caller's `$filter` AND the read range — computed and compared
+        // behind the service, which is the only layer an in-process caller
+        // passes through too. An edge that kept comparing its own
+        // narrower value would therefore reject every legitimate page
+        // two, so it MUST pass `None` and keep only the signed-token
+        // order check. Two fingerprints for one property is the defect,
+        // not the redundancy.
+        //
+        // Deliberately divergent values here: this passes only because
+        // the comparison is gone, so restoring the argument fails it.
         let mut q = ODataQuery::new();
-        // Caller filter hashed to "hash_current".
         q.filter = Some(Box::new(Expr::Compare(
             Box::new(Expr::Identifier("status".into())),
             CompareOperator::Eq,
@@ -1833,10 +1862,17 @@ mod prepare_list_query_tests {
             f: Some("hash_DIFFERENT".into()),
             d: "fwd".to_owned(),
         });
-        let err = prepare_list_query(q).expect_err("filter hash divergence rejects");
-        let reason = extract_first_field_violation_reason(&err)
-            .expect("canonical envelope carries a field violation");
-        assert_eq!(reason, "FILTER_MISMATCH");
+        let out =
+            prepare_list_query(q).expect("the edge no longer owns the fingerprint comparison");
+        assert!(
+            out.cursor.is_some(),
+            "the decoded cursor MUST reach the service, which is where the \
+             fingerprint is compared",
+        );
+        assert_order_keys(
+            &out.order,
+            &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
+        );
     }
 
     #[test]
@@ -1857,27 +1893,6 @@ mod prepare_list_query_tests {
         assert!(
             matches!(err, CanonicalError::InvalidArgument { .. }),
             "malformed cursor signed tokens MUST lift to canonical InvalidArgument",
-        );
-    }
-
-    #[test]
-    fn happy_path_cursor_with_matching_hash_and_order_passes() {
-        let mut q = ODataQuery::new();
-        q.filter_hash = Some("h0".into());
-        q.cursor = Some(CursorV1 {
-            k: vec!["k".into(), "u".into()],
-            o: SortDir::Asc,
-            s: "+window_end,+id".to_owned(),
-            f: Some("h0".into()),
-            d: "fwd".to_owned(),
-        });
-        let out = prepare_list_query(q).expect("matching cursor passes through");
-        assert!(out.cursor.is_some());
-        // The cursor-derived keyset order is materialized into `query.order`
-        // so the storage plugin can build the ORDER BY / keyset predicate.
-        assert_order_keys(
-            &out.order,
-            &[("window_end", SortDir::Asc), ("id", SortDir::Asc)],
         );
     }
 }
@@ -2800,9 +2815,11 @@ mod handle_list_usage_records_tests {
         // here is a 400 — so nothing drove a successful continuation end
         // to end.
         //
-        // `f: None` skips the filter-hash comparison (`validate_cursor_against`
-        // skips it when either side is absent), leaving the order as the
-        // only thing under test.
+        // `f` carries the fingerprint the service binds a continuation to
+        // — the caller's `$filter` and the read range together — because a
+        // token bound to anything else is refused before the order is ever
+        // reached. The order is still the subject; the fingerprint is the
+        // precondition.
         let plugin = HappyPathPlugin::new();
         plugin.set_list_usage_records_response(ODataPage::empty(0));
         let service = service_with_permit_plugin(&plugin, "test.handler.list_records.cursor.v1");
@@ -2812,7 +2829,7 @@ mod handle_list_usage_records_tests {
             k: vec!["2026-06-12T00:00:00Z".into(), uuid::Uuid::nil().to_string()],
             o: SortDir::Asc,
             s: "+window_end,+id".to_owned(),
-            f: None,
+            f: Some(super::list_fingerprint(&ODataQuery::new())),
             d: "fwd".to_owned(),
         });
         // Note: `q.order` intentionally empty, mirroring the toolkit OData
@@ -2861,7 +2878,9 @@ mod handle_list_usage_records_tests {
             k: vec!["r1".into(), uuid::Uuid::nil().to_string()],
             o: SortDir::Asc,
             s: "+resource_id,+id".to_owned(),
-            f: None,
+            // The fingerprint matches, so the refusal below is the keyset
+            // check and not the query-mismatch check next to it.
+            f: Some(super::list_fingerprint(&ODataQuery::new())),
             d: "fwd".to_owned(),
         });
 
@@ -2886,24 +2905,31 @@ mod handle_list_usage_records_tests {
     }
 
     #[tokio::test]
-    async fn cursor_filter_hash_mismatch_returns_400() {
-        // A continuation cursor whose embedded filter-hash no longer
-        // matches the request's `filter_hash` MUST be refused with a 400
-        // rather than silently resumed against a different filter.
-        let service = service_no_plugin();
+    async fn a_cursor_minted_over_another_query_returns_400_naming_the_cursor() {
+        // A continuation whose bound query is not this request's MUST be
+        // refused rather than silently resumed over a different row set.
+        // The comparison moved behind the service when the read range left
+        // `$filter`: the edge's own `filter_hash` covers `$filter` alone,
+        // and an in-process caller has none at all, so the service is the
+        // only owner that can hold both surfaces to the rule. This test
+        // therefore needs a service that gets as far as the read path,
+        // where the earlier edge-only version needed no plugin at all.
+        let plugin = HappyPathPlugin::new();
+        plugin.set_list_usage_records_response(ODataPage::empty(0));
+        let service =
+            service_with_permit_plugin(&plugin, "test.handler.list_records.stale_cursor.v1");
 
         let mut q = ODataQuery::new();
-        q.filter_hash = Some("hash_current".into());
         q.cursor = Some(CursorV1 {
-            k: vec!["k".into()],
+            k: vec!["2026-06-12T00:00:00Z".into(), uuid::Uuid::nil().to_string()],
             o: SortDir::Asc,
             s: "+window_end,+id".to_owned(),
-            f: Some("hash_DIFFERENT".into()),
+            f: Some("minted_over_something_else".into()),
             d: "fwd".to_owned(),
         });
 
         let response = handle_list_usage_records(
-            Extension(SecurityContext::anonymous()),
+            Extension(authenticated_ctx()),
             Extension(service),
             Query(super::list_params(&[("gts_type_id", HAPPY_RECORD_GTS_ID)])),
             OData(q),
@@ -2912,6 +2938,83 @@ mod handle_list_usage_records_tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("cursor"),
+            "the 400 MUST blame the token the caller sent",
+        );
+        assert!(
+            plugin.last_list_order().is_none(),
+            "a cursor bound to another query MUST NOT reach the plugin: \
+             being served is a wrong page, and a wrong page is a 200",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_two_carrying_only_a_cursor_change_is_served_over_rest() {
+        // The legitimate continuation, end to end over REST and with a
+        // `$filter` present, which is what makes it the regression test
+        // for the edge giving up its own comparison: the extractor's
+        // `filter_hash` is a hash of `$filter` alone, so an edge still
+        // comparing it against the filter-plus-range fingerprint the
+        // plugin minted would reject exactly this request.
+        //
+        // Page one is dispatched for real and its fingerprint read off
+        // what the plugin received, so nothing here restates a value the
+        // domain owns.
+        let plugin = HappyPathPlugin::new();
+        plugin.set_list_usage_records_response(ODataPage::empty(0));
+        let service = service_with_permit_plugin(&plugin, "test.handler.list_records.page_two.v1");
+
+        let mut page_one = ODataQuery::from(Some(
+            toolkit_odata::parse_filter_string("resource_id eq 'r1'")
+                .expect("test filter parses")
+                .into_expr(),
+        ));
+        // Mirror the toolkit extractor: it hashes the `$filter` alone.
+        page_one.filter_hash = toolkit_odata::short_filter_hash(page_one.filter());
+
+        let response = handle_list_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(Arc::clone(&service)),
+            Query(super::list_params(&[("gts_type_id", HAPPY_RECORD_GTS_ID)])),
+            OData(page_one.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "page one must be served");
+
+        let minted = plugin
+            .last_list_query()
+            .expect("page one MUST have been dispatched")
+            .filter_hash
+            .expect("every dispatch MUST carry the fingerprint the plugin mints");
+
+        let mut page_two = page_one;
+        page_two.cursor = Some(CursorV1 {
+            k: vec!["2026-06-12T00:00:00Z".into(), uuid::Uuid::nil().to_string()],
+            o: SortDir::Asc,
+            s: "+window_end,+id".to_owned(),
+            f: Some(minted),
+            d: "fwd".to_owned(),
+        });
+
+        let response = handle_list_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(service),
+            Query(super::list_params(&[("gts_type_id", HAPPY_RECORD_GTS_ID)])),
+            OData(page_two),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "page two of an unchanged query MUST be served: the cursor the \
+             plugin minted is bound to the filter AND the range, so an edge \
+             comparing its filter-only hash would refuse every one of them",
+        );
     }
 
     #[tokio::test]

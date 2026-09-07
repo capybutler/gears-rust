@@ -39,6 +39,15 @@ pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUP
 /// path and by the read path's keyset floor, and enumerated on the wire as
 /// one of the `cursor` field violations in `usage-collector-v1.yaml`.
 pub const INVALID_CURSOR: &str = "INVALID_CURSOR";
+/// A continuation token was minted over a different query than the request
+/// carrying it. The bound query is the caller's `$filter` **and** the read
+/// range together, since the range is a typed parameter rather than a
+/// `$filter` conjunct — so changing either `from` or `to` between pages
+/// surfaces here, exactly as changing `$filter` always did. Enumerated on
+/// the wire as one of the `cursor` field violations in
+/// `usage-collector-v1.yaml`, and the code `toolkit_odata`'s own
+/// filter-hash comparison already emits.
+pub const FILTER_MISMATCH: &str = "FILTER_MISMATCH";
 /// An aggregated query produced more distinct groups than
 /// [`crate::MAX_AGGREGATION_BUCKETS`] — typically a high-cardinality `group_by`
 /// (e.g. a per-record metadata key) over a wide range. Narrow the read-path
@@ -70,6 +79,8 @@ pub enum ValidationReason {
     AggregationResultTooLarge,
     /// See [`INVALID_CURSOR`].
     InvalidCursor,
+    /// See [`FILTER_MISMATCH`].
+    FilterMismatch,
     /// Unmodeled / future reason — preserves the raw wire string.
     Unknown(String),
 }
@@ -90,6 +101,7 @@ impl ValidationReason {
             INVALID_METADATA_FIELDS_DUPLICATE => Self::MetadataFieldDuplicate,
             AGGREGATION_RESULT_TOO_LARGE => Self::AggregationResultTooLarge,
             INVALID_CURSOR => Self::InvalidCursor,
+            FILTER_MISMATCH => Self::FilterMismatch,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -109,6 +121,7 @@ impl ValidationReason {
             Self::MetadataFieldDuplicate => INVALID_METADATA_FIELDS_DUPLICATE,
             Self::AggregationResultTooLarge => AGGREGATION_RESULT_TOO_LARGE,
             Self::InvalidCursor => INVALID_CURSOR,
+            Self::FilterMismatch => FILTER_MISMATCH,
             Self::Unknown(s) => s.as_str(),
         }
     }

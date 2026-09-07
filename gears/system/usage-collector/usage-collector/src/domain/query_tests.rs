@@ -3,7 +3,8 @@
 //! [`require_metadata_filter_keys_declared`] — the Spec §3.11 gate on the
 //! admissible `$filter` / `group_by` / `metadata_filter` surface — and for
 //! [`establish_keyset_order`] / [`require_continuation_keyset`], the raw
-//! path's keyset floor in its two modes.
+//! path's keyset floor in its two modes, and for [`read_fingerprint`] /
+//! [`require_cursor_fingerprint`], the query a continuation is bound to.
 //!
 //! There is no bounded-window guard to test: the mandatory read range is a
 //! typed [`usage_collector_sdk::TimeRange`] parameter on both read paths
@@ -21,9 +22,9 @@ use usage_collector_sdk::{
 use uuid::Uuid;
 
 use super::{
-    CANONICAL_KEYSET_FIELDS, compose_query_with_scope, establish_keyset_order,
-    reject_reserved_filter_fields, require_continuation_keyset, require_dimensions_declared,
-    require_metadata_filter_keys_declared,
+    CANONICAL_KEYSET_FIELDS, compose_query_with_scope, establish_keyset_order, read_fingerprint,
+    reject_reserved_filter_fields, require_continuation_keyset, require_cursor_fingerprint,
+    require_dimensions_declared, require_metadata_filter_keys_declared,
 };
 
 /// Build an [`ODataQuery`] whose `$filter` is the parsed `filter` string.
@@ -782,8 +783,8 @@ fn the_floor_touches_nothing_but_the_order() {
 // tuple past the values available to compare against and hand the plugin a
 // misaligned continuation — a silently wrong page, where refusing is merely
 // a refused one. Nothing downstream would catch it:
-// `validate_cursor_against` compares signed tokens and the filter hash and
-// never checks the token's width against the order's.
+// `validate_cursor_against` never checks the token's width against the
+// order's, and the gear hands it no filter hash at all.
 //
 // That the order comes back UNCHANGED is not asserted here, because
 // `require_continuation_keyset` takes `&ODataQuery` and the compiler
@@ -947,4 +948,148 @@ fn a_mixed_direction_continuation_is_refused_as_a_cursor_defect() {
     let err = require_continuation_keyset(&query)
         .expect_err("a token bound to a mixed-direction keyset must be refused");
     assert_cursor_rejection(err);
+}
+
+// ---------------------------------------------------------------------------
+// read_fingerprint / require_cursor_fingerprint — the query a continuation is
+// bound to.
+//
+// `CursorV1::f` exists so a caller who changes their query between pages is
+// refused rather than served a continuation minted over a different row set.
+// While the mandatory window lived inside `$filter`, `short_filter_hash`
+// covered it for free; it is a typed parameter now, so both halves have to be
+// pinned here — the range being present is the point of the change, and the
+// filter still being present is what says the range did not quietly replace
+// the property it was added to.
+// ---------------------------------------------------------------------------
+
+/// A range starting at `secs` past the epoch and running one hour.
+fn hour_from(secs: i64) -> usage_collector_sdk::TimeRange {
+    let from = time::OffsetDateTime::from_unix_timestamp(secs).expect("in-range timestamp");
+    usage_collector_sdk::TimeRange::new(from, from + time::Duration::hours(1)).expect("range")
+}
+
+#[test]
+fn the_fingerprint_covers_both_the_filter_and_the_range() {
+    let range_a = hour_from(1_700_000_000);
+    let range_b = hour_from(1_800_000_000);
+    let plain = ODataQuery::default();
+    let filtered = query_with_filter("resource_id eq 'r1'");
+
+    assert_ne!(
+        read_fingerprint(&plain, range_a),
+        read_fingerprint(&plain, range_b),
+        "the range must move the fingerprint",
+    );
+    assert_ne!(
+        read_fingerprint(&filtered, range_a),
+        read_fingerprint(&plain, range_a),
+        "the filter must move the fingerprint",
+    );
+    assert_eq!(
+        read_fingerprint(&filtered, range_a),
+        read_fingerprint(&filtered, range_a),
+        "and it must be stable, or no cursor would ever validate",
+    );
+}
+
+#[test]
+fn the_fingerprint_of_a_filterless_query_still_carries_the_range() {
+    // `short_filter_hash` returns `None` for an absent filter, and an
+    // absent filter is a legitimate complete request (the PDP scope alone
+    // narrows it). A rendering that short-circuited on the `None` would
+    // drop the range for exactly the callers who send no `$filter`.
+    let plain = ODataQuery::default();
+    assert!(
+        read_fingerprint(&plain, hour_from(1_700_000_000))
+            .contains(&hour_from(1_700_000_000).canonical_form()),
+        "a filterless query's fingerprint must still carry the range",
+    );
+}
+
+#[test]
+fn the_fingerprint_separates_ranges_differing_only_below_the_microsecond() {
+    // The truncation hole, at the level that matters: if the range
+    // rendering truncated to the identity derivation's fixed
+    // six-digit-microsecond form, these two ranges would fingerprint
+    // identically and a cursor minted under either would validate against
+    // the other.
+    let from = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let coarse =
+        usage_collector_sdk::TimeRange::new(from, from + time::Duration::hours(1)).expect("range");
+    let nudged = usage_collector_sdk::TimeRange::new(
+        from,
+        from + time::Duration::hours(1) + time::Duration::nanoseconds(1),
+    )
+    .expect("range");
+    let query = query_with_filter("resource_id eq 'r1'");
+
+    assert_ne!(
+        read_fingerprint(&query, coarse),
+        read_fingerprint(&query, nudged),
+    );
+}
+
+#[test]
+fn a_cursor_carrying_the_same_fingerprint_is_accepted() {
+    let fingerprint = read_fingerprint(&ODataQuery::default(), hour_from(1_700_000_000));
+    let mut query = continuation_ordered_by(&[("window_end", SortDir::Asc), ("id", SortDir::Asc)]);
+    query.cursor.as_mut().expect("cursor").f = Some(fingerprint.clone());
+
+    require_cursor_fingerprint(query.cursor.as_ref().expect("cursor"), &fingerprint)
+        .expect("a cursor minted over this very query must be accepted");
+}
+
+#[test]
+fn a_cursor_carrying_a_different_fingerprint_is_refused_as_a_query_mismatch() {
+    let query = continuation_ordered_by(&[("window_end", SortDir::Asc), ("id", SortDir::Asc)]);
+    let mut cursor = query.cursor.expect("cursor");
+    cursor.f = Some(read_fingerprint(
+        &ODataQuery::default(),
+        hour_from(1_800_000_000),
+    ));
+
+    let err = require_cursor_fingerprint(
+        &cursor,
+        &read_fingerprint(&ODataQuery::default(), hour_from(1_700_000_000)),
+    )
+    .expect_err("a cursor minted over another query must be refused");
+    assert_query_mismatch_rejection(err);
+}
+
+#[test]
+fn a_cursor_carrying_no_fingerprint_at_all_is_refused() {
+    // `validate_cursor_against` skips its own comparison whenever either
+    // side is absent, which is the hole this check exists to close: the
+    // cursor is caller-supplied JSON, so "no fingerprint recorded" is not
+    // evidence of a matching query. A conforming plugin always has one to
+    // mint, because the read path assigns it onto every dispatch.
+    let query = continuation_ordered_by(&[("window_end", SortDir::Asc), ("id", SortDir::Asc)]);
+    let cursor = query.cursor.expect("cursor");
+    assert!(
+        cursor.f.is_none(),
+        "precondition: this fixture mints no fingerprint",
+    );
+
+    let err = require_cursor_fingerprint(
+        &cursor,
+        &read_fingerprint(&ODataQuery::default(), hour_from(1_700_000_000)),
+    )
+    .expect_err("an unbound cursor must be refused rather than admitted");
+    assert_query_mismatch_rejection(err);
+}
+
+/// Assert `err` blames `cursor` with the code the contract enumerates for
+/// a token minted over a different query. `FILTER_MISMATCH` rather than
+/// `INVALID_CURSOR`: the token is structurally fine, it just belongs to
+/// another query — and a changed range is a changed query from the
+/// caller's side.
+fn assert_query_mismatch_rejection(err: UsageCollectorError) {
+    match err {
+        UsageCollectorError::InvalidArgument { field, reason, .. } => {
+            assert_eq!(field, "cursor");
+            assert_eq!(reason, ValidationReason::FilterMismatch);
+        }
+        other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+    }
 }

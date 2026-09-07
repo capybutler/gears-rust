@@ -27,6 +27,7 @@ fn validation_reason_round_trips_each_constant() {
             ValidationReason::AggregationResultTooLarge,
         ),
         (INVALID_CURSOR, ValidationReason::InvalidCursor),
+        (FILTER_MISMATCH, ValidationReason::FilterMismatch),
     ] {
         assert_eq!(ValidationReason::from_wire(wire), expected);
         assert_eq!(expected.as_wire(), wire);

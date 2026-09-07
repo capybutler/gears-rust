@@ -1111,6 +1111,15 @@ pub struct HappyPathPlugin {
     /// gateway failed to floor — an unfloored order is a keyset the plugin
     /// cannot continue, or silently drops rows from.
     list_order: Mutex<Option<RecordedOrder>>,
+    /// The whole [`ODataQuery`] the most-recent `list_usage_records`
+    /// dispatch was handed, so a test can read the `filter_hash` a
+    /// conforming plugin would mint into `next_cursor.f` and the composed
+    /// `$filter` it was computed alongside. A returned page shows neither,
+    /// and the fingerprint's whole job is to be compared against a value
+    /// minted on the previous request — so nothing short of what the
+    /// plugin received can tell a correct fingerprint from one computed
+    /// over the wrong query.
+    list_query: Mutex<Option<ODataQuery>>,
 }
 
 impl HappyPathPlugin {
@@ -1133,6 +1142,7 @@ impl HappyPathPlugin {
             list_time_range: Mutex::new(None),
             aggregate_time_range: Mutex::new(None),
             list_order: Mutex::new(None),
+            list_query: Mutex::new(None),
         })
     }
 
@@ -1231,6 +1241,12 @@ impl HappyPathPlugin {
     /// invoked. Proves the gateway floored the order the SPI requires,
     /// rather than merely that the read returned `Ok`.
     #[must_use]
+    /// The [`ODataQuery`] the most-recent `list_usage_records` dispatch
+    /// received. See [`HappyPathPlugin::list_query`].
+    pub fn last_list_query(&self) -> Option<ODataQuery> {
+        self.list_query.lock().expect("mutex").clone()
+    }
+
     pub fn last_list_order(&self) -> Option<RecordedOrder> {
         self.list_order.lock().expect("mutex").clone()
     }
@@ -1314,6 +1330,7 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
                 .map(|key| (key.field.clone(), key.dir))
                 .collect(),
         );
+        *self.list_query.lock().expect("mutex") = Some(query.clone());
         self.list_usage_records_response
             .lock()
             .expect("mutex")

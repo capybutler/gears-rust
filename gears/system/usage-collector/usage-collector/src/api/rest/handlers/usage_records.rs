@@ -182,12 +182,16 @@ pub async fn handle_get_usage_record(
 /// * **`$top` cap** — `ODataQuery.limit` is bounded by [`MAX_PAGE_SIZE`].
 ///   A caller passing `?$top=1000000` receives a `400 InvalidArgument`
 ///   so they cannot silently misinterpret a clamped page as complete.
-/// * **Cursor validation** — when a `cursor` is present, the toolkit's
-///   [`validate_cursor_against`] confirms it was minted under the same
-///   `$filter` AST and `$orderby` projection; mismatches surface as
-///   the canonical `cursor_decode` / `order_mismatch` / `filter_mismatch`
-///   `Problem`. The decoded `CursorV1` flows to the plugin via
-///   `ODataQuery.cursor` unchanged.
+/// * **Cursor decoding** — when a `cursor` is present, the toolkit's
+///   [`validate_cursor_against`] confirms it was minted under the
+///   `$orderby` projection its own signed tokens carry; a malformed token
+///   or a mismatched order surfaces as the canonical `cursor_decode` /
+///   `order_mismatch` `Problem`. The decoded `CursorV1` flows to the
+///   plugin via `ODataQuery.cursor` unchanged. Whether the token was
+///   minted over *this* query — the caller's `$filter` and the `from` /
+///   `to` range together — is checked behind the service, which is the
+///   only layer both surfaces pass through, and refused as
+///   `FILTER_MISMATCH` against `cursor`.
 /// * **`$orderby` admissibility and normalization** — a caller order is
 ///   refused here, naming `$orderby`, when it mixes sort directions or
 ///   names a key that is not a mandatory record attribute; an admissible
@@ -502,7 +506,7 @@ const METADATA_PREFIX: &str = "metadata.";
 ///    non-mandatory order key and otherwise appends whichever of
 ///    `window_end` / `id` the caller did not name, in their direction;
 /// 3. validate the optional cursor against the order derived from its own
-///    signed tokens and the parsed filter hash.
+///    signed tokens, and materialize that order back onto the query.
 ///
 /// Step 2 exists here, and not only behind the service, so a caller's own
 /// input is refused where it is parsed and the `400` blames `$orderby` —
@@ -560,9 +564,9 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
     // 3. Cursor validation + order materialization. When a cursor is
     // present, `query.order` is empty by toolkit convention; the effective
     // keyset order lives in the cursor's signed-token payload (`cursor.s`).
-    // Derive it, validate the cursor against it and the parsed filter hash,
-    // then write it back into `query.order` so it propagates to the storage
-    // plugin. The plugin reads `query.order` directly to build BOTH the
+    // Derive it, validate the cursor against it, then write it back into
+    // `query.order` so it propagates to the storage plugin. The plugin
+    // reads `query.order` directly to build BOTH the
     // `ORDER BY` and the keyset continuation predicate and has no access to
     // the cursor's token derivation — leaving the order empty makes the
     // plugin reject the continuation with "keyset order must not be empty"
@@ -570,12 +574,20 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
     if let Some(cursor) = query.cursor.as_ref() {
         let effective_order = toolkit_odata::ODataOrderBy::from_signed_tokens(&cursor.s)
             .map_err(CanonicalError::from)?;
-        toolkit_odata::validate_cursor_against(
-            cursor,
-            &effective_order,
-            query.filter_hash.as_deref(),
-        )
-        .map_err(CanonicalError::from)?;
+        // `None`, not `query.filter_hash`: the query a continuation is
+        // bound to is the caller's `$filter` AND the read range, and the
+        // service owns that fingerprint end to end (`read_fingerprint`).
+        // The extractor's `filter_hash` covers `$filter` alone, so an edge
+        // still comparing it against a cursor the plugin minted from the
+        // filter-plus-range value would reject every legitimate page two.
+        // Two fingerprints for one property is the defect, not the
+        // redundancy — and teaching the edge to recompute the same value
+        // would not fix it either, because `filter_hash` is `None` for an
+        // in-process caller, so the edge cannot be the owner. What is left
+        // here is the signed-token order check, which is a wire concern:
+        // the token is decoded where it arrives.
+        toolkit_odata::validate_cursor_against(cursor, &effective_order, None)
+            .map_err(CanonicalError::from)?;
         query.order = effective_order;
     }
 

@@ -70,6 +70,58 @@ impl TimeRange {
         self.to
     }
 
+    /// The range's canonical text form, `<from>~<to>`, each bound rendered
+    /// as its nanoseconds since the Unix epoch.
+    ///
+    /// One spelling, because this value ends up inside an opaque pagination
+    /// cursor. The gear's read path folds it into the fingerprint a keyset
+    /// continuation is bound to, and that
+    /// fingerprint is compared across a page boundary: the caller's next
+    /// request recomputes the string and it has to come out identical, so a
+    /// second spelling that ordered or padded the bounds differently would
+    /// refuse every cursor minted under the first. Same "two spellings of
+    /// one rule" hazard [`Self::contains_window_end`] exists to avoid, one
+    /// level up.
+    ///
+    /// The round trip is what makes the value usable as a fingerprint: the
+    /// gear hands the string to the plugin on `ODataQuery::filter_hash`,
+    /// the plugin mints it into `CursorV1::f`, and the follow-up request
+    /// renders it again from its own `from` / `to`. Nanoseconds since the
+    /// epoch make that reproducible for free — the rendering is
+    /// instant-based, so it is offset-invariant as well as lossless, and
+    /// two spellings of one instant render identically. That is the same
+    /// equivalence [`TimeRange::new`]'s UTC normalization already
+    /// establishes.
+    #[must_use]
+    pub fn canonical_form(self) -> String {
+        // Full nanosecond resolution, deliberately NOT
+        // `crate::id::canonical_period_bound`'s fixed six-digit-microsecond
+        // form. That form truncates — it exists so the identity derivation
+        // reads a frozen width over what is persisted — while
+        // `TimeRange::new` applies no precision check at all, because a read
+        // range derives no identity and refusing a caller who passed
+        // `now()` with nanoseconds would be hostile for nothing. Composing
+        // the two would collapse two ranges differing only below the
+        // microsecond onto one fingerprint, so a cursor minted under either
+        // would validate against the other — defeating the protection the
+        // fingerprint exists to provide. Injectivity over what the caller
+        // sent is this function's requirement; a frozen width over what is
+        // persisted is the derivation's. They are not the same requirement
+        // and they must not share a function.
+        //
+        // Keeping them apart also leaves `canonical_period_bound`'s
+        // `debug_assert!` on a `0..=9999` year covering exactly the
+        // ingestion path it was argued for: `TimeRange::new` validates
+        // ordering only, so an in-process caller can build a range outside
+        // that year span and would trip an assert nobody justified for the
+        // read path.
+        format!(
+            "{}~{}",
+            self.from.unix_timestamp_nanos(),
+            self.to.unix_timestamp_nanos(),
+        )
+    }
+
     /// Does this range select an entry whose covered period ends at
     /// `window_end`?
     ///

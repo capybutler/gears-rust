@@ -4047,6 +4047,7 @@ mod read_path_keyset_floor_tests {
     };
 
     use crate::domain::Service;
+    use crate::domain::query::read_fingerprint;
     use crate::domain::test_support::{
         RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
         fake_declaration_source_with_metadata, recording_plugin_resolver, test_time_range,
@@ -4204,6 +4205,12 @@ mod read_path_keyset_floor_tests {
     /// then decoded the way `prepare_list_query` step 3 does
     /// (`ODataOrderBy::from_signed_tokens`), so the order under test is
     /// derived from the token rather than set alongside it.
+    ///
+    /// `f` is minted the same way: a conforming plugin echoes the
+    /// `filter_hash` it was dispatched with, which is
+    /// [`read_fingerprint`] over the caller's query and range. Without it
+    /// every fixture here would be refused as a cursor bound to another
+    /// query, and these tests are about the order.
     fn cursor_request_ordered_by(keys: &[(&str, SortDir)]) -> ODataQuery {
         let signed = query_ordered_by(keys).order.to_signed_tokens();
         let mut query = ODataQuery::new();
@@ -4218,7 +4225,7 @@ mod read_path_keyset_floor_tests {
                 .collect(),
             o: query.order.0[0].dir,
             s: signed,
-            f: None,
+            f: Some(read_fingerprint(&query, test_time_range())),
             d: "fwd".to_owned(),
         });
         query
@@ -4298,6 +4305,342 @@ mod read_path_keyset_floor_tests {
         assert!(
             spy.last_list_order().is_none(),
             "a refused continuation MUST NOT reach the plugin",
+        );
+    }
+}
+
+/// The query a keyset continuation is bound to, enforced where both
+/// surfaces pass through it.
+///
+/// `CursorV1::f` exists so a caller who changes their query between pages
+/// is refused rather than served a continuation minted over a different row
+/// set. While the mandatory window lived inside `$filter` the fingerprint
+/// covered it for free; it is a typed `TimeRange` parameter now, so it has
+/// to enter the fingerprint explicitly or page 2 of a January query happily
+/// continues from a cursor minted over February — and a wrong page is an
+/// `Ok`, so nothing else in the stack notices.
+///
+/// Asserted through the service rather than the handler on purpose:
+/// `ODataQuery::filter_hash` is `None` for an in-process caller and
+/// `toolkit_odata::validate_cursor_against` skips its comparison when
+/// either side is `None`, so this is exactly the caller an edge-only check
+/// leaves unprotected — and the one no REST test can reach.
+mod read_path_cursor_fingerprint_tests {
+    use std::sync::Arc;
+
+    use toolkit_gts::gts_id;
+    use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, Page as ODataPage, SortDir};
+    use toolkit_security::SecurityContext;
+    use usage_collector_sdk::{
+        MeterTypeId, TimeRange, UsageCollectorError, UsageCollectorPluginV1, ValidationReason,
+    };
+
+    use crate::domain::Service;
+    use crate::domain::query::read_fingerprint;
+    use crate::domain::test_support::{
+        RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
+        fake_declaration_source_with_metadata, recording_plugin_resolver, test_time_range,
+    };
+
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+    fn meter_id() -> MeterTypeId {
+        MeterTypeId::new(GTS_ID).expect("valid gts_type_id")
+    }
+
+    fn ctx() -> SecurityContext {
+        authenticated_ctx()
+    }
+
+    /// Same shape as `read_path_keyset_floor_tests`.
+    fn svc_and_spy() -> (Arc<Service>, Arc<RecordingPlugin>) {
+        let plugin = RecordingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_metadata(&[]))
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                RECORDING_PLUGIN_SUFFIX,
+            );
+        (service, plugin)
+    }
+
+    /// A range one hour wide, `offset` nanoseconds past the epoch.
+    fn range_at(offset_nanos: i64) -> TimeRange {
+        let from = time::OffsetDateTime::UNIX_EPOCH + time::Duration::nanoseconds(offset_nanos);
+        TimeRange::new(from, from + time::Duration::hours(1)).expect("a one-hour range")
+    }
+
+    /// An [`ODataQuery`] whose `$filter` is the parsed `filter` string.
+    fn query_with_filter(filter: &str) -> ODataQuery {
+        let expr = toolkit_odata::parse_filter_string(filter)
+            .expect("test filter parses")
+            .into_expr();
+        ODataQuery::from(Some(expr))
+    }
+
+    /// Page one of `query` over `range`, dispatched for real, returning the
+    /// `filter_hash` the plugin was handed.
+    ///
+    /// This is the mint leg of every round trip below, and it is a real
+    /// dispatch rather than a `read_fingerprint` call so the value under
+    /// test is the one the service actually put on the wire to the plugin.
+    /// A conforming plugin copies it into `next_cursor.f`.
+    async fn mint_fingerprint(query: &ODataQuery, range: TimeRange) -> String {
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        svc.list_usage_records(&ctx(), meter_id(), range, query, &[])
+            .await
+            .expect("page one is a complete request");
+        spy.last_list_query()
+            .expect("the plugin MUST have been dispatched")
+            .filter_hash
+            .expect("every dispatch MUST carry the fingerprint the plugin mints")
+    }
+
+    /// `query` again, now carrying the canonical continuation a plugin
+    /// would have minted from `fingerprint`.
+    ///
+    /// The order round-trips through `to_signed_tokens` /
+    /// `from_signed_tokens` exactly as `prepare_list_query` step 3 does, so
+    /// the cursor under test is decoded rather than assembled.
+    fn continuation_of(query: &ODataQuery, fingerprint: &str) -> ODataQuery {
+        let mut floored = query.clone();
+        crate::domain::query::establish_keyset_order(&mut floored)
+            .expect("an empty order is floorable");
+        let signed = floored.order.to_signed_tokens();
+
+        let mut page_two = query.clone();
+        page_two.order =
+            ODataOrderBy::from_signed_tokens(&signed).expect("a non-empty order round-trips");
+        page_two.cursor = Some(CursorV1 {
+            k: page_two
+                .order
+                .0
+                .iter()
+                .map(|_| "boundary".to_owned())
+                .collect(),
+            o: page_two.order.0[0].dir,
+            s: signed,
+            f: Some(fingerprint.to_owned()),
+            d: "fwd".to_owned(),
+        });
+        page_two
+    }
+
+    fn assert_query_mismatch(err: &UsageCollectorError) {
+        match err {
+            UsageCollectorError::InvalidArgument { field, reason, .. } => {
+                assert_eq!(
+                    field, "cursor",
+                    "the 400 must blame the token, not an $orderby the caller \
+                     cannot send alongside a cursor",
+                );
+                assert_eq!(*reason, ValidationReason::FilterMismatch);
+            }
+            other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cursor_minted_under_the_same_range_is_served() {
+        // The half a careless "just refuse every cursor" edit would break,
+        // and the one that proves the value round-trips: the service
+        // dispatches a fingerprint, a conforming plugin mints it into
+        // `next_cursor.f`, and the follow-up request recomputes the same
+        // string from its own `$filter` and range.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+        let fingerprint = mint_fingerprint(&caller, range).await;
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        svc.list_usage_records(
+            &ctx(),
+            meter_id(),
+            range,
+            &continuation_of(&caller, &fingerprint),
+            &[],
+        )
+        .await
+        .expect("page two of an unchanged query MUST be served");
+
+        assert_eq!(
+            spy.last_list_time_range(),
+            Some(range),
+            "the continuation must reach the plugin with the range it was \
+             minted under",
+        );
+        let dispatched = spy
+            .last_list_query()
+            .expect("the plugin MUST have been dispatched");
+        assert_eq!(
+            dispatched
+                .order
+                .0
+                .iter()
+                .map(|key| (key.field.clone(), key.dir))
+                .collect::<Vec<_>>(),
+            vec![
+                ("window_end".to_owned(), SortDir::Asc),
+                ("id".to_owned(), SortDir::Asc),
+            ],
+            "and with the order rebuilt from the token's signed keys",
+        );
+        assert_eq!(
+            dispatched.filter_hash,
+            Some(fingerprint),
+            "a continuation dispatch must carry the fingerprint too: the \
+             plugin mints page THREE's cursor from whatever it was handed \
+             here, so assigning it on the first-page branch alone breaks \
+             pagination one page later than any two-page test would notice",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_minted_under_a_different_range_never_reaches_the_plugin() {
+        // The whole reason this task exists. Same caller, same `$filter`,
+        // a different range — which used to be a `$filter` conjunct and so
+        // was covered by the hash for free.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let january = test_time_range();
+        let february = range_at(60 * 60 * 24 * 31 * 1_000_000_000);
+        assert_ne!(january, february, "precondition: two different ranges");
+        let fingerprint = mint_fingerprint(&caller, january).await;
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                february,
+                &continuation_of(&caller, &fingerprint),
+                &[],
+            )
+            .await
+            .expect_err("a cursor minted over another range must be refused");
+
+        assert_query_mismatch(&err);
+        assert!(
+            spy.last_list_order().is_none(),
+            "a refused continuation MUST NOT reach the plugin: being served \
+             is a wrong page, and a wrong page is an Ok",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_differing_only_below_the_microsecond_is_rejected() {
+        // The truncation hole the plan caught before the code existed: if
+        // the range rendering reused the identity derivation's fixed
+        // six-digit-microsecond form, these two ranges would fingerprint
+        // identically and this cursor would be served.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let coarse = range_at(0);
+        let nudged = range_at(1);
+        let fingerprint = mint_fingerprint(&caller, coarse).await;
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                nudged,
+                &continuation_of(&caller, &fingerprint),
+                &[],
+            )
+            .await
+            .expect_err("a sub-microsecond range change must still be refused");
+
+        assert_query_mismatch(&err);
+        assert!(spy.last_list_order().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cursor_minted_under_a_different_filter_never_reaches_the_plugin() {
+        // The property the range was added to, not a replacement for it.
+        // `$filter` was already covered before this slice, and an
+        // implementation that fingerprinted the range alone would lose it
+        // silently while every range test above stayed green.
+        let range = test_time_range();
+        let fingerprint = mint_fingerprint(&query_with_filter("resource_id eq 'r1'"), range).await;
+        let page_two = query_with_filter("resource_id eq 'r2'");
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                range,
+                &continuation_of(&page_two, &fingerprint),
+                &[],
+            )
+            .await
+            .expect_err("a cursor minted over another filter must be refused");
+
+        assert_query_mismatch(&err);
+        assert!(spy.last_list_order().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cursor_carrying_no_fingerprint_never_reaches_the_plugin() {
+        // `validate_cursor_against` skips its own comparison whenever
+        // either side is absent. The cursor is caller-supplied JSON, so an
+        // absent `f` is not evidence of a matching query — and admitting
+        // it would leave the whole check optional at the caller's
+        // discretion.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+        let mut page_two = continuation_of(&caller, "unused");
+        page_two.cursor.as_mut().expect("cursor").f = None;
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(&ctx(), meter_id(), range, &page_two, &[])
+            .await
+            .expect_err("an unbound cursor must be refused");
+
+        assert_query_mismatch(&err);
+        assert!(spy.last_list_order().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_dispatched_fingerprint_is_computed_from_the_callers_filter_not_the_composed_one() {
+        // `compose_query_with_scope` AND-merges the server-injected PDP
+        // scope into `$filter` and deliberately preserves the caller's
+        // `filter_hash`, for the reason it documents at length: the scope
+        // is not caller-controlled, so a fingerprint over the composed
+        // filter embeds a value the next request's recomputation can never
+        // reproduce. That failure is silent until a scope exists, which is
+        // why this asserts the value rather than only the round trip — the
+        // round trip is stable either way, since the PDP fake here returns
+        // the same scope every call.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        svc.list_usage_records(&ctx(), meter_id(), range, &caller, &[])
+            .await
+            .expect("page one is a complete request");
+
+        let dispatched = spy
+            .last_list_query()
+            .expect("the plugin MUST have been dispatched");
+        assert_ne!(
+            toolkit_odata::short_filter_hash(dispatched.filter()),
+            toolkit_odata::short_filter_hash(caller.filter()),
+            "precondition: the PDP scope must actually have narrowed the \
+             composed $filter, or this test cannot tell the two apart",
+        );
+        assert_eq!(
+            dispatched.filter_hash,
+            Some(read_fingerprint(&caller, range)),
+            "the fingerprint the plugin mints MUST be the caller's filter \
+             and range, never the composed filter",
         );
     }
 }
