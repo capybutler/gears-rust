@@ -1840,10 +1840,10 @@ mod prepare_list_query_tests {
     #[test]
     fn the_edge_leaves_the_query_fingerprint_comparison_to_the_service() {
         // The extractor's `filter_hash` is a hash of `$filter` alone,
-        // while the fingerprint a continuation is bound to is the
-        // caller's `$filter` AND the read range — computed and compared
-        // behind the service, which is the only layer an in-process caller
-        // passes through too. An edge that kept comparing its own
+        // while the fingerprint a continuation is bound to also covers
+        // `gts_type_id`, the read range and `metadata_filter` — computed
+        // and compared behind the service, which is the only layer an
+        // in-process caller passes through too. An edge that kept comparing its own
         // narrower value would therefore reject every legitimate page
         // two, so it MUST pass `None` and keep only the signed-token
         // order check. Two fingerprints for one property is the defect,
@@ -2819,7 +2819,7 @@ mod handle_list_usage_records_tests {
         // to end.
         //
         // `f` carries the fingerprint the service binds a continuation to
-        // — the caller's `$filter` and the read range together — because a
+        // — the caller's `$filter` and all three typed parameters — because a
         // token bound to anything else is refused before the order is ever
         // reached. The order is still the subject; the fingerprint is the
         // precondition.
@@ -2959,8 +2959,8 @@ mod handle_list_usage_records_tests {
         // `$filter` present, which is what makes it the regression test
         // for the edge giving up its own comparison: the extractor's
         // `filter_hash` is a hash of `$filter` alone, so an edge still
-        // comparing it against the filter-plus-range fingerprint the
-        // plugin minted would reject exactly this request.
+        // comparing it against the wider fingerprint the plugin minted
+        // would reject exactly this request.
         //
         // Page one is dispatched for real and its fingerprint read off
         // what the plugin received, so nothing here restates a value the

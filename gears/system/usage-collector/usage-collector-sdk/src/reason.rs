@@ -40,11 +40,17 @@ pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUP
 /// one of the `cursor` field violations in `usage-collector-v1.yaml`.
 pub const INVALID_CURSOR: &str = "INVALID_CURSOR";
 /// A continuation token was minted over a different query than the request
-/// carrying it. The bound query is the caller's `$filter` **and** the read
-/// range together, since the range is a typed parameter rather than a
-/// `$filter` conjunct — so changing either `from` or `to` between pages
-/// surfaces here, exactly as changing `$filter` always did. Enumerated on
-/// the wire as one of the `cursor` field violations in
+/// carrying it.
+///
+/// The bound query is **every input that selects rows**: the caller's
+/// `$filter` and all three typed parameters — `gts_type_id`, the `from` /
+/// `to` range, and the `metadata.<key>` filters. None of the three is a
+/// `$filter` conjunct, so changing any one of them between pages surfaces
+/// here exactly as changing `$filter` always did. In particular, keeping
+/// `$filter` and the range fixed while changing the meter or a metadata
+/// value does **not** let a cursor carry over.
+///
+/// Enumerated on the wire as one of the `cursor` field violations in
 /// `usage-collector-v1.yaml`, and the code `toolkit_odata`'s own
 /// filter-hash comparison already emits.
 pub const FILTER_MISMATCH: &str = "FILTER_MISMATCH";

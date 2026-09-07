@@ -188,10 +188,11 @@ pub async fn handle_get_usage_record(
 ///   or a mismatched order surfaces as the canonical `cursor_decode` /
 ///   `order_mismatch` `Problem`. The decoded `CursorV1` flows to the
 ///   plugin via `ODataQuery.cursor` unchanged. Whether the token was
-///   minted over *this* query — the caller's `$filter` and the `from` /
-///   `to` range together — is checked behind the service, which is the
-///   only layer both surfaces pass through, and refused as
-///   `FILTER_MISMATCH` against `cursor`.
+///   minted over *this* query — the caller's `$filter` together with
+///   `gts_type_id`, the `from` / `to` range and every `metadata.<key>`
+///   filter — is checked behind the service, which is the only layer both
+///   surfaces pass through, and refused as `FILTER_MISMATCH` against
+///   `cursor`.
 /// * **`$orderby` admissibility and normalization** — a caller order is
 ///   refused here, naming `$orderby`, when it mixes sort directions or
 ///   names a key that is not a mandatory record attribute; an admissible
@@ -575,11 +576,12 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
         let effective_order = toolkit_odata::ODataOrderBy::from_signed_tokens(&cursor.s)
             .map_err(CanonicalError::from)?;
         // `None`, not `query.filter_hash`: the query a continuation is
-        // bound to is the caller's `$filter` AND the read range, and the
-        // service owns that fingerprint end to end (`read_fingerprint`).
-        // The extractor's `filter_hash` covers `$filter` alone, so an edge
-        // still comparing it against a cursor the plugin minted from the
-        // filter-plus-range value would reject every legitimate page two.
+        // bound to is the caller's `$filter` AND all three typed
+        // parameters, and the service owns that fingerprint end to end
+        // (`read_fingerprint`). The extractor's `filter_hash` covers
+        // `$filter` alone, so an edge still comparing it against a cursor
+        // the plugin minted from the wider value would reject every
+        // legitimate page two.
         // Two fingerprints for one property is the defect, not the
         // redundancy — and teaching the edge to recompute the same value
         // would not fix it either, because `filter_hash` is `None` for an

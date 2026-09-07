@@ -1175,7 +1175,12 @@ pub fn is_keyset_safe_record_field(name: &str) -> bool {
 ///
 /// Semantics across a `&[MetadataFilter]`:
 ///
-/// - AND across distinct filters (different keys).
+/// - AND across **every** filter in the slice, including two that name the
+///   same key: a storage plugin emits one AND-ed clause per entry, so
+///   `[k in {a}, k in {b}]` selects rows whose `k` is both — generally
+///   nothing — and is **not** equivalent to the single filter
+///   `k in {a, b}`. A consumer that merged same-key entries would widen
+///   the result set.
 /// - OR within a single filter's `values()`.
 /// - An empty slice imposes no metadata filter.
 ///

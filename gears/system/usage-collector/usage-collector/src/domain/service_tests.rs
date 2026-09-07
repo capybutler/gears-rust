@@ -4319,11 +4319,13 @@ mod read_path_keyset_floor_tests {
 ///
 /// `CursorV1::f` exists so a caller who changes their query between pages
 /// is refused rather than served a continuation minted over a different row
-/// set. While the mandatory window lived inside `$filter` the fingerprint
-/// covered it for free; it is a typed `TimeRange` parameter now, so it has
-/// to enter the fingerprint explicitly or page 2 of a January query happily
-/// continues from a cursor minted over February — and a wrong page is an
-/// `Ok`, so nothing else in the stack notices.
+/// set. Four inputs decide that row set: the caller's `$filter` and the
+/// three typed parameters `gts_type_id`, the read range and
+/// `metadata_filter`. None travels inside `$filter` any more, so each has
+/// to enter the fingerprint explicitly — or page 2 of a January query
+/// happily continues from a cursor minted over February, or against
+/// another meter, and a wrong page is an `Ok` nothing else in the stack
+/// notices.
 ///
 /// Asserted through the service rather than the handler on purpose:
 /// `ODataQuery::filter_hash` is `None` for an in-process caller and
@@ -4334,7 +4336,7 @@ mod read_path_cursor_fingerprint_tests {
     use std::sync::Arc;
 
     use toolkit_gts::gts_id;
-    use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, Page as ODataPage, SortDir};
+    use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page as ODataPage, SortDir};
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
         MetadataFilter, MeterTypeId, TimeRange, UsageCollectorError, UsageCollectorPluginV1,
@@ -4438,6 +4440,36 @@ mod read_path_cursor_fingerprint_tests {
     /// The order round-trips through `to_signed_tokens` /
     /// `from_signed_tokens` exactly as `prepare_list_query` step 3 does, so
     /// the cursor under test is decoded rather than assembled.
+    /// `query` again, carrying a continuation bound to `keys` verbatim —
+    /// no flooring, so the order can be made deliberately unsound.
+    ///
+    /// The order still round-trips through the signed tokens, exactly as
+    /// the handler rebuilds it, so what is under test is a decoded order
+    /// rather than one set alongside the token.
+    fn cursor_request_bound_to(query: &ODataQuery, keys: &[(&str, SortDir)]) -> ODataQuery {
+        let signed = ODataOrderBy(
+            keys.iter()
+                .map(|(field, dir)| OrderKey {
+                    field: (*field).to_owned(),
+                    dir: *dir,
+                })
+                .collect(),
+        )
+        .to_signed_tokens();
+
+        let mut out = query.clone();
+        out.order =
+            ODataOrderBy::from_signed_tokens(&signed).expect("a non-empty order round-trips");
+        out.cursor = Some(CursorV1 {
+            k: out.order.0.iter().map(|_| "boundary".to_owned()).collect(),
+            o: out.order.0[0].dir,
+            s: signed,
+            f: None,
+            d: "fwd".to_owned(),
+        });
+        out
+    }
+
     fn continuation_of(query: &ODataQuery, fingerprint: &str) -> ODataQuery {
         let mut floored = query.clone();
         crate::domain::query::establish_keyset_order(&mut floored)
@@ -4762,6 +4794,56 @@ mod read_path_cursor_fingerprint_tests {
             spy.last_list_order().is_some(),
             "the continuation MUST have reached the plugin",
         );
+    }
+
+    #[tokio::test]
+    async fn a_doubly_defective_cursor_is_refused_for_its_order_first() {
+        // The check order is a documented fact (`require_continuation_keyset`
+        // says structure is checked before relevance) and it is
+        // caller-visible: a token that is BOTH bound to an unsound keyset
+        // and minted over another query gets `INVALID_CURSOR` today and
+        // would get `FILTER_MISMATCH` if the two checks were swapped —
+        // different reason code on the wire, and a different
+        // `error_category` on `uc_query_requests_total` with it. Nothing
+        // else in the suite distinguishes the order, because every other
+        // cursor test is defective in exactly one way.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+
+        // Bound to a one-key order (not a keyset: it names neither
+        // canonical field) AND carrying a fingerprint from another range.
+        let stale = mint_fingerprint(
+            &meter_id(),
+            range_at(60 * 60 * 24 * 1_000_000_000),
+            &caller,
+            &[],
+            &[],
+        )
+        .await;
+        let mut doubly_defective =
+            cursor_request_bound_to(&caller, &[("resource_id", SortDir::Asc)]);
+        doubly_defective.cursor.as_mut().expect("cursor").f = Some(stale);
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(&ctx(), meter_id(), range, &doubly_defective, &[])
+            .await
+            .expect_err("a doubly-defective token must be refused");
+
+        match err {
+            UsageCollectorError::InvalidArgument { field, reason, .. } => {
+                assert_eq!(field, "cursor");
+                assert_eq!(
+                    reason,
+                    ValidationReason::InvalidCursor,
+                    "the ORDER defect must be reported: it is checked first, \
+                     and a swap would silently re-label this as FILTER_MISMATCH",
+                );
+            }
+            other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+        }
+        assert!(spy.last_list_order().is_none());
     }
 
     #[tokio::test]

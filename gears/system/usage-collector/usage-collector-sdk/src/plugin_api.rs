@@ -120,11 +120,20 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// than the boundary values the token carries, which is a silently
     /// wrong page rather than a refused one.
     ///
-    /// `query.filter_hash` is likewise guaranteed on this SPI: the gateway
-    /// always populates it, on every surface and on a first page as much as
-    /// a continuation, so a plugin never has to handle `None` and an absent
-    /// value is a gateway breach rather than a case to paper over — the
-    /// same posture as the `query.order` guarantee above.
+    /// `query.filter_hash` is likewise guaranteed **on this method**: the
+    /// gateway populates it for every `list_usage_records` dispatch —
+    /// REST, the in-process client, and a direct service call alike, and on
+    /// a first page as much as on a continuation — so an implementation of
+    /// this method never has to handle `None`, and an absent value is a
+    /// gateway breach rather than a case to paper over.
+    ///
+    /// The scope is deliberate and narrower than the `query.order`
+    /// guarantee's. [`Self::query_aggregated_usage_records`] paginates
+    /// nothing, so nothing there mints a cursor and the gateway assigns it
+    /// no fingerprint: that method receives whatever `filter_hash` the
+    /// caller's own surface supplied, which is `None` in process and a
+    /// hash of `$filter` alone over REST. An aggregate implementation MUST
+    /// NOT read the slot.
     ///
     /// A `next_cursor` MUST carry that value through verbatim as its `f`.
     /// It is the gateway's fingerprint of the query the page was read

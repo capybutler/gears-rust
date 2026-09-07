@@ -75,8 +75,8 @@ impl TimeRange {
     ///
     /// One spelling, because this value ends up inside an opaque pagination
     /// cursor. The gear's read path folds it into the fingerprint a keyset
-    /// continuation is bound to, and that
-    /// fingerprint is compared across a page boundary: the caller's next
+    /// continuation is bound to, and that fingerprint is compared across a
+    /// page boundary: the caller's next
     /// request recomputes the string and it has to come out identical, so a
     /// second spelling that ordered or padded the bounds differently would
     /// refuse every cursor minted under the first. Same "two spellings of

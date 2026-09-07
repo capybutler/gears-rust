@@ -110,8 +110,8 @@ pub(crate) fn compose_query_with_scope(
     // What the read path then dispatches is not that value: it overwrites
     // `filter_hash` with [`read_fingerprint`], which binds the caller's
     // `$filter` and every typed parameter that selects rows, and the
-    // plugin mints that into
-    // `next_cursor.f`. The rule here is the same rule stated one layer
+    // plugin mints that into `next_cursor.f`. The rule here is the same
+    // rule stated one layer
     // down — compute the bound value from the caller's query, never the
     // composed one — which is why the preservation still has to hold: a
     // re-hash here would be the composed filter leaking into the
@@ -382,13 +382,13 @@ pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), Usag
     Err(UsageCollectorError::inadmissible_cursor_keyset(defect))
 }
 
-/// The fingerprint a keyset continuation is bound to: every input that
-/// decides which rows the page came from.
+/// The fingerprint a keyset continuation is bound to: a 16-character digest
+/// of every input that decides which rows the page came from.
 ///
-/// That is the caller's `$filter` plus all three typed parameters —
-/// `gts_type_id`, the read range, and `metadata_filter`. None of the three
-/// is a `$filter` conjunct, so `toolkit_odata::short_filter_hash` sees none
-/// of them and each has to enter here explicitly.
+/// Those inputs are the caller's `$filter` plus all three typed parameters
+/// — `gts_type_id`, the read range, and `metadata_filter`. None of the
+/// three is a `$filter` conjunct, so `toolkit_odata::short_filter_hash`
+/// sees none of them and each has to enter here explicitly.
 ///
 /// `CursorV1::f` and [`ODataQuery::filter_hash`] exist so a caller who
 /// changes their query between pages is refused rather than served a
@@ -400,6 +400,35 @@ pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), Usag
 /// and be served a continuation that means nothing over its own row set —
 /// as a `200` nothing downstream can notice.
 ///
+/// # Why a digest and not the pre-image
+///
+/// The value is serialized into `CursorV1::f`, base64url-encoded into the
+/// opaque `cursor` token, and sent back as a **URL query parameter**. So
+/// its length is a wire constraint, and returning the pre-image made the
+/// cursor grow with the caller's own metadata filter: `MAX_METADATA_FILTERS`
+/// and `MAX_METADATA_FILTER_VALUES` cap how *many* keys and values a caller
+/// may send, not how long they are, so a request well inside both caps —
+/// five keys of twenty UUID values, say — yields a multi-kilobyte cursor
+/// and a page-2 URL that a proxy refuses with a `414` the caller cannot act
+/// on. Page one succeeds, page two does not, and nothing in the gear is
+/// involved in the failure. Hashing makes the value's length a constant of
+/// this function instead of a function of the caller's input.
+///
+/// Correctness is unaffected either way, which is exactly why the size
+/// argument has to be made on its own: a digest compares equal precisely
+/// when the pre-image does, up to collision, and
+/// [`read_fingerprint_pre_image`] is what rules the collisions out.
+///
+/// [`toolkit_odata::fnv1a_64`] rather than a local hash: it is the same
+/// algorithm and the same 16-hex rendering `short_filter_hash` already
+/// produces for the `$filter` field nested inside the pre-image, so there
+/// is one hashing primitive in this value rather than two that could
+/// drift. FNV-1a is a fixed public specification, so the digest is stable
+/// across builds, platforms and replicas — the property a value compared
+/// on a *later* request cannot do without.
+///
+/// # Ownership
+///
 /// Computed from the **caller's** query, never the composed one. The PDP
 /// scope is AND-merged into `$filter` by [`compose_query_with_scope`] and
 /// is server-injected rather than caller-controlled, so hashing the
@@ -408,17 +437,48 @@ pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), Usag
 /// preserves the caller's `filter_hash` rather than re-hashing it, and just
 /// as silent until a PDP scope actually appears.
 ///
-/// The value round-trips across a page boundary on every surface: the read
-/// path computes it here from the caller's query, then assigns it onto the
-/// composed query it dispatches — replacing the caller's own `filter_hash`
-/// that [`compose_query_with_scope`] preserved — a conforming plugin mints
-/// it into `next_cursor.f`, and the follow-up request recomputes the same
+/// The value round-trips across a page boundary: the read path computes it
+/// here from the caller's query, then assigns it onto the composed query it
+/// dispatches — replacing the caller's own `filter_hash` that
+/// [`compose_query_with_scope`] preserved — a conforming plugin mints it
+/// into `next_cursor.f`, and the follow-up request recomputes the same
 /// string from its own parameters.
+pub(crate) fn read_fingerprint(
+    gts_type_id: &MeterTypeId,
+    time_range: TimeRange,
+    user_query: &ODataQuery,
+    metadata_filter: &[MetadataFilter],
+) -> String {
+    let pre_image =
+        read_fingerprint_pre_image(gts_type_id, time_range, user_query, metadata_filter);
+    format!("{:016x}", toolkit_odata::fnv1a_64(pre_image.as_bytes()))
+}
+
+/// The exact bytes [`read_fingerprint`] digests.
 ///
-/// The range contributes [`TimeRange::canonical_form`] rather than a second
-/// hash: the whole fingerprint is opaque to callers, so a second hashing
-/// primitive would buy nothing and add one more thing that can disagree
-/// with itself.
+/// Split out from the digest so a change to the rendering is diagnosable:
+/// a golden test pins this string, and a second pins the digest over it, so
+/// an edit that moves the fingerprint says *which layer* moved instead of
+/// only "the hash changed".
+///
+/// Every field is length-prefixed as `<len>:<bytes>`, making the
+/// concatenation self-delimiting — a netstring. That is load-bearing, and
+/// **more** so under hashing rather than less: a collision here is a
+/// collision in the digest, and nothing downstream could tell the two
+/// queries apart. None of the fields is separator-free, so no single
+/// separator would do. A GTS type reference carries `~` as its own
+/// terminator, [`TimeRange::canonical_form`] joins its two bounds with `~`,
+/// and a metadata key or value is domain-opaque — `MetadataKey::new`
+/// rejects only the empty string and NUL, so a key may contain any other
+/// byte and a value is unconstrained. Whatever character were chosen, one
+/// field's content could imitate a field boundary and two different
+/// queries would render alike, so a cursor minted under one would validate
+/// against the other. A decimal length makes injectivity hold for
+/// arbitrary content instead of resting on a claim about what callers send.
+///
+/// The two count fields are part of that, not decoration: without the
+/// per-entry value count, `[a → {b}, c → {d}]` and `[a → {b, c, d}]`
+/// render identically.
 ///
 /// `metadata_filter` is **normalized** before it is rendered, because the
 /// fingerprint has to be a function of the query's meaning and not of how
@@ -427,12 +487,14 @@ pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), Usag
 /// query-string order, duplicates included (`parse_metadata_filters` groups
 /// through a `BTreeMap`, so it sorts keys but pushes values as they
 /// arrive), and an in-process caller can build the slice in any order at
-/// all. Since the semantics are OR within a key and AND across keys, two
-/// spellings that differ only in order or in a repeated value are the same
-/// query — so values are sorted and deduplicated, and entries sorted by
-/// key. Two entries on the *same* key are deliberately left as two: `k in
-/// {a} AND k in {b}` is not `k in {a, b}`.
-pub(crate) fn read_fingerprint(
+/// all. Since the semantics are OR within a key and AND across every
+/// filter, two spellings that differ only in order or in a repeated value
+/// are the same query — so values are sorted and deduplicated, entries
+/// sorted by key, and wholly identical entries collapsed (`X AND X` is
+/// `X`). Two entries on the same key with *different* value sets are
+/// deliberately left as two: the storage plugin emits one AND-ed clause per
+/// entry, so `k in {a} AND k in {b}` is not `k in {a, b}`.
+fn read_fingerprint_pre_image(
     gts_type_id: &MeterTypeId,
     time_range: TimeRange,
     user_query: &ODataQuery,
@@ -441,7 +503,7 @@ pub(crate) fn read_fingerprint(
     // `short_filter_hash` returns `None` for an absent filter, and an
     // absent filter is a legitimate complete request — so it folds in as
     // the empty string rather than short-circuiting the rest out of the
-    // fingerprint.
+    // pre-image.
     let filter = toolkit_odata::short_filter_hash(user_query.filter()).unwrap_or_default();
 
     let mut entries: Vec<(&str, Vec<&str>)> = metadata_filter
@@ -454,6 +516,10 @@ pub(crate) fn read_fingerprint(
         })
         .collect();
     entries.sort_unstable();
+    // Only wholly identical entries collapse, which is why this runs after
+    // the value normalization above: `X AND X` is `X`, while two entries on
+    // one key with different value sets mean something a merge would lose.
+    entries.dedup();
 
     let mut out = String::new();
     push_fingerprint_field(&mut out, gts_type_id.as_str());
@@ -470,20 +536,9 @@ pub(crate) fn read_fingerprint(
     out
 }
 
-/// Append one length-prefixed `<len>:<bytes>` field to a fingerprint.
-///
-/// Length-prefixed rather than separator-joined because none of the fields
-/// is separator-free. A GTS type reference carries `~` as its own
-/// terminator, [`TimeRange::canonical_form`] already joins its two bounds
-/// with `~`, and a metadata key or value is domain-opaque —
-/// `MetadataKey::new` rejects only the empty string and NUL, so a key may
-/// contain any other byte, and a value is unconstrained. Whatever single
-/// character were chosen, one field's content could imitate a field
-/// boundary and two different queries would fingerprint identically: a
-/// cursor minted under one would then validate against the other, which is
-/// the failure the fingerprint exists to prevent. A decimal length makes
-/// the concatenation self-delimiting, so injectivity holds for arbitrary
-/// content instead of resting on a claim about what callers send.
+/// Append one length-prefixed `<len>:<bytes>` field to a fingerprint
+/// pre-image. See [`read_fingerprint_pre_image`] for why the length is
+/// there.
 fn push_fingerprint_field(out: &mut String, field: &str) {
     out.push_str(&field.len().to_string());
     out.push(':');
@@ -498,8 +553,10 @@ fn push_fingerprint_field(out: &mut String, field: &str) {
 /// whenever either side is `None`, which is exactly the hole this exists to
 /// close: the cursor is caller-supplied JSON, so "no fingerprint recorded"
 /// is not evidence of a matching query, and a conforming plugin always has
-/// one to mint — the read path assigns [`read_fingerprint`] onto every
-/// query it dispatches, first page included.
+/// one to mint — the raw read path assigns [`read_fingerprint`] onto every
+/// `list_usage_records` dispatch, first page included. (Only that path:
+/// the aggregate path paginates nothing, so it mints no cursor and needs
+/// no fingerprint.)
 ///
 /// Separate from [`require_continuation_keyset`] because the two answer
 /// different questions about the same token and are actionable differently:

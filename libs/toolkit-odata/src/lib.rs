@@ -13,7 +13,7 @@ pub mod schema;
 pub use builder::QueryBuilder;
 pub use limits::ODataLimits;
 pub use page::{Page, PageInfo};
-pub use pagination::{normalize_filter_for_hash, short_filter_hash};
+pub use pagination::{fnv1a_64, normalize_filter_for_hash, short_filter_hash};
 pub use schema::{FieldRef, Schema};
 
 pub mod ast {

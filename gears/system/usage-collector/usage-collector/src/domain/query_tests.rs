@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 use super::{
     CANONICAL_KEYSET_FIELDS, compose_query_with_scope, establish_keyset_order, read_fingerprint,
-    reject_reserved_filter_fields, require_continuation_keyset, require_cursor_fingerprint,
-    require_dimensions_declared, require_metadata_filter_keys_declared,
+    read_fingerprint_pre_image, reject_reserved_filter_fields, require_continuation_keyset,
+    require_cursor_fingerprint, require_dimensions_declared, require_metadata_filter_keys_declared,
 };
 
 /// Build an [`ODataQuery`] whose `$filter` is the parsed `filter` string.
@@ -354,6 +354,9 @@ fn metadata_filter(key: &str) -> MetadataFilter {
 
 /// A [`MetadataFilter`] on `key` over an explicit value set, for the
 /// fingerprint tests, where the values are the subject.
+///
+/// (Placed here beside its sibling; the fingerprint tests are further
+/// down.)
 fn filter_on(key: &str, values: &[&str]) -> MetadataFilter {
     MetadataFilter::new(key, values.iter().copied()).expect("valid metadata filter")
 }
@@ -962,11 +965,14 @@ fn a_mixed_direction_continuation_is_refused_as_a_cursor_defect() {
 //
 // `CursorV1::f` exists so a caller who changes their query between pages is
 // refused rather than served a continuation minted over a different row set.
-// While the mandatory window lived inside `$filter`, `short_filter_hash`
-// covered it for free; it is a typed parameter now, so both halves have to be
-// pinned here — the range being present is the point of the change, and the
-// filter still being present is what says the range did not quietly replace
-// the property it was added to.
+// Four inputs decide that row set — the caller's `$filter` and the three
+// typed parameters `gts_type_id`, the read range and `metadata_filter` — and
+// each is pinned separately below, because none of them travels inside
+// `$filter` where `short_filter_hash` would reach it. The `$filter` case is
+// pinned too, which is what says the typed parameters did not quietly
+// replace the property they were added to. Then the shape of the value
+// itself: its exact pre-image bytes, its digest, and the length that keeps
+// it out of the URL-length failure returning the pre-image caused.
 // ---------------------------------------------------------------------------
 
 /// [`read_fingerprint`] over a fixed meter and no metadata filter, for the
@@ -999,24 +1005,31 @@ fn the_fingerprint_covers_both_the_filter_and_the_range() {
         fingerprint(&plain, range_a),
         "the filter must move the fingerprint",
     );
-    assert_eq!(
-        fingerprint(&filtered, range_a),
-        fingerprint(&filtered, range_a),
-        "and it must be stable, or no cursor would ever validate",
-    );
+    // Stability is NOT asserted by calling the function twice: it is pure,
+    // so `f(x) == f(x)` holds under every mutation and cannot fail. The
+    // hazard it was reaching for is stability across *processes* — the
+    // value is minted on one request and recomputed on the next, possibly
+    // by another replica running another build — which two calls in one
+    // process cannot observe at all. `the_fingerprint_pins_its_exact_bytes`
+    // below is what actually pins it, by comparing against a literal.
 }
 
 #[test]
-fn the_fingerprint_of_a_filterless_query_still_carries_the_range() {
+fn the_pre_image_of_a_filterless_query_still_carries_the_range() {
     // `short_filter_hash` returns `None` for an absent filter, and an
     // absent filter is a legitimate complete request (the PDP scope alone
     // narrows it). A rendering that short-circuited on the `None` would
     // drop the range for exactly the callers who send no `$filter`.
+    //
+    // Asserted on the pre-image, not the fingerprint: the fingerprint is a
+    // digest now, so it contains no field verbatim and a `contains` check
+    // over it could only ever pass by accident.
     let plain = ODataQuery::default();
+    let range = hour_from(1_700_000_000);
     assert!(
-        fingerprint(&plain, hour_from(1_700_000_000))
-            .contains(&hour_from(1_700_000_000).canonical_form()),
-        "a filterless query's fingerprint must still carry the range",
+        read_fingerprint_pre_image(&meter_id(), range, &plain, &[])
+            .contains(&range.canonical_form()),
+        "a filterless query's pre-image must still carry the range",
     );
 }
 
@@ -1258,4 +1271,129 @@ fn the_fingerprint_is_injective_across_field_boundaries() {
             "{left:?} and {right:?} are different queries",
         );
     }
+}
+
+#[test]
+fn the_fingerprint_pre_image_pins_its_exact_bytes() {
+    // The golden test, and the one that makes a fingerprint change
+    // diagnosable. It pins the pre-image rather than only the digest so an
+    // edit says WHICH layer moved: a rendering change fails here, a hashing
+    // change fails the digest test below, and a change to what is bound
+    // fails both.
+    //
+    // The literal is derived from the rule, not captured from a run: field
+    // order is meter, filter hash, range, entry count, then per entry the
+    // key, its value count and its sorted values, each as `<len>:<bytes>`.
+    // Two keys and three values, so both count fields carry a value other
+    // than the entry count and a dropped count is visible.
+    //
+    // Cross-process stability comes free with a literal: nothing about this
+    // string depends on a process-local seed, a HashMap iteration order, or
+    // a `std::hash::Hasher` implementation that may differ between builds.
+    // A value compared on a LATER request, possibly by another replica,
+    // cannot depend on any of those, and only a literal can catch it if it
+    // starts to.
+    let range = hour_from(1_700_000_000);
+    let metadata = [
+        filter_on("region", &["eu", "us"]),
+        filter_on("tier", &["gold"]),
+    ];
+
+    assert_eq!(
+        read_fingerprint_pre_image(&meter_id(), range, &ODataQuery::default(), &metadata),
+        // meter (65 bytes, `gts.`-prefixed — that prefix is part of the
+        // wire form `MeterTypeId::as_str` returns, and pinning the literal
+        // is how this test caught it) | filter hash (absent -> empty)
+        // | range | 2 entries | region: 2 values eu, us | tier: 1 value gold
+        "65:gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~\
+         0:\
+         39:1700000000000000000~1700003600000000000\
+         1:2\
+         6:region1:22:eu2:us\
+         4:tier1:14:gold",
+    );
+}
+
+#[test]
+fn the_fingerprint_is_a_sixteen_character_digest_of_that_pre_image() {
+    // What reaches the wire. The digest exists because the value is
+    // base64url-encoded into the `cursor` URL query parameter, so its
+    // length is a wire constraint: the pre-image grows with the caller's
+    // own metadata filter (the caps bound how many keys and values a
+    // caller may send, not how long they are), and a request well inside
+    // those caps would otherwise produce a multi-kilobyte cursor and a
+    // page-2 URL a proxy refuses with a `414`. A fixed 16 characters
+    // regardless of input is the property under test.
+    let range = hour_from(1_700_000_000);
+    let metadata = [
+        filter_on("region", &["eu", "us"]),
+        filter_on("tier", &["gold"]),
+    ];
+    let fp = read_fingerprint(&meter_id(), range, &ODataQuery::default(), &metadata);
+
+    // FNV-1a 64 over the pinned pre-image above, rendered as 16 hex
+    // digits — the same algorithm and rendering `short_filter_hash`
+    // produces for the `$filter` field nested inside it, so this value
+    // carries one hashing primitive rather than two that could drift.
+    assert_eq!(fp, "2410fb35dc8a65c1");
+    assert_eq!(fp.len(), 16, "the wire length must not depend on the input");
+}
+
+#[test]
+fn the_fingerprint_length_does_not_grow_with_the_metadata_filter() {
+    // The regression this exists for, stated as the caller sees it. The
+    // fingerprint is base64url-encoded into the `cursor` URL query
+    // parameter, so returning the pre-image made the cursor grow with the
+    // caller's own metadata filter — and the edge caps bound how MANY keys
+    // and values a caller may send, not how long they are. A request the
+    // gear accepted on page one then produced a page-2 URL a proxy refused
+    // with a `414`, which is not a failure the caller can act on.
+    //
+    // Deliberately not written against `MAX_METADATA_FILTERS` /
+    // `MAX_METADATA_FILTER_VALUES`: those are REST-edge constants and this
+    // is a domain test, and the property is size-independent anyway, so
+    // asserting it far beyond anything the edge admits is both stronger
+    // and free of a coupling that could drift.
+    let range = hour_from(1_700_000_000);
+    let bare = read_fingerprint(&meter_id(), range, &ODataQuery::default(), &[]);
+
+    let long_values: Vec<String> = (0..64)
+        .map(|i| format!("11111111-1111-1111-1111-{i:012}"))
+        .collect();
+    let wide: Vec<MetadataFilter> = (0..32)
+        .map(|i| {
+            MetadataFilter::new(format!("key_{i}"), long_values.iter().cloned())
+                .expect("valid metadata filter")
+        })
+        .collect();
+    let huge = read_fingerprint(&meter_id(), range, &ODataQuery::default(), &wide);
+
+    assert_eq!(
+        huge.len(),
+        bare.len(),
+        "a wide metadata filter must fingerprint to the same length as no \
+         metadata filter at all, or the cursor grows with caller input",
+    );
+    assert_ne!(
+        huge, bare,
+        "identical length must not mean the metadata filter stopped counting",
+    );
+}
+
+#[test]
+fn two_identical_metadata_entries_fingerprint_as_one() {
+    // `X AND X` is `X`, so this is the same query and must not be refused.
+    // REST cannot produce it — `parse_metadata_filters` groups through a
+    // `BTreeMap`, so a repeated key arrives as one entry — but an
+    // in-process caller assembles the slice itself. Only WHOLLY identical
+    // entries collapse; the same-key-different-values case is the test
+    // above this one.
+    let range = hour_from(1_700_000_000);
+    let once = [filter_on("region", &["eu"])];
+    let twice = [filter_on("region", &["eu"]), filter_on("region", &["eu"])];
+
+    assert_eq!(
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), &once),
+        read_fingerprint(&meter_id(), range, &ODataQuery::default(), &twice),
+    );
 }

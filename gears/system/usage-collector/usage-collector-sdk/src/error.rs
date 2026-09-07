@@ -533,9 +533,9 @@ impl UsageCollectorError {
             reason: ValidationReason::FilterMismatch,
             detail: "the cursor was minted over a different query: continue a page by \
                      resending the same request, cursor apart, or restart pagination \
-                     without a cursor. The cursor binds gts_type_id, the from / to \
-                     range, $filter and every metadata.<key> filter, so changing any \
-                     of them invalidates it"
+                     without a cursor. The cursor binds `gts_type_id`, the `from` / \
+                     `to` range, `$filter` and every `metadata.<key>` filter, so \
+                     changing any of them invalidates it"
                 .to_owned(),
         }
     }
