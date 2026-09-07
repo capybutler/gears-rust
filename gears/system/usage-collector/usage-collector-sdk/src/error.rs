@@ -261,7 +261,8 @@ impl UsageCollectorError {
 
     /// A read-path time range was empty or inverted (`to <= from`).
     ///
-    /// [`crate::TimeRange`] is mandatory on every read path and selects an
+    /// [`crate::TimeRange`] is mandatory on both range-taking read paths
+    /// (the point lookup selects by `id` and takes none) and selects an
     /// entry when `from <= window_end < to`
     /// (`cpt-cf-usage-collector-adr-window-end-selection`), so a range that
     /// is not strictly ordered selects nothing whatever is stored.

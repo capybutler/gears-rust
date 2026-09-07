@@ -44,7 +44,7 @@ use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, SortDir, ast};
 use toolkit_security::AccessScope;
 use usage_collector_sdk::{
     AggregationDimension, MetadataFilter, MeterTypeId, RECORD_ID_FIELD, TimeRange,
-    UsageCollectorError, WINDOW_END_FIELD, is_keyset_safe_record_field,
+    UsageCollectorError, WINDOW_END_FIELD, WINDOW_START_FIELD, is_keyset_safe_record_field,
 };
 
 use crate::domain::authz;
@@ -135,7 +135,17 @@ pub(crate) fn compose_query_with_scope(
 /// and `window_end` has to resolve to a column for the canonical keyset to
 /// mean anything. This guard, not their absence from the schema, is the
 /// whole reason a `$filter` cannot reach them.
-const RESERVED_FILTER_FIELDS: &[&str] = &["gts_type_id", "window_start", "window_end"];
+const RESERVED_FILTER_FIELDS: &[&str] = &[
+    // `gts_type_id` has no SDK constant: it is not a filterable-schema
+    // field at all, so there is nothing to point at.
+    "gts_type_id",
+    // The bounds come from the SDK constants rather than being respelled.
+    // This is the one host-side list where a typo silently un-reserves a
+    // field — the guard would simply stop matching — and it is exactly the
+    // drift the constants were introduced to prevent.
+    WINDOW_START_FIELD,
+    WINDOW_END_FIELD,
+];
 
 /// `true` when `name` names a [`RESERVED_FILTER_FIELDS`] entry, ignoring
 /// ASCII case.
@@ -313,12 +323,110 @@ pub(crate) fn establish_keyset_order(query: &mut ODataQuery) -> Result<(), Usage
     Ok(())
 }
 
+/// Admits a continuation, or refuses it: the three rules a cursor request
+/// must satisfy before its query reaches a plugin.
+///
+/// One call site, three rules, because they all constrain the same
+/// artifact and a caller cannot satisfy some of them:
+///
+/// 1. [`bind_continuation_order`] replaces the order with the one the
+///    token was minted under, so the sort the plugin performs and the
+///    boundary values it compares against come from the same place.
+/// 2. [`require_continuation_keyset`] refuses that order if it is not a
+///    sound keyset — checking it, never extending it.
+/// 3. [`require_cursor_fingerprint`] refuses a token minted over a
+///    different query.
+///
+/// They stay separate functions, each with its own reason code and its own
+/// tests, because they are actionable differently: 2 says the token is
+/// structurally unusable (`INVALID_CURSOR`), 3 says it belongs to another
+/// query (`FILTER_MISMATCH`). Structure before relevance, and binding
+/// before both — a rule about the order cannot be applied to an order that
+/// has not been established yet.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorError::InvalidArgument`] against `cursor` from
+/// whichever rule refuses first.
+pub(crate) fn admit_continuation(
+    query: &mut ODataQuery,
+    fingerprint: &str,
+) -> Result<(), UsageCollectorError> {
+    bind_continuation_order(query)?;
+    require_continuation_keyset(query)?;
+    let cursor = query
+        .cursor
+        .as_ref()
+        .ok_or_else(|| UsageCollectorError::inadmissible_cursor_keyset("it carries no cursor"))?;
+    require_cursor_fingerprint(cursor, fingerprint)
+}
+
+/// Replaces `query.order` with the order the continuation token was minted
+/// under, decoded from its own signed tokens.
+///
+/// The plugin reads `query.order` to build **both** the `ORDER BY` and the
+/// keyset continuation predicate, and compares that predicate against the
+/// boundary values in `CursorV1::k` — which are one per key **of the order
+/// the token was minted under**. So the two have to be the same order, and
+/// the token is the only one of the two that cannot have been tampered
+/// with independently: `k` and `s` travel together.
+///
+/// A caller-supplied order on a cursor request is therefore not an input,
+/// it is a contradiction, and it is overwritten rather than compared.
+/// Overwriting is also what makes this safe to state as a guarantee: an
+/// order that merely *agreed* would still leave the caller's spelling in
+/// the slot, and nothing downstream re-derives it.
+///
+/// This is the half of [`toolkit_odata::validate_cursor_against`] that
+/// concerns the order, and it lives here for the same reason the
+/// fingerprint does: the REST extractor leaves `query.order` empty on a
+/// cursor request, so the handler's own derivation happens to be
+/// equivalent — but an **in-process** caller sets `order` and `cursor`
+/// independently, and an edge-only derivation left that caller able to hand
+/// the plugin `(id, window_end)` against boundary values ordered
+/// `(window_end, id)`. Both are sound keysets naming both canonical
+/// fields, so no structural check catches it, and the result is a
+/// misaligned continuation served as a `200`.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorError::InvalidArgument`] against `cursor`, with
+/// `INVALID_CURSOR`, when the token's signed-token payload does not decode
+/// into a non-empty order. That is a malformed token — the same class as a
+/// truncated or forged one — so it is refused in the cursor's own
+/// vocabulary rather than surfacing as an `$orderby` complaint about a
+/// parameter the caller cannot send alongside a cursor.
+fn bind_continuation_order(query: &mut ODataQuery) -> Result<(), UsageCollectorError> {
+    let Some(cursor) = query.cursor.as_ref() else {
+        return Ok(());
+    };
+    match ODataOrderBy::from_signed_tokens(&cursor.s) {
+        Ok(order) => {
+            query.order = order;
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                signed_tokens = %cursor.s,
+                "usage-collector refused a continuation token whose signed keys do not decode"
+            );
+            Err(UsageCollectorError::inadmissible_cursor_keyset(format!(
+                "its signed keys do not decode into an order ({err})"
+            )))
+        }
+    }
+}
+
 /// Requires the order of a **continuation** to be a sound keyset already,
 /// rather than making it one.
 ///
 /// A cursor request's order does not come from the caller: it has been
-/// reconstructed from the token's own signed keys, and the token's boundary
-/// values (`CursorV1::k`) line up with it one for one. There is nothing
+/// reconstructed from the token's own signed keys by
+/// [`bind_continuation_order`], which runs immediately before this and is
+/// what makes that sentence true on every surface rather than only over
+/// REST. The token's boundary values (`CursorV1::k`) line up with it one
+/// for one. There is nothing
 /// left to normalize — the order either already is the keyset the page was
 /// minted under, or the token did not come from a conforming plugin.
 /// Appending to it would widen the sort tuple past the boundary values the
@@ -371,6 +479,12 @@ pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), Usag
     // a forged or replayed token reaches here too, and that is ordinary
     // hostile input. Same shape as `service::invariant_breach` — log the
     // detail, then return the typed error.
+    //
+    // The defect and the `signed_tokens` beside it describe the same
+    // thing, because `bind_continuation_order` derived the order under
+    // inspection from exactly those tokens. Before it did, an in-process
+    // caller could produce a log line showing a healthy token next to a
+    // defect that came from the caller's own contradictory `order`.
     tracing::warn!(
         defect = %defect,
         signed_tokens = %query
@@ -574,10 +688,36 @@ pub(crate) fn require_cursor_fingerprint(
     cursor: &CursorV1,
     fingerprint: &str,
 ) -> Result<(), UsageCollectorError> {
-    if cursor.f.as_deref() == Some(fingerprint) {
-        return Ok(());
+    match cursor.f.as_deref() {
+        Some(bound) if bound == fingerprint => Ok(()),
+        // Absent, not merely different. A conforming plugin always has a
+        // value to mint — the read path assigns one onto every dispatch —
+        // so `None` is the shape a plugin that never learned about the
+        // field emits, and calling that "you changed your query" would
+        // misdiagnose a conformance breach as caller error. It still
+        // refuses: the cursor is caller-supplied JSON, so an absent
+        // fingerprint is not evidence of a matching query.
+        //
+        // Logged for the same reason `require_continuation_keyset` logs.
+        // The `next_cursor.f` obligation is the one requirement in this
+        // gear's Plugin SPI that gives an implementor no compiler error —
+        // a plugin written before it recompiles clean and paginates
+        // exactly once — so a mismatch that left no operator-side trace
+        // would surface only as a `400` blamed on the caller.
+        bound => {
+            tracing::warn!(
+                bound_fingerprint = bound.unwrap_or("<none>"),
+                expected_fingerprint = %fingerprint,
+                likely_cause = if bound.is_none() {
+                    "plugin did not carry query.filter_hash into next_cursor.f"
+                } else {
+                    "caller changed the query, or plugin recomputed the fingerprint"
+                },
+                "usage-collector refused a continuation token bound to another query"
+            );
+            Err(UsageCollectorError::cursor_query_mismatch())
+        }
     }
-    Err(UsageCollectorError::cursor_query_mismatch())
 }
 
 /// Checks every `group_by` dimension is either a fixed field (no

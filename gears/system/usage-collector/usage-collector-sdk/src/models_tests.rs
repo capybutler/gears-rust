@@ -6,6 +6,7 @@ use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
 use serde_json::json;
 use toolkit_gts::gts_id;
+use toolkit_odata::filter::FilterField as _;
 use uuid::Uuid;
 
 use std::collections::BTreeMap;
@@ -1100,24 +1101,32 @@ fn the_keyset_safe_allowlist_is_exactly_the_mandatory_record_attributes() {
 }
 
 #[test]
-fn keyset_safe_record_fields_are_exactly_the_mandatory_columns() {
-    // The mandatory (never-null) record attributes are sound leading keys for
-    // the plugin's row-value tuple keyset comparison. Both covered-period
-    // bounds are mandatory on every entry, so both qualify — `window_end`
-    // is the one the canonical keyset actually leads on, because it is the
-    // bound the read range selects on.
-    for field in [
-        "id",
-        "window_start",
-        "window_end",
-        "tenant_id",
-        "resource_id",
-        "resource_type",
-        "status",
-    ] {
+fn every_admissible_order_key_resolves_to_a_column() {
+    // Being on the allowlist is necessary but not sufficient: the plugin
+    // resolves an order key through `UsageRecordFilterField`, so a name
+    // admissible here but absent from the filterable schema is an
+    // unmappable order key the gateway happily forwards.
+    //
+    // Two independently maintained spellings of one vocabulary, and this is
+    // the only thing checking they agree. The allowlist's own criterion —
+    // "a domain-optionality fact, not a storage-column fact" — is exactly
+    // what a *derived* attribute satisfies while having no column at all,
+    // so an addition can pass every other test in the repo and fail only
+    // at the plugin.
+    //
+    // This replaces a test that re-asserted the same seven literals the
+    // anchor above pins, through a predicate that reads that very
+    // constant: it could not fail unless the anchor failed first.
+    for field in crate::models::KEYSET_SAFE_RECORD_FIELDS {
         assert!(
             is_keyset_safe_record_field(field),
-            "`{field}` is a mandatory attribute and must be keyset-safe",
+            "`{field}` is on the allowlist, so the predicate reading it must agree",
+        );
+        assert!(
+            crate::models::UsageRecordFilterField::from_name(field).is_some(),
+            "`{field}` is admissible as an order key but has no \
+             field-to-column mapping on the filterable schema, so a plugin \
+             cannot resolve it",
         );
     }
 }

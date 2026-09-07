@@ -54,6 +54,18 @@ const FIELD_SEPARATOR: u8 = 0x1F;
 /// bound would make a read-back entry derive an identifier different from
 /// the one it carries.
 ///
+/// That obligation is stated rather than enforceable: the precision check
+/// is private to the projection named above, so an **external** caller of
+/// this function has no exported way to honour it and gets silent
+/// truncation. Deliberately left that way rather than narrowed, because
+/// `cpt-cf-usage-collector-adr-record-identity-derivation` requires an
+/// independent implementation to be able to reproduce the pre-image, and
+/// that needs this rendering exported. The gap is inherited from
+/// `created_at_micros`'s visibility, not introduced with the covered
+/// period — and a caller reproducing an identifier is checking a value
+/// that already exists, so truncation there yields a mismatch they can
+/// see rather than a corrupt row.
+///
 /// The 27-character width holds for a year in `0..=9999`. Every bound that
 /// arrives over REST is RFC 3339-parsed, and no RFC 3339 timestamp can
 /// express a year outside that range, so on the wire path the width is

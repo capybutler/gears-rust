@@ -4340,8 +4340,8 @@ mod read_path_cursor_fingerprint_tests {
     use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page as ODataPage, SortDir};
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
-        MetadataFilter, MeterTypeId, TimeRange, UsageCollectorError, UsageCollectorPluginV1,
-        ValidationReason,
+        MetadataFilter, MeterTypeId, RECORD_ID_FIELD, TimeRange, UsageCollectorError,
+        UsageCollectorPluginV1, ValidationReason, WINDOW_END_FIELD,
     };
 
     use crate::domain::Service;
@@ -4794,6 +4794,153 @@ mod read_path_cursor_fingerprint_tests {
         assert!(
             spy.last_list_order().is_some(),
             "the continuation MUST have reached the plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_process_order_diverging_from_its_token_never_reaches_the_plugin() {
+        // The other half of `validate_cursor_against`, and the half that
+        // never moved: the order the plugin sorts by must be the order the
+        // token's boundary values were minted under. The token here says
+        // `(window_end, id)` while the caller's `query.order` says
+        // `(id, window_end)` — both are sound keysets naming both canonical
+        // fields, so `require_continuation_keyset` passes them, and the
+        // fingerprint matches because neither the meter, the range, the
+        // filter nor the metadata changed.
+        //
+        // Left uncaught, the plugin builds its row-value tuple predicate
+        // over `(id, window_end)` and compares it against boundary values
+        // ordered `(window_end, id)`: a misaligned continuation served as
+        // an `Ok`, which is exactly the failure the fingerprint was moved
+        // behind the service to prevent. No REST test can reach it — the
+        // handler overwrites `query.order` from the token — so the in-process
+        // caller is the only one who can express the divergence.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+        let fingerprint = mint_fingerprint(&meter_id(), range, &caller, &[], &[]).await;
+
+        // Three ways a caller order can disagree with its token, all of
+        // them individually admissible so no structural check sees them:
+        // permuted, narrower, and wider-with-a-different-lead.
+        for caller_order in [
+            vec![
+                (RECORD_ID_FIELD, SortDir::Asc),
+                (WINDOW_END_FIELD, SortDir::Asc),
+            ],
+            vec![(WINDOW_END_FIELD, SortDir::Asc)],
+            vec![
+                ("resource_id", SortDir::Asc),
+                (WINDOW_END_FIELD, SortDir::Asc),
+                (RECORD_ID_FIELD, SortDir::Asc),
+            ],
+        ] {
+            // A conforming token, then the caller's contradictory order
+            // laid over it.
+            let mut divergent = continuation_of(&caller, &fingerprint);
+            divergent.order = ODataOrderBy(
+                caller_order
+                    .iter()
+                    .map(|(field, dir)| OrderKey {
+                        field: (*field).to_owned(),
+                        dir: *dir,
+                    })
+                    .collect(),
+            );
+
+            let (svc, spy) = svc_and_spy();
+            spy.set_list_usage_records_response(ODataPage::empty(0));
+            svc.list_usage_records(&ctx(), meter_id(), range, &divergent, &[])
+                .await
+                .expect("the token itself is conforming, so this must be served");
+
+            assert_eq!(
+                spy.last_list_order()
+                    .expect("the plugin MUST have been dispatched"),
+                vec![
+                    (WINDOW_END_FIELD.to_owned(), SortDir::Asc),
+                    (RECORD_ID_FIELD.to_owned(), SortDir::Asc),
+                ],
+                "the plugin MUST sort by the order the TOKEN bound, never \
+                 the caller's {caller_order:?}: a row-value tuple compared \
+                 against boundary values in another order is a silently \
+                 wrong page",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_in_process_token_whose_signed_keys_do_not_decode_never_reaches_the_plugin() {
+        // A shape only the binding can catch, and one that was silently
+        // admissible in process before it: the token's `s` is malformed, so
+        // no order can be derived from it — but the caller supplied a
+        // perfectly sound `order` of their own, which the structural check
+        // was reading instead. The handler rejects this at the edge, so
+        // again only an in-process caller can express it.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+        let fingerprint = mint_fingerprint(&meter_id(), range, &caller, &[], &[]).await;
+
+        let mut malformed = continuation_of(&caller, &fingerprint);
+        malformed.cursor.as_mut().expect("cursor").s = String::new();
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(&ctx(), meter_id(), range, &malformed, &[])
+            .await
+            .expect_err("a token whose signed keys do not decode must be refused");
+
+        match err {
+            UsageCollectorError::InvalidArgument { field, reason, .. } => {
+                assert_eq!(
+                    field, "cursor",
+                    "a malformed token blames the token, not an $orderby the \
+                     caller cannot send alongside a cursor",
+                );
+                assert_eq!(reason, ValidationReason::InvalidCursor);
+            }
+            other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+        }
+        assert!(spy.last_list_order().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_sound_caller_order_cannot_launder_an_unsound_token() {
+        // Why the binding runs BEFORE the structural check rather than
+        // after. The token is bound to `+resource_id` alone, which names
+        // neither canonical field and is not a keyset; the caller supplies
+        // the canonical order beside it. Check-then-bind would validate
+        // the caller's sound order and then overwrite it with the token's
+        // unsound one, handing the plugin exactly the order the check
+        // exists to refuse.
+        let caller = query_with_filter("resource_id eq 'r1'");
+        let range = test_time_range();
+        let fingerprint = mint_fingerprint(&meter_id(), range, &caller, &[], &[]).await;
+
+        let mut laundered = cursor_request_bound_to(&caller, &[("resource_id", SortDir::Asc)]);
+        laundered.cursor.as_mut().expect("cursor").f = Some(fingerprint);
+        laundered.order = ODataOrderBy(vec![
+            OrderKey {
+                field: WINDOW_END_FIELD.to_owned(),
+                dir: SortDir::Asc,
+            },
+            OrderKey {
+                field: RECORD_ID_FIELD.to_owned(),
+                dir: SortDir::Asc,
+            },
+        ]);
+
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(ODataPage::empty(0));
+        let err = svc
+            .list_usage_records(&ctx(), meter_id(), range, &laundered, &[])
+            .await
+            .expect_err("an unsound token must be refused whatever order accompanies it");
+
+        assert!(matches!(err, UsageCollectorError::InvalidArgument { .. }));
+        assert!(
+            spy.last_list_order().is_none(),
+            "a sound caller order MUST NOT launder an unsound token past the check",
         );
     }
 

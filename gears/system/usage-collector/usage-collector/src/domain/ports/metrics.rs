@@ -397,13 +397,20 @@ pub enum QueryErrorCategory {
     /// `metadata.<key>` filter). Emitted at the service seam, which owns
     /// that comparison on every surface.
     FilterMismatch,
-    /// Scan-scope budget guard: a `$filter` naming a field reserved to a
-    /// typed parameter, an undeclared `group_by` / `metadata_filter` key,
-    /// or an aggregate result over the declared bucket cap. The mandatory
-    /// read range never lands here — it is a typed parameter validated at
-    /// the edge, before the service is entered. A continuation whose bound
-    /// order is not a keyset also folds in here for want of a category
-    /// that describes it.
+    /// The catch-all for a query the gateway refused on its own surface: a
+    /// `$filter` naming a field reserved to a typed parameter, an
+    /// undeclared `group_by` / `metadata_filter` key, an aggregate result
+    /// over the declared bucket cap, or an `$orderby` that cannot be
+    /// floored into a keyset (mixed sort directions, or a key that is not
+    /// a mandatory record attribute — both reachable in the domain since
+    /// the keyset floor moved there). The mandatory read range never lands
+    /// here: it is a typed parameter validated at the edge, before the
+    /// service is entered.
+    ///
+    /// Wider than its name, and knowingly so. A continuation whose bound
+    /// order is not a keyset folds in too, for want of a category that
+    /// describes it — see `classify_query_result`, where that case has an
+    /// explicit arm.
     QueryBudget,
     /// Plugin transport / readiness / backend failure.
     PluginError,

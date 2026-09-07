@@ -1,6 +1,8 @@
 //! The read-path covered-period range.
 //!
-//! Every read path takes a mandatory bounded range, and one rule says which
+//! Both range-taking read paths — the keyset-paginated raw list and the
+//! aggregate (the point lookup selects by `id` and takes no range) — take
+//! a mandatory bounded range, and one rule says which
 //! entries it selects: `from <= window_end < to`
 //! (`cpt-cf-usage-collector-adr-window-end-selection`). The rule reads the
 //! period **end** and nothing else, so it needs no case for a point event
@@ -76,17 +78,22 @@ impl TimeRange {
     /// One spelling, because this value ends up inside an opaque pagination
     /// cursor. The gear's read path folds it into the fingerprint a keyset
     /// continuation is bound to, and that fingerprint is compared across a
-    /// page boundary: the caller's next
-    /// request recomputes the string and it has to come out identical, so a
+    /// page boundary: the caller's next request recomputes the string and
+    /// it has to come out identical, so a
     /// second spelling that ordered or padded the bounds differently would
     /// refuse every cursor minted under the first. Same "two spellings of
     /// one rule" hazard [`Self::contains_window_end`] exists to avoid, one
     /// level up.
     ///
-    /// The round trip is what makes the value usable as a fingerprint: the
-    /// gear hands the string to the plugin on `ODataQuery::filter_hash`,
-    /// the plugin mints it into `CursorV1::f`, and the follow-up request
-    /// renders it again from its own `from` / `to`. Nanoseconds since the
+    /// The round trip is what makes the value usable: the gear folds this
+    /// string into the fingerprint it dispatches, a conforming plugin
+    /// carries that fingerprint into the cursor it mints, and the
+    /// follow-up request renders this string again from its own `from` /
+    /// `to` and arrives at the same fingerprint. How the gear composes and
+    /// encodes it is the gear's business and deliberately not described
+    /// here — the value a plugin sees is documented as opaque, and a
+    /// sentence in this crate spelling out its internals would invite
+    /// exactly the dependency the other one forbids. Nanoseconds since the
     /// epoch make that reproducible for free — the rendering is
     /// instant-based, so it is offset-invariant as well as lossless, and
     /// two spellings of one instant render identically. That is the same

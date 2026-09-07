@@ -23,7 +23,7 @@ use futures::stream;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use toolkit_macros::domain_model;
-use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
+use toolkit_odata::{CursorV1, ODataQuery, Page as ODataPage, ast};
 use toolkit_security::SecurityContext;
 use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
@@ -43,9 +43,9 @@ use crate::domain::ports::metrics::{
     RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
 };
 use crate::domain::query::{
-    compose_query_with_scope, establish_keyset_order, read_fingerprint,
-    reject_reserved_filter_fields, require_continuation_keyset, require_cursor_fingerprint,
-    require_dimensions_declared, require_metadata_filter_keys_declared,
+    admit_continuation, compose_query_with_scope, establish_keyset_order, read_fingerprint,
+    reject_reserved_filter_fields, require_dimensions_declared,
+    require_metadata_filter_keys_declared,
 };
 use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
@@ -308,9 +308,12 @@ fn classify_query_result<T>(
         // `FILTER_MISMATCH` is a continuation refused because the cursor
         // was minted over a different query: not a budget or surface
         // rejection at all, and it has its own category. Everything else
-        // is a query-budget / query-surface rejection — a `$filter` naming
-        // a reserved field, an undeclared `group_by` / `metadata_filter`
-        // key, or an over-cap aggregate result.
+        // is a query-surface rejection — a `$filter` naming a reserved
+        // field, an undeclared `group_by` / `metadata_filter` key, an
+        // over-cap aggregate result, or an `$orderby` that cannot be
+        // floored into a keyset (mixed directions, or a non-mandatory
+        // key), the last of which became reachable here when the keyset
+        // floor moved into the domain.
         //
         // One known imprecision, inherited rather than introduced: a
         // continuation whose bound ORDER is not a keyset arrives as
@@ -349,6 +352,42 @@ fn classify_query_result<T>(
         ),
         Err(_) => (RequestOutcome::Error, QueryErrorCategory::PluginError),
     }
+}
+
+/// Reports, without failing the request, a `next_cursor` the plugin minted
+/// without the fingerprint it was dispatched with.
+///
+/// Diagnosis only, and deliberately so. The page it accompanies is
+/// correct — the rows were selected under the right query — so refusing it
+/// would turn a plugin's bookkeeping slip into a failed read. What is
+/// broken is the *next* request, which will arrive carrying this token and
+/// be refused by [`require_cursor_fingerprint`] with a `400` on the
+/// caller's `cursor`. This turns that into an `error!` at the point of
+/// breach, one request earlier, naming the component actually at fault.
+///
+/// Worth a wire decode in the domain — which this layer otherwise leaves
+/// to the edge — because the `next_cursor.f` obligation is the one
+/// requirement in this gear's Plugin SPI that gives an implementor no
+/// compiler error: a plugin written before it recompiles clean and
+/// paginates exactly once. The decode diagnoses, never decides; a token
+/// that will not decode at all is itself the breach being reported, and an
+/// absent `next_cursor` is the ordinary last page.
+fn report_unbound_next_cursor<T>(page: &ODataPage<T>, dispatched: Option<&str>) {
+    let Some(token) = page.page_info.next_cursor.as_deref() else {
+        return;
+    };
+    let bound = CursorV1::decode(token).ok();
+    let bound_fingerprint = bound.as_ref().and_then(|cursor| cursor.f.as_deref());
+    if bound_fingerprint == dispatched {
+        return;
+    }
+    tracing::error!(
+        bound_fingerprint = bound_fingerprint.unwrap_or("<none>"),
+        dispatched_fingerprint = dispatched.unwrap_or("<none>"),
+        decoded = bound.is_some(),
+        "usage-collector storage plugin minted a next_cursor that does not carry \
+         query.filter_hash; the caller's next page will be refused as FILTER_MISMATCH"
+    );
 }
 
 /// Project a plugin-side deactivation SPI error onto the closed §3.11.5
@@ -1633,18 +1672,20 @@ impl Service {
     ///    surface exactly as on REST, which is the point of doing it here
     ///    rather than in the handler. A first page has that order
     ///    *established* by [`establish_keyset_order`]; a continuation's
-    ///    order came from its token, so
-    ///    [`require_continuation_keyset`] *requires* it to be one already
-    ///    and refuses it otherwise, because appending to it would widen
-    ///    the sort tuple past the boundary values the token carries.
+    ///    is *taken from its token* and then required to be one already —
+    ///    see [`admit_continuation`] — because appending to it would widen
+    ///    the sort tuple past the boundary values the token carries, and
+    ///    honouring a caller order that disagreed with the token would
+    ///    compare a row-value tuple against boundary values in another
+    ///    order.
     /// 6. **Bind the cursor to its query.** [`read_fingerprint`] digests
     ///    the caller's `$filter` and all three typed parameters —
     ///    `gts_type_id`, the read range and `metadata_filter` — into the
     ///    value a continuation is bound to, and every dispatch carries it on
     ///    `filter_hash` so a conforming plugin mints it into
-    ///    `next_cursor.f`. On a continuation,
-    ///    [`require_cursor_fingerprint`] refuses a token that carries a
-    ///    different one — or none. This is the only place the property is
+    ///    `next_cursor.f`. On a continuation, [`admit_continuation`]
+    ///    refuses a token that carries a different one — or none. This is
+    ///    the only place the property is
     ///    enforced: `filter_hash` is `None` for an in-process caller and
     ///    `toolkit_odata::validate_cursor_against` skips its comparison
     ///    when either side is `None`, so the REST edge deliberately passes
@@ -1782,25 +1823,16 @@ impl Service {
             // is checked at all, since the handler skips the floor on that
             // path. Composition above only rewrites `filter`, so flooring
             // after it sees the order unchanged.
-            match composed.cursor.as_ref() {
-                Some(cursor) => {
-                    require_continuation_keyset(&composed)?;
-                    // Structure first, then relevance: whether the token's
-                    // order could be a keyset at all, then whether the
-                    // token belongs to this query.
-                    //
-                    // The comparison takes the freshly computed value as
-                    // an argument rather than reading `composed.filter_hash`
-                    // back after the assignment below. That is deliberate,
-                    // and it is what makes the two statements
-                    // order-independent: reading it back would compare
-                    // against whichever of the two values happened to be
-                    // there, which is the caller's own filter-only hash
-                    // before the assignment (`compose_query_with_scope`
-                    // preserves it) and so would refuse every legitimate
-                    // page two.
-                    require_cursor_fingerprint(cursor, &fingerprint)?;
-                }
+            match composed.cursor {
+                // Bind, then check structure, then check relevance — see
+                // `admit_continuation`. The fingerprint is passed in
+                // rather than read back off `composed.filter_hash` after
+                // the assignment below: reading it back would compare
+                // against whichever of the two values happened to be
+                // there, which before the assignment is the caller's own
+                // filter-only hash (`compose_query_with_scope` preserves
+                // it) and would refuse every legitimate page two.
+                Some(_) => admit_continuation(&mut composed, &fingerprint)?,
                 None => establish_keyset_order(&mut composed)?,
             }
 
@@ -1819,15 +1851,18 @@ impl Service {
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-plugin-dispatch
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-plugin-catch
-            instrument_spi(
+            let page = instrument_spi(
                 self.metrics.as_ref(),
                 PluginOp::ListUsageRecords,
                 plugin.list_usage_records(gts_type_id, time_range, &composed, metadata_filter),
             )
             .await
-            .map_err(|e| UsageCollectorError::from(DomainError::from(e)))
+            .map_err(|e| UsageCollectorError::from(DomainError::from(e)))?;
             // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-plugin-catch
             // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-plugin-dispatch
+
+            report_unbound_next_cursor(&page, composed.filter_hash.as_deref());
+            Ok(page)
         }
         .await;
         let seconds = start.elapsed().as_secs_f64();

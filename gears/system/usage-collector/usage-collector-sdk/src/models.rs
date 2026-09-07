@@ -585,10 +585,14 @@ pub const WINDOW_START_FIELD: &str = "window_start";
 pub const WINDOW_END_FIELD: &str = "window_end";
 
 /// Wire name of the record identifier. A constant for the same reason as
-/// the two bound names: the gateway's canonical keyset is spelled from
-/// these three, and a keyset half-spelled from constants and half from
-/// string literals is the shape where one half gets repointed and the
-/// other does not.
+/// the two bound names: the gateway's canonical keyset is
+/// `(window_end, id)`, spelled from [`WINDOW_END_FIELD`] and this, and a
+/// keyset half-spelled from constants and half from string literals is the
+/// shape where one half gets repointed and the other does not.
+/// [`WINDOW_START_FIELD`] is not in that keyset — it is a constant for the
+/// filterable-schema and reserved-field vocabularies it shares with its
+/// sibling, so the two bounds are named the same way wherever they appear
+/// together.
 pub const RECORD_ID_FIELD: &str = "id";
 
 /// Lifecycle status of a stored [`UsageRecord`]. Defaults to `Active`.
@@ -1027,11 +1031,17 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 // `query_aggregated_usage_records`; omitting it here means
 // `parse_odata_filter::<UsageRecordFilterField>` rejects any
 // `gts_type_id`-touching predicate at parse time as
-// `FilterError::UnknownField`, so neither plugins nor the gateway need a
-// runtime reject path.
+// `FilterError::UnknownField`, which covers the wire path. It is not the
+// whole story: an in-process caller builds an `ast::Expr` by hand and
+// never passes through the parser, so the host crate keeps a runtime
+// reject path (`reject_reserved_filter_fields`) that reserves
+// `gts_type_id` too, and needs it.
 //
-// The covered-period bounds and `id` ARE on the schema, and none of the
-// three is reachable from a `$filter`. That is not a contradiction: this
+// The covered-period bounds and `id` ARE on the schema, and neither bound
+// is reachable from a `$filter`. `id` deliberately is — see its field
+// doc: pinning one record with `$filter=id eq …` is a supported read, and
+// nothing about `id` is fixed by a typed parameter. That is not a
+// contradiction: this
 // schema is two vocabularies at once — the plugin's field-to-column
 // mapping and the `$orderby` surface. `window_end` has to be nameable for
 // the canonical `(window_end, id)` keyset, and for a cursor's signed
@@ -1155,10 +1165,21 @@ pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
 ///   record, so all of them are keyset-safe.
 ///
 /// This is a domain-optionality fact (an SDK concern), not a storage-column
-/// fact — the gateway rejects a caller `$orderby` on a non-keyset-safe field
-/// with `400`, and the plugin enforces the same invariant fail-closed. The
-/// allowlist is deliberately fail-closed: an unknown or newly added field is
-/// unsafe until it is classified there.
+/// fact. Enforcement is the **gateway's alone**: it refuses a caller
+/// `$orderby` on a non-keyset-safe field with a `400` and guarantees the
+/// order slot the Plugin SPI documents on every surface, so a plugin needs
+/// no fallback keyset of its own and an unusable order is a gateway breach
+/// rather than a case to paper over — see
+/// [`crate::UsageCollectorPluginV1::list_usage_records`], which is
+/// normative for the plugin side. The allowlist is deliberately
+/// fail-closed: an unknown or newly added field is unsafe until it is
+/// classified there.
+///
+/// Being on this list is necessary but not sufficient. An order key also
+/// has to resolve to a column, which is [`UsageRecordFilterField`]'s
+/// vocabulary, not this one — the two are checked against each other in
+/// `models_tests`, because a derived attribute could satisfy the
+/// domain-optionality criterion above while having no column at all.
 #[must_use]
 pub fn is_keyset_safe_record_field(name: &str) -> bool {
     KEYSET_SAFE_RECORD_FIELDS.contains(&name)
