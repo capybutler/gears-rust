@@ -1079,6 +1079,27 @@ fn usage_record_query_filter_surface_rejects_gts_type_id_inside_composite() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn the_keyset_safe_allowlist_is_exactly_the_mandatory_record_attributes() {
+    // The anchor for the exported set. `is_keyset_safe_record_field` reads
+    // `KEYSET_SAFE_RECORD_FIELDS`, and the caller-facing `$orderby`
+    // rejection quotes it verbatim, so the constant IS the wire contract
+    // and a silent addition to it would widen the admissible order surface
+    // with nothing noticing. Spelled out as literals for that reason.
+    assert_eq!(
+        crate::models::KEYSET_SAFE_RECORD_FIELDS,
+        [
+            "id",
+            "window_start",
+            "window_end",
+            "tenant_id",
+            "resource_id",
+            "resource_type",
+            "status",
+        ],
+    );
+}
+
+#[test]
 fn keyset_safe_record_fields_are_exactly_the_mandatory_columns() {
     // The mandatory (never-null) record attributes are sound leading keys for
     // the plugin's row-value tuple keyset comparison. Both covered-period

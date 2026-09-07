@@ -43,8 +43,9 @@ use crate::domain::ports::metrics::{
     RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
 };
 use crate::domain::query::{
-    compose_query_with_scope, ensure_admissible_keyset_order, reject_reserved_filter_fields,
-    require_dimensions_declared, require_metadata_filter_keys_declared,
+    compose_query_with_scope, establish_keyset_order, reject_reserved_filter_fields,
+    require_continuation_keyset, require_dimensions_declared,
+    require_metadata_filter_keys_declared,
 };
 use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
@@ -1585,13 +1586,16 @@ impl Service {
     ///    typed parameters and are NOT touched here: neither ever enters
     ///    `query.filter`, which is why a predicate naming a covered-period
     ///    bound is rejected in step 3 rather than merged in here.
-    /// 5. **Floor the keyset** via [`ensure_admissible_keyset_order`], so
-    ///    the plugin always receives the non-empty, uniform-direction,
-    ///    never-null order naming both `window_end` and `id` that its SPI
-    ///    promises — on this in-process surface exactly as on REST, which
-    ///    is the point of doing it here rather than in the handler. On a
-    ///    cursor request the reconstructed order is required to satisfy
-    ///    that already, and refused if it does not.
+    /// 5. **Floor the keyset**, so the plugin always receives the
+    ///    non-empty, uniform-direction, never-null order naming both
+    ///    `window_end` and `id` that its SPI promises — on this in-process
+    ///    surface exactly as on REST, which is the point of doing it here
+    ///    rather than in the handler. A first page has that order
+    ///    *established* by [`establish_keyset_order`]; a continuation's
+    ///    order came from its token, so
+    ///    [`require_continuation_keyset`] *requires* it to be one already
+    ///    and refuses it otherwise, because appending to it would widen
+    ///    the sort tuple past the boundary values the token carries.
     /// 6. **Delegate** to the bound storage plugin's
     ///    `list_usage_records` SPI with the composed filter, the floored
     ///    order, and the typed `time_range`, which the plugin resolves as
@@ -1690,15 +1694,21 @@ impl Service {
             // non-empty, uniform-direction, never-null keyset naming both
             // canonical fields, and this is the one place every caller
             // passes through — REST, the in-process client, and a direct
-            // `Service` call alike. The REST handler validates a caller's
-            // `$orderby` before it gets here and the floor is idempotent,
-            // so on that path this is a no-op; on every other path it is
-            // what makes the SPI's promise true. It is also the only place
-            // a cursor-reconstructed order is checked, since the handler
-            // skips the floor on that path. Composition above only
-            // rewrites `filter`, so flooring after it sees the order
-            // unchanged.
-            ensure_admissible_keyset_order(&mut composed)?;
+            // `Service` call alike. The branch is in the open because the
+            // two modes are genuinely different operations: a first page's
+            // order is normalized (and `establish_keyset_order` is
+            // idempotent, so the REST handler having already done it makes
+            // this a no-op), while a continuation's came from its token and
+            // is only checked — refusing with a `400` on `cursor` rather
+            // than being widened past the boundary values the token
+            // carries. This is the only place a cursor-reconstructed order
+            // is checked at all, since the handler skips the floor on that
+            // path. Composition above only rewrites `filter`, so flooring
+            // after it sees the order unchanged.
+            match composed.cursor {
+                Some(_) => require_continuation_keyset(&composed)?,
+                None => establish_keyset_order(&mut composed)?,
+            }
 
             let plugin = self
                 .resolve_plugin_for(PluginOp::ListUsageRecords)

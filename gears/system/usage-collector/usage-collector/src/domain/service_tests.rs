@@ -4198,15 +4198,26 @@ mod read_path_keyset_floor_tests {
         }
     }
 
-    /// A continuation request as the REST handler hands it to the service:
-    /// `keys` is the order `prepare_list_query` reconstructed from the
-    /// token's signed keys, and the token is still attached.
+    /// A continuation request as the REST handler hands it to the service.
+    ///
+    /// Minted the way a conforming plugin does (`to_signed_tokens`) and
+    /// then decoded the way `prepare_list_query` step 3 does
+    /// (`ODataOrderBy::from_signed_tokens`), so the order under test is
+    /// derived from the token rather than set alongside it.
     fn cursor_request_ordered_by(keys: &[(&str, SortDir)]) -> ODataQuery {
-        let mut query = query_ordered_by(keys);
+        let signed = query_ordered_by(keys).order.to_signed_tokens();
+        let mut query = ODataQuery::new();
+        query.order =
+            ODataOrderBy::from_signed_tokens(&signed).expect("a non-empty order round-trips");
         query.cursor = Some(CursorV1 {
-            k: keys.iter().map(|_| "boundary".to_owned()).collect(),
-            o: keys.first().map_or(SortDir::Asc, |(_, dir)| *dir),
-            s: query.order.to_signed_tokens(),
+            k: query
+                .order
+                .0
+                .iter()
+                .map(|_| "boundary".to_owned())
+                .collect(),
+            o: query.order.0[0].dir,
+            s: signed,
             f: None,
             d: "fwd".to_owned(),
         });
@@ -4215,13 +4226,15 @@ mod read_path_keyset_floor_tests {
 
     #[tokio::test]
     async fn a_conforming_continuation_reaches_the_plugin_with_the_order_it_was_minted_under() {
-        // No test drove a cursor request past `prepare_list_query` before,
-        // so nothing pinned that the floor leaves a continuation alone.
-        // The order here is what a conforming plugin mints: a floored
-        // order, round-tripped through the token's signed keys. The floor
-        // must be a genuine no-op — same keys, same directions, same width
-        // as the token's boundary values, which is what keeps the
-        // continuation predicate aligned.
+        // The service picks which mode of the floor to run, so this is
+        // where "a continuation is checked, not extended" can actually
+        // fail: `require_continuation_keyset` takes `&ODataQuery` and
+        // cannot mutate, but nothing stops the service calling
+        // `establish_keyset_order` instead. The order here is what a
+        // conforming plugin mints — a floored order, round-tripped through
+        // the token's signed keys — and the plugin must receive it with
+        // the same keys, directions and width, which is what keeps the
+        // continuation predicate aligned with the token's boundary values.
         let keys = [
             ("resource_id", SortDir::Desc),
             ("window_end", SortDir::Desc),

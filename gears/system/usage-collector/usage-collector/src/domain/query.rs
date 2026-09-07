@@ -16,10 +16,13 @@
 //!   `metadata_filter`, the dynamic-key side channel that exists precisely
 //!   because the `toolkit-odata` grammar cannot express filters over JSON
 //!   map keys, so it never flows through `$filter` at all.
-//! * `ensure_admissible_keyset_order` — the raw path's keyset floor: it
-//!   guarantees every dispatch carries the non-empty, uniform-direction,
-//!   never-null order naming both canonical keyset fields that the Plugin
-//!   SPI promises, whichever surface the call came in on.
+//! * `establish_keyset_order` / `require_continuation_keyset` — the raw
+//!   path's keyset floor, in its two modes. Between them they guarantee
+//!   every dispatch carries the non-empty, uniform-direction, never-null
+//!   order naming both canonical keyset fields that the Plugin SPI
+//!   promises, whichever surface the call came in on. A first page has its
+//!   order *established*; a continuation has the token's order *required*
+//!   to be one already.
 //!
 //! Per Spec §3.11, the admissible filter and grouping surface is the fixed
 //! fields (via `$filter`, gated by [`reject_reserved_filter_fields`]) plus
@@ -32,11 +35,11 @@
 
 use std::collections::BTreeSet;
 
-use toolkit_odata::{ODataQuery, SortDir, ast};
+use toolkit_odata::{ODataOrderBy, ODataQuery, SortDir, ast};
 use toolkit_security::AccessScope;
 use usage_collector_sdk::{
-    AggregationDimension, MetadataFilter, MeterTypeId, UsageCollectorError, WINDOW_END_FIELD,
-    is_keyset_safe_record_field,
+    AggregationDimension, MetadataFilter, MeterTypeId, RECORD_ID_FIELD, UsageCollectorError,
+    WINDOW_END_FIELD, is_keyset_safe_record_field,
 };
 
 use crate::domain::authz;
@@ -115,9 +118,8 @@ pub(crate) fn compose_query_with_scope(
 /// ([`usage_collector_sdk::UsageRecordFilterField`]) — that schema doubles
 /// as the plugin's field-to-column mapping and the `$orderby` vocabulary,
 /// and `window_end` has to resolve to a column for the canonical keyset to
-/// mean anything. This guard, not their
-/// absence from the schema, is the whole reason a `$filter` cannot reach
-/// them.
+/// mean anything. This guard, not their absence from the schema, is the
+/// whole reason a `$filter` cannot reach them.
 const RESERVED_FILTER_FIELDS: &[&str] = &["gts_type_id", "window_start", "window_end"];
 
 /// `true` when `name` names a [`RESERVED_FILTER_FIELDS`] entry, ignoring
@@ -188,44 +190,71 @@ pub(crate) fn reject_reserved_filter_fields(filter: &ast::Expr) -> Result<(), Us
 /// row, so an order naming it can never leave a page boundary inside a run
 /// of rows sharing every other key.
 ///
-/// These are *membership* requirements, not positions. The floor appends
-/// whichever is missing, so an order naming neither ends in
-/// `(window_end, id)` — but a caller order that already names `id` keeps
-/// it where it put it (`$orderby=id` floors to `(id, window_end)`). What
-/// is guaranteed downstream is that both names are present, which is what
-/// makes the tuple unique; where they sit is not.
-const CANONICAL_KEYSET_FIELDS: &[&str] = &[WINDOW_END_FIELD, "id"];
+/// These are *membership* requirements, not positions.
+/// [`establish_keyset_order`] appends whichever is missing, so an order
+/// naming neither ends in `(window_end, id)` — but a caller order that
+/// already names `id` keeps it where it put it (`$orderby=id` becomes
+/// `(id, window_end)`). What is guaranteed downstream is that both names
+/// are present, which is what makes the tuple unique; where they sit is
+/// not.
+const CANONICAL_KEYSET_FIELDS: &[&str] = &[WINDOW_END_FIELD, RECORD_ID_FIELD];
 
-/// Guarantees `query.order` is the keyset the Plugin SPI promises: a
-/// non-empty, uniform-direction, never-null order that names every field
-/// in [`CANONICAL_KEYSET_FIELDS`], and so sorts on a globally unique
-/// tuple.
+/// Why an order cannot serve as a keyset, independent of which surface it
+/// arrived on.
 ///
-/// This is the raw path's keyset **floor**, and it lives here rather than
-/// in the REST handler because DESIGN §3.1 allocates order admissibility
-/// to the Query Gateway, which §3.2 exists to keep uniform across the SDK
-/// and REST. An in-process caller reaches
-/// [`Service::list_usage_records`](crate::domain::Service::list_usage_records)
-/// with an [`ODataQuery`] of their own construction — an empty order, most
-/// of the time — so a normalization that only ran at the REST edge left
-/// the SPI's order slot unpopulated on exactly the surface no REST test
-/// can reach.
-///
-/// Two properties have to hold before a missing field can be appended at
-/// all, and neither can be repaired by appending:
+/// Both modes of the floor share these two rules and differ only in what
+/// they do about a shortfall, so the rules live here once and each mode
+/// renders them into the error its own caller can act on.
+enum KeysetDefect {
+    /// The named key sorts against the leading key's direction.
+    MixedDirection(String),
+    /// The named key is not a never-null record attribute — or is not a
+    /// record attribute at all, since
+    /// [`is_keyset_safe_record_field`] is a fail-closed allowlist.
+    InadmissibleKey(String),
+}
+
+/// The two properties an order must have before it can be a keyset at all,
+/// neither of which appending a field could repair.
 ///
 /// * **One direction.** The plugin's continuation is a row-value tuple
 ///   comparison (`(c1, c2, …) > ($…)`), which has no meaning across mixed
 ///   directions.
 /// * **No nullable key.** A tuple whose leading column is NULL compares as
 ///   NULL in SQL's three-valued logic, so every NULL-keyed row silently
-///   drops out of the page and a page ending on one cannot encode a
-///   cursor at all. [`is_keyset_safe_record_field`] is the fail-closed
-///   classification, so an unrecognised name is refused on the same
-///   branch.
+///   drops out of the page and a page ending on one cannot encode a cursor
+///   at all.
+fn keyset_defect(order: &ODataOrderBy) -> Option<KeysetDefect> {
+    let keys = &order.0;
+    if let Some(first) = keys.first()
+        && let Some(deviating) = keys.iter().find(|key| key.dir != first.dir)
+    {
+        return Some(KeysetDefect::MixedDirection(deviating.field.clone()));
+    }
+    keys.iter()
+        .find(|key| !is_keyset_safe_record_field(&key.field))
+        .map(|bad| KeysetDefect::InadmissibleKey(bad.field.clone()))
+}
+
+/// Establishes the keyset the Plugin SPI promises on a **first page**: a
+/// non-empty, uniform-direction, never-null order that names every field
+/// in [`CANONICAL_KEYSET_FIELDS`], and so sorts on a globally unique
+/// tuple.
 ///
-/// Whichever canonical field the order does not already name is then
-/// appended in the order's own direction (`Asc` for an empty order) via
+/// This is the raw path's keyset floor, and it lives here rather than in
+/// the REST handler because DESIGN §3.1 allocates order admissibility to
+/// the Query Gateway, which §3.2 exists to keep uniform across the SDK and
+/// REST. An in-process caller reaches
+/// [`Service::list_usage_records`](crate::domain::Service::list_usage_records)
+/// with an [`ODataQuery`] of their own construction — an empty order, most
+/// of the time — so a normalization that only ran at the REST edge left
+/// the SPI's order slot unpopulated on exactly the surface no REST test
+/// can reach.
+///
+/// [`keyset_defect`] must clear first, because neither of the properties
+/// it checks can be repaired by appending. Whichever canonical field the
+/// order does not already name is then appended in the order's own
+/// direction (`Asc` for an empty order) via
 /// [`toolkit_odata::ODataOrderBy::ensure_tiebreaker`], which skips a field
 /// the order already names — so this is idempotent, and applying it after
 /// REST has validated an order is a no-op rather than a double append. It
@@ -233,94 +262,107 @@ const CANONICAL_KEYSET_FIELDS: &[&str] = &[WINDOW_END_FIELD, "id"];
 /// caller order already naming `id` keeps it where it is and gains only
 /// `window_end` after it.
 ///
-/// # A cursor request is checked, never extended
-///
-/// When `query.cursor` is set the order does not come from the caller: it
-/// has been reconstructed from the token's own signed keys, and the
-/// token's boundary values line up with it one for one. There is nothing
-/// left to normalize — the order either already is the keyset the page was
-/// minted under, or the token did not come from a conforming plugin.
-/// Appending to it would widen the sort tuple past the boundary values the
-/// token carries and hand the plugin a misaligned continuation, which is a
-/// silently wrong page where refusing is merely a refused one. So on that
-/// path the same three properties are *required* rather than established,
-/// and a shortfall is [`UsageCollectorError::inadmissible_cursor_keyset`]
-/// against `cursor` — the parameter the caller actually sent, since they
-/// send no `$orderby` alongside a cursor.
-///
-/// A conforming plugin cannot trip this. It mints `next_cursor` from the
-/// order it was handed, which is a floored one, and
-/// `to_signed_tokens` / `from_signed_tokens` round-trip field names and
-/// directions exactly — so the reconstructed order passes all three checks
-/// and this call is a genuine no-op.
-///
 /// `prepare_list_query` calls this too, on the caller's `$orderby` before
 /// any authorization or plugin work happens, so a wire request is refused
 /// where its input is parsed and the `400` blames the parameter the caller
 /// actually sent. That mirroring is the point of the idempotence: the same
-/// rule, stated once, applied at the edge for the message and again here
-/// for the guarantee.
+/// rule, stated once, applied at the edge for the message and again in the
+/// service for the guarantee.
+///
+/// A continuation goes to [`require_continuation_keyset`] instead — the
+/// two are separate functions precisely so a call site says which one it
+/// wants rather than letting the presence of a cursor decide silently.
 ///
 /// # Errors
 ///
-/// Returns [`UsageCollectorError::InvalidArgument`] when the order mixes
-/// sort directions or names a key that is not a mandatory record
-/// attribute; and, on a cursor request only, when it does not already name
-/// every [`CANONICAL_KEYSET_FIELDS`] entry.
-pub(crate) fn ensure_admissible_keyset_order(
-    query: &mut ODataQuery,
-) -> Result<(), UsageCollectorError> {
-    // A cursor request's order was reconstructed from the token, so it is
-    // checked as-is; a caller's own order is normalized. The two paths
-    // share the rules and differ only in whether a shortfall is repaired
-    // and which parameter a refusal blames.
-    let from_cursor = query.cursor.is_some();
-    let keys = &query.order.0;
-
-    if let Some(first) = keys.first()
-        && keys.iter().any(|key| key.dir != first.dir)
-    {
-        return Err(if from_cursor {
-            UsageCollectorError::inadmissible_cursor_keyset(
-                "its keys do not share one sort direction",
-            )
-        } else {
-            UsageCollectorError::mixed_direction_order()
-        });
-    }
-    if let Some(bad) = keys
-        .iter()
-        .find(|key| !is_keyset_safe_record_field(&key.field))
-    {
-        return Err(if from_cursor {
-            UsageCollectorError::inadmissible_cursor_keyset(&format!(
-                "its key '{}' is not a mandatory record attribute",
-                bad.field
-            ))
-        } else {
-            UsageCollectorError::inadmissible_order_key(&bad.field)
-        });
-    }
-
-    if from_cursor {
-        if let Some(missing) = CANONICAL_KEYSET_FIELDS
-            .iter()
-            .find(|field| !keys.iter().any(|key| key.field == **field))
-        {
-            return Err(UsageCollectorError::inadmissible_cursor_keyset(&format!(
-                "it does not name '{missing}'"
-            )));
+/// Returns [`UsageCollectorError::InvalidArgument`] against `$orderby`
+/// when the order mixes sort directions or names a key that is not a
+/// mandatory record attribute.
+pub(crate) fn establish_keyset_order(query: &mut ODataQuery) -> Result<(), UsageCollectorError> {
+    match keyset_defect(&query.order) {
+        Some(KeysetDefect::MixedDirection(field)) => {
+            return Err(UsageCollectorError::mixed_direction_order(&field));
         }
-        return Ok(());
+        Some(KeysetDefect::InadmissibleKey(field)) => {
+            return Err(UsageCollectorError::inadmissible_order_key(&field));
+        }
+        None => {}
     }
 
-    let dir = keys.last().map_or(SortDir::Asc, |key| key.dir);
+    let dir = query.order.0.last().map_or(SortDir::Asc, |key| key.dir);
     let mut order = std::mem::take(&mut query.order);
     for &field in CANONICAL_KEYSET_FIELDS {
         order = order.ensure_tiebreaker(field, dir);
     }
     query.order = order;
     Ok(())
+}
+
+/// Requires the order of a **continuation** to be a sound keyset already,
+/// rather than making it one.
+///
+/// A cursor request's order does not come from the caller: it has been
+/// reconstructed from the token's own signed keys, and the token's boundary
+/// values (`CursorV1::k`) line up with it one for one. There is nothing
+/// left to normalize — the order either already is the keyset the page was
+/// minted under, or the token did not come from a conforming plugin.
+/// Appending to it would widen the sort tuple past the boundary values the
+/// token carries and hand the plugin a misaligned continuation, which is a
+/// silently wrong page where refusing is merely a refused one. Nothing
+/// downstream would catch it either:
+/// [`toolkit_odata::validate_cursor_against`] compares signed tokens and
+/// the filter hash and never checks the token's width against the order's.
+///
+/// Taking `&ODataQuery` rather than `&mut` is the point — the signature is
+/// what says this path appends nothing.
+///
+/// A conforming plugin cannot trip this. It mints `next_cursor` from the
+/// order it was handed, which is a floored one, and
+/// `to_signed_tokens` / `from_signed_tokens` round-trip field names and
+/// directions exactly — so the reconstructed order passes and this is a
+/// no-op. Everything refused here is a forged, truncated or replayed token,
+/// or a plugin minting against an order it was not given, which is why the
+/// refusal also logs.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorError::InvalidArgument`] against `cursor`, with
+/// `INVALID_CURSOR`, when the order mixes sort directions, names a key
+/// that is not a mandatory record attribute, or does not already name every
+/// [`CANONICAL_KEYSET_FIELDS`] entry.
+pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), UsageCollectorError> {
+    let defect = match keyset_defect(&query.order) {
+        Some(KeysetDefect::MixedDirection(field)) => {
+            format!("its key '{field}' sorts against the leading key")
+        }
+        Some(KeysetDefect::InadmissibleKey(field)) => {
+            format!("its key '{field}' is not a mandatory record attribute")
+        }
+        None => match CANONICAL_KEYSET_FIELDS
+            .iter()
+            .find(|field| !query.order.0.iter().any(|key| key.field == **field))
+        {
+            Some(missing) => format!("it does not name '{missing}'"),
+            None => return Ok(()),
+        },
+    };
+
+    // A caller-visible 400, but the likeliest cause is a plugin minting a
+    // `next_cursor` against an order it was not handed — a conformance
+    // breach the caller can do nothing about and would otherwise leave no
+    // trace. `warn!` rather than the `error!` of a host-invariant breach:
+    // a forged or replayed token reaches here too, and that is ordinary
+    // hostile input. Same shape as `service::invariant_breach` — log the
+    // detail, then return the typed error.
+    tracing::warn!(
+        defect = %defect,
+        signed_tokens = %query
+            .cursor
+            .as_ref()
+            .map_or("<none>", |cursor| cursor.s.as_str()),
+        "usage-collector refused a continuation token whose bound order is not a keyset"
+    );
+    Err(UsageCollectorError::inadmissible_cursor_keyset(defect))
 }
 
 /// Checks every `group_by` dimension is either a fixed field (no

@@ -584,6 +584,13 @@ pub const WINDOW_START_FIELD: &str = "window_start";
 /// [`WINDOW_START_FIELD`] for why both are constants.
 pub const WINDOW_END_FIELD: &str = "window_end";
 
+/// Wire name of the record identifier. A constant for the same reason as
+/// the two bound names: the gateway's canonical keyset is spelled from
+/// these three, and a keyset half-spelled from constants and half from
+/// string literals is the shape where one half gets repointed and the
+/// other does not.
+pub const RECORD_ID_FIELD: &str = "id";
+
 /// Lifecycle status of a stored [`UsageRecord`]. Defaults to `Active`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1074,11 +1081,11 @@ pub struct UsageRecordQuery {
     /// `usage_records.window_end` — the exclusive end of the covered
     /// period, and the column every read path selects on
     /// (`from <= window_end < to`, per
-    /// `cpt-cf-usage-collector-adr-window-end-selection`). It is also the
-    /// leading key of the raw path's `(window_end, id)` keyset, so
-    /// selection and page order name one column and one index serves both.
-    /// Reserved on the `$filter` surface for the same reason as
-    /// [`Self::window_start`].
+    /// `cpt-cf-usage-collector-adr-window-end-selection`). Every raw-path
+    /// page order names it — see [`is_keyset_safe_record_field`] — so
+    /// selection and sorting share a column, and with no caller `$orderby`
+    /// it leads the order and a single index serves both. Reserved on the
+    /// `$filter` surface for the same reason as [`Self::window_start`].
     #[odata(filter(kind = "DateTimeUtc"))]
     pub window_end: time::OffsetDateTime,
     /// `usage_records.tenant_id` (owning tenant). Supports `eq` and `in`.
@@ -1113,6 +1120,24 @@ pub struct UsageRecordQuery {
 
 pub use UsageRecordQueryFilterField as UsageRecordFilterField;
 
+/// The record attributes that are never absent, and therefore sound as
+/// keyset-pagination ordering keys — the closed set
+/// [`is_keyset_safe_record_field`] tests against.
+///
+/// Exported because it is the admissible `$orderby` vocabulary, so a `400`
+/// refusing a caller's order can name the whole set rather than leave them
+/// to guess: seven names is short enough to be actionable, and the set is
+/// closed. Matching is exact, like the `$orderby` grammar itself.
+pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
+    RECORD_ID_FIELD,
+    WINDOW_START_FIELD,
+    WINDOW_END_FIELD,
+    "tenant_id",
+    "resource_id",
+    "resource_type",
+    "status",
+];
+
 /// Record filter fields backed by a **mandatory (never-null)** attribute, and
 /// therefore sound to use as a keyset-pagination ordering key.
 ///
@@ -1126,27 +1151,17 @@ pub use UsageRecordQueryFilterField as UsageRecordFilterField;
 /// - `subject_id` / `subject_type` come from `subject_ref: Option<SubjectRef>`
 ///   and `corrects_id` is `Option<Uuid>` — all three are domain-optional, so
 ///   they are **not** keyset-safe.
-/// - `id`, both covered-period bounds, `tenant_id`, `resource_id`,
-///   `resource_type` and `status` are mandatory on every record, so they
-///   are keyset-safe. `window_end` is additionally the leading key of the
-///   canonical keyset, because it is the bound the read range selects on.
+/// - every entry of [`KEYSET_SAFE_RECORD_FIELDS`] is mandatory on every
+///   record, so all of them are keyset-safe.
 ///
 /// This is a domain-optionality fact (an SDK concern), not a storage-column
 /// fact — the gateway rejects a caller `$orderby` on a non-keyset-safe field
 /// with `400`, and the plugin enforces the same invariant fail-closed. The
 /// allowlist is deliberately fail-closed: an unknown or newly added field is
-/// unsafe until it is classified here.
+/// unsafe until it is classified there.
 #[must_use]
 pub fn is_keyset_safe_record_field(name: &str) -> bool {
-    matches!(
-        name,
-        "id" | "window_start"
-            | "window_end"
-            | "tenant_id"
-            | "resource_id"
-            | "resource_type"
-            | "status"
-    )
+    KEYSET_SAFE_RECORD_FIELDS.contains(&name)
 }
 
 /// Equality-set filter applied to a single [`UsageRecord::metadata`] key.

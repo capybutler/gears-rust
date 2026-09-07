@@ -2791,6 +2791,101 @@ mod handle_list_usage_records_tests {
     }
 
     #[tokio::test]
+    async fn a_valid_cursor_paginates_and_the_plugin_gets_the_bound_order() {
+        // The seam the keyset floor's two modes create: the handler skips
+        // normalization on a cursor request and rebuilds the order from
+        // the token's signed keys, while the service then REQUIRES that
+        // order to be a sound keyset. The wire outcome therefore depends
+        // on those two agreeing, and every other full-stack cursor test
+        // here is a 400 — so nothing drove a successful continuation end
+        // to end.
+        //
+        // `f: None` skips the filter-hash comparison (`validate_cursor_against`
+        // skips it when either side is absent), leaving the order as the
+        // only thing under test.
+        let plugin = HappyPathPlugin::new();
+        plugin.set_list_usage_records_response(ODataPage::empty(0));
+        let service = service_with_permit_plugin(&plugin, "test.handler.list_records.cursor.v1");
+
+        let mut q = ODataQuery::new();
+        q.cursor = Some(CursorV1 {
+            k: vec!["2026-06-12T00:00:00Z".into(), uuid::Uuid::nil().to_string()],
+            o: SortDir::Asc,
+            s: "+window_end,+id".to_owned(),
+            f: None,
+            d: "fwd".to_owned(),
+        });
+        // Note: `q.order` intentionally empty, mirroring the toolkit OData
+        // extractor on a cursor request.
+
+        let response = handle_list_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(service),
+            Query(super::list_params(&[("gts_type_id", HAPPY_RECORD_GTS_ID)])),
+            OData(q),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a continuation bound to the canonical keyset MUST paginate",
+        );
+        assert_eq!(
+            plugin
+                .last_list_order()
+                .expect("the plugin MUST have been dispatched"),
+            vec![
+                ("window_end".to_owned(), SortDir::Asc),
+                ("id".to_owned(), SortDir::Asc),
+            ],
+            "the plugin MUST receive the order the token was minted under, \
+             rebuilt from its signed keys and neither defaulted nor widened",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cursor_bound_to_an_unsound_keyset_returns_400_naming_the_cursor() {
+        // The other half of the seam. A token whose signed keys omit the
+        // period end decodes fine and passes cursor validation, then the
+        // service refuses it rather than widening the order past the two
+        // boundary values the token carries. The `400` must blame `cursor`:
+        // the caller sent no `$orderby` on this request and could not.
+        let plugin = HappyPathPlugin::new();
+        plugin.set_list_usage_records_response(ODataPage::empty(0));
+        let service = service_with_permit_plugin(&plugin, "test.handler.list_records.badcursor.v1");
+
+        let mut q = ODataQuery::new();
+        q.cursor = Some(CursorV1 {
+            k: vec!["r1".into(), uuid::Uuid::nil().to_string()],
+            o: SortDir::Asc,
+            s: "+resource_id,+id".to_owned(),
+            f: None,
+            d: "fwd".to_owned(),
+        });
+
+        let response = handle_list_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(service),
+            Query(super::list_params(&[("gts_type_id", HAPPY_RECORD_GTS_ID)])),
+            OData(q),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("cursor"),
+        );
+        assert!(
+            plugin.last_list_order().is_none(),
+            "a refused continuation MUST NOT reach the plugin",
+        );
+    }
+
+    #[tokio::test]
     async fn cursor_filter_hash_mismatch_returns_400() {
         // A continuation cursor whose embedded filter-hash no longer
         // matches the request's `filter_hash` MUST be refused with a 400

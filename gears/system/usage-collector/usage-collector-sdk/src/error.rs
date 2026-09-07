@@ -422,18 +422,22 @@ impl UsageCollectorError {
     /// over a single direction, so a mixed-direction order can never
     /// become a usable keyset — it is refused rather than forwarded to a
     /// plugin that would reject it late and unspecifically. Attributed to
-    /// `$orderby`, the surface a caller names an order on.
+    /// `$orderby`, the surface a caller names an order on, and naming the
+    /// first key whose direction deviates so the caller can see which of
+    /// their keys to flip.
     #[must_use]
-    pub fn mixed_direction_order() -> Self {
+    pub fn mixed_direction_order(deviating_field: &str) -> Self {
         Self::InvalidArgument {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: None,
             field: "$orderby".to_owned(),
             reason: ValidationReason::Validation,
-            detail: "order keys must all share one sort direction: keyset \
-                     pagination is a row-value tuple comparison and cannot \
-                     compose a mixed-direction tuple"
-                .to_owned(),
+            detail: format!(
+                "order keys must all share one sort direction, but \
+                 '{deviating_field}' sorts against the first key: keyset \
+                 pagination is a row-value tuple comparison and cannot \
+                 compose a mixed-direction tuple"
+            ),
         }
     }
 
@@ -444,7 +448,10 @@ impl UsageCollectorError {
     /// so NULL-keyed rows would silently drop out of the page. The
     /// classification is [`crate::is_keyset_safe_record_field`], which is
     /// a fail-closed allowlist — hence the same rejection for an unknown
-    /// name. Attributed to `$orderby`.
+    /// name. Attributed to `$orderby`, and naming the whole admissible set
+    /// — [`crate::KEYSET_SAFE_RECORD_FIELDS`] is closed and short, so the
+    /// caller is told what they may order by instead of only what they may
+    /// not.
     #[must_use]
     pub fn inadmissible_order_key(field: &str) -> Self {
         Self::InvalidArgument {
@@ -455,7 +462,8 @@ impl UsageCollectorError {
             detail: format!(
                 "order key '{field}' is not supported: keyset pagination needs an \
                  always-present record attribute, so an optional attribute or an \
-                 unrecognised name is refused"
+                 unrecognised name is refused; order by one of {:?}",
+                crate::KEYSET_SAFE_RECORD_FIELDS,
             ),
         }
     }
@@ -471,8 +479,15 @@ impl UsageCollectorError {
     /// where refusing is merely a refused one. Attributed to `cursor`, the
     /// parameter the caller actually supplied, with `INVALID_CURSOR` — the
     /// same field and code `toolkit_odata`'s own decode failures use.
+    ///
+    /// The detail names the defect and the recovery, and deliberately does
+    /// not blame a component: a token can be forged, truncated or replayed
+    /// by the caller just as easily as mis-minted by a plugin, and the
+    /// caller can act on neither hypothesis. The plugin-conformance
+    /// reading belongs in the operator log at the refusal site.
     #[must_use]
-    pub fn inadmissible_cursor_keyset(defect: &str) -> Self {
+    pub fn inadmissible_cursor_keyset(defect: impl Into<String>) -> Self {
+        let defect = defect.into();
         Self::InvalidArgument {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: None,
@@ -480,7 +495,7 @@ impl UsageCollectorError {
             reason: ValidationReason::InvalidCursor,
             detail: format!(
                 "the cursor's bound order is not a usable keyset ({defect}); \
-                 it was not minted by a conforming plugin"
+                 restart pagination without a cursor"
             ),
         }
     }

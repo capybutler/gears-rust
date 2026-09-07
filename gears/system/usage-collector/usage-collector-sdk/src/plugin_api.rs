@@ -105,6 +105,20 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// caller ordering by `id` is handed on as `(id, window_end)`. A
     /// plugin MUST read the order it is given rather than assume a
     /// position for either key.
+    ///
+    /// The obligation runs the other way on the way out. A `next_cursor`
+    /// this method mints MUST be bound to the order it was handed —
+    /// `cursor.s == query.order.to_signed_tokens()` — and its boundary
+    /// values MUST be one per key of that order. The gateway hands the
+    /// follow-up request back with the order decoded from those signed
+    /// tokens and requires it to be a sound keyset: non-empty, one
+    /// direction, never-null keys, and naming both canonical fields. A
+    /// token bound to anything else is refused as `INVALID_CURSOR` and the
+    /// caller cannot continue, so minting against a different order breaks
+    /// pagination for the plugin's own pages. The gateway cannot repair it
+    /// instead of refusing: appending a key would leave the order wider
+    /// than the boundary values the token carries, which is a silently
+    /// wrong page rather than a refused one.
     async fn list_usage_records(
         &self,
         gts_type_id: MeterTypeId,

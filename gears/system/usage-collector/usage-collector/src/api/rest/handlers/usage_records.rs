@@ -26,7 +26,7 @@ use crate::api::rest::dto::{
     UsageRecordDto,
 };
 use crate::domain::Service;
-use crate::domain::query::ensure_admissible_keyset_order;
+use crate::domain::query::establish_keyset_order;
 use crate::domain::service::MAX_BATCH_RECORDS;
 use crate::infra::sdk_error_mapping::{
     UsageRecordResource,
@@ -196,10 +196,13 @@ pub async fn handle_get_usage_record(
 ///   omitted `$orderby` yields `(window_end asc, id asc)`; an
 ///   `$orderby=id` yields `(id asc, window_end asc)`, because the missing
 ///   key is appended and a named one is left where the caller put it. Both
-///   halves are [`ensure_admissible_keyset_order`]: the invariant is owned
+///   halves are [`establish_keyset_order`]: the invariant is owned
 ///   in the domain so that an in-process caller gets it too, and mirrored
 ///   here so the caller's own input is blamed by name. Same arrangement as
-///   the batch-size gate on the create surface above.
+///   the batch-size gate on the create surface above. A continuation has
+///   no caller order to normalize; the order its token was minted under is
+///   checked behind the service instead, and a token bound to an unsound
+///   keyset is refused as `INVALID_CURSOR` against `cursor`.
 ///
 /// Per-key metadata filtering is the typed side-channel
 /// [`MetadataFilter`] from the SDK — `toolkit-odata` has no surface for
@@ -494,8 +497,8 @@ const METADATA_PREFIX: &str = "metadata.";
 /// 1. reject `$top > MAX_PAGE_SIZE` as `InvalidArgument` (no silent
 ///    clamp; a caller asking for more rows than the page-size cap MUST
 ///    be told so they can paginate explicitly);
-/// 2. run the domain's keyset floor [`ensure_admissible_keyset_order`] on
-///    the caller's `$orderby`, which refuses a mixed-direction or
+/// 2. run the domain's keyset floor [`establish_keyset_order`] on the
+///    caller's `$orderby`, which refuses a mixed-direction or
 ///    non-mandatory order key and otherwise appends whichever of
 ///    `window_end` / `id` the caller did not name, in their direction;
 /// 3. validate the optional cursor against the order derived from its own
@@ -535,7 +538,7 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
     }
 
     // 2. $orderby admissibility + the canonical keyset fields, both from
-    // the domain's keyset floor. It refuses a mixed-direction order and an
+    // the domain's first-page floor. It refuses a mixed-direction order and an
     // order key that is not a mandatory record attribute — `created_at` is
     // one such name now, so a stale caller order fails closed rather than
     // resolving — and otherwise appends whichever of `window_end` / `id`
@@ -547,11 +550,11 @@ fn prepare_list_query(mut query: ODataQuery) -> Result<ODataQuery, CanonicalErro
     // Skipped when a cursor is present: the toolkit OData extractor leaves
     // `order` empty on a cursor request (and rejects `$orderby` + `cursor`
     // together), so there is no caller order to floor yet — the effective
-    // one is reconstructed from the token's signed keys in step 3. The
-    // floor still sees it, behind the service, where it is required to
-    // already be a sound keyset rather than extended into one.
+    // one is reconstructed from the token's signed keys in step 3, and the
+    // service then puts it through `require_continuation_keyset`, which
+    // checks rather than extends.
     if query.cursor.is_none() {
-        ensure_admissible_keyset_order(&mut query).map_err(usage_collector_error_to_canonical)?;
+        establish_keyset_order(&mut query).map_err(usage_collector_error_to_canonical)?;
     }
 
     // 3. Cursor validation + order materialization. When a cursor is

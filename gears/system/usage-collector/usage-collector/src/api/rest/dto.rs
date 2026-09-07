@@ -171,8 +171,8 @@ pub struct UsageRecordDto {
     pub window_start: OffsetDateTime,
     /// Exclusive end of the covered period — the bound the read paths
     /// select on, via the mandatory `from` / `to` range
-    /// (`cpt-cf-usage-collector-adr-window-end-selection`), and the
-    /// leading key of the raw path's `(window_end, id)` page order.
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`), and a key
+    /// every raw-path page order names.
     #[serde(with = "time::serde::rfc3339")]
     pub window_end: OffsetDateTime,
 }
