@@ -32,6 +32,7 @@ These carry the target model. Read the sections named, not the whole corpus.
 1. **Distrust every code sketch in this plan.** Sketches were written against the tree at `add59d9b8` and are a starting point, not a specification. Verify each API against the real source before using it. If a sketch does not match reality, **push back and say so in your report** — do not bend code to make a sketch compile. Three of the defects found in slices 1-2 originated in plan sketches.
 2. **Falsify every task before reporting done.** After the tests pass: deliberately weaken the branch the task exists to protect, confirm the corresponding test fails, restore, force a genuine rebuild, re-verify. Report the falsification honestly, including anything that did *not* fail when you expected it to.
    - Restoring with `mv` preserves mtime, so cargo skips the rebuild and your falsification silently passes. Use `cp`, then `touch` the file, and confirm a `Compiling cf-gears-…` line in the output before you trust the result. This produced one false pass in slice 2.
+   - **Falsify more than the mutation this plan names.** A named mutation proves one test earns its place; it says nothing about what the suite as a whole would miss. For any predicate or boundary rule, enumerate the mutations a careless edit would actually produce — drop one conjunct, relax one comparison to its non-strict form, collapse a range to an equality — and check that each is caught. Task 1's review found two surviving mutations of an eight-test suite that covered both bounds and nothing between or below them, while the plan's own falsification step happened to name a mutation the suite already caught.
 3. **Tests live in a sibling `*_tests.rs` file**, hooked with
    ```rust
    #[cfg(test)]
@@ -127,7 +128,7 @@ Purely additive: nothing calls `TimeRange` yet. Task 3 threads it through.
 Two design points to preserve, because both are load-bearing:
 
 - The accessors are named `lower_inclusive()` and `upper_exclusive()`, both taking `self` by value (the type is `Copy`). Three names were rejected, each for a reason worth keeping: `from()` / `to()` mirror the wire parameters but a bare `from` collides with the `From` trait convention, and neither name says which end is inclusive — the thing an off-by-one gets wrong. `from_inclusive()` / `to_exclusive()` fix the second problem and trip `clippy::wrong_self_convention`, which reads `from_*` as a constructor prefix; suppressing it would also force an asymmetric `&self` / `self` pair, because clippy rules the two prefixes differently. `start_*` / `end_*` are lint-clean but reuse the entry's `window_start` / `window_end` vocabulary for a *query range*, which is the conflation this slice most needs to avoid — the range is not an entry's period, and it selects on `window_end` alone. `lower` / `upper` are lint-clean, symmetric, and unambiguous.
-- `contains_window_end` is the **only** place the predicate `from <= window_end < to` is spelled in the workspace. Test doubles and (in slice 6) the plugin contract suite call it rather than re-deriving it.
+- `contains_window_end` is the **reference** spelling of `from <= window_end < to`: every in-process implementation calls it rather than re-deriving it, and the in-memory test doubles will. It is deliberately not described as the *only* spelling in the workspace, which is a claim that cannot hold — a SQL-backed plugin cannot call a Rust method and must emit `window_end >= $n AND window_end < $m` in its own `WHERE` clause. What binds the two to one boundary is the slice-6 contract suite, which is the honest reason that suite exists.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -187,8 +188,24 @@ fn new_normalizes_both_bounds_to_utc() {
 
 #[test]
 fn selection_is_inclusive_at_the_lower_bound() {
+    // This is also what makes a point event on a range boundary selectable
+    // without a case of its own: a point event's window_end equals its
+    // window_start, so it arrives here as an ordinary bound-equal entry.
+    // The rule ADR-0014 replaced dropped exactly that entry.
     let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
     assert!(range.contains_window_end(at(1_700_000_000)));
+}
+
+#[test]
+fn selection_holds_inside_the_range() {
+    let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
+    assert!(range.contains_window_end(at(1_700_001_800)));
+}
+
+#[test]
+fn an_entry_ending_before_the_lower_bound_is_not_selected() {
+    let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
+    assert!(!range.contains_window_end(at(1_699_999_999)));
 }
 
 #[test]
@@ -201,28 +218,23 @@ fn selection_is_exclusive_at_the_upper_bound() {
 }
 
 #[test]
-fn a_point_event_on_the_lower_bound_is_selected() {
-    // A point event is a zero-length period, not a separate shape: it has
-    // window_start == window_end, and the one predicate selects it. The
-    // rule ADR-0014 replaced dropped exactly this entry.
-    let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
-    let instant = at(1_700_000_000);
-    assert!(range.contains_window_end(instant));
-}
-
-#[test]
-fn an_entry_wider_than_the_range_is_selected_by_neither_side() {
-    // The predicate reads window_end and nothing else. An entry covering
-    // [range.from - 1h, range.to + 1h) is invisible to the range, and to
-    // the range before it.
+fn an_entry_wider_than_the_range_falls_in_exactly_one_range() {
+    // The predicate reads window_end and nothing else, so a range does not
+    // see an entry that merely overlaps it — and the entry is not lost
+    // either. ADR-0014's load-bearing consequence is that a range
+    // *partitions* the entries: each falls in exactly one range of any
+    // partition, which is what lets a consumer sum adjacent ranges.
     let range = TimeRange::new(at(1_700_000_000), at(1_700_003_600)).expect("range");
     let wide_entry_end = range.upper_exclusive() + Duration::hours(1);
     assert!(!range.contains_window_end(wide_entry_end));
 
-    let earlier = TimeRange::new(at(1_699_996_400), at(1_700_000_000)).expect("range");
-    assert!(!earlier.contains_window_end(wide_entry_end));
+    let next = TimeRange::new(range.upper_exclusive(), wide_entry_end + Duration::hours(1))
+        .expect("range");
+    assert!(next.contains_window_end(wide_entry_end));
 }
 ```
+
+Note what is deliberately **not** here: a test named for a point event calling `contains_window_end`. That method takes only a `window_end` and has no `window_start`, so it cannot distinguish a point event from any other entry — such a test would be assertion-identical to `selection_is_inclusive_at_the_lower_bound` and would pass forever regardless of point-event handling. ADR-0014's point-event confirmation lands on the ingestion path in task 2 and in the slice-6 contract suite, where the record actually carries both bounds.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -239,11 +251,12 @@ In `usage-collector-sdk/src/error.rs`, next to the other `InvalidArgument` const
 ```rust
     /// A read-path time range was empty or inverted (`to <= from`).
     ///
-    /// The range is mandatory on every read path and selects an entry when
-    /// `from <= window_end < to` (`cpt-cf-usage-collector-adr-window-end-selection`),
-    /// so a range that is not strictly ordered selects nothing whatever is
-    /// stored. Rejecting it names the caller's mistake instead of reporting
-    /// an empty result that reads as "no usage".
+    /// A range becomes mandatory on every read path in task 3, and it
+    /// selects an entry when `from <= window_end < to`
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`), so a range that
+    /// is not strictly ordered selects nothing whatever is stored.
+    /// Rejecting it names the caller's mistake instead of reporting an
+    /// empty result that reads as "no usage".
     #[must_use]
     pub fn invalid_time_range(from: OffsetDateTime, to: OffsetDateTime) -> Self {
         Self::InvalidArgument {
@@ -252,15 +265,34 @@ In `usage-collector-sdk/src/error.rs`, next to the other `InvalidArgument` const
             field: "time_range".to_owned(),
             reason: ValidationReason::Validation,
             detail: format!(
-                "time range requires from < to (got from={from}, to={to}); the range \
-                 selects an entry when from <= window_end < to, so an empty or \
-                 inverted range selects nothing"
+                "time range requires from < to (got from={}, to={}); supply a lower \
+                 bound strictly before the upper bound",
+                rfc3339(from),
+                rfc3339(to),
             ),
         }
     }
 ```
 
-Add `use time::OffsetDateTime;` to `error.rs` if it is not already imported.
+Add `use time::OffsetDateTime;` to `error.rs` if it is not already imported, plus this private helper:
+
+```rust
+/// Renders a timestamp for a caller-facing `detail`.
+///
+/// `OffsetDateTime`'s `Display` is space-separated with an unpadded hour, a
+/// trailing `.0`, and `+00:00:00` in place of `Z` — none of which a caller
+/// sent or can resubmit. The wire contract's `Timestamp` is RFC 3339, so a
+/// diagnostic quotes the value back in the form it arrived in. The fallback
+/// is unreachable (`Rfc3339` cannot fail to format an `OffsetDateTime`) and
+/// exists so a diagnostic path cannot panic.
+fn rfc3339(value: OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| value.to_string())
+}
+```
+
+Every constructor in this file that quotes a timestamp uses it — including the two task 2 adds.
 
 `ValidationReason::Validation` (wire `VALIDATION`) is deliberate: the OpenAPI contract names no finer code for a malformed range, and slice 6 owns the final reason-vocabulary pass. Do not invent a new wire code here.
 
@@ -279,11 +311,19 @@ Create `usage-collector-sdk/src/time_range.rs`:
 //! ranges sum without double counting, and it lets a plugin serve a range
 //! from a rollup keyed on one column.
 //!
-//! The range is a typed parameter on the SDK trait, the Plugin SPI and the
-//! REST surface — never a `$filter` conjunct (DESIGN §3.3 rule 5). That is
-//! why the covered-period fields are reserved on the filter surface: a
-//! predicate over one would be a second, possibly contradictory, constraint
-//! on something already fixed.
+//! The range travels as a typed parameter and never as a `$filter`
+//! conjunct. DESIGN §3.3 rule 5 states that for the two Rust surfaces —
+//! the SDK trait and the Plugin SPI — and §3.1's filter-surface
+//! reservation states it for the wire: "The covered period is likewise not
+//! filterable — the time range is a first-class parameter." That is why the
+//! covered-period fields are reserved on the filter surface (see
+//! `RESERVED_FILTER_FIELDS` in the host crate's `domain::query`): a
+//! predicate over one would be a second, possibly contradictory,
+//! constraint on something already fixed.
+//!
+//! Task 3 of this slice threads the range through those surfaces, replacing
+//! the bounded-`created_at` `$filter` conjunct that carries it today. Until
+//! then this type has no callers.
 
 use time::{OffsetDateTime, UtcOffset};
 
@@ -343,14 +383,20 @@ impl TimeRange {
     /// Does this range select an entry whose covered period ends at
     /// `window_end`?
     ///
-    /// The single spelling of `from <= window_end < to` in the workspace.
-    /// Every surface that needs the predicate — test doubles, and the
-    /// Plugin SPI contract suite — calls this rather than re-deriving it,
-    /// because two spellings of one boundary rule is how the exclusive
-    /// upper bound stops being exclusive on one path.
+    /// The reference spelling of `from <= window_end < to`. Every
+    /// in-process implementation calls it rather than re-deriving the
+    /// predicate, because two spellings of one boundary rule is how an
+    /// exclusive upper bound stops being exclusive on one path. A
+    /// SQL-backed plugin cannot call it and restates the predicate in its
+    /// `WHERE` clause; the slice-6 contract suite is what holds the two to
+    /// the same boundary.
+    ///
+    /// `window_end` needs no normalization: `OffsetDateTime` comparison is
+    /// instant-based — `time` projects the operand into the receiver's
+    /// offset before comparing — so an argument in any offset compares
+    /// correctly against these UTC bounds.
     #[must_use]
-    pub fn contains_window_end(&self, window_end: OffsetDateTime) -> bool {
-        let window_end = window_end.to_offset(UtcOffset::UTC);
+    pub fn contains_window_end(self, window_end: OffsetDateTime) -> bool {
         self.from <= window_end && window_end < self.to
     }
 }
@@ -370,7 +416,7 @@ pub mod time_range;
 pub use time_range::TimeRange;
 ```
 
-Also add `TimeRange` to the crate-level doc comment's domain-models bullet, next to `UsageRecord`.
+Give `TimeRange` **its own bullet** in the crate-level doc comment, not a slot in the domain-models bullet next to `UsageRecord` and `ResourceRef`. It is a read-path query parameter, not a persisted entity — the same distinction the accessor naming works to keep — and the crate's front door is where a reader forms that expectation.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -378,11 +424,18 @@ Also add `TimeRange` to the crate-level doc comment's domain-models bullet, next
 cargo nextest run -p cf-gears-usage-collector-sdk time_range
 ```
 
-Expected: 8 tests pass.
+Expected: 9 tests pass.
 
 - [ ] **Step 6: Falsify**
 
-Weaken `contains_window_end` to `window_end <= self.to` (making the upper bound inclusive), rebuild, and confirm `selection_is_exclusive_at_the_upper_bound` fails. Then weaken `new` to `if to < from`, and confirm `new_rejects_an_empty_range` fails. Restore with `cp` + `touch`, confirm a `Compiling` line, re-run.
+Four mutations, restored between each. The first two are the ones a suite covering only the two bounds silently survives, which is why the inside-the-range and below-the-lower-bound tests exist:
+
+1. `self.from == window_end` — the interval collapses to lower-bound equality.
+2. `window_end < self.to` — the lower-bound conjunct disappears.
+3. `self.from <= window_end && window_end <= self.to` — the upper bound turns inclusive.
+4. `new`'s guard weakened to `if to < from` — an empty range is admitted.
+
+Each must make at least one test fail, and you must report which test caught which. Restore with `cp` + `touch` and confirm a `Compiling` line before re-verifying.
 
 - [ ] **Step 7: Verification bar and commit**
 
@@ -1120,11 +1173,13 @@ In `usage-collector-sdk/src/error.rs`:
             field: field.to_owned(),
             reason: ValidationReason::Validation,
             detail: format!(
-                "covered-period bound `{field}` carries finer than microsecond \
+                "covered-period bound `{field}` = {} carries finer than microsecond \
                  precision ({} ns); the entry identity derivation reads a \
                  fixed-width microsecond form, so a finer value is rejected \
-                 rather than truncated",
-                bound.nanosecond()
+                 rather than truncated — round the bound to the microsecond \
+                 before submitting",
+                rfc3339(bound),
+                bound.nanosecond(),
             ),
         }
     }
@@ -1142,8 +1197,10 @@ In `usage-collector-sdk/src/error.rs`:
             reason: ValidationReason::Validation,
             detail: format!(
                 "covered period requires window_start <= window_end (got \
-                 window_start={window_start}, window_end={window_end}); equal \
-                 bounds are a point event and are valid"
+                 window_start={}, window_end={}); equal bounds are a point \
+                 event and are valid",
+                rfc3339(window_start),
+                rfc3339(window_end),
             ),
         }
     }
@@ -1812,6 +1869,7 @@ BODY
 ## Task 5: bind the time range into the cursor fingerprint
 
 **Files:**
+- Modify: `usage-collector-sdk/src/time_range.rs`, `.../time_range_tests.rs`
 - Modify: `usage-collector/src/api/rest/handlers/usage_records.rs`, `.../usage_records_tests.rs`
 
 Why this task exists: `CursorV1.f` and `ODataQuery.filter_hash` exist so that a caller who changes their `$filter` between pages is rejected with `FILTER_MISMATCH` instead of being served a keyset continuation minted over a different row set. Until this slice the mandatory window lived *inside* `$filter`, so the fingerprint covered it for free. Task 3 moved the range out, which silently dropped that protection: a page-2 request can now carry the same cursor with a different `from` / `to` and be served. Restoring the property is one function.
@@ -1907,20 +1965,40 @@ Expected: compilation failure — `effective_filter_hash` does not exist and `pr
 /// request carrying the same cursor with a different `from` / `to` is
 /// served a continuation that means nothing over its own row set.
 ///
-/// The range contributes its canonical bound rendering rather than a second
+/// The range contributes its canonical rendering rather than a second
 /// hash: the value is opaque to callers, and one fewer hashing primitive is
 /// one fewer thing that can disagree with itself. The PDP scope is
 /// deliberately absent — it is server-injected, not caller-controlled, and
 /// `compose_query_with_scope` documents why it must stay out.
 fn effective_filter_hash(query: &ODataQuery, time_range: TimeRange) -> String {
     let filter = toolkit_odata::short_filter_hash(query.filter()).unwrap_or_default();
-    format!(
-        "{filter}~{}~{}",
-        usage_collector_sdk::id::canonical_period_bound(time_range.lower_inclusive()),
-        usage_collector_sdk::id::canonical_period_bound(time_range.upper_exclusive()),
-    )
+    format!("{filter}~{}", time_range.canonical_form())
 }
 ```
+
+The range's canonical rendering goes on `TimeRange` itself, in the SDK, rather than being composed from two `canonical_period_bound` calls at this call site:
+
+```rust
+    /// The range's canonical text form, `<from>~<to>`, with each bound in
+    /// the fixed-width UTC form the identity derivation uses
+    /// ([`crate::id::canonical_period_bound`]).
+    ///
+    /// One spelling, because this value ends up inside an opaque
+    /// pagination cursor: the gateway folds it into the fingerprint a
+    /// cursor is validated against, so a second spelling that ordered or
+    /// padded the bounds differently would reject every cursor minted
+    /// under the first.
+    #[must_use]
+    pub fn canonical_form(self) -> String {
+        format!(
+            "{}~{}",
+            crate::id::canonical_period_bound(self.from),
+            crate::id::canonical_period_bound(self.to),
+        )
+    }
+```
+
+This is the same "two spellings of one rule" hazard `contains_window_end` guards against, one level up: the fingerprint is compared across requests, so its rendering has to be a single function. Add a test pinning the exact string for a known range, and one asserting two ranges differing only in their upper bound render differently.
 
 `prepare_list_query(mut query: ODataQuery, time_range: TimeRange)` sets
 
@@ -2066,4 +2144,4 @@ Two additions beyond the handoff's bullet list, both stated with their reasons i
 
 **Placeholders** — none. Every code step carries the code; test steps that adapt to an existing fixture say which fixture and what to assert.
 
-**Type consistency** — `TimeRange::new` / `lower_inclusive` / `upper_exclusive` / `contains_window_end`, `canonical_period_bound`, `derive_usage_record_id(tenant, &gts, &key, window_start, window_end)`, `try_into_usage_record`, `effective_filter_hash(&query, time_range)`, `TYPED_LIST_PARAMS` / `TYPED_AGGREGATE_PARAMS`, `last_list_time_range` / `last_aggregate_time_range` are spelled identically in every task that names them.
+**Type consistency** — `TimeRange::new` / `lower_inclusive` / `upper_exclusive` / `contains_window_end` / `canonical_form`, `canonical_period_bound`, `rfc3339`, `derive_usage_record_id(tenant, &gts, &key, window_start, window_end)`, `try_into_usage_record`, `effective_filter_hash(&query, time_range)`, `TYPED_LIST_PARAMS` / `TYPED_AGGREGATE_PARAMS`, `last_list_time_range` / `last_aggregate_time_range` are spelled identically in every task that names them.
