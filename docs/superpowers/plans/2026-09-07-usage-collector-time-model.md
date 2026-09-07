@@ -2117,7 +2117,11 @@ grep -rniE "record creation timestamp|TimeWindow|time window .*filter|unbounded 
 # 6. Self-dating prose. Every hedge this slice wrote about what a later
 #    task changes has now expired: the later task landed. Unlike a stale
 #    tense, these assert a state of the code that is now false.
-grep -rniE "at this commit|in this slice|a later commit|later in this slice|not yet wired" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
+#    Match on the SHORTEST distinctive fragment, never the whole phrase:
+#    task 4 found two hedges the long form missed because a line break
+#    fell inside the phrase mid-sentence. Rustfmt does not reflow doc
+#    comments, so any multi-word grep over prose undercounts.
+grep -rniE "at this commit|in this slice|later commit|not yet wired|after this plan" --include='*.rs' usage-collector usage-collector-sdk plugins/noop-usage-collector-plugin
 
 # 7. Plan task numbers in shipped prose. A reader outside the plan cannot
 #    resolve "Task 3". Pre-existing sites are out of scope; anything this
