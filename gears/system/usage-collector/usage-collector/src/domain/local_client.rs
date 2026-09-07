@@ -7,7 +7,10 @@
 //! `list_usage_records` and `query_aggregated_usage_records` are both
 //! realized by the `usage-query` feature and delegate to the
 //! same-named methods on [`Service`] (PDP authorization, PDP constraint
-//! composition into the `OData` filter, plugin SPI dispatch).
+//! composition into the `OData` filter, plugin SPI dispatch). The
+//! mandatory `time_range` is forwarded verbatim: an in-process caller
+//! already holds a validated [`TimeRange`], so there is nothing to parse
+//! here and no second place a range could be dropped.
 
 use std::sync::Arc;
 
@@ -17,7 +20,7 @@ use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, MeterTypeId,
-    UsageCollectorClientV1, UsageCollectorError, UsageRecord,
+    TimeRange, UsageCollectorClientV1, UsageCollectorError, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -67,12 +70,20 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
         &self,
         ctx: &SecurityContext,
         gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorError> {
         self.svc
-            .query_aggregated_usage_records(ctx, gts_type_id, query, metadata_filter, group_by)
+            .query_aggregated_usage_records(
+                ctx,
+                gts_type_id,
+                time_range,
+                query,
+                metadata_filter,
+                group_by,
+            )
             .await
     }
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
@@ -82,11 +93,12 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
         &self,
         ctx: &SecurityContext,
         gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError> {
         self.svc
-            .list_usage_records(ctx, gts_type_id, query, metadata_filter)
+            .list_usage_records(ctx, gts_type_id, time_range, query, metadata_filter)
             .await
     }
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use usage_collector_sdk::{
     AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
-    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
+    TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 
 #[derive(Debug, Default)]
@@ -59,6 +59,7 @@ impl UsageCollectorPluginV1 for NoopBackend {
     async fn query_aggregated_usage_records(
         &self,
         _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
         _fold: AggregationFold,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
@@ -72,6 +73,7 @@ impl UsageCollectorPluginV1 for NoopBackend {
     async fn list_usage_records(
         &self,
         _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {

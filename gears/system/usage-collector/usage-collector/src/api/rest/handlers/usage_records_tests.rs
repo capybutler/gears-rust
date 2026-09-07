@@ -469,16 +469,50 @@ fn sample_persisted_record(id: Uuid, tenant_id: Uuid) -> UsageRecord {
     sample_persisted_record_with_status(id, tenant_id, UsageRecordStatus::Active)
 }
 
-/// An [`ODataQuery`](toolkit_odata::ODataQuery) carrying a bounded
-/// `created_at` window so a read request clears the gateway's
-/// bounded-window guard and reaches the service / plugin.
-fn bounded_window_query() -> toolkit_odata::ODataQuery {
-    let expr = toolkit_odata::parse_filter_string(
-        "created_at ge 2026-01-01T00:00:00Z and created_at lt 2026-02-01T00:00:00Z",
-    )
-    .expect("bounded window filter parses")
-    .into_expr();
-    toolkit_odata::ODataQuery::from(Some(expr))
+/// Wire spelling of the mandatory raw-path range's inclusive lower bound.
+const RANGE_FROM: &str = "1970-01-01T00:00:00Z";
+/// Wire spelling of its exclusive upper bound. One hour later, so a
+/// handler that swapped or reused a bound fails rather than passing by
+/// symmetry.
+const RANGE_TO: &str = "1970-01-01T01:00:00Z";
+
+/// The mandatory `from` / `to` query parameters every raw-path read
+/// carries. A single helper rather than two literals per call site: the
+/// range is mandatory on every list request, so every one of them would
+/// otherwise repeat the pair.
+fn range_params() -> Vec<(String, String)> {
+    vec![
+        ("from".to_owned(), RANGE_FROM.to_owned()),
+        ("to".to_owned(), RANGE_TO.to_owned()),
+    ]
+}
+
+/// The same range in the aggregate path's carrier — its request body.
+fn range_body() -> crate::api::rest::dto::TimeRangeDto {
+    crate::api::rest::dto::TimeRangeDto {
+        from: OffsetDateTime::UNIX_EPOCH,
+        to: EPOCH_PLUS_ONE_HOUR,
+    }
+}
+
+/// The `field` of the first `field_violations[]` entry in a canonical
+/// `Problem` response body, or `None` when the body carries none.
+///
+/// Read off the wire rather than off a `CanonicalError`, because a handler
+/// test's subject is what a caller receives: a 400 that names no parameter
+/// leaves the caller diffing their request against the docs.
+async fn first_violation_field(response: axum::response::Response) -> Option<String> {
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collected");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("Problem is JSON");
+    body.get("context")?
+        .get("field_violations")?
+        .as_array()?
+        .first()?
+        .get("field")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn sample_persisted_record_with_status(
@@ -2061,6 +2095,193 @@ mod parse_required_gts_type_id_tests {
 }
 
 // ---------------------------------------------------------------------------
+// parse_required_time_range — the raw path's typed mandatory range
+// ---------------------------------------------------------------------------
+//
+// `parse_required_time_range` is the only place the raw path lifts the
+// `from` / `to` query-string pair into a validated `TimeRange`. Six
+// failure modes collapse onto the same `400` at the wire boundary
+// (absent, duplicated, offset-less, unparseable, inverted, empty), so
+// each is pinned separately here — including which of the two parameters
+// the violation blames, because "one of your timestamps is wrong" is not
+// an actionable diagnostic.
+
+mod parse_required_time_range_tests {
+    use time::{OffsetDateTime, UtcOffset};
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_canonical_errors::context::InvalidArgumentV1;
+
+    use super::super::parse_required_time_range;
+    use super::{RANGE_FROM, RANGE_TO};
+
+    fn p(key: &str, value: &str) -> (String, String) {
+        (key.to_owned(), value.to_owned())
+    }
+
+    fn first_violation(err: &CanonicalError) -> (String, String, String) {
+        match err {
+            CanonicalError::InvalidArgument {
+                ctx: InvalidArgumentV1::FieldViolations { field_violations },
+                ..
+            } => {
+                let v = field_violations.first().expect("at least one violation");
+                (v.field.clone(), v.reason.clone(), v.description.clone())
+            }
+            _ => panic!("expected InvalidArgument with field_violations, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn a_well_formed_pair_maps_from_to_the_lower_bound_and_to_to_the_upper() {
+        // Also the anti-swap check: the two bounds are an hour apart, so a
+        // helper that read `to` into the lower slot would produce an
+        // inverted range and fail rather than pass by symmetry.
+        let range = parse_required_time_range(&[p("from", RANGE_FROM), p("to", RANGE_TO)])
+            .expect("a well-formed pair parses");
+        assert_eq!(range.lower_inclusive(), OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(
+            range.upper_exclusive(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        );
+    }
+
+    #[test]
+    fn a_non_utc_offset_is_accepted_and_normalized_to_the_same_instant() {
+        // `Timestamp` in the contract requires an offset, not UTC
+        // specifically. A caller sending `01:00:00+01:00` and one sending
+        // `00:00:00Z` name the same instant and MUST obtain the same
+        // range — the equivalence the covered period gets on ingestion.
+        let range = parse_required_time_range(&[
+            p("from", "1970-01-01T01:00:00+01:00"),
+            p("to", "1970-01-01T03:00:00+02:00"),
+        ])
+        .expect("an offset-bearing pair parses");
+        assert_eq!(
+            range.lower_inclusive(),
+            OffsetDateTime::UNIX_EPOCH,
+            "`01:00:00+01:00` is the epoch instant",
+        );
+        assert_eq!(
+            range.upper_exclusive(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            "`03:00:00+02:00` is one hour after the epoch",
+        );
+        assert_eq!(
+            range.lower_inclusive().offset(),
+            UtcOffset::UTC,
+            "normalization moves the offset, never the instant",
+        );
+        assert_eq!(range.upper_exclusive().offset(), UtcOffset::UTC);
+    }
+
+    #[test]
+    fn an_absent_from_is_rejected_naming_from() {
+        let err = parse_required_time_range(&[p("to", RANGE_TO)])
+            .expect_err("an absent lower bound MUST reject");
+        let (field, reason, description) = first_violation(&err);
+        assert_eq!(field, "from");
+        assert_eq!(reason, "VALIDATION");
+        assert!(
+            description.contains("missing required query parameter"),
+            "description MUST cite the missing-required idiom (got `{description}`)",
+        );
+    }
+
+    #[test]
+    fn an_absent_to_is_rejected_naming_to() {
+        // Separately from `from`: a helper that parsed only the lower bound
+        // and defaulted the upper one would pass the test above.
+        let err = parse_required_time_range(&[p("from", RANGE_FROM)])
+            .expect_err("an absent upper bound MUST reject");
+        let (field, _, _) = first_violation(&err);
+        assert_eq!(field, "to");
+    }
+
+    #[test]
+    fn a_duplicate_from_is_rejected_instead_of_silently_last_winning() {
+        let err = parse_required_time_range(&[
+            p("from", RANGE_FROM),
+            p("from", "1999-01-01T00:00:00Z"),
+            p("to", RANGE_TO),
+        ])
+        .expect_err("a duplicated lower bound MUST reject");
+        let (field, _, description) = first_violation(&err);
+        assert_eq!(field, "from");
+        assert!(
+            description.contains("at most once"),
+            "duplicate-rejection description MUST cite the at-most-once \
+             contract (got `{description}`)",
+        );
+    }
+
+    #[test]
+    fn an_offsetless_bound_is_rejected_rather_than_assumed_to_be_utc() {
+        // A bare local time would attribute usage to whatever offset the
+        // server happened to assume, so RFC 3339 (which requires an
+        // offset) is the parser, not a lenient date-time reader. Pinned on
+        // both bounds so a lenient parse on either one is caught.
+        for (offsetless, other) in [("from", "to"), ("to", "from")] {
+            let err = parse_required_time_range(&[
+                p(offsetless, "2026-01-01T00:00:00"),
+                p(other, if other == "to" { RANGE_TO } else { RANGE_FROM }),
+            ])
+            .expect_err("an offset-less timestamp MUST reject");
+            let (field, reason, description) = first_violation(&err);
+            assert_eq!(field, offsetless, "the violation MUST name the bad bound");
+            assert_eq!(reason, "VALIDATION");
+            assert!(
+                description.contains("offset"),
+                "description MUST say an offset is required (got `{description}`)",
+            );
+        }
+    }
+
+    #[test]
+    fn a_date_only_bound_is_rejected() {
+        let err = parse_required_time_range(&[p("from", "2026-01-01"), p("to", RANGE_TO)])
+            .expect_err("a date without a time MUST reject");
+        assert_eq!(first_violation(&err).0, "from");
+    }
+
+    #[test]
+    fn an_inverted_range_is_rejected_naming_time_range() {
+        // Both bounds parse; the ordering is what fails, so the violation
+        // belongs to the range as a whole rather than to either parameter.
+        let err = parse_required_time_range(&[p("from", RANGE_TO), p("to", RANGE_FROM)])
+            .expect_err("an inverted range MUST reject");
+        let (field, _, description) = first_violation(&err);
+        assert_eq!(field, "time_range");
+        assert!(
+            description.contains("from < to"),
+            "description MUST state the ordering contract (got `{description}`)",
+        );
+    }
+
+    #[test]
+    fn an_empty_range_is_rejected() {
+        // `[from, to)` with equal bounds selects nothing. Rejected at
+        // construction rather than dispatched as a guaranteed-empty read,
+        // so the boundary is `to > from` and not `to >= from`.
+        let err = parse_required_time_range(&[p("from", RANGE_FROM), p("to", RANGE_FROM)])
+            .expect_err("an empty range MUST reject");
+        assert_eq!(first_violation(&err).0, "time_range");
+    }
+
+    #[test]
+    fn a_one_microsecond_range_is_accepted() {
+        // The other side of the same boundary: the narrowest non-empty
+        // range must pass, so the rejection above is about emptiness and
+        // not about narrowness.
+        let range = parse_required_time_range(&[
+            p("from", "1970-01-01T00:00:00Z"),
+            p("to", "1970-01-01T00:00:00.000001Z"),
+        ])
+        .expect("the narrowest non-empty range is valid");
+        assert!(range.upper_exclusive() > range.lower_inclusive());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // reject_unknown_list_params — the list allowlist admits both page-size
 // spellings and nothing beyond the declared set.
 //
@@ -2098,14 +2319,31 @@ mod reject_unknown_list_params_tests {
     #[test]
     fn allowed_params_pass() {
         reject_unknown_list_params(&[
-            p("$filter", "created_at ge 1 and created_at lt 2"),
-            p("$orderby", "created_at asc"),
+            p("$filter", "resource_id eq 'r1'"),
+            p("$orderby", "tenant_id asc"),
             p("limit", "10"),
             p("cursor", "opaque"),
             p("gts_type_id", "g"),
+            p("from", "1970-01-01T00:00:00Z"),
+            p("to", "1970-01-01T01:00:00Z"),
             p("metadata.user_id", "u1"),
         ])
         .expect("the list allowlist admits every documented parameter");
+    }
+
+    #[test]
+    fn the_range_parameters_are_admitted_on_the_list_path() {
+        // `from` / `to` are the raw path's carrier for the mandatory
+        // covered-period range. Rejecting either here would refuse a
+        // parameter the handler goes on to require, so the endpoint could
+        // never be called successfully at all.
+        for admitted in ["from", "to"] {
+            reject_unknown_list_params(&[p("gts_type_id", "g"), p(admitted, "x")]).unwrap_or_else(
+                |err| {
+                    panic!("`{admitted}` MUST be admitted on the list path, got {err:?}");
+                },
+            );
+        }
     }
 
     #[test]
@@ -2153,10 +2391,25 @@ mod reject_unknown_list_params_tests {
 // ---------------------------------------------------------------------------
 
 mod reject_unknown_aggregate_params_tests {
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_canonical_errors::context::InvalidArgumentV1;
+
     use super::super::reject_unknown_aggregate_params;
 
     fn p(key: &str, value: &str) -> (String, String) {
         (key.to_owned(), value.to_owned())
+    }
+
+    fn violating_field(err: &CanonicalError) -> Option<String> {
+        let CanonicalError::InvalidArgument { ctx, .. } = err else {
+            return None;
+        };
+        match ctx {
+            InvalidArgumentV1::FieldViolations { field_violations } => {
+                field_violations.first().map(|v| v.field.clone())
+            }
+            _ => None,
+        }
     }
 
     #[test]
@@ -2186,6 +2439,29 @@ mod reject_unknown_aggregate_params_tests {
                 reject_unknown_aggregate_params(&[p(forbidden, "v")]).is_err(),
                 "`{forbidden}` MUST be rejected on the aggregate path - \
                  list-only OData parameters cannot leak through here",
+            );
+        }
+    }
+
+    #[test]
+    fn range_query_parameters_are_rejected_on_the_aggregate_path() {
+        // The aggregate path reads its range from the request body
+        // (`AggregationRequest.time_range`). Admitting the query-string
+        // spelling too would take a range nothing reads and answer `200`
+        // over whatever the body said — an accepted-and-ignored parameter,
+        // which is the drift these allowlists exist to stop. It must be
+        // named in a 400 instead.
+        for body_only in ["from", "to"] {
+            let err = reject_unknown_aggregate_params(&[
+                p("gts_type_id", "g"),
+                p(body_only, "1970-01-01T00:00:00Z"),
+            ])
+            .expect_err("a range query parameter MUST be rejected on the aggregate path");
+            assert_eq!(
+                violating_field(&err).as_deref(),
+                Some(body_only),
+                "the violation MUST name `{body_only}` so the caller learns to \
+                 move the range into the body",
             );
         }
     }
@@ -2393,7 +2669,7 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(Vec::new()),
+            Query(super::range_params()),
             OData(ODataQuery::new()),
         )
         .await
@@ -2413,10 +2689,13 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(vec![(
-                "gts_type_id".to_owned(),
-                "not-a-valid-prefix".to_owned(),
-            )]),
+            Query(
+                [
+                    vec![("gts_type_id".to_owned(), "not-a-valid-prefix".to_owned())],
+                    super::range_params(),
+                ]
+                .concat(),
+            ),
             OData(ODataQuery::new()),
         )
         .await
@@ -2436,10 +2715,16 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(vec![
-                ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
-                ("totally_unknown".to_owned(), "x".to_owned()),
-            ]),
+            Query(
+                [
+                    vec![
+                        ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
+                        ("totally_unknown".to_owned(), "x".to_owned()),
+                    ],
+                    super::range_params(),
+                ]
+                .concat(),
+            ),
             OData(ODataQuery::new()),
         )
         .await
@@ -2468,16 +2753,197 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(SecurityContext::anonymous()),
             Extension(service),
-            Query(vec![(
-                "gts_type_id".to_owned(),
-                HAPPY_RECORD_GTS_ID.to_owned(),
-            )]),
+            Query(
+                [
+                    vec![("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())],
+                    super::range_params(),
+                ]
+                .concat(),
+            ),
             OData(q),
         )
         .await
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_rejects_a_missing_from_parameter() {
+        // The range is mandatory on the wire. Without it the read would be
+        // an unbounded scan, so the handler MUST refuse before the service
+        // runs rather than defaulting a bound.
+        let service = service_no_plugin();
+
+        let response = handle_list_usage_records(
+            Extension(SecurityContext::anonymous()),
+            Extension(service),
+            Query(vec![
+                ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
+                ("to".to_owned(), super::RANGE_TO.to_owned()),
+            ]),
+            OData(ODataQuery::new()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("from"),
+            "the violation MUST name the absent parameter",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_a_missing_to_parameter() {
+        let service = service_no_plugin();
+
+        let response = handle_list_usage_records(
+            Extension(SecurityContext::anonymous()),
+            Extension(service),
+            Query(vec![
+                ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
+                ("from".to_owned(), super::RANGE_FROM.to_owned()),
+            ]),
+            OData(ODataQuery::new()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("to"),
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_an_offsetless_from_parameter() {
+        // `2026-01-01T00:00:00` carries no offset. A silent UTC assumption
+        // would attribute usage to whatever offset the server happened to
+        // pick, so this is a 400 rather than a lenient parse.
+        let service = service_no_plugin();
+
+        let response = handle_list_usage_records(
+            Extension(SecurityContext::anonymous()),
+            Extension(service),
+            Query(vec![
+                ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
+                ("from".to_owned(), "2026-01-01T00:00:00".to_owned()),
+                ("to".to_owned(), super::RANGE_TO.to_owned()),
+            ]),
+            OData(ODataQuery::new()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("from"),
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_an_inverted_range() {
+        let service = service_no_plugin();
+
+        let response = handle_list_usage_records(
+            Extension(SecurityContext::anonymous()),
+            Extension(service),
+            Query(vec![
+                ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
+                ("from".to_owned(), "2026-02-01T00:00:00Z".to_owned()),
+                ("to".to_owned(), "2026-01-01T00:00:00Z".to_owned()),
+            ]),
+            OData(ODataQuery::new()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("time_range"),
+            "both bounds parse; the ordering is what failed, so the violation \
+             belongs to the range rather than to either parameter",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rejects_a_duplicate_from_parameter() {
+        // Two different lower bounds: last-wins would silently pick one and
+        // mask the caller bug.
+        let service = service_no_plugin();
+
+        let response = handle_list_usage_records(
+            Extension(SecurityContext::anonymous()),
+            Extension(service),
+            Query(vec![
+                ("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned()),
+                ("from".to_owned(), super::RANGE_FROM.to_owned()),
+                ("from".to_owned(), "1999-01-01T00:00:00Z".to_owned()),
+                ("to".to_owned(), super::RANGE_TO.to_owned()),
+            ]),
+            OData(ODataQuery::new()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("from"),
+        );
+    }
+
+    #[tokio::test]
+    async fn list_forwards_the_parsed_wire_range_to_the_plugin() {
+        // The whole point of the wire parameters: the range a caller sent
+        // must arrive at the SPI as a typed `TimeRange`. A handler that
+        // dropped or substituted it would still answer `200` with a page,
+        // so the assertion is on what the plugin was handed.
+        let plugin = HappyPathPlugin::new();
+        plugin.set_list_usage_records_response(ODataPage::new(
+            vec![],
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 1000,
+            },
+        ));
+        let service = service_with_permit_plugin(&plugin, "test.handler.list_records.range.v1");
+
+        let response = handle_list_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(service),
+            Query(
+                [
+                    vec![("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())],
+                    super::range_params(),
+                ]
+                .concat(),
+            ),
+            OData(ODataQuery::new()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let range = plugin
+            .last_list_time_range()
+            .expect("the plugin MUST have been dispatched");
+        assert_eq!(
+            range.lower_inclusive(),
+            time::OffsetDateTime::UNIX_EPOCH,
+            "`from` MUST become the inclusive lower bound",
+        );
+        assert_eq!(
+            range.upper_exclusive(),
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            "`to` MUST become the exclusive upper bound",
+        );
     }
 
     #[tokio::test]
@@ -2507,11 +2973,14 @@ mod handle_list_usage_records_tests {
         let response = handle_list_usage_records(
             Extension(authenticated_ctx()),
             Extension(service),
-            Query(vec![(
-                "gts_type_id".to_owned(),
-                HAPPY_RECORD_GTS_ID.to_owned(),
-            )]),
-            OData(super::bounded_window_query()),
+            Query(
+                [
+                    vec![("gts_type_id".to_owned(), HAPPY_RECORD_GTS_ID.to_owned())],
+                    super::range_params(),
+                ]
+                .concat(),
+            ),
+            OData(ODataQuery::new()),
         )
         .await
         .into_response();
@@ -2623,6 +3092,7 @@ mod handle_query_aggregated_usage_records_tests {
 
     fn no_group() -> QueryAggregatedUsageRecordsRequest {
         QueryAggregatedUsageRecordsRequest {
+            time_range: super::range_body(),
             group_by: Vec::new(),
         }
     }
@@ -2709,6 +3179,7 @@ mod handle_query_aggregated_usage_records_tests {
             Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
             OData(ODataQuery::new()),
             Json(QueryAggregatedUsageRecordsRequest {
+                time_range: super::range_body(),
                 group_by: vec![AggregationDimensionDto::Metadata(String::new())],
             }),
         )
@@ -2719,6 +3190,99 @@ mod handle_query_aggregated_usage_records_tests {
             response.status(),
             StatusCode::BAD_REQUEST,
             "empty metadata-dimension key MUST refuse at the handler boundary",
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_rejects_a_from_query_parameter() {
+        // The aggregate path reads its range from the body. Accepting the
+        // query-string spelling as well would take a range nothing reads
+        // and answer `200` over whatever the body said, so it MUST be named
+        // in a 400 instead of ignored.
+        let service = service_no_plugin();
+
+        let response = handle_query_aggregated_usage_records(
+            Extension(SecurityContext::anonymous()),
+            Extension(service),
+            Query(vec![
+                ("gts_type_id".to_owned(), VALID_GTS_ID.to_owned()),
+                ("from".to_owned(), "1970-01-01T00:00:00Z".to_owned()),
+            ]),
+            OData(ODataQuery::new()),
+            Json(no_group()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("from"),
+            "the violation MUST name the parameter so the caller learns to \
+             move the range into the body",
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_rejects_an_inverted_body_range() {
+        let service = service_no_plugin();
+
+        let response = handle_query_aggregated_usage_records(
+            Extension(SecurityContext::anonymous()),
+            Extension(service),
+            Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
+            OData(ODataQuery::new()),
+            Json(QueryAggregatedUsageRecordsRequest {
+                time_range: crate::api::rest::dto::TimeRangeDto {
+                    from: super::EPOCH_PLUS_ONE_HOUR,
+                    to: time::OffsetDateTime::UNIX_EPOCH,
+                },
+                group_by: Vec::new(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            super::first_violation_field(response).await.as_deref(),
+            Some("time_range"),
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_forwards_the_body_range_to_the_plugin() {
+        // Mirror of the raw path's forwarding test, across the other
+        // carrier: the range in `AggregationRequest.time_range` must reach
+        // the SPI as a typed `TimeRange`.
+        let plugin = RecordingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+                RECORDING_PLUGIN_SUFFIX,
+            );
+        plugin.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
+
+        let response = handle_query_aggregated_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(service),
+            Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
+            OData(ODataQuery::new()),
+            Json(no_group()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let range = plugin
+            .last_aggregate_time_range()
+            .expect("the plugin MUST have been dispatched");
+        assert_eq!(range.lower_inclusive(), time::OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(
+            range.upper_exclusive(),
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         );
     }
 
@@ -2758,8 +3322,9 @@ mod handle_query_aggregated_usage_records_tests {
             Extension(authenticated_ctx()),
             Extension(service),
             Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
-            OData(super::bounded_window_query()),
+            OData(ODataQuery::new()),
             Json(QueryAggregatedUsageRecordsRequest {
+                time_range: super::range_body(),
                 group_by: vec![AggregationDimensionDto::ResourceType],
             }),
         )

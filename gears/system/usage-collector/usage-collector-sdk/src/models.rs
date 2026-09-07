@@ -673,9 +673,10 @@ pub struct UsageRecord {
     /// (`cpt-cf-usage-collector-adr-window-end-selection`, the reference
     /// spelling being [`crate::TimeRange::contains_window_end`]). Reading
     /// the end alone is what makes adjacent ranges sum without double
-    /// counting. Threading the read paths onto it — and retiring the
-    /// pre-slice `$filter` window they still carry at this commit — is a
-    /// later commit in this slice.
+    /// counting. Both read paths now take that range as a typed parameter
+    /// and select on this bound; their keyset page order still ends in the
+    /// retired instant field's tiebreaker, which a later commit in this
+    /// slice repoints onto this one.
     #[serde(with = "time::serde::rfc3339")]
     pub window_end: time::OffsetDateTime,
 }
@@ -990,7 +991,7 @@ pub struct AggregationResult {
 
 /// Maximum number of buckets a single [`AggregationResult`] may carry.
 ///
-/// The gateway-enforced bounded `created_at` window caps the rows an aggregate
+/// The mandatory read-path [`crate::TimeRange`] caps the rows an aggregate
 /// *scans*; this caps the distinct *groups* it produces. A high-cardinality
 /// [`AggregationDimension::Metadata`] key (e.g. a per-record id) could otherwise
 /// materialize an unbounded bucket set into memory, unlike the page-size-clamped

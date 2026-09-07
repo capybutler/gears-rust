@@ -9,6 +9,7 @@ use crate::models::{
     AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
     UsageRecord,
 };
+use crate::time_range::TimeRange;
 
 /// Backend storage adapter trait implemented by
 /// `usage-collector-plugin-<backend>` crates.
@@ -56,30 +57,54 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
         scope: &ast::Expr,
     ) -> Result<UsageRecord, UsageCollectorPluginError>;
 
-    /// Compute the given fold over the authorized scope.
+    /// Compute the given fold over the authorized scope and `time_range`.
     ///
     /// The fold arrives as a parameter: declarations never reach the SPI,
     /// so the plugin stays pure persistence and never resolves a type
-    /// itself. The time window is expressed inside `query.filter` as a
-    /// `created_at ge … and created_at lt …` predicate; there is no
-    /// separate typed parameter.
+    /// itself.
+    ///
+    /// `time_range` is a typed parameter and never appears in
+    /// `query.filter`. The plugin MUST select an entry when
+    /// `from <= window_end < to`
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`): the predicate
+    /// reads the period end alone, needs no case for a point event
+    /// (`window_start == window_end`), and MUST NOT match by overlap or by
+    /// containment — those make adjacent ranges double count or drop
+    /// entries. No selection predicate reads `window_start`.
+    /// [`TimeRange::contains_window_end`] is the reference spelling for an
+    /// in-process implementation; a SQL-backed plugin restates the same
+    /// boundary in its own `WHERE` clause.
     async fn query_aggregated_usage_records(
         &self,
         gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError>;
 
-    /// Keyset-paginated list of usage records.
+    /// Keyset-paginated ledger read over the authorized scope and
+    /// `time_range`.
     ///
-    /// `query.order` is guaranteed non-empty (the gateway defaults to
-    /// `(created_at asc, id asc)` if the caller omits `$orderby`), so
-    /// plugins MUST honour it for stable pagination.
+    /// `time_range` selects on the covered-period end under the same
+    /// obligation as [`Self::query_aggregated_usage_records`], and is
+    /// likewise absent from `query.filter`.
+    ///
+    /// A non-empty `query.order` MUST be honoured: it is the keyset the
+    /// page continuation is built from, so ignoring it drops rows across a
+    /// page boundary.
+    ///
+    /// Non-empty is guaranteed only on the REST path, where the gateway
+    /// appends the canonical unique tiebreaker suffix in the caller's sort
+    /// direction. An in-process SDK caller reaches the service directly and
+    /// may pass an [`ODataQuery`] carrying no order at all, so a plugin
+    /// MUST NOT assume the slot is populated — it applies its own
+    /// deterministic keyset when the slot is empty.
     async fn list_usage_records(
         &self,
         gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;

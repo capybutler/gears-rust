@@ -9,13 +9,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
+use time::OffsetDateTime;
 use toolkit::api::canonical_prelude::*;
 use toolkit_canonical_errors::Problem;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     AggregationDimension, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey,
-    MeterTypeId, ResourceRef, SubjectRef, UsageCollectorError, UsageRecord,
+    MeterTypeId, ResourceRef, SubjectRef, TimeRange, UsageCollectorError, UsageRecord,
     is_keyset_safe_record_field,
 };
 use uuid::Uuid;
@@ -160,17 +161,21 @@ pub async fn handle_get_usage_record(
 ///
 /// Keyset-paginated raw read over the persisted usage records.
 ///
-/// `gts_type_id` is the only mandatory non-OData query parameter (the SDK
-/// trait carries it as a typed [`MeterTypeId`] and the plugin SPI
-/// takes it as a typed named parameter). A bounded `[from, to)` time
-/// window is also mandatory: it is expressed inside `$filter` as
-/// `created_at ge … and created_at lt …` —
-/// `UsageRecordFilterField::created_at` is on the `OData` filter schema
-/// for exactly that purpose — and the service rejects an absent or
-/// one-sided window with `400 InvalidArgument`
-/// (`MISSING_TIME_WINDOW`) before any plugin dispatch. `$filter` /
-/// `$orderby` / `$top` (alias `limit`) / `cursor` flow through the
-/// standard [`OData`] extractor.
+/// `gts_type_id`, `from` and `to` are the mandatory non-OData query
+/// parameters, and all three carry typed values: the SDK trait and the
+/// plugin SPI take `gts_type_id` as a [`MeterTypeId`] and the `from` / `to`
+/// pair as one validated [`TimeRange`]. An entry is selected when the end
+/// of its covered period falls in that range — `from <= window_end < to`
+/// (`cpt-cf-usage-collector-adr-window-end-selection`).
+///
+/// The range never travels inside `$filter`: a predicate naming either
+/// covered-period bound is rejected, because it would be a second,
+/// possibly contradictory, constraint on something the range already
+/// fixes. A missing, duplicated, offset-less, or inverted bound is a
+/// `400 InvalidArgument` raised where the parameter is parsed — the same
+/// place and the same order as a malformed `gts_type_id`, which has always
+/// been parsed before the PDP call. `$filter` / `$orderby` / `$top` (alias
+/// `limit`) / `cursor` flow through the standard [`OData`] extractor.
 ///
 /// Gateway-side guards applied before the service is invoked:
 ///
@@ -184,13 +189,13 @@ pub async fn handle_get_usage_record(
 ///   `Problem`. The decoded `CursorV1` flows to the plugin via
 ///   `ODataQuery.cursor` unchanged.
 /// * **`$orderby` normalization** — the gateway always appends the
-///   canonical unique `(created_at, id)` suffix to the effective
-///   order so the plugin has a stable, gap-free keyset. When the caller
-///   omits `$orderby` this yields `(created_at asc, id asc)`; when the
-///   caller supplies an `$orderby` lacking a unique final key (e.g.
-///   `$orderby=created_at`), the missing tiebreaker key is appended in
-///   the caller's sort direction so pagination cannot drop rows tied on
-///   the boundary value.
+///   canonical unique `(time key, id)` suffix to the effective order so
+///   the plugin has a stable, gap-free keyset. When the
+///   caller supplies an `$orderby` lacking a unique final key, the missing
+///   tiebreaker key is appended in the caller's sort direction so
+///   pagination cannot drop rows tied on the boundary value. That suffix
+///   still names the retired instant field rather than the covered-period
+///   end the range selects on; a later commit in this slice repoints it.
 ///
 /// Per-key metadata filtering is the typed side-channel
 /// [`MetadataFilter`] from the SDK — `toolkit-odata` has no surface for
@@ -222,11 +227,11 @@ pub async fn handle_list_usage_records(
     OData(query): OData,
 ) -> ApiResult<Json<ODataPage<UsageRecordDto>>> {
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
-    let (gts_type_id, metadata_filter, query) = prepare_list_request(&params, query)?;
+    let (gts_type_id, time_range, metadata_filter, query) = prepare_list_request(&params, query)?;
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
 
     let page = service
-        .list_usage_records(&ctx, gts_type_id, &query, &metadata_filter)
+        .list_usage_records(&ctx, gts_type_id, time_range, &query, &metadata_filter)
         .await
         .map_err(usage_collector_error_to_canonical)?;
 
@@ -239,15 +244,27 @@ pub async fn handle_list_usage_records(
 ///
 /// Server-side aggregated read over the persisted usage records.
 ///
-/// The wire shape mirrors `GET /usage-collector/v1/records`: `gts_type_id` is a
-/// mandatory typed query parameter, the `OData` `$filter` (carrying the
-/// `[from, to)` time window as a `created_at` predicate) and the
-/// `metadata.<key>=<value>` typed side-channel flow through query
-/// parameters, and only the group-by dimensions ship in the JSON body —
-/// there is no aggregation parameter: the fold is resolved from the
-/// queried type's declaration. `$orderby`, `$top` / `limit`, and `cursor`
-/// are intentionally NOT accepted here — the aggregation result is not
-/// paginated (the SDK contract emits one `AggregationResult` per call).
+/// The wire shape mirrors `GET /usage-collector/v1/records` apart from where
+/// the range travels: `gts_type_id` is a mandatory typed query parameter and
+/// the `OData` `$filter` plus the `metadata.<key>=<value>` typed
+/// side-channel flow through query parameters, while the mandatory
+/// `time_range` and the group-by dimensions ship in the JSON body
+/// (`AggregationRequest` in `docs/usage-collector-v1.yaml`). There is no
+/// aggregation parameter: the fold is resolved from the queried type's
+/// declaration.
+///
+/// `from` / `to` are deliberately NOT accepted in the query string here.
+/// The aggregate path is a `POST` with a declared body, so the contract
+/// puts the range there; admitting the query-string spelling as well would
+/// accept a parameter nothing reads, which is exactly the drift the
+/// parameter allowlists exist to stop. Selection is the same single
+/// predicate either way — `from <= window_end < to`
+/// (`cpt-cf-usage-collector-adr-window-end-selection`) — and the range is
+/// never a `$filter` conjunct.
+///
+/// `$orderby`, `$top` / `limit`, and `cursor` are likewise not accepted —
+/// the aggregation result is not paginated (the SDK contract emits one
+/// `AggregationResult` per call).
 ///
 /// PDP authorization, declaration resolution, PDP-constraint composition
 /// into the `OData` filter, and the plugin SPI dispatch all happen inside
@@ -269,12 +286,19 @@ pub async fn handle_query_aggregated_usage_records(
     Json(req): Json<QueryAggregatedUsageRecordsRequest>,
 ) -> ApiResult<Json<AggregationResultDto>> {
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
-    let (gts_type_id, metadata_filter, query, group_by) =
+    let (gts_type_id, time_range, metadata_filter, query, group_by) =
         prepare_aggregate_request(&params, query, req)?;
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
 
     let result = service
-        .query_aggregated_usage_records(&ctx, gts_type_id, &query, &metadata_filter, &group_by)
+        .query_aggregated_usage_records(
+            &ctx,
+            gts_type_id,
+            time_range,
+            &query,
+            &metadata_filter,
+            &group_by,
+        )
         .await
         .map_err(usage_collector_error_to_canonical)?;
 
@@ -286,6 +310,7 @@ pub async fn handle_query_aggregated_usage_records(
 /// Result of every aggregate-path pre-service validator.
 type PreparedAggregateRequest = (
     MeterTypeId,
+    TimeRange,
     Vec<MetadataFilter>,
     ODataQuery,
     Vec<AggregationDimension>,
@@ -293,8 +318,15 @@ type PreparedAggregateRequest = (
 
 /// Bundle of every aggregate-path pre-service validator: parameter
 /// allowlist, typed `gts_type_id`, metadata filters, and the body-shape
-/// projection into typed [`AggregationDimension`]s. Propagates the
-/// canonical envelope verbatim on the first failing validator.
+/// projection into the typed [`TimeRange`] and [`AggregationDimension`]s.
+/// Propagates the canonical envelope verbatim on the first failing
+/// validator.
+///
+/// The range comes out of the body here, not the query string
+/// (`AggregationRequest.time_range`), so `deny_unknown_fields` on the DTO
+/// has already refused a body carrying anything else and serde has already
+/// refused one omitting `time_range`; what is left to check is the
+/// ordering, which [`TimeRange::new`] owns.
 fn prepare_aggregate_request(
     params: &[(String, String)],
     query: ODataQuery,
@@ -302,11 +334,13 @@ fn prepare_aggregate_request(
 ) -> Result<PreparedAggregateRequest, CanonicalError> {
     reject_unknown_aggregate_params(params)?;
     let gts_type_id = parse_required_gts_type_id(params)?;
+    let time_range =
+        TimeRange::try_from(req.time_range).map_err(usage_collector_error_to_canonical)?;
     let metadata_filter = parse_metadata_filters(params)?;
     let group_by = req
         .into_group_by()
         .map_err(usage_collector_error_to_canonical)?;
-    Ok((gts_type_id, metadata_filter, query, group_by))
+    Ok((gts_type_id, time_range, metadata_filter, query, group_by))
 }
 
 /// `$`-prefixed `OData` parameters accepted on the aggregate path. `$top`
@@ -316,13 +350,18 @@ fn prepare_aggregate_request(
 const AGGREGATE_ODATA_PARAMS: &[&str] = &["$filter"];
 
 /// Reject any query parameter on the aggregate path that is not in the
-/// declared aggregate-OData set, the typed list parameters (`gts_type_id`),
-/// or a `metadata.<key>` entry. Silent drop of unrecognised parameters
-/// is a documented contract-drift surface, mirroring `list_usage_records`.
+/// declared aggregate-OData set, the typed aggregate parameters
+/// (`gts_type_id`), or a `metadata.<key>` entry. Silent drop of
+/// unrecognised parameters is a documented contract-drift surface,
+/// mirroring `list_usage_records`.
+///
+/// Checks [`TYPED_AGGREGATE_PARAMS`] rather than [`TYPED_LIST_PARAMS`], so
+/// `from` / `to` are named in a `400` here instead of being accepted and
+/// ignored: the aggregate path reads its range from the request body.
 fn reject_unknown_aggregate_params(params: &[(String, String)]) -> Result<(), CanonicalError> {
     if let Some((key, _)) = params.iter().find(|(k, _)| {
         !AGGREGATE_ODATA_PARAMS.contains(&k.as_str())
-            && !TYPED_LIST_PARAMS.contains(&k.as_str())
+            && !TYPED_AGGREGATE_PARAMS.contains(&k.as_str())
             && !k.starts_with(METADATA_PREFIX)
     }) {
         return Err(UsageRecordResource::invalid_argument()
@@ -330,7 +369,7 @@ fn reject_unknown_aggregate_params(params: &[(String, String)]) -> Result<(), Ca
                 key,
                 format!(
                     "unrecognised query parameter `{key}`; expected one of \
-                     {TYPED_LIST_PARAMS:?}, OData parameters \
+                     {TYPED_AGGREGATE_PARAMS:?}, OData parameters \
                      {AGGREGATE_ODATA_PARAMS:?}, or `metadata.<key>` entries"
                 ),
                 "VALIDATION",
@@ -342,21 +381,22 @@ fn reject_unknown_aggregate_params(params: &[(String, String)]) -> Result<(), Ca
 
 /// Result of every pre-service validator, returned as a typed tuple
 /// so the handler can propagate the canonical envelope verbatim.
-type PreparedListRequest = (MeterTypeId, Vec<MetadataFilter>, ODataQuery);
+type PreparedListRequest = (MeterTypeId, TimeRange, Vec<MetadataFilter>, ODataQuery);
 
 /// Bundle of every pre-service validator: parameter allowlist, typed
-/// `gts_type_id`, metadata filters, and the `prepare_list_query`
-/// gateway-side guards. Propagates the canonical envelope verbatim on
-/// the first failing validator.
+/// `gts_type_id`, the typed `from` / `to` range, metadata filters, and the
+/// `prepare_list_query` gateway-side guards. Propagates the canonical
+/// envelope verbatim on the first failing validator.
 fn prepare_list_request(
     params: &[(String, String)],
     query: ODataQuery,
 ) -> Result<PreparedListRequest, CanonicalError> {
     reject_unknown_list_params(params)?;
     let gts_type_id = parse_required_gts_type_id(params)?;
+    let time_range = parse_required_time_range(params)?;
     let metadata_filter = parse_metadata_filters(params)?;
     let query = prepare_list_query(query)?;
-    Ok((gts_type_id, metadata_filter, query))
+    Ok((gts_type_id, time_range, metadata_filter, query))
 }
 
 /// Maximum number of records the gateway will request from the plugin
@@ -397,21 +437,32 @@ pub const MAX_METADATA_FILTER_VALUES: usize = 32;
 /// leaving the caller to diff the response against what they asked for.
 const OUR_ODATA_PARAMS: &[&str] = &["$filter", "$orderby", "$top", "limit", "cursor"];
 
-/// Typed query parameters carrying SDK values that are NOT part of the
-/// `OData` surface.
-const TYPED_LIST_PARAMS: &[&str] = &["gts_type_id"];
+/// Typed query parameters on the raw path carrying SDK values that are NOT
+/// part of the `OData` surface. The covered-period range travels here
+/// rather than in `$filter` (DESIGN §3.3 rule 5).
+const TYPED_LIST_PARAMS: &[&str] = &["gts_type_id", "from", "to"];
+
+/// Typed query parameters on the aggregate path. The range is in the
+/// request body there (`AggregationRequest.time_range`), so `from` / `to`
+/// are not accepted in the query string — an accepted-and-ignored
+/// parameter is exactly the drift this allowlist exists to stop.
+const TYPED_AGGREGATE_PARAMS: &[&str] = &["gts_type_id"];
 
 /// Prefix marking the typed-side-channel [`MetadataFilter`] entries
 /// (`metadata.<key>=<value>`, repeatable).
 const METADATA_PREFIX: &str = "metadata.";
 
 /// The canonical unique keyset suffix appended to every raw-list order.
-/// `created_at` is the primary time key and `id` the globally-unique final
-/// tiebreaker; the pair is the canonical cursor keyset. Appended (via
+/// The leading entry is the primary time key and `id` the globally-unique
+/// final tiebreaker; the pair is the canonical cursor keyset. Appended (via
 /// [`toolkit_odata::ODataOrderBy::ensure_tiebreaker`]) in the caller order's
-/// direction, so an empty `$orderby` normalizes to `(created_at, id)` and
-/// any explicit `$orderby` gains the same unique suffix — see
+/// direction, so an empty `$orderby` normalizes to the pair and any
+/// explicit `$orderby` gains the same unique suffix — see
 /// [`prepare_list_query`].
+///
+/// The time key here is still the retired instant field, not the
+/// covered-period end the mandatory range selects on; a later commit in
+/// this slice repoints it.
 const CANONICAL_TIEBREAKER_FIELDS: &[&str] = &["created_at", "id"];
 
 /// Apply gateway-side guards on the parsed [`ODataQuery`]:
@@ -608,6 +659,42 @@ fn reject_unknown_list_params(params: &[(String, String)]) -> Result<(), Canonic
 fn parse_required_gts_type_id(params: &[(String, String)]) -> Result<MeterTypeId, CanonicalError> {
     let raw = require_single_value(params, "gts_type_id")?;
     MeterTypeId::new(raw.clone()).map_err(usage_collector_error_to_canonical)
+}
+
+/// Extract the mandatory `from` / `to` query parameters into a validated
+/// [`TimeRange`].
+///
+/// Both are parsed as RFC 3339, which rejects an offset-less timestamp —
+/// `docs/usage-collector-v1.yaml`'s `Timestamp` requires an offset, and a
+/// bare local time would silently attribute usage to whatever offset the
+/// server happened to assume. Absence and duplicates go through
+/// [`require_single_value`], so last-wins ambiguity cannot mask a caller
+/// bug, and the ordering check is [`TimeRange::new`]'s.
+///
+/// Runs pre-PDP, alongside [`parse_required_gts_type_id`]: a request whose
+/// typed parameters do not parse has no shape to authorize.
+fn parse_required_time_range(params: &[(String, String)]) -> Result<TimeRange, CanonicalError> {
+    let from = parse_range_bound(params, "from")?;
+    let to = parse_range_bound(params, "to")?;
+    TimeRange::new(from, to).map_err(usage_collector_error_to_canonical)
+}
+
+/// Parse one RFC 3339 range bound out of `params`, blaming `key` on
+/// failure so the caller learns which of the two parameters is wrong.
+fn parse_range_bound(
+    params: &[(String, String)],
+    key: &'static str,
+) -> Result<OffsetDateTime, CanonicalError> {
+    let raw = require_single_value(params, key)?;
+    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).map_err(|err| {
+        UsageRecordResource::invalid_argument()
+            .with_field_violation(
+                key,
+                format!("`{key}` must be an RFC 3339 timestamp with an offset: {err}"),
+                "VALIDATION",
+            )
+            .create()
+    })
 }
 
 /// Group `metadata.<key>=<value>` entries into a `Vec<MetadataFilter>`

@@ -445,3 +445,123 @@ fn aggregation_bucket_dto_serializes_none_value_as_null() {
     let wire = serde_json::to_value(&dto).expect("serialize");
     assert_eq!(wire, serde_json::json!({ "key": [], "value": null }));
 }
+
+// ---------------------------------------------------------------------------
+// TimeRangeDto / QueryAggregatedUsageRecordsRequest — the aggregate path's
+// carrier for the mandatory read range.
+//
+// A `POST` with a declared body puts the range there
+// (`AggregationRequest.time_range` in `docs/usage-collector-v1.yaml`), so
+// the wire-shape guarantees live at this boundary rather than in a query
+// parameter parser: absent means rejected, not unbounded.
+// ---------------------------------------------------------------------------
+
+/// A minimal well-formed aggregate request body.
+fn minimal_aggregate_request_json() -> serde_json::Value {
+    serde_json::json!({
+        "time_range": {
+            "from": SAMPLE_WINDOW_START_RFC3339,
+            "to": SAMPLE_WINDOW_END_RFC3339,
+        }
+    })
+}
+
+#[test]
+fn aggregate_request_parses_the_mandatory_time_range() {
+    let req: super::QueryAggregatedUsageRecordsRequest =
+        serde_json::from_value(minimal_aggregate_request_json()).expect("minimal body parses");
+    assert_eq!(
+        req.time_range.from,
+        OffsetDateTime::parse(
+            SAMPLE_WINDOW_START_RFC3339,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixture bound parses"),
+    );
+    assert_eq!(
+        req.time_range.to,
+        OffsetDateTime::parse(
+            SAMPLE_WINDOW_END_RFC3339,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixture bound parses"),
+    );
+    assert!(
+        req.group_by.is_empty(),
+        "group_by stays optional: only the range is mandatory",
+    );
+}
+
+#[test]
+fn aggregate_request_without_a_time_range_is_rejected() {
+    // No `#[serde(default)]` on the field: the contract marks it required,
+    // and a body omitting it must fail deserialization rather than reach
+    // the service as an unbounded aggregation.
+    let err = serde_json::from_value::<super::QueryAggregatedUsageRecordsRequest>(
+        serde_json::json!({ "group_by": ["resource_type"] }),
+    )
+    .expect_err("a body without `time_range` MUST be rejected");
+    assert!(
+        err.to_string().contains("time_range"),
+        "the failure MUST name the missing field: {err}",
+    );
+}
+
+#[test]
+fn aggregate_request_rejects_an_unknown_body_field() {
+    let mut json = minimal_aggregate_request_json();
+    json.as_object_mut()
+        .expect("object")
+        .insert("op".to_owned(), serde_json::json!("SUM"));
+    let err = serde_json::from_value::<super::QueryAggregatedUsageRecordsRequest>(json)
+        .expect_err("`deny_unknown_fields` MUST refuse an undeclared body field");
+    assert!(
+        err.to_string().contains("op"),
+        "the failure MUST name the offending field: {err}",
+    );
+}
+
+#[test]
+fn time_range_dto_rejects_an_offsetless_bound() {
+    // Same guarantee the raw path's `from` / `to` parser gives: RFC 3339
+    // requires an offset, so a bare local time cannot be attributed to
+    // whatever offset the server happened to assume.
+    for bound in ["from", "to"] {
+        let mut json = minimal_aggregate_request_json();
+        json["time_range"][bound] = serde_json::json!("2026-06-11T12:34:56");
+        assert!(
+            serde_json::from_value::<super::QueryAggregatedUsageRecordsRequest>(json).is_err(),
+            "an offset-less `{bound}` MUST fail to deserialize rather than \
+             being read in some assumed offset",
+        );
+    }
+}
+
+#[test]
+fn time_range_dto_rejects_an_unknown_field_inside_the_range() {
+    let mut json = minimal_aggregate_request_json();
+    json["time_range"]["tz"] = serde_json::json!("Europe/Berlin");
+    serde_json::from_value::<super::QueryAggregatedUsageRecordsRequest>(json)
+        .expect_err("`deny_unknown_fields` MUST refuse an undeclared range field");
+}
+
+#[test]
+fn time_range_dto_projects_onto_the_sdk_range_and_rejects_an_inverted_one() {
+    use usage_collector_sdk::TimeRange;
+
+    let from = OffsetDateTime::UNIX_EPOCH;
+    let to = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1);
+
+    let range = TimeRange::try_from(super::TimeRangeDto { from, to })
+        .expect("an ordered pair projects onto a TimeRange");
+    assert_eq!(range.lower_inclusive(), from);
+    assert_eq!(range.upper_exclusive(), to);
+
+    // The projection is the only validation gate on this path, so the
+    // inverted and empty cases must both fail here rather than reaching a
+    // plugin as a guaranteed-empty (or reversed) scan.
+    TimeRange::try_from(super::TimeRangeDto { from: to, to: from })
+        .expect_err("an inverted body range MUST be rejected");
+    TimeRange::try_from(super::TimeRangeDto { from, to: from })
+        .expect_err("an empty body range MUST be rejected");
+}

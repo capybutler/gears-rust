@@ -10,6 +10,7 @@ use crate::models::{
     AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, MeterTypeId,
     UsageRecord,
 };
+use crate::time_range::TimeRange;
 
 /// Consumer-facing API for Usage Collector operations.
 // @cpt-dod:cpt-cf-usage-collector-dod-foundation-entity-security-context:p1
@@ -60,26 +61,42 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<UsageRecord, UsageCollectorError>;
 
-    /// Aggregated query over one meter.
+    /// Aggregated query over one meter and one range.
     ///
     /// Carries no aggregation parameter: the fold is resolved from the
     /// queried type's declaration, so no request is well-formed and
     /// semantically wrong. A withdrawn record and its invalidation each
     /// contribute nothing.
+    ///
+    /// `time_range` is mandatory and typed — it is never a `$filter`
+    /// conjunct (DESIGN §3.3 rule 5), and a predicate naming either
+    /// covered-period bound is rejected rather than honoured. An entry is
+    /// selected when the end of its covered period falls in the range,
+    /// `from <= window_end < to`, whatever the length of that period
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`).
     async fn query_aggregated_usage_records(
         &self,
         ctx: &SecurityContext,
         gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorError>;
 
-    /// Keyset-paginated list of usage records.
+    /// Keyset-paginated ledger read over one meter and one range.
+    ///
+    /// `time_range` is mandatory and typed, selecting on the covered-period
+    /// end exactly as on [`Self::query_aggregated_usage_records`]. Entries
+    /// are returned as persisted — a withdrawn record and its invalidation
+    /// both appear, because this is a ledger path rather than a derived
+    /// view; excluding them from a locally computed fold is the reader's
+    /// obligation.
     async fn list_usage_records(
         &self,
         ctx: &SecurityContext,
         gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError>;

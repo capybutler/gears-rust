@@ -31,7 +31,7 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
     AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord, MetadataFilter,
-    MeterTypeId, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
+    MeterTypeId, TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -50,6 +50,22 @@ pub(crate) fn projected(submission: &CreateUsageRecord) -> UsageRecord {
         .clone()
         .try_into_usage_record()
         .expect("test fixture supplies a valid covered period")
+}
+
+/// The mandatory read-path range the domain read-path tests hand to
+/// `list_usage_records` / `query_aggregated_usage_records`.
+///
+/// One hour from the epoch. The two bounds differ, so a surface that
+/// swapped or dropped one of them fails rather than passing by symmetry,
+/// and the range is narrow enough that a throwaway "all time" range
+/// substituted anywhere on the way to the SPI is not equal to it.
+#[must_use]
+pub(crate) fn test_time_range() -> TimeRange {
+    TimeRange::new(
+        time::OffsetDateTime::UNIX_EPOCH,
+        time::OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::hours(1)),
+    )
+    .expect("a one-hour range from the epoch is a valid TimeRange")
 }
 
 /// Minimal mock storage-plugin client.
@@ -95,6 +111,7 @@ impl UsageCollectorPluginV1 for MockPlugin {
     async fn query_aggregated_usage_records(
         &self,
         _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
         _fold: AggregationFold,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
@@ -108,6 +125,7 @@ impl UsageCollectorPluginV1 for MockPlugin {
     async fn list_usage_records(
         &self,
         _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
@@ -1073,6 +1091,15 @@ pub struct HappyPathPlugin {
     /// received a compiled PDP scope (Task 13 / DESIGN §3.3) rather than
     /// merely that the call succeeded.
     last_get_scope: Mutex<Option<String>>,
+
+    /// The `time_range` passed to the most-recent `list_usage_records`
+    /// dispatch. The range is a typed parameter rather than a `$filter`
+    /// conjunct, so nothing in the `ODataQuery` a test inspects would
+    /// reveal a range the gateway dropped on the way to the SPI — and a
+    /// dropped range is an unbounded scan that still answers `200`.
+    list_time_range: Mutex<Option<TimeRange>>,
+    /// The same recorder for `query_aggregated_usage_records`.
+    aggregate_time_range: Mutex<Option<TimeRange>>,
 }
 
 impl HappyPathPlugin {
@@ -1092,6 +1119,8 @@ impl HappyPathPlugin {
             get_usage_record_inputs: Mutex::new(Vec::new()),
             get_usage_record_not_found: Mutex::new(std::collections::BTreeSet::new()),
             last_get_scope: Mutex::new(None),
+            list_time_range: Mutex::new(None),
+            aggregate_time_range: Mutex::new(None),
         })
     }
 
@@ -1170,6 +1199,21 @@ impl HappyPathPlugin {
             .last()
             .copied()
     }
+    /// The [`TimeRange`] handed to the most-recent `list_usage_records`
+    /// dispatch, or `None` if it was never invoked. Proves the range
+    /// survived the gateway as a typed parameter, not merely that the read
+    /// returned `Ok`.
+    #[must_use]
+    pub fn last_list_time_range(&self) -> Option<TimeRange> {
+        *self.list_time_range.lock().expect("mutex")
+    }
+    /// The [`TimeRange`] handed to the most-recent
+    /// `query_aggregated_usage_records` dispatch, or `None` if it was never
+    /// invoked.
+    #[must_use]
+    pub fn last_aggregate_time_range(&self) -> Option<TimeRange> {
+        *self.aggregate_time_range.lock().expect("mutex")
+    }
     pub fn last_create_record_input(&self) -> Option<UsageRecord> {
         self.create_record_input.lock().expect("mutex").clone()
     }
@@ -1216,11 +1260,13 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
     async fn query_aggregated_usage_records(
         &self,
         _gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         fold: AggregationFold,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
         _group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
+        *self.aggregate_time_range.lock().expect("mutex") = Some(time_range);
         self.query_aggregated_usage_records_folds
             .lock()
             .expect("mutex")
@@ -1235,9 +1281,11 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
     async fn list_usage_records(
         &self,
         _gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
+        *self.list_time_range.lock().expect("mutex") = Some(time_range);
         self.list_usage_records_response
             .lock()
             .expect("mutex")

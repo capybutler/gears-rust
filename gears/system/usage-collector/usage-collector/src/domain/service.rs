@@ -29,7 +29,7 @@ use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
 use usage_collector_sdk::{
     AggregationDimension, AggregationResult, ConflictReason, CreateUsageRecord,
-    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, UsageCollectorError,
+    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, TimeRange, UsageCollectorError,
     UsageCollectorPluginError, UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord,
     ValidationReason,
 };
@@ -43,8 +43,8 @@ use crate::domain::ports::metrics::{
     RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
 };
 use crate::domain::query::{
-    compose_query_with_scope, reject_reserved_filter_fields, require_bounded_time_window,
-    require_dimensions_declared, require_metadata_filter_keys_declared,
+    compose_query_with_scope, reject_reserved_filter_fields, require_dimensions_declared,
+    require_metadata_filter_keys_declared,
 };
 use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
 use crate::domain::validation::{
@@ -296,8 +296,12 @@ fn classify_query_result<T>(
         Err(UsageCollectorError::NotFound { .. }) => {
             (RequestOutcome::Error, QueryErrorCategory::UnknownUsageType)
         }
-        // The only service-level `InvalidArgument` on the query path is the
-        // mandatory-time-window guard (`require_bounded_time_window`).
+        // Every service-level `InvalidArgument` on the query path is a
+        // query-budget / query-surface rejection: a `$filter` naming a
+        // reserved field, an undeclared `group_by` / `metadata_filter` key,
+        // or an over-cap aggregate result. The mandatory range cannot land
+        // here — it is validated where the typed parameter is parsed, at
+        // the edge, before the service is entered at all.
         Err(UsageCollectorError::InvalidArgument { .. }) => {
             (RequestOutcome::Error, QueryErrorCategory::QueryBudget)
         }
@@ -1577,13 +1581,15 @@ impl Service {
     ///    filter via [`authz::scope_to_odata_filter`]. The composition is
     ///    intersection-only (`composed = user_filter AND constraints`) per
     ///    `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`
-    ///    — no widening is permitted. `gts_type_id` stays a typed parameter
-    ///    and is NOT touched here. The `[from, to)` time window flows
-    ///    through `query.filter` as a `created_at` predicate (see
-    ///    [`usage_collector_sdk::UsageRecordFilterField`]); the gateway
-    ///    no longer accepts a separate `TimeWindow`.
+    ///    — no widening is permitted. `gts_type_id` and `time_range` stay
+    ///    typed parameters and are NOT touched here: neither ever enters
+    ///    `query.filter`, which is why a predicate naming a covered-period
+    ///    bound is rejected in step 3 rather than merged in here.
     /// 5. **Delegate** to the bound storage plugin's
-    ///    `list_usage_records` SPI with the composed filter.
+    ///    `list_usage_records` SPI with the composed filter and the typed
+    ///    `time_range`, which the plugin resolves as
+    ///    `from <= window_end < to`
+    ///    (`cpt-cf-usage-collector-adr-window-end-selection`).
     ///
     /// # Errors
     ///
@@ -1597,7 +1603,9 @@ impl Service {
     ///   declaration) — new as of the declaration-resolution step above.
     /// * [`UsageCollectorError::InvalidArgument`] when `$filter` names a
     ///   reserved field or `metadata_filter` names an undeclared metadata
-    ///   key.
+    ///   key. A malformed range cannot surface here: `time_range` arrives
+    ///   already validated, because [`TimeRange`] has no public fields and
+    ///   `TimeRange::new` is its only constructor.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
     ///   transport / persistence failure.
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-raw:p1
@@ -1611,6 +1619,7 @@ impl Service {
         &self,
         ctx: &SecurityContext,
         gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError> {
@@ -1634,12 +1643,6 @@ impl Service {
             // Authorization composed → track in-flight for the remainder of
             // this attempt (decremented on every exit below, `?` included).
             let _inflight = QueryInflightGuard::enter(self.metrics.as_ref(), QueryKind::Raw);
-
-            // Reject an unbounded query before composition / dispatch so an
-            // authorized caller cannot drive a full-table scan. Runs after
-            // authz to preserve the PDP-first posture (an unauthorized caller
-            // is denied regardless of window shape).
-            require_bounded_time_window(query)?;
 
             // Resolve the queried meter's declaration so the admissibility
             // gate below has a declared-keys set to check `metadata_filter`
@@ -1682,7 +1685,7 @@ impl Service {
             instrument_spi(
                 self.metrics.as_ref(),
                 PluginOp::ListUsageRecords,
-                plugin.list_usage_records(gts_type_id, &composed, metadata_filter),
+                plugin.list_usage_records(gts_type_id, time_range, &composed, metadata_filter),
             )
             .await
             .map_err(|e| UsageCollectorError::from(DomainError::from(e)))
@@ -1729,9 +1732,12 @@ impl Service {
     ///    filter via [`compose_query_with_scope`]. The composition is
     ///    intersection-only per
     ///    `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`.
+    ///    `time_range` is untouched by composition: it is a typed
+    ///    parameter and never a `$filter` conjunct.
     /// 4. **Delegate** to the bound storage plugin's
     ///    `query_aggregated_usage_records` SPI with the composed filter,
-    ///    the typed `gts_type_id`, the metadata side-channel, the declared
+    ///    the typed `gts_type_id`, the typed `time_range`, the metadata
+    ///    side-channel, the declared
     ///    `usage_collector_sdk::AggregationFold`, and any `group_by`
     ///    dimensions, executed server-side per `plugin-spi.md` Method 3.
     ///
@@ -1752,6 +1758,7 @@ impl Service {
         &self,
         ctx: &SecurityContext,
         gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
@@ -1776,12 +1783,6 @@ impl Service {
             // Authorization composed → track in-flight for the remainder of
             // this attempt (decremented on every exit below, `?` included).
             let _inflight = QueryInflightGuard::enter(self.metrics.as_ref(), QueryKind::Aggregated);
-
-            // Reject an unbounded query before composition / dispatch so an
-            // authorized caller cannot drive a full-table aggregation. The
-            // aggregate path has no `$top` ceiling, so the bounded window is
-            // its only scan bound. Runs after authz (PDP-first posture).
-            require_bounded_time_window(query)?;
 
             // Resolve the queried meter's declaration before any plugin
             // dispatch: a meter declares exactly one fold, and this gear
@@ -1835,6 +1836,7 @@ impl Service {
                 PluginOp::QueryAggregatedUsageRecords,
                 plugin.query_aggregated_usage_records(
                     gts_type_id,
+                    time_range,
                     declaration.aggregation_fold,
                     &composed,
                     metadata_filter,

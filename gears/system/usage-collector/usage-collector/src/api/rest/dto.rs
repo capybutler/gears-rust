@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use usage_collector_sdk::{
     AggregationBucket, AggregationDimension, AggregationResult, MetadataKey, ResourceRef,
-    SubjectRef, UsageCollectorError, UsageRecord, UsageRecordStatus,
+    SubjectRef, TimeRange, UsageCollectorError, UsageRecord, UsageRecordStatus,
 };
 use uuid::Uuid;
 
@@ -169,11 +169,11 @@ pub struct UsageRecordDto {
     /// Inclusive start of the covered period the entry measures.
     #[serde(with = "time::serde::rfc3339")]
     pub window_start: OffsetDateTime,
-    /// Exclusive end of the covered period — the bound the read *contract*
-    /// selects on (`cpt-cf-usage-collector-adr-window-end-selection`).
-    /// The read paths still carry their window as a `$filter` conjunct over
-    /// the retired instant field; threading them onto this bound is a later
-    /// commit in this slice.
+    /// Exclusive end of the covered period — the bound the read paths
+    /// select on, via the mandatory `from` / `to` range
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`). The keyset page
+    /// order still ends in the retired instant field's tiebreaker, which a
+    /// later commit in this slice repoints onto this bound.
     #[serde(with = "time::serde::rfc3339")]
     pub window_end: OffsetDateTime,
 }
@@ -287,18 +287,55 @@ impl From<AggregationDimension> for AggregationDimensionDto {
     }
 }
 
+/// Wire projection of [`usage_collector_sdk::TimeRange`] — the mandatory
+/// bounded range on the aggregate path (`AggregationRequest.time_range` in
+/// `docs/usage-collector-v1.yaml`). The raw path carries the same range as
+/// the `from` / `to` query parameters instead, because a `GET` has no body.
+///
+/// Both bounds deserialize through `time::serde::rfc3339`, which rejects an
+/// offset-less timestamp: a bare local time would attribute usage to
+/// whatever offset the server happened to assume.
+///
+/// `Copy`, like the SDK [`TimeRange`] it projects onto — two plain
+/// timestamps — so reading it out of a request body does not partially
+/// move the body away from the group-by projection that follows.
+#[derive(Debug, Clone, Copy)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct TimeRangeDto {
+    /// Inclusive lower bound (RFC 3339, offset mandatory).
+    #[serde(with = "time::serde::rfc3339")]
+    pub from: OffsetDateTime,
+    /// Exclusive upper bound (RFC 3339, offset mandatory).
+    #[serde(with = "time::serde::rfc3339")]
+    pub to: OffsetDateTime,
+}
+
+impl TryFrom<TimeRangeDto> for TimeRange {
+    type Error = UsageCollectorError;
+
+    fn try_from(value: TimeRangeDto) -> Result<Self, Self::Error> {
+        Self::new(value.from, value.to)
+    }
+}
+
 /// Aggregated-query request body for
-/// `POST /usage-collector/v1/records/aggregate`. The typed `gts_type_id`, the
+/// `POST /usage-collector/v1/records/aggregate`. Carries the mandatory
+/// `time_range` and the group-by dimensions; the typed `gts_type_id`, the
 /// `OData` `$filter`, and the `metadata.<key>` side-channel remain query
-/// parameters (mirroring `GET /usage-collector/v1/records`); only the
-/// group-by dimensions ship in the body. Carries no aggregation parameter
-/// (matches `AggregationRequest` in `docs/usage-collector-v1.yaml`): the
-/// fold is resolved from the queried type's declaration, so no request is
-/// well-formed and semantically wrong.
+/// parameters (mirroring `GET /usage-collector/v1/records`). Carries no
+/// aggregation parameter (matches `AggregationRequest` in
+/// `docs/usage-collector-v1.yaml`): the fold is resolved from the queried
+/// type's declaration, so no request is well-formed and semantically wrong.
+///
+/// `time_range` has no `#[serde(default)]` — the contract marks it
+/// required, so a body omitting it is a deserialization failure rather than
+/// an unbounded scan.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct QueryAggregatedUsageRecordsRequest {
+    pub time_range: TimeRangeDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_by: Vec<AggregationDimensionDto>,
 }

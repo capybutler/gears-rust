@@ -512,6 +512,7 @@ mod deactivate_usage_record_tests {
         async fn query_aggregated_usage_records(
             &self,
             _gts_type_id: MeterTypeId,
+            _time_range: usage_collector_sdk::TimeRange,
             _fold: AggregationFold,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
@@ -525,6 +526,7 @@ mod deactivate_usage_record_tests {
         async fn list_usage_records(
             &self,
             _gts_type_id: MeterTypeId,
+            _time_range: usage_collector_sdk::TimeRange,
             _query: &ODataQuery,
             _metadata_filter: &[MetadataFilter],
         ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
@@ -1984,6 +1986,7 @@ mod get_usage_record_tests {
             async fn query_aggregated_usage_records(
                 &self,
                 _gts_type_id: usage_collector_sdk::MeterTypeId,
+                _time_range: usage_collector_sdk::TimeRange,
                 _fold: usage_collector_sdk::AggregationFold,
                 _query: &toolkit_odata::ODataQuery,
                 _metadata_filter: &[usage_collector_sdk::MetadataFilter],
@@ -1997,6 +2000,7 @@ mod get_usage_record_tests {
             async fn list_usage_records(
                 &self,
                 _gts_type_id: usage_collector_sdk::MeterTypeId,
+                _time_range: usage_collector_sdk::TimeRange,
                 _query: &toolkit_odata::ODataQuery,
                 _metadata_filter: &[usage_collector_sdk::MetadataFilter],
             ) -> Result<toolkit_odata::Page<UsageRecord>, UsageCollectorPluginError> {
@@ -2975,7 +2979,7 @@ mod aggregate_declared_fold_tests {
     use crate::domain::test_support::{
         RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
         fake_declaration_source_not_found, fake_declaration_source_with_fold,
-        recording_plugin_resolver,
+        recording_plugin_resolver, test_time_range,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -3009,19 +3013,6 @@ mod aggregate_declared_fold_tests {
         authenticated_ctx()
     }
 
-    // The aggregate path has no `$top` ceiling — the bounded `created_at`
-    // window is its only scan bound, and `require_bounded_time_window` runs
-    // before declaration resolution, so every test here needs one to reach
-    // the fold-resolution / dispatch logic under test.
-    fn bounded_window() -> ODataQuery {
-        let expr = toolkit_odata::parse_filter_string(
-            "created_at ge 2026-01-01T00:00:00Z and created_at lt 2026-02-01T00:00:00Z",
-        )
-        .expect("filter parses")
-        .into_expr();
-        ODataQuery::from(Some(expr))
-    }
-
     #[tokio::test]
     async fn aggregate_serves_the_fold_the_declaration_names() {
         // The request carries no aggregation parameter. Whatever fold reaches
@@ -3030,9 +3021,16 @@ mod aggregate_declared_fold_tests {
         let (svc, spy) = service_with_recording_plugin(source);
         spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
 
-        svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
-            .await
-            .expect("aggregates");
+        svc.query_aggregated_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &[],
+            &[],
+        )
+        .await
+        .expect("aggregates");
 
         assert_eq!(spy.last_fold(), Some(AggregationFold::Max));
     }
@@ -3053,9 +3051,16 @@ mod aggregate_declared_fold_tests {
             let (svc, spy) = service_with_recording_plugin(source);
             spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
 
-            svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
-                .await
-                .unwrap_or_else(|e| panic!("fold {fold:?} MUST dispatch, got {e:?}"));
+            svc.query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("fold {fold:?} MUST dispatch, got {e:?}"));
 
             assert_eq!(
                 spy.last_fold(),
@@ -3071,7 +3076,14 @@ mod aggregate_declared_fold_tests {
         let (svc, spy) = service_with_recording_plugin(source);
 
         let err = svc
-            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+                &[],
+            )
             .await
             .expect_err("an unresolvable type must not reach the plugin");
 
@@ -3111,7 +3123,14 @@ mod aggregate_declared_fold_tests {
         ));
 
         match svc
-            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+                &[],
+            )
             .await
         {
             Err(UsageCollectorError::InvalidArgument { reason, .. }) => {
@@ -3131,7 +3150,14 @@ mod aggregate_declared_fold_tests {
         ));
 
         let result = svc
-            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &[])
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+                &[],
+            )
             .await
             .expect("a result exactly at the cap must be returned");
         assert_eq!(result.buckets.len(), MAX_AGGREGATION_BUCKETS);
@@ -3373,7 +3399,7 @@ mod query_admissibility_tests {
     use crate::domain::test_support::{
         RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
         fake_declaration_source_not_found, fake_declaration_source_with_metadata,
-        recording_plugin_resolver,
+        recording_plugin_resolver, test_time_range,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -3386,31 +3412,17 @@ mod query_admissibility_tests {
         authenticated_ctx()
     }
 
-    /// A minimal bounded `created_at` window — the only `$filter` content a
-    /// raw/aggregated query needs to clear `require_bounded_time_window`
-    /// before reaching the admissibility gate under test here.
-    fn bounded_window() -> ODataQuery {
-        let expr = toolkit_odata::parse_filter_string(
-            "created_at ge 2026-01-01T00:00:00Z and created_at lt 2026-02-01T00:00:00Z",
-        )
-        .expect("filter parses")
-        .into_expr();
-        ODataQuery::from(Some(expr))
-    }
-
-    /// [`bounded_window`] AND-ed with a bare `reserved_field eq 'x'`
-    /// predicate — still bounded (clears `require_bounded_time_window`), so
-    /// whatever it is rejected for is the admissibility gate under test.
-    fn bounded_window_naming(reserved_field: &str) -> ODataQuery {
-        let bounded = bounded_window()
-            .into_filter()
-            .expect("bounded_window() carries a filter");
-        let reserved = ast::Expr::Compare(
+    /// An `ODataQuery` whose `$filter` is a bare `reserved_field eq 'x'`
+    /// predicate. Nothing else is in the filter, so whatever the request is
+    /// rejected for is the admissibility gate under test. The mandatory
+    /// read range travels beside the filter as a typed parameter, so it
+    /// contributes no conjunct here.
+    fn filter_naming(reserved_field: &str) -> ODataQuery {
+        ODataQuery::from(Some(ast::Expr::Compare(
             Box::new(ast::Expr::Identifier(reserved_field.to_owned())),
             ast::CompareOperator::Eq,
             Box::new(ast::Expr::Value(ast::Value::String("x".to_owned()))),
-        );
-        ODataQuery::from(Some(bounded.and(reserved)))
+        )))
     }
 
     /// Build a `Service` + [`RecordingPlugin`] spy over `source`, wired
@@ -3449,7 +3461,8 @@ mod query_admissibility_tests {
             .list_usage_records(
                 &ctx(),
                 meter_id(),
-                &bounded_window_naming("gts_type_id"),
+                test_time_range(),
+                &filter_naming("gts_type_id"),
                 &[],
             )
             .await
@@ -3476,9 +3489,15 @@ mod query_admissibility_tests {
             },
         });
 
-        svc.list_usage_records(&ctx(), meter_id(), &bounded_window(), &[])
-            .await
-            .expect("no reserved field named: the plugin must be reached");
+        svc.list_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &[],
+        )
+        .await
+        .expect("no reserved field named: the plugin must be reached");
     }
 
     #[tokio::test]
@@ -3489,7 +3508,8 @@ mod query_admissibility_tests {
             .query_aggregated_usage_records(
                 &ctx(),
                 meter_id(),
-                &bounded_window_naming("window_start"),
+                test_time_range(),
+                &filter_naming("window_start"),
                 &[],
                 &[],
             )
@@ -3512,7 +3532,14 @@ mod query_admissibility_tests {
             MetadataKey::new("tier").expect("valid key"),
         )];
         let err = svc
-            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+                &dims,
+            )
             .await
             .expect_err("an undeclared group_by dimension must be rejected");
         assert!(
@@ -3535,9 +3562,16 @@ mod query_admissibility_tests {
         let dims = [AggregationDimension::Metadata(
             MetadataKey::new("region").expect("valid key"),
         )];
-        svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
-            .await
-            .expect("a declared group_by dimension must be accepted");
+        svc.query_aggregated_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &[],
+            &dims,
+        )
+        .await
+        .expect("a declared group_by dimension must be accepted");
         assert_eq!(spy.calls(), 1, "an accepted group_by must reach the plugin");
     }
 
@@ -3556,7 +3590,14 @@ mod query_admissibility_tests {
         let (svc_before, _spy_before) =
             service_with_recording_plugin(fake_declaration_source_with_metadata(&[]));
         let err = svc_before
-            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+                &dims,
+            )
             .await
             .expect_err("not yet declared: must be rejected");
         assert!(err.to_string().contains("region"));
@@ -3566,7 +3607,14 @@ mod query_admissibility_tests {
         spy_after
             .set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
         svc_after
-            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &[], &dims)
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+                &dims,
+            )
             .await
             .expect("declared a moment later: must now be admissible, without a restart");
     }
@@ -3591,7 +3639,13 @@ mod query_admissibility_tests {
 
         let filters = [metadata_filter("tier")];
         let err = svc
-            .list_usage_records(&ctx(), meter_id(), &bounded_window(), &filters)
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &filters,
+            )
             .await
             .expect_err("an undeclared metadata_filter key must be rejected");
         assert!(
@@ -3616,9 +3670,15 @@ mod query_admissibility_tests {
         });
 
         let filters = [metadata_filter("region")];
-        svc.list_usage_records(&ctx(), meter_id(), &bounded_window(), &filters)
-            .await
-            .expect("a declared metadata_filter key must be accepted, reaching the plugin");
+        svc.list_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &filters,
+        )
+        .await
+        .expect("a declared metadata_filter key must be accepted, reaching the plugin");
     }
 
     #[tokio::test]
@@ -3628,7 +3688,14 @@ mod query_admissibility_tests {
 
         let filters = [metadata_filter("tier")];
         let err = svc
-            .query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &filters, &[])
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &filters,
+                &[],
+            )
             .await
             .expect_err("an undeclared metadata_filter key must be rejected");
         assert!(
@@ -3649,9 +3716,16 @@ mod query_admissibility_tests {
         spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
 
         let filters = [metadata_filter("region")];
-        svc.query_aggregated_usage_records(&ctx(), meter_id(), &bounded_window(), &filters, &[])
-            .await
-            .expect("a declared metadata_filter key must be accepted");
+        svc.query_aggregated_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &filters,
+            &[],
+        )
+        .await
+        .expect("a declared metadata_filter key must be accepted");
         assert_eq!(
             spy.calls(),
             1,
@@ -3674,7 +3748,13 @@ mod query_admissibility_tests {
         let (svc_before, _spy_before) =
             service_with_recording_plugin(fake_declaration_source_with_metadata(&[]));
         let err = svc_before
-            .list_usage_records(&ctx(), meter_id(), &bounded_window(), &filters)
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &filters,
+            )
             .await
             .expect_err("not yet declared: must be rejected");
         assert!(err.to_string().contains("region"));
@@ -3690,7 +3770,13 @@ mod query_admissibility_tests {
             },
         });
         svc_after
-            .list_usage_records(&ctx(), meter_id(), &bounded_window(), &filters)
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &filters,
+            )
             .await
             .expect("declared a moment later: must now be admissible, without a restart");
     }
@@ -3708,12 +3794,200 @@ mod query_admissibility_tests {
         let (svc, _spy) = service_with_recording_plugin(fake_declaration_source_not_found());
 
         let err = svc
-            .list_usage_records(&ctx(), meter_id(), &bounded_window(), &[])
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+            )
             .await
             .expect_err("an unresolvable type must not reach the plugin");
         assert!(
             matches!(err, UsageCollectorError::NotFound { .. }),
             "expected NotFound, got {err:?}",
+        );
+    }
+}
+
+// The mandatory read range is a typed `TimeRange` parameter on both read
+// paths, never a `$filter` conjunct (DESIGN §3.3 rule 5). Two things need
+// pinning, and neither is visible in a status code: that the range the
+// caller supplied is the one the SPI is handed, and that a caller supplying
+// no `$filter` at all is now a complete request. A range dropped between
+// the gateway and the plugin is an unbounded scan that still answers `Ok`,
+// so every assertion here is on what the plugin received.
+mod read_path_time_range_tests {
+    use std::sync::Arc;
+
+    use toolkit_gts::gts_id;
+    use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo};
+    use toolkit_security::SecurityContext;
+    use usage_collector_sdk::{AggregationResult, MeterTypeId, TimeRange, UsageCollectorPluginV1};
+
+    use crate::domain::Service;
+    use crate::domain::test_support::{
+        RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
+        fake_declaration_source_with_metadata, recording_plugin_resolver, test_time_range,
+    };
+
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+    fn meter_id() -> MeterTypeId {
+        MeterTypeId::new(GTS_ID).expect("valid gts_type_id")
+    }
+
+    fn ctx() -> SecurityContext {
+        authenticated_ctx()
+    }
+
+    /// A `Service` plus the [`RecordingPlugin`] spy behind it, over a
+    /// declaration that declares no metadata keys (nothing here filters on
+    /// one) and the fixed-tenant PDP fake both read paths require.
+    fn svc_and_spy() -> (Arc<Service>, Arc<RecordingPlugin>) {
+        let plugin = RecordingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_metadata(&[]))
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                RECORDING_PLUGIN_SUFFIX,
+            );
+        (service, plugin)
+    }
+
+    fn empty_page() -> ODataPage<usage_collector_sdk::UsageRecord> {
+        ODataPage {
+            items: vec![],
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 1000,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn list_forwards_the_typed_time_range_to_the_plugin() {
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(empty_page());
+
+        let range = test_time_range();
+        svc.list_usage_records(&ctx(), meter_id(), range, &ODataQuery::default(), &[])
+            .await
+            .expect("list succeeds");
+
+        assert_eq!(
+            spy.last_list_time_range(),
+            Some(range),
+            "the caller's range MUST reach the SPI verbatim: a substituted or \
+             dropped range is an unbounded scan that still answers Ok",
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_forwards_the_typed_time_range_to_the_plugin() {
+        let (svc, spy) = svc_and_spy();
+        spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
+
+        let range = test_time_range();
+        svc.query_aggregated_usage_records(
+            &ctx(),
+            meter_id(),
+            range,
+            &ODataQuery::default(),
+            &[],
+            &[],
+        )
+        .await
+        .expect("aggregate succeeds");
+
+        assert_eq!(
+            spy.last_aggregate_time_range(),
+            Some(range),
+            "the aggregate path has no page-size ceiling, so the range is its \
+             only scan bound and MUST reach the SPI verbatim",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_range_the_plugin_receives_tracks_the_one_the_caller_passed() {
+        // The forwarding tests above would both pass against a service that
+        // hard-coded a single range, because they only ever pass one. Two
+        // dispatches with two different ranges, through the same service and
+        // the same spy, is what rules that out.
+        let (svc, spy) = svc_and_spy();
+
+        let first = test_time_range();
+        let second = TimeRange::new(
+            first.upper_exclusive(),
+            first.upper_exclusive() + time::Duration::hours(1),
+        )
+        .expect("the adjacent hour is a valid range");
+        assert_ne!(first, second, "precondition: the two ranges differ");
+
+        spy.set_list_usage_records_response(empty_page());
+        svc.list_usage_records(&ctx(), meter_id(), first, &ODataQuery::default(), &[])
+            .await
+            .expect("first list succeeds");
+        assert_eq!(spy.last_list_time_range(), Some(first));
+
+        spy.set_list_usage_records_response(empty_page());
+        svc.list_usage_records(&ctx(), meter_id(), second, &ODataQuery::default(), &[])
+            .await
+            .expect("second list succeeds");
+        assert_eq!(
+            spy.last_list_time_range(),
+            Some(second),
+            "the second dispatch MUST carry the second range, not a range \
+             fixed at construction or cached from the first call",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_needs_no_time_window_inside_the_filter() {
+        // The window is a typed parameter, so an absent `$filter` is a
+        // complete request. Before this slice the same call was a 400
+        // naming a missing time window.
+        let (svc, spy) = svc_and_spy();
+        spy.set_list_usage_records_response(empty_page());
+
+        svc.list_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &[],
+        )
+        .await
+        .expect("an empty $filter is a complete list request");
+
+        assert!(
+            spy.last_list_time_range().is_some(),
+            "the request must have reached the SPI, not short-circuited",
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_needs_no_time_window_inside_the_filter() {
+        let (svc, spy) = svc_and_spy();
+        spy.set_query_aggregated_usage_records_response(AggregationResult { buckets: vec![] });
+
+        svc.query_aggregated_usage_records(
+            &ctx(),
+            meter_id(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &[],
+            &[],
+        )
+        .await
+        .expect("an empty $filter is a complete aggregate request");
+
+        assert_eq!(
+            spy.calls(),
+            1,
+            "the request must have reached the SPI, not short-circuited",
         );
     }
 }

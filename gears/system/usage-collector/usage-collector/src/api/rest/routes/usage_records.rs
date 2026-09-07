@@ -71,6 +71,21 @@ pub(super) fn register_usage_record_routes(
         .description("Keyset-paginated raw read over the persisted usage records.")
         .tag(USAGE_RECORDS_TAG)
         .query_param("gts_id", true, "Usage-type GTS instance id (mandatory)")
+        // The covered-period range is a first-class parameter on this path,
+        // never a `$filter` conjunct: an entry is selected when its period
+        // end falls in `[from, to)`. A `GET` has no body, so the raw path
+        // carries the range in the query string while the aggregate path
+        // carries it in its declared request body.
+        .query_param(
+            "from",
+            true,
+            "Inclusive lower bound of the covered-period range (RFC 3339 UTC, mandatory)",
+        )
+        .query_param(
+            "to",
+            true,
+            "Exclusive upper bound of the covered-period range (RFC 3339 UTC, mandatory)",
+        )
         .query_param(
             "metadata.<key>",
             false,
@@ -137,9 +152,11 @@ pub(super) fn register_usage_record_routes(
         .authenticated()
         // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
         .no_license_required()
+        // The range is in the body on this path (`AggregationRequest.time_range`),
+        // so no `from` / `to` query parameter is declared or accepted here.
         .json_request::<dto::QueryAggregatedUsageRecordsRequest>(
             openapi,
-            "Optional group-by dimensions",
+            "Mandatory time range plus optional group-by dimensions",
         )
         .handler(handlers::handle_query_aggregated_usage_records)
         .json_response_with_schema::<dto::AggregationResultDto>(

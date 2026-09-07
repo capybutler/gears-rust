@@ -261,10 +261,10 @@ impl UsageCollectorError {
 
     /// A read-path time range was empty or inverted (`to <= from`).
     ///
-    /// Once Task 3 threads [`crate::TimeRange`] onto every read path, it
-    /// will select an entry when `from <= window_end < to`
+    /// [`crate::TimeRange`] is mandatory on every read path and selects an
+    /// entry when `from <= window_end < to`
     /// (`cpt-cf-usage-collector-adr-window-end-selection`), so a range that
-    /// is not strictly ordered would select nothing whatever is stored.
+    /// is not strictly ordered selects nothing whatever is stored.
     /// Rejecting it here names the caller's mistake instead of reporting an
     /// empty result that would read as "no usage".
     #[must_use]
@@ -283,25 +283,9 @@ impl UsageCollectorError {
         }
     }
 
-    /// A raw / aggregated query omitted the mandatory bounded `created_at`
-    /// window.
-    #[must_use]
-    pub fn missing_time_window() -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "$filter".to_owned(),
-            reason: ValidationReason::MissingTimeWindow,
-            detail: "query requires a bounded created_at window: supply both a lower \
-                     (created_at ge|gt ...) and an upper (created_at le|lt ...) bound as \
-                     top-level $filter conjuncts"
-                .to_owned(),
-        }
-    }
-
     /// An aggregated query produced more than `cap`
     /// ([`crate::MAX_AGGREGATION_BUCKETS`]) buckets — a high-cardinality
-    /// `group_by` (e.g. a per-record metadata key) over a wide window. The
+    /// `group_by` (e.g. a per-record metadata key) over a wide range. The
     /// plugin bounds its own scan to `cap + 1` rows (memory guard); the gateway
     /// rejects the over-cap result as this client-fixable `400`.
     #[must_use]
@@ -313,7 +297,7 @@ impl UsageCollectorError {
             reason: ValidationReason::AggregationResultTooLarge,
             detail: format!(
                 "aggregated query produced more than {cap} groups; narrow the \
-                 created_at window or drop a high-cardinality group_by dimension"
+                 time range or drop a high-cardinality group_by dimension"
             ),
         }
     }

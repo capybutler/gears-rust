@@ -8,14 +8,14 @@
 //! ranges sum without double counting, and it lets a plugin serve a range
 //! from a rollup keyed on one column.
 //!
-//! Task 3 threads this type through the SDK trait and the Plugin SPI as a
-//! typed parameter (DESIGN §3.3 rule 5, scoped to those two Rust surfaces)
-//! and through the REST surface as a first-class parameter (DESIGN §3.1
-//! "Filter-surface reservation"), replacing the `$filter` conjunct that
-//! carries the window today. That is why the covered-period fields are
-//! reserved on the filter surface already: a predicate over one would be a
-//! second, possibly contradictory, constraint on something the range is
-//! about to fix.
+//! The type travels as a typed parameter on the SDK trait and the Plugin
+//! SPI (DESIGN §3.3 rule 5, scoped to those two Rust surfaces) and as a
+//! first-class parameter on the REST surface (DESIGN §3.1 "Filter-surface
+//! reservation") — `from` / `to` query parameters on the raw path,
+//! `AggregationRequest.time_range` in the aggregate body. It is never a
+//! `$filter` conjunct, which is why the covered-period fields are reserved
+//! on the filter surface: a predicate over one would be a second, possibly
+//! contradictory, constraint on something the range already fixes.
 
 use time::{OffsetDateTime, UtcOffset};
 

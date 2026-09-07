@@ -6,8 +6,6 @@
 //!
 //! * `compose_query_with_scope` — AND-merges the PDP-returned
 //!   [`AccessScope`] into the caller's `$filter`.
-//! * `require_bounded_time_window` — rejects an unbounded `created_at`
-//!   window before composition / dispatch.
 //! * `reject_reserved_filter_fields` — rejects a `$filter` naming a field
 //!   reserved to a typed parameter (`gts_type_id`, the covered-period
 //!   bounds), wherever in the AST it appears.
@@ -45,9 +43,12 @@ use crate::domain::authz;
 /// fails closed on an unconstrained / empty-constraint / deny-all scope
 /// rather than yielding a pass-through, so there is no "filter unchanged"
 /// branch. When the user supplied no filter the scope filter alone becomes
-/// the composed filter. `gts_id`, the time window, and the order /
-/// limit / cursor / select projections on [`ODataQuery`] flow through
-/// verbatim — the composition only touches the `$filter` AST.
+/// the composed filter, which is what makes an empty `$filter` a complete
+/// request. The order / limit / cursor / select projections on
+/// [`ODataQuery`] flow through verbatim — the composition only touches the
+/// `$filter` AST — and `gts_type_id` and the read range are typed
+/// parameters that never enter an [`ODataQuery`] at all, so composition
+/// cannot narrow, widen, or drop either of them.
 ///
 /// Per `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`:
 /// composition is intersection-only (no widening). PDP constraint
@@ -96,69 +97,6 @@ pub(crate) fn compose_query_with_scope(
     // @cpt-end:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-return
 }
 
-/// The `UsageRecord` field carrying the query time window. The bounded
-/// `[from, to)` window is expressed in the `$filter` AST as
-/// `created_at ge … and created_at lt …`.
-const CREATED_AT_FIELD: &str = "created_at";
-
-/// Require that `query`'s `$filter` pins a bounded `created_at` window:
-/// at least one lower bound (`created_at ge|gt …`) **and** at least one
-/// upper bound (`created_at le|lt …`) must appear as top-level
-/// conjuncts. Without both, the query would drive an unbounded
-/// full-table scan / aggregation — a `DoS` / cost footgun — so it is
-/// rejected with [`UsageCollectorError::missing_time_window`].
-///
-/// Only **top-level conjuncts** count: a bound nested under an `or` /
-/// `not` does not constrain the scan (rows outside the window can still
-/// match), so the AND-chain is flattened and only its leaves are
-/// inspected. The bound's value type is not checked here — a malformed
-/// literal is a type mismatch caught downstream by the plugin's filter
-/// conversion, not a missing-window error.
-///
-/// Enforced on the shared service path (not just the REST handler) so
-/// in-process SDK callers and out-of-process REST callers obtain the
-/// same guarantee, per the single-authorization-path contract.
-pub(crate) fn require_bounded_time_window(query: &ODataQuery) -> Result<(), UsageCollectorError> {
-    let Some(filter) = query.filter() else {
-        return Err(UsageCollectorError::missing_time_window());
-    };
-
-    let mut has_lower = false;
-    let mut has_upper = false;
-    visit_top_level_conjuncts(filter, &mut |conjunct| {
-        if let ast::Expr::Compare(left, op, _right) = conjunct
-            && let ast::Expr::Identifier(name) = left.as_ref()
-            && name.eq_ignore_ascii_case(CREATED_AT_FIELD)
-        {
-            match op {
-                ast::CompareOperator::Ge | ast::CompareOperator::Gt => has_lower = true,
-                ast::CompareOperator::Le | ast::CompareOperator::Lt => has_upper = true,
-                _ => {}
-            }
-        }
-    });
-
-    if has_lower && has_upper {
-        Ok(())
-    } else {
-        Err(UsageCollectorError::missing_time_window())
-    }
-}
-
-/// Walk the top-level conjunction of `expr`, invoking `visit` on each
-/// conjunct. `And` nodes are flattened transparently; any other node
-/// (a leaf comparison, or an `or` / `not` / function subtree) is passed
-/// to `visit` as a single opaque conjunct.
-fn visit_top_level_conjuncts(expr: &ast::Expr, visit: &mut impl FnMut(&ast::Expr)) {
-    match expr {
-        ast::Expr::And(left, right) => {
-            visit_top_level_conjuncts(left, visit);
-            visit_top_level_conjuncts(right, visit);
-        }
-        other => visit(other),
-    }
-}
-
 /// Field names a caller may never name in a `$filter`.
 ///
 /// `gts_type_id` travels as a typed parameter and the covered period as a
@@ -172,11 +110,15 @@ const RESERVED_FILTER_FIELDS: &[&str] = &["gts_type_id", "window_start", "window
 /// `true` when `name` names a [`RESERVED_FILTER_FIELDS`] entry, ignoring
 /// ASCII case.
 ///
-/// Case-insensitive to match [`require_bounded_time_window`]'s own
-/// `created_at` identifier match (`name.eq_ignore_ascii_case(...)`) — the
-/// identical kind of AST-identifier comparison — rather than a bare
-/// `contains`. Not exploitable today (`window_start` / `window_end` are not
-/// yet filterable-schema fields, and `gts_type_id` case-varied would
+/// Case-insensitive rather than a bare `contains` because the reservation
+/// has to be un-evadable: its whole purpose is that no `$filter` naming a
+/// reserved field reaches a plugin, and a case-varied spelling would
+/// otherwise walk straight past it. That reason is local to this check
+/// rather than a gear-wide convention — the `$orderby` guards next door
+/// ([`usage_collector_sdk::is_keyset_safe_record_field`] and
+/// `toolkit_odata::ODataOrderBy::ensure_tiebreaker`) both match exactly.
+/// Not exploitable today (`window_start` / `window_end` are
+/// not yet filterable-schema fields, and `gts_type_id` case-varied would
 /// dead-end as `toolkit_odata`'s own case-insensitive `UnknownField`
 /// downstream), but `window_start` / `window_end` become real filterable
 /// fields in the record-model slice after this plan, at which point a

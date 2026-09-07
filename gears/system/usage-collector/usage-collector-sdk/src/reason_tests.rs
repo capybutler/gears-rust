@@ -9,7 +9,6 @@ fn validation_reason_round_trips_each_constant() {
         (VALIDATION, ValidationReason::Validation),
         (METADATA_VALIDATION, ValidationReason::MetadataValidation),
         (UNKNOWN_METADATA_KEY, ValidationReason::UnknownMetadataKey),
-        (MISSING_TIME_WINDOW, ValidationReason::MissingTimeWindow),
         (INVALID_BASE_GTS_ID, ValidationReason::InvalidBaseGtsId),
         (
             INVALID_METADATA_FIELDS_EMPTY_STRING,

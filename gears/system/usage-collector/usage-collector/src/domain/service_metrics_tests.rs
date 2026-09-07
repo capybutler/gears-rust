@@ -35,7 +35,7 @@ use crate::domain::test_support::{
     ServiceFixture, UnreachableResolver, authenticated_ctx, counter_sum_with_label, enforcer_for,
     fake_declaration_source_with_fold, fake_declaration_source_with_metadata, gauge_last,
     histogram_count, histogram_count_with_label, histogram_sum, histogram_sum_with_label,
-    hub_with_plugin, local_metrics, service_with_metrics_unready_plugin,
+    hub_with_plugin, local_metrics, service_with_metrics_unready_plugin, test_time_range,
 };
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use usage_collector_sdk::UsageCollectorPluginError;
@@ -88,17 +88,6 @@ fn record_page(n: usize) -> ODataPage<UsageRecord> {
             limit: 1000,
         },
     }
-}
-
-/// An `ODataQuery` whose `$filter` pins a bounded `created_at` window — the
-/// minimum a raw/aggregated query needs to clear `require_bounded_time_window`.
-fn bounded_query() -> ODataQuery {
-    let expr = toolkit_odata::parse_filter_string(
-        "created_at ge 2026-01-01T00:00:00Z and created_at lt 2026-02-01T00:00:00Z",
-    )
-    .expect("test filter parses")
-    .into_expr();
-    ODataQuery::from(Some(expr))
 }
 
 /// A PDP permit scoped to `sample_record()`'s tenant (`Uuid::from_u128(2)`),
@@ -191,6 +180,7 @@ async fn query_raw_deny_records_denied_authz_and_inflight_net_zero() {
         .list_usage_records(
             &authenticated_ctx(),
             MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
+            test_time_range(),
             &ODataQuery::default(),
             &[],
         )
@@ -446,6 +436,7 @@ async fn list_projection_denial_records_deny_not_permit() {
         .list_usage_records(
             &authenticated_ctx(),
             MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
+            test_time_range(),
             &ODataQuery::default(),
             &[],
         )
@@ -1042,10 +1033,15 @@ fn classify_query_result_maps_each_arm() {
             Err(unresolved_type_not_found()),
             (RequestOutcome::Error, QueryErrorCategory::UnknownUsageType),
         ),
-        // The only service-level InvalidArgument on the query path is the
-        // mandatory bounded-window guard.
+        // Every service-level InvalidArgument on the query path is a
+        // query-budget / query-surface rejection; the over-cap aggregate
+        // result stands in for the family. The mandatory read range never
+        // lands here: it is validated at the edge, where the typed
+        // parameter is parsed, before the service is entered.
         (
-            Err(UsageCollectorError::missing_time_window()),
+            Err(UsageCollectorError::aggregation_result_too_large(
+                usage_collector_sdk::MAX_AGGREGATION_BUCKETS,
+            )),
             (RequestOutcome::Error, QueryErrorCategory::QueryBudget),
         ),
         (
@@ -1120,9 +1116,15 @@ async fn query_raw_success_records_success_rows_and_duration() {
         .build_with_metrics(plugin, "test.metrics.query.rawok.v1");
 
     let page = service
-        .list_usage_records(&authenticated_ctx(), meter_gts(), &bounded_query(), &[])
+        .list_usage_records(
+            &authenticated_ctx(),
+            meter_gts(),
+            test_time_range(),
+            &ODataQuery::default(),
+            &[],
+        )
         .await
-        .expect("a permitted, bounded raw query succeeds");
+        .expect("a permitted raw query succeeds");
     assert_eq!(page.items.len(), 3);
     provider.force_flush().unwrap();
 
@@ -1193,12 +1195,13 @@ async fn query_aggregated_success_records_success_rows_and_duration() {
         .query_aggregated_usage_records(
             &authenticated_ctx(),
             meter_gts(),
-            &bounded_query(),
+            test_time_range(),
+            &ODataQuery::default(),
             &[],
             &[],
         )
         .await
-        .expect("a permitted, bounded aggregation succeeds");
+        .expect("a permitted aggregation succeeds");
     assert_eq!(result.buckets.len(), 1);
     provider.force_flush().unwrap();
 

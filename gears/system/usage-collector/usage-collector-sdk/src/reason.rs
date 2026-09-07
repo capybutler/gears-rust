@@ -26,10 +26,6 @@ pub const METADATA_VALIDATION: &str = "METADATA_VALIDATION";
 /// Ingestion supplied a metadata key not declared in the resolved meter
 /// declaration's closed `metadata_fields` shape.
 pub const UNKNOWN_METADATA_KEY: &str = "UNKNOWN_METADATA_KEY";
-/// A raw / aggregated query omitted the mandatory bounded `created_at`
-/// window (a lower **and** an upper bound on `created_at` as top-level
-/// `$filter` conjuncts), which would force an unbounded full-table scan.
-pub const MISSING_TIME_WINDOW: &str = "MISSING_TIME_WINDOW";
 /// Malformed / wrong-base `gts_id` on a type or record DTO.
 pub const INVALID_BASE_GTS_ID: &str = "INVALID_BASE_GTS_ID";
 /// `metadata_fields[i]` entry was the empty string.
@@ -40,8 +36,8 @@ pub const INVALID_METADATA_FIELDS_INVALID_KEY: &str = "INVALID_METADATA_FIELDS_I
 pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUPLICATE";
 /// An aggregated query produced more distinct groups than
 /// [`crate::MAX_AGGREGATION_BUCKETS`] — typically a high-cardinality `group_by`
-/// (e.g. a per-record metadata key) over a wide window. Narrow the `created_at`
-/// window or drop the high-cardinality dimension.
+/// (e.g. a per-record metadata key) over a wide range. Narrow the read-path
+/// time range or drop the high-cardinality dimension.
 pub const AGGREGATION_RESULT_TOO_LARGE: &str = "AGGREGATION_RESULT_TOO_LARGE";
 
 /// Typed view of the `field_violations[].reason` codes carried by
@@ -57,8 +53,6 @@ pub enum ValidationReason {
     MetadataValidation,
     /// See [`UNKNOWN_METADATA_KEY`].
     UnknownMetadataKey,
-    /// See [`MISSING_TIME_WINDOW`].
-    MissingTimeWindow,
     /// See [`INVALID_BASE_GTS_ID`].
     InvalidBaseGtsId,
     /// See [`INVALID_METADATA_FIELDS_EMPTY_STRING`].
@@ -83,7 +77,6 @@ impl ValidationReason {
             VALIDATION => Self::Validation,
             METADATA_VALIDATION => Self::MetadataValidation,
             UNKNOWN_METADATA_KEY => Self::UnknownMetadataKey,
-            MISSING_TIME_WINDOW => Self::MissingTimeWindow,
             INVALID_BASE_GTS_ID => Self::InvalidBaseGtsId,
             INVALID_METADATA_FIELDS_EMPTY_STRING => Self::MetadataFieldEmptyString,
             INVALID_METADATA_FIELDS_INVALID_KEY => Self::MetadataFieldInvalidKey,
@@ -102,7 +95,6 @@ impl ValidationReason {
             Self::Validation => VALIDATION,
             Self::MetadataValidation => METADATA_VALIDATION,
             Self::UnknownMetadataKey => UNKNOWN_METADATA_KEY,
-            Self::MissingTimeWindow => MISSING_TIME_WINDOW,
             Self::InvalidBaseGtsId => INVALID_BASE_GTS_ID,
             Self::MetadataFieldEmptyString => INVALID_METADATA_FIELDS_EMPTY_STRING,
             Self::MetadataFieldInvalidKey => INVALID_METADATA_FIELDS_INVALID_KEY,
