@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 
 use super::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
-    IdempotencyKey, MetadataFilter, MetadataKey, MeterTypeId, ResourceRef, SubjectRef, UsageRecord,
-    UsageRecordStatus, WINDOW_START_FIELD, is_keyset_safe_record_field,
+    EntryType, IdempotencyKey, Invalidation, MetadataFilter, MetadataKey, MeterTypeId, ReasonCode,
+    ResourceRef, SubjectRef, UsageRecord, WINDOW_START_FIELD, is_keyset_safe_record_field,
 };
 use crate::error::UsageCollectorError;
 use crate::reason::ValidationReason;
@@ -44,7 +44,27 @@ const SAMPLE_WINDOW_START: time::OffsetDateTime = time::OffsetDateTime::UNIX_EPO
 const SAMPLE_WINDOW_END: time::OffsetDateTime =
     SAMPLE_WINDOW_START.saturating_add(time::Duration::hours(1));
 
-fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid>) -> UsageRecord {
+/// The entry a fixture invalidation withdraws.
+fn target_id() -> Uuid {
+    Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("target uuid")
+}
+
+fn reason_code(value: &str) -> ReasonCode {
+    ReasonCode::new(value).expect("test fixture supplies a valid reason code")
+}
+
+/// The withdrawal a fixture invalidation carries. Both fixtures take an
+/// `Option<Uuid>` and build the whole [`Invalidation`] from it, because the
+/// type admits no other arrangement: a target without a reason is
+/// unrepresentable in Rust and can only be built as JSON.
+fn sample_invalidation(target: Uuid) -> Invalidation {
+    Invalidation {
+        target,
+        reason: reason_code("emitter_duplicate"),
+    }
+}
+
+fn sample_usage_record(subject_ref: Option<SubjectRef>, invalidates: Option<Uuid>) -> UsageRecord {
     UsageRecord {
         id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("record id"),
         gts_type_id: sample_meter_id(),
@@ -54,8 +74,7 @@ fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid
         metadata: metadata_map([("region", "eu"), ("tier", "gold")]),
         value: Decimal::from(42),
         idempotency_key: IdempotencyKey::new("k-1").expect("valid idempotency key"),
-        corrects_id,
-        status: UsageRecordStatus::Active,
+        invalidation: invalidates.map(sample_invalidation),
         window_start: SAMPLE_WINDOW_START,
         window_end: SAMPLE_WINDOW_END,
     }
@@ -63,7 +82,7 @@ fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid
 
 fn sample_create_usage_record(
     subject_ref: Option<SubjectRef>,
-    corrects_id: Option<Uuid>,
+    invalidates: Option<Uuid>,
 ) -> CreateUsageRecord {
     CreateUsageRecord {
         gts_type_id: sample_meter_id(),
@@ -73,7 +92,7 @@ fn sample_create_usage_record(
         metadata: metadata_map([("region", "eu"), ("tier", "gold")]),
         value: Decimal::from(42),
         idempotency_key: IdempotencyKey::new("k-1").expect("valid idempotency key"),
-        corrects_id,
+        invalidation: invalidates.map(sample_invalidation),
         window_start: SAMPLE_WINDOW_START,
         window_end: SAMPLE_WINDOW_END,
     }
@@ -85,25 +104,19 @@ fn sample_create_usage_record(
 // ---------------------------------------------------------------------------
 
 // `try_into_usage_record` is the single point where a submission acquires its
-// identity: it validates the covered period, stamps the deterministic derived
-// `id`, initializes `status` to `Active`, and forwards every caller-supplied
-// field verbatim.
+// identity: it validates the submission's own shape and covered period,
+// stamps the deterministic derived `id`, and forwards every caller-supplied
+// field verbatim — the invalidation reference and its reason included.
 #[test]
-fn try_into_usage_record_stamps_derived_id_and_active_status() {
+fn try_into_usage_record_stamps_the_derived_id_and_forwards_every_field() {
     let subject = SubjectRef::new("sub-1", Some("user".to_owned())).expect("valid subject ref");
-    let corrects = Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("corrects uuid");
-    let input = sample_create_usage_record(Some(subject), Some(corrects));
+    let input = sample_create_usage_record(Some(subject), Some(target_id()));
 
     let record = input
         .clone()
         .try_into_usage_record()
         .expect("the fixture period is valid");
 
-    assert_eq!(
-        record.status,
-        UsageRecordStatus::Active,
-        "a fresh submission must be stamped Active",
-    );
     // Every caller-supplied field is forwarded verbatim.
     assert_eq!(record.gts_type_id, input.gts_type_id);
     assert_eq!(record.tenant_id, input.tenant_id);
@@ -112,7 +125,7 @@ fn try_into_usage_record_stamps_derived_id_and_active_status() {
     assert_eq!(record.metadata, input.metadata);
     assert_eq!(record.value, input.value);
     assert_eq!(record.idempotency_key, input.idempotency_key);
-    assert_eq!(record.corrects_id, input.corrects_id);
+    assert_eq!(record.invalidation, input.invalidation);
     assert_eq!(record.window_start, input.window_start);
     assert_eq!(record.window_end, input.window_end);
 }
@@ -322,8 +335,7 @@ fn one_instant_in_two_offsets_derives_one_id() {
 }
 
 // ---------------------------------------------------------------------------
-// UsageRecord — wire shape (RFC-3339 period bounds, optional skipping,
-// `status` defaulting)
+// UsageRecord — wire shape (RFC-3339 period bounds, optional skipping)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -338,8 +350,12 @@ fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_period_bo
         "subject_ref must be omitted when None; got {object:?}"
     );
     assert!(
-        !object.contains_key("corrects_id"),
-        "corrects_id must be omitted when None; got {object:?}"
+        !object.contains_key("invalidates"),
+        "invalidates must be omitted when None; got {object:?}"
+    );
+    assert!(
+        !object.contains_key("reason_code"),
+        "reason_code must be omitted when None; got {object:?}"
     );
     assert!(
         !object.contains_key("created_at"),
@@ -355,11 +371,6 @@ fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_period_bo
         object.get("window_end").and_then(|v| v.as_str()),
         Some("1970-01-01T01:00:00Z"),
         "window_end must serialize in RFC-3339 form with `Z` UTC marker; got {object:?}"
-    );
-    assert_eq!(
-        object.get("status").and_then(|v| v.as_str()),
-        Some("active"),
-        "status must serialize as lowercase; got {object:?}"
     );
     let round_tripped: UsageRecord = serde_json::from_value(value).expect("UsageRecord round-trip");
     assert_eq!(record, round_tripped);
@@ -388,11 +399,9 @@ fn usage_record_deserialize_requires_both_period_bounds() {
 }
 
 #[test]
-fn usage_record_serde_round_trip_carries_subject_ref_and_corrects_id_when_some() {
+fn usage_record_serde_round_trip_carries_subject_ref_and_the_withdrawal_pair_when_some() {
     let subject = SubjectRef::new("principal-1", Some("user")).expect("valid subject ref");
-    let correction =
-        Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("correction uuid");
-    let record = sample_usage_record(Some(subject), Some(correction));
+    let record = sample_usage_record(Some(subject), Some(target_id()));
     let value = serde_json::to_value(&record).expect("serialize UsageRecord");
     let object = value
         .as_object()
@@ -402,12 +411,411 @@ fn usage_record_serde_round_trip_carries_subject_ref_and_corrects_id_when_some()
         "subject_ref must be present when Some; got {object:?}"
     );
     assert_eq!(
-        object.get("corrects_id").and_then(|v| v.as_str()),
+        object.get("invalidates").and_then(|v| v.as_str()),
         Some("33333333-3333-3333-3333-333333333333"),
-        "corrects_id must serialize as a UUID string; got {object:?}"
+        "invalidates must serialize as a UUID string; got {object:?}"
+    );
+    assert_eq!(
+        object.get("reason_code").and_then(|v| v.as_str()),
+        Some("emitter_duplicate"),
+        "reason_code must serialize transparently as its string; got {object:?}"
     );
     let round_tripped: UsageRecord = serde_json::from_value(value).expect("UsageRecord round-trip");
     assert_eq!(record, round_tripped);
+}
+
+// ---------------------------------------------------------------------------
+// EntryType — the derived record/invalidation discriminator
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entry_type_is_derived_from_the_reference_it_summarizes() {
+    let record = sample_usage_record(None, None);
+    assert_eq!(record.entry_type(), EntryType::Record);
+
+    let invalidation = sample_usage_record(None, Some(target_id()));
+    assert_eq!(invalidation.entry_type(), EntryType::Invalidation);
+}
+
+#[test]
+fn an_entry_carries_no_serialized_entry_type() {
+    // Derived means derived: a stored discriminator is a second place the
+    // kind can be read, and the two can disagree. `deny_unknown_fields`
+    // makes the negative assertion sharp — a submitted one is refused.
+    // This half guards the shape a plugin returns.
+    let json = serde_json::to_value(sample_usage_record(None, None)).expect("serializes");
+    assert!(json.get("entry_type").is_none());
+
+    let mut with_marker = json.as_object().expect("object").clone();
+    with_marker.insert("entry_type".to_owned(), serde_json::json!("invalidation"));
+    serde_json::from_value::<UsageRecord>(serde_json::Value::Object(with_marker))
+        .expect_err("a submitted entry_type must be refused as an unknown field");
+}
+
+#[test]
+fn a_submission_carries_no_entry_type_either() {
+    // The wire contract states the rule on the ingestion shape — "the
+    // ingestion shape accepts no discriminator field" — and this is the
+    // type a request body deserializes into, so it is where a caller could
+    // actually try to send one.
+    let json = serde_json::to_value(sample_create_usage_record(None, None)).expect("serializes");
+    assert!(json.get("entry_type").is_none());
+
+    let mut with_marker = json.as_object().expect("object").clone();
+    with_marker.insert("entry_type".to_owned(), serde_json::json!("invalidation"));
+    serde_json::from_value::<CreateUsageRecord>(serde_json::Value::Object(with_marker))
+        .expect_err("a submitted entry_type must be refused as an unknown field");
+}
+
+#[test]
+fn entry_type_as_str_matches_the_wire_spelling() {
+    assert_eq!(EntryType::Record.as_str(), "record");
+    assert_eq!(EntryType::Invalidation.as_str(), "invalidation");
+}
+
+#[test]
+fn entry_type_serde_agrees_with_as_str_on_both_variants() {
+    // Two spellings of one vocabulary: `rename_all = "lowercase"` and
+    // `as_str`. A surface may reach for either — the REST projection
+    // serializes the value, a metric label takes the `&'static str` — so
+    // they must not be able to drift. Without the rename the derived
+    // `Serialize` would emit `"Record"` while `as_str` kept `"record"`,
+    // and nothing would notice.
+    for kind in [EntryType::Record, EntryType::Invalidation] {
+        assert_eq!(
+            serde_json::to_value(kind).expect("serialize EntryType"),
+            json!(kind.as_str()),
+            "the serde encoding of {kind:?} must be its `as_str` spelling",
+        );
+    }
+    // Spelled out once as literals too, so the pair cannot drift together.
+    assert_eq!(
+        serde_json::to_string(&EntryType::Invalidation).expect("serialize"),
+        "\"invalidation\"",
+    );
+}
+
+#[test]
+fn a_half_shape_body_is_refused_on_deserialize() {
+    // In Rust the pairing is a property of the type: `Invalidation` holds
+    // both halves, so neither a submission nor an entry can carry one
+    // without the other and there is nothing left for the projection to
+    // check. A JSON body is the one place the two can still arrive apart —
+    // the wire keeps them flat, per the contract — so the deserialization
+    // shadow is where the rule now lives. Each direction is checked
+    // separately: dropping either key must be refused, and one arm covers
+    // the other's shape in neither direction.
+    for (present, missing) in [
+        ("invalidates", "reason_code"),
+        ("reason_code", "invalidates"),
+    ] {
+        let full =
+            serde_json::to_value(sample_usage_record(None, Some(target_id()))).expect("serialize");
+        let mut half = full.as_object().expect("object").clone();
+        half.remove(missing).expect("the pair serializes flat");
+        assert!(
+            half.contains_key(present),
+            "the surviving half `{present}` must still be on the body",
+        );
+        let err = serde_json::from_value::<UsageRecord>(serde_json::Value::Object(half))
+            .expect_err("a half-shape entry body must be refused");
+        assert!(
+            err.to_string().contains(missing),
+            "the refusal must name the missing `{missing}`; got {err}",
+        );
+
+        let full = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
+            .expect("serialize");
+        let mut half = full.as_object().expect("object").clone();
+        half.remove(missing).expect("the pair serializes flat");
+        let err = serde_json::from_value::<CreateUsageRecord>(serde_json::Value::Object(half))
+            .expect_err("a half-shape submission body must be refused");
+        assert!(
+            err.to_string().contains(missing),
+            "the refusal must name the missing `{missing}`; got {err}",
+        );
+    }
+
+    // Both halves present, and neither present, both decode.
+    sample_create_usage_record(None, None)
+        .try_into_usage_record()
+        .expect("an ordinary record");
+    sample_create_usage_record(None, Some(target_id()))
+        .try_into_usage_record()
+        .expect("an invalidation");
+}
+
+#[test]
+fn both_entry_shapes_round_trip_through_their_own_codecs() {
+    // Both shapes hand-write `Serialize` and route `Deserialize` through a
+    // shadow, so the two halves of each codec are written twice and only
+    // this test makes them agree. It bites in both directions because the
+    // read shadows carry `deny_unknown_fields`: a key the write half
+    // renames or invents is refused as unknown, and a required key it
+    // stops emitting is refused as missing. Neither failure is one the
+    // compiler can see — the exhaustive destructure in each `Serialize`
+    // catches a *dropped* field, not a *renamed* one.
+    //
+    // `CreateUsageRecord` is the emitter-facing ingestion shape, so drift
+    // there silently changes what an SDK client puts on the wire. It went
+    // unguarded while the entry shape was covered incidentally by its
+    // omit-optionals test; both are named here.
+    // The empty-metadata arm is not decoration: an omitted `metadata` is
+    // the common submission, it is the one field whose absence genuinely
+    // needs `#[serde(default)]` on the read shadows, and the ingestion
+    // shape has no other test that exercises the map-empty → key-absent →
+    // default path.
+    let subject = SubjectRef::new("principal-1", Some("user")).expect("valid subject ref");
+    for invalidates in [None, Some(target_id())] {
+        for subject_ref in [None, Some(subject.clone())] {
+            for metadata in [metadata_map([("region", "eu")]), BTreeMap::new()] {
+                let mut record = sample_usage_record(subject_ref.clone(), invalidates);
+                record.metadata = metadata.clone();
+                let encoded = serde_json::to_value(&record).expect("serialize UsageRecord");
+                assert_eq!(
+                    serde_json::from_value::<UsageRecord>(encoded.clone())
+                        .unwrap_or_else(|e| panic!("UsageRecord must decode its own output: {e}")),
+                    record,
+                    "UsageRecord round-trip must be lossless; encoded as {encoded}",
+                );
+
+                let mut submission = sample_create_usage_record(subject_ref.clone(), invalidates);
+                submission.metadata = metadata;
+                let encoded =
+                    serde_json::to_value(&submission).expect("serialize CreateUsageRecord");
+                assert_eq!(
+                    serde_json::from_value::<CreateUsageRecord>(encoded.clone()).unwrap_or_else(
+                        |e| { panic!("CreateUsageRecord must decode its own output: {e}") }
+                    ),
+                    submission,
+                    "CreateUsageRecord round-trip must be lossless; encoded as {encoded}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_withdrawal_pair_stays_flat_on_the_wire() {
+    // The grouping is a Rust-side shape only. `usage-collector-v1.yaml`
+    // declares `invalidates` and `reason_code` as two sibling properties on
+    // both shapes, so a nested `invalidation` object would be a silent
+    // wire break — invisible to every in-process test that round-trips
+    // through the same type.
+    let invalidation = serde_json::to_value(sample_usage_record(None, Some(target_id())))
+        .expect("serialize an invalidation");
+    let object = invalidation.as_object().expect("object");
+    assert!(
+        object.contains_key("invalidates") && object.contains_key("reason_code"),
+        "the pair must serialize as two flat siblings; got {object:?}",
+    );
+    assert!(
+        !object.contains_key("invalidation"),
+        "the Rust grouping must not reach the wire; got {object:?}",
+    );
+
+    let submission = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
+        .expect("serialize an invalidating submission");
+    let object = submission.as_object().expect("object");
+    assert!(
+        object.contains_key("invalidates") && object.contains_key("reason_code"),
+        "the ingestion shape must carry the same two flat siblings; got {object:?}",
+    );
+    assert!(!object.contains_key("invalidation"));
+
+    for ordinary in [
+        serde_json::to_value(sample_usage_record(None, None)).expect("serialize"),
+        serde_json::to_value(sample_create_usage_record(None, None)).expect("serialize"),
+    ] {
+        let object = ordinary.as_object().expect("object");
+        for absent in ["invalidates", "reason_code", "invalidation"] {
+            assert!(
+                !object.contains_key(absent),
+                "an ordinary measurement carries no `{absent}`; got {object:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn each_entry_shape_serializes_the_exact_wire_key_set() {
+    // A round-trip proves the two halves of one codec agree with each
+    // other; it cannot prove either agrees with the contract. Drift applied
+    // to both shadows of a type — a rename, or a changed value encoding —
+    // round-trips perfectly and still breaks every client. These
+    // assertions are against literals for that reason, and they are the
+    // only thing standing between the wire contract and a symmetric edit.
+    let record = serde_json::to_value(sample_usage_record(None, Some(target_id())))
+        .expect("serialize an entry");
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "gts_type_id",
+            "id",
+            "idempotency_key",
+            "invalidates",
+            "metadata",
+            "reason_code",
+            "resource_ref",
+            "tenant_id",
+            "value",
+            "window_end",
+            "window_start",
+        ],
+        "the entry shape's wire key set is the contract; got {record}",
+    );
+
+    let submission = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
+        .expect("serialize a submission");
+    let mut keys: Vec<&str> = submission
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "gts_type_id",
+            "idempotency_key",
+            "invalidates",
+            "metadata",
+            "reason_code",
+            "resource_ref",
+            "tenant_id",
+            "value",
+            "window_end",
+            "window_start",
+        ],
+        "the ingestion shape is the entry shape minus the derived `id`; got {submission}",
+    );
+
+    // The quantity is a JSON *string*, never a JSON number, on both shapes.
+    // `UsageRecord::value`'s own doc is where this rule is stated: a number
+    // round-trips through a client's float and silently loses precision.
+    // The encoding is declared twice per type now, so a symmetric removal
+    // of `rust_decimal::serde::str` would pass every round-trip.
+    for (shape, encoded) in [("entry", &record), ("submission", &submission)] {
+        let value = encoded.get("value").expect("every shape carries a value");
+        assert_eq!(
+            value,
+            &json!("42"),
+            "the {shape} shape must encode `value` as a decimal string, never a \
+             JSON number; got {value}",
+        );
+        assert!(
+            value.is_string(),
+            "`value` must be a JSON string on {shape}"
+        );
+    }
+
+    // The covered-period bounds are RFC 3339 strings on both shapes, for
+    // the same reason: the encoding is declared once per shadow.
+    for (shape, encoded) in [("entry", &record), ("submission", &submission)] {
+        assert_eq!(
+            encoded.get("window_start"),
+            Some(&json!("1970-01-01T00:00:00Z")),
+            "the {shape} shape must encode window_start as RFC 3339",
+        );
+        assert_eq!(
+            encoded.get("window_end"),
+            Some(&json!("1970-01-01T01:00:00Z")),
+            "the {shape} shape must encode window_end as RFC 3339",
+        );
+    }
+}
+
+#[test]
+fn the_reference_does_not_reach_the_derived_identity() {
+    // `cpt-cf-usage-collector-adr-record-identity-derivation` excludes the
+    // entry type, so an invalidation derives its id from the same five
+    // inputs as its target and departs only through its own idempotency
+    // key. That is what makes a key reused across the pair collide loudly
+    // instead of silently producing two entries.
+    let target = sample_create_usage_record(None, None);
+    let mut withdrawal = target.clone();
+    withdrawal.invalidation = Some(sample_invalidation(target_id()));
+
+    assert_eq!(
+        target.clone().try_into_usage_record().expect("record").id,
+        withdrawal.try_into_usage_record().expect("invalidation").id,
+        "adding a reference must not move the derived identity",
+    );
+
+    let mut rekeyed = target.clone();
+    rekeyed.idempotency_key = IdempotencyKey::new("a-different-key").expect("valid");
+    assert_ne!(
+        target.try_into_usage_record().expect("record").id,
+        rekeyed.try_into_usage_record().expect("re-keyed").id,
+        "the idempotency key is the one departure that does move it",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ReasonCode — validated construction and serde routing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reason_code_rejects_the_wire_bounds_and_control_characters() {
+    // The length bounds are the wire contract's `ReasonCode` schema
+    // (`minLength: 1`, `maxLength: 128`), read as bytes rather than code
+    // points — the same reading `IdempotencyKey` gives its own 256, and
+    // the stricter of the two.
+    ReasonCode::new("").expect_err("empty");
+    ReasonCode::new("x".repeat(129)).expect_err("over 128 bytes");
+    // U+00E9, two bytes in UTF-8: 65 code points, 130 bytes. The cap
+    // counts bytes, so this is over it — and an implementation counting
+    // code points would accept it, which is the whole content of the
+    // divergence `MAX_REASON_CODE_LEN` documents. Every ASCII case above
+    // passes under either reading.
+    ReasonCode::new("\u{e9}".repeat(65)).expect_err("130 bytes in 65 code points");
+    // The schema states no pattern for a reason code, so the control
+    // character exclusion is this newtype's own, and stricter: wire
+    // hygiene for a value that reaches a plugin, not pre-image safety —
+    // the code is no input to the identity derivation.
+    ReasonCode::new("emitter\u{7f}duplicate").expect_err("DEL is a control character");
+    ReasonCode::new("emitter\u{1f}duplicate").expect_err("0x1F is a control character");
+    ReasonCode::new("x".repeat(128)).expect("128 bytes is the boundary, inclusive");
+    ReasonCode::new("emitter_duplicate").expect("an ordinary code");
+}
+
+#[test]
+fn reason_code_deserialize_routes_through_new() {
+    let err = serde_json::from_value::<ReasonCode>(json!(""))
+        .expect_err("empty code must surface as a serde error");
+    assert!(
+        err.to_string().contains("reason_code must not be empty"),
+        "serde error must carry the Validation detail; got {err}"
+    );
+}
+
+#[test]
+fn reason_code_serializes_transparently() {
+    let code = reason_code("emitter_duplicate");
+    assert_eq!(
+        serde_json::to_value(&code).expect("serialize"),
+        json!("emitter_duplicate")
+    );
+    assert_eq!(code.as_str(), "emitter_duplicate");
+    assert_eq!(code.to_string(), "emitter_duplicate");
+}
+
+#[test]
+fn reason_code_from_str_routes_through_new() {
+    assert!(ReasonCode::from_str("emitter_duplicate").is_ok());
+    let err = ReasonCode::from_str("").expect_err("empty code must be rejected");
+    assert!(matches!(
+        err,
+        UsageCollectorError::InvalidArgument { ref field, .. } if field.as_str() == "reason_code"
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -618,9 +1026,9 @@ fn aggregation_bucket_value_above_rust_decimal_ceiling_round_trips() {
 
 #[test]
 fn aggregation_bucket_negative_value_round_trips() {
-    // Compensation rows carry negative magnitudes (and can net to zero) —
-    // widening the carrier to BigDecimal is motivated exactly by this path.
-    // The sign must survive the string wire encoding round-trip.
+    // A measured decrease is an ordinary entry with a negative quantity, so
+    // a bucket can carry one (and a set of them can net to zero). The sign
+    // must survive the string wire encoding round-trip.
     let bucket = AggregationBucket {
         key: Vec::new(),
         value: Some(BigDecimal::from(-42)),
@@ -629,16 +1037,6 @@ fn aggregation_bucket_negative_value_round_trips() {
     assert_eq!(value, json!({ "value": "-42" }));
     let decoded: AggregationBucket = serde_json::from_value(value).expect("round-trip");
     assert_eq!(decoded, bucket);
-}
-
-#[test]
-fn usage_record_deserialize_defaults_status_to_active_when_missing() {
-    let mut value =
-        serde_json::to_value(sample_usage_record(None, None)).expect("serialize seed UsageRecord");
-    value.as_object_mut().expect("object").remove("status");
-    let decoded: UsageRecord = serde_json::from_value(value)
-        .expect("UsageRecord without status field deserializes via #[serde(default)]");
-    assert_eq!(decoded.status, UsageRecordStatus::Active);
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,7 +1493,6 @@ fn the_keyset_safe_allowlist_is_exactly_the_mandatory_record_attributes() {
             "tenant_id",
             "resource_id",
             "resource_type",
-            "status",
         ],
     );
 }
@@ -1108,15 +1505,14 @@ fn every_admissible_order_key_resolves_to_a_column() {
     // unmappable order key the gateway happily forwards.
     //
     // Two independently maintained spellings of one vocabulary, and this is
-    // the only thing checking they agree. The allowlist's own criterion —
-    // "a domain-optionality fact, not a storage-column fact" — is exactly
-    // what a *derived* attribute satisfies while having no column at all,
-    // so an addition can pass every other test in the repo and fail only
-    // at the plugin.
+    // the only thing checking they agree in this direction; the converse —
+    // a name on the filterable schema that must never be an order key — is
+    // `a_derived_field_is_filterable_but_never_an_order_key` below, and
+    // neither guard catches the other's case.
     //
-    // This replaces a test that re-asserted the same seven literals the
-    // anchor above pins, through a predicate that reads that very
-    // constant: it could not fail unless the anchor failed first.
+    // This replaces a test that re-asserted the same literals the anchor
+    // above pins, through a predicate that reads that very constant: it
+    // could not fail unless the anchor failed first.
     for field in crate::models::KEYSET_SAFE_RECORD_FIELDS {
         assert!(
             is_keyset_safe_record_field(field),
@@ -1129,6 +1525,63 @@ fn every_admissible_order_key_resolves_to_a_column() {
              cannot resolve it",
         );
     }
+}
+
+#[test]
+fn a_derived_field_is_filterable_but_never_an_order_key() {
+    // The converse of the guard above, and the half it cannot supply.
+    // Resolving to a column is necessary but not sufficient: `entry_type`
+    // is on the filterable schema (the wire contract's `$filter` parameter
+    // names it) and therefore resolves through `from_name`, while being a
+    // function of the optional `invalidates` that the SDK guarantees no
+    // key for. The guard above passes on it. This one does not.
+    assert!(
+        crate::models::UsageRecordFilterField::from_name("entry_type").is_some(),
+        "`entry_type` is a filterable field per the wire contract",
+    );
+    assert!(
+        !is_keyset_safe_record_field("entry_type"),
+        "`entry_type` is a function of the optional `invalidates`, so the SDK \
+         promises no keyset key over it however present the value is",
+    );
+}
+
+#[test]
+fn the_order_key_refusal_names_the_derived_ground_alongside_the_optional_one() {
+    // The refusal detail is caller-facing and interpolates
+    // `KEYSET_SAFE_RECORD_FIELDS` verbatim, so it is the wire contract for
+    // what may be ordered by. `entry_type` made a third refusal reachable:
+    // a recognised filter field that is neither domain-optional nor
+    // unrecognised, refused because it is derived. A detail naming only
+    // the optional and unknown grounds would misdescribe it, and this is
+    // the only thing pinning that the wording covers the case. Lives here
+    // rather than beside the constructor because it is a claim about the
+    // keyset vocabulary this module owns; `error.rs` carries no sibling
+    // test file.
+    let err = UsageCollectorError::inadmissible_order_key("entry_type");
+    let UsageCollectorError::InvalidArgument {
+        ref field,
+        ref detail,
+        ..
+    } = err
+    else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(field, "$orderby");
+    assert!(
+        detail.contains("entry_type"),
+        "the refusal must echo the key the caller sent; got {detail}",
+    );
+    assert!(
+        detail.contains("derived"),
+        "a derived key is refused on its own ground, not as an optional or \
+         unrecognised one; got {detail}",
+    );
+    assert!(
+        detail.contains("resource_type"),
+        "the refusal must name the admissible set so the caller is told what \
+         they may order by; got {detail}",
+    );
 }
 
 #[test]
@@ -1178,11 +1631,13 @@ fn the_covered_period_bounds_resolve_on_the_filterable_field_schema() {
 
 #[test]
 fn keyset_unsafe_record_fields_are_the_domain_optional_ones() {
-    // `subject_ref` (→ subject_id, subject_type) and `corrects_id` are
-    // `Option`al on `UsageRecord`, so their columns are nullable. A row-value
-    // tuple comparison with a NULL leading key evaluates to NULL in Postgres,
-    // silently dropping NULL rows from the page — so they are NOT keyset-safe.
-    for field in ["subject_id", "subject_type", "corrects_id"] {
+    // `subject_ref` (→ subject_id, subject_type) is `Option`al on
+    // `UsageRecord`, and the `invalidates` filter field reads a target that
+    // is present only on an invalidation, so all three can be absent and
+    // their columns are nullable. A row-value tuple comparison with a NULL
+    // leading key evaluates to NULL in Postgres, silently dropping NULL
+    // rows from the page — so they are NOT keyset-safe.
+    for field in ["subject_id", "subject_type", "invalidates"] {
         assert!(
             !is_keyset_safe_record_field(field),
             "`{field}` is a domain-optional attribute and must NOT be keyset-safe",

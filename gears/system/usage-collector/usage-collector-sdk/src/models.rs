@@ -412,6 +412,118 @@ impl<'de> Deserialize<'de> for IdempotencyKey {
 }
 
 // ---------------------------------------------------------------------------
+// ReasonCode
+// ---------------------------------------------------------------------------
+
+/// Ceiling on the wire length of an invalidation reason code, in bytes.
+///
+/// The wire contract's `ReasonCode` schema says `maxLength: 128`, which
+/// counts code points; this counts bytes, exactly as
+/// `MAX_IDEMPOTENCY_KEY_LEN` does against its own `maxLength: 256`. The two
+/// newtypes carry one divergence rather than two spellings of the same
+/// question, and both fail closed — a value this accepts is one the wire
+/// contract accepts too.
+const MAX_REASON_CODE_LEN: usize = 128;
+
+/// Validating newtype over the caller-supplied invalidation reason code.
+///
+/// [`Invalidation::reason`] carries this rather than a bare `String` for
+/// the reason [`IdempotencyKey`] does: the wire contract constrains the
+/// value and an unvalidated one would reach a storage plugin.
+///
+/// The vocabulary itself is deliberately open — the gear records the
+/// emitter's stated intent and infers nothing from it, so no closed enum
+/// is declared here or on the wire.
+///
+/// # Validation
+///
+/// - Non-empty.
+/// - At most 128 bytes (`MAX_REASON_CODE_LEN`).
+/// - No ASCII control characters, DEL included. Unlike [`IdempotencyKey`]'s,
+///   this exclusion is wire hygiene rather than pre-image safety: the code
+///   is not an input to the entry-identity derivation, so nothing it
+///   carries can reach a digest pre-image. The wire contract states no
+///   pattern for the code, so this is the stricter of the two and fails
+///   closed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ReasonCode(String);
+
+impl ReasonCode {
+    /// Creates a [`ReasonCode`] after validating it against the wire
+    /// contract's `ReasonCode` schema (`minLength: 1`, `maxLength: 128`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorError::InvalidArgument`] when the input is
+    /// empty, longer than 128 bytes, or carries an ASCII control character
+    /// (including DEL).
+    pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
+        let raw = value.into();
+        if raw.is_empty() {
+            return Err(UsageCollectorError::invalid_reason_code(
+                "reason_code must not be empty",
+            ));
+        }
+        if raw.len() > MAX_REASON_CODE_LEN {
+            return Err(UsageCollectorError::invalid_reason_code(
+                "reason_code must be at most 128 bytes",
+            ));
+        }
+        // `char::is_ascii_control()` covers U+007F (DEL) alongside
+        // U+0000..=U+001F.
+        if raw.chars().any(|c| c.is_ascii_control()) {
+            return Err(UsageCollectorError::invalid_reason_code(
+                "reason_code must not contain ASCII control characters",
+            ));
+        }
+        Ok(Self(raw))
+    }
+
+    /// Borrows the underlying string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the newtype and returns the owned string.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for ReasonCode {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ReasonCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ReasonCode {
+    type Err = UsageCollectorError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasonCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        ReasonCode::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MeterTypeId
 // ---------------------------------------------------------------------------
 
@@ -595,24 +707,88 @@ pub const WINDOW_END_FIELD: &str = "window_end";
 /// together.
 pub const RECORD_ID_FIELD: &str = "id";
 
-/// Lifecycle status of a stored [`UsageRecord`]. Defaults to `Active`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+/// The closed discriminator between a measurement and a withdrawal.
+///
+/// **Derived, never stored and never submitted.** It is a projection of
+/// [`UsageRecord::invalidation`], so there is no second place the kind can be
+/// read and no way for a marker to disagree with the payload it marks
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`). An entry is
+/// never identified as a correction by the value or the sign of its
+/// quantity: a zero or negative quantity is an ordinary measurement, and an
+/// invalidation echoes the quantity it withdraws rather than negating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum UsageRecordStatus {
-    /// Live, counts toward aggregates, may be referenced by a compensation.
-    #[default]
-    Active,
-    /// Removed from aggregates by an atomic depth-1 cascade; compensations
-    /// referencing this row are rejected per the L1 `corrects_id` rule.
-    Inactive,
+pub enum EntryType {
+    /// An ordinary measurement: the entry carries no `invalidates`.
+    Record,
+    /// A withdrawal: the entry names the record it invalidates.
+    Invalidation,
+}
+
+impl EntryType {
+    /// The wire spelling, shared by the REST projection and the `$filter`
+    /// surface.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Invalidation => "invalidation",
+        }
+    }
+}
+
+/// The withdrawal an invalidation entry carries: the entry it retracts and
+/// why.
+///
+/// Grouping the two makes the half-shape unrepresentable. They are
+/// both-or-neither
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`), and a type that
+/// cannot express one without the other needs no rule, no check and no
+/// error for the case — which is why neither the projection nor the
+/// gateway carries one.
+///
+/// **The wire shape is two flat sibling properties, not a nested object.**
+/// `usage-collector-v1.yaml` declares `invalidates` and `reason_code`
+/// side by side on `UsageRecord` and `CreateUsageRecordRequest`, and this
+/// grouping does not move them: the serde shadow structs in the wire-codec
+/// section split and rejoin the pair so the bytes are unchanged. That split is also where two
+/// readerships meet — the Plugin SPI is in-process Rust, so a plugin author
+/// implements against this one grouped field while reading an OAS that
+/// shows them two properties.
+///
+/// Fields are public rather than accessor-guarded. [`ResourceRef`] and
+/// [`SubjectRef`] hide theirs because they have a cross-field invariant to
+/// protect; this type has none — both components are mandatory by
+/// construction and [`ReasonCode`] validates itself — so an accessor pair
+/// would add ceremony without adding a guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Invalidation {
+    /// The accepted entry this one withdraws. Not an input to the derived
+    /// identity; see [`UsageRecord::invalidation`].
+    pub target: Uuid,
+    /// Why the withdrawal was issued. Forbidden on an ordinary record —
+    /// including one whose quantity is negative, which records real
+    /// consumption rather than a correction.
+    pub reason: ReasonCode,
 }
 
 /// Single usage record. The persisted shape is the canonical return value
 /// of every create surface (new insert or silent idempotency replay).
+///
+/// A withdrawal's two halves are one field ([`Invalidation`]), so the
+/// pairing is a property of this type rather than of a validation step: an
+/// entry carrying a target without a reason, or the reverse, does not exist
+/// to be checked for. The only place the pair can arrive apart is a wire
+/// body, and the shadow struct that deserializes one refuses the half-shape
+/// there.
+///
+/// The wire encoding is unchanged by that grouping — `invalidates` and
+/// `reason_code` remain two flat sibling properties, both omitted on an
+/// ordinary measurement.
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-entity-usage-record:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-entity-idempotency-key:p1
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "UsageRecordWire")]
 pub struct UsageRecord {
     /// Deterministic gateway-derived entry identity: `UUIDv5` of the 5-tuple
     /// dedup identity
@@ -634,46 +810,58 @@ pub struct UsageRecord {
     /// Resource attribution composite (mandatory).
     pub resource_ref: ResourceRef,
     /// Optional subject attribution composite.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_ref: Option<SubjectRef>,
     /// Caller-supplied metadata. Keys are validated [`MetadataKey`]s and
     /// values are typed as `String` end-to-end; closed-shape membership
     /// against the usage type's `metadata_fields` and the operator-configured
     /// size cap are enforced at the gateway before plugin dispatch. Omitted
     /// from the wire when empty.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<MetadataKey, String>,
     /// Signed numeric measurement value, carried as a fixed-precision
     /// [`rust_decimal::Decimal`] on every surface (SDK, REST, plugin SPI)
     /// and persisted as Postgres `NUMERIC`. The wire encoding is a JSON
     /// string (`"42.5"`) — never a JSON number — so client/server number
     /// representations cannot round-trip through float and silently lose
-    /// precision. The permitted sign is jointly governed by the meter's
-    /// counter/gauge semantics (resolved via `types-registry`, not carried by
-    /// this SDK) and the presence of `corrects_id` per the four-cell value
-    /// matrix.
-    #[serde(with = "rust_decimal::serde::str")]
+    /// precision. The permitted sign is governed by the meter's
+    /// counter/gauge semantics alone (resolved via `types-registry`, not
+    /// carried by this SDK). The sign carries no structural meaning: a
+    /// negative quantity records real consumption, and an invalidation
+    /// echoes the quantity it withdraws rather than negating it
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    ///
+    /// The wire encoding (a JSON string, RFC 3339 for the covered-period
+    /// bounds, and which fields are omitted when empty) is declared on this
+    /// type's two shadow structs in the wire-codec section rather than
+    /// here, because the type serializes through them.
     pub value: Decimal,
     /// Mandatory caller-supplied key for at-least-once-with-dedup
     /// semantics. One of the five inputs to the dedup identity, so a single
     /// stable per-meter key covers many periods without collapsing them
     /// onto one entry.
     pub idempotency_key: IdempotencyKey,
-    /// When set, marks this row as a counter compensation referencing a
-    /// previously emitted ordinary usage row. The four-cell value matrix
-    /// and the L1 referential rule are enforced at the gateway before
-    /// plugin dispatch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrects_id: Option<Uuid>,
-    /// Record lifecycle status.
-    #[serde(default)]
-    pub status: UsageRecordStatus,
+    /// The withdrawal this entry carries, absent on an ordinary
+    /// measurement. Its presence is what makes this entry an invalidation
+    /// — hence [`Self::entry_type`], which reads it.
+    ///
+    /// [`Invalidation::target`] is deliberately excluded from the derived
+    /// identity (`cpt-cf-usage-collector-adr-record-identity-derivation`),
+    /// so one idempotency key cannot stand for both a measurement and its
+    /// withdrawal: reusing the target's key across the pair collides on all
+    /// five dedup attributes instead of silently producing two entries.
+    ///
+    /// That collision is only *loud* because of the exclusion's complement
+    /// (`cpt-cf-usage-collector-adr-mandatory-idempotency`): the target
+    /// **is** part of the canonical-equality comparison set, so the
+    /// collapsed pair compares unequal and is rejected. Drop it from that
+    /// comparison and the same collapse silently absorbs the withdrawal as
+    /// a duplicate of the entry it was meant to withdraw. The exclusion
+    /// here and the inclusion there are one mechanism.
+    pub invalidation: Option<Invalidation>,
     /// Inclusive start of the emitter-supplied covered period (RFC 3339
     /// on the wire). The covered period is the only emitter-supplied time
     /// attribution an entry carries. Persisted at microsecond precision,
     /// UTC-normalized by
     /// [`CreateUsageRecord::try_into_usage_record`].
-    #[serde(with = "time::serde::rfc3339")]
     pub window_start: time::OffsetDateTime,
     /// Exclusive end of the covered period. At or after
     /// [`Self::window_start`]; equal bounds mark a point event, not an
@@ -689,25 +877,44 @@ pub struct UsageRecord {
     /// the column the range selects on is also a sort column, and with no
     /// caller `$orderby` it is the leading one, letting a single index
     /// serve both.
-    #[serde(with = "time::serde::rfc3339")]
     pub window_end: time::OffsetDateTime,
+}
+
+impl UsageRecord {
+    /// This entry's kind, derived from the reference it carries.
+    ///
+    /// Not a field: a stored discriminator is a second place the kind can be
+    /// read and the two can disagree
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). Every
+    /// surface that needs the value computes it here.
+    #[must_use]
+    pub const fn entry_type(&self) -> EntryType {
+        if self.invalidation.is_some() {
+            EntryType::Invalidation
+        } else {
+            EntryType::Record
+        }
+    }
 }
 
 /// Identity-free create submission — the input to every create surface
 /// ([`crate::UsageCollectorClientV1::create_usage_record`] /
 /// [`crate::UsageCollectorClientV1::create_usage_records`]).
 ///
-/// This mirrors [`UsageRecord`] minus the two fields a caller cannot own on
-/// create: `id` (a deterministic projection of the 5-tuple dedup identity —
-/// see [`Self::try_into_usage_record`]) and `status` (always
-/// [`UsageRecordStatus::Active`]
-/// on a fresh insert). Encoding "id is derived, not supplied" in the type —
-/// rather than a doc-comment on a full [`UsageRecord`] — is what keeps a
-/// caller from constructing a meaningless identity the gateway would only
-/// discard. The wire REST surface encodes the same shape as
-/// `CreateUsageRecordRequest`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// This mirrors [`UsageRecord`] minus the one field a caller cannot own on
+/// create: `id`, a deterministic projection of the 5-tuple dedup identity
+/// (see [`Self::try_into_usage_record`]). Encoding "id is derived, not
+/// supplied" in the type — rather than a doc-comment on a full
+/// [`UsageRecord`] — is what keeps a caller from constructing a meaningless
+/// identity the gateway would only discard. The wire REST surface encodes
+/// the same shape as `CreateUsageRecordRequest`.
+///
+/// One shape carries both entry kinds, and [`Self::invalidation`] alone
+/// decides which: there is no caller-supplied discriminator to disagree
+/// with the payload it marks
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "CreateUsageRecordWire")]
 pub struct CreateUsageRecord {
     /// Meter this record attaches to — the derived GTS type declaration
     /// (`gts.cf.core.uc.usage_record.v1~<segment>~`) resolved through
@@ -719,62 +926,67 @@ pub struct CreateUsageRecord {
     /// Resource attribution composite (mandatory).
     pub resource_ref: ResourceRef,
     /// Optional subject attribution composite.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_ref: Option<SubjectRef>,
     /// Caller-supplied metadata. Same validation and closed-shape rules as
     /// [`UsageRecord::metadata`]. Omitted from the wire when empty.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<MetadataKey, String>,
-    /// Signed numeric measurement value. Same encoding and sign governance as
-    /// [`UsageRecord::value`].
-    #[serde(with = "rust_decimal::serde::str")]
+    /// Signed numeric measurement value. Same encoding and sign governance
+    /// as [`UsageRecord::value`] — and, as there, the sign says nothing
+    /// about whether this submission is a correction.
     pub value: Decimal,
     /// Mandatory caller-supplied key for at-least-once-with-dedup semantics.
     pub idempotency_key: IdempotencyKey,
-    /// When set, marks this submission as a counter compensation referencing a
-    /// previously emitted ordinary usage row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrects_id: Option<Uuid>,
+    /// The withdrawal this submission carries, absent on an ordinary
+    /// measurement. Its presence is what makes the submission an
+    /// invalidation; there is no caller-supplied discriminator besides it.
+    pub invalidation: Option<Invalidation>,
     /// Inclusive start of the covered period this submission measures (RFC
     /// 3339 on the wire; the codec requires an offset, so an
     /// offset-less timestamp never reaches the projection). Part of the
     /// dedup identity, so it feeds the derived `id`.
-    #[serde(with = "time::serde::rfc3339")]
     pub window_start: time::OffsetDateTime,
     /// Exclusive end of the covered period. Must be at or after
     /// [`Self::window_start`]; equal bounds submit a point event. Part of
     /// the dedup identity, so it feeds the derived `id` — which is why an
     /// emitter that recomputes its bounds on retry derives a different
     /// identifier, and why deterministic bounds are an emitter obligation.
-    #[serde(with = "time::serde::rfc3339")]
     pub window_end: time::OffsetDateTime,
 }
 
 impl CreateUsageRecord {
     /// Projects this submission into the persisted [`UsageRecord`] shape,
-    /// validating the covered period first.
+    /// validating the submission's own shape first.
     ///
     /// This is the single point at which a submission acquires its identity,
-    /// and the validation is inseparable from it:
+    /// and the period validation is inseparable from it:
     /// `cpt-cf-usage-collector-adr-record-identity-derivation` requires both
     /// period preconditions to be rejected **before** the derivation runs,
     /// so the projection is fallible rather than the caller's obligation.
     ///
     /// In order: both bounds are normalized to UTC, each must then carry at
     /// most microsecond precision, the period must be ordered
-    /// (`window_start <= window_end`, equal bounds being a point event), and
-    /// only then is `id` derived over
+    /// (`window_start <= window_end`, equal bounds being a point event),
+    /// and only then is `id` derived over
     /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
-    /// `status` is initialized to [`UsageRecordStatus::Active`] and every
-    /// other field is forwarded verbatim. Because the identity is a pure
-    /// projection of caller-supplied fields it cannot be supplied
+    /// Every other field is forwarded verbatim, the invalidation reference
+    /// included — it is not an input to the derivation. Because the identity
+    /// is a pure projection of caller-supplied fields it cannot be supplied
     /// independently — which is exactly why the create surface takes this
     /// identity-free type rather than a full [`UsageRecord`].
     ///
-    /// Neither precondition truncates. A truncated bound would be persisted
-    /// under an `id` derived from the truncated value while the emitter
-    /// reproduces the id it submitted, so the two would disagree about the
-    /// same entry.
+    /// Neither period precondition truncates. A truncated bound would be
+    /// persisted under an `id` derived from the truncated value while the
+    /// emitter reproduces the id it submitted, so the two would disagree
+    /// about the same entry.
+    ///
+    /// The withdrawal's own both-or-neither rule is not checked here and
+    /// has no error: [`Invalidation`] groups the target with its reason, so
+    /// a submission carrying one without the other cannot be built. The
+    /// only place the two can arrive apart is a wire body, where
+    /// `CreateUsageRecord`'s deserialization shadow refuses it. The rules an
+    /// invalidation must satisfy against its *target* — that the target
+    /// resolves, is itself a record, and is copied faithfully — need a
+    /// lookup and belong to the ingestion gateway.
     ///
     /// # Errors
     ///
@@ -820,8 +1032,7 @@ impl CreateUsageRecord {
             metadata: self.metadata,
             value: self.value,
             idempotency_key: self.idempotency_key,
-            corrects_id: self.corrects_id,
-            status: UsageRecordStatus::Active,
+            invalidation: self.invalidation,
             window_start,
             window_end,
         })
@@ -853,6 +1064,342 @@ fn require_microsecond_precision(
         Err(UsageCollectorError::sub_microsecond_period_bound(
             field, bound,
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire codecs
+// ---------------------------------------------------------------------------
+//
+// Every entry shape's serde lives here rather than beside the type, so a
+// reader after the two domain shapes finds them adjacent instead of
+// separated by their plumbing. Nothing below is part of the public API:
+// the shadows are private and the two `Serialize` impls are the visible
+// behaviour of `UsageRecord` and `CreateUsageRecord` themselves.
+
+/// `skip_serializing_if` predicate for a borrowed metadata map. The
+/// attribute hands the field by reference, so a borrowed field arrives as
+/// `&&BTreeMap` and `BTreeMap::is_empty` does not typecheck against it. The
+/// double reference is the attribute's calling convention, not a choice —
+/// hence the allow.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn metadata_is_empty(metadata: &&BTreeMap<MetadataKey, String>) -> bool {
+    metadata.is_empty()
+}
+
+/// Splits an [`Invalidation`] into the two flat wire properties, or refuses
+/// a half-shape.
+///
+/// Shared by both entry shapes' shadow structs. The refusal is a plain
+/// message rather than a typed [`UsageCollectorError`]: it can only fire
+/// inside a `Deserialize`, which erases everything but the string, so a
+/// carried reason code would be information the caller never receives.
+fn invalidation_from_wire(
+    invalidates: Option<Uuid>,
+    reason_code: Option<ReasonCode>,
+) -> Result<Option<Invalidation>, String> {
+    match (invalidates, reason_code) {
+        (None, None) => Ok(None),
+        (Some(target), Some(reason)) => Ok(Some(Invalidation { target, reason })),
+        (Some(_), None) => Err(
+            "`invalidates` and `reason_code` are both-or-neither on a usage \
+             record; `reason_code` is missing"
+                .to_owned(),
+        ),
+        (None, Some(_)) => Err(
+            "`invalidates` and `reason_code` are both-or-neither on a usage \
+             record; `invalidates` is missing"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Owned deserialization shadow for [`UsageRecord`].
+///
+/// Exists because the pair is flat on the wire and grouped in the type, and
+/// `#[serde(flatten)]` — the obvious way to bridge that — cannot be used
+/// under `#[serde(deny_unknown_fields)]`. The `deny_unknown_fields` lives
+/// here, so a submitted `entry_type` (or any other stray key) is still
+/// refused.
+///
+/// # The four-shadow shape, and the two-shadow alternative
+///
+/// Each entry type has an owned shadow for reading and a borrowing one for
+/// writing — four in all. `#[serde(try_from = "…")]` and
+/// `#[serde(into = "…")]` do coexist on one type, so **one owned shadow per
+/// type would serve both directions**: two shadows instead of four, no
+/// `metadata_is_empty` and no allow beside it, and — the part that matters
+/// — each field's serde attributes declared once instead of twice.
+///
+/// The cost of that shape is a clone of the whole record on every
+/// serialization, metadata map and strings included, to serve a purely
+/// representational concern. That is what the borrowing shadow buys.
+///
+/// **How much that is worth is unproven, and the honest answer is
+/// "little".** Neither `Serialize` impl here is on any HTTP path this gear
+/// serves: a REST response serializes the host crate's `UsageRecordDto`,
+/// a request body deserializes into its `CreateUsageRecordRequest`, and the
+/// Plugin SPI passes these types in process without serde at all. They are
+/// reached when an SDK consumer serializes the type itself — a submission
+/// it stores, queues, or puts on a transport of its own. The host's own
+/// `From<UsageRecord>` for its DTO rebuilds the metadata map a line later
+/// regardless, so on that path the allocation is paid either way.
+///
+/// The counterweight is real and should be weighed again rather than
+/// inherited: splitting the directions splits the attributes with them.
+/// `#[serde(default)]` lives only on the read shadows and
+/// `skip_serializing_if` only on the write shadows, and nothing makes the
+/// two halves agree except `both_entry_shapes_round_trip_through_their_own
+/// _codecs` in `models_tests` — a drift surface the plain derive did not
+/// have. A rename on a write shadow killed **no** test until that
+/// round-trip existed. **If a third hand-written codec appears here,
+/// revisit this trade rather than copying it a third time.**
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageRecordWire {
+    id: Uuid,
+    gts_type_id: MeterTypeId,
+    tenant_id: Uuid,
+    resource_ref: ResourceRef,
+    #[serde(default)]
+    subject_ref: Option<SubjectRef>,
+    #[serde(default)]
+    metadata: BTreeMap<MetadataKey, String>,
+    #[serde(with = "rust_decimal::serde::str")]
+    value: Decimal,
+    idempotency_key: IdempotencyKey,
+    #[serde(default)]
+    invalidates: Option<Uuid>,
+    #[serde(default)]
+    reason_code: Option<ReasonCode>,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: time::OffsetDateTime,
+}
+
+impl TryFrom<UsageRecordWire> for UsageRecord {
+    type Error = String;
+
+    fn try_from(wire: UsageRecordWire) -> Result<Self, Self::Error> {
+        let UsageRecordWire {
+            id,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            value,
+            idempotency_key,
+            invalidates,
+            reason_code,
+            window_start,
+            window_end,
+        } = wire;
+        Ok(Self {
+            id,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            value,
+            idempotency_key,
+            invalidation: invalidation_from_wire(invalidates, reason_code)?,
+            window_start,
+            window_end,
+        })
+    }
+}
+
+/// Borrowing serialization shadow for [`UsageRecord`].
+///
+/// Borrowed rather than owned so serializing a record costs no clone of its
+/// metadata map and strings — which `#[serde(into = "…")]` would charge on
+/// every call. The [`Serialize`] impl below destructures the record
+/// exhaustively, so a field added to [`UsageRecord`] and not to this shadow
+/// is a compile error rather than a key that silently stops being emitted.
+#[derive(Serialize)]
+struct UsageRecordWireRef<'a> {
+    id: Uuid,
+    gts_type_id: &'a MeterTypeId,
+    tenant_id: Uuid,
+    resource_ref: &'a ResourceRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_ref: Option<&'a SubjectRef>,
+    #[serde(skip_serializing_if = "metadata_is_empty")]
+    metadata: &'a BTreeMap<MetadataKey, String>,
+    #[serde(with = "rust_decimal::serde::str")]
+    value: Decimal,
+    idempotency_key: &'a IdempotencyKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invalidates: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<&'a ReasonCode>,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: time::OffsetDateTime,
+}
+
+impl Serialize for UsageRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Self {
+            id,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            value,
+            idempotency_key,
+            invalidation,
+            window_start,
+            window_end,
+        } = self;
+        UsageRecordWireRef {
+            id: *id,
+            gts_type_id,
+            tenant_id: *tenant_id,
+            resource_ref,
+            subject_ref: subject_ref.as_ref(),
+            metadata,
+            value: *value,
+            idempotency_key,
+            invalidates: invalidation.as_ref().map(|i| i.target),
+            reason_code: invalidation.as_ref().map(|i| &i.reason),
+            window_start: *window_start,
+            window_end: *window_end,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Owned deserialization shadow for [`CreateUsageRecord`]. See
+/// [`UsageRecordWire`] for why the shadow exists; this is the ingestion
+/// half.
+///
+/// It is **not** on the REST path. A request body deserializes into the
+/// host crate's own `CreateUsageRecordRequest` DTO, which carries its own
+/// `deny_unknown_fields` and its own flat fields, and the handler builds a
+/// [`CreateUsageRecord`] from it by struct literal. This shadow is reached
+/// when the SDK type itself is deserialized — an in-process consumer
+/// decoding a submission it stored, queued or received over a transport of
+/// its own. Both paths must agree about the flat pair, and neither can
+/// check the other.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateUsageRecordWire {
+    gts_type_id: MeterTypeId,
+    tenant_id: Uuid,
+    resource_ref: ResourceRef,
+    #[serde(default)]
+    subject_ref: Option<SubjectRef>,
+    #[serde(default)]
+    metadata: BTreeMap<MetadataKey, String>,
+    #[serde(with = "rust_decimal::serde::str")]
+    value: Decimal,
+    idempotency_key: IdempotencyKey,
+    #[serde(default)]
+    invalidates: Option<Uuid>,
+    #[serde(default)]
+    reason_code: Option<ReasonCode>,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: time::OffsetDateTime,
+}
+
+impl TryFrom<CreateUsageRecordWire> for CreateUsageRecord {
+    type Error = String;
+
+    fn try_from(wire: CreateUsageRecordWire) -> Result<Self, Self::Error> {
+        let CreateUsageRecordWire {
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            value,
+            idempotency_key,
+            invalidates,
+            reason_code,
+            window_start,
+            window_end,
+        } = wire;
+        Ok(Self {
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            value,
+            idempotency_key,
+            invalidation: invalidation_from_wire(invalidates, reason_code)?,
+            window_start,
+            window_end,
+        })
+    }
+}
+
+/// Borrowing serialization shadow for [`CreateUsageRecord`]. See
+/// [`UsageRecordWireRef`] for why it borrows.
+#[derive(Serialize)]
+struct CreateUsageRecordWireRef<'a> {
+    gts_type_id: &'a MeterTypeId,
+    tenant_id: Uuid,
+    resource_ref: &'a ResourceRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_ref: Option<&'a SubjectRef>,
+    #[serde(skip_serializing_if = "metadata_is_empty")]
+    metadata: &'a BTreeMap<MetadataKey, String>,
+    #[serde(with = "rust_decimal::serde::str")]
+    value: Decimal,
+    idempotency_key: &'a IdempotencyKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invalidates: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<&'a ReasonCode>,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: time::OffsetDateTime,
+}
+
+impl Serialize for CreateUsageRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Self {
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            value,
+            idempotency_key,
+            invalidation,
+            window_start,
+            window_end,
+        } = self;
+        CreateUsageRecordWireRef {
+            gts_type_id,
+            tenant_id: *tenant_id,
+            resource_ref,
+            subject_ref: subject_ref.as_ref(),
+            metadata,
+            value: *value,
+            idempotency_key,
+            invalidates: invalidation.as_ref().map(|i| i.target),
+            reason_code: invalidation.as_ref().map(|i| &i.reason),
+            window_start: *window_start,
+            window_end: *window_end,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -978,8 +1525,8 @@ pub struct AggregationBucket {
     pub key: Vec<String>,
     /// Aggregation result for the bucket, carried as an arbitrary-precision
     /// [`bigdecimal::BigDecimal`] so `SUM`, `MIN`, `MAX`, and `COUNT` are exact
-    /// at any magnitude and compensation rows net to zero. Postgres `NUMERIC`
-    /// is unbounded, and a wide `SUM` (or large-magnitude `AVG`) can exceed
+    /// at any magnitude. Postgres `NUMERIC` is unbounded, and a wide `SUM`
+    /// (or large-magnitude `AVG`) can exceed
     /// [`rust_decimal::Decimal`]'s ~7.9×10²⁸ ceiling — which previously
     /// surfaced as an `Internal` (HTTP 500) on decode. `AVG` is now exact in
     /// magnitude but may still carry a backend/plugin-chosen rounding scale on
@@ -1057,9 +1604,20 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 // `subject_id`, `subject_type`) so filtering goes through the macro-derived
 // path rather than a hand-rolled slash-path `FilterField` impl.
 //
-// `status` is declared `String` on the filter wire (`"active"` /
-// `"inactive"`); plugins translate to their storage representation via
-// `FieldToColumn::map_value`.
+// `entry_type` is declared `String` on the filter wire (`"record"` /
+// `"invalidation"`). The SDK stores no such attribute — it is a function
+// of `invalidates`, which is optional — so a plugin that wants the field
+// filterable materializes it: a stored generated column
+// (`CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END`)
+// returned from `FieldToColumn::map_field`. `map_value` cannot carry it.
+// That hook rewrites a value and can change neither the column nor the
+// operator, and `toolkit-db`'s `sea_orm_filter` converts the mapped value
+// before it reaches its `IS NULL` / `IS NOT NULL` branch, so an
+// `ODataValue::Null` returned from the hook is refused rather than lowered
+// — for `in` as well as for `eq`. Neither wire spelling is reachable that
+// way. The SDK requires no plugin to materialize the column, which is why
+// `entry_type` is absent from [`KEYSET_SAFE_RECORD_FIELDS`]; see
+// [`is_keyset_safe_record_field`].
 //
 // `metadata` filtering does not flow through OData — see
 // [`MetadataFilter`] below, supplied as a separate parameter on
@@ -1117,26 +1675,33 @@ pub struct UsageRecordQuery {
     /// surface.
     #[odata(filter(kind = "String"))]
     pub subject_type: String,
-    /// `usage_records.corrects_id` (compensation target). Supports `eq`
-    /// and `in`.
+    /// The entry an invalidation withdraws, or absent on an ordinary
+    /// record. Filterable (`eq` / `in`) so a consumer folding entries
+    /// itself can find a withdrawn pair; **not** an order key, because it
+    /// is domain-optional — see [`is_keyset_safe_record_field`].
     #[odata(filter(kind = "Uuid"))]
-    pub corrects_id: Uuid,
-    /// `usage_records.status` lifecycle (`"active"` / `"inactive"`). Plugins
-    /// translate to the storage representation via
-    /// `FieldToColumn::map_value`.
+    pub invalidates: Uuid,
+    /// The derived `record` / `invalidation` discriminator. On the filter
+    /// surface because the wire contract lists it there; a plugin backs it
+    /// with a stored generated column over `invalidates` and returns that
+    /// from `FieldToColumn::map_field` — `map_value` cannot express either
+    /// spelling, see the file-level comment above. **Not** an order key:
+    /// the value is a function of the optional `invalidates`, so the SDK
+    /// holds no such attribute and requires no plugin to hold one —
+    /// mandatory though the value is. See [`is_keyset_safe_record_field`].
     #[odata(filter(kind = "String"))]
-    pub status: String,
+    pub entry_type: String,
 }
 
 pub use UsageRecordQueryFilterField as UsageRecordFilterField;
 
-/// The record attributes that are never absent, and therefore sound as
-/// keyset-pagination ordering keys — the closed set
+/// The record attributes every entry carries in its own right, and
+/// therefore sound as keyset-pagination ordering keys — the closed set
 /// [`is_keyset_safe_record_field`] tests against.
 ///
 /// Exported because it is the admissible `$orderby` vocabulary, so a `400`
 /// refusing a caller's order can name the whole set rather than leave them
-/// to guess: seven names is short enough to be actionable, and the set is
+/// to guess: six names is short enough to be actionable, and the set is
 /// closed. Matching is exact, like the `$orderby` grammar itself.
 pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
     RECORD_ID_FIELD,
@@ -1145,31 +1710,47 @@ pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
     "tenant_id",
     "resource_id",
     "resource_type",
-    "status",
 ];
 
-/// Record filter fields backed by a **mandatory (never-null)** attribute, and
-/// therefore sound to use as a keyset-pagination ordering key.
+/// Record filter fields sound to use as a keyset-pagination ordering key.
 ///
 /// The storage plugin's keyset continuation is a row-value tuple comparison
 /// (`(c1, c2, …) > ($…)`). In SQL three-valued logic a tuple whose leading
 /// column is NULL compares as NULL, so every NULL-keyed row is silently
 /// dropped from the paged result — and a page ending on such a row cannot
-/// encode a `next_cursor` at all (a 500). A field is keyset-safe **iff** its
-/// backing [`UsageRecord`] attribute is never absent:
+/// encode a `next_cursor` at all (a 500). A keyset key therefore has to be
+/// an attribute this SDK guarantees is present on every entry. Two kinds of
+/// field are not, and both are on the filterable schema:
 ///
-/// - `subject_id` / `subject_type` come from `subject_ref: Option<SubjectRef>`
-///   and `corrects_id` is `Option<Uuid>` — all three are domain-optional, so
-///   they are **not** keyset-safe.
-/// - every entry of [`KEYSET_SAFE_RECORD_FIELDS`] is mandatory on every
-///   record, so all of them are keyset-safe.
+/// - **Domain-optional attributes.** `subject_id` / `subject_type` come from
+///   `subject_ref: Option<SubjectRef>`, and the `invalidates` filter field
+///   reads the target inside [`UsageRecord::invalidation`], which is absent
+///   on every ordinary measurement — all three can be absent, so they are
+///   **not** keyset-safe.
+/// - **Attributes derived from an optional one.** `entry_type` is present
+///   on every entry and still not keyset-safe: it is
+///   [`UsageRecord::entry_type`], a function of `invalidates` that
+///   partitions entries on that field's *absence*. The SDK carries no such
+///   attribute of its own and obliges no plugin to materialize one, so it
+///   will not promise a keyset key over it. Presence is not the whole
+///   criterion, and a rule phrased as optionality alone would admit this
+///   one vacuously.
 ///
-/// This is a domain-optionality fact (an SDK concern), not a storage-column
-/// fact. Enforcement is the **gateway's alone**: it refuses a caller
-/// `$orderby` on a non-keyset-safe field with a `400` and guarantees the
-/// order slot the Plugin SPI documents on every surface, so a plugin needs
-/// no fallback keyset of its own and an unusable order is a gateway breach
-/// rather than a case to paper over — see
+/// Every entry of [`KEYSET_SAFE_RECORD_FIELDS`] is an attribute the record
+/// itself carries on every entry, so all of them are keyset-safe.
+///
+/// This is a fact about the shape this SDK guarantees, not about any
+/// storage schema. A plugin is free to materialize `entry_type` as a
+/// generated column — filtering on it needs exactly that — and doing so
+/// still does not make it an order key, because the guarantee a caller's
+/// `$orderby` rests on is the SDK's to give and the SDK does not give this
+/// one.
+///
+/// Enforcement is the **gateway's alone**: it refuses a caller `$orderby` on
+/// a non-keyset-safe field with a `400` and guarantees the order slot the
+/// Plugin SPI documents on every surface, so a plugin needs no fallback
+/// keyset of its own and an unusable order is a gateway breach rather than a
+/// case to paper over — see
 /// [`crate::UsageCollectorPluginV1::list_usage_records`], which is
 /// normative for the plugin side. The allowlist is deliberately
 /// fail-closed: an unknown or newly added field is unsafe until it is
@@ -1178,8 +1759,8 @@ pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
 /// Being on this list is necessary but not sufficient. An order key also
 /// has to resolve to a column, which is [`UsageRecordFilterField`]'s
 /// vocabulary, not this one — the two are checked against each other in
-/// `models_tests`, because a derived attribute could satisfy the
-/// domain-optionality criterion above while having no column at all.
+/// `models_tests`, in both directions, because a derived attribute resolves
+/// there while carrying no presence guarantee here.
 #[must_use]
 pub fn is_keyset_safe_record_field(name: &str) -> bool {
     KEYSET_SAFE_RECORD_FIELDS.contains(&name)

@@ -41,10 +41,10 @@ pub use gts::{USAGE_RECORD_RESOURCE, UsageCollectorPluginSpecV1};
 pub use id::{USAGE_RECORD_ID_NAMESPACE, canonical_period_bound, derive_usage_record_id};
 pub use models::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
-    IdempotencyKey, KEYSET_SAFE_RECORD_FIELDS, MAX_AGGREGATION_BUCKETS, MetadataFilter,
-    MetadataKey, MeterTypeId, RECORD_ID_FIELD, ResourceRef, SubjectRef, USAGE_RECORD_BASE_TYPE,
-    UsageRecord, UsageRecordFilterField, UsageRecordQuery, UsageRecordStatus, WINDOW_END_FIELD,
-    WINDOW_START_FIELD, is_keyset_safe_record_field,
+    EntryType, IdempotencyKey, Invalidation, KEYSET_SAFE_RECORD_FIELDS, MAX_AGGREGATION_BUCKETS,
+    MetadataFilter, MetadataKey, MeterTypeId, RECORD_ID_FIELD, ReasonCode, ResourceRef, SubjectRef,
+    USAGE_RECORD_BASE_TYPE, UsageRecord, UsageRecordFilterField, UsageRecordQuery,
+    WINDOW_END_FIELD, WINDOW_START_FIELD, is_keyset_safe_record_field,
 };
 pub use plugin_api::UsageCollectorPluginV1;
 pub use reason::{ConflictReason, ValidationReason};

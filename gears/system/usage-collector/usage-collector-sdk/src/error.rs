@@ -383,6 +383,12 @@ impl UsageCollectorError {
         Self::newtype_validation("idempotency_key", detail)
     }
 
+    /// `ReasonCode::new` rejected the input. `field` is `reason_code`.
+    #[must_use]
+    pub fn invalid_reason_code(detail: impl Into<String>) -> Self {
+        Self::newtype_validation("reason_code", detail)
+    }
+
     /// Ingestion supplied a metadata key not declared in the referenced
     /// meter's resolved closed `metadata_fields`. Attributed to the record
     /// resource, with `resource_name` carrying the offending `gts_type_id`.
@@ -442,11 +448,13 @@ impl UsageCollectorError {
         }
     }
 
-    /// A caller order named a key that is not sound to paginate on —
-    /// either a domain-optional attribute or a name that is not a record
-    /// attribute at all. Every caller key leads the effective keyset, and
-    /// a row-value tuple whose leading column is NULL compares as NULL,
-    /// so NULL-keyed rows would silently drop out of the page. The
+    /// A caller order named a key that is not sound to paginate on — a
+    /// domain-optional attribute, one derived from an optional attribute,
+    /// or a name that is not a record attribute at all. Every caller key
+    /// leads the effective keyset, and a row-value tuple whose leading
+    /// column is NULL compares as NULL, so NULL-keyed rows would silently
+    /// drop out of the page; a derived attribute is one the SDK guarantees
+    /// no plugin holds a key for. The
     /// classification is [`crate::is_keyset_safe_record_field`], which is
     /// a fail-closed allowlist — hence the same rejection for an unknown
     /// name. Attributed to `$orderby`, and naming the whole admissible set
@@ -461,9 +469,10 @@ impl UsageCollectorError {
             field: "$orderby".to_owned(),
             reason: ValidationReason::Validation,
             detail: format!(
-                "order key '{field}' is not supported: keyset pagination needs an \
-                 always-present record attribute, so an optional attribute or an \
-                 unrecognised name is refused; order by one of {:?}",
+                "order key '{field}' is not supported: keyset pagination needs a \
+                 record attribute present on every entry in its own right, so an \
+                 optional or derived attribute, or an unrecognised name, is \
+                 refused; order by one of {:?}",
                 crate::KEYSET_SAFE_RECORD_FIELDS,
             ),
         }

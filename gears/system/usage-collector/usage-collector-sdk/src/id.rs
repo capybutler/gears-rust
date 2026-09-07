@@ -117,6 +117,15 @@ pub fn canonical_period_bound(bound: OffsetDateTime) -> String {
 ///
 /// A point event derives over a zero-length period, where the two bounds
 /// are equal; the derivation needs no separate case for it.
+///
+/// The parameter list is the enforcement of the entry-type exclusion this
+/// module's header states: `invalidates` is not among the inputs, so an
+/// invalidation derives the same identifier as the target it copies and
+/// departs only through its own idempotency key. Its complement is that
+/// `invalidates` **is** compared for canonical equality
+/// (`cpt-cf-usage-collector-adr-mandatory-idempotency`), which is what
+/// turns a key reused across the pair into a loud rejection rather than a
+/// silently absorbed duplicate.
 #[must_use]
 pub fn derive_usage_record_id(
     tenant_id: Uuid,
