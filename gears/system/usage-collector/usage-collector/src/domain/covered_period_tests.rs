@@ -9,7 +9,8 @@
 use time::{Duration, OffsetDateTime};
 use usage_collector_sdk::{RecordOrigin, UsageCollectorError, ValidationReason};
 
-use super::{CoveredPeriodBounds, enforce_covered_period_bounds};
+use super::{CoveredPeriodBounds, enforce_covered_period_bounds, ingestion_action};
+use crate::domain::authz::usage_record::actions;
 
 /// A fixed instant, supplied rather than read from the clock, so every
 /// entry of a batch is judged against one `now` and no test races the
@@ -134,4 +135,54 @@ fn the_backfill_route_still_rejects_a_period_ending_in_the_future() {
     )
     .expect_err("the future bound governs both routes");
     assert_eq!(*reason_of(&err), ValidationReason::FutureWindow);
+}
+
+#[test]
+fn the_action_is_create_inside_the_backfill_window_and_backfill_beyond_it() {
+    // The elevated action exists FOR the beyond-window case. Inside the
+    // window a backfilled entry needs no grant a live one does not — the
+    // routes differ by which bounds apply and by the origin they stamp,
+    // not by who may call them.
+    assert_eq!(
+        ingestion_action(
+            &default_bounds(),
+            RecordOrigin::Backfill,
+            now(),
+            ending(Duration::days(-30)),
+        ),
+        actions::CREATE,
+        "30 days back is well inside the 90-day window",
+    );
+    assert_eq!(
+        ingestion_action(
+            &default_bounds(),
+            RecordOrigin::Backfill,
+            now(),
+            ending(Duration::days(-120)),
+        ),
+        actions::BACKFILL,
+        "120 days back reaches past the 90-day window, which is the whole \
+         reason the elevated action exists",
+    );
+}
+
+#[test]
+fn the_live_path_authorizes_create_whatever_the_backfill_window_says() {
+    // The live path does not read `backfill_window` at all. Deriving that
+    // from the arithmetic — a live-admitted entry is inside 48 hours, so it
+    // is inside 90 days too — would be a coincidence of the defaults: the
+    // past tolerance and the backfill window are independently configured
+    // keys, and a deployment that widened the past tolerance past the
+    // window would start demanding an elevated grant for ordinary live
+    // emission. So the input here is one the live admission bound would
+    // itself reject.
+    assert_eq!(
+        ingestion_action(
+            &default_bounds(),
+            RecordOrigin::Live,
+            now(),
+            ending(Duration::days(-365)),
+        ),
+        actions::CREATE,
+    );
 }

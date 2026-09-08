@@ -58,6 +58,8 @@ pub mod key {
 pub enum PdpOp {
     /// Usage-record ingestion (single + batch emit).
     Ingest,
+    /// Bulk historical import — the backfill route's own ingestion.
+    Backfill,
     /// Raw (non-aggregated) usage-record listing.
     QueryRaw,
     /// Aggregated usage-record query.
@@ -72,6 +74,7 @@ impl PdpOp {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ingest => "ingest",
+            Self::Backfill => "backfill",
             Self::QueryRaw => "query_raw",
             Self::QueryAggregated => "query_aggregated",
             Self::GetRecord => "get_record",

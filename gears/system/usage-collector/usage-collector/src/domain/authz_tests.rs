@@ -316,6 +316,37 @@ async fn authorize_attribution_tuple_denies_record_outside_granted_tenant() {
         .expect("a record owned by the granted tenant is permitted");
 }
 
+/// The `usage_record` action vocabulary, spelled out.
+///
+/// These four strings are a contract against the PDP policy bundle and
+/// against `gts/permissions.rs`, which derives one permission instance per
+/// action: renaming a constant here silently re-points a deployed grant at
+/// a verb no policy mentions, and the compiler cannot see it because both
+/// sides read the same constant. So the literals are pinned here, once,
+/// where a rename shows up as a diff a reviewer must justify.
+///
+/// The distinctness half is not decorative either: two constants that
+/// collapsed onto one string would give two permissions the same
+/// `(resource_type, action)` pair, and `AttributionTupleKey`'s
+/// action-aware hash would stop separating them.
+#[test]
+fn the_usage_record_action_vocabulary_is_four_distinct_spellings() {
+    use std::collections::BTreeSet;
+
+    let actions = [
+        usage_record::actions::CREATE,
+        usage_record::actions::GET,
+        usage_record::actions::LIST,
+        usage_record::actions::BACKFILL,
+    ];
+    assert_eq!(actions, ["create", "get", "list", "backfill"]);
+    assert_eq!(
+        actions.iter().collect::<BTreeSet<_>>().len(),
+        actions.len(),
+        "two actions collapsed onto one spelling: {actions:?}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // scope_to_odata_filter — projects AccessScope into ODataQuery filter
 // ---------------------------------------------------------------------------

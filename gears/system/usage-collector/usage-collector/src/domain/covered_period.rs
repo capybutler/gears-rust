@@ -1,11 +1,13 @@
 //! The ingestion path's covered-period bounds.
 //!
-//! Three durations and one pure function over them. The function reads
-//! **only the end of the covered period** — the instant that makes
-//! consumption current or historical
+//! Three durations and two pure functions over them: one admits or refuses
+//! an entry, the other picks the PDP action the admitted entry is
+//! authorized against. Both read **only the end of the covered period** —
+//! the instant that makes consumption current or historical
 //! (`cpt-cf-usage-collector-adr-backfill-isolation`, "Why the three bounds
-//! are asymmetric"). It reads neither `window_start`, nor the length of the
-//! period, nor the arrival instant, nor the entry kind.
+//! are asymmetric") — together with the route the entry arrived on. Neither
+//! reads `window_start`, the length of the period, the arrival instant, or
+//! the entry kind.
 //!
 //! That last exclusion is the one that surprises. A withdrawal copies its
 //! target's period, so an invalidation of a closed month has a `window_end`
@@ -18,6 +20,8 @@
 
 use time::{Duration, OffsetDateTime};
 use usage_collector_sdk::{RecordOrigin, UsageCollectorError};
+
+use crate::domain::authz::usage_record;
 
 /// Default future tolerance (5 minutes), the value DESIGN
 /// `cpt-cf-usage-collector-fr-live-future-time-bound` publishes.
@@ -59,11 +63,10 @@ pub struct CoveredPeriodBounds {
     /// How far back the backfill route reaches without elevated
     /// authorization.
     ///
-    /// Carried but not yet read: it selects a PDP action rather than
-    /// admitting or refusing an entry, and the `backfill` action does not
-    /// exist yet. The field lands with its two siblings so the bounds
-    /// arrive as one projection of the configured block rather than in two
-    /// instalments.
+    /// Read by [`ingestion_action`] and by nothing else: it selects a PDP
+    /// action rather than admitting or refusing an entry, so no entry is
+    /// ever rejected for crossing it — an entry beyond it is authorized
+    /// against `backfill` instead of `create`.
     pub backfill_window: Duration,
 }
 
@@ -134,6 +137,45 @@ pub fn enforce_covered_period_bounds(
         ));
     }
     Ok(())
+}
+
+/// The PDP action this entry is authorized against.
+///
+/// Reaching past the backfill window is the elevated case, and the action
+/// is what makes it one: an operator grants `backfill` to an import job and
+/// not to an ordinary emitter. Inside the window a backfilled entry needs
+/// no grant a live entry does not.
+///
+/// The live arm returns `actions::CREATE` without consulting
+/// `backfill_window` at all. Deriving it instead from the arithmetic — a
+/// live-admitted entry is inside the past tolerance, therefore inside the
+/// window — would couple two independently configured keys, and a
+/// deployment that widened the past tolerance past the window would start
+/// demanding an elevated grant for ordinary live emission.
+///
+/// Reads `window_end` and the origin, matching what
+/// [`enforce_covered_period_bounds`] reads, so one batch can carry entries
+/// bound to both actions. That is safe by construction: `action`
+/// participates in `AttributionTupleKey`'s hash/eq, so the two cannot
+/// collapse onto a single PDP decision.
+#[must_use]
+pub fn ingestion_action(
+    bounds: &CoveredPeriodBounds,
+    origin: RecordOrigin,
+    now: OffsetDateTime,
+    window_end: OffsetDateTime,
+) -> &'static str {
+    // Arm order is load-bearing, and the guard's pattern carries the
+    // live-path exclusion structurally: `backfill_window` is reachable only
+    // under `RecordOrigin::Backfill`. (The two `CREATE` arms are merged
+    // because `clippy::match_same_arms` is denied workspace-wide; the
+    // behaviour is the same as spelling them separately.)
+    match origin {
+        RecordOrigin::Backfill if now - window_end > bounds.backfill_window => {
+            usage_record::actions::BACKFILL
+        }
+        RecordOrigin::Live | RecordOrigin::Backfill => usage_record::actions::CREATE,
+    }
 }
 
 #[cfg(test)]

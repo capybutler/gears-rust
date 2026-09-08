@@ -11,8 +11,8 @@
 //! usage-type catalog permission family any more: every type declaration is
 //! owned by `types-registry`, which authorizes its own surface. `action`
 //! values come from `crate::domain::authz::usage_record::actions` — the same
-//! constants the `PolicyEnforcer` gate passes — so the catalog cannot drift
-//! from what the REST surface actually enforces.
+//! constants the `PolicyEnforcer` gate passes — so a catalogued action cannot
+//! drift in spelling from the one the gate enforces.
 //!
 //! Instance id layout: `gts.cf.toolkit.authz.permission.v1~cf.core.uc.<seg>.v1`.
 //!
@@ -51,6 +51,15 @@ gts_instance! {
         display_name: "List usage records".to_owned(),
     }
 }
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_backfill.v1"),
+        resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+        action: usage_record::actions::BACKFILL.to_owned(),
+        display_name: "Import or withdraw usage records for periods older than the backfill window"
+            .to_owned(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -65,12 +74,16 @@ mod tests {
     const UC_PACKAGE: &str = "core";
     const UC_NAMESPACE: &str = "uc";
 
-    /// One per `(resource_type, action)` the usage-collector REST/PEP surface
-    /// enforces.
+    /// One per `(resource_type, action)` in the usage-collector PEP
+    /// vocabulary — the grantable set, which is the catalog's job to
+    /// publish. `usage_record_backfill` is declared here before the
+    /// backfill route passes it, because an operator has to be able to
+    /// grant the elevated action to an import job before that job runs.
     const EXPECTED_PERMISSION_IDS: &[&str] = &[
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_create.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_get.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_list.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_backfill.v1"),
     ];
 
     fn uc_permission_instances() -> Vec<&'static InventoryInstance> {

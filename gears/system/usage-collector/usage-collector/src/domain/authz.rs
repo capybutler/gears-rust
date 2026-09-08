@@ -232,6 +232,17 @@ pub(crate) mod usage_record {
         pub const CREATE: &str = "create";
         pub const GET: &str = "get";
         pub const LIST: &str = "list";
+        /// Import or withdraw a covered period ending further back than the
+        /// configured backfill window.
+        ///
+        /// The elevated grant of
+        /// `cpt-cf-usage-collector-adr-backfill-isolation`. It is **not**
+        /// the backfill route's action — an entry on that route whose
+        /// period ends inside the window authorizes [`CREATE`], because it
+        /// needs no privilege a live emission does not. This one is
+        /// granted to an import job, so an emitter that finds a gap older
+        /// than the window cannot close it on its own.
+        pub const BACKFILL: &str = "backfill";
     }
 }
 
