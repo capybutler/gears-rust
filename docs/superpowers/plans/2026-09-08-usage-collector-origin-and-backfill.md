@@ -40,6 +40,21 @@ where they were paid for. They are current.
    run survives, first ask whether it is an equivalent mutant, and say so —
    never manufacture a kill, and never delete a working test to make a number
    look better.
+
+   **This plan has now produced three prescribed checks that could not fail**,
+   so the rule extends past mutations to assertions:
+
+   - Task 5's `histogram_count(…) == 2` held whether or not the label under
+     test existed — two observations sum to 2 in one series exactly as across
+     two.
+   - Task 7's `!detail.contains("backfill")` held against an **empty**
+     message. **A negative assertion needs a positive anchor**: assert
+     alongside it that the message carries something it must carry, or it is
+     satisfied by the absence of everything.
+   - Task 6's contrast test could not fail unless another test failed first.
+
+   Before accepting any check — yours or a prescribed one — state the mutation
+   that makes it red. If you cannot name one, it is not a test.
 4. **Tests live in a sibling `*_tests.rs` file** with a
    `#[cfg(test)] #[cfg_attr(coverage_nightly, coverage(off))] #[path = "..."]`
    hook. Never an inline `mod tests`. `src/gts/permissions.rs` has a
