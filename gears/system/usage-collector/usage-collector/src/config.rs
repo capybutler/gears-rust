@@ -72,6 +72,53 @@ pub struct UsageCollectorConfig {
     /// `domain::validation::validate_submit_record_metadata` is a
     /// no-op for the default deployment rather than a silent tightening.
     pub metadata_size_cap_bytes: usize,
+
+    /// How far into the future a covered period may end, in seconds.
+    ///
+    /// The live path rejects a period ending further ahead than this, and
+    /// **so does the backfill route** — the route lifts the past bound
+    /// only. The bound protects against a defective or clock-skewed emitter
+    /// opening a period that does not yet exist
+    /// (`cpt-cf-usage-collector-adr-backfill-isolation`).
+    ///
+    /// Defaults to `300` (5 minutes), the value DESIGN
+    /// `cpt-cf-usage-collector-fr-live-future-time-bound` publishes.
+    pub live_future_tolerance_secs: u64,
+
+    /// How far into the past a covered period may end on the **live** path,
+    /// in seconds.
+    ///
+    /// A period ending further back is rejected with a message naming the
+    /// backfill route, which is where such an entry belongs. The default
+    /// covers emitter outage and retry lag, which is what genuinely late
+    /// live data is; anything older is history, and history belongs on the
+    /// route that marks it.
+    ///
+    /// The bound belongs to the path, not to the entry kind, so it governs
+    /// an invalidation over the period it copies exactly as it governs a
+    /// measurement. A withdrawal of a closed month therefore travels the
+    /// backfill route.
+    ///
+    /// Defaults to `172_800` (48 hours).
+    pub live_past_tolerance_secs: u64,
+
+    /// How far back the backfill route reaches without elevated
+    /// authorization, in seconds.
+    ///
+    /// The route admits any period the future bound allows. This window
+    /// decides only *which* PDP action each entry is authorized against:
+    /// inside it, `create`; beyond it, the `backfill` action. It bounds the
+    /// recomputation obligation a materialised aggregate carries.
+    ///
+    /// A deployment must not admit a window wider than the raw retention its
+    /// storage profile guarantees for the target GTS type. The retention
+    /// floor is this window plus one replay horizon
+    /// (`cpt-cf-usage-collector-fr-billing-retention-floor`), 125 days at
+    /// the launch defaults — a plugin-readiness condition surfaced at
+    /// review, not a gear-side sweep.
+    ///
+    /// Defaults to `7_776_000` (90 days).
+    pub backfill_window_secs: u64,
 }
 
 impl Default for UsageCollectorConfig {
@@ -82,6 +129,9 @@ impl Default for UsageCollectorConfig {
             type_cache_ttl_secs: 300,
             type_cache_capacity: 10_000,
             metadata_size_cap_bytes: crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+            live_future_tolerance_secs: 300,
+            live_past_tolerance_secs: 172_800,
+            backfill_window_secs: 7_776_000,
         }
     }
 }
@@ -157,12 +207,30 @@ impl UsageCollectorConfig {
     /// round-trip, which is exactly the coupling the cache exists to remove,
     /// and a zero capacity cannot hold even a single resolved declaration.
     ///
+    /// The three covered-period bounds are checked here too, and this is
+    /// currently their only reader — the Ingestion Gateway does not enforce
+    /// them yet. Each must be non-zero and must fit an `i64`, because a
+    /// bound is compared as a duration of `i64` seconds; a `u64::MAX`
+    /// tolerance is a configuration mistake, not an infinite bound.
+    ///
+    /// `backfill_window_secs` must not be narrower than
+    /// `live_past_tolerance_secs`. The live path's past-tolerance rejection
+    /// tells an emitter to resubmit on the backfill route, so a narrower
+    /// window would point an ordinary emitter at a route where that same
+    /// period needs elevated authorization. The three bounds are otherwise
+    /// deliberately asymmetric
+    /// (`cpt-cf-usage-collector-adr-backfill-isolation`, "Why the three
+    /// bounds are asymmetric"); this is the one ordering among them that has
+    /// to hold.
+    ///
     /// # Errors
     ///
     /// Returns an error if `vendor` is empty or whitespace-only, if the
     /// metrics prefix is not a valid instrument-name prefix (see
-    /// [`MetricsConfig::validate`]), or if `type_cache_ttl_secs` /
-    /// `type_cache_capacity` is zero.
+    /// [`MetricsConfig::validate`]), if `type_cache_ttl_secs` /
+    /// `type_cache_capacity` is zero, if any of the three covered-period
+    /// bounds is zero or does not fit an `i64`, or if
+    /// `backfill_window_secs` is narrower than `live_past_tolerance_secs`.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.vendor.trim().is_empty() {
             anyhow::bail!("[usage_collector].vendor must not be empty or whitespace-only");
@@ -176,6 +244,54 @@ impl UsageCollectorConfig {
         }
         if self.type_cache_capacity == 0 {
             anyhow::bail!("[usage_collector].type_cache_capacity must be greater than 0");
+        }
+        if self.live_future_tolerance_secs == 0 {
+            anyhow::bail!(
+                "[usage_collector].live_future_tolerance_secs must be greater than 0: \
+                 a zero future tolerance refuses a covered period ending a \
+                 microsecond from now, on every ingestion path"
+            );
+        }
+        if self.live_past_tolerance_secs == 0 {
+            anyhow::bail!(
+                "[usage_collector].live_past_tolerance_secs must be greater than 0: \
+                 a zero past tolerance refuses every covered period on the live \
+                 path that does not end in the future"
+            );
+        }
+        if self.backfill_window_secs == 0 {
+            anyhow::bail!(
+                "[usage_collector].backfill_window_secs must be greater than 0: \
+                 a zero window leaves no period the backfill route admits without \
+                 elevated authorization"
+            );
+        }
+        for (key, secs) in [
+            (
+                "live_future_tolerance_secs",
+                self.live_future_tolerance_secs,
+            ),
+            ("live_past_tolerance_secs", self.live_past_tolerance_secs),
+            ("backfill_window_secs", self.backfill_window_secs),
+        ] {
+            if i64::try_from(secs).is_err() {
+                anyhow::bail!(
+                    "[usage_collector].{key} ({secs}) must fit in an i64: a bound is \
+                     compared as a duration of i64 seconds, so a value this large is \
+                     a configuration mistake rather than an infinite bound"
+                );
+            }
+        }
+        if self.backfill_window_secs < self.live_past_tolerance_secs {
+            anyhow::bail!(
+                "[usage_collector].backfill_window_secs ({}) must not be narrower than \
+                 live_past_tolerance_secs ({}): the live path's past-tolerance rejection \
+                 tells an emitter to resubmit on the backfill route, so a narrower window \
+                 would point an ordinary emitter at a route where that same period needs \
+                 elevated authorization",
+                self.backfill_window_secs,
+                self.live_past_tolerance_secs
+            );
         }
         Ok(())
     }
