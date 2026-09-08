@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use toolkit_gts::gts_id;
 use usage_collector_sdk::{
-    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, ResourceRef, UsageRecord,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -52,19 +52,30 @@ fn sample_target_uuid() -> Uuid {
 /// An ordinary measurement: it carries no withdrawal, so its derived
 /// entry type is `record`.
 fn sample_persisted_record() -> UsageRecord {
-    sample_persisted_entry(None)
+    sample_persisted_entry(None, RecordOrigin::Live)
 }
 
 /// A withdrawal of [`SAMPLE_TARGET_ID`]: same payload, plus the one field
 /// whose presence makes the entry an invalidation.
 fn sample_persisted_invalidation() -> UsageRecord {
-    sample_persisted_entry(Some(Invalidation {
-        target: sample_target_uuid(),
-        reason: ReasonCode::new(SAMPLE_REASON_CODE).expect("valid reason code"),
-    }))
+    sample_persisted_entry(
+        Some(Invalidation {
+            target: sample_target_uuid(),
+            reason: ReasonCode::new(SAMPLE_REASON_CODE).expect("valid reason code"),
+        }),
+        RecordOrigin::Live,
+    )
 }
 
-fn sample_persisted_entry(invalidation: Option<Invalidation>) -> UsageRecord {
+/// An entry admitted by the backfill route. Separate from
+/// [`sample_persisted_record`] because `origin` is the one field of the
+/// response projection whose two values are not interchangeable to a
+/// consumer: one is current consumption and the other is imported history.
+fn sample_backfilled_record() -> UsageRecord {
+    sample_persisted_entry(None, RecordOrigin::Backfill)
+}
+
+fn sample_persisted_entry(invalidation: Option<Invalidation>, origin: RecordOrigin) -> UsageRecord {
     UsageRecord {
         id: sample_record_uuid(),
         gts_type_id: MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
@@ -74,6 +85,7 @@ fn sample_persisted_entry(invalidation: Option<Invalidation>) -> UsageRecord {
         metadata: BTreeMap::new(),
         value: Decimal::from_str(SAMPLE_RECORD_VALUE).expect("valid decimal"),
         idempotency_key: IdempotencyKey::new(SAMPLE_IDEMPOTENCY_KEY).expect("valid idem key"),
+        origin,
         invalidation,
         window_start: parse_rfc3339(SAMPLE_WINDOW_START_RFC3339),
         window_end: parse_rfc3339(SAMPLE_WINDOW_END_RFC3339),
@@ -426,10 +438,11 @@ fn usage_record_dto_serialises_exactly_the_declared_wire_keys() {
     // `UsageRecord`, so it appears in both.
     //
     // This is what the gear emits, not what `usage-collector-v1.yaml`'s
-    // `UsageRecord` declares: the contract also requires `accepted_at`,
-    // `acceptance_sequence` and `origin`, and spells `value` as `quantity`.
-    // Both gaps are out of this slice; this assertion is what will fail
-    // when either closes.
+    // `UsageRecord` declares: the contract also requires `accepted_at`
+    // and `acceptance_sequence`, and spells `value` as `quantity`. Those
+    // gaps are still open; this assertion is what will fail when one
+    // closes. `origin` was on that list until the projection started
+    // carrying it, which is why it is now a key below.
     let record =
         serde_json::to_value(UsageRecordDto::from(sample_persisted_record())).expect("serializes");
     let mut keys: Vec<&str> = record
@@ -446,6 +459,7 @@ fn usage_record_dto_serialises_exactly_the_declared_wire_keys() {
             "gts_type_id",
             "id",
             "idempotency_key",
+            "origin",
             "resource_ref",
             "tenant_id",
             "value",
@@ -472,6 +486,7 @@ fn usage_record_dto_serialises_exactly_the_declared_wire_keys() {
             "id",
             "idempotency_key",
             "invalidates",
+            "origin",
             "reason_code",
             "resource_ref",
             "tenant_id",
@@ -503,6 +518,21 @@ fn usage_record_dto_serialises_exactly_the_declared_wire_keys() {
         "`reason_code` MUST be emitted as a bare string, not the newtype's \
          debug form",
     );
+}
+
+#[test]
+fn the_response_projection_carries_the_origin_the_entry_was_admitted_under() {
+    // `origin` is server-assigned from the route the entry arrived on, so
+    // the projection must carry the stored value through rather than
+    // defaulting: a consumer separates imported history from current
+    // consumption on this key alone.
+    let live =
+        serde_json::to_value(UsageRecordDto::from(sample_persisted_record())).expect("serializes");
+    assert_eq!(live.get("origin"), Some(&serde_json::json!("live")));
+
+    let imported =
+        serde_json::to_value(UsageRecordDto::from(sample_backfilled_record())).expect("serializes");
+    assert_eq!(imported.get("origin"), Some(&serde_json::json!("backfill")));
 }
 
 #[test]

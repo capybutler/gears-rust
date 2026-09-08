@@ -88,11 +88,11 @@ pub(crate) const COMPARED_FIELDS: [&str; 8] = [
 ///
 /// **The two ignore-counts differ and that is not a bug**: the submission
 /// ignores `idempotency_key` and `invalidation` (two); the target ignores
-/// `id`, `idempotency_key` and `invalidation` (three), because the target
-/// has an identity the submission has not acquired yet. A destructure-audit
-/// expecting one number on both sides will come out short and go looking for
-/// a defect that is not there. Every ignored binding is discarded by name,
-/// with the reason it is not compared.
+/// `id`, `idempotency_key`, `origin` and `invalidation` (four), because the
+/// target carries two server-assigned fields the submission never supplies.
+/// A destructure-audit expecting one number on both sides will come out
+/// short and go looking for a defect that is not there. Every ignored
+/// binding is discarded by name, with the reason it is not compared.
 ///
 /// The comparison array is as long as [`COMPARED_FIELDS`], so a comparison
 /// added without its name — or removed while its name stays — is a compile
@@ -129,6 +129,14 @@ fn faithful_copy_mismatch(entry: &CreateUsageRecord, target: &UsageRecord) -> Op
         value: target_value,
         // Permitted departure, as on the submission side.
         idempotency_key: _,
+        // Not a copied field: it is stamped from the route each entry
+        // arrived on, and the withdrawal's route is its own. A correction
+        // of a period that has since closed travels the backfill route
+        // while the entry it retracts came in live, so comparing the two
+        // would reject exactly the case the backfill route exists for.
+        // There is nothing on the submission side to compare it against
+        // either — `CreateUsageRecord` carries no origin.
+        origin: _,
         // The target carries none — that is the
         // no-invalidation-of-an-invalidation rule, checked separately by
         // `verify_invalidation_target` and never inferred from a comparison.

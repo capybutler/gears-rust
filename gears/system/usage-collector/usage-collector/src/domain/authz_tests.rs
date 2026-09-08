@@ -24,7 +24,8 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, ResourceRef, SubjectRef, UsageRecord,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, SubjectRef,
+    UsageRecord,
 };
 use uuid::Uuid;
 
@@ -56,6 +57,7 @@ fn record_with(subject: Option<SubjectRef>) -> UsageRecord {
         metadata: BTreeMap::new(),
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-eq").expect("valid idempotency key"),
+        origin: RecordOrigin::Live,
         invalidation: None,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
@@ -149,7 +151,7 @@ async fn key_and_record_compose_byte_identical_pdp_requests_with_full_subject() 
 
 /// Two records that hash-equal under `AttributionTupleKey` MUST always
 /// produce equal PDP requests -- even when their *non*-tuple fields
-/// (`id`, `gts_type_id`, `value`, `idempotency_key`, `metadata`,
+/// (`id`, `gts_type_id`, `value`, `idempotency_key`, `metadata`, `origin`,
 /// `invalidation`, and both covered-period bounds) differ wildly. This pins
 /// the projection-correctness premise of the dedup directly: "share the
 /// tuple => share the PDP payload".
@@ -169,6 +171,7 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         metadata: BTreeMap::new(),
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-A").expect("valid idempotency key"),
+        origin: RecordOrigin::Live,
         invalidation: None,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
@@ -184,6 +187,11 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         metadata: BTreeMap::new(),
         value: Decimal::from(-999),
         idempotency_key: IdempotencyKey::new("idem-B-different").expect("valid idempotency key"),
+        // Admitted by the other ingestion path. The attribution tuple is
+        // blind to which route admitted an entry, so an imported record and
+        // a live one sharing the tuple must still collapse onto one PDP
+        // decision.
+        origin: RecordOrigin::Backfill,
         // The one axis that used to be two fields: record B is a withdrawal
         // and record A a measurement, and the tuple key must still collapse
         // them onto one PDP decision.

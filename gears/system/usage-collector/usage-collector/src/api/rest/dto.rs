@@ -175,6 +175,11 @@ pub struct UsageRecordDto {
     /// `cpt-cf-usage-collector-dod-usage-emission-fr-idempotency`. Every
     /// persisted record carries a non-empty key.
     pub idempotency_key: String,
+    /// Which ingestion path admitted the entry — `live` or `backfill`.
+    /// Server-assigned, `required` on the OAS `UsageRecord`, so it is never
+    /// omitted. Flattened to `String` for the same reason as
+    /// [`Self::gts_type_id`]: to keep `utoipa` out of the SDK crate.
+    pub origin: String,
     /// The entry this one withdraws, absent on an ordinary measurement.
     /// Both-or-neither with [`Self::reason_code`] — the SDK carries the
     /// pair as one field, so a response can never show half of it.
@@ -226,6 +231,10 @@ impl From<UsageRecord> for UsageRecordDto {
                 .collect(),
             value: value.value,
             idempotency_key: value.idempotency_key.into_inner(),
+            // Read in place rather than hoisted above the destructure the
+            // way `entry_type` is: `RecordOrigin` is `Copy` and the field
+            // is untouched by the partial move, so nothing forces it out.
+            origin: value.origin.as_str().to_owned(),
             invalidates,
             reason_code,
             entry_type,

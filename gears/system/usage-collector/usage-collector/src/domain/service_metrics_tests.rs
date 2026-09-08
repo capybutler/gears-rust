@@ -18,7 +18,8 @@ use toolkit_gts::gts_id;
 use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo};
 use usage_collector_sdk::{
     AggregationBucket, AggregationResult, CreateUsageRecord, IdempotencyKey, Invalidation,
-    MetadataKey, MeterTypeId, ReasonCode, ResourceRef, UsageCollectorError, UsageRecord,
+    MetadataKey, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, UsageCollectorError,
+    UsageRecord,
 };
 use uuid::Uuid;
 
@@ -51,6 +52,7 @@ fn sample_record() -> UsageRecord {
         metadata: BTreeMap::new(),
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-1").expect("valid idempotency key"),
+        origin: RecordOrigin::Live,
         invalidation: None,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),

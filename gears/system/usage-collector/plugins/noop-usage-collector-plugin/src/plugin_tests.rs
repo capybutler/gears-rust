@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 use usage_collector_sdk::{
-    IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorPluginError, UsageCollectorPluginV1,
-    UsageRecord,
+    IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef, UsageCollectorPluginError,
+    UsageCollectorPluginV1, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -24,6 +24,7 @@ fn sample_record(id: &str, idempotency_key: &str) -> UsageRecord {
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new(idempotency_key)
             .expect("valid idempotency key fixture"),
+        origin: RecordOrigin::Live,
         invalidation: None,
         window_start: time::OffsetDateTime::UNIX_EPOCH,
         window_end: time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),

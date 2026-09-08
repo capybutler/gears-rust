@@ -29,7 +29,7 @@ use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
 use usage_collector_sdk::{
     AggregationDimension, AggregationResult, ConflictReason, CreateUsageRecord, EntryType,
-    Invalidation, MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, TimeRange,
+    Invalidation, MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, RecordOrigin, TimeRange,
     UsageCollectorError, UsageCollectorPluginError, UsageCollectorPluginSpecV1,
     UsageCollectorPluginV1, UsageRecord, ValidationReason,
 };
@@ -848,6 +848,7 @@ impl Service {
         &self,
         ctx: &SecurityContext,
         record: CreateUsageRecord,
+        origin: RecordOrigin,
     ) -> Result<UsageRecord, UsageCollectorError> {
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-missing-ctx
@@ -870,7 +871,7 @@ impl Service {
             .invalidation
             .as_ref()
             .map(|invalidation| (record.clone(), invalidation.clone()));
-        let record = record.try_into_usage_record()?;
+        let record = record.try_into_usage_record(origin)?;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-pdp-deny
         authz::authorize_usage_record(
@@ -1011,7 +1012,12 @@ impl Service {
     ) -> Result<UsageRecord, UsageCollectorError> {
         let start = std::time::Instant::now();
         let entry_type = entry_type_of(&record);
-        let result = self.create_usage_record_inner(ctx, record).await;
+        // `Live` comes from the route this wrapper *is*, not from a
+        // default: the backfill route stamps `Backfill` through the same
+        // inner path.
+        let result = self
+            .create_usage_record_inner(ctx, record, RecordOrigin::Live)
+            .await;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-completion-metrics
         self.metrics
             .observe_ingestion_duration(start.elapsed().as_secs_f64());
@@ -1076,7 +1082,12 @@ impl Service {
         // into the inner pipeline (the per-entry counter needs it after).
         let entry_types: Vec<EntryType> = records.iter().map(entry_type_of).collect();
 
-        let result = self.create_usage_records_inner(ctx, records).await;
+        // `Live` comes from the route this wrapper *is*, not from a
+        // default: the backfill route stamps `Backfill` through the same
+        // inner path.
+        let result = self
+            .create_usage_records_inner(ctx, records, RecordOrigin::Live)
+            .await;
         let seconds = start.elapsed().as_secs_f64();
 
         match &result {
@@ -1172,6 +1183,7 @@ impl Service {
         &self,
         ctx: &SecurityContext,
         records: Vec<CreateUsageRecord>,
+        origin: RecordOrigin,
     ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError> {
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
         // The `1..=MAX_BATCH_RECORDS` cap is enforced by the public
@@ -1223,7 +1235,7 @@ impl Service {
                     .as_ref()
                     .map(|invalidation| (submission.clone(), invalidation.clone())),
             );
-            match submission.try_into_usage_record() {
+            match submission.try_into_usage_record(origin) {
                 Ok(record) => derived.push((index, record)),
                 Err(e) => {
                     results[index] = Some(Err(e));

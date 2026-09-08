@@ -366,7 +366,7 @@ mod pdp_dedup_tests {
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, SubjectRef,
+        CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef, SubjectRef,
         UsageCollectorPluginV1, UsageRecord,
     };
     use uuid::Uuid;
@@ -403,6 +403,7 @@ mod pdp_dedup_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
+            origin: RecordOrigin::Live,
             invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
@@ -726,8 +727,8 @@ mod gts_type_id_dedup_tests {
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, USAGE_RECORD_RESOURCE,
-        UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
+        CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
+        USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
     };
     use uuid::Uuid;
 
@@ -770,6 +771,7 @@ mod gts_type_id_dedup_tests {
             metadata: input.metadata.clone(),
             value: input.value,
             idempotency_key: input.idempotency_key.clone(),
+            origin: RecordOrigin::Live,
             invalidation: input.invalidation.clone(),
             window_start: input.window_start,
             window_end: input.window_end,
@@ -1710,7 +1712,7 @@ mod get_usage_record_tests {
     fn sample_persisted_record(id: Uuid, tenant_id: Uuid) -> UsageRecord {
         use std::collections::BTreeMap;
         use time::OffsetDateTime;
-        use usage_collector_sdk::{IdempotencyKey, MeterTypeId, ResourceRef};
+        use usage_collector_sdk::{IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef};
         UsageRecord {
             id,
             gts_type_id: MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id"),
@@ -1720,6 +1722,7 @@ mod get_usage_record_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new("idem-happy").expect("valid idempotency key"),
+            origin: RecordOrigin::Live,
             invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
@@ -2732,7 +2735,7 @@ mod batch_size_cap_tests {
     }
 }
 
-// ── Service-level derived-id stamp (in-process / SDK callers) ───────────────
+// ── Service-level server-assigned stamps (in-process / SDK callers) ────────
 //
 // The create surface is identity-free (`CreateUsageRecord`): callers never
 // supply an `id`. The domain `Service` is the single, guaranteed point where a
@@ -2743,6 +2746,10 @@ mod batch_size_cap_tests {
 // handler) and assert the record the plugin RECEIVED carries the
 // deterministic derivation, pinning that the service stamps the derived id on
 // the dispatch path.
+//
+// `origin` is stamped at the same point and from the same call, so it is
+// pinned here too: it is server-assigned from the route, and these two
+// methods ARE the live route.
 #[cfg(test)]
 mod derived_id_stamp_tests {
     use std::collections::BTreeMap;
@@ -2751,8 +2758,8 @@ mod derived_id_stamp_tests {
     use time::OffsetDateTime;
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorPluginV1,
-        derive_usage_record_id,
+        CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
+        UsageCollectorPluginV1, derive_usage_record_id,
     };
     use uuid::Uuid;
 
@@ -2881,6 +2888,61 @@ mod derived_id_stamp_tests {
              window_start, window_end), overwriting the caller-supplied ids - \
              this guards the in-process (non-REST) batch caller path \
              independently of the handler",
+        );
+    }
+
+    /// Both live ingestion surfaces MUST stamp `origin = live` on what they
+    /// dispatch.
+    ///
+    /// Read off the DISPATCHED record rather than off the returned one: the
+    /// plugin echoes a fixture back, so a returned `Live` would only prove
+    /// the fixture was built `Live`. What the service handed the plugin is
+    /// the value it assigned.
+    #[tokio::test]
+    async fn the_live_surfaces_stamp_origin_live() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0xD3);
+        let single = input_record(tenant_id, "idem-origin-singular");
+        let batch = vec![input_record(tenant_id, "idem-origin-batch")];
+
+        plugin.set_create_record(projected(&single));
+        plugin.set_create_records(batch.iter().map(|r| Ok(projected(r))).collect());
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.origin_stamp.live.records.v1",
+        );
+
+        service
+            .create_usage_record(&authenticated_ctx(), single)
+            .await
+            .expect("happy path MUST accept the record");
+        assert_eq!(
+            plugin
+                .last_create_record_input()
+                .expect("plugin received the dispatched record")
+                .origin,
+            RecordOrigin::Live,
+            "create_usage_record IS the live route, so the entry it \
+             dispatches MUST carry origin = live",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), batch)
+            .await
+            .expect("batch dispatch succeeded");
+        assert!(results.iter().all(Result::is_ok));
+        let dispatched_origins: Vec<RecordOrigin> = plugin
+            .last_create_records_input()
+            .expect("plugin received the dispatched batch")
+            .iter()
+            .map(|r| r.origin)
+            .collect();
+        assert_eq!(
+            dispatched_origins,
+            vec![RecordOrigin::Live],
+            "create_usage_records IS the live route, so every entry it \
+             dispatches MUST carry origin = live",
         );
     }
 }
@@ -5246,7 +5308,7 @@ mod withdrawal_exclusion_tests {
     use toolkit_odata::ODataQuery;
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
-        AggregationFold, AggregationResult, IdempotencyKey, MeterTypeId, ResourceRef,
+        AggregationFold, AggregationResult, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
         UsageCollectorPluginV1, UsageRecord, derive_usage_record_id,
     };
     use uuid::Uuid;
@@ -5300,6 +5362,7 @@ mod withdrawal_exclusion_tests {
             metadata: BTreeMap::new(),
             value: value.parse().expect("valid decimal quantity"),
             idempotency_key,
+            origin: RecordOrigin::Live,
             invalidation: None,
             window_start,
             window_end,
@@ -5439,11 +5502,10 @@ mod withdrawal_exclusion_tests {
         // fold the same number; here only the second admits 42.5.
         let (svc, plugin) = service_over_folding_plugin(AggregationFold::Sum);
         plugin.store(measurement("idem-survivor", "7.5", 10));
-        plugin.store(FoldingPlugin::withdrawal_of(&measurement(
-            "idem-purged",
-            "42.5",
-            30,
-        )));
+        plugin.store(FoldingPlugin::withdrawal_of(
+            &measurement("idem-purged", "42.5", 30),
+            RecordOrigin::Live,
+        ));
 
         assert_eq!(
             single_bucket(&aggregate(&svc).await),

@@ -276,7 +276,7 @@ async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_no
 
 use std::collections::BTreeMap;
 use usage_collector_sdk::{
-    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, ResourceRef, UsageRecord,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, UsageRecord,
     derive_usage_record_id,
 };
 
@@ -401,6 +401,7 @@ fn sample_persisted_entry(
         metadata: BTreeMap::new(),
         value: rust_decimal::Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-happy").expect("valid idempotency key"),
+        origin: RecordOrigin::Live,
         invalidation,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: EPOCH_PLUS_ONE_HOUR,

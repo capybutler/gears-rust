@@ -14,8 +14,8 @@ use time::OffsetDateTime;
 use toolkit_gts::gts_id;
 use usage_collector_sdk::{
     CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId, ReasonCode,
-    ResourceRef, SubjectRef, UsageCollectorError, UsageRecord, ValidationReason, WINDOW_END_FIELD,
-    WINDOW_START_FIELD,
+    RecordOrigin, ResourceRef, SubjectRef, UsageCollectorError, UsageRecord, ValidationReason,
+    WINDOW_END_FIELD, WINDOW_START_FIELD,
 };
 use uuid::Uuid;
 
@@ -92,7 +92,7 @@ fn base_submission() -> CreateUsageRecord {
 /// the target carries a derived identity rather than a hand-picked one.
 fn accepted(submission: CreateUsageRecord) -> UsageRecord {
     submission
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("test fixture submits a well-formed covered period")
 }
 

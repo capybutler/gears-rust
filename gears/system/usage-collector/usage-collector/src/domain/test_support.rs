@@ -31,7 +31,8 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
     AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord, MetadataFilter,
-    MeterTypeId, TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
+    MeterTypeId, RecordOrigin, TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1,
+    UsageRecord,
 };
 use uuid::Uuid;
 
@@ -45,10 +46,14 @@ use uuid::Uuid;
 /// tests supplies a valid covered period, so the projection cannot fail —
 /// and if one ever does, the `expect` names the fixture as the defect
 /// rather than letting a bogus record reach the assertion.
+///
+/// Stamped `Live`, because these fixtures stand in for what the live
+/// ingestion path produced; a test about an imported entry hands the origin
+/// to the fixture that needs it rather than reaching through here.
 pub(crate) fn projected(submission: &CreateUsageRecord) -> UsageRecord {
     submission
         .clone()
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("test fixture supplies a valid covered period")
 }
 
@@ -1568,11 +1573,20 @@ impl FoldingPlugin {
     /// for, so a fixture that let a caller negate it would be demonstrating
     /// a different model.
     ///
+    /// `origin` is not a fourth departure — it is not a compared field at
+    /// all, which is why it is a parameter rather than a copied one. It is
+    /// server-assigned from the route the **withdrawal** travelled, and
+    /// that need not be the route its target travelled: withdrawing a
+    /// period old enough to have closed goes by the backfill route while
+    /// the entry it retracts came in live. Inheriting the target's value
+    /// would build a shape the gateway never produces, so callers state
+    /// it and `..record.clone()` must not supply it.
+    ///
     /// Separate from [`Self::store_withdrawn`] because storing the pair is
     /// not the only way to need one: an orphan invalidation has no target
     /// to store, and a suite driving a real plugin gets its target back
     /// from `create_usage_record` rather than putting one there itself.
-    pub(crate) fn withdrawal_of(record: &UsageRecord) -> UsageRecord {
+    pub(crate) fn withdrawal_of(record: &UsageRecord, origin: RecordOrigin) -> UsageRecord {
         let idempotency_key =
             IdempotencyKey::new(format!("{}-withdrawal", record.idempotency_key.as_str()))
                 .expect("a target's key plus a suffix is a valid idempotency key");
@@ -1589,6 +1603,7 @@ impl FoldingPlugin {
                 reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
             }),
             idempotency_key,
+            origin,
             ..record.clone()
         }
     }
@@ -1596,7 +1611,12 @@ impl FoldingPlugin {
     /// Append `record` together with the invalidation that withdraws it,
     /// and hand back that invalidation as persisted.
     pub(crate) fn store_withdrawn(&self, record: UsageRecord) -> UsageRecord {
-        let withdrawal = Self::withdrawal_of(&record);
+        // A pair a fixture stores in one call stands for one emitter
+        // correcting itself on the path it is already using, so the
+        // withdrawal takes the target's origin. A pair that travelled two
+        // different routes is built by calling
+        // [`Self::withdrawal_of`] and [`Self::store`] separately.
+        let withdrawal = Self::withdrawal_of(&record, record.origin);
         self.store(record);
         self.store(withdrawal.clone());
         withdrawal
