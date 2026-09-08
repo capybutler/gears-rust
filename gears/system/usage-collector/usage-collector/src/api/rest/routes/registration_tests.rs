@@ -150,3 +150,156 @@ fn exactly_the_usage_record_routes_are_registered() {
          usage-type route (or any other route) may be present under any name"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Each ingestion route reaches its OWN handler.
+//
+// `openapi_contract_tests` and `usage_records_tests` between them pin the
+// path, method, operationId, tag, request schema and response schemas of
+// both ingestion routes — and none of that observes `.handler(…)`. The
+// handler tests, in turn, call each handler function directly and never
+// touch the router. So repointing `POST /records/backfill` at
+// `handle_create_usage_records` left every one of those green while the
+// route stamped `origin: live` and enforced the live past bound on every
+// request — defeating the only thing the route exists for.
+//
+// This is the seam that closes it: dispatch through the real router and
+// read the `RecordOrigin` off the record the storage plugin was handed.
+// The crossover is asserted in BOTH directions, because the reverse
+// mis-wiring is not the harmless one it looks like — the live route
+// pointed at the backfill handler would silently lift the live past
+// tolerance for every emitter on the platform.
+// ---------------------------------------------------------------------------
+
+/// One valid submission against the happy-path meter, in the shape the
+/// gateway derives from the wire body below.
+fn backfill_probe_submission() -> usage_collector_sdk::CreateUsageRecord {
+    usage_collector_sdk::CreateUsageRecord {
+        gts_type_id: usage_collector_sdk::MeterTypeId::new(PROBE_GTS_ID)
+            .expect("valid gts_type_id"),
+        tenant_id: Uuid::from_u128(0x9911),
+        resource_ref: usage_collector_sdk::ResourceRef::new("rsc-route-probe", "compute.vm")
+            .expect("valid resource ref"),
+        subject_ref: None,
+        metadata: std::collections::BTreeMap::new(),
+        value: rust_decimal::Decimal::from(1),
+        idempotency_key: usage_collector_sdk::IdempotencyKey::new("idem-route-probe")
+            .expect("valid idempotency key"),
+        invalidation: None,
+        window_start: crate::domain::test_support::recent_window_start(),
+        window_end: crate::domain::test_support::recent_window_end(),
+    }
+}
+
+const PROBE_GTS_ID: &str =
+    toolkit_gts::gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+/// The wire body carrying [`backfill_probe_submission`].
+///
+/// Written as JSON rather than serialized from the request DTO, which
+/// derives `Deserialize` only — and which is the right shape for this
+/// test anyway, since a client posts bytes. A body that drifted from the
+/// DTO could not pass silently: `deny_unknown_fields` and the mandatory
+/// members make a mismatch a `4xx`, and both assertions below demand
+/// `200`.
+fn probe_request_body() -> Body {
+    let submission = backfill_probe_submission();
+    let rfc3339 = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .expect("fixture timestamp formats as RFC 3339")
+    };
+    Body::from(
+        serde_json::json!({
+            "records": [{
+                "gts_type_id": PROBE_GTS_ID,
+                "tenant_id": submission.tenant_id.to_string(),
+                "resource_ref": {
+                    "resource_id": "rsc-route-probe",
+                    "resource_type": "compute.vm",
+                },
+                "value": "1",
+                "idempotency_key": "idem-route-probe",
+                "window_start": rfc3339(submission.window_start),
+                "window_end": rfc3339(submission.window_end),
+            }],
+        })
+        .to_string(),
+    )
+}
+
+/// POST the probe body to `path` through the fully wired router, and
+/// return the `RecordOrigin` the gateway stamped on the record it handed
+/// the storage plugin.
+///
+/// The origin is read off what the plugin was HANDED, never off what the
+/// fixture hands back: the echo is programmed with the origin under test,
+/// so an assertion on the response body alone would be an assertion about
+/// the fixture.
+async fn origin_stamped_by_route(
+    path: &str,
+    echo_origin: usage_collector_sdk::RecordOrigin,
+) -> (StatusCode, usage_collector_sdk::RecordOrigin) {
+    let plugin = HappyPathPlugin::new();
+    plugin.set_create_records(vec![Ok(
+        crate::domain::test_support::projected_with_origin(
+            &backfill_probe_submission(),
+            echo_origin,
+        ),
+    )]);
+    let service = ServiceFixture::default()
+        .with_source(crate::domain::test_support::fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.routes.handler_binding.happy.v1",
+        );
+
+    let request = Request::post(path)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(probe_request_body())
+        .expect("request builds");
+
+    let status = super::register_routes(Router::new(), &OpenApiRegistryImpl::new(), service)
+        .layer(axum::Extension(authenticated_ctx()))
+        .oneshot(request)
+        .await
+        .expect("Router's error type is Infallible")
+        .status();
+
+    let forwarded = plugin
+        .last_create_records_input()
+        .unwrap_or_else(|| panic!("`{path}` MUST reach the storage plugin"));
+    assert_eq!(forwarded.len(), 1, "`{path}` MUST dispatch the one record");
+    (status, forwarded[0].origin)
+}
+
+#[tokio::test]
+async fn each_ingestion_route_dispatches_to_its_own_handler() {
+    let (live_status, live_origin) = origin_stamped_by_route(
+        "/usage-collector/v1/records",
+        usage_collector_sdk::RecordOrigin::Live,
+    )
+    .await;
+    assert_eq!(live_status, StatusCode::OK);
+    assert_eq!(
+        live_origin,
+        usage_collector_sdk::RecordOrigin::Live,
+        "`POST /usage-collector/v1/records` MUST be bound to \
+         `handle_create_usage_records`; bound to the backfill handler it \
+         would lift the live past tolerance for every emitter",
+    );
+
+    let (backfill_status, backfill_origin) = origin_stamped_by_route(
+        usage_collector_sdk::BACKFILL_ROUTE_PATH,
+        usage_collector_sdk::RecordOrigin::Backfill,
+    )
+    .await;
+    assert_eq!(backfill_status, StatusCode::OK);
+    assert_eq!(
+        backfill_origin,
+        usage_collector_sdk::RecordOrigin::Backfill,
+        "`POST {}` MUST be bound to `handle_backfill_usage_records`; bound to \
+         the live handler it would stamp `origin: live` and enforce the live \
+         past bound, which is the whole reason this route exists",
+        usage_collector_sdk::BACKFILL_ROUTE_PATH,
+    );
+}

@@ -131,10 +131,12 @@ fn the_backfill_route_admits_what_the_live_past_tolerance_rejects() {
 
 #[test]
 fn the_backfill_route_still_rejects_a_period_ending_in_the_future() {
-    // The route differs from POST /records in four respects and the future
-    // bound is not one of them. Lifting it here would let a defective
-    // emitter open a period that does not yet exist, on a route whose whole
-    // purpose is history.
+    // The route differs from POST /records in the four respects the
+    // contract enumerates — the registered description names the three of
+    // them the gear implements — and the future bound is not one of
+    // either list. Lifting it here would let a defective emitter open a
+    // period that does not yet exist, on a route whose whole purpose is
+    // history.
     let err = enforce_covered_period_bounds(
         &default_bounds(),
         RecordOrigin::Backfill,

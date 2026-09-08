@@ -1158,7 +1158,7 @@ impl Service {
             .await
     }
 
-    /// Bulk historical import on its own route
+    /// Bulk historical import of periods the live path rejects
     /// (`cpt-cf-usage-collector-adr-backfill-isolation`).
     ///
     /// The ADR's *workload* isolation is **not implemented**: this route

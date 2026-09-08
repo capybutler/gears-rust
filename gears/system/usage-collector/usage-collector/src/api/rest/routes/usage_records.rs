@@ -1,5 +1,6 @@
 //! `OperationBuilder` route registration for the foundation
-//! `/usage-collector/v1/records` create + read surface.
+//! `/usage-collector/v1/records` create + read surface, and for the
+//! `/records/backfill` bulk-import route registered alongside it.
 //! Every route is registered with `.no_license_required()` — the
 //! foundation create surface is platform-internal substrate.
 
@@ -68,7 +69,7 @@ pub(super) fn register_usage_record_routes(
     // deliberate and are recorded with the slice.
     router = OperationBuilder::post(usage_collector_sdk::BACKFILL_ROUTE_PATH)
         .operation_id("usage_collector.backfill_usage_records")
-        .summary("Bulk historical import on its own route")
+        .summary("Bulk historical import of periods the live path rejects")
         .description(
             "Identical validation and request shape to POST /records, differing in \
              three respects: every accepted entry is stamped `origin: backfill`, the \

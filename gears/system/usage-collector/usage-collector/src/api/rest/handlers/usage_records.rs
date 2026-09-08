@@ -1,9 +1,11 @@
 //! REST handlers for the foundation `/usage-collector/v1/records`
-//! create + read surface. Each handler is a thin pass-through: it pulls
-//! the gateway-resolved `SecurityContext`, dispatches to the domain
-//! [`Service`], and lifts `UsageCollectorError` through the host-owned
-//! canonical mapping. PDP authorization runs inside the `Service`
-//! method each handler dispatches to.
+//! create + read surface, and for the `/records/backfill` bulk-import
+//! route that shares the create route's whole handler body. Each handler
+//! is a thin pass-through: it pulls the gateway-resolved
+//! `SecurityContext`, dispatches to the domain [`Service`], and lifts
+//! `UsageCollectorError` through the host-owned canonical mapping. PDP
+//! authorization runs inside the `Service` method each handler dispatches
+//! to.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -53,7 +55,13 @@ use crate::infra::sdk_error_mapping::{
 pub async fn handle_create_usage_records(
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-submit
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-missing-ctx
+    // The instruction names two sites: the `Extension<SecurityContext>`
+    // the gateway middleware supplies on REST, marked here, and the fold
+    // of each submission into its attribution tuple, marked on the shared
+    // body below. The extraction split them, so both routes mark both.
+    // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
     Extension(ctx): Extension<SecurityContext>,
+    // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
     // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-missing-ctx
     Extension(service): Extension<Arc<Service>>,
     Json(req): Json<CreateUsageRecordsRequest>,
@@ -88,13 +96,17 @@ pub async fn handle_create_usage_records(
 /// description names three differences from `POST /records`, not the four
 /// the published contract enumerates.
 ///
-/// No `@cpt` markers here: the batch flow's instructions are realized in
-/// the shared body below and, for the submission step, on
-/// [`handle_create_usage_records`]'s extractors. This route's own
-/// obligation is the unimplemented workload isolation, which no marker
-/// may claim.
+/// The only `@cpt` marker here is the REST half of
+/// `inst-algo-attrib-receive-ctx` — the `Extension<SecurityContext>` the
+/// instruction names explicitly, so it is marked on every route that
+/// takes one. The batch flow's own instructions stay on
+/// [`handle_create_usage_records`]'s extractors and in the shared body.
+/// This route's own obligation is the unimplemented workload isolation,
+/// which no marker may claim.
 pub async fn handle_backfill_usage_records(
+    // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
     Extension(ctx): Extension<SecurityContext>,
+    // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
     Extension(service): Extension<Arc<Service>>,
     Json(req): Json<CreateUsageRecordsRequest>,
 ) -> ApiResult<impl IntoResponse> {
@@ -120,18 +132,17 @@ pub async fn handle_backfill_usage_records(
 /// between two copies of this bookkeeping would misattribute rejections
 /// rather than fail loudly. That is why there is one copy.
 // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
-async fn dispatch_usage_record_batch<D>(
+async fn dispatch_usage_record_batch(
     ctx: &SecurityContext,
     req: CreateUsageRecordsRequest,
-    dispatch: D,
-) -> ApiResult<(StatusCode, Json<CreateUsageRecordsResponse>)>
-where
-    D: AsyncFnOnce(
+    dispatch: impl AsyncFnOnce(
         &SecurityContext,
         Vec<CreateUsageRecord>,
-    )
-        -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError>,
-{
+    ) -> Result<
+        Vec<Result<UsageRecord, UsageCollectorError>>,
+        UsageCollectorError,
+    >,
+) -> ApiResult<(StatusCode, Json<CreateUsageRecordsResponse>)> {
     // Mirror the service's `1..=MAX_BATCH_RECORDS` gate at the handler so
     // an oversized or empty wire payload is rejected as `InvalidArgument`
     // before the per-record loop allocates / iterates. The service still
