@@ -256,8 +256,8 @@ impl UsageCollectorError {
             reason: ValidationReason::FutureWindow,
             detail: format!(
                 "covered period ends at {}, more than {tolerance} after now \
-                 ({}); an ingestion path admits only a period ending within \
-                 that tolerance of the present",
+                 ({}); every ingestion path admits only a period ending \
+                 within that tolerance of the present",
                 rfc3339(window_end),
                 rfc3339(now),
             ),

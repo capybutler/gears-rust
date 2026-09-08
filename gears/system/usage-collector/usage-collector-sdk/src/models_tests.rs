@@ -340,6 +340,14 @@ fn the_past_tolerance_rejection_names_both_backfill_surfaces() {
         "{detail}"
     );
     assert!(detail.contains("backfill_usage_records"), "{detail}");
+    // `cpt-cf-usage-collector-fr-live-future-time-bound` requires the error
+    // to identify the offending instant AND the bound it breached. The
+    // tolerance is the half rendered by a third-party `Display` impl — 48
+    // hours normalises to `2d` — so it is the half likelier to be mangled.
+    assert!(
+        detail.contains("2d"),
+        "the rejection must name the bound it breached; got {detail}"
+    );
 }
 
 #[test]
@@ -369,8 +377,11 @@ fn the_future_tolerance_rejection_does_not_name_the_backfill_route() {
     // The claim itself: no mention of the route, in any casing.
     assert!(!detail.to_lowercase().contains("backfill"), "{detail}");
     // A `!contains` passes vacuously against an empty detail, so anchor it
-    // on what the rejection must still carry — the offending instant, in
-    // the RFC 3339 form the caller sent and could resubmit.
+    // on what the rejection must still carry. The PRD names two halves —
+    // the offending instant and the bound it breached — so pin both: the
+    // instant in the RFC 3339 form the caller sent and could resubmit, and
+    // the tolerance, which is rendered by a third-party `Display` impl and
+    // so is the likelier of the two to be mangled.
     assert!(
         detail.contains(
             &window_end
@@ -378,6 +389,10 @@ fn the_future_tolerance_rejection_does_not_name_the_backfill_route() {
                 .expect("the fixture instant is RFC 3339 representable")
         ),
         "{detail}"
+    );
+    assert!(
+        detail.contains("5m"),
+        "the rejection must name the bound it breached; got {detail}"
     );
 }
 

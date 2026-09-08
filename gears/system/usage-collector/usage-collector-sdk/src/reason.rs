@@ -80,10 +80,11 @@ pub const INVALIDATION_REFERENCE_INCOMPLETE: &str = "INVALIDATION_REFERENCE_INCO
 pub const INVALIDATION_TARGET_NOT_RECORD: &str = "INVALIDATION_TARGET_NOT_RECORD";
 /// An invalidation departed from its target in a field it must copy.
 pub const INVALIDATION_FIELD_MISMATCH: &str = "INVALIDATION_FIELD_MISMATCH";
-/// The covered period ends further into the future than the live path's
-/// configured future tolerance. Raised on **both** ingestion routes: the
-/// bound guards against an emitter opening a period that does not yet
-/// exist, and the backfill route lifts only the past bound.
+/// The covered period ends further into the future than the ingestion
+/// path's configured future tolerance. Raised on **both** ingestion
+/// routes — one configured value governs each of them: the bound guards
+/// against an emitter opening a period that does not yet exist, and the
+/// backfill route lifts only the past bound.
 pub const FUTURE_WINDOW: &str = "FUTURE_WINDOW";
 /// The covered period ends further into the past than the live path's
 /// configured past tolerance. Raised on the live path only; the detail
