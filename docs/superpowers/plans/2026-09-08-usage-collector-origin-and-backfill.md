@@ -73,6 +73,14 @@ where they were paid for. They are current.
    so `backfill_window` is unreachable under `Live` — which is the property that
    mattered. Ground rule 1 already said to distrust every sketch; this is the
    instance where the sketch would not even build.
+
+   **And prescribed *commit messages* have shipped false claims.** Task 11's
+   message, given verbatim in this plan, said the workload-isolation obligation
+   was "recorded in `DIVERGENCES`". It was not — Task 14 owns that file and the
+   entry did not exist yet. The implementer reworded it rather than shipping the
+   claim. **A commit message is a durable assertion about the state of the
+   repository; check it against the repository like any other claim**, most of
+   all when it credits work to a task that has not run.
 4. **Tests live in a sibling `*_tests.rs` file** with a
    `#[cfg(test)] #[cfg_attr(coverage_nightly, coverage(off))] #[path = "..."]`
    hook. Never an inline `mod tests`. `src/gts/permissions.rs` has a
