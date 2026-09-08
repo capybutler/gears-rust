@@ -3109,6 +3109,19 @@ that rather than reading it as scope creep:
   `..super::record_with(`. Four measurements, four answers, each one closer.
   **A count is not verified by one grep — it is verified by a grep whose pattern
   you have argued cannot miss a spelling.**
+
+  Two concrete traps, both hit on this branch:
+
+  - **Never post-filter `grep -rn` output on digits.** Task 6's first sweep
+    piped through `grep -viE '…|[0-9]{2,}|…'` to drop version numbers, and it
+    matched grep's own **line numbers** — silently discarding every hit on a
+    line ≥ 10, including the only file outside the SDK that stated the count
+    being changed. Filter before the line numbers are added, or match on the
+    text after the second colon.
+  - **A count can be spelled with no number at all.** An enumeration that is now
+    one item short is the same defect and is invisible to any search for a
+    numeral or a number-word. Grep for the *members* of the set, not only for
+    its cardinality.
 - **T9** re-bases ~75 ingestion-path assertions off a 1970 covered period before
   it enforces anything, in a separate commit. Its enforcement commit should be
   small; if it is not, the re-base leaked into it.
