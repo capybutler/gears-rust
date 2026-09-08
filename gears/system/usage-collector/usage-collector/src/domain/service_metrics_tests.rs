@@ -989,7 +989,7 @@ fn classify_record_error_maps_each_arm() {
             RecordErrorCategory::MetadataSize,
         ),
         (
-            UsageCollectorError::negative_counter_value(Decimal::from(-1)),
+            UsageCollectorError::invalidation_field_mismatch("value", Uuid::from_u128(11)),
             RecordErrorCategory::SemanticsViolation,
         ),
         // Conflict: idempotency is its own category; any other conflict reason

@@ -17,7 +17,6 @@
 //! projects onto the canonical envelope, so callers dispatch on the variant
 //! (and, within a category, the typed reason) rather than parsing strings.
 
-use rust_decimal::Decimal;
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -75,8 +74,11 @@ pub enum UsageCollectorError {
     InvalidArgument {
         /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
-        /// Offending resource name (`gts_id`), when the violation is about a
-        /// specific resource; `None` otherwise.
+        /// The offending identifier, when the violation is about a
+        /// specific resource; `None` otherwise. Which identifier depends on
+        /// what the violation is about: a `gts_id` for a meter-shaped
+        /// violation, the target's `UsageRecord.id` for one about an
+        /// invalidation's target.
         resource_name: Option<String>,
         /// Attributed request field (`value`, `records`, `metadata`, …).
         field: String,
@@ -160,30 +162,6 @@ impl UsageCollectorError {
     }
 
     // ── InvalidArgument (400) ───────────────────────────────────────────
-
-    /// Counter ordinary record carried a negative value (`value >= 0`).
-    #[must_use]
-    pub fn negative_counter_value(value: Decimal) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "value".to_owned(),
-            reason: ValidationReason::SemanticsViolation,
-            detail: format!("counter ordinary record requires value >= 0 (got {value})"),
-        }
-    }
-
-    /// Counter compensation row carried a non-negative value (`value < 0`).
-    #[must_use]
-    pub fn non_negative_counter_compensation(value: Decimal) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "value".to_owned(),
-            reason: ValidationReason::SemanticsViolation,
-            detail: format!("counter compensation requires value < 0 (got {value})"),
-        }
-    }
 
     /// Batch submission size out of bounds (empty or over the per-call cap).
     #[must_use]
@@ -571,9 +549,71 @@ impl UsageCollectorError {
         }
     }
 
+    /// A REST submission carried a reference without a reason code, or the
+    /// reverse. The two are both-or-neither
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`): the
+    /// reference is what makes the entry an invalidation, and the reason
+    /// carries the intent, so half the pair describes nothing. `field`
+    /// names the **missing** half, which is the one the caller has to add.
+    ///
+    /// Reachable from the REST fold point alone. The domain carries the
+    /// pair as one `Invalidation`, so an in-process caller cannot construct
+    /// the shape this rejects — and the REST layer does not yet raise it,
+    /// so this constructor currently has no caller in the gear.
+    #[must_use]
+    pub fn invalidation_reference_incomplete(missing_field: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: missing_field.to_owned(),
+            reason: ValidationReason::InvalidationReferenceIncomplete,
+            detail: format!(
+                "an invalidation carries both a target reference and a reason code; \
+                 `{missing_field}` is missing"
+            ),
+        }
+    }
+
+    /// An invalidation's target was itself an invalidation. A correction
+    /// cannot be reversed: withdrawal applies to measurements, so the
+    /// entry that withdrew one is not itself withdrawable. The separate
+    /// cap of one withdrawal per entry is the store's
+    /// ([`Self::already_invalidated`]), not this check's.
+    #[must_use]
+    pub fn invalidation_target_not_record(target: Uuid) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: Some(target.to_string()),
+            field: "invalidates".to_owned(),
+            reason: ValidationReason::InvalidationTargetNotRecord,
+            detail: format!("invalidates {target} references an invalidation, not a record"),
+        }
+    }
+
+    /// An invalidation departed from its target in a field it must copy.
+    ///
+    /// `field` names **the field that differs**, which is the whole point
+    /// of the diagnostic: the entry is a faithful copy in every
+    /// caller-supplied field, departing only in its own idempotency key,
+    /// `invalidates` and `reason_code`, so a rejection that only said
+    /// "mismatch" would leave the emitter diffing two payloads by hand.
+    #[must_use]
+    pub fn invalidation_field_mismatch(field: &str, target: Uuid) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: Some(target.to_string()),
+            field: field.to_owned(),
+            reason: ValidationReason::InvalidationFieldMismatch,
+            detail: format!(
+                "`{field}` differs from usage record {target}; an invalidation copies every \
+                 caller-supplied field of the entry it withdraws"
+            ),
+        }
+    }
+
     // ── NotFound (404) ──────────────────────────────────────────────────
 
-    /// Deactivation / get referenced a `UsageRecord.id` that does not exist.
+    /// A lookup referenced a `UsageRecord.id` that does not exist.
     #[must_use]
     pub fn usage_record_not_found(id: Uuid) -> Self {
         Self::NotFound {
@@ -583,30 +623,41 @@ impl UsageCollectorError {
         }
     }
 
-    /// A compensation's `corrects_id` referenced a row that does not exist.
-    /// (Collapsed into the record `NotFound` category — no distinct wire
-    /// `context.reason`; the `detail` text carries the human distinction.)
+    /// An invalidation's `invalidates` resolved to nothing.
+    ///
+    /// `NotFound` rather than a conflict: the reference names an entry the
+    /// ledger does not hold. `name` carries the target uuid, which is what
+    /// separates this from the other `NotFound` a submission can raise —
+    /// an unresolvable meter names a `gts_type_id`, and a `gts_type_id`
+    /// never parses as a [`Uuid`] while an entry id always does. A
+    /// consumer telling the two apart has only `name` to do it with,
+    /// because the category carries no wire `context.reason`; the `detail`
+    /// text carries the human distinction.
     #[must_use]
-    pub fn corrects_id_not_found(corrects_id: Uuid) -> Self {
+    pub fn invalidation_target_not_found(target: Uuid) -> Self {
         Self::NotFound {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: corrects_id.to_string(),
-            detail: format!(
-                "corrects_id {corrects_id} does not reference an existing usage record"
-            ),
+            name: target.to_string(),
+            detail: format!("invalidates {target} does not reference an existing usage record"),
         }
     }
 
     // ── Conflict / Aborted (409) ────────────────────────────────────────
 
-    /// Deactivation targeted a record whose status was already `Inactive`.
+    /// The target already carries an accepted invalidation. Raised from the
+    /// store's atomic check, never from a gateway pre-read — a gateway-side
+    /// pre-read cannot exclude a concurrent second submission, so it would
+    /// be a check that fails exactly when it matters
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). `name` is
+    /// the target so the caller can look the pair up; `detail` names the
+    /// invalidation that already withdrew it.
     #[must_use]
-    pub fn already_inactive(id: Uuid) -> Self {
+    pub fn already_invalidated(target: Uuid, invalidated_by: Uuid) -> Self {
         Self::Conflict {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: id.to_string(),
-            reason: ConflictReason::AlreadyInactive,
-            detail: format!("usage record already inactive: {id}"),
+            name: target.to_string(),
+            reason: ConflictReason::AlreadyInvalidated,
+            detail: format!("usage record {target} is already invalidated by {invalidated_by}"),
         }
     }
 
@@ -622,42 +673,6 @@ impl UsageCollectorError {
             detail: format!(
                 "idempotency key {idempotency_key} already bound to record {existing_id}"
             ),
-        }
-    }
-
-    /// A compensation's `corrects_id` referenced another compensation row.
-    #[must_use]
-    pub fn corrects_id_targets_compensation(corrects_id: Uuid) -> Self {
-        Self::Conflict {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: corrects_id.to_string(),
-            reason: ConflictReason::CorrectsIdTargetsCompensation,
-            detail: format!("corrects_id {corrects_id} targets a compensation row"),
-        }
-    }
-
-    /// A compensation's `corrects_id` referenced a row in a different
-    /// `(tenant, usage type, resource, subject)` identity tuple.
-    #[must_use]
-    pub fn corrects_id_wrong_scope(corrects_id: Uuid) -> Self {
-        Self::Conflict {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: corrects_id.to_string(),
-            reason: ConflictReason::CorrectsIdWrongScope,
-            detail: format!(
-                "corrects_id {corrects_id} references a row in a different tenant, usage type, resource, or subject"
-            ),
-        }
-    }
-
-    /// A compensation's `corrects_id` referenced an `inactive` row.
-    #[must_use]
-    pub fn corrects_id_inactive(corrects_id: Uuid) -> Self {
-        Self::Conflict {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: corrects_id.to_string(),
-            reason: ConflictReason::CorrectsIdInactive,
-            detail: format!("corrects_id {corrects_id} references an inactive usage record"),
         }
     }
 
@@ -763,20 +778,26 @@ pub enum UsageCollectorPluginError {
         existing_id: Uuid,
     },
 
-    /// `get_usage_record` / `deactivate_usage_record` referenced an `id`
-    /// that does not exist.
+    /// A lookup referenced a `UsageRecord.id` the store does not hold —
+    /// `get_usage_record`, or the target of a submitted invalidation.
     #[error("usage record not found: {id}")]
     UsageRecordNotFound {
         /// Caller-supplied target `UsageRecord.id`.
         id: Uuid,
     },
 
-    /// `deactivate_usage_record` targeted a record whose status was
-    /// already `Inactive`.
-    #[error("usage record already inactive: {id}")]
-    UsageRecordAlreadyInactive {
-        /// Caller-supplied target `UsageRecord.id`.
+    /// A second withdrawal of a record that already carries one. This is
+    /// the plugin's **one** invalidation obligation: only the store can
+    /// make the check atomic with the entry it admits
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). Carries the
+    /// existing invalidation's id, so the gateway's rejection can name the
+    /// entry that already withdrew the target.
+    #[error("usage record {id} is already invalidated by {invalidated_by}")]
+    AlreadyInvalidated {
+        /// The target the submission tried to withdraw.
         id: Uuid,
+        /// The invalidation entry that already withdrew it.
+        invalidated_by: Uuid,
     },
 
     /// Non-retryable unclassified plugin-side failure (plugin invariant

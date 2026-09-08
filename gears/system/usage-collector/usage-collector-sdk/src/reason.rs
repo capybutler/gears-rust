@@ -15,8 +15,19 @@ use core::fmt;
 // ValidationReason — 400 InvalidArgument `field_violations[].reason`.
 // ─────────────────────────────────────────────────────────────────────
 
-/// Counter / gauge value-matrix violation (counter ordinary `value >= 0`,
-/// counter compensation `value < 0`).
+/// Reserved, and emitted by nothing in this crate.
+///
+/// It named a counter/gauge value-matrix rule keyed on the sign of a
+/// quantity. The wire contract forbids that rule outright — `UsageQuantity`
+/// in `usage-collector-v1.yaml` says the sign is never constrained, and a
+/// negative quantity is an ordinary measurement recording a real decrease
+/// — so the constructors that raised it are gone and nothing replaces
+/// them.
+///
+/// Kept rather than removed: [`ValidationReason`] is `#[non_exhaustive]`,
+/// so dropping a variant is silent for a downstream matcher, and a
+/// consumer reading an envelope stored while the rule was live still needs
+/// this to model itself.
 pub const SEMANTICS_VIOLATION: &str = "SEMANTICS_VIOLATION";
 /// Generic request-shape validation failure (batch size, validating
 /// newtypes, closed-kind enum parse). Catch-all when no finer code applies.
@@ -59,6 +70,16 @@ pub const FILTER_MISMATCH: &str = "FILTER_MISMATCH";
 /// (e.g. a per-record metadata key) over a wide range. Narrow the read-path
 /// time range or drop the high-cardinality dimension.
 pub const AGGREGATION_RESULT_TOO_LARGE: &str = "AGGREGATION_RESULT_TOO_LARGE";
+/// A REST submission carried a target reference without a reason code, or
+/// a reason code without a target reference. Raised at the fold point
+/// where the flat wire pair becomes one `Option<Invalidation>`; no
+/// in-process caller can reach it, because the domain type makes the
+/// half-shape unrepresentable.
+pub const INVALIDATION_REFERENCE_INCOMPLETE: &str = "INVALIDATION_REFERENCE_INCOMPLETE";
+/// An invalidation's target was itself an invalidation.
+pub const INVALIDATION_TARGET_NOT_RECORD: &str = "INVALIDATION_TARGET_NOT_RECORD";
+/// An invalidation departed from its target in a field it must copy.
+pub const INVALIDATION_FIELD_MISMATCH: &str = "INVALIDATION_FIELD_MISMATCH";
 
 /// Typed view of the `field_violations[].reason` codes carried by
 /// [`crate::UsageCollectorError::InvalidArgument`].
@@ -87,6 +108,12 @@ pub enum ValidationReason {
     InvalidCursor,
     /// See [`FILTER_MISMATCH`].
     FilterMismatch,
+    /// See [`INVALIDATION_REFERENCE_INCOMPLETE`].
+    InvalidationReferenceIncomplete,
+    /// See [`INVALIDATION_TARGET_NOT_RECORD`].
+    InvalidationTargetNotRecord,
+    /// See [`INVALIDATION_FIELD_MISMATCH`].
+    InvalidationFieldMismatch,
     /// Unmodeled / future reason — preserves the raw wire string.
     Unknown(String),
 }
@@ -108,6 +135,9 @@ impl ValidationReason {
             AGGREGATION_RESULT_TOO_LARGE => Self::AggregationResultTooLarge,
             INVALID_CURSOR => Self::InvalidCursor,
             FILTER_MISMATCH => Self::FilterMismatch,
+            INVALIDATION_REFERENCE_INCOMPLETE => Self::InvalidationReferenceIncomplete,
+            INVALIDATION_TARGET_NOT_RECORD => Self::InvalidationTargetNotRecord,
+            INVALIDATION_FIELD_MISMATCH => Self::InvalidationFieldMismatch,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -128,6 +158,9 @@ impl ValidationReason {
             Self::AggregationResultTooLarge => AGGREGATION_RESULT_TOO_LARGE,
             Self::InvalidCursor => INVALID_CURSOR,
             Self::FilterMismatch => FILTER_MISMATCH,
+            Self::InvalidationReferenceIncomplete => INVALIDATION_REFERENCE_INCOMPLETE,
+            Self::InvalidationTargetNotRecord => INVALIDATION_TARGET_NOT_RECORD,
+            Self::InvalidationFieldMismatch => INVALIDATION_FIELD_MISMATCH,
             Self::Unknown(s) => s.as_str(),
         }
     }
@@ -143,16 +176,11 @@ impl fmt::Display for ValidationReason {
 // ConflictReason — 409 Aborted `context.reason`.
 // ─────────────────────────────────────────────────────────────────────
 
-/// Deactivation targeted a record already `inactive` (one-way latch).
-pub const ALREADY_INACTIVE: &str = "ALREADY_INACTIVE";
 /// Same `idempotency_key`, canonical-field-different payload.
 pub const IDEMPOTENCY_CONFLICT: &str = "IDEMPOTENCY_CONFLICT";
-/// `corrects_id` referenced another compensation row.
-pub const CORRECTS_ID_TARGETS_COMPENSATION: &str = "CORRECTS_ID_TARGETS_COMPENSATION";
-/// `corrects_id` referenced a row in a different identity tuple.
-pub const CORRECTS_ID_WRONG_SCOPE: &str = "CORRECTS_ID_WRONG_SCOPE";
-/// `corrects_id` referenced an `inactive` row.
-pub const CORRECTS_ID_INACTIVE: &str = "CORRECTS_ID_INACTIVE";
+/// A second withdrawal of an already-invalidated record. The store detects
+/// it, atomically against the entry it admits.
+pub const ALREADY_INVALIDATED: &str = "ALREADY_INVALIDATED";
 
 /// Typed view of the `context.reason` codes carried by
 /// [`crate::UsageCollectorError::Conflict`] (the AIP-193 `Aborted` /
@@ -160,16 +188,10 @@ pub const CORRECTS_ID_INACTIVE: &str = "CORRECTS_ID_INACTIVE";
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConflictReason {
-    /// See [`ALREADY_INACTIVE`].
-    AlreadyInactive,
     /// See [`IDEMPOTENCY_CONFLICT`].
     IdempotencyConflict,
-    /// See [`CORRECTS_ID_TARGETS_COMPENSATION`].
-    CorrectsIdTargetsCompensation,
-    /// See [`CORRECTS_ID_WRONG_SCOPE`].
-    CorrectsIdWrongScope,
-    /// See [`CORRECTS_ID_INACTIVE`].
-    CorrectsIdInactive,
+    /// See [`ALREADY_INVALIDATED`].
+    AlreadyInvalidated,
     /// Unmodeled / future reason — preserves the raw wire string.
     Unknown(String),
 }
@@ -180,11 +202,8 @@ impl ConflictReason {
     #[must_use]
     pub fn from_wire(s: &str) -> Self {
         match s {
-            ALREADY_INACTIVE => Self::AlreadyInactive,
             IDEMPOTENCY_CONFLICT => Self::IdempotencyConflict,
-            CORRECTS_ID_TARGETS_COMPENSATION => Self::CorrectsIdTargetsCompensation,
-            CORRECTS_ID_WRONG_SCOPE => Self::CorrectsIdWrongScope,
-            CORRECTS_ID_INACTIVE => Self::CorrectsIdInactive,
+            ALREADY_INVALIDATED => Self::AlreadyInvalidated,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -194,11 +213,8 @@ impl ConflictReason {
     #[must_use]
     pub fn as_wire(&self) -> &str {
         match self {
-            Self::AlreadyInactive => ALREADY_INACTIVE,
             Self::IdempotencyConflict => IDEMPOTENCY_CONFLICT,
-            Self::CorrectsIdTargetsCompensation => CORRECTS_ID_TARGETS_COMPENSATION,
-            Self::CorrectsIdWrongScope => CORRECTS_ID_WRONG_SCOPE,
-            Self::CorrectsIdInactive => CORRECTS_ID_INACTIVE,
+            Self::AlreadyInvalidated => ALREADY_INVALIDATED,
             Self::Unknown(s) => s.as_str(),
         }
     }

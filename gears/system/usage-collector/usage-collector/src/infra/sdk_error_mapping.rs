@@ -3,7 +3,7 @@
 //! [`toolkit_canonical_errors::CanonicalError`], which `IntoResponse`
 //! renders as the RFC-9457 `Problem` body on the REST surface. The
 //! SDK-category → AIP-193-category → HTTP-status mapping is documented in
-//! DESIGN §3.3 "Error Envelopes" and refreshed by ADR-0012.
+//! DESIGN §3.3 "Error Envelopes".
 //!
 //! `usage-collector-sdk` deliberately carries no `toolkit-canonical-errors`
 //! dependency, so the lift lives here. Both `UsageCollectorError` and
@@ -132,9 +132,9 @@ fn lift_common(err: UsageCollectorError) -> CanonicalError {
         }
 
         // ---- 409 Aborted (Conflict) ----
-        // The already-inactive deactivation latch, the idempotency conflict,
-        // and the L1 `corrects_id` rules all collapse here; the typed
-        // `ConflictReason` rides on `context.reason`.
+        // The idempotency conflict and the store's at-most-one-invalidation
+        // rejection both collapse here; the typed `ConflictReason` rides on
+        // `context.reason`.
         // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-idempotency:p1
         // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-principle-idempotency-by-key:p1
         // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-atomic-outcome-mapping:p1:inst-algo-outcome-already-inactive

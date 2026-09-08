@@ -9,9 +9,10 @@
 //! There is no catalog error vocabulary any more: every type declaration is
 //! owned by `types-registry` and resolved through the Type Resolver, whose
 //! unresolvable outcome is [`DomainError::DeclarationNotFound`]. Validation
-//! failures (typed SDK variants — `NegativeCounterValue`, `InvalidResourceRef`,
-//! etc.) flow back to the caller verbatim and are not re-classified through
-//! `DomainError`.
+//! failures (typed SDK `InvalidArgument`s — an invalid `resource_ref`, a
+//! metadata key outside the declared shape, an invalidation that departs
+//! from its target) flow back to the caller verbatim and are not
+//! re-classified through `DomainError`.
 
 use toolkit_macros::domain_model;
 use usage_collector_sdk::{
@@ -74,7 +75,8 @@ pub enum DomainError {
 
     /// Ingestion supplied a `metadata` map carrying a key that is not a
     /// member of the referenced meter's declared `metadata_fields` list
-    /// per ADR-0012 (closed shape, keyed by `gts_type_id`).
+    /// per `cpt-cf-usage-collector-adr-registry-owned-typing` (closed
+    /// shape, keyed by `gts_type_id`).
     #[error("unknown metadata key '{key}' for meter {gts_type_id}")]
     UnknownMetadataKey {
         gts_type_id: MeterTypeId,
@@ -91,15 +93,19 @@ pub enum DomainError {
         existing_id: Uuid,
     },
 
-    /// `deactivate_usage_record` referenced an `id` that does not exist
-    /// within the visible scope.
+    /// A lookup referenced a `UsageRecord.id` that does not exist within
+    /// the visible scope.
     #[error("usage record not found: {id}")]
     UsageRecordNotFound { id: Uuid },
 
-    /// `deactivate_usage_record` referenced an `id` that was already
-    /// `inactive` (one-way latch).
-    #[error("usage record already inactive: {id}")]
-    UsageRecordAlreadyInactive { id: Uuid },
+    /// A submitted invalidation targeted a record that already carries
+    /// one. At-most-one-invalidation is the store's obligation, not the
+    /// gateway's — only the store can make the check atomic with the entry
+    /// it admits (`cpt-cf-usage-collector-adr-append-only-invalidation`) —
+    /// so this always arrives lifted from a plugin error, carrying the
+    /// invalidation that already withdrew the target.
+    #[error("usage record {id} is already invalidated by {invalidated_by}")]
+    AlreadyInvalidated { id: Uuid, invalidated_by: Uuid },
 
     /// The referenced GTS type does not resolve to a usable declaration:
     /// `types-registry` has no row for it, or the row it has does not carry
@@ -301,8 +307,8 @@ impl From<UsageCollectorPluginError> for DomainError {
             UsageCollectorPluginError::UsageRecordNotFound { id } => {
                 Self::UsageRecordNotFound { id }
             }
-            UsageCollectorPluginError::UsageRecordAlreadyInactive { id } => {
-                Self::UsageRecordAlreadyInactive { id }
+            UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by } => {
+                Self::AlreadyInvalidated { id, invalidated_by }
             }
             other => Self::Internal(other.to_string()),
         }
@@ -317,7 +323,7 @@ fn is_plugin_error_exhaustive_today(e: &UsageCollectorPluginError) -> bool {
             | UsageCollectorPluginError::Internal(_)
             | UsageCollectorPluginError::IdempotencyConflict { .. }
             | UsageCollectorPluginError::UsageRecordNotFound { .. }
-            | UsageCollectorPluginError::UsageRecordAlreadyInactive { .. }
+            | UsageCollectorPluginError::AlreadyInvalidated { .. }
     )
 }
 
@@ -350,7 +356,9 @@ impl From<DomainError> for UsageCollectorError {
                 existing_id,
             } => Self::idempotency_conflict(&idempotency_key, existing_id),
             DomainError::UsageRecordNotFound { id } => Self::usage_record_not_found(id),
-            DomainError::UsageRecordAlreadyInactive { id } => Self::already_inactive(id),
+            DomainError::AlreadyInvalidated { id, invalidated_by } => {
+                Self::already_invalidated(id, invalidated_by)
+            }
             // DESIGN §3.3: an unresolvable GTS type is a 404 naming the
             // identifier, whether the registry never declared it or the
             // Type Resolver rejected an incomplete declaration for it — both

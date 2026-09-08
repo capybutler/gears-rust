@@ -28,6 +28,18 @@ fn validation_reason_round_trips_each_constant() {
         ),
         (INVALID_CURSOR, ValidationReason::InvalidCursor),
         (FILTER_MISMATCH, ValidationReason::FilterMismatch),
+        (
+            INVALIDATION_REFERENCE_INCOMPLETE,
+            ValidationReason::InvalidationReferenceIncomplete,
+        ),
+        (
+            INVALIDATION_TARGET_NOT_RECORD,
+            ValidationReason::InvalidationTargetNotRecord,
+        ),
+        (
+            INVALIDATION_FIELD_MISMATCH,
+            ValidationReason::InvalidationFieldMismatch,
+        ),
     ] {
         assert_eq!(ValidationReason::from_wire(wire), expected);
         assert_eq!(expected.as_wire(), wire);
@@ -37,20 +49,35 @@ fn validation_reason_round_trips_each_constant() {
 #[test]
 fn conflict_reason_round_trips_each_constant() {
     for (wire, expected) in [
-        (ALREADY_INACTIVE, ConflictReason::AlreadyInactive),
         (IDEMPOTENCY_CONFLICT, ConflictReason::IdempotencyConflict),
-        (
-            CORRECTS_ID_TARGETS_COMPENSATION,
-            ConflictReason::CorrectsIdTargetsCompensation,
-        ),
-        (
-            CORRECTS_ID_WRONG_SCOPE,
-            ConflictReason::CorrectsIdWrongScope,
-        ),
-        (CORRECTS_ID_INACTIVE, ConflictReason::CorrectsIdInactive),
+        (ALREADY_INVALIDATED, ConflictReason::AlreadyInvalidated),
     ] {
         assert_eq!(ConflictReason::from_wire(wire), expected);
         assert_eq!(expected.as_wire(), wire);
+    }
+}
+
+#[test]
+fn the_retired_compensation_reasons_no_longer_model_themselves() {
+    // The four compensation codes left the vocabulary with the
+    // mutate-in-place correction model
+    // (`cpt-cf-usage-collector-adr-append-only-invalidation`). Because
+    // `ConflictReason` is `#[non_exhaustive]`, their removal is silent for
+    // a downstream matcher: it falls through to `Unknown` rather than
+    // failing to build. So pin that the fall-through happens *and* that it
+    // preserves the raw string, so a consumer reading an envelope stored
+    // under the old model still sees what it said.
+    for wire in [
+        "ALREADY_INACTIVE",
+        "CORRECTS_ID_TARGETS_COMPENSATION",
+        "CORRECTS_ID_WRONG_SCOPE",
+        "CORRECTS_ID_INACTIVE",
+    ] {
+        assert_eq!(
+            ConflictReason::from_wire(wire),
+            ConflictReason::Unknown(wire.to_owned()),
+        );
+        assert_eq!(ConflictReason::from_wire(wire).as_wire(), wire);
     }
 }
 

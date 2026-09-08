@@ -9,11 +9,11 @@
 //! exercise any more.
 //!
 //! After the error-envelope compaction, the 503 `context.reason` triage codes
-//! (`PLUGIN_READINESS` / `PLUGIN_TRANSIENT` / `AUTHZ_UNAVAILABLE`) and the
-//! corrects-id `CORRECTS_ID_NOT_FOUND` 404 reason are no longer emitted — the
-//! canonical `ServiceUnavailable` / `NotFound` contexts have no reason slot, so
-//! those were batch-only JSON post-injections that the compaction removed.
-//! Operator triage for 503s reads the curated `detail` string instead.
+//! (`PLUGIN_READINESS` / `PLUGIN_TRANSIENT` / `AUTHZ_UNAVAILABLE`) and every
+//! 404 `context.reason` are no longer emitted — the canonical
+//! `ServiceUnavailable` / `NotFound` contexts have no reason slot, so those
+//! were batch-only JSON post-injections that the compaction removed. Operator
+//! triage for 503s reads the curated `detail` string instead.
 
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use toolkit_gts::gts_id;
@@ -133,18 +133,25 @@ fn declaration_not_found_maps_to_404_naming_the_gts_type_id() {
 }
 
 #[test]
-fn already_inactive_maps_to_409_aborted_with_already_inactive_reason() {
-    let id = Uuid::from_u128(0xCAFE_BABE);
-    let c = lift_record(UsageCollectorError::already_inactive(id));
+fn already_invalidated_maps_to_409_aborted_with_already_invalidated_reason() {
+    // The store's at-most-one-invalidation rejection
+    // (`cpt-cf-usage-collector-adr-append-only-invalidation`) names the
+    // *target* on `resource.name`, so a caller can look the pair up, and
+    // rides its typed reason on `context.reason`.
+    let target = Uuid::from_u128(0xCAFE_BABE);
+    let invalidated_by = Uuid::from_u128(0xFEED);
+    let c = lift_record(UsageCollectorError::already_invalidated(
+        target,
+        invalidated_by,
+    ));
     assert_eq!(c.status_code(), 409);
     assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
-    assert_eq!(c.resource_name(), Some(id.to_string().as_str()));
+    assert_eq!(c.resource_name(), Some(target.to_string().as_str()));
 
     let problem = Problem::from(c);
     assert_eq!(
         problem_context_string(&problem, "reason").as_deref(),
-        Some("ALREADY_INACTIVE"),
-        "AlreadyInactive MUST carry context.reason=ALREADY_INACTIVE per the feature spec",
+        Some("ALREADY_INVALIDATED"),
     );
 }
 
@@ -161,44 +168,22 @@ fn idempotency_conflict_maps_to_409_aborted() {
 }
 
 #[test]
-fn negative_counter_value_carries_semantics_violation_reason() {
-    use rust_decimal::Decimal;
-    let c = lift_record(UsageCollectorError::negative_counter_value(Decimal::from(
-        -1,
-    )));
-    assert_eq!(c.status_code(), 400);
-    let problem = Problem::from(c);
+fn invalidation_target_not_found_maps_to_404_naming_the_target_uuid() {
+    // An unresolvable `invalidates` collapses into the plain record
+    // `NotFound` (404), which carries no machine reason — the canonical
+    // `NotFound` context has no reason slot, so the `detail` text carries
+    // the human distinction and `resource.name` carries the target uuid.
+    // The uuid on `name` is load-bearing beyond diagnostics: the service's
+    // `classify_record_error` tells this apart from an unresolvable meter
+    // by whether `name` parses as a `Uuid`.
+    let target = Uuid::from_u128(0xDEAD_BEEF);
     assert_eq!(
-        first_field_violation_string(&problem, "reason").as_deref(),
-        Some("SEMANTICS_VIOLATION"),
-        "NegativeCounterValue routes to the SEMANTICS_VIOLATION wire reason",
+        lift_record(UsageCollectorError::invalidation_target_not_found(target)).resource_name(),
+        Some(target.to_string().as_str()),
+        "the target uuid on `name` is what `classify_record_error` parses",
     );
-}
-
-#[test]
-fn non_negative_counter_compensation_carries_semantics_violation_reason() {
-    use rust_decimal::Decimal;
-    let c = lift_record(UsageCollectorError::non_negative_counter_compensation(
-        Decimal::ZERO,
-    ));
-    assert_eq!(c.status_code(), 400);
-    let problem = Problem::from(c);
-    assert_eq!(
-        first_field_violation_string(&problem, "reason").as_deref(),
-        Some("SEMANTICS_VIOLATION"),
-        "NonNegativeCounterCompensation routes to the SEMANTICS_VIOLATION wire reason",
-    );
-}
-
-#[test]
-fn corrects_id_not_found_maps_to_404_without_reason() {
-    // Post-injection removed: corrects-id-not-found now collapses into the
-    // plain record `NotFound` (404). The `CORRECTS_ID_NOT_FOUND` machine
-    // reason is no longer emitted (it was batch-only); the `detail` text
-    // preserves the human distinction.
-    let corrects_id = Uuid::from_u128(0xDEAD_BEEF);
     let problem =
-        usage_record_error_to_problem(UsageCollectorError::corrects_id_not_found(corrects_id));
+        usage_record_error_to_problem(UsageCollectorError::invalidation_target_not_found(target));
     assert_eq!(problem.status, Some(404));
     assert_eq!(problem_context_string(&problem, "reason"), None);
 }
@@ -227,41 +212,79 @@ fn types_registry_unavailable_per_record_problem_is_503() {
 }
 
 #[test]
-fn corrects_id_targets_compensation_maps_to_409_aborted_with_reason() {
-    let corrects_id = Uuid::from_u128(7);
-    let c = lift_record(UsageCollectorError::corrects_id_targets_compensation(
-        corrects_id,
-    ));
-    assert_eq!(c.status_code(), 409);
+fn invalidation_target_not_record_maps_to_400_attributing_the_reference_field() {
+    let target = Uuid::from_u128(7);
+    let c = lift_record(UsageCollectorError::invalidation_target_not_record(target));
+    assert_eq!(c.status_code(), 400);
     assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
     let problem = Problem::from(c);
     assert_eq!(
-        problem_context_string(&problem, "reason").as_deref(),
-        Some("CORRECTS_ID_TARGETS_COMPENSATION"),
+        first_field_violation_string(&problem, "reason").as_deref(),
+        Some("INVALIDATION_TARGET_NOT_RECORD"),
+    );
+    assert_eq!(
+        first_field_violation_string(&problem, "field").as_deref(),
+        Some("invalidates"),
+        "an unwithdrawable target is attributed to the reference that named it",
+    );
+    assert_eq!(
+        lift_record(UsageCollectorError::invalidation_target_not_record(target)).resource_name(),
+        Some(target.to_string().as_str()),
+        "the target uuid is the only identifier a submission-time rejection has \
+         to name: the submitted entry has no id yet",
     );
 }
 
 #[test]
-fn corrects_id_wrong_scope_maps_to_409_aborted_with_reason() {
-    let corrects_id = Uuid::from_u128(8);
-    let c = lift_record(UsageCollectorError::corrects_id_wrong_scope(corrects_id));
-    assert_eq!(c.status_code(), 409);
+fn invalidation_field_mismatch_attributes_the_field_that_differs() {
+    // The diagnostic's whole value is naming *which* field departed from
+    // the target: an invalidation is a faithful copy in every
+    // caller-supplied field, so a rejection that only said "mismatch"
+    // would leave the emitter diffing two payloads by hand. Pin that the
+    // caller-supplied field name reaches `field_violations[0].field`
+    // rather than a constant.
+    let target = Uuid::from_u128(8);
+    let c = lift_record(UsageCollectorError::invalidation_field_mismatch(
+        "value", target,
+    ));
+    assert_eq!(c.status_code(), 400);
     let problem = Problem::from(c);
     assert_eq!(
-        problem_context_string(&problem, "reason").as_deref(),
-        Some("CORRECTS_ID_WRONG_SCOPE"),
+        first_field_violation_string(&problem, "reason").as_deref(),
+        Some("INVALIDATION_FIELD_MISMATCH"),
+    );
+    assert_eq!(
+        first_field_violation_string(&problem, "field").as_deref(),
+        Some("value"),
+    );
+    assert_eq!(
+        lift_record(UsageCollectorError::invalidation_field_mismatch(
+            "value", target
+        ))
+        .resource_name(),
+        Some(target.to_string().as_str()),
+        "the target uuid is the only identifier a submission-time rejection has \
+         to name: the submitted entry has no id yet",
     );
 }
 
 #[test]
-fn corrects_id_inactive_maps_to_409_aborted_with_reason() {
-    let corrects_id = Uuid::from_u128(9);
-    let c = lift_record(UsageCollectorError::corrects_id_inactive(corrects_id));
-    assert_eq!(c.status_code(), 409);
+fn invalidation_reference_incomplete_attributes_the_missing_half() {
+    // Both-or-neither is rejected at the REST fold point naming the half
+    // the caller has to add — the domain carries the pair as one
+    // `Invalidation`, so nothing downstream can raise this.
+    let c = lift_record(UsageCollectorError::invalidation_reference_incomplete(
+        "reason_code",
+    ));
+    assert_eq!(c.status_code(), 400);
     let problem = Problem::from(c);
     assert_eq!(
-        problem_context_string(&problem, "reason").as_deref(),
-        Some("CORRECTS_ID_INACTIVE"),
+        first_field_violation_string(&problem, "reason").as_deref(),
+        Some("INVALIDATION_REFERENCE_INCOMPLETE"),
+    );
+    assert_eq!(
+        first_field_violation_string(&problem, "field").as_deref(),
+        Some("reason_code"),
     );
 }
 
@@ -333,14 +356,10 @@ fn invalid_metadata_key_uses_usage_record_resource() {
 // ---------------------------------------------------------------------------
 
 fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
-    use rust_decimal::Decimal;
-
     let gts_type_id = sample_meter_id();
     let uuid = Uuid::new_v4();
     vec![
         UsageCollectorError::permission_denied("denied"),
-        UsageCollectorError::negative_counter_value(Decimal::from(-1)),
-        UsageCollectorError::non_negative_counter_compensation(Decimal::ZERO),
         UsageCollectorError::invalid_batch_size(0, 1, 100),
         UsageCollectorError::metadata_size_exceeded(9000, 8192),
         UsageCollectorError::invalid_metadata_key("r"),
@@ -350,12 +369,12 @@ fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
         UsageCollectorError::invalid_idempotency_key("r"),
         UsageCollectorError::unknown_metadata_key(&gts_type_id, "k"),
         UsageCollectorError::usage_record_not_found(uuid),
-        UsageCollectorError::already_inactive(uuid),
         UsageCollectorError::idempotency_conflict("idem-fence", uuid),
-        UsageCollectorError::corrects_id_not_found(uuid),
-        UsageCollectorError::corrects_id_targets_compensation(uuid),
-        UsageCollectorError::corrects_id_wrong_scope(uuid),
-        UsageCollectorError::corrects_id_inactive(uuid),
+        UsageCollectorError::invalidation_reference_incomplete("reason_code"),
+        UsageCollectorError::invalidation_target_not_found(uuid),
+        UsageCollectorError::invalidation_target_not_record(uuid),
+        UsageCollectorError::invalidation_field_mismatch("value", uuid),
+        UsageCollectorError::already_invalidated(uuid, Uuid::new_v4()),
         UsageCollectorError::plugin_unavailable(),
         UsageCollectorError::types_registry_unavailable(),
         UsageCollectorError::service_unavailable("x", None),

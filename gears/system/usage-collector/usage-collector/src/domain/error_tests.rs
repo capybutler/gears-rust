@@ -169,7 +169,7 @@ fn idempotency_conflict_lifts_to_conflict_keyed_by_existing_id() {
     }
 }
 
-// ── event-deactivation feature: deactivate-record error variants ────
+// ── Entry-lookup and invalidation error variants ────────────────────
 
 #[test]
 fn plugin_usage_record_not_found_lifts_to_sdk_not_found() {
@@ -191,30 +191,51 @@ fn plugin_usage_record_not_found_lifts_to_sdk_not_found() {
 }
 
 #[test]
-fn plugin_usage_record_already_inactive_lifts_to_sdk_conflict() {
-    let id = uuid::Uuid::from_u128(0xCAFE_BABE);
-    let domain: DomainError = UsageCollectorPluginError::UsageRecordAlreadyInactive { id }.into();
-    assert!(matches!(domain, DomainError::UsageRecordAlreadyInactive { id: d } if d == id));
+fn the_plugins_at_most_one_check_lifts_to_a_conflict() {
+    // At-most-one-invalidation is the store's obligation, not the
+    // gateway's: only the store can make the check atomic with the entry
+    // it admits (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    // So this arrives as a plugin error and must survive the two lifts
+    // with its discrimination intact — including the second uuid, which is
+    // what lets the rejection name the entry that already withdrew the
+    // target.
+    let target = uuid::Uuid::from_u128(0xCAFE_BABE);
+    let invalidated_by = uuid::Uuid::from_u128(0xFEED);
+    let domain: DomainError = UsageCollectorPluginError::AlreadyInvalidated {
+        id: target,
+        invalidated_by,
+    }
+    .into();
+    assert!(matches!(
+        domain,
+        DomainError::AlreadyInvalidated { id, invalidated_by: by }
+            if id == target && by == invalidated_by
+    ));
     let sdk: UsageCollectorError = domain.into();
     match sdk {
         UsageCollectorError::Conflict {
             resource_type,
             name,
             reason,
-            ..
+            detail,
         } => {
             assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
-            assert_eq!(name, id.to_string());
-            assert_eq!(reason, ConflictReason::AlreadyInactive);
+            assert_eq!(name, target.to_string());
+            assert_eq!(reason, ConflictReason::AlreadyInvalidated);
+            assert!(
+                detail.contains(&invalidated_by.to_string()),
+                "the rejection must name the invalidation that already withdrew \
+                 the target, got {detail:?}",
+            );
         }
         other => panic!("expected Conflict, got {other:?}"),
     }
 }
 
 #[test]
-fn sdk_already_inactive_is_not_retryable() {
-    let err = UsageCollectorError::already_inactive(uuid::Uuid::nil());
-    assert!(!err.is_retryable(), "AlreadyInactive is not retryable");
+fn sdk_already_invalidated_is_not_retryable() {
+    let err = UsageCollectorError::already_invalidated(uuid::Uuid::nil(), uuid::Uuid::nil());
+    assert!(!err.is_retryable(), "AlreadyInvalidated is not retryable");
 }
 
 // ---------------------------------------------------------------------------
