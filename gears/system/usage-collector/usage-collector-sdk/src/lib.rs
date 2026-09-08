@@ -42,9 +42,9 @@ pub use id::{USAGE_RECORD_ID_NAMESPACE, canonical_period_bound, derive_usage_rec
 pub use models::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
     EntryType, IdempotencyKey, Invalidation, KEYSET_SAFE_RECORD_FIELDS, MAX_AGGREGATION_BUCKETS,
-    MetadataFilter, MetadataKey, MeterTypeId, RECORD_ID_FIELD, ReasonCode, ResourceRef, SubjectRef,
-    USAGE_RECORD_BASE_TYPE, UsageRecord, UsageRecordFilterField, UsageRecordQuery,
-    WINDOW_END_FIELD, WINDOW_START_FIELD, is_keyset_safe_record_field,
+    MetadataFilter, MetadataKey, MeterTypeId, RECORD_ID_FIELD, ReasonCode, RecordOrigin,
+    ResourceRef, SubjectRef, USAGE_RECORD_BASE_TYPE, UsageRecord, UsageRecordFilterField,
+    UsageRecordQuery, WINDOW_END_FIELD, WINDOW_START_FIELD, is_keyset_safe_record_field,
 };
 pub use plugin_api::UsageCollectorPluginV1;
 pub use reason::{ConflictReason, ValidationReason};

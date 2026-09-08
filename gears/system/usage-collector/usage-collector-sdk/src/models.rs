@@ -738,6 +738,53 @@ impl EntryType {
     }
 }
 
+/// Which ingestion path admitted an entry.
+///
+/// **Server-assigned, never caller-supplied.** The Ingestion Gateway stamps
+/// it from the route the entry arrived on
+/// (`cpt-cf-usage-collector-adr-backfill-isolation`), which is why it is
+/// absent from [`CreateUsageRecord`] and refused by that type's
+/// `deny_unknown_fields` wire shadow. It joins `id` and `accepted_at` in
+/// DESIGN §3.1's server-assigned group.
+///
+/// It applies to invalidation entries exactly as to measurements. The
+/// covered-period bounds belong to the path rather than to the entry kind,
+/// so a withdrawal of a period older than the live past tolerance travels
+/// the backfill route and reads `backfill` — which makes that the normal
+/// origin for a correction of closed history, not an unusual one.
+///
+/// The value lets a consumer separate imported history from current
+/// consumption. That distinction matters once a charge has already been
+/// raised for a period: a consumer rating the feed handles a backfilled
+/// entry as batch catch-up rather than as current consumption.
+///
+/// Closed, and deliberately so. It is also a bounded metric label on
+/// `uc_ingestion_records_total` and `uc_ingestion_duration_seconds`
+/// (DESIGN §3.11.5), so an open vocabulary here would be unbounded
+/// cardinality there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordOrigin {
+    /// Admitted by the live ingestion path — `POST /records` or
+    /// `create_usage_record` / `create_usage_records`.
+    Live,
+    /// Admitted by the dedicated bulk-import route — `POST /records/backfill`
+    /// or `backfill_usage_records`.
+    Backfill,
+}
+
+impl RecordOrigin {
+    /// The wire spelling, shared by the REST projection, the `$filter`
+    /// surface and the metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Backfill => "backfill",
+        }
+    }
+}
+
 /// The withdrawal an invalidation entry carries: the entry it retracts and
 /// why.
 ///

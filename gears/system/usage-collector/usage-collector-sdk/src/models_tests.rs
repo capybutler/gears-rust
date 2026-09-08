@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 use super::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
     EntryType, IdempotencyKey, Invalidation, MetadataFilter, MetadataKey, MeterTypeId, ReasonCode,
-    ResourceRef, SubjectRef, UsageRecord, WINDOW_START_FIELD, is_keyset_safe_record_field,
+    RecordOrigin, ResourceRef, SubjectRef, UsageRecord, WINDOW_START_FIELD,
+    is_keyset_safe_record_field,
 };
 use crate::error::UsageCollectorError;
 use crate::reason::ValidationReason;
@@ -1859,4 +1860,50 @@ fn meter_type_id_from_str_routes_through_new() {
         err,
         UsageCollectorError::InvalidArgument { ref field, .. } if field == "gts_type_id"
     ));
+}
+
+#[test]
+fn record_origin_wire_spellings_are_the_two_the_contract_declares() {
+    // `RecordOrigin` in usage-collector-v1.yaml is `enum: [live, backfill]`.
+    // These strings are a wire contract and a bounded metric-label
+    // vocabulary at once, so they are asserted against literals rather
+    // than against the enum.
+    assert_eq!(RecordOrigin::Live.as_str(), "live");
+    assert_eq!(RecordOrigin::Backfill.as_str(), "backfill");
+}
+
+#[test]
+fn record_origin_serialises_to_its_wire_spelling() {
+    assert_eq!(
+        serde_json::to_value(RecordOrigin::Live).expect("serializes"),
+        serde_json::json!("live"),
+    );
+    assert_eq!(
+        serde_json::to_value(RecordOrigin::Backfill).expect("serializes"),
+        serde_json::json!("backfill"),
+    );
+}
+
+#[test]
+fn record_origin_deserialises_from_its_wire_spelling_and_refuses_anything_else() {
+    // Both variants, not just one: the read direction is what a consumer
+    // decoding a persisted entry depends on, and a value that only
+    // round-trips in one direction is the shape a `rename` on a single
+    // variant would produce.
+    assert_eq!(
+        serde_json::from_value::<RecordOrigin>(serde_json::json!("live")).expect("declared value"),
+        RecordOrigin::Live,
+    );
+    assert_eq!(
+        serde_json::from_value::<RecordOrigin>(serde_json::json!("backfill"))
+            .expect("declared value"),
+        RecordOrigin::Backfill,
+    );
+    // The marker is closed. A third value is a contract violation, not a
+    // forward-compatible extension: a consumer that cannot tell imported
+    // history from live consumption is the gap the marker exists to close.
+    serde_json::from_value::<RecordOrigin>(serde_json::json!("imported"))
+        .expect_err("RecordOrigin is closed");
+    serde_json::from_value::<RecordOrigin>(serde_json::json!("Live"))
+        .expect_err("the wire spelling is lowercase");
 }
