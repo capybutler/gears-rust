@@ -418,10 +418,19 @@ Do not touch any marker naming any other id, and do not reflow the surrounding
 comments.
 
 The `entry_type_of` region at `service.rs:268-276` loses its
-`@cpt-begin` / `@cpt-end` pair. Replace the stale explanatory comment at that
-site (the one saying the marker names compensation and a record kind) with a
-plain statement of what the function does, since the condition it described no
-longer holds.
+`@cpt-begin` / `@cpt-end` pair. **Delete** the stale explanatory paragraph at
+that site — the one saying the marker names compensation and a record kind —
+rather than replacing it. It existed only to explain that the marker id was
+misleading, so with the marker gone it has no referent, and the comment's own
+first paragraph ("`invalidation` iff it names the entry it withdraws, else
+`record`") already states the function's behaviour. Do not write a replacement
+sentence: restating the three lines of code below it is a style this crate uses
+nowhere else, and the comment is complete at two paragraphs.
+
+*(This instruction originally said "replace … with a plain statement of what the
+function does". That was wrong — it assumed a gap the first paragraph already
+filled — and the code-quality review caught the redundant comment it produced.
+Corrected here rather than left standing beside the fix.)*
 
 - [ ] **Step 3: Verify nothing but comments changed**
 
