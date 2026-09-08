@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use super::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
     EntryType, IdempotencyKey, Invalidation, MetadataFilter, MetadataKey, MeterTypeId, ReasonCode,
-    RecordOrigin, ResourceRef, SubjectRef, UsageRecord, WINDOW_START_FIELD,
+    RecordOrigin, ResourceRef, SubjectRef, UsageRecord, WINDOW_END_FIELD, WINDOW_START_FIELD,
     is_keyset_safe_record_field,
 };
 use crate::error::UsageCollectorError;
@@ -305,6 +305,80 @@ fn try_into_usage_record_rejects_an_inverted_covered_period() {
         panic!("expected InvalidArgument, got {err:?}");
     };
     assert_eq!(field, "window_end");
+}
+
+#[test]
+fn the_past_tolerance_rejection_names_both_backfill_surfaces() {
+    // `cpt-cf-usage-collector-adr-backfill-isolation`: "The rejection names
+    // the route, and both surfaces carry it." A REST caller needs the path;
+    // an in-process caller needs the trait method, and a URL tells it
+    // nothing. Asserted against literals rather than against
+    // `BACKFILL_ROUTE_PATH`, because this string is what turns a rejection
+    // into an actionable instruction: spelling the expectation from the
+    // same constant the message is built from would let the path move and
+    // the test still pass.
+    let window_end = SAMPLE_WINDOW_END;
+    let now = window_end.saturating_add(time::Duration::days(30));
+    let err = UsageCollectorError::covered_period_before_past_tolerance(
+        window_end,
+        now,
+        time::Duration::hours(48),
+    );
+    let UsageCollectorError::InvalidArgument {
+        reason,
+        field,
+        detail,
+        ..
+    } = &err
+    else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(*reason, ValidationReason::PastWindow);
+    assert_eq!(field, WINDOW_END_FIELD);
+    assert!(
+        detail.contains("/usage-collector/v1/records/backfill"),
+        "{detail}"
+    );
+    assert!(detail.contains("backfill_usage_records"), "{detail}");
+}
+
+#[test]
+fn the_future_tolerance_rejection_does_not_name_the_backfill_route() {
+    // The backfill route lifts the past bound and nothing else. Pointing a
+    // clock-skewed emitter at it would send a defect somewhere it is just
+    // as invalid, and the route's own description says so: it exists "for
+    // exactly the periods that bound rejects", meaning the past one.
+    let now = SAMPLE_WINDOW_END;
+    let window_end = now.saturating_add(time::Duration::days(30));
+    let err = UsageCollectorError::covered_period_beyond_future_tolerance(
+        window_end,
+        now,
+        time::Duration::minutes(5),
+    );
+    let UsageCollectorError::InvalidArgument {
+        reason,
+        field,
+        detail,
+        ..
+    } = &err
+    else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(*reason, ValidationReason::FutureWindow);
+    assert_eq!(field, WINDOW_END_FIELD);
+    // The claim itself: no mention of the route, in any casing.
+    assert!(!detail.to_lowercase().contains("backfill"), "{detail}");
+    // A `!contains` passes vacuously against an empty detail, so anchor it
+    // on what the rejection must still carry — the offending instant, in
+    // the RFC 3339 form the caller sent and could resubmit.
+    assert!(
+        detail.contains(
+            &window_end
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("the fixture instant is RFC 3339 representable")
+        ),
+        "{detail}"
+    );
 }
 
 #[test]

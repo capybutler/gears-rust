@@ -40,6 +40,8 @@ fn validation_reason_round_trips_each_constant() {
             INVALIDATION_FIELD_MISMATCH,
             ValidationReason::InvalidationFieldMismatch,
         ),
+        (FUTURE_WINDOW, ValidationReason::FutureWindow),
+        (PAST_WINDOW, ValidationReason::PastWindow),
     ] {
         assert_eq!(ValidationReason::from_wire(wire), expected);
         assert_eq!(expected.as_wire(), wire);

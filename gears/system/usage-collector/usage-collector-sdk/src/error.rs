@@ -18,12 +18,12 @@
 //! (and, within a category, the typed reason) rather than parsing strings.
 
 use thiserror::Error;
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::gts::USAGE_RECORD_RESOURCE;
-use crate::models::{MeterTypeId, WINDOW_END_FIELD};
+use crate::models::{BACKFILL_ROUTE_PATH, MeterTypeId, WINDOW_END_FIELD};
 use crate::reason::{ConflictReason, ValidationReason};
 
 /// Renders an instant the way a caller-facing `detail` must echo it: RFC
@@ -233,6 +233,67 @@ impl UsageCollectorError {
                  event and are valid",
                 rfc3339(window_start),
                 rfc3339(window_end),
+            ),
+        }
+    }
+
+    /// The covered period ends beyond the ingestion path's future tolerance.
+    ///
+    /// Raised on **both** routes: the backfill route lifts the past bound
+    /// and nothing else, so the detail deliberately does not mention it.
+    /// Pointing a clock-skewed emitter at the backfill route would send a
+    /// defect somewhere it is just as invalid.
+    #[must_use]
+    pub fn covered_period_beyond_future_tolerance(
+        window_end: OffsetDateTime,
+        now: OffsetDateTime,
+        tolerance: Duration,
+    ) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: WINDOW_END_FIELD.to_owned(),
+            reason: ValidationReason::FutureWindow,
+            detail: format!(
+                "covered period ends at {}, more than {tolerance} after now \
+                 ({}); an ingestion path admits only a period ending within \
+                 that tolerance of the present",
+                rfc3339(window_end),
+                rfc3339(now),
+            ),
+        }
+    }
+
+    /// The covered period ends beyond the live path's past tolerance.
+    ///
+    /// The detail names the backfill route on both surfaces, per
+    /// `cpt-cf-usage-collector-adr-backfill-isolation`: "The rejection names
+    /// the route, and both surfaces carry it." A REST caller needs the path
+    /// and an in-process caller needs the method, and a URL tells the
+    /// latter nothing.
+    ///
+    /// It says "entry" rather than "record" because the same rejection
+    /// meets an invalidation withdrawing a closed period — which is the
+    /// ordinary case for a correction, not a rare one.
+    #[must_use]
+    pub fn covered_period_before_past_tolerance(
+        window_end: OffsetDateTime,
+        now: OffsetDateTime,
+        tolerance: Duration,
+    ) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: WINDOW_END_FIELD.to_owned(),
+            reason: ValidationReason::PastWindow,
+            detail: format!(
+                "covered period ends at {}, more than {tolerance} before now \
+                 ({}); the live path admits only a period ending within that \
+                 tolerance. Submit this entry on the backfill route instead \
+                 — `POST {BACKFILL_ROUTE_PATH}`, or `backfill_usage_records` \
+                 on the SDK trait",
+                rfc3339(window_end),
+                rfc3339(now),
             ),
         }
     }

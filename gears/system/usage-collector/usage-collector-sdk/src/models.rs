@@ -708,6 +708,15 @@ pub const WINDOW_END_FIELD: &str = "window_end";
 /// together.
 pub const RECORD_ID_FIELD: &str = "id";
 
+/// The REST path of the dedicated backfill route, named by the live path's
+/// past-tolerance rejection.
+///
+/// A constant rather than a literal because the string appears in the
+/// rejection message, in the route registration, and in the
+/// `usage-collector-v1.yaml` contract, and a rejection naming a path that
+/// has moved is worse than one naming no path at all.
+pub const BACKFILL_ROUTE_PATH: &str = "/usage-collector/v1/records/backfill";
+
 /// The closed discriminator between a measurement and a withdrawal.
 ///
 /// **Derived, never stored and never submitted.** It is a projection of

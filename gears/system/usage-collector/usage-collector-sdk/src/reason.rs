@@ -80,6 +80,16 @@ pub const INVALIDATION_REFERENCE_INCOMPLETE: &str = "INVALIDATION_REFERENCE_INCO
 pub const INVALIDATION_TARGET_NOT_RECORD: &str = "INVALIDATION_TARGET_NOT_RECORD";
 /// An invalidation departed from its target in a field it must copy.
 pub const INVALIDATION_FIELD_MISMATCH: &str = "INVALIDATION_FIELD_MISMATCH";
+/// The covered period ends further into the future than the live path's
+/// configured future tolerance. Raised on **both** ingestion routes: the
+/// bound guards against an emitter opening a period that does not yet
+/// exist, and the backfill route lifts only the past bound.
+pub const FUTURE_WINDOW: &str = "FUTURE_WINDOW";
+/// The covered period ends further into the past than the live path's
+/// configured past tolerance. Raised on the live path only; the detail
+/// names the backfill route, which exists for exactly these periods
+/// (`cpt-cf-usage-collector-adr-backfill-isolation`).
+pub const PAST_WINDOW: &str = "PAST_WINDOW";
 
 /// Typed view of the `field_violations[].reason` codes carried by
 /// [`crate::UsageCollectorError::InvalidArgument`].
@@ -114,6 +124,10 @@ pub enum ValidationReason {
     InvalidationTargetNotRecord,
     /// See [`INVALIDATION_FIELD_MISMATCH`].
     InvalidationFieldMismatch,
+    /// See [`FUTURE_WINDOW`].
+    FutureWindow,
+    /// See [`PAST_WINDOW`].
+    PastWindow,
     /// Unmodeled / future reason — preserves the raw wire string.
     Unknown(String),
 }
@@ -138,6 +152,8 @@ impl ValidationReason {
             INVALIDATION_REFERENCE_INCOMPLETE => Self::InvalidationReferenceIncomplete,
             INVALIDATION_TARGET_NOT_RECORD => Self::InvalidationTargetNotRecord,
             INVALIDATION_FIELD_MISMATCH => Self::InvalidationFieldMismatch,
+            FUTURE_WINDOW => Self::FutureWindow,
+            PAST_WINDOW => Self::PastWindow,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -161,6 +177,8 @@ impl ValidationReason {
             Self::InvalidationReferenceIncomplete => INVALIDATION_REFERENCE_INCOMPLETE,
             Self::InvalidationTargetNotRecord => INVALIDATION_TARGET_NOT_RECORD,
             Self::InvalidationFieldMismatch => INVALIDATION_FIELD_MISMATCH,
+            Self::FutureWindow => FUTURE_WINDOW,
+            Self::PastWindow => PAST_WINDOW,
             Self::Unknown(s) => s.as_str(),
         }
     }
