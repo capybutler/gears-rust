@@ -1503,13 +1503,19 @@ fn usage_record_query_filter_surface_rejects_gts_type_id_inside_composite() {
 #[test]
 fn the_filter_surface_carries_every_fixed_field_design_declares() {
     // The converse of the three refusals above: DESIGN §3.1's
-    // `UsageRecordFilterField` row makes the admissible `$filter` /
-    // `group_by` set these eight fixed names plus the queried meter's
-    // declared metadata keys, resolved per request. Pinned because the
-    // schema struct is the only place the fixed half is written down, and
-    // a name dropped from it does not fail loudly — it degrades to the
-    // same `UnknownField` refusal `gts_type_id` gets, which reads to a
-    // caller like their own mistake.
+    // `UsageRecordFilterField` row makes the admissible `$filter` set
+    // these eight fixed names plus the queried meter's declared metadata
+    // keys, resolved per request. Pinned because the schema struct is the
+    // only place the fixed half is written down, and a name dropped from
+    // it does not fail loudly — it degrades to the same `UnknownField`
+    // refusal `gts_type_id` gets, which reads to a caller like their own
+    // mistake.
+    //
+    // `$filter` only. The DESIGN row names `group_by` too, but the
+    // aggregate path resolves a dimension through `AggregationDimension`,
+    // a separate and currently narrower enum: five of these eight, with
+    // no `entry_type`, `invalidates` or `origin`. This asserts nothing
+    // about it.
     //
     // A lower bound, not the whole schema: `id`, `window_start` and
     // `window_end` are on it too, for the keyset and the plugin's
@@ -1558,38 +1564,6 @@ fn the_keyset_safe_allowlist_is_exactly_the_mandatory_record_attributes() {
 }
 
 #[test]
-fn origin_is_keyset_safe_where_the_other_always_present_field_is_not() {
-    // `origin` and `entry_type` are both present on every entry and get
-    // opposite verdicts, so the rule beside `KEYSET_SAFE_RECORD_FIELDS` is
-    // not "is the value always there". `origin` is a stored field of
-    // `UsageRecord`, so every plugin persists it and a row-value keyset
-    // over its column drops nothing; `entry_type` is a function of the
-    // optional `invalidates` that the SDK obliges no plugin to
-    // materialize, so there is no column to promise a key over.
-    //
-    // Both resolve on the filterable schema, and that is what makes the
-    // pair worth pinning together: column resolution cannot be what
-    // separates them, so nothing but this asserts that the split is the
-    // stored/derived one the doc claims.
-    assert!(
-        is_keyset_safe_record_field("origin"),
-        "`origin` is a stored, mandatory record attribute and must be admissible \
-         as an order key",
-    );
-    assert!(
-        !is_keyset_safe_record_field("entry_type"),
-        "`entry_type` is derived from an optional field and must stay inadmissible",
-    );
-    for field in ["origin", "entry_type"] {
-        assert!(
-            crate::models::UsageRecordFilterField::from_name(field).is_some(),
-            "`{field}` is on the filterable schema, so resolving to a column is \
-             not what tells the two apart",
-        );
-    }
-}
-
-#[test]
 fn every_admissible_order_key_resolves_to_a_column() {
     // Being on the allowlist is necessary but not sufficient: the plugin
     // resolves an order key through `UsageRecordFilterField`, so a name
@@ -1599,7 +1573,7 @@ fn every_admissible_order_key_resolves_to_a_column() {
     // Two independently maintained spellings of one vocabulary, and this is
     // the only thing checking they agree in this direction; the converse —
     // a name on the filterable schema that must never be an order key — is
-    // `a_derived_field_is_filterable_but_never_an_order_key` below, and
+    // `derivation_not_presence_separates_entry_type_from_origin` below, and
     // neither guard catches the other's case.
     //
     // This replaces a test that re-asserted the same literals the anchor
@@ -1620,21 +1594,34 @@ fn every_admissible_order_key_resolves_to_a_column() {
 }
 
 #[test]
-fn a_derived_field_is_filterable_but_never_an_order_key() {
+fn derivation_not_presence_separates_entry_type_from_origin() {
     // The converse of the guard above, and the half it cannot supply.
     // Resolving to a column is necessary but not sufficient: `entry_type`
     // is on the filterable schema (the wire contract's `$filter` parameter
     // names it) and therefore resolves through `from_name`, while being a
     // function of the optional `invalidates` that the SDK guarantees no
     // key for. The guard above passes on it. This one does not.
-    assert!(
-        crate::models::UsageRecordFilterField::from_name("entry_type").is_some(),
-        "`entry_type` is a filterable field per the wire contract",
-    );
+    //
+    // `origin` is the positive control, and it is what keeps the ground
+    // honest: it too has a value on every entry, and it too resolves
+    // through `from_name`, so neither presence nor column resolution can
+    // be what refuses `entry_type`. Being a field of the record rather
+    // than a function of one is the whole of the difference.
+    for field in ["entry_type", "origin"] {
+        assert!(
+            crate::models::UsageRecordFilterField::from_name(field).is_some(),
+            "`{field}` is a filterable field per the wire contract",
+        );
+    }
     assert!(
         !is_keyset_safe_record_field("entry_type"),
         "`entry_type` is a function of the optional `invalidates`, so the SDK \
          promises no keyset key over it however present the value is",
+    );
+    assert!(
+        is_keyset_safe_record_field("origin"),
+        "`origin` is a field of the record itself, so the SDK does promise a \
+         keyset key over it",
     );
 }
 

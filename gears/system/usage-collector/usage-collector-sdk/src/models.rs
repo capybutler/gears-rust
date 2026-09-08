@@ -1842,12 +1842,16 @@ pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
 ///
 /// Every entry of [`KEYSET_SAFE_RECORD_FIELDS`] is an attribute the record
 /// itself carries on every entry, so all of them are keyset-safe.
-/// [`UsageRecord::origin`] is the case that shows the two rules above are
-/// one rule and not a list of exceptions: like `entry_type` it has a value
-/// on every entry, and unlike `entry_type` it is a field of the record
-/// rather than a function of another one, so every plugin persisting a
-/// [`UsageRecord`] persists it non-null and there is a column to promise a
-/// key over. Derivation, not presence, is what separates the two.
+/// [`UsageRecord::origin`] shows why the second bullet is not an exception
+/// to the first: both ask whether the SDK carries the attribute in its own
+/// right on every entry. `origin` has a value on every entry like
+/// `entry_type`, but it is a field of the record rather than a function of
+/// one, so the SDK's shape obliges every plugin persisting a
+/// [`UsageRecord`] to persist it non-null. The column follows from that
+/// obligation; for `entry_type` no obligation exists, whatever column a
+/// plugin chooses to build. Between *those* two, derivation rather than
+/// presence is the discriminator — `subject_id` is a stored field too, and
+/// it is the first bullet, not this one, that excludes it.
 ///
 /// This is a fact about the shape this SDK guarantees, not about any
 /// storage schema. A plugin is free to materialize `entry_type` as a
