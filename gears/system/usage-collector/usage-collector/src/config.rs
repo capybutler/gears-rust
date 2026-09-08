@@ -236,11 +236,13 @@ impl UsageCollectorConfig {
     /// round-trip, which is exactly the coupling the cache exists to remove,
     /// and a zero capacity cannot hold even a single resolved declaration.
     ///
-    /// The three covered-period bounds are checked here too, and this is
-    /// currently their only reader — the Ingestion Gateway does not enforce
-    /// them yet. Each must be non-zero and must fit an `i64`, because a
-    /// bound is compared as a duration of `i64` seconds; a `u64::MAX`
-    /// tolerance is a configuration mistake, not an infinite bound.
+    /// The three covered-period bounds are checked here too. Each must be
+    /// non-zero and must fit an `i64`, because a bound is compared as a
+    /// duration of `i64` seconds; a `u64::MAX` tolerance is a configuration
+    /// mistake, not an infinite bound. Those two guarantees are what make
+    /// [`Self::covered_period_bounds`] — the projection the Ingestion
+    /// Gateway enforces — infallible, so this is the one place a bad bound
+    /// can still be refused.
     ///
     /// `backfill_window_secs` must not be narrower than
     /// `live_past_tolerance_secs`. The live path's past-tolerance rejection

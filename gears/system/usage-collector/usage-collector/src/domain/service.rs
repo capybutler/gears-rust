@@ -844,6 +844,12 @@ impl Service {
     ///   period — a bound finer than microsecond precision, or an inverted
     ///   period. This is raised by the projection in the first statement of
     ///   the body, so it outranks every other failure here.
+    /// * [`UsageCollectorError::InvalidArgument`] with reason
+    ///   `FUTURE_WINDOW` / `PAST_WINDOW` when the covered period ends
+    ///   outside this path's tolerances
+    ///   ([`enforce_covered_period_bounds`]). Raised immediately after the
+    ///   projection, so it outranks everything below it — including the PDP
+    ///   call, per DESIGN §3.8's pipeline order.
     /// * [`UsageCollectorError::InvalidArgument`] on a malformed `metadata`
     ///   payload or a semantics violation.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
