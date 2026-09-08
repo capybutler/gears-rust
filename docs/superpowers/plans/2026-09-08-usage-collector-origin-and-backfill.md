@@ -3077,10 +3077,13 @@ that rather than reading it as scope creep:
 
 - **T4** touches ~48 `UsageRecord` construction sites across three packages,
   because adding a field is a compile error at every *literal* one. That is the
-  guard working, not a design problem — but note the guard has a hole: the two
-  **struct-update** sites (`test_support.rs:1592`, `authz_tests.rs:70`) compile
-  unchanged and silently inherit the base record's `origin`. Those two need
-  reading, not just building.
+  guard working, not a design problem — but note the guard has a hole: a
+  **struct-update** site compiles unchanged and silently inherits the base
+  record's `origin`. There are **five** of them, not the two this plan first
+  listed: `test_support.rs` (`withdrawal_of`), `authz_tests.rs`
+  (`record_with_tenant`), `service_tests.rs` ×2 (`target_row`), and
+  `service_metrics_tests.rs` (`sample_target_row`). They need reading, not just
+  building — a third miscount in this plan, found by the Task 4 implementer.
 - **T9** re-bases ~75 ingestion-path assertions off a 1970 covered period before
   it enforces anything, in a separate commit. Its enforcement commit should be
   small; if it is not, the re-base leaked into it.
