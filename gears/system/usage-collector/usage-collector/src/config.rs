@@ -199,6 +199,34 @@ impl MetricsConfig {
 }
 
 impl UsageCollectorConfig {
+    /// Projects the three configured covered-period bounds into the
+    /// [`CoveredPeriodBounds`] the Ingestion Gateway enforces.
+    ///
+    /// Infallible, and deliberately so: [`Self::validate`] already
+    /// guarantees at bootstrap that each of the three keys is non-zero and
+    /// fits an `i64`, which is exactly what
+    /// [`time::Duration::seconds`] needs. A fallible projection here would
+    /// force every ingestion call site to handle an error that bootstrap has
+    /// already made unreachable — so the `i64` conversions saturate rather
+    /// than panic, and a configuration that could saturate them was refused
+    /// at `Gear::init`.
+    ///
+    /// [`CoveredPeriodBounds`]: crate::domain::covered_period::CoveredPeriodBounds
+    #[must_use]
+    pub fn covered_period_bounds(&self) -> crate::domain::covered_period::CoveredPeriodBounds {
+        crate::domain::covered_period::CoveredPeriodBounds {
+            future_tolerance: time::Duration::seconds(
+                i64::try_from(self.live_future_tolerance_secs).unwrap_or(i64::MAX),
+            ),
+            live_past_tolerance: time::Duration::seconds(
+                i64::try_from(self.live_past_tolerance_secs).unwrap_or(i64::MAX),
+            ),
+            backfill_window: time::Duration::seconds(
+                i64::try_from(self.backfill_window_secs).unwrap_or(i64::MAX),
+            ),
+        }
+    }
+
     /// Validates the configuration at bootstrap.
     ///
     /// Rejects an empty or whitespace-only `vendor` selector so the failure

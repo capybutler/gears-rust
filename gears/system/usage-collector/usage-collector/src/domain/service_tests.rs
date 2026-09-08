@@ -339,6 +339,7 @@ async fn new_with_metrics_accepts_a_resolver_built_over_a_fake_source() {
         Arc::new(NoopMetrics),
         type_resolver,
         crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+        crate::domain::test_support::default_covered_period_bounds(),
     );
 
     let resolved = svc.get_plugin().await;
@@ -634,6 +635,7 @@ mod pdp_dedup_tests {
             Arc::new(crate::domain::ports::metrics::NoopMetrics),
             type_resolver,
             crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+            crate::domain::test_support::default_covered_period_bounds(),
         ));
 
         let results = service
@@ -3212,6 +3214,257 @@ mod covered_period_batch_tests {
                 .collect::<Vec<_>>(),
             vec!["idem-three-way-accepted"],
             "neither the rejected period nor the denied tuple may be dispatched",
+        );
+    }
+}
+
+// ── The live path's two-sided covered-period bound, at the service ─────────
+//
+// `covered_period_tests.rs` pins the rule itself. These pin that the
+// Ingestion Gateway applies it — on both entry points, before the PDP call
+// and before any plugin dispatch — and that it governs an invalidation over
+// the period the invalidation copies, which is the case nothing in this
+// tree pinned before.
+mod covered_period_bounds_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use toolkit_gts::gts_id;
+    use usage_collector_sdk::{
+        BACKFILL_ROUTE_PATH, CreateUsageRecord, IdempotencyKey, Invalidation, MeterTypeId,
+        ReasonCode, ResourceRef, UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
+        ValidationReason,
+    };
+    use uuid::Uuid;
+
+    use crate::domain::Service;
+    use crate::domain::test_support::{
+        HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
+        projected, recent_window_end, recent_window_start,
+    };
+
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+    /// A [`ServiceFixture`] wired with an arbitrary working declaration —
+    /// these tests exercise the covered-period bound, not the declaration.
+    /// The bound is enforced ahead of the resolver, so the declaration only
+    /// has to let an admitted entry through.
+    fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
+        ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build(plugin, suffix)
+    }
+
+    /// A submission the live path admits: the shared recent covered period,
+    /// an hour long and closed an hour ago.
+    fn fresh_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
+        CreateUsageRecord {
+            gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
+            tenant_id,
+            resource_ref: ResourceRef::new("rsc-bounds", "compute.vm").expect("valid resource ref"),
+            subject_ref: None,
+            metadata: BTreeMap::new(),
+            value: rust_decimal::Decimal::from(1),
+            idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
+            invalidation: None,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
+        }
+    }
+
+    /// The same submission, differing in the covered period and in nothing
+    /// else: a month back, well beyond the 48-hour live past tolerance and
+    /// equally well short of the boundary, so the outcome does not depend on
+    /// how loaded the runner is.
+    fn stale_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
+        let window_end = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+        CreateUsageRecord {
+            window_start: window_end - time::Duration::hours(1),
+            window_end,
+            ..fresh_record(tenant_id, idem)
+        }
+    }
+
+    fn invalid_argument(err: &UsageCollectorError) -> (&ValidationReason, &str) {
+        match err {
+            UsageCollectorError::InvalidArgument { reason, detail, .. } => (reason, detail),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_live_path_refuses_a_period_older_than_the_past_tolerance_and_names_the_route() {
+        let plugin = HappyPathPlugin::new();
+        let submission = stale_record(Uuid::from_u128(0xC1), "idem-stale");
+        // Armed to succeed, so the rejection can only come from the bound.
+        plugin.set_create_record(projected(&submission));
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.bounds.live_past.record.v1",
+        );
+
+        let err = service
+            .create_usage_record(&authenticated_ctx(), submission)
+            .await
+            .expect_err("a period 30 days old is beyond the 48-hour live tolerance");
+
+        let (reason, detail) = invalid_argument(&err);
+        assert_eq!(*reason, ValidationReason::PastWindow);
+        assert!(
+            detail.contains(BACKFILL_ROUTE_PATH),
+            "the rejection MUST name the route the entry belongs on: {detail}",
+        );
+        assert_eq!(
+            plugin.last_create_record_input(),
+            None,
+            "a refused period MUST NOT reach the storage plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_live_path_refuses_a_withdrawal_over_a_period_older_than_the_past_tolerance() {
+        // The failure mode of the whole slice, and the thing no test in the
+        // tree pinned before this one. The bound belongs to the path, not to
+        // the entry kind: an invalidation is a faithful copy of its target,
+        // so its `window_end` IS the target's, and withdrawing a closed
+        // month is refused on the live path exactly as a fresh measurement
+        // of that month would be
+        // (`cpt-cf-usage-collector-adr-backfill-isolation`). `origin =
+        // backfill` on a correction is the ordinary case, not a rare one.
+        //
+        // Getting this backwards is easy and silent. If the bound read the
+        // arrival instant instead of the copied period, this submission
+        // would be accepted and a correction of closed history would persist
+        // reading `origin = live` — the exact gap the past bound closes.
+        let tenant_id = Uuid::from_u128(0xC2);
+        let target = Uuid::from_u128(0x6C2);
+
+        // The target: a measurement whose period closed a month ago, stored
+        // under the identity the gateway would have derived for it.
+        let measurement = stale_record(tenant_id, "idem-target");
+        let target_row = UsageRecord {
+            id: target,
+            ..projected(&measurement)
+        };
+        // The withdrawal: a faithful copy of that measurement, departing
+        // only in the two permitted places — its own idempotency key and the
+        // reference itself. Its covered period is the target's, which is
+        // the whole point.
+        let withdrawal = CreateUsageRecord {
+            invalidation: Some(Invalidation {
+                target,
+                reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+            }),
+            ..stale_record(tenant_id, "idem-withdrawal")
+        };
+
+        let plugin = HappyPathPlugin::new();
+        plugin.set_get_record(target_row);
+        plugin.set_create_record(projected(&withdrawal));
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.bounds.live_past.withdrawal.v1",
+        );
+
+        let err = service
+            .create_usage_record(&authenticated_ctx(), withdrawal)
+            .await
+            .expect_err("a withdrawal of a closed month belongs on the backfill route");
+
+        // The rejection must arrive on the PERIOD, not on the target — so
+        // assert the typed reason rather than mere failure, and assert the
+        // target was never read. Both still hold if the faithful-copy
+        // comparator is later reordered; neither holds if the bound moved
+        // behind the target lookup.
+        let (reason, detail) = invalid_argument(&err);
+        assert_eq!(*reason, ValidationReason::PastWindow);
+        assert!(detail.contains(BACKFILL_ROUTE_PATH), "{detail}");
+        assert_eq!(
+            plugin.get_usage_record_calls(),
+            0,
+            "the period bound MUST refuse the entry before the target is read",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_month_long_period_that_just_closed_is_ordinary_live_consumption() {
+        // ADR confirmation case 2, and the one place it can be pinned: the
+        // bound reads the END of the covered period, so a monthly accrual
+        // meter emitting the moment its month closes is admitted even
+        // though the period it covers is 30 days long — fifteen times the
+        // live past tolerance.
+        //
+        // The rule itself cannot express the mistake (the function is
+        // handed one instant), but this call site can: hand it
+        // `record.window_start` instead of `record.window_end` and this
+        // test is the only one that goes red, because every other ingestion
+        // fixture in the tree covers an hour and the swap is invisible
+        // inside a tolerance measured in days.
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0xC4);
+        let window_end = time::OffsetDateTime::now_utc() - time::Duration::minutes(1);
+        let submission = CreateUsageRecord {
+            window_start: window_end - time::Duration::days(30),
+            window_end,
+            ..fresh_record(tenant_id, "idem-month-long")
+        };
+        plugin.set_create_record(projected(&submission));
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.bounds.live_past.month_long.v1",
+        );
+
+        service
+            .create_usage_record(&authenticated_ctx(), submission)
+            .await
+            .expect("a 30-day period that closed a minute ago is live consumption");
+    }
+
+    #[tokio::test]
+    async fn a_batch_rejects_only_the_entries_whose_period_is_out_of_bounds() {
+        // Per-submission, at its own input index, with the surviving entries
+        // still dispatched — the same posture the projection's own period
+        // preconditions already have. A batch-level rejection here would
+        // make one stale entry discard a whole import.
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0xC3);
+        let input = vec![
+            fresh_record(tenant_id, "idem-ok-0"),
+            stale_record(tenant_id, "idem-stale-1"),
+            fresh_record(tenant_id, "idem-ok-2"),
+        ];
+        // Two per-record outcomes, not three: a refused period never reaches
+        // the plugin, and a third would silently absorb a routing mistake.
+        plugin.set_create_records(vec![Ok(projected(&input[0])), Ok(projected(&input[2]))]);
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.bounds.live_past.batch.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), input)
+            .await
+            .expect("a refused period is per-entry, never batch-level");
+
+        assert_eq!(results.len(), 3, "one result per input, in input order");
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert!(results[2].is_ok(), "{:?}", results[2]);
+        let Err(err) = &results[1] else {
+            panic!("index 1 must carry the rejection, at its own index");
+        };
+        assert_eq!(*invalid_argument(err).0, ValidationReason::PastWindow);
+
+        let dispatched = plugin
+            .last_create_records_input()
+            .expect("the surviving entries MUST still be dispatched");
+        assert_eq!(
+            dispatched
+                .iter()
+                .map(|r| r.idempotency_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["idem-ok-0", "idem-ok-2"],
+            "only the out-of-bounds entry is withheld",
         );
     }
 }

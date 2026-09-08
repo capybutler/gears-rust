@@ -1,6 +1,7 @@
 //! Domain layer for the usage-collector module.
 
 pub mod authz;
+pub mod covered_period;
 pub mod error;
 pub mod invalidation;
 pub mod local_client;

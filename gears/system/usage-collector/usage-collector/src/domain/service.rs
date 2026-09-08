@@ -20,6 +20,7 @@ use std::time::Duration;
 use authz_resolver_sdk::PolicyEnforcer;
 use futures::StreamExt;
 use futures::stream;
+use time::OffsetDateTime;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use toolkit_macros::domain_model;
@@ -36,6 +37,7 @@ use usage_collector_sdk::{
 use uuid::Uuid;
 
 use crate::domain::authz::{self, AttributionTupleKey, usage_record};
+use crate::domain::covered_period::{CoveredPeriodBounds, enforce_covered_period_bounds};
 use crate::domain::invalidation::verify_invalidation_target;
 use crate::domain::ports::declarations::UnavailableDeclarationSource;
 use crate::domain::ports::metrics::{
@@ -718,6 +720,13 @@ pub struct Service {
     /// threads `UsageCollectorConfig::metadata_size_cap_bytes` through
     /// explicitly.
     metadata_size_cap_bytes: usize,
+
+    /// The covered-period bounds both ingestion paths enforce, projected
+    /// from the configured `[usage_collector]` block by
+    /// `UsageCollectorConfig::covered_period_bounds`. Held as the finished
+    /// [`CoveredPeriodBounds`] rather than as the whole config, for the
+    /// same reason `metadata_size_cap_bytes` is held as a plain `usize`.
+    covered_period_bounds: CoveredPeriodBounds,
 }
 
 impl Service {
@@ -739,6 +748,12 @@ impl Service {
     /// `new_with_metrics` itself takes the cap as a plain mandatory `usize`
     /// with no default; production bootstrap passes
     /// `UsageCollectorConfig::metadata_size_cap_bytes` explicitly instead.
+    ///
+    /// The covered-period bounds are likewise defaulted here, by projecting
+    /// `UsageCollectorConfig::default()` rather than by restating 5 minutes
+    /// / 48 hours / 90 days: the published defaults live in exactly one
+    /// place, and a deployment that moves them cannot leave this
+    /// constructor behind.
     #[must_use]
     pub fn new(hub: Arc<ClientHub>, vendor: String, enforcer: PolicyEnforcer) -> Self {
         let metrics: Arc<dyn UsageCollectorMetrics> = Arc::new(NoopMetrics);
@@ -757,6 +772,7 @@ impl Service {
             metrics,
             type_resolver,
             DEFAULT_METADATA_SIZE_CAP_BYTES,
+            crate::config::UsageCollectorConfig::default().covered_period_bounds(),
         )
     }
 
@@ -779,7 +795,10 @@ impl Service {
     /// `metrics` is injected as a finished `Arc<dyn UsageCollectorMetrics>`
     /// rather than built from a prefix string in here. `metadata_size_cap_bytes`
     /// is likewise taken as the plain `usize` the config carries (not the
-    /// whole `UsageCollectorConfig`), for the same reason.
+    /// whole `UsageCollectorConfig`), for the same reason — and so is
+    /// `covered_period_bounds`, taken as the finished
+    /// [`CoveredPeriodBounds`] that
+    /// `UsageCollectorConfig::covered_period_bounds` projects.
     #[must_use]
     pub fn new_with_metrics(
         hub: Arc<ClientHub>,
@@ -788,6 +807,7 @@ impl Service {
         metrics: Arc<dyn UsageCollectorMetrics>,
         type_resolver: Arc<TypeResolver>,
         metadata_size_cap_bytes: usize,
+        covered_period_bounds: CoveredPeriodBounds,
     ) -> Self {
         Self {
             hub,
@@ -797,6 +817,7 @@ impl Service {
             metrics,
             type_resolver,
             metadata_size_cap_bytes,
+            covered_period_bounds,
         }
     }
 
@@ -877,6 +898,16 @@ impl Service {
             .as_ref()
             .map(|invalidation| (record.clone(), invalidation.clone()));
         let record = record.try_into_usage_record(origin)?;
+        // Read once, so a batch and a single emit are judged the same way:
+        // against one instant, not against a clock that moves under the
+        // pipeline. Between the projection and the PDP call because §3.8
+        // orders period validation (step 3) before authorization (step 5).
+        enforce_covered_period_bounds(
+            &self.covered_period_bounds,
+            origin,
+            OffsetDateTime::now_utc(),
+            record.window_end,
+        )?;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-pdp-deny
         authz::authorize_usage_record(
@@ -1266,6 +1297,12 @@ impl Service {
         // batch. Every later pass carries the input index explicitly rather
         // than re-`enumerate()`ing, because the surviving vector is no
         // longer index-aligned with the input.
+        //
+        // `now` is captured once for the whole batch rather than per entry:
+        // a batch is one submission, and two entries carrying the same
+        // covered period must not be judged differently because the clock
+        // crossed the bound between them.
+        let now = OffsetDateTime::now_utc();
         let mut derived: Vec<(usize, UsageRecord)> = Vec::with_capacity(submission_count);
         for (index, submission) in records.into_iter().enumerate() {
             withdrawals.push(
@@ -1274,7 +1311,20 @@ impl Service {
                     .as_ref()
                     .map(|invalidation| (submission.clone(), invalidation.clone())),
             );
-            match submission.try_into_usage_record(origin) {
+            match submission.try_into_usage_record(origin).and_then(|record| {
+                // A covered period outside the path's bounds is a
+                // per-submission rejection at its own input index, exactly
+                // like the projection's own period preconditions above it —
+                // never a batch-level failure, or one stale entry would
+                // discard a whole import.
+                enforce_covered_period_bounds(
+                    &self.covered_period_bounds,
+                    origin,
+                    now,
+                    record.window_end,
+                )?;
+                Ok(record)
+            }) {
                 Ok(record) => derived.push((index, record)),
                 Err(e) => {
                     results[index] = Some(Err(e));

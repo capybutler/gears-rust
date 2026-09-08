@@ -111,6 +111,10 @@ impl Gear for UsageCollectorModule {
             cfg.type_cache_capacity,
             metrics.clone(),
         );
+        // Projected before `cfg.vendor` is moved out of `cfg`. The
+        // projection is infallible because `cfg.validate()` above already
+        // refused a zero or out-of-`i64` bound.
+        let covered_period_bounds = cfg.covered_period_bounds();
         let svc = Service::new_with_metrics(
             hub,
             cfg.vendor,
@@ -118,6 +122,7 @@ impl Gear for UsageCollectorModule {
             metrics,
             type_resolver,
             cfg.metadata_size_cap_bytes,
+            covered_period_bounds,
         );
 
         let svc = Arc::new(svc);

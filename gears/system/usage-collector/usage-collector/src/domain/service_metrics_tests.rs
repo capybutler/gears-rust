@@ -1349,6 +1349,7 @@ async fn query_aggregated_success_records_success_rows_and_duration() {
         metrics,
         type_resolver,
         crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+        crate::domain::test_support::default_covered_period_bounds(),
     ));
 
     let result = service

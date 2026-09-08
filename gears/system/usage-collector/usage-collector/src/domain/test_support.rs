@@ -86,6 +86,15 @@ pub(crate) fn recent_window_end() -> time::OffsetDateTime {
     recent_window().1
 }
 
+/// The covered-period bounds every fixture `Service` is built with: the
+/// published defaults, projected from `UsageCollectorConfig::default()`
+/// rather than restated here, so a fixture can never quietly enforce a
+/// tolerance the shipped configuration does not.
+#[must_use]
+pub fn default_covered_period_bounds() -> crate::domain::covered_period::CoveredPeriodBounds {
+    crate::config::UsageCollectorConfig::default().covered_period_bounds()
+}
+
 /// Projects a create submission into its persisted shape, for a plugin echo
 /// fixture that must agree with the service on the derived `id`.
 ///
@@ -818,6 +827,7 @@ fn build_service(
         params
             .cap
             .unwrap_or(crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES),
+        default_covered_period_bounds(),
     ));
     (service, resolver)
 }
@@ -905,6 +915,7 @@ pub fn service_with_metrics_unready_plugin(
         metrics,
         type_resolver,
         crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+        default_covered_period_bounds(),
     ));
     (service, provider, exporter)
 }
