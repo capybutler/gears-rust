@@ -2,6 +2,7 @@
 
 pub mod authz;
 pub mod error;
+pub mod invalidation;
 pub mod local_client;
 pub mod ports;
 pub mod query;
