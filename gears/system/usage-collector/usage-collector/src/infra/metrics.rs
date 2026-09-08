@@ -24,7 +24,7 @@ use crate::domain::ports::metrics::{
     PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
     RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics, key,
 };
-use usage_collector_sdk::EntryType;
+use usage_collector_sdk::{EntryType, RecordOrigin};
 
 /// Bucket boundaries (seconds) for `uc_pdp_duration_seconds` — brackets the
 /// PDP share of the 200 ms ingestion p95 budget (DESIGN §3.11.5).
@@ -156,12 +156,13 @@ impl UcMetricsMeter {
             ingestion_records: meter
                 .u64_counter(format!("{prefix}_ingestion_records_total"))
                 .with_description(
-                    "Per-record ingestion acknowledgements by outcome, entry_type, error_category",
+                    "Per-record ingestion acknowledgements by outcome, entry_type, origin, \
+                     error_category",
                 )
                 .build(),
             ingestion_duration_seconds: meter
                 .f64_histogram(format!("{prefix}_ingestion_duration_seconds"))
-                .with_description("Ingestion request wall-clock")
+                .with_description("Ingestion request wall-clock by origin")
                 .with_boundaries(INGESTION_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             ingestion_batch_size: meter
@@ -265,8 +266,9 @@ impl UsageCollectorMetrics for UcMetricsMeter {
         self.ingestion_batch_size.record(size as f64, &[]);
     }
 
-    fn observe_ingestion_duration(&self, seconds: f64) {
-        self.ingestion_duration_seconds.record(seconds, &[]);
+    fn observe_ingestion_duration(&self, seconds: f64, origin: RecordOrigin) {
+        self.ingestion_duration_seconds
+            .record(seconds, &[KeyValue::new(key::ORIGIN, origin.as_str())]);
     }
 
     fn observe_record_metadata_bytes(&self, bytes: u64) {
@@ -278,6 +280,7 @@ impl UsageCollectorMetrics for UcMetricsMeter {
         &self,
         outcome: RecordOutcome,
         entry_type: EntryType,
+        origin: RecordOrigin,
         error_category: RecordErrorCategory,
     ) {
         self.ingestion_records.add(
@@ -285,6 +288,7 @@ impl UsageCollectorMetrics for UcMetricsMeter {
             &[
                 KeyValue::new(key::OUTCOME, outcome.as_str()),
                 KeyValue::new(key::ENTRY_TYPE, entry_type.as_str()),
+                KeyValue::new(key::ORIGIN, origin.as_str()),
                 KeyValue::new(key::ERROR_CATEGORY, error_category.as_str()),
             ],
         );

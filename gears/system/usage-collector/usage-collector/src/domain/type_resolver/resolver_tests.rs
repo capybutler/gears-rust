@@ -65,12 +65,13 @@ impl UsageCollectorMetrics for RecordingMetrics {
     ) {
     }
     fn observe_ingestion_batch_size(&self, _: u64) {}
-    fn observe_ingestion_duration(&self, _: f64) {}
+    fn observe_ingestion_duration(&self, _: f64, _: usage_collector_sdk::RecordOrigin) {}
     fn observe_record_metadata_bytes(&self, _: u64) {}
     fn record_ingestion_record(
         &self,
         _: crate::domain::ports::metrics::RecordOutcome,
         _: usage_collector_sdk::EntryType,
+        _: usage_collector_sdk::RecordOrigin,
         _: crate::domain::ports::metrics::RecordErrorCategory,
     ) {
     }

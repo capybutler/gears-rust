@@ -24,7 +24,7 @@
 //! as metric labels; they belong in structured logs and traces.
 
 use toolkit_macros::domain_model;
-use usage_collector_sdk::EntryType;
+use usage_collector_sdk::{EntryType, RecordOrigin};
 
 /// Label key constants shared by the instrument families below.
 pub mod key {
@@ -40,6 +40,8 @@ pub mod key {
     pub const OUTCOME: &str = "outcome";
     /// `entry_type` — measurement vs withdrawal.
     pub const ENTRY_TYPE: &str = "entry_type";
+    /// `origin` — which ingestion path admitted the entry.
+    pub const ORIGIN: &str = "origin";
     /// `query_kind` — aggregated vs raw query.
     pub const QUERY_KIND: &str = "query_kind";
     /// `result` — Type Resolver call outcome.
@@ -559,25 +561,30 @@ pub trait UsageCollectorMetrics: Send + Sync {
     /// submission, before per-record processing.
     fn observe_ingestion_batch_size(&self, size: u64);
 
-    /// Observe `uc_ingestion_duration_seconds` (label-free) — one per
-    /// completed ingestion request (single-emit call or batch submission).
-    fn observe_ingestion_duration(&self, seconds: f64);
+    /// Observe `uc_ingestion_duration_seconds{origin}` — one per completed
+    /// ingestion request (single-emit call or batch submission). The label
+    /// separates the bulk-import latency profile from the live path's,
+    /// which the live-path p95 budget depends on not being averaged
+    /// together with a catch-up job's.
+    fn observe_ingestion_duration(&self, seconds: f64, origin: RecordOrigin);
 
     /// Observe `uc_record_metadata_bytes` — one per submitted record that
     /// carries metadata (recorded before the size-cap comparison).
     fn observe_record_metadata_bytes(&self, bytes: u64);
 
-    /// Increment `uc_ingestion_records_total{outcome, entry_type, error_category}`
-    /// once per entry in a batch acknowledgement (and once for a single emit).
+    /// Increment
+    /// `uc_ingestion_records_total{outcome, entry_type, origin, error_category}`
+    /// once per entry in a batch acknowledgement (and once for a single
+    /// emit).
     ///
-    /// `entry_type` carries the correction share, which is what makes a
-    /// withdrawal visible in the ingestion profile at all. §3.11.5 names an
-    /// `origin` label on this family too; the gear has no `RecordOrigin` to
-    /// populate it from, so the series is emitted without it.
+    /// `entry_type` carries the correction share and `origin` the backfill
+    /// share — between them, what makes a withdrawal of closed history
+    /// visible in the ingestion profile at all.
     fn record_ingestion_record(
         &self,
         outcome: RecordOutcome,
         entry_type: EntryType,
+        origin: RecordOrigin,
         error_category: RecordErrorCategory,
     );
 
@@ -638,9 +645,16 @@ impl UsageCollectorMetrics for NoopMetrics {
     fn record_plugin_call(&self, _: PluginOp, _: f64) {}
     fn record_plugin_accept_error(&self, _: PluginOp, _: PluginErrorCategory) {}
     fn observe_ingestion_batch_size(&self, _: u64) {}
-    fn observe_ingestion_duration(&self, _: f64) {}
+    fn observe_ingestion_duration(&self, _: f64, _: RecordOrigin) {}
     fn observe_record_metadata_bytes(&self, _: u64) {}
-    fn record_ingestion_record(&self, _: RecordOutcome, _: EntryType, _: RecordErrorCategory) {}
+    fn record_ingestion_record(
+        &self,
+        _: RecordOutcome,
+        _: EntryType,
+        _: RecordOrigin,
+        _: RecordErrorCategory,
+    ) {
+    }
     fn record_ingestion_request(&self, _: IngestRequestOutcome, _: IngestRequestErrorCategory) {}
     fn query_inflight_inc(&self, _: QueryKind) {}
     fn query_inflight_dec(&self, _: QueryKind) {}

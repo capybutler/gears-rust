@@ -1002,7 +1002,9 @@ impl Service {
     /// telemetry. Per DESIGN §3.11.5 the single-emit SDK surface records
     /// `uc_ingestion_duration_seconds` plus exactly one
     /// `uc_ingestion_records_total` (the request-level `uc_ingestion_requests_total`
-    /// is a batch-only counter and is NOT incremented here).
+    /// is a batch-only counter and is NOT incremented here). Both carry
+    /// `origin="live"`: this is the live route, and DESIGN §3.3 declares no
+    /// single-emit backfill counterpart.
     ///
     /// # Errors
     ///
@@ -1019,19 +1021,19 @@ impl Service {
         let entry_type = entry_type_of(&record);
         // `Live` comes from the route this wrapper *is*, not from a
         // default: the backfill route stamps `Backfill` through the same
-        // inner path.
-        let result = self
-            .create_usage_record_inner(ctx, record, RecordOrigin::Live)
-            .await;
+        // inner path. It is also the `origin` label on both ingestion
+        // instruments below, so the stamp and the telemetry cannot disagree.
+        let origin = RecordOrigin::Live;
+        let result = self.create_usage_record_inner(ctx, record, origin).await;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-completion-metrics
         self.metrics
-            .observe_ingestion_duration(start.elapsed().as_secs_f64());
+            .observe_ingestion_duration(start.elapsed().as_secs_f64(), origin);
         let (outcome, error_category) = match &result {
             Ok(_) => (RecordOutcome::Accepted, RecordErrorCategory::None),
             Err(e) => (RecordOutcome::Rejected, classify_record_error(e)),
         };
         self.metrics
-            .record_ingestion_record(outcome, entry_type, error_category);
+            .record_ingestion_record(outcome, entry_type, origin, error_category);
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-completion-metrics
         result
     }
@@ -1039,13 +1041,16 @@ impl Service {
     /// Batch ingestion entry
     /// (`cpt-cf-usage-collector-flow-usage-emission-emit-records-batch`).
     ///
-    /// Enforces the `1..=`[`MAX_BATCH_RECORDS`] structural cap (rejected before
-    /// the pipeline and NOT recorded on either ingestion instrument, per
-    /// §3.11.5's closed vocabulary), observes `uc_ingestion_batch_size`, then
-    /// delegates to [`Self::create_usage_records_inner`] and records the
+    /// The live batch route: runs `create_usage_records_instrumented` with
+    /// [`RecordOrigin::Live`], which enforces the
+    /// `1..=`[`MAX_BATCH_RECORDS`] structural cap (rejected before the
+    /// pipeline and NOT recorded on either ingestion instrument, per
+    /// §3.11.5's closed vocabulary), observes `uc_ingestion_batch_size`,
+    /// delegates to [`Self::create_usage_records_inner`], and records the
     /// completion telemetry: one `uc_ingestion_records_total` per per-record
     /// outcome, one `uc_ingestion_requests_total` (`accepted` / `partial` /
-    /// `rejected`), and `uc_ingestion_duration_seconds`.
+    /// `rejected`), and `uc_ingestion_duration_seconds` — the first and last
+    /// of those carrying `origin="live"`.
     ///
     /// # Errors
     ///
@@ -1063,6 +1068,28 @@ impl Service {
         &self,
         ctx: &SecurityContext,
         records: Vec<CreateUsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError> {
+        // `Live` comes from the route this wrapper *is*, not from a default.
+        self.create_usage_records_instrumented(ctx, records, RecordOrigin::Live)
+            .await
+    }
+
+    /// The batch ingestion body, parameterized by the path that admitted the
+    /// submission.
+    ///
+    /// DESIGN §3.2 makes the backfill path "the same component under
+    /// workload isolation: identical validation ... and `origin =
+    /// backfill`", and §3.3 gives `backfill_usage_records` the same
+    /// signature as [`Self::create_usage_records`]. `origin` is therefore
+    /// the whole difference between the two batch entry points, and they
+    /// share this body rather than each carrying a copy of the completion
+    /// telemetry — a second copy is how the two paths' counters drift apart
+    /// the first time one of them is edited.
+    async fn create_usage_records_instrumented(
+        &self,
+        ctx: &SecurityContext,
+        records: Vec<CreateUsageRecord>,
+        origin: RecordOrigin,
     ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError> {
         let start = std::time::Instant::now();
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-cap-check
@@ -1087,12 +1114,7 @@ impl Service {
         // into the inner pipeline (the per-entry counter needs it after).
         let entry_types: Vec<EntryType> = records.iter().map(entry_type_of).collect();
 
-        // `Live` comes from the route this wrapper *is*, not from a
-        // default: the backfill route stamps `Backfill` through the same
-        // inner path.
-        let result = self
-            .create_usage_records_inner(ctx, records, RecordOrigin::Live)
-            .await;
+        let result = self.create_usage_records_inner(ctx, records, origin).await;
         let seconds = start.elapsed().as_secs_f64();
 
         match &result {
@@ -1105,8 +1127,12 @@ impl Service {
                         Ok(_) => (RecordOutcome::Accepted, RecordErrorCategory::None),
                         Err(e) => (RecordOutcome::Rejected, classify_record_error(e)),
                     };
-                    self.metrics
-                        .record_ingestion_record(outcome, entry_type, error_category);
+                    self.metrics.record_ingestion_record(
+                        outcome,
+                        entry_type,
+                        origin,
+                        error_category,
+                    );
                 }
                 // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-records-counter
                 // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-request-completion-metrics
@@ -1127,7 +1153,7 @@ impl Service {
                 );
             }
         }
-        self.metrics.observe_ingestion_duration(seconds);
+        self.metrics.observe_ingestion_duration(seconds, origin);
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-request-completion-metrics
         result
     }

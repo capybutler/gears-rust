@@ -15,7 +15,7 @@ use crate::domain::ports::metrics::{
     RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics,
 };
 use crate::infra::metrics::{UcMetricsMeter, build_default_adapter};
-use usage_collector_sdk::EntryType;
+use usage_collector_sdk::{EntryType, RecordOrigin};
 
 const TEST_PREFIX: &str = "uc";
 
@@ -107,6 +107,34 @@ fn histogram_count(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
                 {
                     return h
                         .data_points()
+                        .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
+                        .sum();
+                }
+            }
+        }
+    }
+    0
+}
+
+fn histogram_count_with_label(
+    exporter: &InMemoryMetricExporter,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> u64 {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for metric in sm.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::F64(MetricData::Histogram(h)) = metric.data()
+                {
+                    return h
+                        .data_points()
+                        .filter(|dp| {
+                            dp.attributes()
+                                .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                        })
                         .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
                         .sum();
                 }
@@ -298,16 +326,18 @@ fn ingestion_instruments_render_names_labels_and_buckets() {
     let m = meter(&provider, TEST_PREFIX);
 
     m.observe_ingestion_batch_size(20);
-    m.observe_ingestion_duration(0.05);
+    m.observe_ingestion_duration(0.05, RecordOrigin::Live);
     m.observe_record_metadata_bytes(1500);
     m.record_ingestion_record(
         RecordOutcome::Accepted,
         EntryType::Invalidation,
+        RecordOrigin::Backfill,
         RecordErrorCategory::None,
     );
     m.record_ingestion_record(
         RecordOutcome::Rejected,
         EntryType::Record,
+        RecordOrigin::Live,
         RecordErrorCategory::MetadataSize,
     );
     m.record_ingestion_request(
@@ -353,12 +383,104 @@ fn ingestion_instruments_render_names_labels_and_buckets() {
         ),
         1,
     );
+    // The two counter calls were given different origins, so a label pinned
+    // to a constant rather than read from the argument fails one of these.
+    assert_eq!(
+        counter_sum_with_label(&exporter, "uc_ingestion_records_total", "origin", "live"),
+        1,
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "origin",
+            "backfill"
+        ),
+        1,
+    );
     assert_eq!(
         counter_sum_with_label(
             &exporter,
             "uc_ingestion_requests_total",
             "outcome",
             "partial"
+        ),
+        1,
+    );
+}
+
+#[test]
+fn the_ingestion_instruments_separate_live_from_backfilled_entries() {
+    // DESIGN §3.11.5 puts `origin` on both ingestion families. The counter
+    // carries the throughput NFR, and the backfill share is one of the
+    // things it exists to make legible. The histogram carries the latency
+    // budget, and a bulk import's latency profile is not the live path's —
+    // averaging them together is what would hide a catch-up job degrading
+    // live ingestion.
+    let (provider, exporter) = local_provider();
+    let m = meter(&provider, TEST_PREFIX);
+
+    m.record_ingestion_record(
+        RecordOutcome::Accepted,
+        EntryType::Record,
+        RecordOrigin::Live,
+        RecordErrorCategory::None,
+    );
+    m.record_ingestion_record(
+        RecordOutcome::Accepted,
+        EntryType::Invalidation,
+        RecordOrigin::Backfill,
+        RecordErrorCategory::None,
+    );
+    m.observe_ingestion_duration(0.05, RecordOrigin::Live);
+    m.observe_ingestion_duration(0.4, RecordOrigin::Backfill);
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_sum_with_label(&exporter, "uc_ingestion_records_total", "origin", "live"),
+        1,
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "origin",
+            "backfill"
+        ),
+        1,
+    );
+
+    // A withdrawal of closed history is the entry that carries both new
+    // label values at once, and it is the ordinary case rather than an
+    // exotic one: the covered-period bounds belong to the path, so a
+    // correction of a closed period travels the backfill route.
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "entry_type",
+            "invalidation",
+        ),
+        1,
+    );
+
+    // The histogram was label-free before this slice, so both observations
+    // used to land in one series; they are now two. The total alone cannot
+    // tell those apart, so assert the per-origin split as well.
+    assert_eq!(
+        histogram_count(&exporter, "uc_ingestion_duration_seconds"),
+        2
+    );
+    assert_eq!(
+        histogram_count_with_label(&exporter, "uc_ingestion_duration_seconds", "origin", "live"),
+        1,
+    );
+    assert_eq!(
+        histogram_count_with_label(
+            &exporter,
+            "uc_ingestion_duration_seconds",
+            "origin",
+            "backfill",
         ),
         1,
     );
