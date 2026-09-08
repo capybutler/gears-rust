@@ -24,7 +24,7 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    IdempotencyKey, MeterTypeId, ResourceRef, SubjectRef, UsageRecord, UsageRecordStatus,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, ResourceRef, SubjectRef, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -56,8 +56,7 @@ fn record_with(subject: Option<SubjectRef>) -> UsageRecord {
         metadata: BTreeMap::new(),
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-eq").expect("valid idempotency key"),
-        corrects_id: None,
-        status: UsageRecordStatus::Active,
+        invalidation: None,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
@@ -151,7 +150,7 @@ async fn key_and_record_compose_byte_identical_pdp_requests_with_full_subject() 
 /// Two records that hash-equal under `AttributionTupleKey` MUST always
 /// produce equal PDP requests -- even when their *non*-tuple fields
 /// (`id`, `gts_type_id`, `value`, `idempotency_key`, `metadata`,
-/// `corrects_id`, and both covered-period bounds) differ wildly. This pins
+/// `invalidation`, and both covered-period bounds) differ wildly. This pins
 /// the projection-correctness premise of the dedup directly: "share the
 /// tuple => share the PDP payload".
 ///
@@ -170,8 +169,7 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         metadata: BTreeMap::new(),
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-A").expect("valid idempotency key"),
-        corrects_id: None,
-        status: UsageRecordStatus::Active,
+        invalidation: None,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     };
@@ -186,8 +184,13 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         metadata: BTreeMap::new(),
         value: Decimal::from(-999),
         idempotency_key: IdempotencyKey::new("idem-B-different").expect("valid idempotency key"),
-        corrects_id: Some(Uuid::from_u128(0xCCCC)),
-        status: UsageRecordStatus::Active,
+        // The one axis that used to be two fields: record B is a withdrawal
+        // and record A a measurement, and the tuple key must still collapse
+        // them onto one PDP decision.
+        invalidation: Some(Invalidation {
+            target: Uuid::from_u128(0xCCCC),
+            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+        }),
         window_start: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
         window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(72),
     };

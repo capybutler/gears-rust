@@ -24,6 +24,7 @@
 //! as metric labels; they belong in structured logs and traces.
 
 use toolkit_macros::domain_model;
+use usage_collector_sdk::EntryType;
 
 /// Label key constants shared by the instrument families below.
 pub mod key {
@@ -37,8 +38,8 @@ pub mod key {
     pub const ERROR_CATEGORY: &str = "error_category";
     /// `outcome` — request/record completion outcome.
     pub const OUTCOME: &str = "outcome";
-    /// `record_kind` — usage vs compensation record.
-    pub const RECORD_KIND: &str = "record_kind";
+    /// `entry_type` — measurement vs withdrawal.
+    pub const ENTRY_TYPE: &str = "entry_type";
     /// `query_kind` — aggregated vs raw query.
     pub const QUERY_KIND: &str = "query_kind";
     /// `result` — Type Resolver call outcome.
@@ -293,26 +294,14 @@ impl RecordOutcome {
     }
 }
 
-/// `record_kind` label for `uc_ingestion_records_total`.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordKind {
-    /// Ordinary usage record (`corrects_id` unset).
-    Usage,
-    /// Compensation record (`corrects_id` set).
-    Compensation,
-}
-
-impl RecordKind {
-    /// The bounded `record_kind` label value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Usage => "usage",
-            Self::Compensation => "compensation",
-        }
-    }
-}
+// The `entry_type` label for `uc_ingestion_records_total` is
+// [`usage_collector_sdk::EntryType`] itself, not a second enum declared here.
+// The two would be the same closed pair spelled twice, and the label value a
+// dashboard groups by has to be the value the wire and the `$filter` surface
+// carry — one vocabulary, one spelling, and `EntryType::as_str` is already
+// the function that produces it. Nothing about that type is
+// infrastructure-shaped, so importing it costs the port no layer violation:
+// the domain already depends on the SDK for every shape it names.
 
 /// `error_category` label for `uc_ingestion_records_total` (per-record).
 #[domain_model]
@@ -325,8 +314,32 @@ pub enum RecordErrorCategory {
     /// The referenced `gts_type_id` does not resolve to a usable declaration
     /// (the Type Resolver's `DeclarationNotFound`).
     UnknownUsageType,
-    /// Counter/gauge semantics violation or an L1 `corrects_id` referential fault.
+    /// A submission rejected against its meter's declaration or the shape
+    /// rules of the ingest path — a covered period the identity derivation
+    /// refuses, and the metadata-adjacent validation reasons that are not
+    /// the closed-shape or size-cap pair below.
+    ///
+    /// It also carries **one** invalidation rule, which
+    /// [`Self::InvalidationRule`] therefore does not: an `invalidates` that
+    /// resolves to nothing. That rejection is a `NotFound`, which carries
+    /// no typed reason, so nothing but `detail` prose separates it from an
+    /// entry id that resolves to nothing — and a plugin's own
+    /// `UsageRecordNotFound` reaches the same arm. See
+    /// `crate::domain::service`'s `classify_record_error`.
     SemanticsViolation,
+    /// An invalidation rejected against the entry it withdraws. DESIGN
+    /// §3.11.5 gives it "the copy, reference and at-most-one rules alone";
+    /// this carries the copy and at-most-one rules whole, and the
+    /// **typed half** of the reference rule — a target that is itself an
+    /// invalidation, and a half-shaped reference from the REST fold point.
+    /// The untyped half, a reference resolving to nothing, is on
+    /// [`Self::SemanticsViolation`] for the reason stated there, so this
+    /// series under-counts the reference rule by exactly that condition.
+    ///
+    /// A period-bound rejection is not an invalidation rule for either
+    /// entry type, because the bound belongs to the path rather than to the
+    /// withdrawal.
+    InvalidationRule,
     /// Metadata size-cap or closed-shape rejection (the sole metadata category).
     MetadataSize,
     /// Same-key canonical-field mismatch.
@@ -344,6 +357,7 @@ impl RecordErrorCategory {
             Self::Authz => "authz",
             Self::UnknownUsageType => "unknown_usage_type",
             Self::SemanticsViolation => "semantics_violation",
+            Self::InvalidationRule => "invalidation_rule",
             Self::MetadataSize => "metadata_size",
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::PluginError => "plugin_error",
@@ -553,12 +567,17 @@ pub trait UsageCollectorMetrics: Send + Sync {
     /// carries metadata (recorded before the size-cap comparison).
     fn observe_record_metadata_bytes(&self, bytes: u64);
 
-    /// Increment `uc_ingestion_records_total{outcome, record_kind, error_category}`
-    /// once per record in a batch acknowledgement (and once for a single emit).
+    /// Increment `uc_ingestion_records_total{outcome, entry_type, error_category}`
+    /// once per entry in a batch acknowledgement (and once for a single emit).
+    ///
+    /// `entry_type` carries the correction share, which is what makes a
+    /// withdrawal visible in the ingestion profile at all. §3.11.5 names an
+    /// `origin` label on this family too; the gear has no `RecordOrigin` to
+    /// populate it from, so the series is emitted without it.
     fn record_ingestion_record(
         &self,
         outcome: RecordOutcome,
-        kind: RecordKind,
+        entry_type: EntryType,
         error_category: RecordErrorCategory,
     );
 
@@ -621,7 +640,7 @@ impl UsageCollectorMetrics for NoopMetrics {
     fn observe_ingestion_batch_size(&self, _: u64) {}
     fn observe_ingestion_duration(&self, _: f64) {}
     fn observe_record_metadata_bytes(&self, _: u64) {}
-    fn record_ingestion_record(&self, _: RecordOutcome, _: RecordKind, _: RecordErrorCategory) {}
+    fn record_ingestion_record(&self, _: RecordOutcome, _: EntryType, _: RecordErrorCategory) {}
     fn record_ingestion_request(&self, _: IngestRequestOutcome, _: IngestRequestErrorCategory) {}
     fn query_inflight_inc(&self, _: QueryKind) {}
     fn query_inflight_dec(&self, _: QueryKind) {}

@@ -1053,6 +1053,11 @@ pub type RecordedOrder = Vec<(String, toolkit_odata::SortDir)>;
 /// type stay readable.
 pub type CreateRecordsBatchResult = Vec<Result<UsageRecord, UsageCollectorPluginError>>;
 
+/// A programmed `Transient` held as its `(detail, retry_after_seconds)`
+/// parts, because [`UsageCollectorPluginError`] is not `Clone` and a
+/// deduped fan-out may surface the same fault more than once.
+pub type ProgrammedTransient = (String, Option<u64>);
+
 /// Programmable plugin stub that returns the configured response for each
 /// SPI method, defaulting to `UsageCollectorPluginError::internal("not
 /// programmed")` for methods the test has not explicitly set up. Methods
@@ -1065,6 +1070,13 @@ pub struct HappyPathPlugin {
     create_record_response: Mutex<Option<Result<UsageRecord, UsageCollectorPluginError>>>,
     create_records_response: Mutex<Option<CreateRecordsBatchResult>>,
     get_record_response: Mutex<Option<UsageRecord>>,
+    /// Per-id `get_usage_record` rows, consulted before
+    /// `get_record_response`. A batch resolving several distinct
+    /// invalidation targets needs the plugin to answer differently per id:
+    /// with one shared row, a fan-out that looked a target up under a
+    /// *different* entry's reference would return the same row and every
+    /// assertion would still pass.
+    get_record_by_id: Mutex<std::collections::BTreeMap<Uuid, UsageRecord>>,
     list_usage_records_response: Mutex<Option<ODataPage<UsageRecord>>>,
     query_aggregated_usage_records_response: Mutex<Option<AggregationResult>>,
     /// Every [`AggregationFold`] passed to `query_aggregated_usage_records`,
@@ -1076,12 +1088,22 @@ pub struct HappyPathPlugin {
     create_record_input: Mutex<Option<UsageRecord>>,
     create_records_input: Mutex<Option<Vec<UsageRecord>>>,
     /// Every record `id` ever passed to `get_usage_record`, in call
-    /// order. Drives the L1-corrects-id dedup tests.
+    /// order. Drives the invalidation-target dedup tests.
     get_usage_record_inputs: Mutex<Vec<Uuid>>,
     /// Record `id`s that should surface as
     /// `UsageCollectorPluginError::UsageRecordNotFound` instead of
     /// returning the default `get_record_response`.
     get_usage_record_not_found: Mutex<std::collections::BTreeSet<Uuid>>,
+    /// A retryable backend fault every `get_usage_record` call surfaces
+    /// instead of a row. Distinct from the not-found set: a target that
+    /// cannot be read is not a target that is absent, and the two must not
+    /// reach the caller as the same answer.
+    get_usage_record_transient: Mutex<Option<ProgrammedTransient>>,
+    /// The same fault scoped to one id. A batch mixing one unreadable
+    /// target with one readable one is the only shape that shows a
+    /// transient on one entry not abandoning the others, and the blanket
+    /// knob above cannot express it.
+    get_usage_record_transient_by_id: Mutex<std::collections::BTreeMap<Uuid, ProgrammedTransient>>,
     /// `Debug` rendering of the most-recent `scope` passed to
     /// `get_usage_record`, so a test can assert the plugin actually
     /// received a compiled PDP scope (Task 13 / DESIGN §3.3) rather than
@@ -1121,6 +1143,7 @@ impl HappyPathPlugin {
             create_record_response: Mutex::new(None),
             create_records_response: Mutex::new(None),
             get_record_response: Mutex::new(None),
+            get_record_by_id: Mutex::new(std::collections::BTreeMap::new()),
             list_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_folds: Mutex::new(Vec::new()),
@@ -1128,6 +1151,8 @@ impl HappyPathPlugin {
             create_records_input: Mutex::new(None),
             get_usage_record_inputs: Mutex::new(Vec::new()),
             get_usage_record_not_found: Mutex::new(std::collections::BTreeSet::new()),
+            get_usage_record_transient: Mutex::new(None),
+            get_usage_record_transient_by_id: Mutex::new(std::collections::BTreeMap::new()),
             last_get_scope: Mutex::new(None),
             list_time_range: Mutex::new(None),
             aggregate_time_range: Mutex::new(None),
@@ -1152,6 +1177,16 @@ impl HappyPathPlugin {
     pub fn set_get_record(&self, record: UsageRecord) {
         *self.get_record_response.lock().expect("mutex") = Some(record);
     }
+    /// Program `get_usage_record(id, _)` to answer with `record`, ahead of
+    /// whatever [`Self::set_get_record`] set. Lets one batch resolve
+    /// several distinct targets to *different* rows, which is what makes a
+    /// mis-keyed lookup observable at all.
+    pub fn set_get_record_for(&self, id: Uuid, record: UsageRecord) {
+        self.get_record_by_id
+            .lock()
+            .expect("mutex")
+            .insert(id, record);
+    }
     /// Mark `id` so the next (and every subsequent) `get_usage_record`
     /// call carrying it returns `UsageRecordNotFound` regardless of the
     /// default `get_record_response`.
@@ -1160,6 +1195,35 @@ impl HappyPathPlugin {
             .lock()
             .expect("mutex")
             .insert(id);
+    }
+    /// Program every subsequent `get_usage_record` call to fail as
+    /// `Transient`, whatever the id. Drives a backend fault on the
+    /// invalidation-target read, which must fail the submission rather
+    /// than reject it.
+    ///
+    /// **Takes precedence over [`Self::set_get_usage_record_not_found`]**
+    /// and over the per-id rows, so a test that sets both silently gets the
+    /// transient. Deliberate — a store that cannot answer cannot report
+    /// absence either — but a test relying on the not-found set must not
+    /// also set this.
+    pub fn set_get_usage_record_transient(&self, detail: &str, retry_after_seconds: Option<u64>) {
+        *self.get_usage_record_transient.lock().expect("mutex") =
+            Some((detail.to_owned(), retry_after_seconds));
+    }
+    /// The same fault for one id only, mirroring
+    /// [`Self::set_get_usage_record_not_found`]'s shape. Consulted after the
+    /// blanket knob above and before both the per-id rows and the not-found
+    /// set.
+    pub fn set_get_usage_record_transient_for(
+        &self,
+        id: Uuid,
+        detail: &str,
+        retry_after_seconds: Option<u64>,
+    ) {
+        self.get_usage_record_transient_by_id
+            .lock()
+            .expect("mutex")
+            .insert(id, (detail.to_owned(), retry_after_seconds));
     }
     /// Every record `id` passed to `get_usage_record`, in call order.
     #[must_use]
@@ -1332,6 +1396,29 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         self.get_usage_record_inputs.lock().expect("mutex").push(id);
         *self.last_get_scope.lock().expect("mutex") = Some(format!("{scope:?}"));
+        if let Some((detail, retry_after_seconds)) = self
+            .get_usage_record_transient
+            .lock()
+            .expect("mutex")
+            .clone()
+        {
+            return Err(UsageCollectorPluginError::transient_with_retry(
+                detail,
+                retry_after_seconds,
+            ));
+        }
+        if let Some((detail, retry_after_seconds)) = self
+            .get_usage_record_transient_by_id
+            .lock()
+            .expect("mutex")
+            .get(&id)
+            .cloned()
+        {
+            return Err(UsageCollectorPluginError::transient_with_retry(
+                detail,
+                retry_after_seconds,
+            ));
+        }
         if self
             .get_usage_record_not_found
             .lock()
@@ -1339,6 +1426,9 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
             .contains(&id)
         {
             return Err(UsageCollectorPluginError::UsageRecordNotFound { id });
+        }
+        if let Some(row) = self.get_record_by_id.lock().expect("mutex").get(&id) {
+            return Ok(row.clone());
         }
         self.get_record_response
             .lock()

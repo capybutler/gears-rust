@@ -28,19 +28,20 @@ use toolkit_security::SecurityContext;
 use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
 use usage_collector_sdk::{
-    AggregationDimension, AggregationResult, ConflictReason, CreateUsageRecord,
-    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, TimeRange, UsageCollectorError,
-    UsageCollectorPluginError, UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord,
-    ValidationReason,
+    AggregationDimension, AggregationResult, ConflictReason, CreateUsageRecord, EntryType,
+    Invalidation, MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, TimeRange,
+    UsageCollectorError, UsageCollectorPluginError, UsageCollectorPluginSpecV1,
+    UsageCollectorPluginV1, UsageRecord, ValidationReason,
 };
 use uuid::Uuid;
 
 use crate::domain::authz::{self, AttributionTupleKey, usage_record};
+use crate::domain::invalidation::verify_invalidation_target;
 use crate::domain::ports::declarations::UnavailableDeclarationSource;
 use crate::domain::ports::metrics::{
     IngestRequestErrorCategory, IngestRequestOutcome, NoopMetrics, PdpOp, PluginErrorCategory,
-    PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory, RecordKind, RecordOutcome,
-    RequestOutcome, UsageCollectorMetrics,
+    PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory, RecordOutcome, RequestOutcome,
+    UsageCollectorMetrics,
 };
 use crate::domain::query::{
     admit_continuation, compose_query_with_scope, establish_keyset_order, read_fingerprint,
@@ -48,10 +49,7 @@ use crate::domain::query::{
     require_metadata_filter_keys_declared,
 };
 use crate::domain::type_resolver::{ResolvedDeclaration, TypeResolver, TypeResolverConfig};
-use crate::domain::validation::{
-    DEFAULT_METADATA_SIZE_CAP_BYTES, SemanticsOutcome, validate_record_semantics,
-    validate_submit_record_metadata, verify_l1_corrects_id,
-};
+use crate::domain::validation::{DEFAULT_METADATA_SIZE_CAP_BYTES, validate_submit_record_metadata};
 
 use super::error::DomainError;
 
@@ -77,21 +75,31 @@ const PDP_CONCURRENCY: usize = 8;
 /// [`TypeResolver::resolve`] (itself single-flighted per key, and normally
 /// served from cache — see [`crate::domain::type_resolver`]) for the
 /// type-resolution pre-pass; sized identically to [`PDP_CONCURRENCY`] (the
-/// two fan-outs run sequentially, not concurrently, so the effective
-/// in-flight ceiling stays at 8). Replaces the pre-Task-9
+/// three request-local fan-outs — this one, PDP above and the
+/// invalidation-target one below — run sequentially, not concurrently, so
+/// the effective in-flight ceiling stays at 8). Replaces the pre-Task-9
 /// `CATALOG_FANOUT_CONCURRENCY`, which bounded the plugin-side
 /// `get_usage_type` catalog fan-out this pre-pass supersedes.
 const TYPE_RESOLUTION_FANOUT_CONCURRENCY: usize = 8;
 
-/// Concurrency cap for the per-distinct-`corrects_id` `get_usage_record`
-/// L1 lookup fan-out in `create_usage_records`. Bounds plugin-side
-/// pressure for the compensation referential-check pre-pass; same value
-/// as [`TYPE_RESOLUTION_FANOUT_CONCURRENCY`] because that pre-pass and this
-/// one both contend for the platform's external-call posture even though
-/// the type-resolution pre-pass no longer shares a plugin handle with this
-/// one. Bounds the `inst-algo-semantics-l1-bounded-fanout` step of
+/// Concurrency cap for the per-distinct-target `get_usage_record` fan-out
+/// that resolves a batch's invalidation references in
+/// `create_usage_records`. Bounds plugin-side pressure for the
+/// target pre-check, and is 8 for the platform's established external-call
+/// posture — the same reason the two pre-passes above are 8, restated
+/// rather than delegated, so the value survives either of them changing.
+/// The three run sequentially, so the effective in-flight ceiling stays at
+/// 8. Bounds the `inst-algo-semantics-l1-bounded-fanout` step of
 /// `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`.
-const L1_LOOKUP_FANOUT_CONCURRENCY: usize = 8;
+///
+/// **A deliberate default, not a pinned one.** No test constrains the
+/// number: raising it to `usize::MAX` changes no observable outcome, only
+/// how much of the batch is in flight at once. Pinning it would take a
+/// test that observes concurrency — overlapping SPI calls against a clock
+/// or a barrier — and a timing-dependent test bought to protect a tuning
+/// constant is a flake trade this gear is not making. The same is true of
+/// the two caps above.
+const TARGET_LOOKUP_FANOUT_CONCURRENCY: usize = 8;
 
 /// One PDP fan-out outcome: the input indices that share an attribution
 /// tuple plus the `Result<(), DomainError>` returned for that tuple's
@@ -105,18 +113,42 @@ type PdpGroupDecision = (Vec<usize>, Result<(), DomainError>);
 /// plugin-owned catalog row per `gts_id` instead of a resolved declaration.
 type DeclarationCache = HashMap<MeterTypeId, Result<Arc<ResolvedDeclaration>, DomainError>>;
 
-/// Cached L1 referential lookup per distinct `corrects_id`, lifted into
+/// Cached target lookup per distinct `invalidates`, lifted into
 /// [`DomainError`] so the variant identity of
 /// `UsageRecordNotFound { id }` survives the cache (and is reclassified
 /// to `UsageCollectorError::NotFound` on the per-record
-/// projection — same lift that the in-loop code path used).
-type L1LookupCache = HashMap<Uuid, Result<UsageRecord, DomainError>>;
+/// projection — same lift that the in-loop code path uses).
+type InvalidationTargetCache = HashMap<Uuid, Result<UsageRecord, DomainError>>;
 
-/// A per-record validation outcome deferred to the post-loop L1 pre-pass:
-/// `(input_index, the record itself, the corrects_id to fetch)`. Records
-/// only end up here when they passed PDP, the declaration resolution
-/// pre-pass, AND semantics validation reported `NeedsL1Lookup`.
-type PendingL1Lookup = (usize, UsageRecord, Uuid);
+/// One entry whose target check was deferred to the post-loop pre-pass.
+/// Entries reach it only after passing PDP and the declaration-resolution
+/// pre-pass, and only when they carry an `invalidates` reference.
+///
+/// A named struct rather than a tuple, and that is a correctness choice
+/// rather than a stylistic one: two of its four members are record-shaped
+/// and two are the pairing itself (the input index the outcome is projected
+/// back to, and the reference the fan-out is keyed by). A positional shape
+/// with two record-shaped elements is exactly where an alignment slip
+/// hides, and a slip in either direction rejects the wrong submission with
+/// someone else's identifier.
+struct PendingInvalidationTarget {
+    /// Input index of the submission, and the only slot in `results` this
+    /// entry's outcome may be projected into.
+    index: usize,
+    /// The submission as the caller sent it. The faithful-copy comparator
+    /// runs against this rather than against `record`: the submission has
+    /// no identity yet, which is the honest reason `id` is not compared,
+    /// and destructuring the *submission* shape is what makes a field added
+    /// to [`CreateUsageRecord`] alone a compile error there. Kept because
+    /// `CreateUsageRecord::try_into_usage_record` consumes it.
+    submission: CreateUsageRecord,
+    /// The withdrawal `submission` carries, unwrapped once here so the
+    /// verification cannot be reached for an entry that has none. Its
+    /// `target` is the fan-out key and the identifier both rejections echo.
+    invalidation: Invalidation,
+    /// The projected entry, dispatched to the plugin once verified.
+    record: UsageRecord,
+}
 
 /// Log a host-invariant breach (cache miss, SPI size mismatch, unfilled
 /// result slot) and build the typed `Internal` returned for it, so each
@@ -215,14 +247,21 @@ impl Drop for QueryInflightGuard<'_> {
     }
 }
 
-/// `record_kind` label for a submitted record: `compensation` iff it carries
-/// a `corrects_id`, else `usage`.
+/// `entry_type` label for a submitted entry: `invalidation` iff it names the
+/// entry it withdraws, else `record`.
+///
+/// Reads the submission's own reference for the same reason the domain does
+/// — there is no submitted discriminator that could disagree with it, and
+/// the sign of a quantity carries no structural meaning
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`). The label type
+/// is [`EntryType`] itself, so the value a dashboard groups by is the value
+/// the wire carries.
 // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p2:inst-compensation-record-kind-label
-fn record_kind_of(record: &CreateUsageRecord) -> RecordKind {
-    if record.corrects_id.is_some() {
-        RecordKind::Compensation
+fn entry_type_of(record: &CreateUsageRecord) -> EntryType {
+    if record.invalidation.is_some() {
+        EntryType::Invalidation
     } else {
-        RecordKind::Usage
+        EntryType::Record
     }
 }
 // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p2:inst-compensation-record-kind-label
@@ -250,13 +289,22 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
     match err {
         UsageCollectorError::PermissionDenied { .. } => RecordErrorCategory::Authz,
         // An unresolved `gts_type_id` (the Type Resolver's `DeclarationNotFound`)
-        // vs a `corrects_id` referencing a missing record are both wire-tagged
+        // vs an `invalidates` naming a missing entry are both wire-tagged
         // `resource_type: USAGE_RECORD_RESOURCE` now that types-registry owns
         // the catalog — `resource_type` can no longer tell them apart. `name`
         // still can: a resolved meter's `gts_type_id` never parses as a `Uuid`
-        // and a record's `id` / `corrects_id` always does, so that is the
-        // discriminator here. The L1 referential family stays with
-        // semantics_violation, not folded into unknown_usage_type.
+        // and an entry id always does, so that is the discriminator here.
+        //
+        // The uuid-named arm stays on semantics_violation and does NOT join
+        // the invalidation family, even though an unresolvable `invalidates`
+        // is the ADR's valid-reference rule. `NotFound` carries no typed
+        // reason (that is the variant's shape, not an omission), so the only
+        // thing separating it from `usage_record_not_found` is prose in
+        // `detail` — and classifying a metric label off a message string is
+        // how a label silently stops matching when the message is reworded.
+        // §3.11.5's `invalidation_rule` therefore under-counts by exactly
+        // this condition; the divergence is recorded rather than paid for
+        // with a fragile discriminator.
         UsageCollectorError::NotFound { name, .. } if Uuid::parse_str(name).is_err() => {
             RecordErrorCategory::UnknownUsageType
         }
@@ -265,10 +313,19 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
             ValidationReason::UnknownMetadataKey | ValidationReason::MetadataValidation => {
                 RecordErrorCategory::MetadataSize
             }
+            // The copy rule, and the reference rule at the one boundary that
+            // types it — DESIGN §3.11.5 gives them a category of their own so
+            // a correction backlog is legible without reading `detail`.
+            ValidationReason::InvalidationReferenceIncomplete
+            | ValidationReason::InvalidationTargetNotRecord
+            | ValidationReason::InvalidationFieldMismatch => RecordErrorCategory::InvalidationRule,
             _ => RecordErrorCategory::SemanticsViolation,
         },
         UsageCollectorError::Conflict { reason, .. } => match reason {
             ConflictReason::IdempotencyConflict => RecordErrorCategory::IdempotencyConflict,
+            // At-most-one-invalidation, the store's own rule, lifted from the
+            // plugin. Same family as the gateway's two.
+            ConflictReason::AlreadyInvalidated => RecordErrorCategory::InvalidationRule,
             _ => RecordErrorCategory::SemanticsViolation,
         },
         _ => RecordErrorCategory::PluginError,
@@ -399,13 +456,18 @@ fn report_unbound_next_cursor<T>(page: &ODataPage<T>, dispatched: Option<&str>) 
 /// this module use the same SPI method for a system-internal lookup that
 /// predates (and is out of scope for) that guarantee, and whose own
 /// authorization already happens elsewhere. Both are the same
-/// `corrects_id` L1 referential check — a same-request existence / shape
-/// check on the record being corrected, run *after* the submitted
-/// record's own PDP authorization already succeeded, so not a
-/// caller-scoped read of a chosen row — reached once per path:
+/// invalidation-target pre-check — a same-request existence / shape check
+/// on the entry a submission proposes to withdraw, run *after* the
+/// submitting caller's own PDP authorization already succeeded, so not a
+/// caller-scoped read of a chosen row — one call site per path:
 ///
-/// * [`resolve_l1_lookups`], for the batch create path.
+/// * [`resolve_invalidation_targets`], for the batch create path.
 /// * [`Service::create_usage_record_inner`], for the single-record one.
+///
+/// Because the row comes back unscoped, nothing derived from it may reach
+/// the caller. [`verify_invalidation_target`] is written to that rule: its
+/// rejections name the caller's own reference and the field that differs,
+/// never the target's identity or any of its values.
 ///
 /// Passing `true` at both asks the plugin for exactly the "no SPI-level
 /// narrowing" behaviour they had before this SPI grew a `scope`
@@ -433,28 +495,59 @@ fn collapse_deny_to_not_found(
     }
 }
 
-/// Resolve every deferred L1 referential check from
+/// Resolve every deferred invalidation-target check from
 /// [`Service::create_usage_records`]'s validation loop.
 ///
-/// Builds a request-local `Map<corrects_id, Result<UsageRecord, _>>` via
-/// a bounded `get_usage_record` fan-out
-/// (`inst-algo-semantics-l1-dedup` / `inst-algo-semantics-l1-bounded-fanout`),
-/// then for every input index in `pending` runs
-/// [`verify_l1_corrects_id`] and the deferred metadata check, projecting
-/// the outcome into `results` (rejection) or `eligible` (verified).
+/// Builds a request-local `Map<target, Result<UsageRecord, _>>` via a
+/// bounded `get_usage_record` fan-out over the **distinct** targets — a
+/// batch withdrawing one entry twice costs one read, not two
+/// (`inst-algo-semantics-l1-dedup` /
+/// `inst-algo-semantics-l1-bounded-fanout`) — then, for every entry in
+/// `pending`, runs [`verify_invalidation_target`] and the deferred metadata
+/// check, projecting the outcome into `results` (rejection) or `eligible`
+/// (verified).
+///
+/// The metadata check stays behind the target check so a submission
+/// breaking both is told about the copy: the metadata it would be told to
+/// fix is metadata it has to copy from the target regardless.
+///
+/// **The pairing is this function's obligation, in both directions.**
+/// [`verify_invalidation_target`] takes the row it is handed and never
+/// re-checks that it is the row the entry named, so both directions are
+/// checked here.
+///
+/// Request-local: the fan-out key and the `results` slot are read off one
+/// destructured [`PendingInvalidationTarget`], so no entry is verified
+/// against a row fetched for a different entry, and no outcome lands on a
+/// different input index.
+///
+/// Store-side: the returned row's `id` must equal the id it was fetched
+/// for. That re-derives nothing the store owns — the gateway supplied the
+/// id — and it is the same class of check as the SPI result-count breach in
+/// [`Service::create_usage_records_inner`]. It has to be here rather than
+/// left to the SPI contract, because the failure is not confined to
+/// wording a rejection badly: a submission that happens to be a faithful
+/// copy of the *returned* row would be **accepted**, withdrawing an entry
+/// nothing ever checked.
+///
+/// At-most-one-invalidation is deliberately **not** checked here. Only the
+/// store can make that check atomic with the entry it admits; a
+/// gateway-side pre-read cannot exclude a concurrent second submission, so
+/// it would be a check that fails exactly when it matters
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`). The plugin's
+/// `AlreadyInvalidated` is lifted on dispatch instead.
 ///
 /// Extracted from the host body to keep `create_usage_records` under the
 /// cognitive-complexity cap without losing the explicit
-/// `semantics → L1 → metadata` error-priority ordering described in the
-/// algorithm.
+/// `target → metadata` error-priority ordering described in the algorithm.
 // @cpt-algo:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1
 // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-dedup
 // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-bounded-fanout
 // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-lookup
-async fn resolve_l1_lookups(
+async fn resolve_invalidation_targets(
     plugin: &dyn UsageCollectorPluginV1,
     metrics: &dyn UsageCollectorMetrics,
-    pending: Vec<PendingL1Lookup>,
+    pending: Vec<PendingInvalidationTarget>,
     declaration_cache: &DeclarationCache,
     metadata_size_cap_bytes: usize,
     results: &mut [Option<Result<UsageRecord, UsageCollectorError>>],
@@ -464,35 +557,46 @@ async fn resolve_l1_lookups(
         return;
     }
 
-    let distinct_ids: HashSet<Uuid> = pending.iter().map(|(_, _, id)| *id).collect();
+    let distinct_targets: HashSet<Uuid> = pending
+        .iter()
+        .map(|entry| entry.invalidation.target)
+        .collect();
 
-    let l1_cache: L1LookupCache =
-        stream::iter(distinct_ids.into_iter().map(|corrects_id| async move {
+    let target_cache: InvalidationTargetCache =
+        stream::iter(distinct_targets.into_iter().map(|target| async move {
             let outcome = instrument_spi(
                 metrics,
                 PluginOp::GetUsageRecord,
-                plugin.get_usage_record(corrects_id, &unrestricted_read_filter()),
+                plugin.get_usage_record(target, &unrestricted_read_filter()),
             )
             .await
             .map_err(DomainError::from);
-            (corrects_id, outcome)
+            (target, outcome)
         }))
-        .buffer_unordered(L1_LOOKUP_FANOUT_CONCURRENCY)
+        .buffer_unordered(TARGET_LOOKUP_FANOUT_CONCURRENCY)
         .collect()
         .await;
 
-    for (index, record, corrects_id) in pending {
+    for entry in pending {
+        let PendingInvalidationTarget {
+            index,
+            submission,
+            invalidation,
+            record,
+        } = entry;
+
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-not-found
-        // The L1 pre-pass populates the cache for every pending
-        // corrects_id, so a missing entry here is a host-invariant
-        // breach. Surface it as a typed `Internal` per-record error
-        // rather than `unreachable!()` — request paths must not panic
-        // on an invariant failure, matching the SPI-size-mismatch arm
-        // in `create_usage_records_inner`.
-        let referenced = match l1_cache.get(&corrects_id) {
-            Some(Ok(r)) => r,
+        // The pre-pass populates the cache for every pending target, so a
+        // missing entry here is a host-invariant breach. Surface it as a
+        // typed `Internal` per-record error rather than `unreachable!()` —
+        // request paths must not panic on an invariant failure, matching the
+        // SPI-size-mismatch arm in `create_usage_records_inner`.
+        let target = match target_cache.get(&invalidation.target) {
+            Some(Ok(row)) => row,
             Some(Err(DomainError::UsageRecordNotFound { .. })) => {
-                results[index] = Some(Err(UsageCollectorError::corrects_id_not_found(corrects_id)));
+                results[index] = Some(Err(UsageCollectorError::invalidation_target_not_found(
+                    invalidation.target,
+                )));
                 continue;
             }
             Some(Err(e)) => {
@@ -501,27 +605,43 @@ async fn resolve_l1_lookups(
             }
             None => {
                 results[index] = Some(Err(invariant_breach(format!(
-                    "L1 pre-pass cache miss for corrects_id {corrects_id}"
+                    "target pre-pass cache miss for invalidates {}",
+                    invalidation.target,
                 ))));
                 continue;
             }
         };
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-not-found
 
-        if let Err(e) = verify_l1_corrects_id(&record, corrects_id, referenced) {
+        // The store answered with a different entry than the one it was
+        // asked for. A host-invariant breach, not a caller fault: the id
+        // was the gateway's to supply and the SPI's to honour. The detail
+        // names only the id the caller sent — the row's own identity is
+        // exactly what must not cross back on an unscoped read.
+        if target.id != invalidation.target {
+            results[index] = Some(Err(invariant_breach(format!(
+                "storage plugin answered get_usage_record({}) with a different entry",
+                invalidation.target,
+            ))));
+            continue;
+        }
+
+        // The comparator is handed the submission, not `record`: the two
+        // carry the same caller-supplied fields, but only the submission
+        // shape makes a field added to it alone a compile error there.
+        if let Err(e) = verify_invalidation_target(&submission, &invalidation, target) {
             results[index] = Some(Err(e));
             continue;
         }
 
-        // Metadata check deferred behind L1 to preserve the
-        // `semantics → L1 → metadata` error-priority ordering the pre-A3
-        // in-loop code exposed. A missing declaration entry here is a
-        // host-invariant breach (the pre-pass covers every PDP-allowed
-        // record's gts_type_id); surface it as a typed `Internal` rather than
-        // panic the request thread.
+        // Metadata check deferred behind the target check to preserve the
+        // error-priority ordering the pre-A3 in-loop code exposed. A missing
+        // declaration entry here is a host-invariant breach (the pre-pass
+        // covers every PDP-allowed record's gts_type_id); surface it as a
+        // typed `Internal` rather than panic the request thread.
         let Some(Ok(declaration)) = declaration_cache.get(&record.gts_type_id) else {
             results[index] = Some(Err(invariant_breach(format!(
-                "declaration pre-pass cache miss for gts_type_id {} before L1 metadata check",
+                "declaration pre-pass cache miss for gts_type_id {} before the metadata check",
                 record.gts_type_id,
             ))));
             continue;
@@ -738,11 +858,21 @@ impl Service {
         // The service is the guaranteed choke point for every caller (REST +
         // in-process). The create surface is identity-free
         // (`CreateUsageRecord`); the entry acquires its deterministic
-        // dedup-identity-derived `id` and its initial `Active` status HERE,
-        // and only after its covered period has been validated —
+        // dedup-identity-derived `id` HERE, and only after its covered
+        // period has been validated —
         // `cpt-cf-usage-collector-adr-record-identity-derivation` requires
         // both period preconditions to be rejected before the derivation
         // runs.
+        //
+        // The projection consumes the submission, and the faithful-copy
+        // comparator runs against the submission rather than the projection
+        // — so an entry naming a target keeps what the caller sent. The
+        // clone is confined to that branch: an ordinary measurement, the
+        // common path, clones nothing.
+        let withdrawal = record
+            .invalidation
+            .as_ref()
+            .map(|invalidation| (record.clone(), invalidation.clone()));
         let record = record.try_into_usage_record()?;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-pdp-deny
@@ -784,31 +914,52 @@ impl Service {
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-invalid
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate-fail
-        if let SemanticsOutcome::NeedsL1Lookup { corrects_id } = validate_record_semantics(&record)
-        {
+        // `invalidates` is the whole decision: its presence is what makes
+        // the entry an invalidation, and there is no submitted
+        // discriminator that could disagree with it. An ordinary
+        // measurement costs no target read at all — asserting that absence
+        // is what stops the common path paying for the rare one.
+        if let Some((submission, invalidation)) = withdrawal {
             // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-lookup
-            let referenced = match instrument_spi(
+            let target = match instrument_spi(
                 self.metrics.as_ref(),
                 PluginOp::GetUsageRecord,
-                plugin.get_usage_record(corrects_id, &unrestricted_read_filter()),
+                plugin.get_usage_record(invalidation.target, &unrestricted_read_filter()),
             )
             .await
             {
                 Ok(row) => row,
                 // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-not-found
                 Err(UsageCollectorPluginError::UsageRecordNotFound { .. }) => {
-                    return Err(UsageCollectorError::corrects_id_not_found(corrects_id));
+                    return Err(UsageCollectorError::invalidation_target_not_found(
+                        invalidation.target,
+                    ));
                 }
                 // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-not-found
                 Err(e) => return Err(UsageCollectorError::from(DomainError::from(e))),
             };
             // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2:p1:inst-algo-semantics-l1-lookup
-            verify_l1_corrects_id(&record, corrects_id, &referenced)?;
+            // The store answered with a different entry than the one it was
+            // asked for — the same breach `resolve_invalidation_targets`
+            // rejects, and with even less excuse here: this path reads one
+            // id and gets one row back.
+            if target.id != invalidation.target {
+                return Err(invariant_breach(format!(
+                    "storage plugin answered get_usage_record({}) with a different entry",
+                    invalidation.target,
+                )));
+            }
+            verify_invalidation_target(&submission, &invalidation, &target)?;
         }
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate-fail
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-invalid
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-check
+
+        // The metadata check below stays after the target check above: a
+        // submission breaking both rules is told about the copy, because
+        // the metadata it would be told to fix is metadata it has to copy
+        // from the target regardless.
 
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-metadata-size-cap-enforcement:p1:inst-algo-metadata-observe-bytes
         observe_metadata_bytes(self.metrics.as_ref(), &record.metadata);
@@ -888,7 +1039,7 @@ impl Service {
         record: CreateUsageRecord,
     ) -> Result<UsageRecord, UsageCollectorError> {
         let start = std::time::Instant::now();
-        let record_kind = record_kind_of(&record);
+        let entry_type = entry_type_of(&record);
         let result = self.create_usage_record_inner(ctx, record).await;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-completion-metrics
         self.metrics
@@ -898,7 +1049,7 @@ impl Service {
             Err(e) => (RecordOutcome::Rejected, classify_record_error(e)),
         };
         self.metrics
-            .record_ingestion_record(outcome, record_kind, error_category);
+            .record_ingestion_record(outcome, entry_type, error_category);
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-completion-metrics
         result
     }
@@ -950,9 +1101,9 @@ impl Service {
             .observe_ingestion_batch_size(u64::try_from(actual).unwrap_or(u64::MAX));
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-observe-batch-size
 
-        // `record_kind` is captured per input index before `records` is moved
-        // into the inner pipeline (the per-record counter needs it after).
-        let record_kinds: Vec<RecordKind> = records.iter().map(record_kind_of).collect();
+        // `entry_type` is captured per input index before `records` is moved
+        // into the inner pipeline (the per-entry counter needs it after).
+        let entry_types: Vec<EntryType> = records.iter().map(entry_type_of).collect();
 
         let result = self.create_usage_records_inner(ctx, records).await;
         let seconds = start.elapsed().as_secs_f64();
@@ -960,13 +1111,15 @@ impl Service {
         match &result {
             Ok(per_record) => {
                 // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-records-counter
-                for (record_result, kind) in per_record.iter().zip(record_kinds.iter().copied()) {
+                for (record_result, entry_type) in
+                    per_record.iter().zip(entry_types.iter().copied())
+                {
                     let (outcome, error_category) = match record_result {
                         Ok(_) => (RecordOutcome::Accepted, RecordErrorCategory::None),
                         Err(e) => (RecordOutcome::Rejected, classify_record_error(e)),
                     };
                     self.metrics
-                        .record_ingestion_record(outcome, kind, error_category);
+                        .record_ingestion_record(outcome, entry_type, error_category);
                 }
                 // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-records-counter
                 // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-request-completion-metrics
@@ -1062,11 +1215,27 @@ impl Service {
         // further down.
         let mut pdp_allowed: Vec<bool> = vec![true; submission_count];
 
+        // The withdrawal each submission carries, kept per input index
+        // because `try_into_usage_record` consumes the submission the
+        // faithful-copy comparator runs against. `Some` exactly when the
+        // entry is an invalidation.
+        //
+        // What this buys is that the trigger is read off the **submission**
+        // rather than off the projection, so the comparator runs against
+        // what the caller actually sent. The `Invalidation` half is
+        // redundant with the one the projected entry carries — it is only
+        // ever built from the same submission, so it is never built
+        // inconsistently; that is a property of this one construction site,
+        // not of the type. The clone is confined to the invalidation branch
+        // — an ordinary measurement clones nothing.
+        let mut withdrawals: Vec<Option<(CreateUsageRecord, Invalidation)>> =
+            Vec::with_capacity(submission_count);
+
         // The service is the guaranteed choke point for every caller (REST +
         // in-process). The create surface is identity-free
         // (`CreateUsageRecord`); each entry acquires its deterministic
-        // dedup-identity-derived `id` and its initial `Active` status HERE,
-        // before authorization or dispatch — the single point of derivation.
+        // dedup-identity-derived `id` HERE, before authorization or
+        // dispatch — the single point of derivation.
         //
         // The derivation is per-submission and fallible (the covered-period
         // preconditions of
@@ -1077,6 +1246,12 @@ impl Service {
         // longer index-aligned with the input.
         let mut derived: Vec<(usize, UsageRecord)> = Vec::with_capacity(submission_count);
         for (index, submission) in records.into_iter().enumerate() {
+            withdrawals.push(
+                submission
+                    .invalidation
+                    .as_ref()
+                    .map(|invalidation| (submission.clone(), invalidation.clone())),
+            );
             match submission.try_into_usage_record() {
                 Ok(record) => derived.push((index, record)),
                 Err(e) => {
@@ -1097,7 +1272,7 @@ impl Service {
             .map_err(UsageCollectorError::from)?;
 
         let mut eligible: Vec<(usize, UsageRecord)> = Vec::new();
-        let mut pending_l1: Vec<PendingL1Lookup> = Vec::new();
+        let mut pending_targets: Vec<PendingInvalidationTarget> = Vec::new();
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-pdp
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-dedup-tuple-key
@@ -1224,16 +1399,22 @@ impl Service {
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics-invalid
-            if let SemanticsOutcome::NeedsL1Lookup { corrects_id } =
-                validate_record_semantics(&record)
-            {
-                // L1 lookup is deferred to a post-loop dedup + bounded
-                // fan-out pre-pass (`inst-algo-semantics-l1-dedup` /
-                // `inst-algo-semantics-l1-bounded-fanout`); the metadata
-                // check runs after L1 succeeds so the existing
-                // semantics→L1→metadata error-priority ordering is
-                // preserved end-to-end.
-                pending_l1.push((index, record, corrects_id));
+            // `invalidates` is the whole decision: its presence is what makes
+            // the entry an invalidation, and there is no submitted
+            // discriminator that could disagree with it. The target read is
+            // deferred to a post-loop dedup + bounded fan-out pre-pass
+            // (`inst-algo-semantics-l1-dedup` /
+            // `inst-algo-semantics-l1-bounded-fanout`) so a batch withdrawing
+            // one target repeatedly reads it once; the metadata check runs
+            // after the target check there, so the target→metadata
+            // error-priority ordering is preserved end-to-end.
+            if let Some((submission, invalidation)) = withdrawals[index].take() {
+                pending_targets.push(PendingInvalidationTarget {
+                    index,
+                    submission,
+                    invalidation,
+                    record,
+                });
                 continue;
             }
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics-invalid
@@ -1266,10 +1447,10 @@ impl Service {
             // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-eligible
         }
 
-        resolve_l1_lookups(
+        resolve_invalidation_targets(
             plugin.as_ref(),
             self.metrics.as_ref(),
-            pending_l1,
+            pending_targets,
             &declaration_cache,
             self.metadata_size_cap_bytes,
             &mut results,
@@ -1277,12 +1458,12 @@ impl Service {
         )
         .await;
 
-        // The L1 phase pushes verified-compensation records to `eligible`
+        // The target pre-check pushes verified invalidations to `eligible`
         // after the input-order foreach has completed, so the vec is no
         // longer guaranteed in input-index order. Sort once before the
         // plugin SPI dispatch; per-record results are still routed back
         // via the input index, so this only affects the order in which
-        // the plugin sees the records.
+        // the plugin sees the entries.
         eligible.sort_by_key(|(index, _)| *index);
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-foreach-validate
 

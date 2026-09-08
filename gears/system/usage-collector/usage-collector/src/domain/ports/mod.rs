@@ -10,5 +10,5 @@ pub use declarations::{DeclarationSource, UnavailableDeclarationSource};
 pub use metrics::{
     AuthzDecision, IngestRequestErrorCategory, IngestRequestOutcome, NoopMetrics, PdpFailureCause,
     PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
-    RecordKind, RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics,
+    RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics,
 };

@@ -17,8 +17,8 @@ use time::OffsetDateTime;
 use toolkit_gts::gts_id;
 use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo};
 use usage_collector_sdk::{
-    AggregationBucket, AggregationResult, CreateUsageRecord, IdempotencyKey, MetadataKey,
-    MeterTypeId, ResourceRef, UsageCollectorError, UsageRecord, UsageRecordStatus,
+    AggregationBucket, AggregationResult, CreateUsageRecord, IdempotencyKey, Invalidation,
+    MetadataKey, MeterTypeId, ReasonCode, ResourceRef, UsageCollectorError, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -51,16 +51,15 @@ fn sample_record() -> UsageRecord {
         metadata: BTreeMap::new(),
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-1").expect("valid idempotency key"),
-        corrects_id: None,
-        status: UsageRecordStatus::Active,
+        invalidation: None,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
 }
 
 /// The identity-free create-surface twin of [`sample_record`]: mirrors its
-/// canonical fields minus the server-owned `id` / `status`, for the
-/// `create_usage_record{,s}` entry points which now take `CreateUsageRecord`.
+/// canonical fields minus the server-owned `id`, for the
+/// `create_usage_record{,s}` entry points which take `CreateUsageRecord`.
 fn sample_create_record() -> CreateUsageRecord {
     CreateUsageRecord {
         gts_type_id: MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
@@ -70,7 +69,7 @@ fn sample_create_record() -> CreateUsageRecord {
         metadata: BTreeMap::new(),
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-1").expect("valid idempotency key"),
-        corrects_id: None,
+        invalidation: None,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
@@ -233,8 +232,8 @@ async fn ingestion_single_deny_records_rejected_authz_and_duration_no_request_co
         counter_sum_with_label(
             &exporter,
             "uc_ingestion_records_total",
-            "record_kind",
-            "usage"
+            "entry_type",
+            "record"
         ),
         1,
     );
@@ -305,6 +304,125 @@ async fn ingestion_batch_all_denied_observes_batch_size_and_partial_request() {
     assert_eq!(
         histogram_count(&exporter, "uc_ingestion_duration_seconds"),
         1
+    );
+}
+
+// ── Ingestion: the entry_type share and the invalidation error family ──
+//
+// `uc_ingestion_records_total` is the counter carrying the throughput NFR,
+// and `entry_type` is what makes the correction share visible in the
+// ingestion profile at all (DESIGN §3.11.5). Both tests drive the real
+// service so the label comes from the same `entry_type_of` the production
+// path uses.
+
+/// The persisted entry a withdrawal of [`sample_create_record`] copies
+/// faithfully: identical caller-supplied fields, its own identity and its
+/// own idempotency key.
+fn sample_target_row(id: Uuid) -> UsageRecord {
+    UsageRecord {
+        id,
+        idempotency_key: IdempotencyKey::new("idem-target").expect("valid idempotency key"),
+        ..sample_record()
+    }
+}
+
+/// A faithful withdrawal of [`sample_target_row`]: the create-surface twin
+/// of `sample_create_record`, departing only in its own idempotency key and
+/// the withdrawal it carries.
+fn sample_withdrawal(target: Uuid) -> CreateUsageRecord {
+    CreateUsageRecord {
+        idempotency_key: IdempotencyKey::new("idem-withdrawal").expect("valid idempotency key"),
+        invalidation: Some(Invalidation {
+            target,
+            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+        }),
+        ..sample_create_record()
+    }
+}
+
+#[tokio::test]
+async fn an_invalidation_counts_under_its_own_entry_type() {
+    let target = Uuid::from_u128(0x9001);
+    let plugin = HappyPathPlugin::new();
+    plugin.set_get_record(sample_target_row(target));
+    plugin.set_create_record(sample_record());
+
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build_with_metrics(plugin, "test.metrics.ingest.entry_type.v1");
+
+    service
+        .create_usage_record(&authenticated_ctx(), sample_withdrawal(target))
+        .await
+        .expect("a faithful withdrawal of a resolvable target is accepted");
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "entry_type",
+            "invalidation",
+        ),
+        1,
+    );
+    // And nothing landed on the measurement series — a label that counted
+    // every entry the same way would satisfy the assertion above alone.
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "entry_type",
+            "record"
+        ),
+        0,
+    );
+}
+
+#[tokio::test]
+async fn an_invalidation_rule_rejection_carries_its_own_error_category() {
+    let target = Uuid::from_u128(0x9002);
+    let plugin = HappyPathPlugin::new();
+    // The target departs from the submission in `value`, so the copy rule
+    // rejects it.
+    let mut row = sample_target_row(target);
+    row.value = Decimal::from(999);
+    plugin.set_get_record(row);
+
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(CountingTenantPermitResolver::new())
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build_with_metrics(plugin, "test.metrics.ingest.invalidation_rule.v1");
+
+    let err = service
+        .create_usage_record(&authenticated_ctx(), sample_withdrawal(target))
+        .await
+        .expect_err("an unfaithful copy is rejected");
+    assert!(
+        matches!(err, UsageCollectorError::InvalidArgument { .. }),
+        "expected the copy rejection, got {err:?}",
+    );
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "error_category",
+            "invalidation_rule",
+        ),
+        1,
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "error_category",
+            "semantics_violation",
+        ),
+        0,
+        "the invalidation family must not fall back into the semantics one",
     );
 }
 
@@ -973,14 +1091,17 @@ fn classify_record_error_maps_each_arm() {
             unresolved_type_not_found(),
             RecordErrorCategory::UnknownUsageType,
         ),
-        // A record-resource NotFound (an L1 `corrects_id` reference) stays with
-        // the semantics family — NOT folded into catalog absence.
+        // A uuid-named NotFound stays with the semantics family — NOT
+        // folded into catalog absence, and NOT into the invalidation
+        // family either: `NotFound` carries no typed reason, so an
+        // unresolvable `invalidates` and an unresolvable entry id are the
+        // same shape here and only `detail` prose separates them.
         (
             UsageCollectorError::usage_record_not_found(Uuid::from_u128(7)),
             RecordErrorCategory::SemanticsViolation,
         ),
         (
-            UsageCollectorError::corrects_id_not_found(Uuid::from_u128(8)),
+            UsageCollectorError::invalidation_target_not_found(Uuid::from_u128(8)),
             RecordErrorCategory::SemanticsViolation,
         ),
         // The two metadata reasons are the ONLY InvalidArgument arms that map to
@@ -993,19 +1114,49 @@ fn classify_record_error_maps_each_arm() {
             UsageCollectorError::unknown_metadata_key(&meter_gts(), "region"),
             RecordErrorCategory::MetadataSize,
         ),
+        // The `InvalidArgument` catch-all, held by a live reason rather than
+        // by prose. Five reasons reach it from a constructor in this
+        // workspace — `Validation`, `InvalidCursor`, `FilterMismatch`,
+        // `InvalidBaseGtsId` and `AggregationResultTooLarge` — and
+        // `InvalidCursor` stands for all five. `SemanticsViolation` is NOT
+        // among them: the variant is reserved and no constructor produces
+        // it (see `usage_collector_sdk::reason`). Without a case here a
+        // mutation of that arm passes, because every other
+        // `InvalidArgument` row names a reason the match handles
+        // explicitly.
         (
-            UsageCollectorError::invalidation_field_mismatch("value", Uuid::from_u128(11)),
+            UsageCollectorError::inadmissible_cursor_keyset("mixed directions"),
             RecordErrorCategory::SemanticsViolation,
         ),
-        // Conflict: idempotency is its own category; any other conflict reason
-        // is semantics_violation.
+        // The three typed invalidation rejections carry their own category
+        // (DESIGN §3.11.5), so a correction backlog is legible without
+        // reading `detail`.
+        (
+            UsageCollectorError::invalidation_field_mismatch("value", Uuid::from_u128(11)),
+            RecordErrorCategory::InvalidationRule,
+        ),
+        (
+            UsageCollectorError::invalidation_target_not_record(Uuid::from_u128(12)),
+            RecordErrorCategory::InvalidationRule,
+        ),
+        (
+            UsageCollectorError::invalidation_reference_incomplete("reason_code"),
+            RecordErrorCategory::InvalidationRule,
+        ),
+        // Conflict: idempotency is its own category and at-most-one is the
+        // invalidation family's. `ConflictReason`'s third variant is
+        // `Unknown(String)`, which only `from_wire` produces — no host-side
+        // constructor can reach the arm's catch-all, so it has no case
+        // here.
         (
             UsageCollectorError::idempotency_conflict("k", Uuid::from_u128(9)),
             RecordErrorCategory::IdempotencyConflict,
         ),
+        // At-most-one-invalidation, the store's own rule, joins the
+        // gateway's two.
         (
-            UsageCollectorError::corrects_id_inactive(Uuid::from_u128(10)),
-            RecordErrorCategory::SemanticsViolation,
+            UsageCollectorError::already_invalidated(Uuid::from_u128(10), Uuid::from_u128(13)),
+            RecordErrorCategory::InvalidationRule,
         ),
         // Anything unclassified is a plugin_error.
         (

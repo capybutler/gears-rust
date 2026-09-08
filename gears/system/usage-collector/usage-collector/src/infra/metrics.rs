@@ -21,9 +21,10 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 
 use crate::domain::ports::metrics::{
     AuthzDecision, IngestRequestErrorCategory, IngestRequestOutcome, PdpFailureCause, PdpOp,
-    PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory, RecordKind,
+    PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
     RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics, key,
 };
+use usage_collector_sdk::EntryType;
 
 /// Bucket boundaries (seconds) for `uc_pdp_duration_seconds` — brackets the
 /// PDP share of the 200 ms ingestion p95 budget (DESIGN §3.11.5).
@@ -155,7 +156,7 @@ impl UcMetricsMeter {
             ingestion_records: meter
                 .u64_counter(format!("{prefix}_ingestion_records_total"))
                 .with_description(
-                    "Per-record ingestion acknowledgements by outcome, record_kind, error_category",
+                    "Per-record ingestion acknowledgements by outcome, entry_type, error_category",
                 )
                 .build(),
             ingestion_duration_seconds: meter
@@ -276,14 +277,14 @@ impl UsageCollectorMetrics for UcMetricsMeter {
     fn record_ingestion_record(
         &self,
         outcome: RecordOutcome,
-        kind: RecordKind,
+        entry_type: EntryType,
         error_category: RecordErrorCategory,
     ) {
         self.ingestion_records.add(
             1,
             &[
                 KeyValue::new(key::OUTCOME, outcome.as_str()),
-                KeyValue::new(key::RECORD_KIND, kind.as_str()),
+                KeyValue::new(key::ENTRY_TYPE, entry_type.as_str()),
                 KeyValue::new(key::ERROR_CATEGORY, error_category.as_str()),
             ],
         );

@@ -11,10 +11,11 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMete
 
 use crate::domain::ports::metrics::{
     AuthzDecision, IngestRequestErrorCategory, IngestRequestOutcome, PdpFailureCause, PdpOp,
-    PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory, RecordKind,
+    PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
     RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics,
 };
 use crate::infra::metrics::{UcMetricsMeter, build_default_adapter};
+use usage_collector_sdk::EntryType;
 
 const TEST_PREFIX: &str = "uc";
 
@@ -301,12 +302,12 @@ fn ingestion_instruments_render_names_labels_and_buckets() {
     m.observe_record_metadata_bytes(1500);
     m.record_ingestion_record(
         RecordOutcome::Accepted,
-        RecordKind::Compensation,
+        EntryType::Invalidation,
         RecordErrorCategory::None,
     );
     m.record_ingestion_record(
         RecordOutcome::Rejected,
-        RecordKind::Usage,
+        EntryType::Record,
         RecordErrorCategory::MetadataSize,
     );
     m.record_ingestion_request(
@@ -338,8 +339,8 @@ fn ingestion_instruments_render_names_labels_and_buckets() {
         counter_sum_with_label(
             &exporter,
             "uc_ingestion_records_total",
-            "record_kind",
-            "compensation",
+            "entry_type",
+            "invalidation",
         ),
         1,
     );

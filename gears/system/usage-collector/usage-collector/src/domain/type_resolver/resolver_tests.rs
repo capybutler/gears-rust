@@ -70,7 +70,7 @@ impl UsageCollectorMetrics for RecordingMetrics {
     fn record_ingestion_record(
         &self,
         _: crate::domain::ports::metrics::RecordOutcome,
-        _: crate::domain::ports::metrics::RecordKind,
+        _: usage_collector_sdk::EntryType,
         _: crate::domain::ports::metrics::RecordErrorCategory,
     ) {
     }

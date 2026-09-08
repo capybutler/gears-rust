@@ -367,7 +367,7 @@ mod pdp_dedup_tests {
     use time::OffsetDateTime;
     use usage_collector_sdk::{
         CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, SubjectRef,
-        UsageCollectorPluginV1, UsageRecord, UsageRecordStatus,
+        UsageCollectorPluginV1, UsageRecord,
     };
     use uuid::Uuid;
 
@@ -403,8 +403,7 @@ mod pdp_dedup_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: None,
-            status: UsageRecordStatus::Active,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
@@ -422,7 +421,7 @@ mod pdp_dedup_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: None,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
@@ -728,7 +727,7 @@ mod gts_type_id_dedup_tests {
     use time::OffsetDateTime;
     use usage_collector_sdk::{
         CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, USAGE_RECORD_RESOURCE,
-        UsageCollectorError, UsageCollectorPluginV1, UsageRecord, UsageRecordStatus,
+        UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
     };
     use uuid::Uuid;
 
@@ -755,7 +754,7 @@ mod gts_type_id_dedup_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: None,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
@@ -771,8 +770,7 @@ mod gts_type_id_dedup_tests {
             metadata: input.metadata.clone(),
             value: input.value,
             idempotency_key: input.idempotency_key.clone(),
-            corrects_id: input.corrects_id,
-            status: UsageRecordStatus::Active,
+            invalidation: input.invalidation.clone(),
             window_start: input.window_start,
             window_end: input.window_end,
         }
@@ -919,117 +917,109 @@ mod gts_type_id_dedup_tests {
     }
 }
 
-// ── corrects_id L1 dedup pre-pass in `create_usage_records` ────────────────
+// ── invalidation-target pre-check in `create_usage_records` ───────────────
 //
-// Pins the intra-batch L1-lookup dedup behavior described in
+// Pins the intra-batch dedup described in
 // `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`
 // instructions `inst-algo-semantics-l1-dedup` and
-// `inst-algo-semantics-l1-bounded-fanout`: records sharing the same
-// `corrects_id` MUST collapse to a single `get_usage_record` SPI
-// round-trip, and ordinary (non-compensation) records MUST NOT trigger
-// any L1 lookup at all.
+// `inst-algo-semantics-l1-bounded-fanout` — entries naming the same target
+// MUST collapse to a single `get_usage_record` SPI round-trip, and an
+// ordinary measurement MUST NOT trigger a target read at all — plus the
+// per-index pairing the fan-out is the only place that can break.
 #[cfg(test)]
-mod corrects_id_dedup_tests {
+mod invalidation_target_batch_tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use toolkit_gts::gts_id;
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, USAGE_RECORD_RESOURCE,
-        UsageCollectorError, UsageCollectorPluginV1, UsageRecord, UsageRecordStatus,
+        ConflictReason, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId,
+        ReasonCode, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
+        UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, ValidationReason,
     };
     use uuid::Uuid;
 
     use crate::domain::Service;
     use crate::domain::test_support::{
-        HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
-        projected,
+        HappyPathPlugin, ServiceFixture, authenticated_ctx, counter_sum_with_label,
+        fake_declaration_source_with_fold, fake_declaration_source_with_metadata, projected,
     };
 
     const COUNTER_GTS_ID: &str =
         gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
     /// A [`ServiceFixture`] wired with an arbitrary working declaration —
-    /// these tests exercise the L1 `corrects_id` dedup pre-pass, not the
-    /// declaration itself.
+    /// these tests exercise the target pre-check, not the declaration.
     fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
         ServiceFixture::default()
             .with_source(fake_declaration_source_with_fold("SUM"))
             .build(plugin, suffix)
     }
 
-    fn referenced_original(tenant_id: Uuid) -> UsageRecord {
-        // The L1 verifier checks (corrects_id IS NULL, identity-tuple match,
-        // status=Active) against this row, so the compensation records under
-        // test must mirror its (tenant, gts_type_id, resource_ref, subject_ref)
-        // shape. `set_get_record` returns this same row for any id the
-        // host looks up — that's fine because verify_l1_corrects_id reads
-        // identity fields, not id.
-        UsageRecord {
-            id: Uuid::from_u128(0xDEAD_BEEF),
-            gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
-            tenant_id,
-            resource_ref: ResourceRef::new("rsc-comp", "compute.vm").expect("valid resource ref"),
-            subject_ref: None,
-            metadata: BTreeMap::new(),
-            value: rust_decimal::Decimal::from(10),
-            idempotency_key: IdempotencyKey::new("idem-original").expect("valid idempotency key"),
-            corrects_id: None,
-            status: UsageRecordStatus::Active,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
-        }
-    }
-
-    fn compensation_for(tenant_id: Uuid, corrects_id: Uuid, idem: &str) -> CreateUsageRecord {
-        CreateUsageRecord {
-            gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
-            tenant_id,
-            resource_ref: ResourceRef::new("rsc-comp", "compute.vm").expect("valid resource ref"),
-            subject_ref: None,
-            metadata: BTreeMap::new(),
-            value: rust_decimal::Decimal::from(-1),
-            idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: Some(corrects_id),
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
-        }
-    }
-
+    /// The base measurement every fixture here is shaped from. An
+    /// invalidation is a faithful copy of it, so a withdrawal is built by
+    /// changing exactly the two permitted departures — the idempotency key
+    /// and the `invalidation` field itself.
     fn ordinary_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
             gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
-            resource_ref: ResourceRef::new("rsc-comp", "compute.vm").expect("valid resource ref"),
+            resource_ref: ResourceRef::new("rsc-target", "compute.vm").expect("valid resource ref"),
             subject_ref: None,
             metadata: BTreeMap::new(),
-            value: rust_decimal::Decimal::from(1),
+            value: rust_decimal::Decimal::from(10),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: None,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
-    /// Five compensations sharing one `corrects_id` MUST collapse to a
-    /// single `get_usage_record` SPI round-trip.
+    fn withdrawal_of(tenant_id: Uuid, target: Uuid, idem: &str) -> CreateUsageRecord {
+        CreateUsageRecord {
+            invalidation: Some(Invalidation {
+                target,
+                reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+            }),
+            ..ordinary_record(tenant_id, idem)
+        }
+    }
+
+    /// The persisted entry a withdrawal built by [`withdrawal_of`] copies
+    /// faithfully: same caller-supplied fields, its own identity and its
+    /// own idempotency key.
+    fn target_row(tenant_id: Uuid, id: Uuid) -> UsageRecord {
+        UsageRecord {
+            id,
+            idempotency_key: IdempotencyKey::new("idem-target").expect("valid idempotency key"),
+            ..projected(&ordinary_record(tenant_id, "idem-target"))
+        }
+    }
+
+    /// Five withdrawals of one target MUST collapse to a single
+    /// `get_usage_record` SPI round-trip. The count in the name is left
+    /// open because the body's is five and a name that says "two" is a
+    /// claim a reader would have to check against the body to disbelieve.
+    ///
+    /// The read is what the dedup buys; the store still admits at most one
+    /// of them, and that rejection is the plugin's rather than a second
+    /// read's.
     #[tokio::test]
-    async fn create_usage_records_collapses_get_usage_record_calls_for_shared_corrects_id() {
+    async fn withdrawals_of_one_target_share_a_single_lookup() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x501);
-        plugin.set_get_record(referenced_original(tenant_id));
+        let target = Uuid::from_u128(0x601);
+        plugin.set_get_record(target_row(tenant_id, target));
 
-        let corrects_id = Uuid::from_u128(0x601);
         let input: Vec<CreateUsageRecord> = (0..5)
-            .map(|i| compensation_for(tenant_id, corrects_id, &format!("idem-comp-{i}")))
+            .map(|i| withdrawal_of(tenant_id, target, &format!("idem-w-{i}")))
             .collect();
-
         plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.l1_dedup.shared.records.v1",
+            "test.target.shared.records.v1",
         );
 
         let results = service
@@ -1039,41 +1029,42 @@ mod corrects_id_dedup_tests {
         assert_eq!(results.len(), 5);
         assert!(
             results.iter().all(Result::is_ok),
-            "every compensation MUST be accepted: {results:?}",
+            "every faithful withdrawal MUST be accepted by the gateway: {results:?}",
         );
 
         assert_eq!(
             plugin.get_usage_record_calls(),
             1,
-            "5 compensations sharing one corrects_id MUST collapse to a single \
-             get_usage_record SPI dispatch (intra-batch L1 dedup); observed {} calls",
+            "5 withdrawals of one target MUST collapse to a single \
+             get_usage_record SPI dispatch; observed {} calls",
             plugin.get_usage_record_calls(),
         );
     }
 
-    /// Three distinct `corrects_id`s MUST produce three `get_usage_record`
-    /// dispatches.
+    /// Three distinct targets MUST produce three `get_usage_record`
+    /// dispatches, for exactly those three ids.
     #[tokio::test]
-    async fn create_usage_records_issues_one_get_usage_record_call_per_distinct_corrects_id() {
+    async fn distinct_targets_each_cost_their_own_lookup() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x502);
-        plugin.set_get_record(referenced_original(tenant_id));
 
-        let corrects_id_a = Uuid::from_u128(0x602);
-        let corrects_id_b = Uuid::from_u128(0x603);
-        let corrects_id_c = Uuid::from_u128(0x604);
+        let target_a = Uuid::from_u128(0x602);
+        let target_b = Uuid::from_u128(0x603);
+        let target_c = Uuid::from_u128(0x604);
+        for target in [target_a, target_b, target_c] {
+            plugin.set_get_record_for(target, target_row(tenant_id, target));
+        }
 
         let input = vec![
-            compensation_for(tenant_id, corrects_id_a, "idem-A"),
-            compensation_for(tenant_id, corrects_id_b, "idem-B"),
-            compensation_for(tenant_id, corrects_id_c, "idem-C"),
+            withdrawal_of(tenant_id, target_a, "idem-A"),
+            withdrawal_of(tenant_id, target_b, "idem-B"),
+            withdrawal_of(tenant_id, target_c, "idem-C"),
         ];
-
         plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.l1_dedup.distinct.records.v1",
+            "test.target.distinct.records.v1",
         );
 
         let results = service
@@ -1081,40 +1072,43 @@ mod corrects_id_dedup_tests {
             .await
             .expect("batch dispatch succeeded");
         assert_eq!(results.len(), 3);
-        assert!(results.iter().all(Result::is_ok));
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
 
         assert_eq!(
             plugin.get_usage_record_calls(),
             3,
-            "3 distinct corrects_ids MUST produce 3 get_usage_record SPI dispatches; \
+            "3 distinct targets MUST produce 3 get_usage_record SPI dispatches; \
              observed {} calls",
             plugin.get_usage_record_calls(),
         );
 
         let mut seen = plugin.get_usage_record_inputs();
         seen.sort();
-        let mut expected = vec![corrects_id_a, corrects_id_b, corrects_id_c];
+        let mut expected = vec![target_a, target_b, target_c];
         expected.sort();
         assert_eq!(
             seen, expected,
-            "the deduped fan-out MUST ask the plugin for exactly the distinct corrects_ids",
+            "the deduped fan-out MUST ask the plugin for exactly the distinct targets",
         );
     }
 
-    /// Ordinary records (no `corrects_id`) MUST NOT trigger any L1 lookup.
+    /// An ordinary measurement MUST cost no target lookup at all.
+    ///
+    /// Asserting the *absence* of the dispatch is the point: a gateway that
+    /// looked up unconditionally would pass every acceptance test in this
+    /// module while doubling the plugin traffic of the common path.
     #[tokio::test]
-    async fn create_usage_records_skips_l1_lookup_when_no_record_has_corrects_id() {
+    async fn an_ordinary_record_costs_no_target_lookup() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x503);
         let input: Vec<CreateUsageRecord> = (0..5)
             .map(|i| ordinary_record(tenant_id, &format!("idem-ord-{i}")))
             .collect();
-
         plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.l1_dedup.no_corrects.records.v1",
+            "test.target.no_invalidates.records.v1",
         );
 
         let results = service
@@ -1122,44 +1116,47 @@ mod corrects_id_dedup_tests {
             .await
             .expect("batch dispatch succeeded");
         assert_eq!(results.len(), 5);
-        assert!(results.iter().all(Result::is_ok));
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
 
         assert_eq!(
             plugin.get_usage_record_calls(),
             0,
-            "ordinary records (corrects_id IS NULL) MUST NOT trigger L1 lookups; \
+            "an entry carrying no `invalidates` MUST NOT trigger a target lookup; \
              observed {} get_usage_record dispatches",
             plugin.get_usage_record_calls(),
         );
     }
 
-    /// L1 not-found for one `corrects_id` MUST project to every record
-    /// sharing it (rejected as `CorrectsIdNotFound`), while records
-    /// referencing a different known `corrects_id` are still accepted.
+    /// A target that resolves to nothing MUST reject every entry naming
+    /// it, at its own input index, while an entry naming a resolvable
+    /// target in the same batch is still accepted.
+    ///
+    /// The rejections sit at indices 0 and 2 with the acceptance between
+    /// them, so a projection that wrote every outcome to one slot leaves
+    /// another empty and cannot pass.
     #[tokio::test]
-    async fn create_usage_records_projects_l1_not_found_to_every_record_sharing_unknown_corrects_id()
-     {
+    async fn an_unresolvable_target_rejects_every_entry_naming_it() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x504);
-        plugin.set_get_record(referenced_original(tenant_id));
 
-        let corrects_id_good = Uuid::from_u128(0x605);
-        let corrects_id_bad = Uuid::from_u128(0x606);
-        plugin.set_get_usage_record_not_found(corrects_id_bad);
+        let good = Uuid::from_u128(0x605);
+        let missing = Uuid::from_u128(0x606);
+        plugin.set_get_record_for(good, target_row(tenant_id, good));
+        plugin.set_get_usage_record_not_found(missing);
 
         let input = vec![
-            compensation_for(tenant_id, corrects_id_bad, "idem-bad-0"),
-            compensation_for(tenant_id, corrects_id_good, "idem-good-0"),
-            compensation_for(tenant_id, corrects_id_bad, "idem-bad-1"),
+            withdrawal_of(tenant_id, missing, "idem-bad-0"),
+            withdrawal_of(tenant_id, good, "idem-good-0"),
+            withdrawal_of(tenant_id, missing, "idem-bad-1"),
         ];
 
-        // Only the known-good record reaches the persist SPI; program one
+        // Only the resolvable one reaches the persist SPI; program one
         // accepted response.
         plugin.set_create_records(vec![Ok(projected(&input[1]))]);
 
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
-            "test.l1_dedup.mixed_not_found.records.v1",
+            "test.target.mixed_not_found.records.v1",
         );
 
         let results = service
@@ -1170,34 +1167,497 @@ mod corrects_id_dedup_tests {
 
         assert!(
             results[1].is_ok(),
-            "record at index 1 (known corrects_id) MUST be accepted, got {:?}",
+            "the entry naming a resolvable target MUST be accepted, got {:?}",
             results[1],
         );
         for idx in [0usize, 2] {
             match results[idx].as_ref() {
                 Err(UsageCollectorError::NotFound {
                     resource_type,
+                    name,
                     detail,
-                    ..
-                }) if resource_type == USAGE_RECORD_RESOURCE && detail.contains("corrects_id") => {
+                }) if resource_type == USAGE_RECORD_RESOURCE => {
+                    assert_eq!(
+                        name,
+                        &missing.to_string(),
+                        "index {idx} MUST name the unresolvable target",
+                    );
                     assert!(
-                        detail.contains(&corrects_id_bad.to_string()),
-                        "record at index {idx} MUST surface CorrectsIdNotFound carrying \
-                         the unknown corrects_id",
+                        detail.contains(&missing.to_string()),
+                        "index {idx} detail MUST carry the unresolvable target",
                     );
                 }
-                other => panic!(
-                    "record at index {idx} MUST be rejected as CorrectsIdNotFound, got {other:?}",
-                ),
+                other => panic!("index {idx} MUST be rejected as NotFound, got {other:?}"),
             }
         }
 
         assert_eq!(
             plugin.get_usage_record_calls(),
             2,
-            "2 distinct corrects_ids carrying 3 records MUST produce 2 get_usage_record \
+            "2 distinct targets carrying 3 entries MUST produce 2 get_usage_record \
              dispatches; observed {} calls",
             plugin.get_usage_record_calls(),
+        );
+    }
+
+    /// Two withdrawals of **different** targets, resolved in one batch,
+    /// MUST each be told about the target *they* named.
+    ///
+    /// This is the pairing the comparator cannot check for itself: it is
+    /// handed a row and a reference and trusts they belong together, so the
+    /// fan-out — keyed by target, projected back by input index — is the
+    /// only place the two can come apart. The rows are deliberately
+    /// different *kinds* of wrong, so a swap of either the key or the index
+    /// changes which reason lands where, not merely which uuid it carries.
+    #[tokio::test]
+    async fn each_rejection_names_the_target_its_own_entry_sent() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x505);
+
+        // Target A is itself a withdrawal — the no-invalidation-of-an-
+        // invalidation rule.
+        let target_a = Uuid::from_u128(0x607);
+        let mut row_a = target_row(tenant_id, target_a);
+        row_a.invalidation = Some(Invalidation {
+            target: Uuid::from_u128(0x60F),
+            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+        });
+        plugin.set_get_record_for(target_a, row_a);
+
+        // Target B is an ordinary entry the submission copies unfaithfully.
+        let target_b = Uuid::from_u128(0x608);
+        let mut row_b = target_row(tenant_id, target_b);
+        row_b.value = rust_decimal::Decimal::from(999);
+        plugin.set_get_record_for(target_b, row_b);
+
+        let input = vec![
+            withdrawal_of(tenant_id, target_a, "idem-pair-a"),
+            withdrawal_of(tenant_id, target_b, "idem-pair-b"),
+        ];
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.target.pairing.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), input)
+            .await
+            .expect("batch dispatch succeeded");
+        assert_eq!(results.len(), 2);
+
+        match results[0].as_ref() {
+            Err(UsageCollectorError::InvalidArgument {
+                reason: ValidationReason::InvalidationTargetNotRecord,
+                resource_name,
+                ..
+            }) => assert_eq!(
+                resource_name.as_deref(),
+                Some(target_a.to_string().as_str()),
+                "index 0 MUST be told about the target IT named",
+            ),
+            other => panic!("index 0 MUST be refused as a non-record target, got {other:?}"),
+        }
+        match results[1].as_ref() {
+            Err(UsageCollectorError::InvalidArgument {
+                reason: ValidationReason::InvalidationFieldMismatch,
+                field,
+                resource_name,
+                ..
+            }) => {
+                assert_eq!(field, "value", "the field that differs MUST be named");
+                assert_eq!(
+                    resource_name.as_deref(),
+                    Some(target_b.to_string().as_str()),
+                    "index 1 MUST be told about the target IT named",
+                );
+            }
+            other => panic!("index 1 MUST be refused as an unfaithful copy, got {other:?}"),
+        }
+    }
+
+    /// A submission that breaks the copy rule **and** the metadata rule is
+    /// told about the copy.
+    ///
+    /// Error priority: the target rules run before the declaration's. The
+    /// metadata a caller would be told to fix is metadata it has to copy
+    /// from the target regardless, so telling it about the metadata first
+    /// sends it to fix the wrong thing.
+    #[tokio::test]
+    async fn a_copy_mismatch_outranks_a_metadata_rejection() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x506);
+        let target = Uuid::from_u128(0x609);
+
+        // The declaration declares `region` and nothing else, so `zone` is
+        // an undeclared key and fails the closed-shape check.
+        let mut row = target_row(tenant_id, target);
+        row.value = rust_decimal::Decimal::from(999);
+        plugin.set_get_record_for(target, row);
+
+        let mut submission = withdrawal_of(tenant_id, target, "idem-both-broken");
+        submission.metadata.insert(
+            MetadataKey::new("zone").expect("valid metadata key"),
+            "eu-1".to_owned(),
+        );
+
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_metadata(&["region"]))
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.target.priority.records.v1",
+            );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), vec![submission])
+            .await
+            .expect("batch dispatch succeeded");
+
+        match results[0].as_ref() {
+            Err(UsageCollectorError::InvalidArgument { reason, .. }) => assert_eq!(
+                *reason,
+                ValidationReason::InvalidationFieldMismatch,
+                "the copy rejection MUST outrank the metadata one",
+            ),
+            other => panic!("a submission breaking both rules MUST be rejected, got {other:?}"),
+        }
+    }
+
+    /// The store's own rule: a target that already carries a withdrawal is
+    /// refused by the plugin, and the gateway lifts it verbatim rather than
+    /// pre-reading for it.
+    #[tokio::test]
+    async fn a_plugin_already_invalidated_rejection_is_lifted_as_a_conflict() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x507);
+        let target = Uuid::from_u128(0x60A);
+        let existing = Uuid::from_u128(0x60B);
+        plugin.set_get_record_for(target, target_row(tenant_id, target));
+        plugin.set_create_records(vec![Err(UsageCollectorPluginError::AlreadyInvalidated {
+            id: target,
+            invalidated_by: existing,
+        })]);
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.target.already_invalidated.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(
+                &authenticated_ctx(),
+                vec![withdrawal_of(tenant_id, target, "idem-second")],
+            )
+            .await
+            .expect("batch dispatch succeeded");
+
+        match results[0].as_ref() {
+            Err(UsageCollectorError::Conflict {
+                reason: ConflictReason::AlreadyInvalidated,
+                name,
+                detail,
+                ..
+            }) => {
+                assert_eq!(name, &target.to_string());
+                assert!(detail.contains(&existing.to_string()));
+            }
+            other => panic!("at-most-one is the store's rule to report, got {other:?}"),
+        }
+    }
+
+    /// A backend fault on the target read MUST fail the submission, not
+    /// reject it: an unreadable target is not an absent one, and a caller
+    /// told `NotFound` would stop retrying a withdrawal that is perfectly
+    /// valid.
+    #[tokio::test]
+    async fn a_transient_target_lookup_fails_the_entry_rather_than_rejecting_it() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x508);
+        let target = Uuid::from_u128(0x60C);
+        plugin.set_get_usage_record_transient("target store timed out", Some(7));
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.target.transient.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(
+                &authenticated_ctx(),
+                vec![withdrawal_of(tenant_id, target, "idem-transient")],
+            )
+            .await
+            .expect("batch dispatch succeeded");
+
+        match results[0].as_ref() {
+            Err(UsageCollectorError::ServiceUnavailable {
+                detail,
+                retry_after_seconds,
+            }) => {
+                assert_eq!(detail, "target store timed out");
+                assert_eq!(*retry_after_seconds, Some(7));
+            }
+            other => panic!("a transient target read MUST NOT become a rejection, got {other:?}"),
+        }
+    }
+
+    /// The plugin MUST see the batch in submission order, even though the
+    /// target pre-check pushes its verified entries out of the input-order
+    /// loop and onto the end of `eligible`.
+    ///
+    /// Nothing user-visible depends on it — per-entry results are routed
+    /// back by input index either way — which is exactly why it needs its
+    /// own test: the property lives entirely in what the plugin receives,
+    /// and `last_create_records_input` is the only place it is observable.
+    /// The invalidation is at index 0 so removing the sort reverses the
+    /// pair rather than leaving it untouched.
+    #[tokio::test]
+    async fn the_plugin_sees_the_batch_in_submission_order() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x50A);
+        let target = Uuid::from_u128(0x610);
+        plugin.set_get_record_for(target, target_row(tenant_id, target));
+
+        let input = vec![
+            withdrawal_of(tenant_id, target, "idem-order-withdrawal"),
+            ordinary_record(tenant_id, "idem-order-plain"),
+        ];
+        plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.target.order.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), input)
+            .await
+            .expect("batch dispatch succeeded");
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+
+        let dispatched = plugin
+            .last_create_records_input()
+            .expect("the batch reached the persist SPI");
+        let keys: Vec<&str> = dispatched
+            .iter()
+            .map(|r| r.idempotency_key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["idem-order-withdrawal", "idem-order-plain"],
+            "the deferred target pre-check MUST NOT reorder the batch the \
+             plugin is handed",
+        );
+    }
+
+    /// A transient on one entry's target MUST NOT abandon the entries
+    /// behind it in the pending list.
+    ///
+    /// The generic backend-fault arm projects per entry and continues; a
+    /// version that returned instead would leave every later slot unfilled.
+    /// The unreadable target is first, so the surviving entries are exactly
+    /// the ones a `return` would drop.
+    #[tokio::test]
+    async fn a_transient_on_one_target_does_not_abandon_the_rest_of_the_batch() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x50B);
+
+        let unreadable = Uuid::from_u128(0x611);
+        let readable = Uuid::from_u128(0x612);
+        plugin.set_get_usage_record_transient_for(unreadable, "target store timed out", Some(7));
+        plugin.set_get_record_for(readable, target_row(tenant_id, readable));
+
+        let input = vec![
+            withdrawal_of(tenant_id, unreadable, "idem-iso-unreadable"),
+            withdrawal_of(tenant_id, readable, "idem-iso-readable"),
+        ];
+        plugin.set_create_records(vec![Ok(projected(&input[1]))]);
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.target.isolation.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), input)
+            .await
+            .expect("batch dispatch succeeded");
+        assert_eq!(results.len(), 2);
+
+        match results[0].as_ref() {
+            Err(UsageCollectorError::ServiceUnavailable { detail, .. }) => {
+                assert_eq!(detail, "target store timed out");
+            }
+            other => panic!("index 0's target was unreadable, got {other:?}"),
+        }
+        assert!(
+            results[1].is_ok(),
+            "a backend fault on one entry's target MUST NOT reject — or drop — \
+             an entry whose own target read succeeded: {:?}",
+            results[1],
+        );
+    }
+
+    /// A batch MUST label each entry with **its own** `entry_type`.
+    ///
+    /// The label is captured per input index before the pipeline consumes
+    /// the submissions and re-joined to the outcomes by `zip` afterwards;
+    /// that join is the only place a label can come apart from the entry it
+    /// describes, and no single-emit test reaches it.
+    #[tokio::test]
+    async fn a_batch_labels_each_entry_with_its_own_entry_type() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x50C);
+        let target = Uuid::from_u128(0x613);
+        plugin.set_get_record_for(target, target_row(tenant_id, target));
+
+        let input = vec![
+            ordinary_record(tenant_id, "idem-label-plain"),
+            withdrawal_of(tenant_id, target, "idem-label-withdrawal"),
+        ];
+        plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
+
+        let (service, provider, exporter) = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build_with_metrics(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.target.batch_label.records.v1",
+            );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), input)
+            .await
+            .expect("batch dispatch succeeded");
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        provider.force_flush().unwrap();
+
+        assert_eq!(
+            counter_sum_with_label(
+                &exporter,
+                "uc_ingestion_records_total",
+                "entry_type",
+                "record"
+            ),
+            1,
+        );
+        assert_eq!(
+            counter_sum_with_label(
+                &exporter,
+                "uc_ingestion_records_total",
+                "entry_type",
+                "invalidation",
+            ),
+            1,
+        );
+    }
+
+    /// A plugin answering `get_usage_record(a)` with a *different* row MUST
+    /// be refused, not believed.
+    ///
+    /// The fixture is the dangerous shape rather than a convenient one: the
+    /// submission is a faithful copy of the row the plugin returns, so
+    /// without the check every rule the gateway enforces passes and the
+    /// entry is **accepted** — a withdrawal of an entry nothing ever
+    /// checked. It is a host-invariant breach rather than a caller fault,
+    /// so it surfaces as `Internal`, and the message names only the id the
+    /// caller sent: the row came back from an unscoped read and its own
+    /// identity must not cross back.
+    #[tokio::test]
+    async fn a_plugin_answering_with_the_wrong_row_is_refused_not_believed() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x50D);
+        let requested = Uuid::from_u128(0x614);
+        let answered = Uuid::from_u128(0x615);
+
+        // Asked for `requested`, answered with the row for `answered`.
+        plugin.set_get_record_for(requested, target_row(tenant_id, answered));
+
+        // The persist SPI is programmed to succeed even though a correct
+        // gateway never reaches it. Without that, a gateway that admitted
+        // the entry would fail on an unprogrammed SPI instead — the test
+        // would still fail, but reporting the wrong defect. Programmed, the
+        // failure a reader sees is `Ok(..)`: the false accept itself.
+        let submission = withdrawal_of(tenant_id, requested, "idem-wrong-row");
+        plugin.set_create_records(vec![Ok(projected(&submission))]);
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.target.wrong_row.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), vec![submission])
+            .await
+            .expect("batch dispatch succeeded");
+
+        match results[0].as_ref() {
+            Err(UsageCollectorError::Internal { detail }) => {
+                assert!(
+                    detail.contains(&requested.to_string()),
+                    "the breach MUST name the id the caller sent: {detail}",
+                );
+                assert!(
+                    !detail.contains(&answered.to_string()),
+                    "the breach MUST NOT echo the row's own identity: {detail}",
+                );
+            }
+            other => panic!(
+                "a mis-answering plugin MUST NOT have its row believed — this \
+                 submission copies it faithfully and would otherwise be \
+                 accepted; got {other:?}",
+            ),
+        }
+        assert!(
+            plugin.last_create_records_input().is_none(),
+            "the breach MUST short-circuit before the persist SPI",
+        );
+    }
+
+    /// One measurement, one good withdrawal and one bad withdrawal MUST
+    /// come back index-aligned, with only the bad one rejected — and the
+    /// bad one is last, so a projection that wrote to a fixed slot could
+    /// not pass.
+    #[tokio::test]
+    async fn a_mixed_batch_rejects_only_the_entry_that_broke_a_rule() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x509);
+
+        let good = Uuid::from_u128(0x60D);
+        let bad = Uuid::from_u128(0x60E);
+        plugin.set_get_record_for(good, target_row(tenant_id, good));
+        let mut row_bad = target_row(tenant_id, bad);
+        row_bad.value = rust_decimal::Decimal::from(999);
+        plugin.set_get_record_for(bad, row_bad);
+
+        let input = vec![
+            ordinary_record(tenant_id, "idem-mixed-plain"),
+            withdrawal_of(tenant_id, good, "idem-mixed-good"),
+            withdrawal_of(tenant_id, bad, "idem-mixed-bad"),
+        ];
+        plugin.set_create_records(vec![Ok(projected(&input[0])), Ok(projected(&input[1]))]);
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.target.mixed.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), input)
+            .await
+            .expect("batch dispatch succeeded");
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert!(results[1].is_ok(), "{:?}", results[1]);
+        assert!(
+            matches!(
+                results[2].as_ref(),
+                Err(UsageCollectorError::InvalidArgument {
+                    reason: ValidationReason::InvalidationFieldMismatch,
+                    ..
+                })
+            ),
+            "only the unfaithful copy MUST be rejected, and at its own index: {:?}",
+            results[2],
         );
     }
 }
@@ -1236,7 +1696,6 @@ mod get_usage_record_tests {
 
     use usage_collector_sdk::{
         USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
-        UsageRecordStatus,
     };
     use uuid::Uuid;
 
@@ -1261,8 +1720,7 @@ mod get_usage_record_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new("idem-happy").expect("valid idempotency key"),
-            corrects_id: None,
-            status: UsageRecordStatus::Active,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
@@ -1587,9 +2045,9 @@ mod private_helpers_tests {
     #[test]
     fn user_filter_and_scope_are_and_merged() {
         let user_filter = Expr::Compare(
-            Box::new(Expr::Identifier("status".into())),
+            Box::new(Expr::Identifier("resource_type".into())),
             CompareOperator::Eq,
-            Box::new(Expr::Value(Value::String("active".into()))),
+            Box::new(Expr::Value(Value::String("compute.vm".into()))),
         );
         let mut user_query = ODataQuery::new();
         user_query.filter = Some(Box::new(user_filter));
@@ -1615,14 +2073,15 @@ mod private_helpers_tests {
 }
 
 // The plural `create_usage_records` path is exercised by the `pdp_dedup`,
-// `gts_id_dedup`, and `corrects_id_dedup` modules; the singular path has
-// its own PDP / catalog / semantics / L1 / SPI sequencing in
-// `service.rs::create_usage_record` and was uncovered. These tests pin one
-// outcome per stage: PDP deny, plugin-reported transient on the persist
-// SPI, semantics violations (negative counter + gauge compensation),
-// L1 corrects_id not-found, L1 corrects_id wrong-scope, and the happy
-// path. The mirror keeps a single source-of-truth for what "every stage
-// rejects with its locked SDK envelope" means for the singular flow.
+// `gts_id_dedup` and `invalidation_target_batch` modules; the singular path
+// has its own PDP / declaration / target / metadata / SPI sequencing in
+// `service.rs::create_usage_record` — an in-line lookup rather than the
+// deduped fan-out, so the two are separate code and need separate cover.
+// These tests pin one outcome per stage: PDP deny, plugin-reported
+// transient on the persist SPI, a target that resolves to nothing, a target
+// that is itself a withdrawal, an unfaithful copy, the copy rule outranking
+// the metadata rule, the store's at-most-one rejection, a backend fault on
+// the target read, and the happy path.
 
 mod create_usage_record_path_tests {
     use std::collections::BTreeMap;
@@ -1631,28 +2090,30 @@ mod create_usage_record_path_tests {
 
     use time::OffsetDateTime;
     use usage_collector_sdk::{
-        ConflictReason, CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef,
-        USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
-        UsageCollectorPluginV1, UsageRecord, UsageRecordStatus,
+        ConflictReason, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId,
+        ReasonCode, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
+        UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, ValidationReason,
     };
     use uuid::Uuid;
 
     use crate::domain::Service;
     use crate::domain::test_support::{
         DenyAllResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx, enforcer_for,
-        fake_declaration_source_with_fold, hub_with_plugin, projected,
+        fake_declaration_source_with_fold, fake_declaration_source_with_metadata, hub_with_plugin,
+        projected,
     };
 
     const COUNTER_GTS_ID: &str =
         gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
-    /// Build an ordinary record (no `corrects_id`) with the given
+    /// Build an ordinary measurement (no `invalidates`) with the given
     /// `tenant_id` and `value`. Used as the base shape every test in this
     /// module shapes — call sites mutate `value` / `gts_type_id` /
-    /// `corrects_id` to drive the per-stage outcome. There is no more
-    /// caller-visible `kind` to gate a value-sign rule on, so `value` no longer
-    /// drives any accept/reject decision here — it is carried only because
-    /// `CreateUsageRecord` requires one.
+    /// `invalidation` to drive the per-stage outcome. There is no
+    /// caller-visible `kind` to gate a value-sign rule on, so `value` no
+    /// longer drives any accept/reject decision here — it is carried only
+    /// because `CreateUsageRecord` requires one, and because a withdrawal
+    /// has to echo it.
     fn counter_record(tenant_id: Uuid, value: i64, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
             gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
@@ -1663,16 +2124,35 @@ mod create_usage_record_path_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(value),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: None,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
     }
 
-    fn counter_compensation(tenant_id: Uuid, corrects_id: Uuid, idem: &str) -> CreateUsageRecord {
-        let mut r = counter_record(tenant_id, -1, idem);
-        r.corrects_id = Some(corrects_id);
+    /// A withdrawal of `target`: a faithful copy of
+    /// `counter_record(tenant_id, 10, ..)`, departing only in its own
+    /// idempotency key and the withdrawal itself. The quantity is echoed,
+    /// never negated — an invalidation removes a measurement rather than
+    /// offsetting it
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    fn counter_withdrawal(tenant_id: Uuid, target: Uuid, idem: &str) -> CreateUsageRecord {
+        let mut r = counter_record(tenant_id, 10, idem);
+        r.invalidation = Some(Invalidation {
+            target,
+            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+        });
         r
+    }
+
+    /// The persisted entry [`counter_withdrawal`] copies faithfully: same
+    /// caller-supplied fields, its own identity and idempotency key.
+    fn target_row(tenant_id: Uuid, id: Uuid) -> UsageRecord {
+        UsageRecord {
+            id,
+            idempotency_key: IdempotencyKey::new("idem-target").expect("valid idempotency key"),
+            ..projected(&counter_record(tenant_id, 10, "idem-target"))
+        }
     }
 
     /// Build a `Service` wired against a permit-by-default PDP, a working
@@ -1722,7 +2202,7 @@ mod create_usage_record_path_tests {
         assert_eq!(
             plugin.get_usage_record_calls(),
             0,
-            "PDP deny MUST short-circuit before any L1 lookup",
+            "PDP deny MUST short-circuit before any target lookup",
         );
         assert!(
             plugin.last_create_records_input().is_none(),
@@ -1769,12 +2249,42 @@ mod create_usage_record_path_tests {
         }
     }
 
-    /// `corrects_id` references a uuid the plugin does not have ⇒
-    /// `CorrectsIdNotFound`. Pins the L1 referential rule 1 lift on the
-    /// singular path (the plural path has its own coverage in
-    /// `corrects_id_dedup_tests`).
+    /// A faithful withdrawal of a resolvable target is accepted, and costs
+    /// exactly one target read.
     #[tokio::test]
-    async fn create_usage_record_l1_corrects_id_not_found_returns_typed_error() {
+    async fn create_usage_record_accepts_a_faithful_withdrawal_after_one_target_lookup() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x703);
+        let target = Uuid::from_u128(0x800);
+        plugin.set_get_record(target_row(tenant_id, target));
+
+        let submission = counter_withdrawal(tenant_id, target, "idem-faithful");
+        plugin.set_create_record(projected(&submission));
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as _,
+            "test.singular.faithful.records.v1",
+        );
+
+        service
+            .create_usage_record(&authenticated_ctx(), submission)
+            .await
+            .expect("a faithful withdrawal of a resolvable target MUST be accepted");
+
+        assert_eq!(
+            plugin.get_usage_record_calls(),
+            1,
+            "an invalidation MUST resolve its target exactly once",
+        );
+    }
+
+    /// `invalidates` names a uuid the plugin does not hold ⇒ `NotFound`
+    /// naming the target. The valid-reference rule of
+    /// `cpt-cf-usage-collector-adr-append-only-invalidation`, on the
+    /// singular path (the batch path has its own cover in
+    /// `invalidation_target_batch_tests`).
+    #[tokio::test]
+    async fn create_usage_record_unresolvable_target_returns_not_found() {
         let plugin = HappyPathPlugin::new();
 
         let missing = Uuid::from_u128(0x801);
@@ -1782,95 +2292,293 @@ mod create_usage_record_path_tests {
 
         let service = service_with_permit(
             Arc::clone(&plugin) as _,
-            "test.singular.l1_not_found.records.v1",
+            "test.singular.target_not_found.records.v1",
         );
 
-        let record = counter_compensation(Uuid::from_u128(0x705), missing, "idem-l1-missing");
+        let record = counter_withdrawal(Uuid::from_u128(0x705), missing, "idem-missing-target");
 
         let err = service
             .create_usage_record(&authenticated_ctx(), record)
             .await
-            .expect_err("unknown corrects_id MUST surface as Err");
+            .expect_err("an unresolvable target MUST surface as Err");
 
         assert!(
             matches!(
                 err,
-                UsageCollectorError::NotFound { ref resource_type, ref detail, .. }
+                UsageCollectorError::NotFound { ref resource_type, ref name, ref detail }
                     if resource_type == USAGE_RECORD_RESOURCE
-                        && detail.contains("corrects_id")
+                        && name == &missing.to_string()
                         && detail.contains(&missing.to_string())
             ),
-            "L1 referential rule 1 MUST surface as `CorrectsIdNotFound` \
-             carrying the caller-supplied corrects_id; got {err:?}",
+            "an unresolvable `invalidates` MUST surface as NotFound naming the \
+             caller-supplied target; got {err:?}",
         );
         assert!(
-            plugin.last_create_records_input().is_none(),
-            "L1 not-found MUST short-circuit before the persist SPI",
+            plugin.last_create_record_input().is_none(),
+            "an unresolvable target MUST short-circuit before the persist SPI",
         );
     }
 
-    /// `corrects_id` references a row in a different `tenant_id` ⇒
-    /// `CorrectsIdWrongScope`. Pins the L1 referential rule 3 lift on
-    /// the singular path: the verifier reads identity-tuple fields
-    /// (tenant, `gts_type_id`, `resource_ref`, `subject_ref`) off the
-    /// referenced row and rejects on the first mismatch.
+    /// `invalidates` names an entry that is itself a withdrawal ⇒
+    /// `InvalidationTargetNotRecord`. A correction cannot be reversed: the
+    /// entry that withdrew a measurement is not itself withdrawable.
     #[tokio::test]
-    async fn create_usage_record_l1_corrects_id_wrong_scope_returns_typed_error() {
+    async fn create_usage_record_target_that_is_an_invalidation_is_refused() {
         let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x707);
+        let target = Uuid::from_u128(0x802);
 
-        let referenced_tenant = Uuid::from_u128(0x901);
-        let other_tenant = Uuid::from_u128(0x902);
-        let corrects_id = Uuid::from_u128(0x802);
-
-        // Referenced row sits in `referenced_tenant`; the incoming
-        // compensation will be shaped under `other_tenant` so the
-        // identity-tuple comparison fails on the tenant axis.
-        let referenced = UsageRecord {
-            id: corrects_id,
-            gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
-            tenant_id: referenced_tenant,
-            resource_ref: ResourceRef::new("rsc-singular", "compute.vm")
-                .expect("valid resource ref"),
-            subject_ref: None,
-            metadata: BTreeMap::new(),
-            value: rust_decimal::Decimal::from(10),
-            idempotency_key: IdempotencyKey::new("idem-referenced").expect("valid idempotency key"),
-            corrects_id: None,
-            status: UsageRecordStatus::Active,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
-        };
-        plugin.set_get_record(referenced);
+        let mut row = target_row(tenant_id, target);
+        row.invalidation = Some(Invalidation {
+            target: Uuid::from_u128(0x80F),
+            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+        });
+        plugin.set_get_record(row);
 
         let service = service_with_permit(
             Arc::clone(&plugin) as _,
-            "test.singular.l1_wrong_scope.records.v1",
+            "test.singular.target_not_record.records.v1",
         );
-
-        let record = counter_compensation(other_tenant, corrects_id, "idem-l1-wrong-scope");
 
         let err = service
-            .create_usage_record(&authenticated_ctx(), record)
+            .create_usage_record(
+                &authenticated_ctx(),
+                counter_withdrawal(tenant_id, target, "idem-withdraw-a-withdrawal"),
+            )
             .await
-            .expect_err("cross-tenant corrects_id MUST surface as Err");
+            .expect_err("withdrawing a withdrawal MUST surface as Err");
 
-        assert!(
-            matches!(
-                err,
-                UsageCollectorError::Conflict {
-                    reason: ConflictReason::CorrectsIdWrongScope,
-                    ref name,
-                    ref detail,
-                    ..
-                } if name == &corrects_id.to_string()
-                    || detail.contains(&corrects_id.to_string()),
+        match err {
+            UsageCollectorError::InvalidArgument {
+                reason: ValidationReason::InvalidationTargetNotRecord,
+                field,
+                resource_name,
+                ..
+            } => {
+                assert_eq!(field, "invalidates");
+                assert_eq!(resource_name.as_deref(), Some(target.to_string().as_str()));
+            }
+            other => panic!(
+                "a target that is itself an invalidation MUST surface as \
+                 InvalidationTargetNotRecord; got {other:?}",
             ),
-            "L1 referential rule 3 MUST surface as `CorrectsIdWrongScope` \
-             carrying the caller-supplied corrects_id; got {err:?}",
-        );
+        }
         assert!(
-            plugin.last_create_records_input().is_none(),
-            "L1 wrong-scope MUST short-circuit before the persist SPI",
+            plugin.last_create_record_input().is_none(),
+            "a non-record target MUST short-circuit before the persist SPI",
+        );
+    }
+
+    /// A withdrawal departing from its target in a copied field ⇒
+    /// `InvalidationFieldMismatch` **naming the field that differs**. The
+    /// message names what differs and never what it differs from: the
+    /// target was read unscoped, so echoing its value would make the
+    /// rejection an oracle for a row this caller has no grant for.
+    #[tokio::test]
+    async fn create_usage_record_unfaithful_copy_names_the_field_that_differs() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x708);
+        let target = Uuid::from_u128(0x803);
+
+        let mut row = target_row(tenant_id, target);
+        row.value = rust_decimal::Decimal::from(999);
+        plugin.set_get_record(row);
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as _,
+            "test.singular.field_mismatch.records.v1",
+        );
+
+        let err = service
+            .create_usage_record(
+                &authenticated_ctx(),
+                counter_withdrawal(tenant_id, target, "idem-unfaithful"),
+            )
+            .await
+            .expect_err("an unfaithful copy MUST surface as Err");
+
+        match err {
+            UsageCollectorError::InvalidArgument {
+                reason: ValidationReason::InvalidationFieldMismatch,
+                field,
+                detail,
+                ..
+            } => {
+                assert_eq!(
+                    field, "value",
+                    "the rejection MUST name the field that differs"
+                );
+                assert!(
+                    !detail.contains("999"),
+                    "the rejection MUST NOT echo the target's value: {detail}",
+                );
+            }
+            other => panic!(
+                "a departure in a copied field MUST surface as \
+                 InvalidationFieldMismatch; got {other:?}",
+            ),
+        }
+    }
+
+    /// A submission breaking the copy rule **and** the metadata rule is
+    /// told about the copy: the metadata it would be sent to fix is
+    /// metadata it has to copy from the target regardless.
+    #[tokio::test]
+    async fn create_usage_record_copy_mismatch_outranks_a_metadata_rejection() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x709);
+        let target = Uuid::from_u128(0x804);
+
+        let mut row = target_row(tenant_id, target);
+        row.value = rust_decimal::Decimal::from(999);
+        plugin.set_get_record(row);
+
+        let mut submission = counter_withdrawal(tenant_id, target, "idem-both-broken");
+        submission.metadata.insert(
+            MetadataKey::new("zone").expect("valid metadata key"),
+            "eu-1".to_owned(),
+        );
+
+        // The declaration declares `region` alone, so `zone` fails the
+        // closed-shape check.
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_metadata(&["region"]))
+            .build(
+                Arc::clone(&plugin) as _,
+                "test.singular.priority.records.v1",
+            );
+
+        let err = service
+            .create_usage_record(&authenticated_ctx(), submission)
+            .await
+            .expect_err("a submission breaking both rules MUST surface as Err");
+
+        match err {
+            UsageCollectorError::InvalidArgument { reason, .. } => assert_eq!(
+                reason,
+                ValidationReason::InvalidationFieldMismatch,
+                "the copy rejection MUST outrank the metadata one",
+            ),
+            other => panic!("expected a validation rejection, got {other:?}"),
+        }
+    }
+
+    /// The store's at-most-one rule, lifted verbatim. The gateway runs no
+    /// pre-read for it — only the store can make the check atomic with the
+    /// entry it admits.
+    #[tokio::test]
+    async fn create_usage_record_plugin_already_invalidated_lifts_to_conflict() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x70A);
+        let target = Uuid::from_u128(0x805);
+        let existing = Uuid::from_u128(0x806);
+        plugin.set_get_record(target_row(tenant_id, target));
+        plugin.set_create_record_err(UsageCollectorPluginError::AlreadyInvalidated {
+            id: target,
+            invalidated_by: existing,
+        });
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as _,
+            "test.singular.already_invalidated.records.v1",
+        );
+
+        let err = service
+            .create_usage_record(
+                &authenticated_ctx(),
+                counter_withdrawal(tenant_id, target, "idem-second-withdrawal"),
+            )
+            .await
+            .expect_err("a second withdrawal MUST surface as Err");
+
+        match err {
+            UsageCollectorError::Conflict {
+                reason: ConflictReason::AlreadyInvalidated,
+                name,
+                detail,
+                ..
+            } => {
+                assert_eq!(name, target.to_string());
+                assert!(detail.contains(&existing.to_string()));
+            }
+            other => panic!("at-most-one is the store's rule to report; got {other:?}"),
+        }
+    }
+
+    /// A backend fault on the target read MUST fail the submission rather
+    /// than reject it: an unreadable target is not an absent one.
+    #[tokio::test]
+    async fn create_usage_record_transient_target_lookup_lifts_to_service_unavailable() {
+        let plugin = HappyPathPlugin::new();
+        plugin.set_get_usage_record_transient("target store timed out", Some(7));
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as _,
+            "test.singular.target_transient.records.v1",
+        );
+
+        let err = service
+            .create_usage_record(
+                &authenticated_ctx(),
+                counter_withdrawal(Uuid::from_u128(0x70B), Uuid::from_u128(0x807), "idem-t"),
+            )
+            .await
+            .expect_err("a transient target read MUST surface as Err");
+
+        match err {
+            UsageCollectorError::ServiceUnavailable {
+                detail,
+                retry_after_seconds,
+            } => {
+                assert_eq!(detail, "target store timed out");
+                assert_eq!(retry_after_seconds, Some(7));
+            }
+            other => panic!("a transient target read MUST NOT become a rejection; got {other:?}"),
+        }
+    }
+
+    /// A plugin answering `get_usage_record(a)` with a different row MUST be
+    /// refused here too. This path reads one id and gets one row back, so
+    /// it has even less excuse than the batch fan-out; the submission is
+    /// again a faithful copy of the returned row, so without the check it
+    /// is accepted.
+    #[tokio::test]
+    async fn create_usage_record_refuses_a_plugin_that_answers_with_the_wrong_row() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x70C);
+        let requested = Uuid::from_u128(0x808);
+        let answered = Uuid::from_u128(0x809);
+        plugin.set_get_record(target_row(tenant_id, answered));
+
+        // Programmed so a gateway that believed the row would return
+        // `Ok(..)` — the false accept — rather than tripping over an
+        // unprogrammed SPI and reporting the wrong defect.
+        let submission = counter_withdrawal(tenant_id, requested, "idem-wrong-row");
+        plugin.set_create_record(projected(&submission));
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as _,
+            "test.singular.wrong_row.records.v1",
+        );
+
+        let err = service
+            .create_usage_record(&authenticated_ctx(), submission)
+            .await
+            .expect_err("a mis-answering plugin MUST surface as Err");
+
+        match err {
+            UsageCollectorError::Internal { detail } => {
+                assert!(detail.contains(&requested.to_string()), "{detail}");
+                assert!(!detail.contains(&answered.to_string()), "{detail}");
+            }
+            other => panic!(
+                "a row that is not the row asked for MUST be a host-invariant \
+                 breach, not an acceptance; got {other:?}",
+            ),
+        }
+        assert!(
+            plugin.last_create_record_input().is_none(),
+            "the breach MUST short-circuit before the persist SPI",
         );
     }
 
@@ -1914,8 +2622,7 @@ mod create_usage_record_path_tests {
         assert_eq!(
             plugin.get_usage_record_calls(),
             0,
-            "ordinary counter records (corrects_id IS NULL) MUST NOT \
-             trigger an L1 lookup",
+            "an entry carrying no `invalidates` MUST NOT trigger a target lookup",
         );
     }
 }
@@ -1954,7 +2661,7 @@ mod batch_size_cap_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: None,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
@@ -2078,7 +2785,7 @@ mod derived_id_stamp_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: None,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
@@ -2230,7 +2937,7 @@ mod covered_period_batch_tests {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
-            corrects_id: None,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
@@ -2729,7 +3436,7 @@ mod ingestion_declared_type_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(format!("idem-{}", Uuid::new_v4()))
                 .expect("valid idempotency key"),
-            corrects_id: None,
+            invalidation: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
         }
