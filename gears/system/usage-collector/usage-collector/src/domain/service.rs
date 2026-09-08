@@ -1041,14 +1041,13 @@ impl Service {
     /// Batch ingestion entry
     /// (`cpt-cf-usage-collector-flow-usage-emission-emit-records-batch`).
     ///
-    /// The live batch route: runs `create_usage_records_instrumented` with
-    /// [`RecordOrigin::Live`], which enforces the
-    /// `1..=`[`MAX_BATCH_RECORDS`] structural cap (rejected before the
-    /// pipeline and NOT recorded on either ingestion instrument, per
-    /// §3.11.5's closed vocabulary), observes `uc_ingestion_batch_size`,
-    /// delegates to [`Self::create_usage_records_inner`], and records the
-    /// completion telemetry: one `uc_ingestion_records_total` per per-record
-    /// outcome, one `uc_ingestion_requests_total` (`accepted` / `partial` /
+    /// The live batch route. Enforces the `1..=`[`MAX_BATCH_RECORDS`]
+    /// structural cap (rejected before the pipeline and NOT recorded on
+    /// either ingestion instrument, per §3.11.5's closed vocabulary),
+    /// observes `uc_ingestion_batch_size`, delegates to
+    /// [`Self::create_usage_records_inner`], and records the completion
+    /// telemetry: one `uc_ingestion_records_total` per per-record outcome,
+    /// one `uc_ingestion_requests_total` (`accepted` / `partial` /
     /// `rejected`), and `uc_ingestion_duration_seconds` — the first and last
     /// of those carrying `origin="live"`.
     ///
@@ -1069,13 +1068,16 @@ impl Service {
         ctx: &SecurityContext,
         records: Vec<CreateUsageRecord>,
     ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError> {
-        // `Live` comes from the route this wrapper *is*, not from a default.
-        self.create_usage_records_instrumented(ctx, records, RecordOrigin::Live)
+        // The batch body lives in `create_usage_records_for_origin`, shared
+        // with the backfill route so the two cannot drift. `Live` comes from
+        // the route this wrapper *is*, not from a default.
+        self.create_usage_records_for_origin(ctx, records, RecordOrigin::Live)
             .await
     }
 
     /// The batch ingestion body, parameterized by the path that admitted the
-    /// submission.
+    /// submission: the structural `1..=`[`MAX_BATCH_RECORDS`] cap, the
+    /// pipeline call, and the completion telemetry alike.
     ///
     /// DESIGN §3.2 makes the backfill path "the same component under
     /// workload isolation: identical validation ... and `origin =
@@ -1085,7 +1087,7 @@ impl Service {
     /// share this body rather than each carrying a copy of the completion
     /// telemetry — a second copy is how the two paths' counters drift apart
     /// the first time one of them is edited.
-    async fn create_usage_records_instrumented(
+    async fn create_usage_records_for_origin(
         &self,
         ctx: &SecurityContext,
         records: Vec<CreateUsageRecord>,

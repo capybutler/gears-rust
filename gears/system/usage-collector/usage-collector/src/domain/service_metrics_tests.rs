@@ -252,6 +252,17 @@ async fn ingestion_single_deny_records_rejected_authz_and_duration_no_request_co
         histogram_count(&exporter, "uc_ingestion_duration_seconds"),
         1
     );
+    // The adapter tests prove the instruments emit whatever origin they are
+    // handed; these prove the live wrapper hands them `live`. Without them,
+    // hardcoding `RecordOrigin::Backfill` in the wrapper passes the suite.
+    assert_eq!(
+        counter_sum_with_label(&exporter, "uc_ingestion_records_total", "origin", "live"),
+        1,
+    );
+    assert_eq!(
+        histogram_count_with_label(&exporter, "uc_ingestion_duration_seconds", "origin", "live"),
+        1,
+    );
     // Single-emit does NOT increment the batch-only request counter.
     assert_eq!(
         counter_sum_with_label(
@@ -306,6 +317,16 @@ async fn ingestion_batch_all_denied_observes_batch_size_and_partial_request() {
     assert_eq!(
         histogram_count(&exporter, "uc_ingestion_duration_seconds"),
         1
+    );
+    // Both entries travelled the live batch wrapper, so both per-entry
+    // increments and the one duration observation carry `origin="live"`.
+    assert_eq!(
+        counter_sum_with_label(&exporter, "uc_ingestion_records_total", "origin", "live"),
+        2,
+    );
+    assert_eq!(
+        histogram_count_with_label(&exporter, "uc_ingestion_duration_seconds", "origin", "live"),
+        1,
     );
 }
 

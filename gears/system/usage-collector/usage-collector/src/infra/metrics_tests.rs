@@ -411,62 +411,25 @@ fn ingestion_instruments_render_names_labels_and_buckets() {
 
 #[test]
 fn the_ingestion_instruments_separate_live_from_backfilled_entries() {
-    // DESIGN §3.11.5 puts `origin` on both ingestion families. The counter
-    // carries the throughput NFR, and the backfill share is one of the
-    // things it exists to make legible. The histogram carries the latency
-    // budget, and a bulk import's latency profile is not the live path's —
-    // averaging them together is what would hide a catch-up job degrading
-    // live ingestion.
+    // `uc_ingestion_duration_seconds` carries the latency budget, and a bulk
+    // import's latency profile is not the live path's — averaging them
+    // together is what would hide a catch-up job degrading live ingestion.
+    //
+    // The histogram is the half of DESIGN §3.11.5's `origin` pair that no
+    // other test can cover: it was label-free before this slice, so both
+    // observations used to land in one series, and `histogram_count` /
+    // `histogram_bounds` are label-blind — the total of 2 below holds
+    // whether these landed in one series or two. Only the per-origin counts
+    // tell those apart. The counter's `origin` vocabulary is left to
+    // `ingestion_instruments_render_names_labels_and_buckets`, which already
+    // drives both values through it.
     let (provider, exporter) = local_provider();
     let m = meter(&provider, TEST_PREFIX);
 
-    m.record_ingestion_record(
-        RecordOutcome::Accepted,
-        EntryType::Record,
-        RecordOrigin::Live,
-        RecordErrorCategory::None,
-    );
-    m.record_ingestion_record(
-        RecordOutcome::Accepted,
-        EntryType::Invalidation,
-        RecordOrigin::Backfill,
-        RecordErrorCategory::None,
-    );
     m.observe_ingestion_duration(0.05, RecordOrigin::Live);
     m.observe_ingestion_duration(0.4, RecordOrigin::Backfill);
     provider.force_flush().unwrap();
 
-    assert_eq!(
-        counter_sum_with_label(&exporter, "uc_ingestion_records_total", "origin", "live"),
-        1,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_ingestion_records_total",
-            "origin",
-            "backfill"
-        ),
-        1,
-    );
-
-    // A withdrawal of closed history is the entry that carries both new
-    // label values at once, and it is the ordinary case rather than an
-    // exotic one: the covered-period bounds belong to the path, so a
-    // correction of a closed period travels the backfill route.
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_ingestion_records_total",
-            "entry_type",
-            "invalidation",
-        ),
-        1,
-    );
-
-    // The histogram was label-free before this slice, so both observations
-    // used to land in one series; they are now two. The total alone cannot
-    // tell those apart, so assert the per-origin split as well.
     assert_eq!(
         histogram_count(&exporter, "uc_ingestion_duration_seconds"),
         2
