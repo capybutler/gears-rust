@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
-use time::OffsetDateTime;
 use toolkit_gts::gts_id;
 use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo};
 use usage_collector_sdk::{
@@ -34,7 +33,8 @@ use crate::domain::test_support::{
     ServiceFixture, UnreachableResolver, authenticated_ctx, counter_sum_with_label, enforcer_for,
     fake_declaration_source_with_fold, fake_declaration_source_with_metadata, gauge_last,
     histogram_count, histogram_count_with_label, histogram_sum, histogram_sum_with_label,
-    hub_with_plugin, local_metrics, service_with_metrics_unready_plugin, test_time_range,
+    hub_with_plugin, local_metrics, recent_window_end, recent_window_start,
+    service_with_metrics_unready_plugin, test_time_range,
 };
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use usage_collector_sdk::UsageCollectorPluginError;
@@ -54,8 +54,8 @@ fn sample_record() -> UsageRecord {
         idempotency_key: IdempotencyKey::new("idem-1").expect("valid idempotency key"),
         origin: RecordOrigin::Live,
         invalidation: None,
-        window_start: OffsetDateTime::UNIX_EPOCH,
-        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        window_start: recent_window_start(),
+        window_end: recent_window_end(),
     }
 }
 
@@ -72,8 +72,8 @@ fn sample_create_record() -> CreateUsageRecord {
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-1").expect("valid idempotency key"),
         invalidation: None,
-        window_start: OffsetDateTime::UNIX_EPOCH,
-        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        window_start: recent_window_start(),
+        window_end: recent_window_end(),
     }
 }
 

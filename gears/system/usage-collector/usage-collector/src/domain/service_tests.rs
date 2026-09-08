@@ -364,7 +364,6 @@ mod pdp_dedup_tests {
     use std::sync::Arc;
     use toolkit_gts::gts_id;
 
-    use time::OffsetDateTime;
     use usage_collector_sdk::{
         CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef, SubjectRef,
         UsageCollectorPluginV1, UsageRecord,
@@ -373,6 +372,7 @@ mod pdp_dedup_tests {
 
     use crate::domain::test_support::{
         HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
+        recent_window_end, recent_window_start,
     };
 
     const HAPPY_GTS_ID: &str =
@@ -405,8 +405,8 @@ mod pdp_dedup_tests {
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             origin: RecordOrigin::Live,
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 
@@ -423,8 +423,8 @@ mod pdp_dedup_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 
@@ -725,7 +725,6 @@ mod gts_type_id_dedup_tests {
     use std::sync::Arc;
     use toolkit_gts::gts_id;
 
-    use time::OffsetDateTime;
     use usage_collector_sdk::{
         CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
         USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
@@ -734,7 +733,7 @@ mod gts_type_id_dedup_tests {
 
     use crate::domain::test_support::{
         HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_counting,
-        fake_declaration_source_with_one_unresolvable,
+        fake_declaration_source_with_one_unresolvable, recent_window_end, recent_window_start,
     };
 
     const GTS_A: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -756,8 +755,8 @@ mod gts_type_id_dedup_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 
@@ -934,7 +933,6 @@ mod invalidation_target_batch_tests {
     use std::sync::Arc;
     use toolkit_gts::gts_id;
 
-    use time::OffsetDateTime;
     use usage_collector_sdk::{
         ConflictReason, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId,
         ReasonCode, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
@@ -946,6 +944,7 @@ mod invalidation_target_batch_tests {
     use crate::domain::test_support::{
         HappyPathPlugin, ServiceFixture, authenticated_ctx, counter_sum_with_label,
         fake_declaration_source_with_fold, fake_declaration_source_with_metadata, projected,
+        recent_window_end, recent_window_start,
     };
 
     const COUNTER_GTS_ID: &str =
@@ -973,8 +972,8 @@ mod invalidation_target_batch_tests {
             value: rust_decimal::Decimal::from(10),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 
@@ -2091,7 +2090,6 @@ mod create_usage_record_path_tests {
     use std::sync::Arc;
     use toolkit_gts::gts_id;
 
-    use time::OffsetDateTime;
     use usage_collector_sdk::{
         ConflictReason, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId,
         ReasonCode, RecordOrigin, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
@@ -2103,7 +2101,7 @@ mod create_usage_record_path_tests {
     use crate::domain::test_support::{
         DenyAllResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx, enforcer_for,
         fake_declaration_source_with_fold, fake_declaration_source_with_metadata, hub_with_plugin,
-        projected,
+        projected, recent_window_end, recent_window_start,
     };
 
     const COUNTER_GTS_ID: &str =
@@ -2128,8 +2126,8 @@ mod create_usage_record_path_tests {
             value: rust_decimal::Decimal::from(value),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 
@@ -2648,7 +2646,6 @@ mod batch_size_cap_tests {
     use std::sync::Arc;
     use toolkit_gts::gts_id;
 
-    use time::OffsetDateTime;
     use usage_collector_sdk::{
         CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorError,
         UsageCollectorPluginV1, ValidationReason,
@@ -2656,7 +2653,9 @@ mod batch_size_cap_tests {
     use uuid::Uuid;
 
     use crate::domain::service::MAX_BATCH_RECORDS;
-    use crate::domain::test_support::{HappyPathPlugin, ServiceFixture, authenticated_ctx};
+    use crate::domain::test_support::{
+        HappyPathPlugin, ServiceFixture, authenticated_ctx, recent_window_end, recent_window_start,
+    };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
@@ -2671,8 +2670,8 @@ mod batch_size_cap_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 
@@ -2761,7 +2760,6 @@ mod server_assigned_stamp_tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use time::OffsetDateTime;
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
         CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
@@ -2772,7 +2770,7 @@ mod server_assigned_stamp_tests {
     use crate::domain::Service;
     use crate::domain::test_support::{
         HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
-        projected,
+        projected, recent_window_end, recent_window_start,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -2799,8 +2797,8 @@ mod server_assigned_stamp_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 
@@ -2965,7 +2963,6 @@ mod covered_period_batch_tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use time::OffsetDateTime;
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
         CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorError,
@@ -2976,7 +2973,7 @@ mod covered_period_batch_tests {
     use crate::domain::Service;
     use crate::domain::test_support::{
         DenyOneResourceResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx,
-        fake_declaration_source_with_fold, projected,
+        fake_declaration_source_with_fold, projected, recent_window_end, recent_window_start,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -3006,8 +3003,8 @@ mod covered_period_batch_tests {
             value: rust_decimal::Decimal::from(1),
             idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 
@@ -3436,7 +3433,6 @@ mod ingestion_declared_type_tests {
 
     use std::sync::Arc;
 
-    use time::OffsetDateTime;
     use toolkit_gts::gts_id;
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
@@ -3450,7 +3446,8 @@ mod ingestion_declared_type_tests {
     use crate::domain::test_support::{
         RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture, authenticated_ctx,
         fake_declaration_source_counting, fake_declaration_source_not_found,
-        fake_declaration_source_with_metadata, projected, recording_plugin_resolver,
+        fake_declaration_source_with_metadata, projected, recent_window_end, recent_window_start,
+        recording_plugin_resolver,
     };
 
     const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
@@ -3505,8 +3502,8 @@ mod ingestion_declared_type_tests {
             idempotency_key: IdempotencyKey::new(format!("idem-{}", Uuid::new_v4()))
                 .expect("valid idempotency key"),
             invalidation: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }
     }
 

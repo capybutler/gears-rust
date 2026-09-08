@@ -33,7 +33,8 @@ use crate::api::rest::dto::{CreateUsageRecordRequest, CreateUsageRecordsRequest,
 use crate::domain::Service;
 use crate::domain::test_support::{
     CountingPermitResolver, CountingUnreachableResolver, HappyPathPlugin, ServiceFixture,
-    authenticated_ctx, enforcer_for, fake_declaration_source_with_fold, recording_plugin_resolver,
+    authenticated_ctx, enforcer_for, fake_declaration_source_with_fold, recent_window_end,
+    recent_window_start, recording_plugin_resolver,
 };
 
 /// Wire a `Service` against a counting unreachable-PDP resolver and an
@@ -73,8 +74,8 @@ async fn create_with_only_bad_gts_type_id_records_short_circuits_to_207_without_
             idempotency_key: "idem-bad-prefix-1".to_owned(),
             invalidates: None,
             reason_code: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: EPOCH_PLUS_ONE_HOUR,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }],
     };
 
@@ -193,8 +194,8 @@ async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_no
             idempotency_key: "idem-over-long-1".to_owned(),
             invalidates: None,
             reason_code: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: EPOCH_PLUS_ONE_HOUR,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }],
     };
 
@@ -403,8 +404,8 @@ fn sample_persisted_entry(
         idempotency_key: IdempotencyKey::new("idem-happy").expect("valid idempotency key"),
         origin: RecordOrigin::Live,
         invalidation,
-        window_start: OffsetDateTime::UNIX_EPOCH,
-        window_end: EPOCH_PLUS_ONE_HOUR,
+        window_start: recent_window_start(),
+        window_end: recent_window_end(),
     }
 }
 
@@ -427,8 +428,8 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
         tenant_id,
         &gts_id,
         &idempotency_key,
-        OffsetDateTime::UNIX_EPOCH,
-        EPOCH_PLUS_ONE_HOUR,
+        recent_window_start(),
+        recent_window_end(),
     );
     let persisted_uuid = Uuid::new_v4();
     assert_ne!(derived_id, persisted_uuid, "test premise");
@@ -455,8 +456,8 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
             idempotency_key: "idem-happy".to_owned(),
             invalidates: None,
             reason_code: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: EPOCH_PLUS_ONE_HOUR,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }],
     };
 
@@ -528,8 +529,8 @@ async fn create_stamps_derived_id() {
         tenant_id,
         &gts_id,
         &idempotency_key,
-        OffsetDateTime::UNIX_EPOCH,
-        EPOCH_PLUS_ONE_HOUR,
+        recent_window_start(),
+        recent_window_end(),
     );
 
     let service = ServiceFixture::default()
@@ -553,8 +554,8 @@ async fn create_stamps_derived_id() {
             idempotency_key: "idem-derive-1".to_owned(),
             invalidates: None,
             reason_code: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: EPOCH_PLUS_ONE_HOUR,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }],
     };
 
@@ -642,14 +643,14 @@ async fn create_same_key_different_covered_periods_derives_distinct_ids() {
 
     let mut dispatched_ids = Vec::new();
     for (window_start, window_end) in [
-        (OffsetDateTime::UNIX_EPOCH, EPOCH_PLUS_ONE_HOUR),
+        (recent_window_start(), recent_window_end()),
         (
-            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
-            EPOCH_PLUS_ONE_HOUR,
+            recent_window_start() + time::Duration::seconds(1),
+            recent_window_end(),
         ),
         (
-            OffsetDateTime::UNIX_EPOCH,
-            EPOCH_PLUS_ONE_HOUR + time::Duration::seconds(1),
+            recent_window_start(),
+            recent_window_end() + time::Duration::seconds(1),
         ),
     ] {
         plugin.set_create_records(vec![Ok(sample_persisted_record(Uuid::new_v4(), tenant_id))]);
@@ -676,6 +677,18 @@ async fn create_same_key_different_covered_periods_derives_distinct_ids() {
         "one idempotency key + three distinct covered periods MUST derive three \
          distinct ids; got {dispatched_ids:?}",
     );
+}
+
+/// A covered-period bound in its wire spelling.
+///
+/// The wire-built fixtures format [`recent_window`]'s bounds through this
+/// rather than carrying a date literal: a literal sits inside the live
+/// path's 48-hour past tolerance only until it doesn't, and a fixture
+/// period that quietly stopped being plausible is the exact defect this
+/// re-base cleared.
+fn rfc3339(at: OffsetDateTime) -> String {
+    at.format(&time::format_description::well_known::Rfc3339)
+        .expect("a UTC instant formats as RFC 3339")
 }
 
 /// A one-record batch request built from the wire, so the RFC 3339 codec
@@ -785,8 +798,8 @@ fn create_request_json_with(extra: &serde_json::Value) -> serde_json::Value {
         "resource_ref": { "resource_id": "rsc-happy", "resource_type": "compute.vm" },
         "value": "1",
         "idempotency_key": "idem-withdrawal",
-        "window_start": "1970-01-01T00:00:00Z",
-        "window_end": "1970-01-01T01:00:00Z",
+        "window_start": rfc3339(recent_window_start()),
+        "window_end": rfc3339(recent_window_end()),
     });
     let obj = record.as_object_mut().expect("object");
     for (k, v) in extra.as_object().expect("extra is an object") {
@@ -1055,7 +1068,10 @@ async fn an_inverted_covered_period_is_rejected_per_record() {
     // per-record rejection uses.
     let (status, item) = dispatch_one_record_batch(
         "test.handler.create_records.inverted_period.v1",
-        create_request_json("2026-05-29T13:00:00Z", "2026-05-29T12:00:00Z"),
+        create_request_json(
+            &rfc3339(recent_window_end()),
+            &rfc3339(recent_window_start()),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::MULTI_STATUS);
@@ -1070,7 +1086,7 @@ async fn a_point_event_is_accepted_per_record() {
     // handler test.
     let (status, item) = dispatch_one_record_batch(
         "test.handler.create_records.point_event.v1",
-        create_request_json("2026-05-29T12:00:00Z", "2026-05-29T12:00:00Z"),
+        create_request_json(&rfc3339(recent_window_end()), &rfc3339(recent_window_end())),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1126,8 +1142,8 @@ async fn create_records_happy_path_wire_body_projects_the_invalidation_entry_typ
             idempotency_key: "idem-happy".to_owned(),
             invalidates: None,
             reason_code: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: EPOCH_PLUS_ONE_HOUR,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         }],
     };
 
@@ -1192,15 +1208,15 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         tenant_id,
         &gts_id,
         &IdempotencyKey::new("idem-mixed-0").expect("valid idempotency key"),
-        OffsetDateTime::UNIX_EPOCH,
-        EPOCH_PLUS_ONE_HOUR,
+        recent_window_start(),
+        recent_window_end(),
     );
     let derived_id_2 = derive_usage_record_id(
         tenant_id,
         &gts_id,
         &IdempotencyKey::new("idem-mixed-2").expect("valid idempotency key"),
-        OffsetDateTime::UNIX_EPOCH,
-        EPOCH_PLUS_ONE_HOUR,
+        recent_window_start(),
+        recent_window_end(),
     );
     let persisted_uuid_0 = Uuid::new_v4();
     let persisted_uuid_2 = Uuid::new_v4();
@@ -1229,8 +1245,8 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         idempotency_key: idem.to_owned(),
         invalidates: None,
         reason_code: None,
-        window_start: OffsetDateTime::UNIX_EPOCH,
-        window_end: EPOCH_PLUS_ONE_HOUR,
+        window_start: recent_window_start(),
+        window_end: recent_window_end(),
     };
 
     let req = CreateUsageRecordsRequest {
@@ -1249,8 +1265,8 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
                 idempotency_key: "idem-mixed-1".to_owned(),
                 invalidates: None,
                 reason_code: None,
-                window_start: OffsetDateTime::UNIX_EPOCH,
-                window_end: EPOCH_PLUS_ONE_HOUR,
+                window_start: recent_window_start(),
+                window_end: recent_window_end(),
             },
             valid_record("idem-mixed-2"),
         ],
@@ -2713,8 +2729,8 @@ async fn create_with_batch_above_cap_rejects_without_iterating_records() {
             idempotency_key: format!("idem-oversize-{i}"),
             invalidates: None,
             reason_code: None,
-            window_start: OffsetDateTime::UNIX_EPOCH,
-            window_end: EPOCH_PLUS_ONE_HOUR,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
         })
         .collect();
 

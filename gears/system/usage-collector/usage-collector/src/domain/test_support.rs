@@ -36,6 +36,56 @@ use usage_collector_sdk::{
 };
 use uuid::Uuid;
 
+/// A covered period a live emitter could plausibly have just closed: one
+/// hour long, ending an hour ago.
+///
+/// Ingestion fixtures need this because the live path bounds the end of the
+/// covered period against the wall clock, 48 hours by default. The epoch
+/// period these fixtures used before this slice was not realistic, only
+/// unconstrained — no emitter submits 1970 on the live path, and one that
+/// tried would now be told to use the backfill route.
+///
+/// Deliberately an hour clear of both bounds rather than minutes: a test
+/// that is 30 seconds from a boundary is a test that fails on a loaded CI
+/// runner. Read paths keep their epoch fixtures — they read no clock.
+///
+/// The pair is resolved once per test process and then reused verbatim, so
+/// two fixtures built by separate calls still describe the *same* covered
+/// period. That matters because `window_start` / `window_end` are two of
+/// the five dedup-identity members: a fixture pair that drifted by a
+/// microsecond would derive two different ids and quietly stop
+/// corresponding.
+pub(crate) fn recent_window() -> (time::OffsetDateTime, time::OffsetDateTime) {
+    static WINDOW: std::sync::LazyLock<(time::OffsetDateTime, time::OffsetDateTime)> =
+        std::sync::LazyLock::new(|| {
+            // Truncated to the whole second: `try_into_usage_record` admits
+            // at most microsecond precision, and a whole second is also what
+            // a hand-written RFC 3339 fixture can echo without surprises.
+            let now = time::OffsetDateTime::now_utc();
+            let end =
+                now.replace_nanosecond(0).expect("0 ns is in range") - time::Duration::hours(1);
+            (end - time::Duration::hours(1), end)
+        });
+    *WINDOW
+}
+
+/// The inclusive start of [`recent_window`].
+pub(crate) fn recent_window_start() -> time::OffsetDateTime {
+    recent_window().0
+}
+
+/// The exclusive end of [`recent_window`] — the only bound the ingestion
+/// path's tolerances read.
+///
+/// These two accessors exist alongside the pair because almost every
+/// fixture that needs them is a struct literal with a `window_start` and a
+/// `window_end` field and nowhere convenient to bind a tuple. Both read the
+/// one memoised pair, so the two halves can never come from different clock
+/// reads.
+pub(crate) fn recent_window_end() -> time::OffsetDateTime {
+    recent_window().1
+}
+
 /// Projects a create submission into its persisted shape, for a plugin echo
 /// fixture that must agree with the service on the derived `id`.
 ///
