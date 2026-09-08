@@ -887,6 +887,10 @@ pub struct UsageRecord {
     /// stable per-meter key covers many periods without collapsing them
     /// onto one entry.
     pub idempotency_key: IdempotencyKey,
+    /// Which path admitted this entry — server-assigned by the Ingestion
+    /// Gateway from the route it arrived on, never caller-supplied. See
+    /// [`RecordOrigin`]. Not an input to [`Self::id`]'s derivation.
+    pub origin: RecordOrigin,
     /// The withdrawal this entry carries, absent on an ordinary
     /// measurement. Its presence is what makes this entry an invalidation
     /// — hence [`Self::entry_type`], which reads it.
@@ -949,9 +953,10 @@ impl UsageRecord {
 /// ([`crate::UsageCollectorClientV1::create_usage_record`] /
 /// [`crate::UsageCollectorClientV1::create_usage_records`]).
 ///
-/// This mirrors [`UsageRecord`] minus the one field a caller cannot own on
-/// create: `id`, a deterministic projection of the 5-tuple dedup identity
-/// (see [`Self::try_into_usage_record`]). Encoding "id is derived, not
+/// This mirrors [`UsageRecord`] minus the two fields the server assigns:
+/// `id`, a deterministic projection of the 5-tuple dedup identity (see
+/// [`Self::try_into_usage_record`]), and `origin`, stamped from the route
+/// the entry arrived on (see [`RecordOrigin`]). Encoding "id is derived, not
 /// supplied" in the type — rather than a doc-comment on a full
 /// [`UsageRecord`] — is what keeps a caller from constructing a meaningless
 /// identity the gateway would only discard. The wire REST surface encodes
@@ -1017,10 +1022,23 @@ impl CreateUsageRecord {
     /// and only then is `id` derived over
     /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
     /// Every other field is forwarded verbatim, the invalidation reference
-    /// included — it is not an input to the derivation. Because the identity
-    /// is a pure projection of caller-supplied fields it cannot be supplied
-    /// independently — which is exactly why the create surface takes this
-    /// identity-free type rather than a full [`UsageRecord`].
+    /// included — it is not an input to the derivation. `origin` is the
+    /// exception: it is the one field not forwarded from the submission but
+    /// stamped from the argument — and, like the invalidation reference, it
+    /// is not an input to the derivation.
+    ///
+    /// `origin` is server-assigned
+    /// (`cpt-cf-usage-collector-adr-backfill-isolation`), so it arrives as an
+    /// argument rather than being stamped onto an already-constructed record.
+    /// That keeps one site deciding an entry's origin, instead of a
+    /// construct-then-stamp pair whose halves can drift apart or be
+    /// reordered.
+    ///
+    /// It is a convention rather than a guarantee: [`UsageRecord`]'s fields
+    /// are public and it is not `#[non_exhaustive]`, so any holder can build
+    /// a modified copy with a struct update, and this crate's own fixtures
+    /// do. What the argument buys is that no such copy sits on the ingestion
+    /// path.
     ///
     /// Neither period precondition truncates. A truncated bound would be
     /// persisted under an `id` derived from the truncated value while the
@@ -1048,7 +1066,10 @@ impl CreateUsageRecord {
     ///
     /// Returns [`UsageCollectorError::InvalidArgument`] when a bound is
     /// finer than microsecond precision, or when the period is inverted.
-    pub fn try_into_usage_record(self) -> Result<UsageRecord, UsageCollectorError> {
+    pub fn try_into_usage_record(
+        self,
+        origin: RecordOrigin,
+    ) -> Result<UsageRecord, UsageCollectorError> {
         // Normalization runs before the preconditions, not after, and that
         // ordering is safe rather than merely convenient: `UtcOffset` holds
         // whole seconds, so the nanosecond component is invariant under the
@@ -1088,6 +1109,9 @@ impl CreateUsageRecord {
             metadata: self.metadata,
             value: self.value,
             idempotency_key: self.idempotency_key,
+            // Declaration order, which
+            // `clippy::inconsistent_struct_constructor` requires.
+            origin,
             invalidation: self.invalidation,
             window_start,
             window_end,
@@ -1224,6 +1248,7 @@ struct UsageRecordWire {
     #[serde(with = "rust_decimal::serde::str")]
     value: Decimal,
     idempotency_key: IdempotencyKey,
+    origin: RecordOrigin,
     #[serde(default)]
     invalidates: Option<Uuid>,
     #[serde(default)]
@@ -1247,6 +1272,7 @@ impl TryFrom<UsageRecordWire> for UsageRecord {
             metadata,
             value,
             idempotency_key,
+            origin,
             invalidates,
             reason_code,
             window_start,
@@ -1261,6 +1287,7 @@ impl TryFrom<UsageRecordWire> for UsageRecord {
             metadata,
             value,
             idempotency_key,
+            origin,
             invalidation: invalidation_from_wire(invalidates, reason_code)?,
             window_start,
             window_end,
@@ -1288,6 +1315,7 @@ struct UsageRecordWireRef<'a> {
     #[serde(with = "rust_decimal::serde::str")]
     value: Decimal,
     idempotency_key: &'a IdempotencyKey,
+    origin: RecordOrigin,
     #[serde(skip_serializing_if = "Option::is_none")]
     invalidates: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1312,6 +1340,7 @@ impl Serialize for UsageRecord {
             metadata,
             value,
             idempotency_key,
+            origin,
             invalidation,
             window_start,
             window_end,
@@ -1325,6 +1354,7 @@ impl Serialize for UsageRecord {
             metadata,
             value: *value,
             idempotency_key,
+            origin: *origin,
             invalidates: invalidation.as_ref().map(|i| i.target),
             reason_code: invalidation.as_ref().map(|i| &i.reason),
             window_start: *window_start,

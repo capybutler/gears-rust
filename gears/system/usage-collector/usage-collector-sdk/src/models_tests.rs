@@ -75,6 +75,11 @@ fn sample_usage_record(subject_ref: Option<SubjectRef>, invalidates: Option<Uuid
         metadata: metadata_map([("region", "eu"), ("tier", "gold")]),
         value: Decimal::from(42),
         idempotency_key: IdempotencyKey::new("k-1").expect("valid idempotency key"),
+        // `live` by default: no test that builds a record by hand has the
+        // admitting path as its subject. The ones that do go through
+        // `try_into_usage_record`, which is what stamps an origin — or
+        // override this field after building, as the metadata cases do.
+        origin: RecordOrigin::Live,
         invalidation: invalidates.map(sample_invalidation),
         window_start: SAMPLE_WINDOW_START,
         window_end: SAMPLE_WINDOW_END,
@@ -115,7 +120,7 @@ fn try_into_usage_record_stamps_the_derived_id_and_forwards_every_field() {
 
     let record = input
         .clone()
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("the fixture period is valid");
 
     // Every caller-supplied field is forwarded verbatim.
@@ -142,7 +147,7 @@ fn try_into_usage_record_derives_the_id_over_the_five_tuple() {
         submission.window_end,
     );
     let record = submission
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("the fixture period is valid");
     assert_eq!(record.id, expected);
 }
@@ -164,7 +169,7 @@ fn try_into_usage_record_id_matches_full_record_with_same_dedup_identity() {
 
     assert_eq!(
         input
-            .try_into_usage_record()
+            .try_into_usage_record(RecordOrigin::Live)
             .expect("the fixture period is valid")
             .id,
         crate::id::derive_usage_record_id(
@@ -188,7 +193,7 @@ fn try_into_usage_record_rejects_a_sub_microsecond_window_start() {
     let mut submission = sample_create_usage_record(None, None);
     submission.window_start = submission.window_start.replace_nanosecond(500).unwrap();
     let err = submission
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect_err("sub-microsecond bound must be rejected");
     let UsageCollectorError::InvalidArgument { field, .. } = err else {
         panic!("expected InvalidArgument, got {err:?}");
@@ -201,7 +206,7 @@ fn try_into_usage_record_rejects_a_sub_microsecond_window_end() {
     let mut submission = sample_create_usage_record(None, None);
     submission.window_end = submission.window_end.replace_nanosecond(1).unwrap();
     let err = submission
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect_err("sub-microsecond bound must be rejected");
     let UsageCollectorError::InvalidArgument { field, .. } = err else {
         panic!("expected InvalidArgument, got {err:?}");
@@ -236,7 +241,7 @@ fn a_sub_microsecond_rejection_reads_the_same_in_every_offset() {
         let mut submission = sample_create_usage_record(None, None);
         submission.window_start = sub_us.to_offset(offset);
         let err = submission
-            .try_into_usage_record()
+            .try_into_usage_record(RecordOrigin::Live)
             .expect_err("a sub-microsecond bound must be rejected in ANY offset");
         let UsageCollectorError::InvalidArgument { field, detail, .. } = err else {
             panic!("expected InvalidArgument, got {err:?}");
@@ -273,7 +278,7 @@ fn try_into_usage_record_accepts_a_whole_microsecond_bound() {
         .replace_nanosecond(999_999_000)
         .unwrap();
     let record = submission
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("whole-microsecond bounds are valid");
     assert_eq!(record.window_start.nanosecond(), 1_000);
     assert_eq!(record.window_end.nanosecond(), 999_999_000);
@@ -284,7 +289,7 @@ fn try_into_usage_record_accepts_equal_bounds_as_a_point_event() {
     let mut submission = sample_create_usage_record(None, None);
     submission.window_end = submission.window_start;
     let record = submission
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("point event is valid input");
     assert_eq!(record.window_start, record.window_end);
 }
@@ -294,7 +299,7 @@ fn try_into_usage_record_rejects_an_inverted_covered_period() {
     let mut submission = sample_create_usage_record(None, None);
     submission.window_end = submission.window_start - time::Duration::seconds(1);
     let err = submission
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect_err("window_end < window_start must be rejected");
     let UsageCollectorError::InvalidArgument { field, .. } = err else {
         panic!("expected InvalidArgument, got {err:?}");
@@ -311,7 +316,7 @@ fn try_into_usage_record_normalizes_both_bounds_to_utc() {
     submission.window_start = start.to_offset(offset);
     submission.window_end = end.to_offset(offset);
     let record = submission
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("the fixture period is valid");
     assert_eq!(record.window_start.offset(), time::UtcOffset::UTC);
     assert_eq!(record.window_end.offset(), time::UtcOffset::UTC);
@@ -327,12 +332,18 @@ fn one_instant_in_two_offsets_derives_one_id() {
     // different offset must not surface a false IdempotencyConflict.
     let offset = time::UtcOffset::from_hms(2, 0, 0).unwrap();
     let utc = sample_create_usage_record(None, None)
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("valid");
     let mut shifted = sample_create_usage_record(None, None);
     shifted.window_start = shifted.window_start.to_offset(offset);
     shifted.window_end = shifted.window_end.to_offset(offset);
-    assert_eq!(utc.id, shifted.try_into_usage_record().expect("valid").id,);
+    assert_eq!(
+        utc.id,
+        shifted
+            .try_into_usage_record(RecordOrigin::Live)
+            .expect("valid")
+            .id,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -539,10 +550,10 @@ fn a_half_shape_body_is_refused_on_deserialize() {
 
     // Both halves present, and neither present, both decode.
     sample_create_usage_record(None, None)
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("an ordinary record");
     sample_create_usage_record(None, Some(target_id()))
-        .try_into_usage_record()
+        .try_into_usage_record(RecordOrigin::Live)
         .expect("an invalidation");
 }
 
@@ -663,6 +674,7 @@ fn each_entry_shape_serializes_the_exact_wire_key_set() {
             "idempotency_key",
             "invalidates",
             "metadata",
+            "origin",
             "reason_code",
             "resource_ref",
             "tenant_id",
@@ -696,7 +708,8 @@ fn each_entry_shape_serializes_the_exact_wire_key_set() {
             "window_end",
             "window_start",
         ],
-        "the ingestion shape is the entry shape minus the derived `id`; got {submission}",
+        "the ingestion shape is the entry shape minus the two the server \
+         assigns, `id` and `origin`; got {submission}",
     );
 
     // The quantity is a JSON *string*, never a JSON number, on both shapes.
@@ -746,16 +759,29 @@ fn the_reference_does_not_reach_the_derived_identity() {
     withdrawal.invalidation = Some(sample_invalidation(target_id()));
 
     assert_eq!(
-        target.clone().try_into_usage_record().expect("record").id,
-        withdrawal.try_into_usage_record().expect("invalidation").id,
+        target
+            .clone()
+            .try_into_usage_record(RecordOrigin::Live)
+            .expect("record")
+            .id,
+        withdrawal
+            .try_into_usage_record(RecordOrigin::Live)
+            .expect("invalidation")
+            .id,
         "adding a reference must not move the derived identity",
     );
 
     let mut rekeyed = target.clone();
     rekeyed.idempotency_key = IdempotencyKey::new("a-different-key").expect("valid");
     assert_ne!(
-        target.try_into_usage_record().expect("record").id,
-        rekeyed.try_into_usage_record().expect("re-keyed").id,
+        target
+            .try_into_usage_record(RecordOrigin::Live)
+            .expect("record")
+            .id,
+        rekeyed
+            .try_into_usage_record(RecordOrigin::Live)
+            .expect("re-keyed")
+            .id,
         "the idempotency key is the one departure that does move it",
     );
 }
@@ -1906,4 +1932,95 @@ fn record_origin_deserialises_from_its_wire_spelling_and_refuses_anything_else()
         .expect_err("RecordOrigin is closed");
     serde_json::from_value::<RecordOrigin>(serde_json::json!("Live"))
         .expect_err("the wire spelling is lowercase");
+}
+
+#[test]
+fn the_projection_stamps_the_origin_it_is_handed() {
+    let submission = sample_create_usage_record(None, None);
+    let live = submission
+        .clone()
+        .try_into_usage_record(RecordOrigin::Live)
+        .expect("valid submission");
+    let backfilled = submission
+        .try_into_usage_record(RecordOrigin::Backfill)
+        .expect("valid submission");
+
+    assert_eq!(live.origin, RecordOrigin::Live);
+    assert_eq!(backfilled.origin, RecordOrigin::Backfill);
+}
+
+#[test]
+fn origin_is_not_an_input_to_the_derived_identity() {
+    // The dedup identity is the 5-tuple
+    // (tenant, gts_type, key, window_start, window_end) and `origin` is not
+    // one of its five members
+    // (`cpt-cf-usage-collector-adr-record-identity-derivation`). This is
+    // load-bearing rather than incidental: re-importing history that was
+    // once emitted live has to collide with the entry it re-creates so the
+    // store can absorb it as a duplicate, and it can only collide if the
+    // identifier ignores the path.
+    let submission = sample_create_usage_record(None, None);
+    let live = submission
+        .clone()
+        .try_into_usage_record(RecordOrigin::Live)
+        .expect("valid submission");
+    let backfilled = submission
+        .try_into_usage_record(RecordOrigin::Backfill)
+        .expect("valid submission");
+
+    assert_eq!(live.id, backfilled.id);
+}
+
+#[test]
+fn a_create_submission_cannot_carry_an_origin() {
+    // `origin` is server-assigned, so the ingestion shape has no such
+    // property and its `deny_unknown_fields` shadow refuses one. A caller
+    // that could name its own path could label imported history as live
+    // consumption, which is the distinction the marker exists to make.
+    let mut json = serde_json::to_value(sample_create_usage_record(None, None))
+        .expect("the submission serializes through its own codec");
+    json.as_object_mut()
+        .expect("object")
+        .insert("origin".to_owned(), json!("live"));
+
+    serde_json::from_value::<CreateUsageRecord>(json)
+        .expect_err("origin is server-assigned and must be refused on the create shape");
+}
+
+#[test]
+fn the_persisted_wire_shape_carries_origin_and_requires_it() {
+    let record = sample_create_usage_record(None, None)
+        .try_into_usage_record(RecordOrigin::Backfill)
+        .expect("valid submission");
+    let json = serde_json::to_value(&record).expect("serializes");
+
+    assert_eq!(
+        json.get("origin"),
+        Some(&json!("backfill")),
+        "every persisted entry carries its origin on the wire",
+    );
+
+    // Required, not defaulted. An entry decoded from a body with no
+    // `origin` has no truthful value to fall back on, and defaulting to
+    // `live` would silently relabel imported history as current
+    // consumption.
+    let mut without = json;
+    without.as_object_mut().expect("object").remove("origin");
+    serde_json::from_value::<UsageRecord>(without)
+        .expect_err("origin is mandatory on the persisted shape");
+}
+
+#[test]
+fn a_backfill_origin_round_trips_through_both_shadows() {
+    // `sample_usage_record` pins `live`, so the general round-trip never
+    // exercises the other variant across the two hand-written halves.
+    let record = sample_create_usage_record(None, None)
+        .try_into_usage_record(RecordOrigin::Backfill)
+        .expect("valid submission");
+    let json = serde_json::to_value(&record).expect("serializes");
+
+    assert_eq!(
+        serde_json::from_value::<UsageRecord>(json).expect("round-trips"),
+        record,
+    );
 }
