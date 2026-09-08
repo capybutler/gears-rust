@@ -77,7 +77,7 @@ const PDP_CONCURRENCY: usize = 8;
 /// type-resolution pre-pass; sized identically to [`PDP_CONCURRENCY`] (the
 /// three request-local fan-outs — this one, PDP above and the
 /// invalidation-target one below — run sequentially, not concurrently, so
-/// the effective in-flight ceiling stays at 8). Replaces the pre-Task-9
+/// the effective in-flight ceiling stays at 8). Replaces the retired
 /// `CATALOG_FANOUT_CONCURRENCY`, which bounded the plugin-side
 /// `get_usage_type` catalog fan-out this pre-pass supersedes.
 const TYPE_RESOLUTION_FANOUT_CONCURRENCY: usize = 8;
@@ -109,7 +109,7 @@ type PdpGroupDecision = (Vec<usize>, Result<(), DomainError>);
 
 /// Cached resolution per distinct meter, lifted into [`DomainError`] so one
 /// resolution outcome projects to every record sharing that type without
-/// re-resolving it. Replaces the pre-Task-9 `CatalogCache`, which cached a
+/// re-resolving it. Replaces the retired `CatalogCache`, which cached a
 /// plugin-owned catalog row per `gts_id` instead of a resolved declaration.
 type DeclarationCache = HashMap<MeterTypeId, Result<Arc<ResolvedDeclaration>, DomainError>>;
 
@@ -313,9 +313,14 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
             ValidationReason::UnknownMetadataKey | ValidationReason::MetadataValidation => {
                 RecordErrorCategory::MetadataSize
             }
-            // The copy rule, and the reference rule at the one boundary that
-            // types it — DESIGN §3.11.5 gives them a category of their own so
-            // a correction backlog is legible without reading `detail`.
+            // Three of the gateway's five invalidation rules, the three that
+            // carry a typed reason: explicit reference (the half-shape the
+            // REST fold point refuses), no-invalidation-of-an-invalidation,
+            // and faithful copy. DESIGN §3.11.5 gives them a category of
+            // their own so a correction backlog is legible without reading
+            // `detail`. Valid reference is the fourth and is on
+            // `SemanticsViolation` for the reason above; reason code is the
+            // fifth and is enforced by the type, so it raises nothing.
             ValidationReason::InvalidationReferenceIncomplete
             | ValidationReason::InvalidationTargetNotRecord
             | ValidationReason::InvalidationFieldMismatch => RecordErrorCategory::InvalidationRule,
@@ -324,7 +329,7 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
         UsageCollectorError::Conflict { reason, .. } => match reason {
             ConflictReason::IdempotencyConflict => RecordErrorCategory::IdempotencyConflict,
             // At-most-one-invalidation, the store's own rule, lifted from the
-            // plugin. Same family as the gateway's two.
+            // plugin. Same family as the gateway's three above.
             ConflictReason::AlreadyInvalidated => RecordErrorCategory::InvalidationRule,
             _ => RecordErrorCategory::SemanticsViolation,
         },
@@ -1349,7 +1354,7 @@ impl Service {
         // Resolver's own error type) eagerly so the cached value is Clone
         // and a single resolution can be projected to every input index
         // that references the gts_type_id without re-resolving it. Replaces
-        // the pre-Task-9 plugin-side `get_usage_type` catalog fan-out at the
+        // the retired plugin-side `get_usage_type` catalog fan-out at the
         // same bounded concurrency.
         let declaration_cache: DeclarationCache =
             stream::iter(distinct_gts_type_ids.into_iter().map(|gts_type_id| {
@@ -1595,7 +1600,7 @@ impl Service {
     /// Keyset-paginated list of `UsageRecord`s from the bound storage
     /// plugin's table, narrowed by the PDP-returned constraints.
     ///
-    /// Four responsibilities live here per
+    /// Seven responsibilities live here per
     /// `cpt-cf-usage-collector-flow-usage-query-query-raw`:
     ///
     /// 1. **Authorize** the request via [`authz::authorize_list_usage_records`].
@@ -1850,9 +1855,11 @@ impl Service {
     /// Aggregated read over `UsageRecord`s, narrowed by the PDP-returned
     /// constraints and executed server-side by the bound storage plugin.
     ///
-    /// Mirrors [`Self::list_usage_records`] in posture — the same
-    /// responsibilities live here per
-    /// `cpt-cf-usage-collector-flow-usage-query-query-aggregated`:
+    /// Mirrors [`Self::list_usage_records`] in posture. Five of that
+    /// path's seven responsibilities live here per
+    /// `cpt-cf-usage-collector-flow-usage-query-query-aggregated` — the
+    /// keyset floor and the cursor binding do not, because this path
+    /// returns buckets rather than a page and mints no continuation:
     ///
     /// 1. **Authorize** the request via [`authz::authorize_list_usage_records`]
     ///    (the PEP shape is shared: pre-row, no per-record attribution, with
@@ -1865,13 +1872,20 @@ impl Service {
     ///    aggregation: the fold served is exactly the one the declaration
     ///    names, so no request can name a different one. Runs before any
     ///    plugin dispatch, so an unresolvable type never reaches the SPI.
-    /// 3. **Compose** the PDP constraints into the user-supplied `OData`
+    /// 3. **Gate** the query surface on that declaration (Spec §3.11), the
+    ///    same three checks the raw path's step 3 runs — and unlike that
+    ///    path, all three apply: `reject_reserved_filter_fields` on the
+    ///    `$filter`, `require_dimensions_declared` on `group_by`, which
+    ///    only this path takes, and `require_metadata_filter_keys_declared`
+    ///    on the metadata side channel. Recomputed per request, so a
+    ///    property declared a moment ago is usable on this very call.
+    /// 4. **Compose** the PDP constraints into the user-supplied `OData`
     ///    filter via [`compose_query_with_scope`]. The composition is
     ///    intersection-only per
     ///    `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`.
     ///    `time_range` is untouched by composition: it is a typed
     ///    parameter and never a `$filter` conjunct.
-    /// 4. **Delegate** to the bound storage plugin's
+    /// 5. **Delegate** to the bound storage plugin's
     ///    `query_aggregated_usage_records` SPI with the composed filter,
     ///    the typed `gts_type_id`, the typed `time_range`, the metadata
     ///    side-channel, the declared

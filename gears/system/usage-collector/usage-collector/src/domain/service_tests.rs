@@ -778,8 +778,8 @@ mod gts_type_id_dedup_tests {
 
     // The "5 records, identical gts_type_id → exactly one resolution" case is
     // now covered by `ingestion_declared_type_tests::a_batch_resolves_each_distinct_type_once`
-    // (Task 9's own required test, using `CountingDeclarationSource`) —
-    // deleted here rather than duplicated.
+    // (which uses `CountingDeclarationSource`) — deleted here rather than
+    // duplicated.
 
     /// Three records, three distinct `gts_type_id`s → exactly three
     /// declaration resolutions (one per distinct id), asking the resolver
@@ -1665,7 +1665,7 @@ mod invalidation_target_batch_tests {
 // ─── usage-emission feature (read-by-id) ─────────────────────────────────
 //
 // `Service::get_usage_record` is the host-side gateway for the read-by-id
-// surface of the usage-emission feature. Per DESIGN §3.3 / §3.5 (Task 13)
+// surface of the usage-emission feature. Per DESIGN §3.3 / §3.5
 // it authorizes like `list_usage_records` and
 // `query_aggregated_usage_records`: a pre-row PDP call
 // (`authz::authorize_get_usage_record_scope`, no per-record attribution
@@ -1871,7 +1871,7 @@ mod get_usage_record_tests {
     }
 
     /// The plugin receives the compiled PDP scope on the point lookup —
-    /// DESIGN §3.3 / Task 13's central guarantee. Asserts the spy actually
+    /// DESIGN §3.3's central guarantee. Asserts the spy actually
     /// captured a scope expression (not merely that the call completed);
     /// the captured `Debug` rendering must carry the tenant-narrowing
     /// predicate `recording_plugin_resolver` grants, so a regression that
@@ -3358,7 +3358,7 @@ mod aggregate_declared_fold_tests {
 }
 
 // The kind/op compatibility rule is gone from ingestion too, the same way
-// Task 8 removed it from the aggregate path (see the comment above
+// it left the aggregate path (see the comment above
 // `aggregate_declared_fold_tests`): validation runs against the meter's
 // resolved declaration instead of a plugin-owned catalog row, and the
 // per-distinct-`gts_id` catalog fan-out in `create_usage_records` is now a
@@ -3569,7 +3569,7 @@ mod ingestion_declared_type_tests {
     }
 }
 
-// Task 12: `CompiledMetadataSchema::declared_keys()` gates the read paths'
+// `CompiledMetadataSchema::declared_keys()` gates the read paths'
 // `$filter` / `group_by` surface (Spec §3.11). The pure-function coverage
 // (every `ast::Expr` variant, nested-`or`/`not`/`in` rejection, recomputation
 // across differing declared-key sets) lives in `query_tests.rs`; this module

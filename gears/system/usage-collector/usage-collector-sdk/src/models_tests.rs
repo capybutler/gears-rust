@@ -1790,8 +1790,9 @@ fn meter_type_id_rejects_consecutive_tildes() {
 
 #[test]
 fn meter_type_id_rejects_control_characters() {
-    // ADR-0007 concatenates this value under a 0x1F separator, so a control
-    // character would break the injectivity the identifier derivation needs.
+    // `cpt-cf-usage-collector-adr-record-identity-derivation` concatenates
+    // this value under a 0x1F separator, so a control character would break
+    // the injectivity the identifier derivation needs.
     let with_us = "gts.cf.core.uc.usage_record.v1~exa\u{1F}mple._.m.v1~";
     assert!(MeterTypeId::new(with_us).is_err());
     let with_del = "gts.cf.core.uc.usage_record.v1~exa\u{7F}mple._.m.v1~";

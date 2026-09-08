@@ -631,7 +631,7 @@ async fn per_record_permit_records_exactly_one_permit_no_double_count() {
 #[tokio::test]
 async fn plugin_backend_error_records_duration_counter_and_ready() {
     // `get_usage_record` now authorizes via a pre-row compiled-scope PDP
-    // request (Task 13 — no per-record attribution attributes), which
+    // request (no per-record attribution attributes), which
     // `CountingAllowAllResolver`'s unconstrained permit would fail closed
     // under `require_constraints(true)` before the plugin is ever
     // dispatched. `CountingPermitResolver` grants a real tenant-narrowing
@@ -682,7 +682,7 @@ async fn plugin_domain_typed_error_does_not_increment_accept_counter() {
     // A domain-typed variant (UsageRecordNotFound) is a caller-visible
     // outcome, NOT a plugin fault — its duration is still observed, but it
     // MUST NOT increment uc_plugin_accept_errors_total. `get_usage_record`
-    // authorizes via a pre-row compiled-scope PDP request (Task 13), so
+    // authorizes via a pre-row compiled-scope PDP request, so
     // (as above) a real permitting resolver is required to reach the
     // plugin dispatch this test means to exercise — `CountingAllowAllResolver`'s
     // unconstrained permit would instead fail closed before the plugin
@@ -762,7 +762,7 @@ async fn plugin_unready_increments_unready_counter_and_zeroes_ready() {
 // deny-path emit tests above short-circuit at PDP and never reach the SPI, so
 // they cannot guard this wiring; these tests drive the dispatch.
 //
-// Task 9: the referenced meter's declaration is now resolved through the Type
+// The referenced meter's declaration is resolved through the Type
 // Resolver, not a plugin-side `get_usage_type` catalog dispatch — so these
 // tests wire a working resolver (`service_with_metrics_and_source`) and no
 // longer assert a `get_usage_type` duration sample on the emit path (there is
@@ -811,7 +811,7 @@ async fn ingestion_single_success_dispatch_records_plugin_call_duration_per_op()
 
 #[tokio::test]
 async fn ingestion_batch_success_dispatch_records_plugin_call_duration_per_op() {
-    // Two records sharing one gts_id: the declaration resolves once (Task 9's
+    // Two records sharing one gts_id: the declaration resolves once (the
     // resolver fan-out — see `ingestion_declared_type_tests` in
     // `service_tests.rs` for the dedicated dedup coverage), and the eligible
     // records persist through one `create_usage_records` dispatch — an

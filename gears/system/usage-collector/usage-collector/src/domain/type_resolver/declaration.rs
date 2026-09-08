@@ -89,8 +89,8 @@ impl ResolvedDeclaration {
     /// but not a string, or names a fold this major version does not serve.
     /// Every case fails closed: the gear never substitutes a default for a
     /// declared attribute. Also returns whatever
-    /// [`CompiledMetadataSchema::compile`] returns — infallible today; Task 5
-    /// adds metadata-subschema compilation and its own failure mode there.
+    /// [`CompiledMetadataSchema::compile`] returns, which fails when the
+    /// declared `metadata` subschema is not a compilable JSON Schema.
     pub fn from_schema(
         gts_type_id: MeterTypeId,
         schema: &GtsTypeSchema,

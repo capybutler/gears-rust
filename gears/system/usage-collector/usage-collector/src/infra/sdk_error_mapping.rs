@@ -24,9 +24,11 @@ use usage_collector_sdk::{USAGE_RECORD_RESOURCE, UsageCollectorError};
 pub(crate) struct UsageRecordResource;
 
 /// Lift the SDK error envelope onto the AIP-193 canonical shape for the
-/// **ingestion** REST surface (`POST /usage-records`, `POST
-/// /usage-records:batch`, `GET /usage-records`, `DELETE
-/// /usage-records/{id}`, `GET /usage-records:aggregate`). Use this from
+/// usage-record REST surface — the four routes this gear registers:
+/// `POST /usage-collector/v1/records` (single and batch alike),
+/// `GET /usage-collector/v1/records`,
+/// `POST /usage-collector/v1/records/aggregate` and
+/// `GET /usage-collector/v1/records/{id}`. Use this from
 /// handlers in `api/rest/handlers/usage_records.rs`. The cross-cutting
 /// `PermissionDenied` variant resolves to a UsageRecord-shaped envelope;
 /// every other variant carries its own `resource_type` and routes through

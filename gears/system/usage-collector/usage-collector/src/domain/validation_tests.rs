@@ -72,7 +72,7 @@ fn declaration_with_metadata_keys(keys: &[&str]) -> ResolvedDeclaration {
     ResolvedDeclaration::from_schema(meter_id(), &schema).expect("valid declaration")
 }
 
-// Repointed at the resolved declaration (Task 9): the closed-shape check now
+// Repointed at the resolved declaration: the closed-shape check now
 // runs against `ResolvedDeclaration::metadata_schema`, not a plugin-owned
 // catalog row's `metadata_fields` set — but the intent this test pins ("an
 // undeclared metadata key is rejected") is unchanged.
@@ -123,9 +123,9 @@ fn declared_metadata_key_is_accepted() {
 // `>=`, comparison — exactly at the cap is accepted; one byte over is
 // rejected. The value length is sized off the measured single-entry
 // overhead so the boundary holds regardless of `MetadataKey`'s serde shape.
-// Task 9 threads the cap in as a parameter (`Service::metadata_size_cap_bytes`,
+// The cap is threaded in as a parameter (`Service::metadata_size_cap_bytes`,
 // itself from `UsageCollectorConfig::metadata_size_cap_bytes`) rather than
-// reading a hard-coded constant; these tests pin the DEFAULT cap value
+// read from a hard-coded constant; these tests pin the DEFAULT cap value
 // (`DEFAULT_METADATA_SIZE_CAP_BYTES`) behaves exactly as the old hard-coded
 // constant did, and a separate test below pins that a non-default configured
 // cap is actually honoured.

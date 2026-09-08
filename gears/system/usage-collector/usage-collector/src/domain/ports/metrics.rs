@@ -85,15 +85,15 @@ impl PdpOp {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginOp {
-    /// SPI Method 1.
+    /// `create_usage_record`.
     CreateUsageRecord,
-    /// SPI Method 2.
+    /// `create_usage_records`.
     CreateUsageRecords,
-    /// SPI Method 3.
+    /// `query_aggregated_usage_records`.
     QueryAggregatedUsageRecords,
-    /// SPI Method 4.
+    /// `list_usage_records`.
     ListUsageRecords,
-    /// SPI Method 10.
+    /// `get_usage_record`.
     GetUsageRecord,
 }
 

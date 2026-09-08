@@ -52,7 +52,7 @@ impl CompiledMetadataSchema {
     /// itself. The invariant then holds by construction, whether or not a
     /// schema author remembered `additionalProperties: false`, and the
     /// admissible key set is exactly the one the query surface gates
-    /// filtering and grouping on (Task 12). The compiled validator still
+    /// filtering and grouping on. The compiled validator still
     /// enforces per-value constraints such as `minLength`.
     ///
     /// A meter declaring no `metadata` properties therefore has an empty

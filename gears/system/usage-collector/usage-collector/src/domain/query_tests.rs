@@ -647,7 +647,16 @@ fn an_order_on_created_at_is_rejected() {
 fn an_order_on_a_domain_optional_attribute_is_rejected() {
     // A row-value tuple whose leading column is NULL compares as NULL, so
     // every NULL-keyed row would silently drop out of the page.
-    for field in ["subject_id", "subject_type", "corrects_id"] {
+    //
+    // All three names are *on* the filterable schema and resolve through
+    // `UsageRecordFilterField::from_name`; they are refused because the
+    // record can carry none of them on every entry. That is what separates
+    // this test from `an_order_on_created_at_is_rejected` above, which
+    // pins the fail-closed refusal of a name the schema does not carry at
+    // all. `invalidates` reads the target inside the optional
+    // `UsageRecord::invalidation` and is absent on every ordinary
+    // measurement.
+    for field in ["subject_id", "subject_type", "invalidates"] {
         let mut query = query_ordered_by(&[(field, SortDir::Asc)]);
         let err = establish_keyset_order(&mut query)
             .expect_err(&format!("ordering on optional `{field}` must be refused"));
@@ -692,9 +701,10 @@ fn a_uniform_multi_key_order_on_mandatory_attributes_is_accepted() {
 ///
 /// Deliberately wider than the exact-shape tests above: orders naming
 /// neither / one / both canonical fields, in leading, middle and trailing
-/// positions, at one to three caller keys, in both directions. Only
-/// durable mandatory attributes appear — `status` leaves the filterable
-/// schema in a later slice.
+/// positions, at zero to three caller keys, in both directions. Only
+/// keyset-safe attributes appear: every name here is on
+/// `KEYSET_SAFE_RECORD_FIELDS`, which is what makes each shape admissible
+/// rather than a rejection in disguise.
 const ADMISSIBLE_ORDER_SHAPES: &[&[(&str, SortDir)]] = &[
     &[],
     &[("window_end", SortDir::Asc)],
@@ -731,10 +741,10 @@ const ADMISSIBLE_ORDER_SHAPES: &[&[(&str, SortDir)]] = &[
 fn the_floor_establishes_the_documented_guarantee_for_every_admissible_shape() {
     // The guarantee, and ONLY the guarantee: no exact-shape assertion
     // anywhere in this test, so `assert_keyset_guarantee` is the single
-    // thing that can fail. The shape tests above cover four inputs between
-    // them; this covers every admissible shape the floor can be handed,
-    // which is what catches a mutation that happens to be correct on the
-    // four written-out ones.
+    // thing that can fail. The shape tests above cover seven inputs
+    // between them; this covers every admissible shape the floor can be
+    // handed, which is what catches a mutation that happens to be correct
+    // on the seven written-out ones.
     for keys in ADMISSIBLE_ORDER_SHAPES {
         let mut query = query_ordered_by(keys);
         establish_keyset_order(&mut query)

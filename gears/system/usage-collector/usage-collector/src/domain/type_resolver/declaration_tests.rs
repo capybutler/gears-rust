@@ -28,8 +28,8 @@ const BASE: &str = "gts.cf.core.uc.usage_record.v1~";
 ///   either placement merges the same way. `x-gts-traits` itself is *not* a
 ///   departure — both this fixture and the doc example place it at the top
 ///   level, which is the placement `extract_traits`/`effective_traits()`
-///   actually reads (see the task 4 report for the history: the doc example
-///   used to nest it in `allOf` and was fixed in a follow-up commit).
+///   actually reads (the doc example used to nest it in `allOf` and was
+///   fixed in a follow-up commit).
 fn schema_with_traits(traits: serde_json::Value) -> GtsTypeSchema {
     let base = GtsTypeSchema::try_new(
         GtsTypeId::try_new(BASE).expect("base type id"),

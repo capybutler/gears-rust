@@ -178,9 +178,11 @@ pub fn permit_with_string_constraint(property: &'static str, value: String) -> E
 /// hard-coded tenant. Echoing the request's `OWNER_TENANT_ID` back as the
 /// granted scope compiles to a non-empty `AccessScope` AND satisfies the gate
 /// for ANY record tenant a test picks. When the request carries no
-/// `OWNER_TENANT_ID` (the subject-only catalog surface, which runs under
-/// `require_constraints(false)`), it falls back to an empty-constraints
-/// `allow_all` permit — the legitimate happy-path there.
+/// `OWNER_TENANT_ID` it falls back to an empty-constraints `allow_all`
+/// permit. No gear path produces such a request any more — the subject-only
+/// catalog surface that did is gone, and every `pdp_scope_with` call site
+/// now runs under `require_constraints(true)` — so that arm is reachable
+/// only from a test that builds the request itself.
 #[must_use]
 pub fn permit_scoped_to_request_tenant(request: &EvaluationRequest) -> EvaluationResponse {
     match request
@@ -576,7 +578,8 @@ fn inert_type_resolver(metrics: Arc<dyn UsageCollectorMetrics>) -> Arc<TypeResol
 
 /// Build a usage-collector storage-plugin instance id under the schema
 /// prefix advertised by [`UsageCollectorPluginSpecV1`], with `suffix` as
-/// the five-token instance tail (e.g. `"test.happy_path.records.v1"`).
+/// the five-token instance tail (e.g.
+/// `"test.usage_collector.recording.plugin.v1"`).
 #[must_use]
 pub fn usage_collector_instance_id(suffix: &str) -> String {
     format!("{}{suffix}", UsageCollectorPluginSpecV1::gts_type_id())
@@ -630,9 +633,8 @@ pub fn hub_with_plugin(
 /// and an internally-built [`CountingTenantPermitResolver`] PDP fake (scopes
 /// its permit to the request's own `OWNER_TENANT_ID`, so per-record paths
 /// under `require_constraints(true)` pass the tenant gate for whatever
-/// tenant the record names, while the subject-only catalog surface —  no
-/// `OWNER_TENANT_ID`, `require_constraints(false)` — still gets an
-/// `allow_all` permit).
+/// tenant the record names; a request carrying no `OWNER_TENANT_ID` still
+/// gets an `allow_all` permit, which no gear path asks for any more).
 #[derive(Default)]
 pub(crate) struct ServiceFixture {
     source: Option<Arc<dyn DeclarationSource>>,
@@ -1058,6 +1060,132 @@ pub type CreateRecordsBatchResult = Vec<Result<UsageRecord, UsageCollectorPlugin
 /// deduped fan-out may surface the same fault more than once.
 pub type ProgrammedTransient = (String, Option<u64>);
 
+/// The `get_usage_record` half of [`HappyPathPlugin`], as its own type.
+///
+/// It is a seam rather than a split for tidiness: nothing else in the stub
+/// reads or writes any of this state, and one SPI method reads all of it.
+/// Holding it separately is what lets the **precedence order** be written
+/// once, here, instead of being reconstructed from a sentence on each
+/// setter — which is how it was documented before, and which is a shape
+/// that drifts the moment a sixth knob is added.
+///
+/// [`Self::lookup`] consults, in order, stopping at the first that answers:
+///
+/// 1. the blanket transient — a store that cannot answer cannot report
+///    absence either, so this outranks the not-found set deliberately;
+/// 2. the per-id transient, for a batch mixing one unreadable target with
+///    one readable one — the only shape that shows a transient on one entry
+///    not abandoning the others;
+/// 3. the not-found set;
+/// 4. the per-id row, so a batch resolving several distinct targets answers
+///    differently per id — with one shared row a fan-out that looked a
+///    target up under a *different* entry's reference would return the same
+///    row and every assertion would still pass;
+/// 5. the shared fallback row.
+///
+/// Every call is recorded in [`Self::inputs`] before any of that, so a
+/// dedup assertion counts dispatches whatever answer they produced, and the
+/// `scope` is captured so a test can prove the point lookup handed the
+/// plugin a compiled PDP scope rather than a placeholder.
+#[derive(Default)]
+pub struct TargetLookupDouble {
+    row: Mutex<Option<UsageRecord>>,
+    row_by_id: Mutex<std::collections::BTreeMap<Uuid, UsageRecord>>,
+    not_found: Mutex<std::collections::BTreeSet<Uuid>>,
+    transient: Mutex<Option<ProgrammedTransient>>,
+    transient_by_id: Mutex<std::collections::BTreeMap<Uuid, ProgrammedTransient>>,
+    inputs: Mutex<Vec<Uuid>>,
+    last_scope: Mutex<Option<String>>,
+}
+
+impl TargetLookupDouble {
+    /// The shared fallback row, step 5 of the precedence order.
+    pub fn set_row(&self, record: UsageRecord) {
+        *self.row.lock().expect("mutex") = Some(record);
+    }
+    /// A row for one id, step 4.
+    pub fn set_row_for(&self, id: Uuid, record: UsageRecord) {
+        self.row_by_id.lock().expect("mutex").insert(id, record);
+    }
+    /// Mark `id` absent, step 3.
+    pub fn set_not_found(&self, id: Uuid) {
+        self.not_found.lock().expect("mutex").insert(id);
+    }
+    /// A retryable fault on every id, step 1. Outranks the not-found set
+    /// and both row knobs, so a test relying on those must not set this.
+    pub fn set_transient(&self, detail: &str, retry_after_seconds: Option<u64>) {
+        *self.transient.lock().expect("mutex") = Some((detail.to_owned(), retry_after_seconds));
+    }
+    /// The same fault for one id, step 2.
+    pub fn set_transient_for(&self, id: Uuid, detail: &str, retry_after_seconds: Option<u64>) {
+        self.transient_by_id
+            .lock()
+            .expect("mutex")
+            .insert(id, (detail.to_owned(), retry_after_seconds));
+    }
+    /// Every `id` handed to [`Self::lookup`], in call order.
+    #[must_use]
+    pub fn inputs(&self) -> Vec<Uuid> {
+        self.inputs.lock().expect("mutex").clone()
+    }
+    /// Number of [`Self::lookup`] calls so far.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.inputs.lock().expect("mutex").len()
+    }
+    /// `Debug` rendering of the most-recent `scope`, or `None` before the
+    /// first call.
+    #[must_use]
+    pub fn last_scope(&self) -> Option<String> {
+        self.last_scope.lock().expect("mutex").clone()
+    }
+
+    /// Record the call, then answer it by the precedence order on this
+    /// type's doc.
+    ///
+    /// # Errors
+    ///
+    /// The programmed fault, if any: a transient (steps 1-2), a not-found
+    /// (step 3), or `not_programmed` when no row was ever set.
+    pub fn lookup(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        self.inputs.lock().expect("mutex").push(id);
+        *self.last_scope.lock().expect("mutex") = Some(format!("{scope:?}"));
+        if let Some((detail, retry_after_seconds)) = self.transient.lock().expect("mutex").clone() {
+            return Err(UsageCollectorPluginError::transient_with_retry(
+                detail,
+                retry_after_seconds,
+            ));
+        }
+        if let Some((detail, retry_after_seconds)) = self
+            .transient_by_id
+            .lock()
+            .expect("mutex")
+            .get(&id)
+            .cloned()
+        {
+            return Err(UsageCollectorPluginError::transient_with_retry(
+                detail,
+                retry_after_seconds,
+            ));
+        }
+        if self.not_found.lock().expect("mutex").contains(&id) {
+            return Err(UsageCollectorPluginError::UsageRecordNotFound { id });
+        }
+        if let Some(row) = self.row_by_id.lock().expect("mutex").get(&id) {
+            return Ok(row.clone());
+        }
+        self.row
+            .lock()
+            .expect("mutex")
+            .clone()
+            .ok_or_else(|| not_programmed("get_usage_record"))
+    }
+}
+
 /// Programmable plugin stub that returns the configured response for each
 /// SPI method, defaulting to `UsageCollectorPluginError::internal("not
 /// programmed")` for methods the test has not explicitly set up. Methods
@@ -1069,14 +1197,11 @@ pub type ProgrammedTransient = (String, Option<u64>);
 pub struct HappyPathPlugin {
     create_record_response: Mutex<Option<Result<UsageRecord, UsageCollectorPluginError>>>,
     create_records_response: Mutex<Option<CreateRecordsBatchResult>>,
-    get_record_response: Mutex<Option<UsageRecord>>,
-    /// Per-id `get_usage_record` rows, consulted before
-    /// `get_record_response`. A batch resolving several distinct
-    /// invalidation targets needs the plugin to answer differently per id:
-    /// with one shared row, a fan-out that looked a target up under a
-    /// *different* entry's reference would return the same row and every
-    /// assertion would still pass.
-    get_record_by_id: Mutex<std::collections::BTreeMap<Uuid, UsageRecord>>,
+    /// The whole `get_usage_record` half, in its own type: seven pieces of
+    /// state touched by exactly one SPI method and by nothing else here.
+    /// See [`TargetLookupDouble`], which owns the precedence order the
+    /// setters used to describe one doc comment at a time.
+    target_lookup: TargetLookupDouble,
     list_usage_records_response: Mutex<Option<ODataPage<UsageRecord>>>,
     query_aggregated_usage_records_response: Mutex<Option<AggregationResult>>,
     /// Every [`AggregationFold`] passed to `query_aggregated_usage_records`,
@@ -1087,28 +1212,6 @@ pub struct HappyPathPlugin {
 
     create_record_input: Mutex<Option<UsageRecord>>,
     create_records_input: Mutex<Option<Vec<UsageRecord>>>,
-    /// Every record `id` ever passed to `get_usage_record`, in call
-    /// order. Drives the invalidation-target dedup tests.
-    get_usage_record_inputs: Mutex<Vec<Uuid>>,
-    /// Record `id`s that should surface as
-    /// `UsageCollectorPluginError::UsageRecordNotFound` instead of
-    /// returning the default `get_record_response`.
-    get_usage_record_not_found: Mutex<std::collections::BTreeSet<Uuid>>,
-    /// A retryable backend fault every `get_usage_record` call surfaces
-    /// instead of a row. Distinct from the not-found set: a target that
-    /// cannot be read is not a target that is absent, and the two must not
-    /// reach the caller as the same answer.
-    get_usage_record_transient: Mutex<Option<ProgrammedTransient>>,
-    /// The same fault scoped to one id. A batch mixing one unreadable
-    /// target with one readable one is the only shape that shows a
-    /// transient on one entry not abandoning the others, and the blanket
-    /// knob above cannot express it.
-    get_usage_record_transient_by_id: Mutex<std::collections::BTreeMap<Uuid, ProgrammedTransient>>,
-    /// `Debug` rendering of the most-recent `scope` passed to
-    /// `get_usage_record`, so a test can assert the plugin actually
-    /// received a compiled PDP scope (Task 13 / DESIGN §3.3) rather than
-    /// merely that the call succeeded.
-    last_get_scope: Mutex<Option<String>>,
 
     /// The `time_range` passed to the most-recent `list_usage_records`
     /// dispatch. The range is a typed parameter rather than a `$filter`
@@ -1142,18 +1245,12 @@ impl HappyPathPlugin {
         Arc::new(Self {
             create_record_response: Mutex::new(None),
             create_records_response: Mutex::new(None),
-            get_record_response: Mutex::new(None),
-            get_record_by_id: Mutex::new(std::collections::BTreeMap::new()),
+            target_lookup: TargetLookupDouble::default(),
             list_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_folds: Mutex::new(Vec::new()),
             create_record_input: Mutex::new(None),
             create_records_input: Mutex::new(None),
-            get_usage_record_inputs: Mutex::new(Vec::new()),
-            get_usage_record_not_found: Mutex::new(std::collections::BTreeSet::new()),
-            get_usage_record_transient: Mutex::new(None),
-            get_usage_record_transient_by_id: Mutex::new(std::collections::BTreeMap::new()),
-            last_get_scope: Mutex::new(None),
             list_time_range: Mutex::new(None),
             aggregate_time_range: Mutex::new(None),
             list_order: Mutex::new(None),
@@ -1174,75 +1271,62 @@ impl HappyPathPlugin {
     pub fn set_create_records(&self, results: CreateRecordsBatchResult) {
         *self.create_records_response.lock().expect("mutex") = Some(results);
     }
+    /// The shared fallback row. Delegates to [`TargetLookupDouble`], which
+    /// documents where it sits in the precedence order.
     pub fn set_get_record(&self, record: UsageRecord) {
-        *self.get_record_response.lock().expect("mutex") = Some(record);
+        self.target_lookup.set_row(record);
     }
     /// Program `get_usage_record(id, _)` to answer with `record`, ahead of
     /// whatever [`Self::set_get_record`] set. Lets one batch resolve
     /// several distinct targets to *different* rows, which is what makes a
     /// mis-keyed lookup observable at all.
     pub fn set_get_record_for(&self, id: Uuid, record: UsageRecord) {
-        self.get_record_by_id
-            .lock()
-            .expect("mutex")
-            .insert(id, record);
+        self.target_lookup.set_row_for(id, record);
     }
     /// Mark `id` so the next (and every subsequent) `get_usage_record`
     /// call carrying it returns `UsageRecordNotFound` regardless of the
-    /// default `get_record_response`.
+    /// shared row.
     pub fn set_get_usage_record_not_found(&self, id: Uuid) {
-        self.get_usage_record_not_found
-            .lock()
-            .expect("mutex")
-            .insert(id);
+        self.target_lookup.set_not_found(id);
     }
     /// Program every subsequent `get_usage_record` call to fail as
     /// `Transient`, whatever the id. Drives a backend fault on the
     /// invalidation-target read, which must fail the submission rather
-    /// than reject it.
-    ///
-    /// **Takes precedence over [`Self::set_get_usage_record_not_found`]**
-    /// and over the per-id rows, so a test that sets both silently gets the
-    /// transient. Deliberate — a store that cannot answer cannot report
-    /// absence either — but a test relying on the not-found set must not
-    /// also set this.
+    /// than reject it. Outranks every other knob — see
+    /// [`TargetLookupDouble`].
     pub fn set_get_usage_record_transient(&self, detail: &str, retry_after_seconds: Option<u64>) {
-        *self.get_usage_record_transient.lock().expect("mutex") =
-            Some((detail.to_owned(), retry_after_seconds));
+        self.target_lookup
+            .set_transient(detail, retry_after_seconds);
     }
     /// The same fault for one id only, mirroring
-    /// [`Self::set_get_usage_record_not_found`]'s shape. Consulted after the
-    /// blanket knob above and before both the per-id rows and the not-found
-    /// set.
+    /// [`Self::set_get_usage_record_not_found`]'s shape.
     pub fn set_get_usage_record_transient_for(
         &self,
         id: Uuid,
         detail: &str,
         retry_after_seconds: Option<u64>,
     ) {
-        self.get_usage_record_transient_by_id
-            .lock()
-            .expect("mutex")
-            .insert(id, (detail.to_owned(), retry_after_seconds));
+        self.target_lookup
+            .set_transient_for(id, detail, retry_after_seconds);
     }
     /// Every record `id` passed to `get_usage_record`, in call order.
     #[must_use]
     pub fn get_usage_record_inputs(&self) -> Vec<Uuid> {
-        self.get_usage_record_inputs.lock().expect("mutex").clone()
+        self.target_lookup.inputs()
     }
     /// Total number of `get_usage_record` SPI dispatches so far.
     #[must_use]
     pub fn get_usage_record_calls(&self) -> usize {
-        self.get_usage_record_inputs.lock().expect("mutex").len()
+        self.target_lookup.calls()
     }
     /// `Debug` rendering of the `scope` filter passed to the most-recent
     /// `get_usage_record` call, or `None` if it was never invoked. Proves
     /// the caller-facing point lookup actually handed the plugin a
-    /// compiled PDP scope (Task 13 / DESIGN §3.3), not merely that the
+    /// compiled PDP scope (DESIGN §3.3), not merely that the
     /// call returned `Ok`.
     #[must_use]
     pub fn last_get_scope(&self) -> Option<String> {
-        self.last_get_scope.lock().expect("mutex").clone()
+        self.target_lookup.last_scope()
     }
     pub fn set_list_usage_records_response(&self, page: ODataPage<UsageRecord>) {
         *self.list_usage_records_response.lock().expect("mutex") = Some(page);
@@ -1394,52 +1478,12 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
         id: Uuid,
         scope: &ast::Expr,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
-        self.get_usage_record_inputs.lock().expect("mutex").push(id);
-        *self.last_get_scope.lock().expect("mutex") = Some(format!("{scope:?}"));
-        if let Some((detail, retry_after_seconds)) = self
-            .get_usage_record_transient
-            .lock()
-            .expect("mutex")
-            .clone()
-        {
-            return Err(UsageCollectorPluginError::transient_with_retry(
-                detail,
-                retry_after_seconds,
-            ));
-        }
-        if let Some((detail, retry_after_seconds)) = self
-            .get_usage_record_transient_by_id
-            .lock()
-            .expect("mutex")
-            .get(&id)
-            .cloned()
-        {
-            return Err(UsageCollectorPluginError::transient_with_retry(
-                detail,
-                retry_after_seconds,
-            ));
-        }
-        if self
-            .get_usage_record_not_found
-            .lock()
-            .expect("mutex")
-            .contains(&id)
-        {
-            return Err(UsageCollectorPluginError::UsageRecordNotFound { id });
-        }
-        if let Some(row) = self.get_record_by_id.lock().expect("mutex").get(&id) {
-            return Ok(row.clone());
-        }
-        self.get_record_response
-            .lock()
-            .expect("mutex")
-            .clone()
-            .ok_or_else(|| not_programmed("get_usage_record"))
+        self.target_lookup.lookup(id, scope)
     }
 }
 
-/// Spy alias over [`HappyPathPlugin`] for the declared-fold aggregate tests
-/// (Tasks 8, 9, 12, 13): [`HappyPathPlugin::calls`] and
+/// Spy alias over [`HappyPathPlugin`] for the declared-fold aggregate
+/// tests: [`HappyPathPlugin::calls`] and
 /// [`HappyPathPlugin::last_fold`] already record every
 /// `query_aggregated_usage_records` dispatch, so this is a naming alias
 /// rather than a second spy type.

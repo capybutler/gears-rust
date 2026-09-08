@@ -239,8 +239,8 @@ fn sdk_already_invalidated_is_not_retryable() {
 }
 
 // ---------------------------------------------------------------------------
-// DeclarationNotFound — Type Resolver's fail-closed "does not resolve" case
-// (task 4). Both constructors build this one variant: a genuine not-found
+// DeclarationNotFound — Type Resolver's fail-closed "does not resolve" case.
+// Both constructors build this one variant: a genuine not-found
 // answer from the registry and an incomplete declaration collapse to the
 // identical wire failure, per DESIGN §3.2/§3.3 (see the variant's doc
 // comment).
@@ -276,8 +276,9 @@ fn declaration_incomplete_names_the_identifier_and_carries_the_reason() {
         err.to_string().contains("canonical_unit"),
         "diagnostic must name the offending trait, got: {err}"
     );
-    // Same predicate as a genuine not-found: Task 6's cache must not treat an
-    // incomplete declaration as more resolvable than an absent one.
+    // Same predicate as a genuine not-found: the Type Resolver's cache must
+    // not treat an incomplete declaration as more resolvable than an absent
+    // one.
     assert!(err.is_declaration_not_found());
 }
 
@@ -307,7 +308,7 @@ fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_record_resource
 }
 
 // ---------------------------------------------------------------------------
-// DomainError::invalid_metadata / InvalidMetadata (task 5): the closed
+// DomainError::invalid_metadata / InvalidMetadata: the closed
 // metadata surface a meter declares. `CompiledMetadataSchema::validate` has
 // no `gts_type_id` in scope (only the entry's own metadata map), so — unlike
 // `UnknownMetadataKey` above — this lifts attributed to the record surface,

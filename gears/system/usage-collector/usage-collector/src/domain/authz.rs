@@ -33,8 +33,8 @@ use super::error::DomainError;
 /// four PDP-helper instruments in DESIGN §3.11.5
 /// (`uc_pdp_ready`, `uc_pdp_duration_seconds`, `uc_authz_decisions_total`,
 /// `uc_pdp_failures_total`). Every `domain/authz.rs` helper routes through
-/// this wrapper so instrumentation cannot drift between the catalog,
-/// per-record, and query PDP call sites.
+/// this wrapper so instrumentation cannot drift between the per-record and
+/// query PDP call sites — the three `pdp_scope_with` calls in this file.
 ///
 /// **`uc_authz_decisions_total` records the EFFECTIVE gear decision, not the
 /// raw `access_scope_with` return.** Under `require_constraints(true)` a permit
@@ -45,8 +45,8 @@ use super::error::DomainError;
 /// decision off the raw `Ok` would count a cross-tenant attribution attempt —
 /// the very reconnaissance signal the deny-anomaly alert (DESIGN §3.11.6) keys
 /// off — as a `permit`. So the `permit` sample is emitted only after `gate`
-/// admits; a gate rejection records `deny`. The catalog surface (no row scope)
-/// passes an always-admitting gate, so its permit is final at the PDP boundary.
+/// admits; a gate rejection records `deny`. Every call site here runs under
+/// `require_constraints(true)`, so no permit is final at the PDP boundary.
 ///
 /// Classification (matches `cpt-cf-usage-collector-algo-foundation-pdp-authorize`),
 /// each case also observing duration: `Ok(scope)` with `gate` admitting → permit
@@ -243,7 +243,8 @@ pub(crate) mod usage_record {
 /// `action` selects the verb the PDP authorizes against; `actions::CREATE`
 /// for emission is the only one any caller passes today, and
 /// [`AttributionTupleKey`]'s own doc carries the rule that keeps a second
-/// one from silently sharing its decision. Unlike [`authorize`], this path
+/// one from silently sharing its decision. Unlike the query-path helpers,
+/// which project their constraints into an `OData` filter, this path
 /// runs under `require_constraints(true)` and applies the per-record
 /// attribution gate in [`scope_admits_attribution_tuple`]:
 /// `access_scope_with` fails closed only on an outright PDP deny /

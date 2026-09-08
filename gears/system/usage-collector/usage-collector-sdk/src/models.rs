@@ -567,7 +567,8 @@ impl MeterTypeId {
     /// Length and control characters are checked before the value is handed
     /// to [`GtsTypeId::try_new`], so the diagnostic names the real problem
     /// rather than surfacing a generic GTS parse error. The control-character
-    /// exclusion is load-bearing, not cosmetic: ADR-0007's entry-identifier
+    /// exclusion is load-bearing, not cosmetic:
+    /// `cpt-cf-usage-collector-adr-record-identity-derivation`'s entry-identifier
     /// derivation concatenates this value with the other dedup-identity
     /// inputs under a `0x1F` separator, and a control character inside it
     /// would let two distinct dedup identities collapse to the same

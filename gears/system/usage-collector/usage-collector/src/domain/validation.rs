@@ -35,7 +35,7 @@ use crate::domain::type_resolver::ResolvedDeclaration;
 /// `create_usage_record` before plugin dispatch when the host has no more
 /// specific configured value.
 ///
-/// `UsageCollectorConfig::metadata_size_cap_bytes` (Task 7) defaults to the
+/// `UsageCollectorConfig::metadata_size_cap_bytes` defaults to the
 /// identical `8192`, so a `Service` built without an explicit cap (every
 /// `Service::new` / `Service::new_with_metrics` caller not itself threading a
 /// configured value) enforces exactly this constant — wiring the config value

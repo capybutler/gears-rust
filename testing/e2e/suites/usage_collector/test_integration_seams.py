@@ -4,14 +4,63 @@ Each test targets exactly one seam that only manifests over real HTTP against
 real TimescaleDB. Storage SQL, aggregation internals, domain validation and
 DTO conversion are covered by unit tests and by
 `make test-usage-collector-pg` — not here.
+
+QUARANTINED — this module does not run. See `pytestmark` below.
 """
 
 from datetime import datetime
 from decimal import Decimal
 
+import pytest
+
 from .conftest import accepted_records, record_payload, window_filter
 
+# ── Quarantine ────────────────────────────────────────────────────────────
+# Every test here is skipped, for two reasons that are worth keeping apart.
+#
+# 1. PRE-EXISTING, and it already covered the whole module. Each test takes
+#    the `make_usage_type` fixture, which POSTs `/usage-types`. The usage-type
+#    catalog and its routes were deleted before the correction-model slice —
+#    `src/api/rest/routes/` has had no usage-types module since — so every
+#    test in this file has been failing at setup independently of anything
+#    below. `test_list_usage_types_includes_created`, `test_get_usage_type`
+#    and `test_delete_usage_type_referenced_by_record_is_rejected` are that
+#    breakage and nothing else: they test the deleted catalog directly.
+#
+# 2. ADDED BY THE CORRECTION-MODEL SLICE, which replaced the mutate-in-place
+#    correction model (a `status` latch plus `POST /records/{id}/deactivate`)
+#    with an append-only one: a correction is an ordinary ingested entry
+#    carrying `invalidates` + `reason_code`, and `entry_type` is derived from
+#    `invalidates` rather than stored. Two tests pin vocabulary that slice
+#    deleted, and each carries a note in place below:
+#      - `test_ingest_and_read_record_roundtrip` asserts
+#        `body["status"] == "active"`; `UsageRecord` carries no `status`, and
+#        the response DTO now projects `entry_type`.
+#      - `test_deactivate_is_monotonic` asserts the route (deleted), the
+#        `inactive` field value (deleted) and the `ALREADY_INACTIVE` reason
+#        code (deleted). Its whole premise — that a correction flips a latch
+#        on the target — is the model that was replaced.
+#
+# Rewriting is deliberately NOT done here: it needs a running deployment plus
+# a TimescaleDB plugin on the append-only model to verify against, and the
+# plugin under `plugins/timescaledb-usage-collector-plugin/` is still on the
+# pre-slice-2 model. A rewrite owes: a replacement for `make_usage_type` that
+# declares a meter through the GTS registry instead of the deleted catalog;
+# `status`/`entry_type` repointed; and `test_deactivate_is_monotonic` replaced
+# by an invalidation test that submits a faithful copy carrying `invalidates`
+# and asserts the second attempt is `409 ALREADY_INVALIDATED` — which is now
+# the storage plugin's atomic obligation, not the gateway's.
+pytestmark = pytest.mark.skip(
+    reason="quarantined: usage-type catalog endpoints deleted (pre-existing), and "
+    "the deactivation surface plus the `status` field were deleted by the "
+    "append-only correction-model slice; needs a running deployment to rewrite"
+)
 
+
+# Quarantine reason 2 (see the module header): `status` no longer exists on
+# the record or on the wire. The seam this test guards — a `Decimal` value
+# crossing as a string and a timestamptz round-trip — is still worth having;
+# only the `status` assertion needs repointing, to the derived `entry_type`.
 async def test_ingest_and_read_record_roundtrip(api, make_usage_type):
     """Seam: handler <-> JSON wire format <-> PostgreSQL round-trip.
 
@@ -106,6 +155,11 @@ async def test_aggregate_groups_by_resource(api, make_usage_type):
     assert sums == {"res-a": Decimal("15"), "res-b": Decimal("7")}
 
 
+# Quarantine reason 2 (see the module header): this test has no successor
+# assertion to repoint to. Deactivation was not renamed — the whole
+# mutate-the-target mechanism it describes was replaced by appending a second
+# entry, so the route, the `inactive` value and `ALREADY_INACTIVE` are all
+# gone. A rewrite is a new test, not an edit of this one.
 async def test_deactivate_is_monotonic(api, make_usage_type):
     """Seam: deactivation is one-way, enforced at the storage transaction.
 

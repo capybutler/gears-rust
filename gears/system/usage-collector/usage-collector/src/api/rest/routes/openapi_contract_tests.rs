@@ -721,7 +721,7 @@ fn assert_problem_envelope(doc: &Value, key: &str, label: &str, response: &Value
 /// already drifted this way — `operation_builder.rs:1495` and `:1529`
 /// advertise a 422 that the body deliberately omits.
 ///
-/// 503 is in the set because all nine routes call `.error_503(openapi)`.
+/// 503 is in the set because all four routes call `.error_503(openapi)`.
 /// The document makes no explicit 503 promise — the status rides
 /// `default:` — so this is a registry-side requirement only, which is
 /// what [`every_operation_declares_the_standard_error_set`] already is.

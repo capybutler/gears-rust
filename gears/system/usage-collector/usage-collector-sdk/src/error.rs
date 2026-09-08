@@ -789,8 +789,8 @@ pub enum UsageCollectorPluginError {
     },
 
     /// A second withdrawal of a record that already carries one. This is
-    /// the plugin's **one** invalidation obligation: only the store can
-    /// make the check atomic with the entry it admits
+    /// the plugin's **one admission-time** invalidation obligation: only
+    /// the store can make the check atomic with the entry it admits
     /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). Carries the
     /// existing invalidation's id, so the gateway's rejection can name the
     /// entry that already withdrew the target.

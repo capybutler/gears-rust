@@ -147,9 +147,9 @@ impl DomainError {
     /// `types-registry` has no declaration under this identifier.
     ///
     /// Distinct from [`Self::TypesRegistryUnavailable`]: this is a definite
-    /// answer, not a transport failure, so a cache built on top of this port
-    /// (Task 6) can act on it directly rather than riding it out on a stale
-    /// entry. Test for it with [`Self::is_declaration_not_found`].
+    /// answer, not a transport failure, so the Type Resolver's cache, built
+    /// on top of this port, can act on it directly rather than riding it out
+    /// on a stale entry. Test for it with [`Self::is_declaration_not_found`].
     #[must_use]
     pub fn declaration_not_found(id: &MeterTypeId) -> Self {
         Self::DeclarationNotFound {
@@ -175,7 +175,8 @@ impl DomainError {
 
     /// True when this is a definite "does not resolve" answer rather than a
     /// possibly-transient availability failure. The `DeclarationSource` port
-    /// contract (and Task 6's cache) depends on telling the two apart: only
+    /// contract (and the Type Resolver's cache) depends on telling the two
+    /// apart: only
     /// this case is safe to act on immediately rather than served from a
     /// stale cached entry.
     #[must_use]

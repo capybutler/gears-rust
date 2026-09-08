@@ -63,10 +63,12 @@ impl UsageCollectorPluginV1 for NoopBackend {
     /// **not** the shape a conforming plugin answers with: the no-grouping
     /// case is a single bucket carrying an empty `key`
     /// ([`AggregationResult`]), whose value is absent for every fold but
-    /// `COUNT`. A caller does see the difference — the gear passes the
-    /// buckets through to the wire — but no gear-side logic branches on the
-    /// count, so the default stands in a backend that MUST NOT be used in
-    /// production.
+    /// `COUNT`. The gear does read the count — it refuses a result over the
+    /// declared aggregate-bucket cap and observes the count as result-row
+    /// telemetry — and it passes the buckets through to the wire, so a
+    /// caller sees the difference too. Zero is under every cap and reads as
+    /// an empty result, which is why the default is harmless here and only
+    /// here: this is a backend that MUST NOT be used in production.
     async fn query_aggregated_usage_records(
         &self,
         _gts_type_id: MeterTypeId,

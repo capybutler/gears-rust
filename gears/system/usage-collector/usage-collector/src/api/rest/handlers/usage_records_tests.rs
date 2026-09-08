@@ -1411,8 +1411,8 @@ async fn get_with_malformed_uuid_returns_400_before_reaching_service() {
 async fn get_without_plugin_surfaces_503() {
     // No usage-collector storage plugin registered. `get_usage_record` now
     // authorizes via a pre-row compiled-scope PDP request BEFORE resolving
-    // the plugin (Task 13 moved the point lookup onto the same posture as
-    // list/aggregate), so a *permitting* resolver is required to reach
+    // the plugin (the point lookup shares the posture of list/aggregate),
+    // so a *permitting* resolver is required to reach
     // `Service::get_plugin`'s failure at all — a `CountingUnreachableResolver`
     // sentinel would instead surface 503 from the PDP step itself, proving
     // nothing about plugin resolution. `CountingPermitResolver` grants a
@@ -1508,7 +1508,7 @@ async fn get_happy_path_returns_200_with_record_body() {
     plugin.set_get_record(sample_persisted_record(target_uuid, tenant_id));
 
     // `get_usage_record` now authorizes via a pre-row compiled-scope PDP
-    // request (Task 13); the fixture's default `CountingTenantPermitResolver`
+    // request; the fixture's default `CountingTenantPermitResolver`
     // reads the constraint back out of the caller's own request, which a
     // pre-row request carries none of, so it would fall back to an
     // allow-all permit and fail closed under `require_constraints(true)`.
@@ -3628,7 +3628,7 @@ mod handle_query_aggregated_usage_records_tests {
         // `bigdecimal_str_option` contract. The service resolves the fold
         // from the declaration (there is no `op` on the wire any more), so
         // this wires a working Type Resolver rather than the plugin-side
-        // catalog the pre-Task-8 test used.
+        // catalog this test used before the catalog was retired.
         let source = fake_declaration_source_with_fold("SUM");
         let plugin = RecordingPlugin::new();
         let service = ServiceFixture::default()

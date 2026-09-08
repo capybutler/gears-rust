@@ -57,7 +57,7 @@ pub struct UsageCollectorConfig {
     /// plain mandatory `usize`, with no default of its own; every other
     /// caller, `module.rs` bootstrap included, passes this configured value
     /// or the constant explicitly) — so wiring this value through to
-    /// `domain::validation::validate_submit_record_metadata` (Task 9) is a
+    /// `domain::validation::validate_submit_record_metadata` is a
     /// no-op for the default deployment rather than a silent tightening.
     pub metadata_size_cap_bytes: usize,
 }
