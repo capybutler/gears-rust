@@ -1195,6 +1195,17 @@ histogram needs a per-label count, add a `histogram_count_with_label` beside
 `histogram_count` following its shape, rather than reaching into the exporter
 inline.
 
+**Corrected during execution — the histogram assertion above cannot fail.**
+`histogram_count(&exporter, "uc_ingestion_duration_seconds") == 2` is satisfied
+whether or not the label exists: two observations sum to 2 in one series exactly
+as they do across two. Proving the series *splits* is the entire point of the
+change, so the assertion has to be per-label —
+`histogram_count_with_label(…, "origin", "live") == 1` and the same for
+`backfill`, alongside the total. **This is ground rule 3 — a prescribed check
+that could not fail — occurring in a prescribed *assertion* rather than a
+prescribed mutation.** The rule generalises: distrust any prescribed check whose
+failure mode you have not stated.
+
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
