@@ -181,10 +181,12 @@ fn harness_sees_the_whole_rest_surface() {
 
     assert_eq!(
         registry_ops(&reg).len(),
-        4,
-        "expected 4 registered operations (create, list, get, aggregate); \
-         a withdrawal travels the ordinary ingestion path, so there is no \
-         dedicated correction endpoint",
+        5,
+        "expected 5 registered operations (create, backfill, list, get, \
+         aggregate); a withdrawal travels one of the two ingestion paths, so \
+         there is no dedicated correction endpoint. An old-enough withdrawal \
+         is submitted to `backfill`, which is an ingestion route and not a \
+         correction one",
     );
     assert_eq!(yaml_ops(&doc).len(), 7, "expected 7 documented operations");
 }

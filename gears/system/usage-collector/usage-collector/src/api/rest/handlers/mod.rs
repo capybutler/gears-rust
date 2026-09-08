@@ -7,6 +7,6 @@
 mod usage_records;
 
 pub(crate) use usage_records::{
-    handle_create_usage_records, handle_get_usage_record, handle_list_usage_records,
-    handle_query_aggregated_usage_records,
+    handle_backfill_usage_records, handle_create_usage_records, handle_get_usage_record,
+    handle_list_usage_records, handle_query_aggregated_usage_records,
 };

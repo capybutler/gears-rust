@@ -51,7 +51,6 @@ use crate::infra::sdk_error_mapping::{
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-api-post-records:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-entity-security-context:p1
 pub async fn handle_create_usage_records(
-    // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-submit
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-missing-ctx
     Extension(ctx): Extension<SecurityContext>,
@@ -60,10 +59,83 @@ pub async fn handle_create_usage_records(
     Json(req): Json<CreateUsageRecordsRequest>,
     // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-submit
 ) -> ApiResult<impl IntoResponse> {
-    // Mirror `Service::create_usage_records`' `1..=MAX_BATCH_RECORDS` gate at
-    // the handler so an oversized or empty wire payload is rejected as
-    // `InvalidArgument` before the per-record loop allocates / iterates.
-    // The service still enforces the same invariant for non-REST callers.
+    // `create_usage_records` is the whole difference between this handler
+    // and `handle_backfill_usage_records`; it is what makes the gateway
+    // stamp `origin = live`. Everything around that choice — the batch
+    // cap, the per-index fold, the re-sort, the 200 / 207 selection — is
+    // the shared body, because a second copy of per-index
+    // bookkeeping is how the two routes would silently disagree about
+    // which input a rejection belongs to.
+    dispatch_usage_record_batch(&ctx, req, async |ctx, batch| {
+        service.create_usage_records(ctx, batch).await
+    })
+    .await
+}
+
+/// `POST /usage-collector/v1/records/backfill`
+///
+/// Bulk historical import. Same request shape, same per-entry response
+/// envelope and same `200` / `207` selection as
+/// [`handle_create_usage_records`] — the dispatched
+/// [`Service::backfill_usage_records`] is the only difference, and with it
+/// the `origin = backfill` marker the gateway stamps, the lifted past
+/// bound on the covered period, and the elevated authorization an entry
+/// older than the configured backfill window is judged against.
+///
+/// The ADR's *workload* isolation is not implemented — see
+/// [`Service::backfill_usage_records`], which carries that TODO. Nothing
+/// on this route bounds it apart from the live one, so the registered
+/// description names three differences from `POST /records`, not the four
+/// the published contract enumerates.
+///
+/// No `@cpt` markers here: the batch flow's instructions are realized in
+/// the shared body below and, for the submission step, on
+/// [`handle_create_usage_records`]'s extractors. This route's own
+/// obligation is the unimplemented workload isolation, which no marker
+/// may claim.
+pub async fn handle_backfill_usage_records(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(service): Extension<Arc<Service>>,
+    Json(req): Json<CreateUsageRecordsRequest>,
+) -> ApiResult<impl IntoResponse> {
+    dispatch_usage_record_batch(&ctx, req, async |ctx, batch| {
+        service.backfill_usage_records(ctx, batch).await
+    })
+    .await
+}
+
+/// The batch-ingestion handler body, shared by `POST /records` and
+/// `POST /records/backfill`.
+///
+/// `dispatch` is the only variation: which [`Service`] batch entry point
+/// the eligible records go to, and therefore which
+/// [`usage_collector_sdk::RecordOrigin`] the gateway stamps them with. The
+/// structural batch cap, the fold of each wire record into its domain
+/// type, the index-preserving dispatch, the re-sort and the `200` / `207`
+/// selection are identical on both routes and live here once — mirroring
+/// `Service::create_usage_records_for_origin`, which does the same for the
+/// domain half of the same two paths.
+///
+/// A rejection carries the input index it belongs to, so a divergence
+/// between two copies of this bookkeeping would misattribute rejections
+/// rather than fail loudly. That is why there is one copy.
+// @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
+async fn dispatch_usage_record_batch<D>(
+    ctx: &SecurityContext,
+    req: CreateUsageRecordsRequest,
+    dispatch: D,
+) -> ApiResult<(StatusCode, Json<CreateUsageRecordsResponse>)>
+where
+    D: AsyncFnOnce(
+        &SecurityContext,
+        Vec<CreateUsageRecord>,
+    )
+        -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError>,
+{
+    // Mirror the service's `1..=MAX_BATCH_RECORDS` gate at the handler so
+    // an oversized or empty wire payload is rejected as `InvalidArgument`
+    // before the per-record loop allocates / iterates. The service still
+    // enforces the same invariant for non-REST callers.
     let actual = req.records.len();
     if actual == 0 || actual > MAX_BATCH_RECORDS {
         return Err(usage_collector_error_to_canonical(
@@ -95,10 +167,9 @@ pub async fn handle_create_usage_records(
         // Batch-level dispatch failure (plugin resolution, SPI size
         // mismatch) bubbles through `?` as a whole-request canonical
         // envelope — the same failure would have hit every record
-        // identically. `Service::create_usage_records` post-condition:
-        // one result per dispatched record, in order.
-        let per_record = service
-            .create_usage_records(&ctx, batch)
+        // identically. Both dispatched entry points carry the same
+        // post-condition: one result per dispatched record, in order.
+        let per_record = dispatch(ctx, batch)
             .await
             .map_err(usage_collector_error_to_canonical)?;
         for (index, outcome) in indices.into_iter().zip(per_record) {

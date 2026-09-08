@@ -13,6 +13,12 @@ use super::{dto, handlers};
 
 const USAGE_RECORDS_TAG: &str = "Usage Records";
 
+/// The bulk-import route carries its own tag rather than sitting under
+/// [`USAGE_RECORDS_TAG`]: it is a separate operator-facing surface with
+/// its own authorization story, and the published contract groups it that
+/// way.
+const BACKFILL_TAG: &str = "Backfill";
+
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-api-post-records:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-ingestion:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-component-ingestion-gateway:p1
@@ -44,6 +50,52 @@ pub(super) fn register_usage_record_routes(
         .error_503(openapi)
         .register(router, openapi);
     // @cpt-end:cpt-cf-usage-collector-dod-usage-emission-api-post-records:p1:inst-register-route-create-records
+
+    // The path comes from `usage_collector_sdk::BACKFILL_ROUTE_PATH`, not a
+    // literal: the SDK's past-tolerance rejection tells a caller to resubmit
+    // here, and a route that moved out from under that message would leave
+    // the rejection pointing at nothing.
+    //
+    // `usage-collector-v1.yaml` enumerates FOUR ways this route differs from
+    // `POST /records`; the description below names THREE. The omitted one is
+    // workload isolation, which this slice does not implement — the route is
+    // `Service::create_usage_records_for_origin` under a different origin,
+    // sharing the live path's runtime, connection pool and fan-out budget
+    // (the TODO on `Service::backfill_usage_records`). Publishing the
+    // contract's fourth claim would put an isolation guarantee on the wire
+    // that the code falsifies, so the summary drops "isolated from live
+    // ingestion" for the same reason. Both divergences from the document are
+    // deliberate and are recorded with the slice.
+    router = OperationBuilder::post(usage_collector_sdk::BACKFILL_ROUTE_PATH)
+        .operation_id("usage_collector.backfill_usage_records")
+        .summary("Bulk historical import on its own route")
+        .description(
+            "Identical validation and request shape to POST /records, differing in \
+             three respects: every accepted entry is stamped `origin: backfill`, the \
+             live path's past bound on the covered period does not apply because this \
+             route exists for exactly the periods that bound rejects, and submissions \
+             whose covered period ends further back than the configured backfill \
+             window require elevated authorization. The route takes measurements and \
+             invalidation entries alike, mixed in one batch.",
+        )
+        .tag(BACKFILL_TAG)
+        .authenticated()
+        .no_license_required()
+        .json_request::<dto::CreateUsageRecordsRequest>(openapi, "Usage-record import payload")
+        .handler(handlers::handle_backfill_usage_records)
+        .json_response_with_schema::<dto::CreateUsageRecordsResponse>(
+            openapi,
+            StatusCode::OK,
+            "Every entry accepted or deduplicated",
+        )
+        .json_response_with_schema::<dto::CreateUsageRecordsResponse>(
+            openapi,
+            StatusCode::MULTI_STATUS,
+            "At least one entry rejected; inspect each per-entry outcome",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
 
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-raw:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-query-fr-query-raw:p1

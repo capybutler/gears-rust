@@ -3716,3 +3716,348 @@ mod handle_query_aggregated_usage_records_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// handle_backfill_usage_records — POST /usage-collector/v1/records/backfill
+//
+// The backfill route shares the live route's whole handler body
+// (`dispatch_usage_record_batch`); the dispatched `Service` entry point is
+// the only variation, and with it the `RecordOrigin` the gateway stamps.
+// So the tests here pin exactly what the shared body cannot: that this
+// handler dispatches to `Service::backfill_usage_records`, evidenced by
+// the origin on the record the plugin is HANDED — not by the origin on the
+// record the fixture hands back, which would be asserting the fixture.
+//
+// The envelope itself (200 all-accepted / 207 any-rejected, index-ordered
+// results) is asserted here too, because it is the published contract of
+// this route even though the code realizing it is shared.
+// ---------------------------------------------------------------------------
+
+mod handle_backfill_usage_records_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use axum::Json;
+    use axum::extract::Extension;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use usage_collector_sdk::{CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin};
+    use uuid::Uuid;
+
+    use super::super::handle_backfill_usage_records;
+    use super::{HAPPY_RECORD_GTS_ID, ResourceRefDto};
+    use crate::api::rest::dto::{CreateUsageRecordRequest, CreateUsageRecordsRequest};
+    use crate::domain::test_support::{
+        HappyPathPlugin, ServiceFixture, authenticated_ctx, fake_declaration_source_with_fold,
+        projected_with_origin, recent_window_end, recent_window_start,
+    };
+
+    /// One valid wire record against the happy-path meter.
+    fn wire_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecordRequest {
+        CreateUsageRecordRequest {
+            gts_type_id: HAPPY_RECORD_GTS_ID.to_owned(),
+            tenant_id,
+            resource_ref: ResourceRefDto {
+                resource_id: "rsc-backfill".to_owned(),
+                resource_type: "compute.vm".to_owned(),
+            },
+            subject_ref: None,
+            metadata: BTreeMap::new(),
+            value: rust_decimal::Decimal::from(1),
+            idempotency_key: idem.to_owned(),
+            invalidates: None,
+            reason_code: None,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
+        }
+    }
+
+    /// The domain submission the gateway derives from [`wire_record`], so
+    /// the echo fixture can be programmed with the same projection the
+    /// service will produce.
+    fn domain_submission(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
+        CreateUsageRecord {
+            gts_type_id: MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id"),
+            tenant_id,
+            resource_ref: usage_collector_sdk::ResourceRef::new("rsc-backfill", "compute.vm")
+                .expect("valid resource ref"),
+            subject_ref: None,
+            metadata: BTreeMap::new(),
+            value: rust_decimal::Decimal::from(1),
+            idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
+            invalidation: None,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
+        }
+    }
+
+    fn service_and_plugin(
+        results: Vec<
+            Result<
+                usage_collector_sdk::UsageRecord,
+                usage_collector_sdk::UsageCollectorPluginError,
+            >,
+        >,
+        instance: &str,
+    ) -> (Arc<crate::domain::Service>, Arc<HappyPathPlugin>) {
+        let plugin = HappyPathPlugin::new();
+        plugin.set_create_records(results);
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build(
+                Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+                instance,
+            );
+        (service, plugin)
+    }
+
+    async fn wire_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body collected");
+        serde_json::from_slice(&bytes).expect("body is JSON")
+    }
+
+    /// An all-accepted backfill batch is `200 OK`, and the entries it
+    /// returns carry `origin: backfill`.
+    ///
+    /// The load-bearing assertion is on the record the plugin was HANDED:
+    /// `forwarded[0].origin == Backfill` is what fails if this handler
+    /// dispatches to `Service::create_usage_records` instead. The wire
+    /// assertion rides on the echo fixture, which is programmed through
+    /// `projected_with_origin(.., Backfill)` precisely so a live-stamping
+    /// regression cannot be papered over by a `Live` projection agreeing
+    /// with itself.
+    #[tokio::test]
+    async fn backfill_all_accepted_is_200_and_stamps_origin_backfill() {
+        let tenant_id = Uuid::from_u128(7);
+        let submission = domain_submission(tenant_id, "idem-backfill-0");
+        let echoed = projected_with_origin(&submission, RecordOrigin::Backfill);
+        let persisted_id = echoed.id;
+        let (service, plugin) = service_and_plugin(
+            vec![Ok(echoed)],
+            "test.handler.backfill_records.accepted.v1",
+        );
+
+        let req = CreateUsageRecordsRequest {
+            records: vec![wire_record(tenant_id, "idem-backfill-0")],
+        };
+
+        let response = handle_backfill_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(service),
+            Json(req),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an all-accepted backfill batch MUST surface as 200 OK, not 207: \
+             the backfill route publishes the same envelope as POST /records",
+        );
+
+        let body = wire_body(response).await;
+        let results = body
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .expect("response carries a `results` array");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .get("outcome")
+                .and_then(serde_json::Value::as_str),
+            Some("accepted"),
+        );
+        let record = results[0]
+            .get("record")
+            .expect("accepted item carries `record`");
+        assert_eq!(
+            record.get("id").and_then(serde_json::Value::as_str),
+            Some(persisted_id.to_string().as_str()),
+            "wire body MUST echo the service-returned record",
+        );
+        assert_eq!(
+            record.get("origin").and_then(serde_json::Value::as_str),
+            Some("backfill"),
+            "an entry accepted on the backfill route MUST come back \
+             `origin: backfill`",
+        );
+
+        let forwarded = plugin
+            .last_create_records_input()
+            .expect("plugin received the eligible batch");
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded[0].origin,
+            RecordOrigin::Backfill,
+            "the handler MUST dispatch to `Service::backfill_usage_records`; \
+             a dispatch to `create_usage_records` hands the plugin an entry \
+             stamped `Live`",
+        );
+    }
+
+    /// A backfill batch with at least one rejection is `207 Multi-Status`,
+    /// and the per-entry results stay ordered by input index.
+    ///
+    /// Input index 1 is rejected at the handler fold (bad `gts_type_id`
+    /// prefix) and never reaches the service, so the accepted entries sit
+    /// at indices 0 and 2 with a gap between them — which is exactly the
+    /// bookkeeping a second copy of the shared body would break.
+    #[tokio::test]
+    async fn backfill_with_one_rejection_is_207_and_preserves_input_order() {
+        let tenant_id = Uuid::from_u128(8);
+        let echoed_0 = projected_with_origin(
+            &domain_submission(tenant_id, "idem-backfill-mixed-0"),
+            RecordOrigin::Backfill,
+        );
+        let echoed_2 = projected_with_origin(
+            &domain_submission(tenant_id, "idem-backfill-mixed-2"),
+            RecordOrigin::Backfill,
+        );
+        let (persisted_0, persisted_2) = (echoed_0.id, echoed_2.id);
+        assert_ne!(persisted_0, persisted_2, "test premise: distinct entries");
+        let (service, plugin) = service_and_plugin(
+            vec![Ok(echoed_0), Ok(echoed_2)],
+            "test.handler.backfill_records.mixed.v1",
+        );
+
+        let mut bad = wire_record(tenant_id, "idem-backfill-mixed-1");
+        bad.gts_type_id = "not-a-valid-prefix".to_owned();
+        let req = CreateUsageRecordsRequest {
+            records: vec![
+                wire_record(tenant_id, "idem-backfill-mixed-0"),
+                bad,
+                wire_record(tenant_id, "idem-backfill-mixed-2"),
+            ],
+        };
+
+        let response = handle_backfill_usage_records(
+            Extension(authenticated_ctx()),
+            Extension(service),
+            Json(req),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::MULTI_STATUS,
+            "any rejection in a backfill batch MUST surface as 207 Multi-Status",
+        );
+
+        let body = wire_body(response).await;
+        let results = body
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .expect("response carries a `results` array");
+        assert_eq!(results.len(), 3);
+
+        let outcome = |i: usize| {
+            results[i]
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        };
+        let index_field = |i: usize| results[i].get("index").and_then(serde_json::Value::as_u64);
+
+        assert_eq!(outcome(0), "accepted");
+        assert_eq!(index_field(0), Some(0));
+        assert_eq!(
+            results[0]
+                .get("record")
+                .and_then(|r| r.get("id"))
+                .and_then(serde_json::Value::as_str),
+            Some(persisted_0.to_string().as_str()),
+        );
+        assert_eq!(
+            results[0]
+                .get("record")
+                .and_then(|r| r.get("origin"))
+                .and_then(serde_json::Value::as_str),
+            Some("backfill"),
+        );
+
+        assert_eq!(outcome(1), "rejected", "input index 1 MUST be rejected");
+        assert_eq!(index_field(1), Some(1));
+
+        assert_eq!(outcome(2), "accepted");
+        assert_eq!(index_field(2), Some(2));
+        assert_eq!(
+            results[2]
+                .get("record")
+                .and_then(|r| r.get("id"))
+                .and_then(serde_json::Value::as_str),
+            Some(persisted_2.to_string().as_str()),
+            "the second accepted entry MUST land at input index 2, not at the \
+             index it held in the eligible sub-batch",
+        );
+
+        let forwarded = plugin
+            .last_create_records_input()
+            .expect("plugin received the eligible batch");
+        assert_eq!(
+            forwarded.len(),
+            2,
+            "plugin MUST receive only the handler-validated records",
+        );
+        for entry in &forwarded {
+            assert_eq!(
+                entry.origin,
+                RecordOrigin::Backfill,
+                "every entry of a backfill batch MUST reach the plugin \
+                 stamped `Backfill`",
+            );
+        }
+    }
+
+    /// `origin` is server-assigned: it records the route an entry
+    /// travelled, so a caller that could name it could file live traffic
+    /// as history (or the reverse) and defeat the marker's whole purpose.
+    /// `CreateUsageRecordRequest`'s `deny_unknown_fields` is what refuses
+    /// it, and this pins that the refusal survives — on the body shape
+    /// this route accepts, which is the same one `POST /records` accepts.
+    ///
+    /// The accepting half is the anchor: without it, a rename or a removal
+    /// of some unrelated required field would make the rejecting half pass
+    /// for the wrong reason.
+    #[test]
+    fn a_request_body_naming_its_own_origin_is_refused() {
+        let record = || {
+            serde_json::json!({
+                "gts_type_id": HAPPY_RECORD_GTS_ID,
+                "tenant_id": Uuid::from_u128(9).to_string(),
+                "resource_ref": {
+                    "resource_id": "rsc-backfill",
+                    "resource_type": "compute.vm",
+                },
+                "value": "1",
+                "idempotency_key": "idem-backfill-origin",
+                "window_start": "2026-07-07T00:00:00Z",
+                "window_end": "2026-07-07T01:00:00Z",
+            })
+        };
+
+        // Positive anchor: the very same body, minus `origin`, is accepted.
+        serde_json::from_value::<CreateUsageRecordsRequest>(serde_json::json!({
+            "records": [record()],
+        }))
+        .expect("the backfill body without `origin` MUST deserialize");
+
+        let mut with_origin = record();
+        with_origin
+            .as_object_mut()
+            .expect("record is a JSON object")
+            .insert("origin".to_owned(), serde_json::json!("live"));
+        let err = serde_json::from_value::<CreateUsageRecordsRequest>(serde_json::json!({
+            "records": [with_origin],
+        }))
+        .expect_err("a caller-supplied `origin` MUST be refused");
+        assert!(
+            err.to_string().contains("origin"),
+            "the refusal MUST name `origin` so the caller knows which member \
+             to drop (got `{err}`)",
+        );
+    }
+}
