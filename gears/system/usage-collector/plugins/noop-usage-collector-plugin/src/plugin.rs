@@ -56,6 +56,17 @@ impl UsageCollectorPluginV1 for NoopBackend {
         Err(UsageCollectorPluginError::UsageRecordNotFound { id })
     }
 
+    /// Persists nothing, so every fold is taken over an empty selection and
+    /// the withdrawal exclusion the SPI states has nothing to leave out.
+    ///
+    /// The empty `buckets` vector is this backend's well-formed default,
+    /// **not** the shape a conforming plugin answers with: the no-grouping
+    /// case is a single bucket carrying an empty `key`
+    /// ([`AggregationResult`]), whose value is absent for every fold but
+    /// `COUNT`. A caller does see the difference — the gear passes the
+    /// buckets through to the wire — but no gear-side logic branches on the
+    /// count, so the default stands in a backend that MUST NOT be used in
+    /// production.
     async fn query_aggregated_usage_records(
         &self,
         _gts_type_id: MeterTypeId,

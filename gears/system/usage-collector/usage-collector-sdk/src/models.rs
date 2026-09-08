@@ -1537,6 +1537,9 @@ pub struct AggregationBucket {
     /// magnitude but may still carry a backend/plugin-chosen rounding scale on
     /// non-terminating quotients (arbitrary precision is still finite). `None`
     /// when no rows matched the bucket (e.g. `MIN` over an empty set).
+    /// `COUNT` is the one exception and answers `Some(0)`: counting an
+    /// empty selection is zero rather than absent, the same split
+    /// `SELECT COUNT(*)` makes against `SELECT MIN(v)` over no rows.
     /// Wire-encoded as a JSON string (never a float) for the same round-trip
     /// reason as [`UsageRecord::value`], via
     /// [`crate::serde_helpers::bigdecimal_str_option`].

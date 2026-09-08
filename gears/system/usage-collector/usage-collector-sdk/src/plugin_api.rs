@@ -51,6 +51,21 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// `id` that does not exist at all. This is what keeps the by-id
     /// surface from acting as an existence oracle: the caller cannot tell
     /// "exists but not yours" apart from "does not exist".
+    ///
+    /// A withdrawn pair MUST be returned **as persisted** — both entries,
+    /// the invalidation naming its target
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). This is a
+    /// ledger path rather than a derived view, and a plugin MUST NOT
+    /// withhold a withdrawn entry from it as a kindness: hiding one
+    /// destroys the audit trail the append-only model exists to keep, and
+    /// the exclusion belongs to the fold instead
+    /// ([`Self::query_aggregated_usage_records`]). This path carries no
+    /// filter that selects withdrawn entries in or out — the target
+    /// reference an invalidation carries ([`UsageRecord::invalidation`]) is
+    /// what a consumer reads instead. The kind alone will not do it: an
+    /// entry known to be an invalidation still has to name the record it
+    /// withdrew before anything can be left out. A consumer folding entries
+    /// it read here leaves a withdrawn pair out on its own side.
     async fn get_usage_record(
         &self,
         id: Uuid,
@@ -74,6 +89,52 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// [`TimeRange::contains_window_end`] is the reference spelling for an
     /// in-process implementation; a SQL-backed plugin restates the same
     /// boundary in its own `WHERE` clause.
+    ///
+    /// **A withdrawn pair contributes nothing.** Two obligations rather
+    /// than one conditional
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`), and the
+    /// plugin MUST honour both:
+    ///
+    /// 1. An **invalidation entry** contributes nothing to any fold,
+    ///    whether or not its target is in the selection.
+    /// 2. A **record an accepted invalidation names** contributes nothing
+    ///    either.
+    ///
+    /// The reference an entry carries ([`UsageRecord::invalidation`]) is
+    /// both what makes it an invalidation, for the first, and what names
+    /// the record to leave out with it, for the second.
+    ///
+    /// Leaving out only the record double-counts the measurement the
+    /// withdrawal was meant to remove, because an invalidation echoes the
+    /// quantity it withdraws rather than negating it. The rule holds under
+    /// every value of `fold` and needs no interpretation of what a quantity
+    /// means, which is what makes withdrawal expressible as one rule across
+    /// every declared fold rather than one rule per meter kind.
+    ///
+    /// The first obligation standing alone is not pedantry. Retention is
+    /// plugin-owned (DESIGN §3.10 "Consistency Contract"), so a conforming
+    /// deployment can purge a target and keep the invalidation that
+    /// withdrew it. That orphan still contributes nothing, and admitting it
+    /// would be the double count in its purest form — the echoed quantity
+    /// reported with nothing left to pair it against.
+    ///
+    /// Both entries carry one covered period, so no `time_range` selects
+    /// one of the pair without the other and no placement of the
+    /// invalidation changes a result.
+    ///
+    /// A materialised aggregate MUST **recompute** over the affected range
+    /// rather than absorb an appended term: no further term reverses `MAX`,
+    /// `MIN` or `LATEST`. Append-only is a property of the ledger, not of a
+    /// derived view.
+    ///
+    /// This is a read-path obligation, distinct from the store's one
+    /// admission-time invalidation rule
+    /// ([`UsageCollectorPluginError::AlreadyInvalidated`]): that one
+    /// decides what is admitted, this one what a fold counts. The gear
+    /// enforces neither — it dispatches this call and returns what the
+    /// plugin computes — so the `invalidation-excluded-from-fold` contract
+    /// test DESIGN §3.3 "Plugin SPI" requires of every conforming plugin is
+    /// what binds an implementation to it.
     async fn query_aggregated_usage_records(
         &self,
         gts_type_id: MeterTypeId,
@@ -90,6 +151,20 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// `time_range` selects on the covered-period end under the same
     /// obligation as [`Self::query_aggregated_usage_records`], and is
     /// likewise absent from `query.filter`.
+    ///
+    /// A withdrawn pair MUST likewise be returned as persisted here, under
+    /// the ledger obligation [`Self::get_usage_record`] states — both
+    /// entries, though **not necessarily on one page**: the pair shares a
+    /// `window_end` but not an `id`, and an admissible order names both, so
+    /// whichever of the two it leads with, a page boundary can fall between
+    /// them. A consumer leaving a pair out folds over a range it has read
+    /// whole rather than over a single page.
+    ///
+    /// "No filter that selects them in or out" means none this method
+    /// applies on its own initiative. A caller's `$filter` may name
+    /// `invalidates` or `entry_type` — the filterable schema declares both,
+    /// the former precisely so a consumer folding entries itself can find a
+    /// withdrawn pair.
     ///
     /// `query.order` MUST be honoured: it is the keyset the page
     /// continuation is built from, so ignoring it drops rows across a page

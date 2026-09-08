@@ -1445,6 +1445,255 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
 /// rather than a second spy type.
 pub(crate) type RecordingPlugin = HappyPathPlugin;
 
+// ── FoldingPlugin: the in-memory reference for withdrawal exclusion ────────
+
+use bigdecimal::BigDecimal;
+use toolkit_odata::PageInfo;
+use usage_collector_sdk::{
+    AggregationBucket, IdempotencyKey, Invalidation, ReasonCode, derive_usage_record_id,
+};
+
+/// In-memory storage double that actually folds, so the withdrawal
+/// exclusion has something to be demonstrated against.
+///
+/// A genuinely separate type, not a third name for [`HappyPathPlugin`]:
+/// that one replays a programmed [`AggregationResult`] and [`MockPlugin`]
+/// refuses every call, so neither can show what a fold does with a
+/// withdrawn pair. This one holds entries and computes the answer. It
+/// selects on the covered-period end with
+/// [`TimeRange::contains_window_end`], leaves out every entry that is an
+/// invalidation **or** is named by one, and folds what is left
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+///
+/// It is a **fixture, not a backend**. What it pins is the reference
+/// semantics the `invalidation-excluded-from-fold` contract test DESIGN
+/// §3.3 "Plugin SPI" requires of every conforming plugin — a suite this
+/// repo does not carry, and which has this double to be written against
+/// when it arrives. What it does **not** implement, so nobody lifts it
+/// expecting more:
+///
+/// * **`group_by`** — every fold produces exactly one bucket with an empty
+///   key, whatever dimensions are requested. Grouping is orthogonal to the
+///   exclusion and no test here needs it.
+/// * **The PDP scope and `query.filter`** — both ignored, on the two paths
+///   that carry the scope composed into `$filter` and on
+///   `get_usage_record`, which receives it as an `&ast::Expr` of its own.
+///   Honouring either would make every assertion here depend on an `OData`
+///   evaluator this fixture does not have, so a row outside the caller's
+///   scope is returned rather than withheld — which a conforming plugin
+///   must not do.
+/// * **`metadata_filter`, paging and `query.order`** — a page carries every
+///   selected entry in insertion order and mints no `next_cursor`.
+/// * **The create surface** — entries arrive through [`Self::store`] and
+///   [`Self::store_withdrawn`]; `create_usage_record` and
+///   `create_usage_records` refuse. At-most-one-invalidation is an
+///   admission rule
+///   ([`UsageCollectorPluginError::AlreadyInvalidated`]), and admitting
+///   nothing is how this double stays small.
+/// * **`acceptance_sequence`** — [`UsageRecord`] carries no such field, so
+///   `LATEST` here resolves on `window_end` alone and breaks a tie by
+///   insertion order. The declared tie-break is greatest `window_end`, then
+///   greatest `acceptance_sequence`; a conforming plugin owes the second
+///   half and this fixture cannot give it.
+///
+/// Empty-selection answers follow SQL: `COUNT` is zero and every other fold
+/// is absent.
+pub(crate) struct FoldingPlugin {
+    stored: Mutex<Vec<UsageRecord>>,
+}
+
+impl FoldingPlugin {
+    #[must_use]
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stored: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Append one entry to the ledger, exactly as persisted.
+    pub(crate) fn store(&self, record: UsageRecord) {
+        self.stored.lock().expect("mutex").push(record);
+    }
+
+    /// The invalidation that withdraws `record`, as it would be persisted.
+    ///
+    /// Built **from** the target rather than written out beside it, so the
+    /// two cannot drift apart: it is a faithful copy departing in exactly
+    /// the three permitted places — its own idempotency key, the reference,
+    /// and the reason. The echoed quantity is what the exclusion exists
+    /// for, so a fixture that let a caller negate it would be demonstrating
+    /// a different model.
+    ///
+    /// Separate from [`Self::store_withdrawn`] because storing the pair is
+    /// not the only way to need one: an orphan invalidation has no target
+    /// to store, and a suite driving a real plugin gets its target back
+    /// from `create_usage_record` rather than putting one there itself.
+    pub(crate) fn withdrawal_of(record: &UsageRecord) -> UsageRecord {
+        let idempotency_key =
+            IdempotencyKey::new(format!("{}-withdrawal", record.idempotency_key.as_str()))
+                .expect("a target's key plus a suffix is a valid idempotency key");
+        UsageRecord {
+            id: derive_usage_record_id(
+                record.tenant_id,
+                &record.gts_type_id,
+                &idempotency_key,
+                record.window_start,
+                record.window_end,
+            ),
+            invalidation: Some(Invalidation {
+                target: record.id,
+                reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+            }),
+            idempotency_key,
+            ..record.clone()
+        }
+    }
+
+    /// Append `record` together with the invalidation that withdraws it,
+    /// and hand back that invalidation as persisted.
+    pub(crate) fn store_withdrawn(&self, record: UsageRecord) -> UsageRecord {
+        let withdrawal = Self::withdrawal_of(&record);
+        self.store(record);
+        self.store(withdrawal.clone());
+        withdrawal
+    }
+
+    /// Every entry `time_range` selects, in insertion order.
+    fn selection(&self, time_range: TimeRange) -> Vec<UsageRecord> {
+        self.stored
+            .lock()
+            .expect("mutex")
+            .iter()
+            .filter(|entry| time_range.contains_window_end(entry.window_end))
+            .cloned()
+            .collect()
+    }
+
+    /// [`Self::selection`] with both entries of every withdrawn pair left
+    /// out — the invalidation, and the record it names.
+    fn folded_selection(&self, time_range: TimeRange) -> Vec<UsageRecord> {
+        let selected = self.selection(time_range);
+        // The withdrawn set is read off the selection rather than off the
+        // whole ledger, which is what a single-statement backend does too.
+        // The two agree because a pair carries one covered period, so no
+        // range takes one entry without the other.
+        let withdrawn: std::collections::BTreeSet<Uuid> = selected
+            .iter()
+            .filter_map(|entry| entry.invalidation.as_ref().map(|inv| inv.target))
+            .collect();
+        selected
+            .into_iter()
+            .filter(|entry| entry.invalidation.is_none() && !withdrawn.contains(&entry.id))
+            .collect()
+    }
+}
+
+/// `value` as a [`BigDecimal`], through its decimal string so no binary
+/// float sits between the two representations.
+fn quantity_of(record: &UsageRecord) -> BigDecimal {
+    record
+        .value
+        .to_string()
+        .parse::<BigDecimal>()
+        .expect("a Decimal renders as a parseable decimal string")
+}
+
+/// `fold` over `entries`, as the single bucket value a plugin would report.
+///
+/// `None` is the empty-selection answer for every fold but `COUNT`, which
+/// counts zero — the same split SQL makes.
+fn fold_over(fold: AggregationFold, entries: &[UsageRecord]) -> Option<BigDecimal> {
+    match fold {
+        AggregationFold::Count => Some(BigDecimal::from(
+            u64::try_from(entries.len()).expect("a fixture holds a countable number of entries"),
+        )),
+        AggregationFold::Sum => (!entries.is_empty()).then(|| {
+            entries.iter().fold(BigDecimal::from(0), |total, entry| {
+                total + quantity_of(entry)
+            })
+        }),
+        AggregationFold::Max => entries.iter().map(quantity_of).max(),
+        AggregationFold::Min => entries.iter().map(quantity_of).min(),
+        // No `acceptance_sequence` exists to break a tie on, so insertion
+        // order stands in for it: `max_by` keeps the last of equal keys.
+        AggregationFold::Latest => entries
+            .iter()
+            .max_by(|left, right| left.window_end.cmp(&right.window_end))
+            .map(quantity_of),
+    }
+}
+
+#[async_trait]
+impl UsageCollectorPluginV1 for FoldingPlugin {
+    async fn create_usage_record(
+        &self,
+        _record: UsageRecord,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        Err(UsageCollectorPluginError::internal(
+            "FoldingPlugin admits no create: entries arrive through store()",
+        ))
+    }
+
+    async fn create_usage_records(
+        &self,
+        _records: Vec<UsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorPluginError>>, UsageCollectorPluginError>
+    {
+        Err(UsageCollectorPluginError::internal(
+            "FoldingPlugin admits no create: entries arrive through store()",
+        ))
+    }
+
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        _scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        self.stored
+            .lock()
+            .expect("mutex")
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .ok_or(UsageCollectorPluginError::UsageRecordNotFound { id })
+    }
+
+    async fn query_aggregated_usage_records(
+        &self,
+        _gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        _query: &ODataQuery,
+        _metadata_filter: &[MetadataFilter],
+        _group_by: &[AggregationDimension],
+    ) -> Result<AggregationResult, UsageCollectorPluginError> {
+        let entries = self.folded_selection(time_range);
+        Ok(AggregationResult {
+            buckets: vec![AggregationBucket {
+                key: Vec::new(),
+                value: fold_over(fold, &entries),
+            }],
+        })
+    }
+
+    async fn list_usage_records(
+        &self,
+        _gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        _query: &ODataQuery,
+        _metadata_filter: &[MetadataFilter],
+    ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
+        Ok(ODataPage {
+            items: self.selection(time_range),
+            page_info: PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: 1000,
+            },
+        })
+    }
+}
+
 // ── DeclarationSource fakes: fold / metadata / not-found / counting ────────
 
 use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
@@ -1638,9 +1887,16 @@ pub(crate) fn fake_declaration_source_counting() -> Arc<CountingDeclarationSourc
 /// instance id across tests never collides.
 pub(crate) const RECORDING_PLUGIN_SUFFIX: &str = "test.usage_collector.recording.plugin.v1";
 
-/// The PDP fake a `RecordingPlugin`-backed [`ServiceFixture`] must use
+/// The same, for a [`FoldingPlugin`]-backed [`Service`]. Distinct from
+/// [`RECORDING_PLUGIN_SUFFIX`] only so a reader of a hub registration can
+/// tell which double is behind it.
+pub(crate) const FOLDING_PLUGIN_SUFFIX: &str = "test.usage_collector.folding.plugin.v1";
+
+/// The PDP fake a read-path [`ServiceFixture`] must use
 /// (`.with_resolver(recording_plugin_resolver())`) instead of the default
-/// [`CountingTenantPermitResolver`].
+/// [`CountingTenantPermitResolver`] — [`RecordingPlugin`]- and
+/// [`FoldingPlugin`]-backed alike, since what it answers is a property of
+/// the path rather than of the double behind it.
 ///
 /// The aggregate path's PDP request carries no per-instance resource
 /// properties (it authorizes pre-row, under `require_constraints(true)`),

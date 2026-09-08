@@ -5224,3 +5224,279 @@ mod read_path_cursor_fingerprint_tests {
         );
     }
 }
+
+// ── Withdrawal exclusion from the fold ─────────────────────────────────────
+//
+// The gear folds nothing: `query_aggregated_usage_records` dispatches to the
+// plugin and returns what it computes. So these tests do not — and cannot —
+// bind a real storage plugin to anything. What they pin is the *reference*
+// semantics the SPI now states normatively — the ones the
+// `invalidation-excluded-from-fold` contract test DESIGN §3.3 requires of
+// every conforming plugin, a suite this repo does not carry — held here
+// against the in-memory `FoldingPlugin`. They also catch a gear-side
+// regression that changed what the plugin is handed: a dropped
+// `time_range`, or a fold other than the declared one, moves these numbers.
+mod withdrawal_exclusion_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use bigdecimal::BigDecimal;
+    use time::OffsetDateTime;
+    use toolkit_gts::gts_id;
+    use toolkit_odata::ODataQuery;
+    use toolkit_security::SecurityContext;
+    use usage_collector_sdk::{
+        AggregationFold, AggregationResult, IdempotencyKey, MeterTypeId, ResourceRef,
+        UsageCollectorPluginV1, UsageRecord, derive_usage_record_id,
+    };
+    use uuid::Uuid;
+
+    use crate::domain::Service;
+    use crate::domain::test_support::{
+        FOLDING_PLUGIN_SUFFIX, FoldingPlugin, ServiceFixture, authenticated_ctx,
+        fake_declaration_source_with_fold, recording_plugin_resolver, test_time_range,
+    };
+
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+    /// The tenant every entry here is attributed to — the one
+    /// [`recording_plugin_resolver`] returns as its fixed
+    /// `OWNER_TENANT_ID` constraint, so the composed scope names the rows
+    /// the fixture holds rather than some other tenant's.
+    fn tenant_id() -> Uuid {
+        Uuid::from_u128(2)
+    }
+
+    fn meter_id() -> MeterTypeId {
+        MeterTypeId::new(GTS_ID).expect("valid gts_type_id")
+    }
+
+    fn ctx() -> SecurityContext {
+        authenticated_ctx()
+    }
+
+    /// A persisted measurement inside [`test_time_range`], carrying `value`
+    /// and ending `minutes` after the epoch.
+    ///
+    /// Built through [`derive_usage_record_id`] rather than a random `id`
+    /// so the identity is the one the gateway would have derived, which is
+    /// what an invalidation's reference has to name.
+    fn measurement(idem: &str, value: &str, minutes: i64) -> UsageRecord {
+        let window_start = OffsetDateTime::UNIX_EPOCH;
+        let window_end = OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(minutes);
+        let idempotency_key = IdempotencyKey::new(idem).expect("valid idempotency key");
+        UsageRecord {
+            id: derive_usage_record_id(
+                tenant_id(),
+                &meter_id(),
+                &idempotency_key,
+                window_start,
+                window_end,
+            ),
+            gts_type_id: meter_id(),
+            tenant_id: tenant_id(),
+            resource_ref: ResourceRef::new("rsc-fold", "compute.vm").expect("valid resource ref"),
+            subject_ref: None,
+            metadata: BTreeMap::new(),
+            value: value.parse().expect("valid decimal quantity"),
+            idempotency_key,
+            invalidation: None,
+            window_start,
+            window_end,
+        }
+    }
+
+    /// A `Service` over a fresh [`FoldingPlugin`], serving `fold` as the
+    /// declared one.
+    fn service_over_folding_plugin(fold: AggregationFold) -> (Arc<Service>, Arc<FoldingPlugin>) {
+        let plugin = FoldingPlugin::new();
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold(fold.as_str()))
+            .with_resolver(recording_plugin_resolver())
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                FOLDING_PLUGIN_SUFFIX,
+            );
+        (service, plugin)
+    }
+
+    /// The one bucket a no-grouping aggregate answers with.
+    fn single_bucket(result: &AggregationResult) -> Option<BigDecimal> {
+        match result.buckets.as_slice() {
+            [bucket] => {
+                assert!(bucket.key.is_empty(), "no grouping was requested");
+                bucket.value.clone()
+            }
+            other => panic!("a no-grouping aggregate answers with one bucket, got {other:?}"),
+        }
+    }
+
+    fn big(literal: &str) -> BigDecimal {
+        literal.parse().expect("valid decimal literal")
+    }
+
+    async fn aggregate(service: &Service) -> AggregationResult {
+        service
+            .query_aggregated_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+                &[],
+            )
+            .await
+            .expect("the aggregate must reach the plugin and fold")
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_pair_folds_to_nothing_while_both_stay_readable() {
+        // The exclusion is load-bearing for correctness, not tidiness: a
+        // fold that admitted the echoed quantity would double-count the
+        // very measurement the withdrawal was meant to remove
+        // (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+        //
+        // Both entries carry one covered period, so no range selects one of
+        // the pair without the other — which is why no placement of the
+        // invalidation changes the result.
+        let (svc, plugin) = service_over_folding_plugin(AggregationFold::Sum);
+        let withdrawn = measurement("idem-withdrawn", "42.5", 30);
+        plugin.store(measurement("idem-survivor", "7.5", 10));
+        let invalidation = plugin.store_withdrawn(withdrawn.clone());
+
+        assert_eq!(
+            single_bucket(&aggregate(&svc).await),
+            Some(big("7.5")),
+            "only the entry nothing withdrew may reach the fold",
+        );
+
+        // …and the ledger paths return all three, as persisted. This is a
+        // ledger, not a derived view: leaving a withdrawn pair out of a
+        // locally computed fold is the reader's obligation, and the
+        // reference the invalidation carries is what they read to do it.
+        let page = svc
+            .list_usage_records(
+                &ctx(),
+                meter_id(),
+                test_time_range(),
+                &ODataQuery::default(),
+                &[],
+            )
+            .await
+            .expect("the raw path must reach the plugin");
+        assert_eq!(
+            page.items.len(),
+            3,
+            "the raw path returns every entry as persisted, withdrawn or not",
+        );
+
+        for id in [withdrawn.id, invalidation.id] {
+            let row = svc
+                .get_usage_record(&ctx(), id)
+                .await
+                .expect("both entries of a withdrawn pair stay readable by id");
+            assert_eq!(row.id, id);
+        }
+        assert_eq!(
+            invalidation.invalidation.as_ref().map(|inv| inv.target),
+            Some(withdrawn.id),
+            "the invalidation names the entry it withdrew, which is what a \
+             consumer folding on its own side reads",
+        );
+    }
+
+    #[tokio::test]
+    async fn excluding_only_the_target_double_counts() {
+        // The failure mode the rule exists to prevent, pinned as its own
+        // case: a plugin that dropped the withdrawn record but kept the
+        // echoed invalidation reports the measurement it was told to
+        // remove. Over the pair alone the wrong answer under `SUM` is
+        // 42.5 and the right one is an empty selection — so this fails
+        // loudly rather than by a rounding.
+        let (svc, plugin) = service_over_folding_plugin(AggregationFold::Sum);
+        plugin.store_withdrawn(measurement("idem-only-pair", "42.5", 30));
+
+        assert_eq!(
+            single_bucket(&aggregate(&svc).await),
+            None,
+            "a withdrawn pair leaves nothing to fold; 42.5 would be the \
+             echoed quantity counted once more",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_orphan_invalidation_still_contributes_nothing() {
+        // The invalidation half of the rule stands on its own: an
+        // invalidation contributes nothing to a fold whether or not its
+        // target is in the selection. Retention is plugin-owned (DESIGN
+        // §3.10), so a conforming deployment can purge a target and keep
+        // the entry that withdrew it — this is a reachable state, not a
+        // malformed ledger.
+        //
+        // It is also the one input shape that tells the two half-rules
+        // apart. Over a conforming pair the invalidation is a faithful
+        // copy, so "kept the target" and "kept the invalidation" give a
+        // fold the same number; here only the second admits 42.5.
+        let (svc, plugin) = service_over_folding_plugin(AggregationFold::Sum);
+        plugin.store(measurement("idem-survivor", "7.5", 10));
+        plugin.store(FoldingPlugin::withdrawal_of(&measurement(
+            "idem-purged",
+            "42.5",
+            30,
+        )));
+
+        assert_eq!(
+            single_bucket(&aggregate(&svc).await),
+            Some(big("7.5")),
+            "an orphan invalidation contributes nothing; 42.5 would be the \
+             echoed quantity admitted with its target already gone",
+        );
+    }
+
+    #[tokio::test]
+    async fn every_declared_fold_excludes_the_pair() {
+        // The ADR's Confirmation asks for this across all five: withdrawal
+        // is the primitive precisely because its meaning does not depend on
+        // what a quantity means, and `MAX` / `MIN` / `LATEST` reverse under
+        // no additional term at all.
+        //
+        // Two pairs are withdrawn, not one, and their quantities straddle
+        // the survivors' — 99 above and 1 below. With a single withdrawn
+        // quantity, either `MAX` or `MIN` would answer the same whether the
+        // pair leaked in or not, and that half of the case would pass
+        // vacuously. Both pairs also end later than either survivor, so
+        // `LATEST` moves too. Admitting the pairs gives 227.5 / 6 / 99 / 1
+        // / 1 against the five expected below: every fold moves.
+        //
+        // All five are collected before a single assertion, so a defect
+        // reports every fold it moved rather than stopping at the first.
+        let mut answers = Vec::new();
+        for fold in [
+            AggregationFold::Sum,
+            AggregationFold::Count,
+            AggregationFold::Max,
+            AggregationFold::Min,
+            AggregationFold::Latest,
+        ] {
+            let (svc, plugin) = service_over_folding_plugin(fold);
+            plugin.store(measurement("idem-low", "7.5", 10));
+            plugin.store(measurement("idem-high", "20", 20));
+            plugin.store_withdrawn(measurement("idem-big", "99", 30));
+            plugin.store_withdrawn(measurement("idem-small", "1", 40));
+
+            answers.push((fold, single_bucket(&aggregate(&svc).await)));
+        }
+
+        assert_eq!(
+            answers,
+            vec![
+                (AggregationFold::Sum, Some(big("27.5"))),
+                (AggregationFold::Count, Some(big("2"))),
+                (AggregationFold::Max, Some(big("20"))),
+                (AggregationFold::Min, Some(big("7.5"))),
+                (AggregationFold::Latest, Some(big("20"))),
+            ],
+            "every declared fold must see the two survivors alone",
+        );
+    }
+}
