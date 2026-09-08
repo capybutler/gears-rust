@@ -170,12 +170,13 @@ fn the_action_is_create_inside_the_backfill_window_and_backfill_beyond_it() {
 fn the_live_path_authorizes_create_whatever_the_backfill_window_says() {
     // The live path does not read `backfill_window` at all. Deriving that
     // from the arithmetic — a live-admitted entry is inside 48 hours, so it
-    // is inside 90 days too — would be a coincidence of the defaults: the
-    // past tolerance and the backfill window are independently configured
-    // keys, and a deployment that widened the past tolerance past the
-    // window would start demanding an elevated grant for ordinary live
-    // emission. So the input here is one the live admission bound would
-    // itself reject.
+    // is inside 90 days too — would happen to hold, because
+    // `config::validate` refuses a window narrower than the past tolerance.
+    // But that invariant lives on `UsageCollectorConfig`, and this function
+    // takes a `CoveredPeriodBounds` any caller can construct directly, so
+    // the derivation would depend on a config-validation invariant this
+    // type does not carry. Hence an input the live admission bound would
+    // itself reject: `ingestion_action` must answer it anyway.
     assert_eq!(
         ingestion_action(
             &default_bounds(),

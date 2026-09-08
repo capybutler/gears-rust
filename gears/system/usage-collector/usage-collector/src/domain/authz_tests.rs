@@ -325,14 +325,15 @@ async fn authorize_attribution_tuple_denies_record_outside_granted_tenant() {
 /// sides read the same constant. So the literals are pinned here, once,
 /// where a rename shows up as a diff a reviewer must justify.
 ///
-/// The distinctness half is not decorative either: two constants that
-/// collapsed onto one string would give two permissions the same
-/// `(resource_type, action)` pair, and `AttributionTupleKey`'s
-/// action-aware hash would stop separating them.
+/// Distinctness follows from the literal list rather than being asserted
+/// separately — four distinct literals cannot collapse — but it is the
+/// property that matters: two constants sharing one string would give two
+/// permissions the same `(resource_type, action)` pair, and
+/// `AttributionTupleKey`'s action-aware hash would stop separating them.
+/// That hash contract is pinned by
+/// [`different_actions_yield_distinct_tuple_keys_for_same_attribution`].
 #[test]
 fn the_usage_record_action_vocabulary_is_four_distinct_spellings() {
-    use std::collections::BTreeSet;
-
     let actions = [
         usage_record::actions::CREATE,
         usage_record::actions::GET,
@@ -340,11 +341,6 @@ fn the_usage_record_action_vocabulary_is_four_distinct_spellings() {
         usage_record::actions::BACKFILL,
     ];
     assert_eq!(actions, ["create", "get", "list", "backfill"]);
-    assert_eq!(
-        actions.iter().collect::<BTreeSet<_>>().len(),
-        actions.len(),
-        "two actions collapsed onto one spelling: {actions:?}",
-    );
 }
 
 // ---------------------------------------------------------------------------

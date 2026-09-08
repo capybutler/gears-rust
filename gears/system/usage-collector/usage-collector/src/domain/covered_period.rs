@@ -147,17 +147,23 @@ pub fn enforce_covered_period_bounds(
 /// no grant a live entry does not.
 ///
 /// The live arm returns `actions::CREATE` without consulting
-/// `backfill_window` at all. Deriving it instead from the arithmetic — a
-/// live-admitted entry is inside the past tolerance, therefore inside the
-/// window — would couple two independently configured keys, and a
-/// deployment that widened the past tolerance past the window would start
-/// demanding an elevated grant for ordinary live emission.
+/// `backfill_window` at all. `config::validate` does refuse
+/// `backfill_window < live_past_tolerance`
+/// (`cpt-cf-usage-collector-adr-backfill-isolation`), so deriving the live
+/// answer from the arithmetic — a live-admitted entry is inside the past
+/// tolerance, therefore inside the window — would happen to be correct
+/// today. But that invariant lives on [`UsageCollectorConfig`], not on
+/// [`CoveredPeriodBounds`], which any caller can construct directly.
+/// Reading the window on the live path would make this function's
+/// correctness depend on a check in another module.
 ///
 /// Reads `window_end` and the origin, matching what
 /// [`enforce_covered_period_bounds`] reads, so one batch can carry entries
 /// bound to both actions. That is safe by construction: `action`
 /// participates in `AttributionTupleKey`'s hash/eq, so the two cannot
 /// collapse onto a single PDP decision.
+///
+/// [`UsageCollectorConfig`]: crate::config::UsageCollectorConfig
 #[must_use]
 pub fn ingestion_action(
     bounds: &CoveredPeriodBounds,
@@ -165,16 +171,17 @@ pub fn ingestion_action(
     now: OffsetDateTime,
     window_end: OffsetDateTime,
 ) -> &'static str {
-    // Arm order is load-bearing, and the guard's pattern carries the
-    // live-path exclusion structurally: `backfill_window` is reachable only
-    // under `RecordOrigin::Backfill`. (The two `CREATE` arms are merged
-    // because `clippy::match_same_arms` is denied workspace-wide; the
-    // behaviour is the same as spelling them separately.)
+    // The window comparison is nested inside `Backfill`, so the live arm
+    // cannot reach `bounds` at all.
     match origin {
-        RecordOrigin::Backfill if now - window_end > bounds.backfill_window => {
-            usage_record::actions::BACKFILL
+        RecordOrigin::Live => usage_record::actions::CREATE,
+        RecordOrigin::Backfill => {
+            if now - window_end > bounds.backfill_window {
+                usage_record::actions::BACKFILL
+            } else {
+                usage_record::actions::CREATE
+            }
         }
-        RecordOrigin::Live | RecordOrigin::Backfill => usage_record::actions::CREATE,
     }
 }
 
