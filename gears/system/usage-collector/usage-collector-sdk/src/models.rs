@@ -982,8 +982,13 @@ impl CreateUsageRecord {
     /// The withdrawal's own both-or-neither rule is not checked here and
     /// has no error: [`Invalidation`] groups the target with its reason, so
     /// a submission carrying one without the other cannot be built. The
-    /// only place the two can arrive apart is a wire body, where
-    /// `CreateUsageRecord`'s deserialization shadow refuses it. The rules an
+    /// only place the two can arrive apart is a wire body, and which
+    /// boundary refuses one depends on the body: a JSON body decoded
+    /// straight into [`CreateUsageRecord`] is refused by this type's own
+    /// deserialization shadow, while a REST body reaches the host as a DTO
+    /// carrying the pair flat — as the served schema declares it — and is
+    /// refused where that DTO is folded into this type. The shadow is not
+    /// the only guard, and it is not the one a REST caller meets. The rules an
     /// invalidation must satisfy against its *target* — that the target
     /// resolves, is itself a record, and is copied faithfully — need a
     /// lookup and belong to the ingestion gateway.

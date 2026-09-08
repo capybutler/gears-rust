@@ -15,8 +15,9 @@ use toolkit_canonical_errors::Problem;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    AggregationDimension, CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey,
-    MeterTypeId, ResourceRef, SubjectRef, TimeRange, UsageCollectorError, UsageRecord,
+    AggregationDimension, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataFilter,
+    MetadataKey, MeterTypeId, ReasonCode, ResourceRef, SubjectRef, TimeRange, UsageCollectorError,
+    UsageRecord,
 };
 use uuid::Uuid;
 
@@ -789,13 +790,41 @@ fn require_single_value<'a>(
 }
 
 /// Convert one per-record submission into the identity-free domain create
-/// input, lifting `gts_type_id`-, attribution-, `idempotency_key`-, and
-/// metadata-shape failures into per-record `Problem` envelopes. The covered
-/// period is caller-supplied and forwarded verbatim; it is validated — and
-/// rejected, never truncated — where it is read, inside
-/// [`usage_collector_sdk::CreateUsageRecord::try_into_usage_record`], which
-/// is also where the record's `id` and initial `status` are stamped once,
-/// authoritatively, inside [`Service::create_usage_records`].
+/// input, lifting `gts_type_id`-, attribution-, `idempotency_key`-,
+/// `reason_code`- and metadata-shape failures into per-record `Problem`
+/// envelopes. The covered period is caller-supplied and forwarded verbatim;
+/// it is validated — and rejected, never truncated — where it is read,
+/// inside [`usage_collector_sdk::CreateUsageRecord::try_into_usage_record`],
+/// which is also where the entry's `id` is derived once, authoritatively,
+/// inside [`Service::create_usage_records`]. An accepted entry carries no
+/// lifecycle flag to stamp: it is never rewritten
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+///
+/// This is also the fold point for the correction reference, and therefore
+/// the one place on the REST path where both-or-neither is enforced. The
+/// wire keeps `invalidates` and `reason_code` as two flat siblings because
+/// the OAS declares them that way; the domain keeps them as one
+/// [`Invalidation`], so a half-shape is unrepresentable past this line and
+/// nothing downstream re-checks it.
+///
+/// Three boundaries carry that one rule **on a submission path**, and none
+/// of them is redundant, because each is the only one standing on its own
+/// path:
+///
+/// * in-process — the pair is one type, so the shape never exists to be
+///   checked;
+/// * a JSON body deserialized straight into
+///   [`usage_collector_sdk::CreateUsageRecord`] — refused by the SDK's own
+///   shadow struct, untyped because a `Deserialize` erases everything but a
+///   message;
+/// * a REST body — arrives flat through the DTO and is refused here, typed,
+///   naming the missing half.
+///
+/// A fourth applies the same rule off the submission paths: the shadow
+/// behind [`usage_collector_sdk::UsageRecord`] refuses a half-shape when a
+/// persisted entry is rehydrated from a wire body. Counting it among the
+/// three above is what makes the enumeration wrong, not what makes it
+/// long.
 #[allow(clippy::result_large_err)]
 fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsageRecord, Problem> {
     let gts_type_id = MeterTypeId::new(req.gts_type_id)
@@ -816,6 +845,28 @@ fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsa
     let metadata = metadata_from_wire(req.metadata)
         .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
 
+    let invalidation = match (req.invalidates, req.reason_code) {
+        (Some(target), Some(reason)) => {
+            let reason = ReasonCode::new(reason)
+                .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
+            Some(Invalidation { target, reason })
+        }
+        (None, None) => None,
+        // `field` names the half the caller has to add, not the half they
+        // sent — a rejection naming what is already there is not
+        // actionable.
+        (Some(_), None) => {
+            return Err(Problem::from(usage_collector_error_to_canonical(
+                UsageCollectorError::invalidation_reference_incomplete("reason_code"),
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(Problem::from(usage_collector_error_to_canonical(
+                UsageCollectorError::invalidation_reference_incomplete("invalidates"),
+            )));
+        }
+    };
+
     Ok(CreateUsageRecord {
         gts_type_id,
         tenant_id: req.tenant_id,
@@ -824,7 +875,7 @@ fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsa
         metadata,
         value: req.value,
         idempotency_key,
-        corrects_id: req.corrects_id,
+        invalidation,
         window_start: req.window_start,
         window_end: req.window_end,
     })

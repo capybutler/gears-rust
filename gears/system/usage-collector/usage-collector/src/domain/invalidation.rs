@@ -10,8 +10,11 @@
 //! target answers — the target is itself a record, and the copy is faithful.
 //! The other four are elsewhere, and none of them is a comparison:
 //!
-//! * **Explicit reference** (both-or-neither) is a rule at three boundaries,
-//!   and only one of them is a check. In-process it is structural:
+//! * **Explicit reference** (both-or-neither) is a rule at three boundaries
+//!   on a submission path, and only one of them is a typed rejection. (A
+//!   fourth applies it off those paths, when a persisted entry is
+//!   rehydrated from a wire body into `usage_collector_sdk::UsageRecord`.)
+//!   In-process it is structural:
 //!   `usage_collector_sdk::Invalidation` groups the reference with its
 //!   reason, so no in-process caller can build a half-shape. A JSON body
 //!   decoded straight into [`usage_collector_sdk::CreateUsageRecord`] is

@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use usage_collector_sdk::{
     AggregationBucket, AggregationDimension, AggregationResult, MetadataKey, ResourceRef,
-    SubjectRef, TimeRange, UsageCollectorError, UsageRecord, UsageRecordStatus,
+    SubjectRef, TimeRange, UsageCollectorError, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -110,13 +110,25 @@ pub struct CreateUsageRecordRequest {
     /// stable per-meter key covers many periods; a missing key surfaces as
     /// a request-deserialization failure.
     pub idempotency_key: String,
-    /// When set, marks this submission as a counter compensation
-    /// referencing a previously emitted ordinary usage row. Absent on
-    /// ordinary submissions. The four-cell value matrix and L1 referential
-    /// rule are enforced at the gateway per
-    /// `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`.
+    /// The entry this submission withdraws. Supplying it makes the
+    /// submission an invalidation and requires [`Self::reason_code`];
+    /// omitting it makes the submission an ordinary record. There is no
+    /// caller-supplied discriminator on this shape, so a marker cannot
+    /// disagree with the payload it marks
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrects_id: Option<Uuid>,
+    pub invalidates: Option<Uuid>,
+    /// Why the withdrawal was issued. Both-or-neither with
+    /// [`Self::invalidates`], which the wire contract states as
+    /// `dependentRequired` and `record_request_into_domain` — the create
+    /// handler's fold point — enforces when it folds the pair into the
+    /// domain's one field.
+    ///
+    /// The pair stays flat here because that is what the OAS declares and
+    /// what `api_dto` emits into the served document; folding it on this
+    /// shape would change the published schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
     /// Inclusive start of the covered period this submission measures (RFC
     /// 3339, offset mandatory).
     #[serde(with = "time::serde::rfc3339")]
@@ -138,8 +150,12 @@ pub struct CreateUsageRecordsRequest {
 /// Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_type_id` is
 /// flattened to `String` so the type can derive `utoipa::ToSchema` without
 /// pulling `utoipa` into the SDK crate; both covered-period bounds are
-/// emitted as RFC 3339 to match the SDK wire shape. `status` is projected to
-/// its lowercase string form for the same reason.
+/// emitted as RFC 3339 to match the SDK wire shape. `entry_type` is
+/// flattened to `String` for the first of those reasons and not the second:
+/// the SDK wire shape carries no `entry_type` at all — the discriminator is
+/// derived from `invalidates` and never stored — so there is no encoding
+/// here to mirror, only a `utoipa::ToSchema` derive to keep out of the SDK
+/// crate.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct UsageRecordDto {
@@ -159,13 +175,20 @@ pub struct UsageRecordDto {
     /// `cpt-cf-usage-collector-dod-usage-emission-fr-idempotency`. Every
     /// persisted record carries a non-empty key.
     pub idempotency_key: String,
-    /// Present when this record is a counter compensation referencing a
-    /// previously emitted ordinary usage row.
+    /// The entry this one withdraws, absent on an ordinary measurement.
+    /// Both-or-neither with [`Self::reason_code`] — the SDK carries the
+    /// pair as one field, so a response can never show half of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrects_id: Option<Uuid>,
-    /// Lifecycle status: `"active"` on a fresh insert, `"inactive"` after a
-    /// depth-1 deactivation cascade.
-    pub status: String,
+    pub invalidates: Option<Uuid>,
+    /// Why the withdrawal was issued. Absent on an ordinary measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// `record` or `invalidation`, **derived** from [`Self::invalidates`]
+    /// rather than stored
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    /// `readOnly` on the wire: it appears on this read shape and on no
+    /// ingestion shape, and it is `required`, so it is never omitted.
+    pub entry_type: String,
     /// Inclusive start of the covered period the entry measures.
     #[serde(with = "time::serde::rfc3339")]
     pub window_start: OffsetDateTime,
@@ -179,6 +202,17 @@ pub struct UsageRecordDto {
 
 impl From<UsageRecord> for UsageRecordDto {
     fn from(value: UsageRecord) -> Self {
+        // Read before the destructuring below moves `invalidation` out:
+        // `entry_type()` borrows the record, so computing it afterwards is
+        // a borrow-after-move the compiler refuses.
+        let entry_type = value.entry_type().as_str().to_owned();
+        let (invalidates, reason_code) = match value.invalidation {
+            Some(invalidation) => (
+                Some(invalidation.target),
+                Some(invalidation.reason.into_inner()),
+            ),
+            None => (None, None),
+        };
         Self {
             id: value.id,
             gts_type_id: value.gts_type_id.to_string(),
@@ -192,11 +226,9 @@ impl From<UsageRecord> for UsageRecordDto {
                 .collect(),
             value: value.value,
             idempotency_key: value.idempotency_key.into_inner(),
-            corrects_id: value.corrects_id,
-            status: match value.status {
-                UsageRecordStatus::Active => "active".to_owned(),
-                UsageRecordStatus::Inactive => "inactive".to_owned(),
-            },
+            invalidates,
+            reason_code,
+            entry_type,
             window_start: value.window_start,
             window_end: value.window_end,
         }

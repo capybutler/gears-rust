@@ -71,7 +71,8 @@ async fn create_with_only_bad_gts_type_id_records_short_circuits_to_207_without_
             metadata: std::collections::BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-bad-prefix-1".to_owned(),
-            corrects_id: None,
+            invalidates: None,
+            reason_code: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: EPOCH_PLUS_ONE_HOUR,
         }],
@@ -190,7 +191,8 @@ async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_no
             metadata: std::collections::BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-over-long-1".to_owned(),
-            corrects_id: None,
+            invalidates: None,
+            reason_code: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: EPOCH_PLUS_ONE_HOUR,
         }],
@@ -274,12 +276,16 @@ async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_no
 
 use std::collections::BTreeMap;
 use usage_collector_sdk::{
-    IdempotencyKey, MeterTypeId, ResourceRef, UsageRecord, UsageRecordStatus,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, ResourceRef, UsageRecord,
     derive_usage_record_id,
 };
 
 const HAPPY_RECORD_GTS_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+/// The reason every withdrawal fixture states. Open vocabulary — the gear
+/// records the emitter's stated intent and infers nothing from it.
+const HAPPY_REASON_CODE: &str = "emitter_duplicate";
 
 /// The exclusive end of the fixture covered period, one hour after the
 /// epoch start. Distinct from the start so a test that confused the two
@@ -288,7 +294,7 @@ const EPOCH_PLUS_ONE_HOUR: OffsetDateTime =
     OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::hours(1));
 
 fn sample_persisted_record(id: Uuid, tenant_id: Uuid) -> UsageRecord {
-    sample_persisted_record_with_status(id, tenant_id, UsageRecordStatus::Active)
+    sample_persisted_entry(id, tenant_id, None)
 }
 
 /// Wire spelling of the mandatory raw-path range's inclusive lower bound.
@@ -366,10 +372,25 @@ async fn first_violation_field(response: axum::response::Response) -> Option<Str
         .map(str::to_owned)
 }
 
-fn sample_persisted_record_with_status(
+/// The same payload carrying a withdrawal of `target`, so its derived
+/// entry type is `invalidation`. A faithful copy of
+/// [`sample_persisted_record`] in every compared field, which is what lets
+/// a full-stack test submit it against that record as its target.
+fn sample_persisted_invalidation(id: Uuid, tenant_id: Uuid, target: Uuid) -> UsageRecord {
+    sample_persisted_entry(
+        id,
+        tenant_id,
+        Some(Invalidation {
+            target,
+            reason: ReasonCode::new(HAPPY_REASON_CODE).expect("valid reason code"),
+        }),
+    )
+}
+
+fn sample_persisted_entry(
     id: Uuid,
     tenant_id: Uuid,
-    status: UsageRecordStatus,
+    invalidation: Option<Invalidation>,
 ) -> UsageRecord {
     UsageRecord {
         id,
@@ -380,8 +401,7 @@ fn sample_persisted_record_with_status(
         metadata: BTreeMap::new(),
         value: rust_decimal::Decimal::from(1),
         idempotency_key: IdempotencyKey::new("idem-happy").expect("valid idempotency key"),
-        corrects_id: None,
-        status,
+        invalidation,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: EPOCH_PLUS_ONE_HOUR,
     }
@@ -432,7 +452,8 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-happy".to_owned(),
-            corrects_id: None,
+            invalidates: None,
+            reason_code: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: EPOCH_PLUS_ONE_HOUR,
         }],
@@ -474,11 +495,11 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
          gateway-derived dispatched UUID",
     );
     assert_eq!(
-        record.get("status").and_then(serde_json::Value::as_str),
-        Some("active"),
-        "wire body MUST project `UsageRecordStatus::Active` to lowercase \
-         string `active` (a regression that flipped this to e.g. `\"ACTIVE\"` \
-         or the empty string would silently break OAS-typed clients)",
+        record.get("entry_type").and_then(serde_json::Value::as_str),
+        Some("record"),
+        "wire body MUST project the derived entry type to lowercase string \
+         `record` (a regression that flipped this to e.g. `\"RECORD\"` or the \
+         empty string would silently break OAS-typed clients)",
     );
 
     // Sanity: the plugin was actually invoked with the gateway-derived id.
@@ -529,7 +550,8 @@ async fn create_stamps_derived_id() {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-derive-1".to_owned(),
-            corrects_id: None,
+            invalidates: None,
+            reason_code: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: EPOCH_PLUS_ONE_HOUR,
         }],
@@ -610,7 +632,8 @@ async fn create_same_key_different_covered_periods_derives_distinct_ids() {
                 metadata: BTreeMap::new(),
                 value: rust_decimal::Decimal::from(1),
                 idempotency_key: "idem-distinct".to_owned(),
-                corrects_id: None,
+                invalidates: None,
+                reason_code: None,
                 window_start,
                 window_end,
             }],
@@ -732,6 +755,251 @@ fn rejected_violation_field(item: &serde_json::Value) -> String {
         .to_owned()
 }
 
+/// Reads `field_violations[0].reason` off a `rejected` batch entry.
+///
+/// The field alone says which half of the request is at fault; the reason
+/// is what a caller dispatches on, so a test that pins only the field
+/// stays green when the condition is reclassified.
+fn rejected_violation_reason(item: &serde_json::Value) -> String {
+    item.get("error")
+        .and_then(|problem| problem.get("context"))
+        .and_then(|c| c.get("field_violations"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .expect("rejected entry carries field_violations[0].reason")
+        .to_owned()
+}
+
+/// A one-record batch body carrying whatever correction fields `extra`
+/// names, so a half-shape is expressible on the wire. It is not
+/// expressible in the domain — `CreateUsageRecord` carries the pair as one
+/// field — which is exactly why the fold point is the only place that can
+/// refuse it.
+fn create_request_json_with(extra: &serde_json::Value) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "gts_type_id": HAPPY_RECORD_GTS_ID,
+        "tenant_id": Uuid::from_u128(2).to_string(),
+        "resource_ref": { "resource_id": "rsc-happy", "resource_type": "compute.vm" },
+        "value": "1",
+        "idempotency_key": "idem-withdrawal",
+        "window_start": "1970-01-01T00:00:00Z",
+        "window_end": "1970-01-01T01:00:00Z",
+    });
+    let obj = record.as_object_mut().expect("object");
+    for (k, v) in extra.as_object().expect("extra is an object") {
+        obj.insert(k.clone(), v.clone());
+    }
+    serde_json::json!({ "records": [record] })
+}
+
+#[tokio::test]
+async fn a_reference_without_a_reason_is_rejected_naming_the_missing_half() {
+    // The wire contract states this as `dependentRequired`, and
+    // `record_request_into_domain` is the only place on this path that can
+    // enforce it: past the fold the pair is one `Invalidation`, so a
+    // half-shape does not exist to be re-checked. The diagnostic names the
+    // half the caller has to add, not the half they sent.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.reference_without_reason.v1",
+        create_request_json_with(&serde_json::json!({
+            "invalidates": Uuid::from_u128(77).to_string(),
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::MULTI_STATUS,
+        "an all-rejected batch MUST surface as 207 Multi-Status",
+    );
+    assert_eq!(rejected_violation_field(&item), "reason_code");
+    assert_eq!(
+        rejected_violation_reason(&item),
+        "INVALIDATION_REFERENCE_INCOMPLETE",
+    );
+}
+
+#[tokio::test]
+async fn a_reason_without_a_reference_is_rejected_naming_the_missing_half() {
+    // The other half of the same rule. Both arms are pinned because the
+    // fold is a four-arm match and an implementation that folded only one
+    // direction would pass the sibling above.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.reason_without_reference.v1",
+        create_request_json_with(&serde_json::json!({ "reason_code": HAPPY_REASON_CODE })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert_eq!(rejected_violation_field(&item), "invalidates");
+    assert_eq!(
+        rejected_violation_reason(&item),
+        "INVALIDATION_REFERENCE_INCOMPLETE",
+    );
+}
+
+#[tokio::test]
+async fn neither_correction_field_is_an_ordinary_record() {
+    // The complement the two rejections above need: a submission carrying
+    // neither half folds to `None` and is accepted. Without it, a fold that
+    // rejected every submission would pass both of them.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.no_correction_fields.v1",
+        create_request_json_with(&serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        item.get("outcome").and_then(serde_json::Value::as_str),
+        Some("accepted"),
+        "a submission carrying neither correction field is an ordinary \
+         record; got {item:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_reason_code_is_rejected_per_record() {
+    // The fold builds the reason through `ReasonCode::new`, the same way
+    // the sibling newtype conversions in `record_request_into_domain`
+    // build theirs, so an unvalidated code cannot reach a storage plugin.
+    // An empty code is the cheapest witness: it is refused by the newtype
+    // and never by the domain, which sees only the validated form.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.malformed_reason_code.v1",
+        create_request_json_with(&serde_json::json!({
+            "invalidates": Uuid::from_u128(78).to_string(),
+            "reason_code": "",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert_eq!(
+        rejected_violation_field(&item),
+        "reason_code",
+        "the rejection MUST attribute to the offending field, not to the \
+         reference beside it",
+    );
+    assert_eq!(
+        rejected_violation_reason(&item),
+        "VALIDATION",
+        "a malformed code is a newtype validation failure, NOT the \
+         both-or-neither rule: the pair is complete here and only its \
+         content is bad",
+    );
+}
+
+#[tokio::test]
+async fn an_unfaithful_copy_is_rejected_naming_the_field_that_differs() {
+    // End to end, past the fold: both halves are present, so the fold
+    // builds an `Invalidation` and the gateway resolves the target. The
+    // submission departs from it in `value`, and the diagnostic is the
+    // deliverable — a rejection saying only "mismatch" leaves the emitter
+    // diffing two payloads by hand.
+    let tenant_id = Uuid::from_u128(2);
+    let target_uuid = Uuid::from_u128(0x4242);
+    let plugin = HappyPathPlugin::new();
+    plugin.set_get_record_for(target_uuid, sample_persisted_record(target_uuid, tenant_id));
+    plugin.set_create_records(vec![Ok(sample_persisted_record(Uuid::new_v4(), tenant_id))]);
+    let service = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            "test.handler.create_records.unfaithful_copy.v1",
+        );
+
+    // The fixture target carries `value: 1`; this submission says 2. Every
+    // other compared field matches, so the rejection can only be about the
+    // quantity.
+    let body = create_request_json_with(&serde_json::json!({
+        "invalidates": target_uuid.to_string(),
+        "reason_code": HAPPY_REASON_CODE,
+        "value": "2",
+    }));
+    let req: CreateUsageRecordsRequest =
+        serde_json::from_value(body).expect("the request body deserializes");
+
+    let response = handle_create_usage_records(
+        Extension(authenticated_ctx()),
+        Extension(service),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collected");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("body is JSON");
+    let item = body
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .cloned()
+        .expect("response carries results[0]");
+
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert_eq!(
+        rejected_violation_field(&item),
+        "value",
+        "the rejection MUST name the field that differs, not the reference",
+    );
+    assert_eq!(
+        rejected_violation_reason(&item),
+        "INVALIDATION_FIELD_MISMATCH",
+    );
+}
+
+#[tokio::test]
+async fn a_faithful_copy_reaches_the_plugin() {
+    // The complement of the mismatch above, and the pin that the fold
+    // actually builds an `Invalidation` rather than dropping the pair: the
+    // record the gateway dispatches carries the caller's target and reason.
+    // A fold that silently discarded both halves would still be accepted
+    // here, and only this assertion catches it.
+    let tenant_id = Uuid::from_u128(2);
+    let target_uuid = Uuid::from_u128(0x4243);
+    let plugin = HappyPathPlugin::new();
+    plugin.set_get_record_for(target_uuid, sample_persisted_record(target_uuid, tenant_id));
+    plugin.set_create_records(vec![Ok(sample_persisted_invalidation(
+        Uuid::new_v4(),
+        tenant_id,
+        target_uuid,
+    ))]);
+    let service = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .build(
+            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            "test.handler.create_records.faithful_copy.v1",
+        );
+
+    let body = create_request_json_with(&serde_json::json!({
+        "invalidates": target_uuid.to_string(),
+        "reason_code": HAPPY_REASON_CODE,
+    }));
+    let req: CreateUsageRecordsRequest =
+        serde_json::from_value(body).expect("the request body deserializes");
+
+    let response = handle_create_usage_records(
+        Extension(authenticated_ctx()),
+        Extension(service),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let forwarded = plugin
+        .last_create_records_input()
+        .expect("plugin received the eligible batch");
+    assert_eq!(forwarded.len(), 1);
+    let invalidation = forwarded[0]
+        .invalidation
+        .as_ref()
+        .expect("the fold MUST carry the correction reference through to the SPI");
+    assert_eq!(invalidation.target, target_uuid);
+    assert_eq!(invalidation.reason.as_str(), HAPPY_REASON_CODE);
+}
+
 #[tokio::test]
 async fn a_leap_second_period_bound_is_rejected() {
     // `time`'s RFC 3339 parser renders 23:59:60 at a valid stand-in
@@ -813,28 +1081,34 @@ async fn a_point_event_is_accepted_per_record() {
 }
 
 #[tokio::test]
-async fn create_records_happy_path_wire_body_projects_inactive_status_as_lowercase() {
+async fn create_records_happy_path_wire_body_projects_the_invalidation_entry_type() {
     // Sibling to `create_records_happy_path_wire_body_reflects_service_returned_record`:
-    // pin the other side of the `UsageRecordStatus` projection. Plugins can
-    // legitimately return an `Inactive` record from a re-emit (post-cascade)
-    // scenario; the wire MUST project it as lowercase string `inactive`. A
-    // regression that flipped the `From<UsageRecord>` mapping (e.g. capital
-    // case, empty string, or the wrong variant) would not surface in any
-    // existing test.
+    // pin the other side of the derived-`entry_type` projection. The
+    // projection reads the record's own reference, so a plugin returning an
+    // entry that carries one MUST surface as `entry_type: "invalidation"`
+    // with the correction pair beside it. A regression that hard-coded the
+    // discriminator, or dropped either half of the pair out of
+    // `From<UsageRecord>`, would not surface in any other test.
+    //
+    // The submission itself is an ordinary record: what is under test is
+    // the response projection of whatever the plugin returned, not the
+    // ingestion path's own target resolution.
     let plugin = HappyPathPlugin::new();
     let tenant_id = Uuid::from_u128(2);
     let persisted_uuid = Uuid::new_v4();
-    plugin.set_create_records(vec![Ok(sample_persisted_record_with_status(
+    let target_uuid = Uuid::new_v4();
+    assert_ne!(persisted_uuid, target_uuid, "test premise");
+    plugin.set_create_records(vec![Ok(sample_persisted_invalidation(
         persisted_uuid,
         tenant_id,
-        UsageRecordStatus::Inactive,
+        target_uuid,
     ))]);
 
     let service = ServiceFixture::default()
         .with_source(fake_declaration_source_with_fold("SUM"))
         .build(
             Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-            "test.handler.create_records.inactive_projection.v1",
+            "test.handler.create_records.invalidation_projection.v1",
         );
 
     let req = CreateUsageRecordsRequest {
@@ -849,7 +1123,8 @@ async fn create_records_happy_path_wire_body_projects_inactive_status_as_lowerca
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: "idem-happy".to_owned(),
-            corrects_id: None,
+            invalidates: None,
+            reason_code: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: EPOCH_PLUS_ONE_HOUR,
         }],
@@ -876,10 +1151,27 @@ async fn create_records_happy_path_wire_body_projects_inactive_status_as_lowerca
         .and_then(|item| item.get("record"))
         .expect("accepted item carries `record`");
     assert_eq!(
-        record.get("status").and_then(serde_json::Value::as_str),
-        Some("inactive"),
-        "wire body MUST project `UsageRecordStatus::Inactive` to lowercase \
-         string `inactive`",
+        record.get("entry_type").and_then(serde_json::Value::as_str),
+        Some("invalidation"),
+        "an entry carrying a withdrawal MUST project as `invalidation`",
+    );
+    assert_eq!(
+        record
+            .get("invalidates")
+            .and_then(serde_json::Value::as_str),
+        Some(target_uuid.to_string().as_str()),
+        "the wire body MUST carry the withdrawn entry's id",
+    );
+    assert_eq!(
+        record
+            .get("reason_code")
+            .and_then(serde_json::Value::as_str),
+        Some(HAPPY_REASON_CODE),
+        "the wire body MUST carry the stated reason beside the reference",
+    );
+    assert!(
+        record.get("status").is_none(),
+        "no lifecycle flag survives on the wire; got {record:?}",
     );
 }
 
@@ -934,7 +1226,8 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         metadata: BTreeMap::new(),
         value: rust_decimal::Decimal::from(1),
         idempotency_key: idem.to_owned(),
-        corrects_id: None,
+        invalidates: None,
+        reason_code: None,
         window_start: OffsetDateTime::UNIX_EPOCH,
         window_end: EPOCH_PLUS_ONE_HOUR,
     };
@@ -953,7 +1246,8 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
                 metadata: BTreeMap::new(),
                 value: rust_decimal::Decimal::from(1),
                 idempotency_key: "idem-mixed-1".to_owned(),
-                corrects_id: None,
+                invalidates: None,
+                reason_code: None,
                 window_start: OffsetDateTime::UNIX_EPOCH,
                 window_end: EPOCH_PLUS_ONE_HOUR,
             },
@@ -1261,8 +1555,9 @@ async fn get_happy_path_returns_200_with_record_body() {
         "wire body MUST echo the loaded record's UUID",
     );
     assert_eq!(
-        body.get("status").and_then(serde_json::Value::as_str),
-        Some("active"),
+        body.get("entry_type").and_then(serde_json::Value::as_str),
+        Some("record"),
+        "the point lookup MUST project the derived entry type too",
     );
 }
 
@@ -1483,8 +1778,8 @@ mod prepare_list_query_tests {
         // Both keys are deliberately keyset-safe. With a non-mandatory
         // second key the order would be refused anyway, for the other
         // reason, and this test would stay green with the direction rule
-        // deleted. `tenant_id` rather than `status` so the fixture outlives
-        // `status` leaving the filterable schema.
+        // deleted. `tenant_id` is on the keyset allowlist, so the fixture
+        // rests on the same closed set admissibility is decided against.
         let mut q = ODataQuery::new();
         q.order = ODataOrderBy(vec![
             OrderKey {
@@ -1512,13 +1807,13 @@ mod prepare_list_query_tests {
     fn orderby_on_a_nullable_field_is_rejected_as_invalid_argument() {
         // The storage plugin's keyset continuation is a row-value tuple
         // comparison that is only sound over NOT NULL columns. `subject_id`,
-        // `subject_type`, and `corrects_id` are domain-optional (nullable), so
+        // `subject_type`, and `invalidates` are domain-optional (nullable), so
         // a `$orderby` leading on one of them would silently drop NULL-keyed
         // rows from the page (and 500 on a page ending at a NULL row). Reject
         // it up front with a typed 400 that names the real cause instead of
         // leaking a plugin-internal keyset error — or, worse, an incomplete
         // page — to the caller.
-        for field in ["subject_id", "subject_type", "corrects_id"] {
+        for field in ["subject_id", "subject_type", "invalidates"] {
             let mut q = ODataQuery::new();
             q.order = ODataOrderBy(vec![OrderKey {
                 field: field.into(),
@@ -1539,10 +1834,14 @@ mod prepare_list_query_tests {
 
     #[test]
     fn orderby_on_a_mandatory_field_other_than_the_tiebreaker_is_accepted() {
-        // Guard against over-rejection: `tenant_id` / `status` are mandatory
-        // (NOT NULL) columns, so ordering by them is a valid keyset and must
-        // still gain the canonical `(window_end, id)` suffix.
-        for field in ["tenant_id", "status"] {
+        // Guard against over-rejection: `tenant_id` and `resource_id` are
+        // attributes every entry carries in its own right, so ordering by
+        // either is a valid keyset and must still gain the canonical
+        // `(window_end, id)` suffix. Both are on
+        // `KEYSET_SAFE_RECORD_FIELDS`, which is what admissibility is
+        // decided against — so this fixture moves only if that allowlist
+        // does, and loudly.
+        for field in ["tenant_id", "resource_id"] {
             let mut q = ODataQuery::new();
             q.order = ODataOrderBy(vec![OrderKey {
                 field: field.into(),
@@ -1643,9 +1942,9 @@ mod prepare_list_query_tests {
         // the comparison is gone, so restoring the argument fails it.
         let mut q = ODataQuery::new();
         q.filter = Some(Box::new(Expr::Compare(
-            Box::new(Expr::Identifier("status".into())),
+            Box::new(Expr::Identifier("resource_type".into())),
             CompareOperator::Eq,
-            Box::new(Expr::Value(Value::String("active".into()))),
+            Box::new(Expr::Value(Value::String("compute.vm".into()))),
         )));
         q.filter_hash = Some("hash_current".into());
         q.cursor = Some(CursorV1 {
@@ -2411,7 +2710,8 @@ async fn create_with_batch_above_cap_rejects_without_iterating_records() {
             metadata: BTreeMap::new(),
             value: rust_decimal::Decimal::from(1),
             idempotency_key: format!("idem-oversize-{i}"),
-            corrects_id: None,
+            invalidates: None,
+            reason_code: None,
             window_start: OffsetDateTime::UNIX_EPOCH,
             window_end: EPOCH_PLUS_ONE_HOUR,
         })
@@ -2979,8 +3279,8 @@ mod handle_list_usage_records_tests {
     async fn happy_path_maps_page_items_through_dto_and_preserves_page_info() {
         // Plugin returns a 2-item `Page<UsageRecord>` with a non-default
         // `PageInfo`. The handler MUST:
-        //   1. project each item via `UsageRecordDto::from` (id +
-        //      lowercase `status` are the cheapest, regression-prone
+        //   1. project each item via `UsageRecordDto::from` (id + the
+        //      derived `entry_type` are the cheapest, regression-prone
         //      witnesses), and
         //   2. carry `page_info` verbatim (`next_cursor`, `prev_cursor`,
         //      `limit`).
@@ -3036,10 +3336,10 @@ mod handle_list_usage_records_tests {
         );
         for (i, item) in items.iter().enumerate() {
             assert_eq!(
-                item.get("status").and_then(serde_json::Value::as_str),
-                Some("active"),
-                "items[{i}].status MUST be lowercase `active` (projection \
-                 through UsageRecordDto::from)",
+                item.get("entry_type").and_then(serde_json::Value::as_str),
+                Some("record"),
+                "items[{i}].entry_type MUST be the derived lowercase \
+                 `record` (projection through UsageRecordDto::from)",
             );
         }
 

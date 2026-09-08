@@ -557,9 +557,11 @@ impl UsageCollectorError {
     /// names the **missing** half, which is the one the caller has to add.
     ///
     /// Reachable from the REST fold point alone. The domain carries the
-    /// pair as one `Invalidation`, so an in-process caller cannot construct
-    /// the shape this rejects — and the REST layer does not yet raise it,
-    /// so this constructor currently has no caller in the gear.
+    /// pair as one [`crate::Invalidation`], so an in-process caller cannot
+    /// construct the shape this rejects, and nothing downstream of the fold
+    /// re-checks it — the host's `record_request_into_domain` is its only
+    /// caller, raising it from two call sites, one per direction of the
+    /// half-shape.
     #[must_use]
     pub fn invalidation_reference_incomplete(missing_field: &str) -> Self {
         Self::InvalidArgument {

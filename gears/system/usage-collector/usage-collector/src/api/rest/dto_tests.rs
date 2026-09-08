@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use toolkit_gts::gts_id;
 use usage_collector_sdk::{
-    IdempotencyKey, MeterTypeId, ResourceRef, UsageRecord, UsageRecordStatus,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, ResourceRef, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -30,6 +30,9 @@ const SAMPLE_WINDOW_START_RFC3339: &str = "2026-06-11T12:34:56Z";
 const SAMPLE_WINDOW_END_RFC3339: &str = "2026-06-11T13:34:56Z";
 const SAMPLE_RECORD_VALUE: &str = "42.5";
 const SAMPLE_IDEMPOTENCY_KEY: &str = "idem-dto-tests-1";
+const SAMPLE_REASON_CODE: &str = "emitter_duplicate";
+/// Wire spelling of [`sample_target_uuid`].
+const SAMPLE_TARGET_ID: &str = "33333333-3333-3333-3333-333333333333";
 
 fn sample_record_uuid() -> Uuid {
     Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111_u128)
@@ -39,7 +42,29 @@ fn sample_tenant_uuid() -> Uuid {
     Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222_u128)
 }
 
-fn sample_persisted_record(status: UsageRecordStatus) -> UsageRecord {
+/// The entry a withdrawal fixture names. Distinct from
+/// [`sample_record_uuid`] so a projection that echoed the entry's own id
+/// into `invalidates` fails rather than passing by coincidence.
+fn sample_target_uuid() -> Uuid {
+    Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333_u128)
+}
+
+/// An ordinary measurement: it carries no withdrawal, so its derived
+/// entry type is `record`.
+fn sample_persisted_record() -> UsageRecord {
+    sample_persisted_entry(None)
+}
+
+/// A withdrawal of [`SAMPLE_TARGET_ID`]: same payload, plus the one field
+/// whose presence makes the entry an invalidation.
+fn sample_persisted_invalidation() -> UsageRecord {
+    sample_persisted_entry(Some(Invalidation {
+        target: sample_target_uuid(),
+        reason: ReasonCode::new(SAMPLE_REASON_CODE).expect("valid reason code"),
+    }))
+}
+
+fn sample_persisted_entry(invalidation: Option<Invalidation>) -> UsageRecord {
     UsageRecord {
         id: sample_record_uuid(),
         gts_type_id: MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
@@ -49,8 +74,7 @@ fn sample_persisted_record(status: UsageRecordStatus) -> UsageRecord {
         metadata: BTreeMap::new(),
         value: Decimal::from_str(SAMPLE_RECORD_VALUE).expect("valid decimal"),
         idempotency_key: IdempotencyKey::new(SAMPLE_IDEMPOTENCY_KEY).expect("valid idem key"),
-        corrects_id: None,
-        status,
+        invalidation,
         window_start: parse_rfc3339(SAMPLE_WINDOW_START_RFC3339),
         window_end: parse_rfc3339(SAMPLE_WINDOW_END_RFC3339),
     }
@@ -62,7 +86,7 @@ fn parse_rfc3339(raw: &str) -> OffsetDateTime {
 }
 
 fn sample_usage_record_dto() -> UsageRecordDto {
-    UsageRecordDto::from(sample_persisted_record(UsageRecordStatus::Active))
+    UsageRecordDto::from(sample_persisted_record())
 }
 
 #[test]
@@ -241,58 +265,249 @@ fn create_usage_record_request_optional_metadata_defaults_to_empty_map() {
 }
 
 #[test]
-fn create_usage_record_request_optional_corrects_id_defaults_to_none() {
-    // Pin `#[serde(default, skip_serializing_if = "Option::is_none")]` on
-    // `corrects_id`: absent on ordinary submissions, present only for counter
-    // compensations.
+fn create_usage_record_request_optional_correction_fields_default_to_none() {
+    // Pin `#[serde(default)]` on both halves of the correction reference:
+    // an ordinary submission carries neither, so a body omitting both must
+    // deserialize rather than fail as a missing field.
     let req: CreateUsageRecordRequest = serde_json::from_value(minimal_create_record_json())
-        .expect("missing corrects_id must default to None");
+        .expect("a body omitting both correction fields must deserialize");
     assert!(
-        req.corrects_id.is_none(),
-        "absent `corrects_id` MUST deserialise to None (got {:?})",
-        req.corrects_id,
+        req.invalidates.is_none(),
+        "absent `invalidates` MUST deserialise to None (got {:?})",
+        req.invalidates,
     );
+    assert!(
+        req.reason_code.is_none(),
+        "absent `reason_code` MUST deserialise to None (got {:?})",
+        req.reason_code,
+    );
+}
+
+#[test]
+fn create_usage_record_request_carries_the_correction_pair_flat() {
+    // The pair stays two flat sibling properties on this shape because the
+    // OAS declares it that way and `api_dto` emits this struct into the
+    // served document. The domain folds them into one field; folding them
+    // here would change the published schema.
+    let mut json = minimal_create_record_json();
+    let obj = json.as_object_mut().expect("object");
+    obj.insert(
+        "invalidates".to_owned(),
+        serde_json::json!(SAMPLE_TARGET_ID),
+    );
+    obj.insert(
+        "reason_code".to_owned(),
+        serde_json::json!(SAMPLE_REASON_CODE),
+    );
+    let req: CreateUsageRecordRequest =
+        serde_json::from_value(json).expect("a withdrawal body deserializes");
+    assert_eq!(req.invalidates, Some(sample_target_uuid()));
+    assert_eq!(req.reason_code.as_deref(), Some(SAMPLE_REASON_CODE));
+}
+
+#[test]
+fn a_submitted_entry_type_is_refused_as_an_unknown_field() {
+    // `entry_type` is `readOnly` on the wire and appears on the read shape
+    // alone. `deny_unknown_fields` already refuses one here; this pins that
+    // the ingestion shape stays discriminator-free, so a marker can never
+    // disagree with the payload it marks.
+    let mut json = minimal_create_record_json();
+    json.as_object_mut()
+        .expect("object")
+        .insert("entry_type".to_owned(), serde_json::json!("invalidation"));
+    let err = serde_json::from_value::<CreateUsageRecordRequest>(json)
+        .expect_err("the ingestion shape accepts no discriminator");
+    assert!(
+        err.to_string().contains("entry_type"),
+        "the failure MUST name the discriminator it refused (got `{err}`)",
+    );
+}
+
+#[test]
+fn create_usage_record_request_accepts_exactly_the_declared_wire_keys() {
+    // The literal complement of `deny_unknown_fields`: that attribute
+    // proves nothing undeclared gets in, and this proves every declared key
+    // does. A rename applied to both sides of a codec round-trips
+    // perfectly and still breaks every client, so the accepted key set is
+    // asserted against literals rather than against the struct.
+    let mut json = minimal_create_record_json();
+    {
+        let obj = json.as_object_mut().expect("object");
+        obj.insert(
+            "subject_ref".to_owned(),
+            serde_json::json!({ "subject_id": "sub-dto", "subject_type": "user" }),
+        );
+        obj.insert("metadata".to_owned(), serde_json::json!({ "region": "eu" }));
+        obj.insert(
+            "invalidates".to_owned(),
+            serde_json::json!(SAMPLE_TARGET_ID),
+        );
+        obj.insert(
+            "reason_code".to_owned(),
+            serde_json::json!(SAMPLE_REASON_CODE),
+        );
+    }
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "gts_type_id",
+            "idempotency_key",
+            "invalidates",
+            "metadata",
+            "reason_code",
+            "resource_ref",
+            "subject_ref",
+            "tenant_id",
+            "value",
+            "window_end",
+            "window_start",
+        ],
+        "test premise: the fixture spells every declared property once",
+    );
+    serde_json::from_value::<CreateUsageRecordRequest>(json)
+        .expect("every declared wire key MUST be accepted under deny_unknown_fields");
 }
 
 // ---------------------------------------------------------------------------
 // UsageRecordDto wire-contract pins.
 //
-// `UsageRecordDto` is the response projection of `UsageRecord`. The handler
-// tests assert the persisted-record UUID makes it through but never check the
-// status / value / period-bound / metadata projections — a regression in any of
-// `serde(with = "rust_decimal::serde::str")`, `serde(with =
-// "time::serde::rfc3339")`, the status `"active"` / `"inactive"` mapping, or
-// the empty-metadata skip would not fail any existing test. The pins below
-// cover each.
+// `UsageRecordDto` is the response projection of `UsageRecord`, and it is
+// what every REST response body actually serializes — the SDK's own
+// `UsageRecord` never reaches an HTTP body, so the literal encoding pinned
+// on the SDK shape covers none of what a client receives. The handler tests
+// assert the persisted-record UUID makes it through but never check the
+// entry-type / value / period-bound / metadata projections — a regression in
+// any of `serde(with = "rust_decimal::serde::str")`, `serde(with =
+// "time::serde::rfc3339")`, the derived `entry_type`, or the empty-metadata
+// skip would not fail any existing test. The pins below cover each, and the
+// key-set assertion below covers them against a literal rather than against
+// the struct: a rename applied to both halves of a codec round-trips and
+// still breaks every client.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn usage_record_dto_serialises_active_status_as_lowercase_string() {
-    let dto = UsageRecordDto::from(sample_persisted_record(UsageRecordStatus::Active));
-    let json = serde_json::to_value(&dto).expect("UsageRecordDto serialises");
-    assert_eq!(
-        json.get("status").and_then(serde_json::Value::as_str),
-        Some("active"),
-        "Active MUST project to lowercase string `active` (got {:?})",
-        json.get("status"),
-    );
+fn the_response_carries_a_derived_entry_type_and_no_status() {
+    // `entry_type` is `readOnly` on the wire and derived in the domain, so
+    // the projection computes it from the record's own reference — there is
+    // nothing on `UsageRecord` to copy it from
+    // (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    let dto = UsageRecordDto::from(sample_persisted_record());
+    assert_eq!(dto.entry_type, "record");
+    assert_eq!(dto.invalidates, None);
+    assert_eq!(dto.reason_code, None);
+
+    let dto = UsageRecordDto::from(sample_persisted_invalidation());
+    assert_eq!(dto.entry_type, "invalidation");
+    assert_eq!(dto.invalidates, Some(sample_target_uuid()));
+    assert_eq!(dto.reason_code.as_deref(), Some(SAMPLE_REASON_CODE));
+
+    // No lifecycle flag survives anywhere on the wire: the model carries
+    // none and there is no row to rewrite. Checked on the serialized body
+    // rather than on the struct, because a field re-added under a serde
+    // rename would not show up as a compile error here.
+    let json =
+        serde_json::to_value(UsageRecordDto::from(sample_persisted_record())).expect("serializes");
+    assert!(json.get("status").is_none(), "got {json:?}");
+    assert!(json.get("corrects_id").is_none(), "got {json:?}");
 }
 
 #[test]
-fn usage_record_dto_serialises_inactive_status_as_lowercase_string() {
-    let dto = UsageRecordDto::from(sample_persisted_record(UsageRecordStatus::Inactive));
-    let json = serde_json::to_value(&dto).expect("UsageRecordDto serialises");
+fn usage_record_dto_serialises_exactly_the_declared_wire_keys() {
+    // The literal key set a client receives, in both entry shapes. An
+    // ordinary measurement omits every optional property; a withdrawal adds
+    // exactly the correction pair. `entry_type` is `required` on the OAS
+    // `UsageRecord`, so it appears in both.
+    //
+    // This is what the gear emits, not what `usage-collector-v1.yaml`'s
+    // `UsageRecord` declares: the contract also requires `accepted_at`,
+    // `acceptance_sequence` and `origin`, and spells `value` as `quantity`.
+    // Both gaps are out of this slice; this assertion is what will fail
+    // when either closes.
+    let record =
+        serde_json::to_value(UsageRecordDto::from(sample_persisted_record())).expect("serializes");
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
     assert_eq!(
-        json.get("status").and_then(serde_json::Value::as_str),
-        Some("inactive"),
-        "Inactive MUST project to lowercase string `inactive` (got {:?})",
-        json.get("status"),
+        keys,
+        vec![
+            "entry_type",
+            "gts_type_id",
+            "id",
+            "idempotency_key",
+            "resource_ref",
+            "tenant_id",
+            "value",
+            "window_end",
+            "window_start",
+        ],
+        "an ordinary measurement's response body MUST carry exactly these keys",
+    );
+
+    let invalidation = serde_json::to_value(UsageRecordDto::from(sample_persisted_invalidation()))
+        .expect("serializes");
+    let mut keys: Vec<&str> = invalidation
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "entry_type",
+            "gts_type_id",
+            "id",
+            "idempotency_key",
+            "invalidates",
+            "reason_code",
+            "resource_ref",
+            "tenant_id",
+            "value",
+            "window_end",
+            "window_start",
+        ],
+        "a withdrawal's response body MUST add exactly the correction pair",
+    );
+
+    assert_eq!(
+        invalidation
+            .get("entry_type")
+            .and_then(serde_json::Value::as_str),
+        Some("invalidation"),
+    );
+    assert_eq!(
+        invalidation
+            .get("invalidates")
+            .and_then(serde_json::Value::as_str),
+        Some(SAMPLE_TARGET_ID),
+        "`invalidates` MUST be emitted as the target's uuid string",
+    );
+    assert_eq!(
+        invalidation
+            .get("reason_code")
+            .and_then(serde_json::Value::as_str),
+        Some(SAMPLE_REASON_CODE),
+        "`reason_code` MUST be emitted as a bare string, not the newtype's \
+         debug form",
     );
 }
 
 #[test]
 fn usage_record_dto_serialises_value_as_string_and_period_bounds_as_rfc3339() {
-    let dto = UsageRecordDto::from(sample_persisted_record(UsageRecordStatus::Active));
+    let dto = UsageRecordDto::from(sample_persisted_record());
     let json = serde_json::to_value(&dto).expect("UsageRecordDto serialises");
     assert_eq!(
         json.get("value").and_then(serde_json::Value::as_str),
@@ -317,12 +532,12 @@ fn usage_record_dto_serialises_value_as_string_and_period_bounds_as_rfc3339() {
 
 #[test]
 fn usage_record_dto_omits_empty_metadata_and_absent_subject_ref() {
-    // Empty `metadata` / `None` `subject_ref` / `None` `corrects_id` MUST be
-    // skipped on the wire so the OAS response shape stays minimal. A
+    // Empty `metadata` / `None` `subject_ref` / an absent correction pair
+    // MUST be skipped on the wire so the OAS response shape stays minimal. A
     // regression that dropped `skip_serializing_if` would surface them as
-    // `metadata: {}` / `subject_ref: null` / `corrects_id: null` and break
+    // `metadata: {}` / `subject_ref: null` / `invalidates: null` and break
     // OAS-clients that treat absent and null as distinct.
-    let dto = UsageRecordDto::from(sample_persisted_record(UsageRecordStatus::Active));
+    let dto = UsageRecordDto::from(sample_persisted_record());
     let json = serde_json::to_value(&dto).expect("UsageRecordDto serialises");
     let obj = json
         .as_object()
@@ -336,8 +551,12 @@ fn usage_record_dto_omits_empty_metadata_and_absent_subject_ref() {
         "absent subject_ref MUST be omitted (got {obj:?})",
     );
     assert!(
-        !obj.contains_key("corrects_id"),
-        "absent corrects_id MUST be omitted (got {obj:?})",
+        !obj.contains_key("invalidates"),
+        "an absent invalidates MUST be omitted (got {obj:?})",
+    );
+    assert!(
+        !obj.contains_key("reason_code"),
+        "an absent reason_code MUST be omitted (got {obj:?})",
     );
 }
 
@@ -356,7 +575,7 @@ fn usage_record_dto_omits_empty_metadata_and_absent_subject_ref() {
 fn create_usage_record_result_dto_serialises_accepted_with_lowercase_tag() {
     let dto = CreateUsageRecordResultDto::Accepted {
         index: 0,
-        record: UsageRecordDto::from(sample_persisted_record(UsageRecordStatus::Active)),
+        record: UsageRecordDto::from(sample_persisted_record()),
     };
     let json = serde_json::to_value(&dto).expect("Accepted serialises");
     let obj = json.as_object().expect("Accepted serialises to an object");
