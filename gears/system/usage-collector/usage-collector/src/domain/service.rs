@@ -36,8 +36,10 @@ use usage_collector_sdk::{
 };
 use uuid::Uuid;
 
-use crate::domain::authz::{self, AttributionTupleKey, usage_record};
-use crate::domain::covered_period::{CoveredPeriodBounds, enforce_covered_period_bounds};
+use crate::domain::authz::{self, AttributionTupleKey};
+use crate::domain::covered_period::{
+    CoveredPeriodBounds, enforce_covered_period_bounds, ingestion_action,
+};
 use crate::domain::invalidation::verify_invalidation_target;
 use crate::domain::ports::declarations::UnavailableDeclarationSource;
 use crate::domain::ports::metrics::{
@@ -263,6 +265,25 @@ fn entry_type_of(record: &CreateUsageRecord) -> EntryType {
         EntryType::Invalidation
     } else {
         EntryType::Record
+    }
+}
+
+/// The `operation` label the PDP-helper instruments (`uc_pdp_*`,
+/// `uc_authz_decisions_total`) carry for an entry admitted by `origin`'s
+/// route.
+///
+/// A **route** label, not a verb. It is the one thing that keeps a bulk
+/// import's PDP latency and denial rate separable from live emission's on
+/// the same instruments, so it follows the entry point rather than the
+/// covered period: every entry of a backfill batch is `operation="backfill"`,
+/// including the ones authorized against `actions::CREATE` because their
+/// period ends inside the configured window. The verb such an entry is
+/// authorized against comes from [`ingestion_action`] instead, and the two
+/// answers disagree by design — see [`PdpOp::Backfill`].
+const fn pdp_op_for(origin: RecordOrigin) -> PdpOp {
+    match origin {
+        RecordOrigin::Live => PdpOp::Ingest,
+        RecordOrigin::Backfill => PdpOp::Backfill,
     }
 }
 
@@ -934,18 +955,23 @@ impl Service {
             .invalidation
             .as_ref()
             .map(|invalidation| (record.clone(), invalidation.clone()));
+        // One clock read for the admission and the action alike: the two
+        // read the same `window_end` against bounds that share an origin,
+        // and a second `now_utc()` could put them on opposite sides of the
+        // backfill window.
+        let now = OffsetDateTime::now_utc();
         // Ahead of the PDP call below, because §3.8 orders period
         // validation (step 3) before authorization (step 5).
-        let record = self.project_and_admit(record, origin, OffsetDateTime::now_utc())?;
+        let record = self.project_and_admit(record, origin, now)?;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-pdp-deny
         authz::authorize_usage_record(
             &self.enforcer,
             self.metrics.as_ref(),
-            PdpOp::Ingest,
+            pdp_op_for(origin),
             ctx,
             &record,
-            usage_record::actions::CREATE,
+            ingestion_action(&self.covered_period_bounds, origin, now, record.window_end),
         )
         .await
         .map_err(UsageCollectorError::from)?;
@@ -1132,6 +1158,61 @@ impl Service {
         // with the backfill route so the two cannot drift. `Live` comes from
         // the route this wrapper *is*, not from a default.
         self.create_usage_records_for_origin(ctx, records, RecordOrigin::Live)
+            .await
+    }
+
+    /// Bulk historical import, isolated from live ingestion
+    /// (`cpt-cf-usage-collector-adr-backfill-isolation`).
+    ///
+    /// Stamps `origin = backfill` and admits the covered periods the live
+    /// past tolerance rejects. Validation is otherwise identical to
+    /// [`Self::create_usage_records`] — the future tolerance included,
+    /// because this route lifts the past bound and nothing else.
+    ///
+    /// It takes invalidation entries as well as measurements, mixed in one
+    /// batch. A withdrawal of a period older than the live past tolerance
+    /// belongs here rather than on the live path, so a correction of closed
+    /// history reads as history: `origin` records the route each entry
+    /// travelled, and it is not one of the fields the faithful-copy rule
+    /// compares, so withdrawing a `live` target here is the ordinary case
+    /// rather than a mismatch.
+    ///
+    /// An entry whose covered period ends further back than the configured
+    /// backfill window is authorized against
+    /// `usage_record::actions::BACKFILL` instead of `CREATE`
+    /// ([`ingestion_action`]). One batch may mix the two; every entry of it
+    /// is labelled `operation="backfill"` on the PDP instruments either
+    /// way, that label being the route rather than the verb.
+    ///
+    // TODO(`cpt-cf-usage-collector-nfr-workload-isolation`): this route
+    // shares the live path's runtime, connection pool and fan-out budget —
+    // it is the same `create_usage_records_for_origin` body under a
+    // different `origin`, and nothing here bounds it separately. The ADR
+    // makes workload isolation a gear-level obligation and it is
+    // unimplemented; a bulk import can still degrade live ingestion p95.
+    // Backend pool isolation is separately a plugin deployment obligation.
+    // Confirmation is a concurrent load test against
+    // `cpt-cf-usage-collector-nfr-throughput-profile`, which is why nothing
+    // in the gear-level suite goes red while this stands.
+    ///
+    /// # Errors
+    ///
+    /// The same variants as [`Self::create_usage_records`].
+    ///
+    /// # Post-condition
+    ///
+    /// As [`Self::create_usage_records`]: on `Ok`, one result slot per
+    /// input, in input order.
+    pub async fn backfill_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        records: Vec<CreateUsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError> {
+        // `Backfill` comes from the route this wrapper *is*. Everything
+        // else — the structural cap, the pipeline, the completion telemetry
+        // — is the live route's own body, which is what keeps the two from
+        // drifting.
+        self.create_usage_records_for_origin(ctx, records, RecordOrigin::Backfill)
             .await
     }
 
@@ -1375,11 +1456,18 @@ impl Service {
         // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-dedup-tuple-key
         let mut distinct_tuples: HashMap<AttributionTupleKey, Vec<usize>> = HashMap::new();
         for (index, record) in &derived {
+            // Per record, not per batch: `ingestion_action` reads each
+            // entry's own `window_end`, so one backfill batch straddling
+            // the configured window carries `create` and `backfill` at
+            // once. `action` is part of `AttributionTupleKey`'s hash/eq,
+            // which is what keeps two such entries sharing one attribution
+            // tuple from collapsing onto a single PDP decision — the entry
+            // beyond the window would otherwise ride in on the other's
+            // `create` permit.
+            let action =
+                ingestion_action(&self.covered_period_bounds, origin, now, record.window_end);
             distinct_tuples
-                .entry(AttributionTupleKey::from_record(
-                    record,
-                    usage_record::actions::CREATE,
-                ))
+                .entry(AttributionTupleKey::from_record(record, action))
                 .or_default()
                 .push(*index);
         }
@@ -1392,9 +1480,9 @@ impl Service {
         // any record field outside the key, so two records that
         // hash-equal under `AttributionTupleKey` cannot diverge in PDP
         // payload — they share the SAME `AccessRequest` by construction.
-        // `action` is part of the key (hash/eq), so a future caller that
-        // mixes actions in one batch cannot collapse onto a single PDP
-        // decision.
+        // `action` is part of the key (hash/eq), which is what lets the
+        // loop above vary it per record without two verbs collapsing onto
+        // one decision.
         let pdp_decisions: Vec<PdpGroupDecision> =
             stream::iter(distinct_tuples.into_iter().map(|(key, indices)| {
                 let enforcer = &self.enforcer;
@@ -1403,7 +1491,7 @@ impl Service {
                     let decision = authz::authorize_attribution_tuple(
                         enforcer,
                         metrics,
-                        PdpOp::Ingest,
+                        pdp_op_for(origin),
                         ctx,
                         &key,
                     )

@@ -22,6 +22,7 @@ use usage_collector_sdk::{
 };
 use uuid::Uuid;
 
+use authz_resolver_sdk::AuthZResolverApi;
 use toolkit_security::pep_properties;
 
 use super::{classify_query_result, classify_record_error};
@@ -29,12 +30,12 @@ use crate::domain::Service;
 use crate::domain::authz::usage_record;
 use crate::domain::ports::metrics::{QueryErrorCategory, RecordErrorCategory, RequestOutcome};
 use crate::domain::test_support::{
-    CountingPermitResolver, CountingTenantPermitResolver, DenyAllResolver, HappyPathPlugin,
-    ServiceFixture, UnreachableResolver, authenticated_ctx, counter_sum_with_label, enforcer_for,
-    fake_declaration_source_with_fold, fake_declaration_source_with_metadata, gauge_last,
-    histogram_count, histogram_count_with_label, histogram_sum, histogram_sum_with_label,
-    hub_with_plugin, local_metrics, recent_window_end, recent_window_start,
-    service_with_metrics_unready_plugin, test_time_range,
+    ActionRecordingPermitResolver, CountingPermitResolver, CountingTenantPermitResolver,
+    DenyAllResolver, HappyPathPlugin, ServiceFixture, UnreachableResolver, authenticated_ctx,
+    counter_sum_with_label, enforcer_for, fake_declaration_source_with_fold,
+    fake_declaration_source_with_metadata, gauge_last, histogram_count, histogram_count_with_label,
+    histogram_sum, histogram_sum_with_label, hub_with_plugin, local_metrics, recent_window_end,
+    recent_window_start, service_with_metrics_unready_plugin, test_time_range,
 };
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
 use usage_collector_sdk::UsageCollectorPluginError;
@@ -327,6 +328,100 @@ async fn ingestion_batch_all_denied_observes_batch_size_and_partial_request() {
     assert_eq!(
         histogram_count_with_label(&exporter, "uc_ingestion_duration_seconds", "origin", "live"),
         1,
+    );
+}
+
+#[tokio::test]
+async fn ingestion_backfill_batch_labels_both_instruments_backfill() {
+    // The backfill route shares the live route's telemetry block, so what
+    // needs pinning is the one thing it does not share: the `origin` it
+    // hands both ingestion instruments. `DenyAllResolver` keeps the batch
+    // short of the plugin — the labels under test are recorded on the
+    // completion path whatever each per-record outcome was.
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_resolver(Arc::new(DenyAllResolver))
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.backfill.batch.v1");
+
+    let result = service
+        .backfill_usage_records(
+            &authenticated_ctx(),
+            vec![sample_create_record(), sample_create_record()],
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "batch returns per-record outcomes, not an outer Err"
+    );
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "origin",
+            "backfill"
+        ),
+        2,
+    );
+    assert_eq!(
+        histogram_count_with_label(
+            &exporter,
+            "uc_ingestion_duration_seconds",
+            "origin",
+            "backfill"
+        ),
+        1,
+    );
+    // No live share at all: a wrapper that stamped `Live` would satisfy an
+    // assertion on the totals but not this one.
+    assert_eq!(
+        counter_sum_with_label(&exporter, "uc_ingestion_records_total", "origin", "live"),
+        0,
+    );
+}
+
+#[tokio::test]
+async fn the_pdp_operation_label_follows_the_backfill_route_not_the_verb() {
+    // `PdpOp::Backfill.as_str()` and `usage_record::actions::BACKFILL` are
+    // both the string "backfill" and mean different things: a route label
+    // versus an elevated verb. `sample_create_record` covers the shared
+    // recent period, which is well inside the configured backfill window,
+    // so this batch is the case where the two disagree — labelled
+    // `operation="backfill"` and authorized against `create`.
+    //
+    // Without this test `PdpOp::Backfill` reaches no metric sample at all
+    // and a route left on `PdpOp::Ingest` would fold a bulk import's PDP
+    // latency and denial rate into live emission's series unnoticed.
+    let resolver = ActionRecordingPermitResolver::new();
+    let (service, provider, exporter) = ServiceFixture::default()
+        .with_source(fake_declaration_source_with_fold("SUM"))
+        .with_resolver(Arc::clone(&resolver) as Arc<dyn AuthZResolverApi>)
+        .build_with_metrics(HappyPathPlugin::new(), "test.metrics.backfill.pdp.v1");
+
+    let _outcome = service
+        .backfill_usage_records(&authenticated_ctx(), vec![sample_create_record()])
+        .await;
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        resolver.actions_sorted(),
+        vec!["create".to_owned()],
+        "a period inside the backfill window needs no privilege a live \
+         emission does not",
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_authz_decisions_total",
+            "operation",
+            "backfill"
+        ),
+        1,
+    );
+    assert_eq!(
+        counter_sum_with_label(&exporter, "uc_authz_decisions_total", "operation", "ingest"),
+        0,
+        "the label is the route, and this entry did not travel the live one",
     );
 }
 

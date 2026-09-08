@@ -59,6 +59,16 @@ pub enum PdpOp {
     /// Usage-record ingestion (single + batch emit).
     Ingest,
     /// Bulk historical import — the backfill route's own ingestion.
+    ///
+    /// A **route** label, and it is not the same thing as the PEP verb
+    /// `usage_record::actions::BACKFILL`, whose string it happens to
+    /// share. The label follows the entry point; the verb follows the
+    /// covered period. So a backfill-route entry whose period ends inside
+    /// the configured window is labelled `operation="backfill"` here and
+    /// authorized against `create` — and every entry of a backfill batch
+    /// carries this label whichever verb it was authorized against, which
+    /// is what keeps a bulk import's PDP latency and denial rate separable
+    /// from live emission's.
     Backfill,
     /// Raw (non-aggregated) usage-record listing.
     QueryRaw,

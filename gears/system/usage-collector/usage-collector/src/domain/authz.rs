@@ -147,10 +147,14 @@ async fn pdp_scope_with<T>(
 ///
 /// `action` participates in the hash/eq contract so a batch carrying
 /// records bound to different actions cannot collapse onto a single PDP
-/// decision. Today every batch caller passes a constant
-/// (`usage_record::actions::CREATE`); promoting `action` into the key
-/// makes the safety property hold structurally for any future caller
-/// that mixes actions in one batch.
+/// decision. The backfill route is the caller that mixes them: it picks
+/// each entry's verb from that entry's own covered period
+/// ([`crate::domain::covered_period::ingestion_action`]), so one batch
+/// spanning the configured backfill window carries `create` and
+/// `backfill` together — under a single attribution tuple when the two
+/// entries share a tenant, resource and subject. Drop `action` from the
+/// key and those two collapse, and the entry reaching past the window
+/// rides in on the other's `create` permit.
 #[domain_model]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct AttributionTupleKey {
@@ -251,10 +255,14 @@ pub(crate) mod usage_record {
 /// [`UsageRecord`]: the owning tenant (`record.tenant_id`), the optional
 /// subject reference (its mandatory `subject_id` plus optional
 /// `subject_type` qualifier), and the mandatory resource reference.
-/// `action` selects the verb the PDP authorizes against; `actions::CREATE`
-/// for emission is the only one any caller passes today, and
-/// [`AttributionTupleKey`]'s own doc carries the rule that keeps a second
-/// one from silently sharing its decision. Unlike the query-path helpers,
+/// `action` selects the verb the PDP authorizes against: the single-emit
+/// ingestion path passes whatever
+/// [`crate::domain::covered_period::ingestion_action`] picks for the
+/// entry — `actions::CREATE`, or `actions::BACKFILL` for one reaching
+/// past the configured backfill window — and
+/// [`AttributionTupleKey`]'s own doc carries the rule that keeps two such
+/// verbs in one batch from silently sharing a decision. Unlike the
+/// query-path helpers,
 /// which project their constraints into an `OData` filter, this path
 /// runs under `require_constraints(true)` and applies the per-record
 /// attribution gate in [`scope_admits_attribution_tuple`]:

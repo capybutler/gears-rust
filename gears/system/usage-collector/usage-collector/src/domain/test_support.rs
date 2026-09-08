@@ -107,12 +107,28 @@ pub fn default_covered_period_bounds() -> crate::domain::covered_period::Covered
 /// rather than letting a bogus record reach the assertion.
 ///
 /// Stamped `Live`, because these fixtures stand in for what the live
-/// ingestion path produced; a test about an imported entry hands the origin
-/// to the fixture that needs it rather than reaching through here.
+/// ingestion path produced; a test about an imported entry reaches for
+/// [`projected_with_origin`] rather than through here.
 pub(crate) fn projected(submission: &CreateUsageRecord) -> UsageRecord {
+    projected_with_origin(submission, RecordOrigin::Live)
+}
+
+/// [`projected`] for a route other than the live one — the shape the
+/// backfill route hands its storage plugin.
+///
+/// A plugin echo fixture programmed with a `Live` projection would return
+/// `origin = live` however the gateway stamped the entry it was handed, so
+/// a test asserting the marker on the returned record would be asserting
+/// its own fixture. Programming the echo through here, and asserting
+/// against what the plugin was *handed*, is what makes that assertion
+/// about the gateway.
+pub(crate) fn projected_with_origin(
+    submission: &CreateUsageRecord,
+    origin: RecordOrigin,
+) -> UsageRecord {
     submission
         .clone()
-        .try_into_usage_record(RecordOrigin::Live)
+        .try_into_usage_record(origin)
         .expect("test fixture supplies a valid covered period")
 }
 
@@ -359,6 +375,58 @@ impl AuthZResolverApi for CountingTenantPermitResolver {
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(permit_scoped_to_request_tenant(&request))
+    }
+}
+
+/// PDP fake that permits everything and records the `action` of every
+/// request it sees.
+///
+/// The counting fakes beside it answer "how many decisions"; this one
+/// answers "which verb". The backfill route is the first caller that varies
+/// the action *within* one batch, and a test that only counts calls cannot
+/// tell a batch authorizing `create` twice from one authorizing `create`
+/// and `backfill` — both are two calls. Permits through
+/// [`permit_scoped_to_request_tenant`], so it clears the per-record
+/// attribution gate for any tenant a test picks, exactly as
+/// [`CountingTenantPermitResolver`] does.
+#[derive(Debug, Default)]
+pub struct ActionRecordingPermitResolver {
+    actions: std::sync::Mutex<Vec<String>>,
+}
+
+impl ActionRecordingPermitResolver {
+    /// Build an action-recording tenant-scoped permit resolver.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The actions authorized so far, sorted.
+    ///
+    /// Sorted rather than in call order because the batch PDP fan-out is
+    /// `buffer_unordered`: asserting call order would produce a test that
+    /// fails intermittently on a loaded runner and says nothing extra when
+    /// it passes.
+    #[must_use]
+    pub fn actions_sorted(&self) -> Vec<String> {
+        let mut seen = self.actions.lock().expect("mutex").clone();
+        seen.sort();
+        seen
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for ActionRecordingPermitResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.actions
+            .lock()
+            .expect("mutex")
+            .push(request.action.name.clone());
         Ok(permit_scoped_to_request_tenant(&request))
     }
 }

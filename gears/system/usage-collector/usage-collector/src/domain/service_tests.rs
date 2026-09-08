@@ -3523,6 +3523,337 @@ mod covered_period_bounds_tests {
     }
 }
 
+// ── The backfill route ─────────────────────────────────────────────────────
+//
+// `Service::backfill_usage_records` is the live batch body under a
+// different `origin`, so what is worth pinning here is only what the origin
+// changes: the marker every accepted entry carries, the past bound it
+// lifts, that the lift reaches a withdrawal of closed history, and the PDP
+// verb it derives per entry from the covered period.
+//
+// The ADR's Confirmation section is the list
+// (`cpt-cf-usage-collector-adr-backfill-isolation`). Its first two cases
+// are the live path's and live in `covered_period_bounds_tests` above; its
+// last is a concurrent load test against the workload-isolation NFR, which
+// is unimplemented and out of scope here — see the TODO at
+// `Service::backfill_usage_records`.
+mod backfill_route_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use authz_resolver_sdk::AuthZResolverApi;
+    use toolkit_gts::gts_id;
+    use usage_collector_sdk::{
+        BACKFILL_ROUTE_PATH, CreateUsageRecord, IdempotencyKey, Invalidation, MeterTypeId,
+        ReasonCode, RecordOrigin, ResourceRef, UsageCollectorError, UsageCollectorPluginV1,
+        UsageRecord, ValidationReason,
+    };
+    use uuid::Uuid;
+
+    use crate::domain::Service;
+    use crate::domain::test_support::{
+        ActionRecordingPermitResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx,
+        default_covered_period_bounds, fake_declaration_source_with_fold, projected,
+        projected_with_origin, recent_window_end, recent_window_start,
+    };
+
+    const GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
+
+    fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
+        ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .build(plugin, suffix)
+    }
+
+    /// A submission over the shared recent covered period — the one the
+    /// live path admits.
+    fn fresh_record(tenant_id: Uuid, resource_id: &str, idem: &str) -> CreateUsageRecord {
+        CreateUsageRecord {
+            gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
+            tenant_id,
+            resource_ref: ResourceRef::new(resource_id, "compute.vm").expect("valid resource ref"),
+            subject_ref: None,
+            metadata: BTreeMap::new(),
+            value: rust_decimal::Decimal::from(1),
+            idempotency_key: IdempotencyKey::new(idem).expect("valid idempotency key"),
+            invalidation: None,
+            window_start: recent_window_start(),
+            window_end: recent_window_end(),
+        }
+    }
+
+    /// The same submission over a covered period `days` old, and differing
+    /// in nothing else.
+    ///
+    /// Offset from the memoised [`recent_window_end`] rather than from a
+    /// fresh `now_utc()`, so two submissions built by separate calls carry
+    /// the SAME period — two clock reads land microseconds apart, which
+    /// derives two different ids and makes a withdrawal built that way an
+    /// unfaithful copy of its target.
+    fn aged_record(tenant_id: Uuid, resource_id: &str, idem: &str, days: i64) -> CreateUsageRecord {
+        let window_end = recent_window_end() - time::Duration::days(days);
+        CreateUsageRecord {
+            window_start: window_end - time::Duration::hours(1),
+            window_end,
+            ..fresh_record(tenant_id, resource_id, idem)
+        }
+    }
+
+    fn invalid_argument(err: &UsageCollectorError) -> (&ValidationReason, &str) {
+        match err {
+            UsageCollectorError::InvalidArgument { reason, detail, .. } => (reason, detail),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// ADR confirmation case 5, the write half — `api/rest/dto_tests.rs`
+    /// carries the read half.
+    ///
+    /// Two entries, and the fresh one is the load-bearing half: a batch of
+    /// nothing but aged periods would be stamped correctly by a route that
+    /// derived `origin` from how old the period is rather than from the
+    /// entry point, and the marker's whole job is to record the path the
+    /// entry travelled. The assertion is on what the gateway HANDED the
+    /// plugin, not on what the plugin handed back — the echo is a fixture
+    /// and would answer `backfill` however the entry was stamped.
+    #[tokio::test]
+    async fn the_backfill_route_stamps_every_accepted_entry_with_backfill() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0xD1);
+        let input = vec![
+            aged_record(tenant_id, "rsc-import", "idem-import-aged", 30),
+            fresh_record(tenant_id, "rsc-import", "idem-import-fresh"),
+        ];
+        plugin.set_create_records(
+            input
+                .iter()
+                .map(|r| Ok(projected_with_origin(r, RecordOrigin::Backfill)))
+                .collect(),
+        );
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.backfill.stamp.records.v1",
+        );
+
+        let results = service
+            .backfill_usage_records(&authenticated_ctx(), input)
+            .await
+            .expect("batch dispatch succeeded");
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+
+        let dispatched = plugin
+            .last_create_records_input()
+            .expect("both entries reached the storage plugin");
+        assert_eq!(
+            dispatched.iter().map(|r| r.origin).collect::<Vec<_>>(),
+            vec![RecordOrigin::Backfill, RecordOrigin::Backfill],
+            "the route stamps its own origin on every entry it admits, \
+             whatever each entry's covered period is",
+        );
+        assert_eq!(
+            results[0].as_ref().expect("accepted").origin,
+            RecordOrigin::Backfill,
+            "and the marker survives to the caller",
+        );
+    }
+
+    /// ADR confirmation case 3, both halves in one test so the two can
+    /// never drift into agreeing with each other by accident: the live path
+    /// refuses the period and names the route, and the route admits it.
+    #[tokio::test]
+    async fn the_backfill_route_admits_the_period_the_live_path_rejected() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0xD2);
+        let stale = aged_record(tenant_id, "rsc-both", "idem-both", 30);
+        // Armed to succeed on BOTH surfaces, so neither outcome below can
+        // come from an unprogrammed plugin.
+        plugin.set_create_record(projected(&stale));
+        plugin.set_create_records(vec![Ok(projected_with_origin(
+            &stale,
+            RecordOrigin::Backfill,
+        ))]);
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.backfill.admits.records.v1",
+        );
+
+        let live_err = service
+            .create_usage_record(&authenticated_ctx(), stale.clone())
+            .await
+            .expect_err("30 days is beyond the 48-hour live past tolerance");
+        let (reason, detail) = invalid_argument(&live_err);
+        assert_eq!(*reason, ValidationReason::PastWindow);
+        assert!(
+            detail.contains(BACKFILL_ROUTE_PATH),
+            "the rejection names the route this test then exercises: {detail}",
+        );
+
+        let results = service
+            .backfill_usage_records(&authenticated_ctx(), vec![stale])
+            .await
+            .expect("batch dispatch succeeded");
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].is_ok(),
+            "the route exists for exactly the period the live path named it \
+             for: {results:?}",
+        );
+    }
+
+    /// ADR confirmation case 4.
+    ///
+    /// The target is built with `origin = Live` and withdrawn on the
+    /// backfill route. `origin` records the path each entry travelled and
+    /// is NOT one of the fields the faithful-copy rule compares, so a
+    /// `live` target and a `backfill` withdrawal is the ordinary pair
+    /// rather than a mismatch — a correction found weeks later is exactly
+    /// how history gets corrected. If the comparator ever started reading
+    /// `origin`, this is the test that goes red.
+    #[tokio::test]
+    async fn a_withdrawal_of_closed_history_is_refused_live_and_accepted_on_backfill() {
+        let tenant_id = Uuid::from_u128(0xD3);
+        let target = Uuid::from_u128(0x6D3);
+
+        // The measurement whose period closed a month ago, persisted as the
+        // live path would have left it.
+        let measurement = aged_record(tenant_id, "rsc-withdraw", "idem-target", 30);
+        let target_row = UsageRecord {
+            id: target,
+            ..projected_with_origin(&measurement, RecordOrigin::Live)
+        };
+        assert_eq!(
+            target_row.origin,
+            RecordOrigin::Live,
+            "the target must be a LIVE entry, or the pair this test is about \
+             is not the pair it built",
+        );
+        // A faithful copy of it, departing only in the two permitted
+        // places — its own idempotency key, and the reference itself.
+        let withdrawal = CreateUsageRecord {
+            invalidation: Some(Invalidation {
+                target,
+                reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+            }),
+            ..aged_record(tenant_id, "rsc-withdraw", "idem-withdrawal", 30)
+        };
+
+        let plugin = HappyPathPlugin::new();
+        plugin.set_get_record(target_row.clone());
+        plugin.set_create_record(projected(&withdrawal));
+        plugin.set_create_records(vec![Ok(projected_with_origin(
+            &withdrawal,
+            RecordOrigin::Backfill,
+        ))]);
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.backfill.withdrawal.records.v1",
+        );
+
+        let live_err = service
+            .create_usage_record(&authenticated_ctx(), withdrawal.clone())
+            .await
+            .expect_err("a withdrawal of a closed month belongs on the backfill route");
+        let (reason, detail) = invalid_argument(&live_err);
+        assert_eq!(*reason, ValidationReason::PastWindow);
+        assert!(detail.contains(BACKFILL_ROUTE_PATH), "{detail}");
+
+        let results = service
+            .backfill_usage_records(&authenticated_ctx(), vec![withdrawal])
+            .await
+            .expect("batch dispatch succeeded");
+        assert_eq!(results.len(), 1);
+        let accepted = results[0]
+            .as_ref()
+            .expect("a faithful withdrawal of a live target is accepted here");
+        assert_eq!(accepted.origin, RecordOrigin::Backfill);
+        assert_eq!(
+            plugin.get_usage_record_calls(),
+            1,
+            "the target was read exactly once, on the backfill attempt; the live \
+             attempt was refused by the period bound before the lookup",
+        );
+        let dispatched = plugin
+            .last_create_records_input()
+            .expect("the withdrawal reached the storage plugin");
+        assert_eq!(dispatched[0].origin, RecordOrigin::Backfill);
+    }
+
+    /// [`crate::domain::authz::AttributionTupleKey`] carries `action` in its
+    /// hash/eq precisely so a batch bound to different actions cannot
+    /// collapse onto a single PDP decision. The backfill route is the first
+    /// caller that mixes them; before this test the property was structural
+    /// but unexercised.
+    ///
+    /// Both entries share ONE attribution tuple — same tenant, same
+    /// resource, no subject — so the only thing keeping them apart is the
+    /// action. Drop `action` from the key and the two collapse onto one
+    /// decision, and the entry reaching past the backfill window rides in
+    /// on the other's `create` permit.
+    ///
+    /// The assertion is on the recorded action STRINGS. Counting calls
+    /// would pass for the wrong reason twice over: two calls is also what a
+    /// dedup broken on some other field produces, and one call is what the
+    /// correct implementation produces if the fixture's two periods stopped
+    /// straddling the window — which is why the straddle is asserted below
+    /// rather than left to the reader to recompute from two literals.
+    #[tokio::test]
+    async fn one_backfill_batch_mixing_window_sides_authorizes_two_distinct_actions() {
+        let bounds = default_covered_period_bounds();
+        let inside_days = 30_i64;
+        let beyond_days = 120_i64;
+        assert!(
+            time::Duration::days(inside_days) < bounds.backfill_window
+                && time::Duration::days(beyond_days) > bounds.backfill_window,
+            "the fixture's two periods MUST straddle the configured backfill \
+             window ({:?}) or this test silently stops mixing actions",
+            bounds.backfill_window,
+        );
+
+        let tenant_id = Uuid::from_u128(0xD4);
+        let resolver = ActionRecordingPermitResolver::new();
+        let plugin = HappyPathPlugin::new();
+        // One attribution tuple, two idempotency keys: the submissions are
+        // distinct entries that a PDP dedup keyed on anything but `action`
+        // would fold together.
+        let input = vec![
+            aged_record(tenant_id, "rsc-mixed", "idem-inside", inside_days),
+            aged_record(tenant_id, "rsc-mixed", "idem-beyond", beyond_days),
+        ];
+        plugin.set_create_records(
+            input
+                .iter()
+                .map(|r| Ok(projected_with_origin(r, RecordOrigin::Backfill)))
+                .collect(),
+        );
+        let service = ServiceFixture::default()
+            .with_source(fake_declaration_source_with_fold("SUM"))
+            .with_resolver(Arc::clone(&resolver) as Arc<dyn AuthZResolverApi>)
+            .build(
+                Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+                "test.backfill.mixed.records.v1",
+            );
+
+        let results = service
+            .backfill_usage_records(&authenticated_ctx(), input)
+            .await
+            .expect("batch dispatch succeeded");
+        assert!(
+            results.iter().all(Result::is_ok),
+            "crossing the backfill window selects a different verb; it does \
+             NOT reject the entry: {results:?}",
+        );
+
+        assert_eq!(
+            resolver.actions_sorted(),
+            vec!["backfill".to_owned(), "create".to_owned()],
+            "one batch, one attribution tuple, two actions: the PDP must see \
+             both",
+        );
+    }
+}
+
 // The kind/op compatibility rule (`require_op_allowed_for_kind` /
 // the deleted aggregation-op allow-list) is gone, not relocated: a meter declares
 // exactly one fold and a caller cannot choose one at all, so there is no
