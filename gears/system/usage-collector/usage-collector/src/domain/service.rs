@@ -807,6 +807,11 @@ impl Service {
     /// TTL-cached — see [`crate::domain::type_resolver`]), not read from a
     /// plugin-owned catalog.
     ///
+    /// `origin` is the caller's route, not a caller's value: the wrapper
+    /// that *is* a route passes its own, which is the only thing
+    /// distinguishing the live and backfill entry points over this shared
+    /// pipeline.
+    ///
     /// # Errors
     ///
     /// * [`UsageCollectorError::PermissionDenied`] /
@@ -1163,6 +1168,12 @@ impl Service {
     /// denial, an unresolvable declaration, malformed metadata, SPI errors
     /// against individual records) surface in the per-index `Result`
     /// entries of the returned vector rather than the outer `Err`.
+    ///
+    /// `origin` is the caller's route, not a caller's value: the wrapper
+    /// that *is* a route passes its own, which is the only thing
+    /// distinguishing the live and backfill entry points over this shared
+    /// pipeline. It is one value for the whole batch — a batch is admitted
+    /// by one route.
     ///
     /// # Post-condition
     ///

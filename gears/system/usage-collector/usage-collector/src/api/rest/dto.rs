@@ -155,7 +155,11 @@ pub struct CreateUsageRecordsRequest {
 /// the SDK wire shape carries no `entry_type` at all — the discriminator is
 /// derived from `invalidates` and never stored — so there is no encoding
 /// here to mirror, only a `utoipa::ToSchema` derive to keep out of the SDK
-/// crate.
+/// crate. `origin` is the third flattening, and for `gts_type_id`'s reason
+/// rather than `entry_type`'s: the SDK carries it as a closed enum whose
+/// wire form is already the lowercased variant name, so this `String`
+/// mirrors an encoding that does exist, and only the `utoipa::ToSchema`
+/// derive is being kept out of the SDK.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct UsageRecordDto {
@@ -231,9 +235,9 @@ impl From<UsageRecord> for UsageRecordDto {
                 .collect(),
             value: value.value,
             idempotency_key: value.idempotency_key.into_inner(),
-            // Read in place rather than hoisted above the destructure the
-            // way `entry_type` is: `RecordOrigin` is `Copy` and the field
-            // is untouched by the partial move, so nothing forces it out.
+            // `entry_type` is hoisted above the destructure because it
+            // borrows the whole record; a plain field read needs no such
+            // treatment.
             origin: value.origin.as_str().to_owned(),
             invalidates,
             reason_code,

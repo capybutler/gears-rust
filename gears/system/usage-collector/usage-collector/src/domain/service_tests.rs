@@ -2094,7 +2094,7 @@ mod create_usage_record_path_tests {
     use time::OffsetDateTime;
     use usage_collector_sdk::{
         ConflictReason, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId,
-        ReasonCode, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
+        ReasonCode, RecordOrigin, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
         UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, ValidationReason,
     };
     use uuid::Uuid;
@@ -2149,11 +2149,17 @@ mod create_usage_record_path_tests {
     }
 
     /// The persisted entry [`counter_withdrawal`] copies faithfully: same
-    /// caller-supplied fields, its own identity and idempotency key.
+    /// caller-supplied fields, its own identity, its own idempotency key
+    /// and its own origin.
     fn target_row(tenant_id: Uuid, id: Uuid) -> UsageRecord {
         UsageRecord {
             id,
             idempotency_key: IdempotencyKey::new("idem-target").expect("valid idempotency key"),
+            // Deliberately not the origin the live submission will carry: a
+            // withdrawal's route is its own, so a mismatch here MUST NOT
+            // make the copy unfaithful (`faithful_copy_mismatch` ignores
+            // `origin`). This fixture is what pins that.
+            origin: RecordOrigin::Backfill,
             ..projected(&counter_record(tenant_id, 10, "idem-target"))
         }
     }
@@ -2751,7 +2757,7 @@ mod batch_size_cap_tests {
 // pinned here too: it is server-assigned from the route, and these two
 // methods ARE the live route.
 #[cfg(test)]
-mod derived_id_stamp_tests {
+mod server_assigned_stamp_tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

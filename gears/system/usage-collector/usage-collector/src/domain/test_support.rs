@@ -1578,9 +1578,13 @@ impl FoldingPlugin {
     /// server-assigned from the route the **withdrawal** travelled, and
     /// that need not be the route its target travelled: withdrawing a
     /// period old enough to have closed goes by the backfill route while
-    /// the entry it retracts came in live. Inheriting the target's value
-    /// would build a shape the gateway never produces, so callers state
-    /// it and `..record.clone()` must not supply it.
+    /// the entry it retracts came in live.
+    ///
+    /// Matching the target is the common case, not a wrong one. Inheriting
+    /// it silently is what the parameter rules out: that would make the
+    /// mixed-route pair unreachable and the matched pair unremarkable, so
+    /// callers state it and `..record.clone()` must not supply it —
+    /// [`Self::store_withdrawn`] states the matched case explicitly.
     ///
     /// Separate from [`Self::store_withdrawn`] because storing the pair is
     /// not the only way to need one: an orphan invalidation has no target
