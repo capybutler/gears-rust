@@ -1500,6 +1500,38 @@ fn usage_record_query_filter_surface_rejects_gts_type_id_inside_composite() {
     );
 }
 
+#[test]
+fn the_filter_surface_carries_every_fixed_field_design_declares() {
+    // The converse of the three refusals above: DESIGN §3.1's
+    // `UsageRecordFilterField` row makes the admissible `$filter` /
+    // `group_by` set these eight fixed names plus the queried meter's
+    // declared metadata keys, resolved per request. Pinned because the
+    // schema struct is the only place the fixed half is written down, and
+    // a name dropped from it does not fail loudly — it degrades to the
+    // same `UnknownField` refusal `gts_type_id` gets, which reads to a
+    // caller like their own mistake.
+    //
+    // A lower bound, not the whole schema: `id`, `window_start` and
+    // `window_end` are on it too, for the keyset and the plugin's
+    // field-to-column mapping rather than for filtering — see the
+    // file-level comment above `UsageRecordQuery`.
+    for field in [
+        "tenant_id",
+        "resource_id",
+        "resource_type",
+        "subject_id",
+        "subject_type",
+        "entry_type",
+        "origin",
+        "invalidates",
+    ] {
+        assert!(
+            crate::models::UsageRecordFilterField::from_name(field).is_some(),
+            "`{field}` is a fixed filterable field per DESIGN §3.1",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Keyset-safe (never-null) order-field classification
 // ---------------------------------------------------------------------------
@@ -1520,8 +1552,41 @@ fn the_keyset_safe_allowlist_is_exactly_the_mandatory_record_attributes() {
             "tenant_id",
             "resource_id",
             "resource_type",
+            "origin",
         ],
     );
+}
+
+#[test]
+fn origin_is_keyset_safe_where_the_other_always_present_field_is_not() {
+    // `origin` and `entry_type` are both present on every entry and get
+    // opposite verdicts, so the rule beside `KEYSET_SAFE_RECORD_FIELDS` is
+    // not "is the value always there". `origin` is a stored field of
+    // `UsageRecord`, so every plugin persists it and a row-value keyset
+    // over its column drops nothing; `entry_type` is a function of the
+    // optional `invalidates` that the SDK obliges no plugin to
+    // materialize, so there is no column to promise a key over.
+    //
+    // Both resolve on the filterable schema, and that is what makes the
+    // pair worth pinning together: column resolution cannot be what
+    // separates them, so nothing but this asserts that the split is the
+    // stored/derived one the doc claims.
+    assert!(
+        is_keyset_safe_record_field("origin"),
+        "`origin` is a stored, mandatory record attribute and must be admissible \
+         as an order key",
+    );
+    assert!(
+        !is_keyset_safe_record_field("entry_type"),
+        "`entry_type` is derived from an optional field and must stay inadmissible",
+    );
+    for field in ["origin", "entry_type"] {
+        assert!(
+            crate::models::UsageRecordFilterField::from_name(field).is_some(),
+            "`{field}` is on the filterable schema, so resolving to a column is \
+             not what tells the two apart",
+        );
+    }
 }
 
 #[test]

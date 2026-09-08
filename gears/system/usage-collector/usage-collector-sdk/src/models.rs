@@ -1780,6 +1780,20 @@ pub struct UsageRecordQuery {
     /// mandatory though the value is. See [`is_keyset_safe_record_field`].
     #[odata(filter(kind = "String"))]
     pub entry_type: String,
+    /// `usage_records.origin` — which ingestion path admitted the entry
+    /// (`live` / `backfill`). On the filter surface because DESIGN §3.1
+    /// lists it among the fixed `$filter` and `group_by` fields: a
+    /// consumer that has already raised a charge for a period needs to
+    /// separate imported history from current consumption
+    /// (`cpt-cf-usage-collector-adr-backfill-isolation`).
+    ///
+    /// Declared `String` on the filter wire, like [`Self::entry_type`] —
+    /// but unlike it, this is a stored attribute of the entry rather than
+    /// a function of an optional one, so a plugin maps it to a real
+    /// non-null column and it **is** a sound order key. See
+    /// [`is_keyset_safe_record_field`].
+    #[odata(filter(kind = "String"))]
+    pub origin: String,
 }
 
 pub use UsageRecordQueryFilterField as UsageRecordFilterField;
@@ -1790,7 +1804,7 @@ pub use UsageRecordQueryFilterField as UsageRecordFilterField;
 ///
 /// Exported because it is the admissible `$orderby` vocabulary, so a `400`
 /// refusing a caller's order can name the whole set rather than leave them
-/// to guess: six names is short enough to be actionable, and the set is
+/// to guess: seven names is short enough to be actionable, and the set is
 /// closed. Matching is exact, like the `$orderby` grammar itself.
 pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
     RECORD_ID_FIELD,
@@ -1799,6 +1813,7 @@ pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
     "tenant_id",
     "resource_id",
     "resource_type",
+    "origin",
 ];
 
 /// Record filter fields sound to use as a keyset-pagination ordering key.
@@ -1827,6 +1842,12 @@ pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
 ///
 /// Every entry of [`KEYSET_SAFE_RECORD_FIELDS`] is an attribute the record
 /// itself carries on every entry, so all of them are keyset-safe.
+/// [`UsageRecord::origin`] is the case that shows the two rules above are
+/// one rule and not a list of exceptions: like `entry_type` it has a value
+/// on every entry, and unlike `entry_type` it is a field of the record
+/// rather than a function of another one, so every plugin persisting a
+/// [`UsageRecord`] persists it non-null and there is a column to promise a
+/// key over. Derivation, not presence, is what separates the two.
 ///
 /// This is a fact about the shape this SDK guarantees, not about any
 /// storage schema. A plugin is free to materialize `entry_type` as a
