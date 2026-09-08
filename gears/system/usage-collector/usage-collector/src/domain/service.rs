@@ -256,6 +256,15 @@ impl Drop for QueryInflightGuard<'_> {
 /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). The label type
 /// is [`EntryType`] itself, so the value a dashboard groups by is the value
 /// the wire carries.
+///
+/// The `inst-compensation-record-kind-label` marker below is inherited
+/// verbatim from the `record_kind_of` this replaced, and its id still says
+/// "compensation" and "record kind" for a function that computes neither.
+/// It is a **live** marker region on new code rather than a dangling one,
+/// so it is moved and not renamed: the marker-id categories were dropped
+/// wholesale by the DESIGN rework, minting a replacement id would invent
+/// one in a dropped category, and a crate-wide marker decision is out of
+/// this slice's scope. Read the id as a coordinate, not as a description.
 // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p2:inst-compensation-record-kind-label
 fn entry_type_of(record: &CreateUsageRecord) -> EntryType {
     if record.invalidation.is_some() {

@@ -187,15 +187,18 @@ pub async fn handle_get_usage_record(
 ///   decoded into the effective `$orderby`; a malformed token surfaces as
 ///   the canonical `cursor_decode` `Problem`. The decoded `CursorV1` flows
 ///   to the plugin via `ODataQuery.cursor` unchanged. Both of the
-///   *comparisons* a cursor needs happen behind the service, which is the
-///   only layer an in-process caller also passes through: the order the
-///   plugin sorts by is taken from the token there, and whether the token
-///   was
-///   minted over *this* query — the caller's `$filter` together with
-///   `gts_type_id`, the `from` / `to` range and every `metadata.<key>`
-///   filter — is checked behind the service, which is the only layer both
-///   surfaces pass through, and refused as `FILTER_MISMATCH` against
-///   `cursor`.
+///   *bindings* a cursor needs happen behind the service, which is the
+///   only layer an in-process caller also passes through — and only one
+///   of the two is a comparison. The order the plugin sorts by is
+///   **overwritten** with the one decoded from the token rather than
+///   compared against a caller's: an order that merely *agreed* would
+///   still leave the caller's spelling in the slot, and nothing
+///   downstream re-derives it (`bind_continuation_order` in
+///   `crate::domain::query`, which is normative for that rule). Whether
+///   the token was minted over *this* query — the caller's `$filter`
+///   together with `gts_type_id`, the `from` / `to` range and every
+///   `metadata.<key>` filter — is the comparison, and a mismatch is
+///   refused as `FILTER_MISMATCH` against `cursor`.
 /// * **`$orderby` admissibility and normalization** — a caller order is
 ///   refused here, naming `$orderby`, when it mixes sort directions or
 ///   names a key that is not a mandatory record attribute; an admissible

@@ -5,6 +5,18 @@
 //! changing the binding requires a gear restart. The usage-type catalog is
 //! plugin-owned (ADR-0012 / foundation.md 0.2.0), so no usage-type
 //! declarations are accepted here.
+//!
+//! **Both halves of that last sentence are stale, and it is left standing
+//! rather than half-corrected.** The catalog is not plugin-owned any more —
+//! `types-registry` owns every declaration and this gear registers no
+//! usage-type surface at all — and `ADR-0012` no longer names the decision
+//! it once did: that number now resolves to
+//! `cpt-cf-usage-collector-adr-backfill-isolation`. It is the live example
+//! of why a shipped citation names an ADR by id and never by number.
+//! Repointing the id alone would preserve a false claim under a correct
+//! reference, which is worse than an obviously stale one; the sentence
+//! needs rewriting by whoever finishes the usage-type-catalog doc debt.
+//! The same pair sits in `lib.rs` twice and in `config_tests.rs`.
 
 use serde::Deserialize;
 

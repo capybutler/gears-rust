@@ -27,6 +27,18 @@ from .conftest import accepted_records, record_payload, window_filter
 #    and `test_delete_usage_type_referenced_by_record_is_rejected` are that
 #    breakage and nothing else: they test the deleted catalog directly.
 #
+#    The catalog is not the only pre-existing cause, and a rewrite owes the
+#    others too. `test_ingest_and_read_record_roundtrip` also asserts
+#    `body["gts_id"]` and `body["created_at"]`; the time-model slice before
+#    this one retired both — the type reference is `gts_type_id` and the
+#    record carries a `window_start` / `window_end` covered period instead
+#    of a `created_at` instant. `record_payload` in `conftest.py` submits
+#    the same two retired keys, and `window_filter()` there builds a
+#    `created_at ge … and created_at lt …` `$filter` that every read test
+#    passes — a shape the gear now rejects outright, because the covered
+#    period is a typed `from` / `to` parameter and a predicate naming a
+#    period bound is a reserved-field `400`.
+#
 # 2. ADDED BY THE CORRECTION-MODEL SLICE, which replaced the mutate-in-place
 #    correction model (a `status` latch plus `POST /records/{id}/deactivate`)
 #    with an append-only one: a correction is an ordinary ingested entry
