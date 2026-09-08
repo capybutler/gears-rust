@@ -3702,6 +3702,74 @@ mod backfill_route_tests {
         );
     }
 
+    /// The other side of the bound the route lifts, and the reason DESIGN
+    /// §3.3 says the route lifts the past bound "and nothing else".
+    ///
+    /// The wiring is true by construction — both batch wrappers share
+    /// `create_usage_records_for_origin`, and
+    /// `enforce_covered_period_bounds` nests only the PAST comparison
+    /// inside `origin == Live` — but "true by construction" is what the
+    /// `origin` metric label was before a mutation showed nothing pinned
+    /// it. A future-dated entry is a clock-skewed emitter, and pointing one
+    /// at the import route would send a defect somewhere it is just as
+    /// invalid.
+    ///
+    /// The rejection is per-record, at the entry's input index, because a
+    /// refused covered period is a precondition of that submission's
+    /// identity derivation rather than of the batch.
+    #[tokio::test]
+    async fn the_backfill_route_refuses_a_period_ending_beyond_the_future_tolerance() {
+        assert!(
+            time::Duration::hours(1) > default_covered_period_bounds().future_tolerance,
+            "the fixture puts the period an hour ahead of now and needs that \
+             to be outside the configured tolerance, which is {:?}",
+            default_covered_period_bounds().future_tolerance,
+        );
+
+        let plugin = HappyPathPlugin::new();
+        // `recent_window_end()` is an hour BEHIND now, so two hours on from
+        // it is an hour AHEAD. Anchored on the memoised fixture rather than
+        // on a fresh clock read, for the reason `aged_record` documents.
+        let window_end = recent_window_end() + time::Duration::hours(2);
+        let submission = CreateUsageRecord {
+            window_start: window_end - time::Duration::hours(1),
+            window_end,
+            ..fresh_record(Uuid::from_u128(0xD5), "rsc-future", "idem-import-future")
+        };
+        // Armed to succeed, so the rejection below can only come from the
+        // bound and not from an unprogrammed plugin.
+        plugin.set_create_records(vec![Ok(projected_with_origin(
+            &submission,
+            RecordOrigin::Backfill,
+        ))]);
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.backfill.future.records.v1",
+        );
+
+        let results = service
+            .backfill_usage_records(&authenticated_ctx(), vec![submission])
+            .await
+            .expect("the batch itself dispatches; the entry is refused in its own slot");
+
+        assert_eq!(results.len(), 1);
+        let err = results[0]
+            .as_ref()
+            .expect_err("the import route lifts the past bound, not the future one");
+        let (reason, detail) = invalid_argument(err);
+        assert_eq!(*reason, ValidationReason::FutureWindow);
+        assert!(
+            !detail.contains(BACKFILL_ROUTE_PATH),
+            "the entry is already ON the backfill route, so naming it as the \
+             place the entry belongs would be a loop: {detail}",
+        );
+        assert_eq!(
+            plugin.last_create_records_input(),
+            None,
+            "a refused period MUST NOT reach the storage plugin",
+        );
+    }
+
     /// ADR confirmation case 4.
     ///
     /// The target is built with `origin = Live` and withdrawn on the

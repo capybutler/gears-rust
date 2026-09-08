@@ -22,6 +22,7 @@ use toolkit::client_hub::ClientHub;
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
     IdempotencyKey, RecordOrigin, ResourceRef, UsageCollectorClientV1, UsageCollectorError,
+    UsageCollectorPluginV1,
 };
 use uuid::Uuid;
 
@@ -82,7 +83,7 @@ fn client_and_spy() -> (UsageCollectorLocalClient, Arc<RecordingPlugin>) {
         .with_source(fake_declaration_source_with_metadata(&[]))
         .with_resolver(recording_plugin_resolver())
         .build(
-            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             RECORDING_PLUGIN_SUFFIX,
         );
     (UsageCollectorLocalClient::new(svc), plugin)
@@ -183,13 +184,11 @@ fn backfill_submission(idem: &str, days_old: i64) -> CreateUsageRecord {
 #[tokio::test]
 async fn backfill_usage_records_reaches_the_backfill_route_not_the_live_batch() {
     let plugin = HappyPathPlugin::new();
-    // Thirty days back: past the live path's 48-hour past tolerance, inside
-    // the 90-day backfill window (so the entry still authorizes `create`
-    // and the fixture needs no elevated grant). The fresh entry beside it
-    // is the load-bearing half of the origin assertion — a batch of nothing
-    // but aged periods would also be stamped `backfill` by a route that
-    // derived the marker from how old a period is rather than from the
-    // entry point it arrived on.
+    // Thirty days back: past the live path's 48-hour past tolerance, so
+    // only the backfill route admits it, and inside the 90-day backfill
+    // window, so it still authorizes `create`. The fresh entry beside it
+    // keeps the origin assertion honest under a delegation to the live
+    // batch, which would reach the plugin with that one stamped `live`.
     let input = vec![
         backfill_submission("idem-local-import-aged", 30),
         backfill_submission("idem-local-import-fresh", 0),
@@ -203,7 +202,7 @@ async fn backfill_usage_records_reaches_the_backfill_route_not_the_live_batch() 
     let svc = ServiceFixture::default()
         .with_source(fake_declaration_source_with_fold("SUM"))
         .build(
-            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             BACKFILL_PLUGIN_SUFFIX,
         );
     let client = UsageCollectorLocalClient::new(svc);
