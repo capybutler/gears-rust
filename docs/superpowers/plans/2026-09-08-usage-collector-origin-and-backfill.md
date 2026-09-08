@@ -3071,6 +3071,22 @@ cargo doc --no-deps -p cf-gears-usage-collector-sdk -p cf-gears-usage-collector
 items that clippy, the tests and rustfmt all pass over. It earned its place in
 slice 4. Clippy is deny-warnings in CI.
 
+**The host's warning count is 35, and `grep -c '^warning:'` will tell you 36.**
+rustdoc ends with its own summary line — `warning: cf-gears-usage-collector (lib
+doc) generated 35 warnings` — which starts with `warning:` and so counts itself.
+Two reviewers and one implementer hit this; the controller then hit it while
+checking the implementer. **Read rustdoc's summary line rather than counting
+lines**, or exclude it:
+
+```bash
+cargo doc --no-deps -p cf-gears-usage-collector 2>&1 \
+  | grep '^warning:' | grep -vc 'generated .* warning'
+```
+
+The SDK crate emits 0. This is the same failure as the `[0-9]{2,}` filter that
+matched grep's own line numbers: a count taken from a tool's output has to
+exclude the tool's own commentary about the count.
+
 **Baseline: 648 passed, 6 skipped.** The 6 are the `#[ignore]`d OpenAPI drift
 tests; leave them skipped. Task 3 is the one task that legitimately leaves the
 host crate not compiling; Task 4 owes the first host run.
