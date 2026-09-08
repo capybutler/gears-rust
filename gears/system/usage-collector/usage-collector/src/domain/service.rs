@@ -256,16 +256,6 @@ impl Drop for QueryInflightGuard<'_> {
 /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). The label type
 /// is [`EntryType`] itself, so the value a dashboard groups by is the value
 /// the wire carries.
-///
-/// The `inst-compensation-record-kind-label` marker below is inherited
-/// verbatim from the `record_kind_of` this replaced, and its id still says
-/// "compensation" and "record kind" for a function that computes neither.
-/// It is a **live** marker region on new code rather than a dangling one,
-/// so it is moved and not renamed: the marker-id categories were dropped
-/// wholesale by the DESIGN rework, minting a replacement id would invent
-/// one in a dropped category, and a crate-wide marker decision is out of
-/// this slice's scope. Read the id as a coordinate, not as a description.
-// @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p2:inst-compensation-record-kind-label
 fn entry_type_of(record: &CreateUsageRecord) -> EntryType {
     if record.invalidation.is_some() {
         EntryType::Invalidation
@@ -273,7 +263,6 @@ fn entry_type_of(record: &CreateUsageRecord) -> EntryType {
         EntryType::Record
     }
 }
-// @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p2:inst-compensation-record-kind-label
 
 /// Observe `uc_record_metadata_bytes` for a record that carries metadata,
 /// measured as the serialized JSON size (the canonical on-the-wire
@@ -834,7 +823,6 @@ impl Service {
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
     ///   transport / persistence failure.
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-emission-compensation:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-ingestion:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-record-metadata:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-resource-attribution:p1
@@ -842,7 +830,6 @@ impl Service {
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-ingestion-authorization:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-usage-type-existence-and-semantics:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-tenant-attribution:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-compensation-flow:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-principle-fail-closed:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-principle-pluggable-storage:p1
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-constraint-no-business-logic:p1
@@ -856,8 +843,6 @@ impl Service {
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-entity-usage-record:p1
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-submit
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-missing-ctx
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-submit
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-missing-ctx
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
     async fn create_usage_record_inner(
         &self,
@@ -865,8 +850,6 @@ impl Service {
         record: CreateUsageRecord,
     ) -> Result<UsageRecord, UsageCollectorError> {
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-missing-ctx
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-submit
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-missing-ctx
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-submit
         // The service is the guaranteed choke point for every caller (REST +
@@ -890,8 +873,6 @@ impl Service {
         let record = record.try_into_usage_record()?;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-pdp-deny
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-attrib-authz
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-pdp-deny
         authz::authorize_usage_record(
             &self.enforcer,
             self.metrics.as_ref(),
@@ -902,8 +883,6 @@ impl Service {
         )
         .await
         .map_err(UsageCollectorError::from)?;
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-pdp-deny
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-attrib-authz
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-pdp-deny
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
 
@@ -913,7 +892,6 @@ impl Service {
             .map_err(UsageCollectorError::from)?;
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-usage-type-not-found
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-usage-type-not-found
         // Resolve the referenced meter's declaration through the Type
         // Resolver (not the plugin — there is no in-process catalog cache,
         // and validation no longer reads a plugin-owned catalog row at
@@ -921,13 +899,10 @@ impl Service {
         // dispatch, mirroring `Self::query_aggregated_usage_records`'s
         // identical fail-closed posture on the read path.
         let declaration = self.type_resolver.resolve(&record.gts_type_id).await?;
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-usage-type-not-found
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-usage-type-not-found
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-check
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-invalid
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate-fail
         // `invalidates` is the whole decision: its presence is what makes
         // the entry an invalidation, and there is no submitted
         // discriminator that could disagree with it. An ordinary
@@ -965,8 +940,6 @@ impl Service {
             }
             verify_invalidation_target(&submission, &invalidation, &target)?;
         }
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate-fail
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-invalid
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-check
 
@@ -981,17 +954,11 @@ impl Service {
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-metadata-closed-shape
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-metadata-cap
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-metadata-too-large
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-closed-shape
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-cap
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-too-large
         validate_submit_record_metadata(
             &declaration,
             &record.metadata,
             self.metadata_size_cap_bytes,
         )?;
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-too-large
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-cap
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-metadata-closed-shape
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-metadata-too-large
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-metadata-cap
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-metadata-closed-shape
@@ -1002,11 +969,6 @@ impl Service {
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-spi-fail
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-conflict
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-accepted
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-spi-dispatch
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-spi-catch
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-spi-fail
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-conflict
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-accepted
         // @cpt-begin:cpt-cf-usage-collector-state-usage-emission-usage-record-ingestion-lifecycle:p2:inst-state-usage-record-persisted
         // @cpt-begin:cpt-cf-usage-collector-state-usage-emission-usage-record-ingestion-lifecycle:p2:inst-state-usage-record-spi-error
         // @cpt-begin:cpt-cf-usage-collector-state-usage-emission-usage-record-ingestion-lifecycle:p2:inst-state-usage-record-rejected-validation
@@ -1021,11 +983,6 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-state-usage-emission-usage-record-ingestion-lifecycle:p2:inst-state-usage-record-spi-error
         // @cpt-end:cpt-cf-usage-collector-state-usage-emission-usage-record-ingestion-lifecycle:p2:inst-state-usage-record-persisted
         // @cpt-end:cpt-cf-usage-collector-state-usage-emission-usage-record-ingestion-lifecycle:p2:inst-state-usage-record-validated
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-accepted
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-conflict
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-spi-fail
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-spi-catch
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-spi-dispatch
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-accepted
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-conflict
         // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-spi-fail

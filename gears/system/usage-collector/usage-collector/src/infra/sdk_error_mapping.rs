@@ -135,7 +135,6 @@ fn lift_common(err: UsageCollectorError) -> CanonicalError {
         // `context.reason`.
         // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-idempotency:p1
         // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-principle-idempotency-by-key:p1
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate-fail
         E::Conflict {
             resource_type,
             name,
@@ -152,7 +151,6 @@ fn lift_common(err: UsageCollectorError) -> CanonicalError {
                 unrecognized_resource(&resource_type)
             }
         }
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-compensation:p1:inst-compensation-validate-fail
 
         // ---- 503 ServiceUnavailable (surface-less) ----
         // @cpt-begin:cpt-cf-usage-collector-dod-usage-emission-principle-pluggable-storage:p1:inst-dod-pluggable-storage-fail
