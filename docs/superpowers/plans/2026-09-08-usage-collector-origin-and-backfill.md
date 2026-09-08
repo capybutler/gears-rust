@@ -64,6 +64,15 @@ where they were paid for. They are current.
 
    Before accepting any check — yours or a prescribed one — state the mutation
    that makes it red. If you cannot name one, it is not a test.
+
+   **Prescribed *code* has been wrong too, not only prescribed checks.** Task
+   10's `ingestion_action` body, given verbatim in this plan, does not compile:
+   its two `CREATE` arms are identical and `clippy::match_same_arms` is denied
+   workspace-wide. Merging them to `Live | Backfill => CREATE` keeps the
+   live-path exclusion **structural** — the guard's pattern is `Backfill`-only,
+   so `backfill_window` is unreachable under `Live` — which is the property that
+   mattered. Ground rule 1 already said to distrust every sketch; this is the
+   instance where the sketch would not even build.
 4. **Tests live in a sibling `*_tests.rs` file** with a
    `#[cfg(test)] #[cfg_attr(coverage_nightly, coverage(off))] #[path = "..."]`
    hook. Never an inline `mod tests`. `src/gts/permissions.rs` has a
