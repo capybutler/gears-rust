@@ -51,14 +51,6 @@ gts_instance! {
         display_name: "List usage records".to_owned(),
     }
 }
-gts_instance! {
-    AuthzPermissionV1 {
-        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_deactivate.v1"),
-        resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-        action: usage_record::actions::DEACTIVATE.to_owned(),
-        display_name: "Deactivate usage record".to_owned(),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -79,7 +71,6 @@ mod tests {
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_create.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_get.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_list.v1"),
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_deactivate.v1"),
     ];
 
     fn uc_permission_instances() -> Vec<&'static InventoryInstance> {

@@ -153,10 +153,4 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;
-
-    /// Deactivate a usage record.
-    ///
-    /// On `Ok(())`, the targeted record and every active record that
-    /// compensates it are atomically flipped to `inactive`.
-    async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError>;
 }

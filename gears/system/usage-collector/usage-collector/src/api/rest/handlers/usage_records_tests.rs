@@ -1,11 +1,11 @@
 //! Handler-level unit tests for the foundation
-//! `/usage-collector/v1/records` create + deactivation surface.
+//! `/usage-collector/v1/records` create and read surface.
 //!
 //! Scope: pin handler-shaped concerns the SDK error-mapping and service
 //! tests cannot reach. Specifically, the create handler lifts per-record
 //! `gts_type_id` validation failures into the canonical `InvalidArgument`
 //! `Problem` envelope (`field_violations[0].reason="INVALID_BASE_GTS_ID"`)
-//! WITHOUT failing the surrounding batch, and the deactivate handler
+//! WITHOUT failing the surrounding batch, and the point-lookup handler
 //! lifts a malformed `uuid` path segment into the canonical
 //! `InvalidArgument` envelope before reaching the service.
 //!
@@ -13,7 +13,7 @@
 //!
 //! * Wire-shape / DTO conversions — pinned in
 //!   [`crate::api::rest::dto::tests`].
-//! * Service-layer create / deactivation — pinned in
+//! * Service-layer create / read — pinned in
 //!   [`crate::domain::service::service_tests`].
 
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use toolkit::client_hub::ClientHub;
 use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
 
-use super::{handle_create_usage_records, handle_deactivate_usage_record, handle_get_usage_record};
+use super::{handle_create_usage_records, handle_get_usage_record};
 use crate::api::rest::dto::{CreateUsageRecordRequest, CreateUsageRecordsRequest, ResourceRefDto};
 use crate::domain::Service;
 use crate::domain::test_support::{
@@ -258,184 +258,6 @@ async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_no
         "the over-long identifier MUST be rejected before the service (and \
          therefore the PDP) is ever reached - closing the window by \
          construction, not by a deep bridge-conversion check",
-    );
-}
-
-#[tokio::test]
-async fn deactivate_with_malformed_uuid_returns_400_before_reaching_service() {
-    // A non-UUID path segment surfaces as a canonical InvalidArgument
-    // problem without ever dispatching to the service. The counting
-    // resolver lets the test pin the short-circuit directly: a service
-    // path entry would have invoked it, so `calls() == 0` is the
-    // sentinel.
-    let (service, resolver) = service_with_sentinel_pdp();
-
-    let raw_uuid = "not-a-uuid".to_owned();
-    let response = handle_deactivate_usage_record(
-        Extension(SecurityContext::anonymous()),
-        Extension(service),
-        Path(raw_uuid.clone()),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(
-        response.status(),
-        StatusCode::BAD_REQUEST,
-        "malformed UUID MUST lift to 400",
-    );
-
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    assert!(
-        content_type.contains("problem+json"),
-        "malformed-UUID response MUST be application/problem+json, not axum's \
-         default text/plain (got `{content_type}`)",
-    );
-
-    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("Problem body collected");
-    let body: serde_json::Value =
-        serde_json::from_slice(&body_bytes).expect("Problem body is JSON");
-    let violation = body
-        .get("context")
-        .and_then(|c| c.get("field_violations"))
-        .and_then(|fv| fv.as_array())
-        .and_then(|arr| arr.first())
-        .expect("InvalidArgument envelope carries field_violations[0]");
-    assert_eq!(
-        violation.get("field").and_then(serde_json::Value::as_str),
-        Some("id"),
-        "field_violations[0].field MUST identify the malformed path segment",
-    );
-    assert_eq!(
-        violation.get("reason").and_then(serde_json::Value::as_str),
-        Some("VALIDATION"),
-        "field_violations[0].reason MUST be VALIDATION for a non-UUID id",
-    );
-    let description = violation
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    assert!(
-        description.contains(raw_uuid.as_str()),
-        "field_violations[0].description MUST echo the rejected raw value \
-         (got `{description}`)",
-    );
-
-    assert_eq!(
-        resolver.calls(),
-        0,
-        "handler MUST reject the malformed UUID before reaching the service \
-         (resolver MUST NOT be touched)",
-    );
-}
-
-#[tokio::test]
-async fn deactivate_without_plugin_surfaces_503() {
-    // Wire a service against an empty `ClientHub` (no usage-collector
-    // storage plugin registered). The `service_with_sentinel_pdp` helper
-    // does NOT register a plugin, so the deactivate handler's first step
-    // (`Service::get_plugin`) fails with the plugin-host `ServiceUnavailable`
-    // and the handler lifts that to a canonical 503 `Problem` envelope.
-    //
-    // This is NOT a test of the PDP-unreachable branch — `resolver.calls()`
-    // here is `0` because the handler never reaches the PDP step. The
-    // PDP-unreachable branch is covered by
-    // `deactivate_with_unreachable_pdp_surfaces_503` below (which wires a
-    // real plugin so the PDP step IS reached and the unreachable resolver
-    // surfaces the 503).
-    let (service, resolver) = service_with_sentinel_pdp();
-
-    let response = handle_deactivate_usage_record(
-        Extension(SecurityContext::anonymous()),
-        Extension(service),
-        Path(Uuid::new_v4().to_string()),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(
-        response.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "missing storage plugin MUST surface 503",
-    );
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    assert!(
-        content_type.contains("problem+json"),
-        "503 envelope MUST be application/problem+json (got `{content_type}`)",
-    );
-    assert_eq!(
-        resolver.calls(),
-        0,
-        "missing-plugin path MUST short-circuit BEFORE reaching the PDP \
-         (resolver MUST NOT be touched - its non-zero call count would \
-         mean the handler walked past `get_plugin` unexpectedly)",
-    );
-}
-
-#[tokio::test]
-async fn deactivate_with_unreachable_pdp_surfaces_503() {
-    // Wire a service against a REAL plugin (so `get_plugin` succeeds and the
-    // prefetch returns a record) plus an unreachable PDP resolver. The
-    // handler reaches the PDP step, the resolver fails with transport
-    // `ServiceUnavailable`, and the handler lifts that to a canonical 503
-    // `Problem` envelope. The counting resolver pins this as the real PDP
-    // path: `calls() >= 1` is direct evidence the handler walked past
-    // `get_plugin` and `get_usage_record` and invoked the PDP.
-    let plugin = HappyPathPlugin::new();
-    let target_uuid = Uuid::new_v4();
-    let tenant_id = Uuid::from_u128(2);
-    plugin.set_get_record(sample_persisted_record(target_uuid, tenant_id));
-
-    let hub = crate::domain::test_support::hub_with_plugin(
-        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-        "test.handler.deactivate.unreachable_pdp.v1",
-        "cyberfabric",
-    );
-    let resolver = CountingUnreachableResolver::new();
-    let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-    let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
-
-    let response = handle_deactivate_usage_record(
-        Extension(authenticated_ctx()),
-        Extension(service),
-        Path(target_uuid.to_string()),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(
-        response.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "unreachable PDP MUST surface 503",
-    );
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    assert!(
-        content_type.contains("problem+json"),
-        "503 envelope MUST be application/problem+json (got `{content_type}`)",
-    );
-    assert!(
-        resolver.calls() >= 1,
-        "handler MUST reach the PDP step before failing — a missing-plugin \
-         or prefetch-failure path that bypasses the PDP would not catch a \
-         real PDP-unreachable regression (resolver.calls() == {})",
-        resolver.calls(),
     );
 }
 
@@ -1207,63 +1029,16 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
     assert_eq!(forwarded[1].id, derived_id_2);
 }
 
-#[tokio::test]
-async fn deactivate_happy_path_returns_204_no_content() {
-    // Wire a permit-PDP service whose plugin succeeds on both the
-    // pre-PDP `get_usage_record` prefetch (so the gateway has an
-    // attribution tuple to authorize against) and on the
-    // `deactivate_usage_record` SPI dispatch. The handler MUST emit a
-    // 204 No Content with no body.
-    let plugin = HappyPathPlugin::new();
-    let target_uuid = Uuid::new_v4();
-    let tenant_id = Uuid::from_u128(2);
-    plugin.set_get_record(sample_persisted_record(target_uuid, tenant_id));
-    plugin.set_deactivate_ok();
-
-    let service = ServiceFixture::default().build(
-        Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-        "test.handler.deactivate.happy.v1",
-    );
-
-    let response = handle_deactivate_usage_record(
-        Extension(authenticated_ctx()),
-        Extension(service),
-        Path(target_uuid.to_string()),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(
-        response.status(),
-        StatusCode::NO_CONTENT,
-        "happy-path deactivate MUST surface 204 No Content",
-    );
-    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body collected");
-    assert!(
-        body_bytes.is_empty(),
-        "204 No Content MUST carry an empty body (got {body_bytes:?})",
-    );
-    assert_eq!(
-        plugin.last_deactivate_input(),
-        Some(target_uuid),
-        "service MUST forward the path-supplied UUID to the plugin",
-    );
-}
-
 // ---------------------------------------------------------------------------
 // `handle_get_usage_record`: GET /usage-collector/v1/records/{id}
 //
 // Handler-shaped concerns the service tests cannot reach:
 //   - Malformed UUID path segment lifts to InvalidArgument (HTTP 400)
 //     BEFORE the service is invoked.
-//   - `get_usage_record` now authorizes via a pre-row compiled-scope PDP
-//     request BEFORE resolving the plugin (Task 13 / DESIGN §3.3), unlike
-//     `deactivate_usage_record`'s unchanged prefetch-then-authorize
-//     posture above — so a missing plugin surfaces 503 AFTER the PDP is
-//     reached (not before), and an unreachable PDP surfaces 503 before any
-//     plugin dispatch (not after a prefetch).
+//   - `get_usage_record` authorizes via a pre-row compiled-scope PDP
+//     request BEFORE resolving the plugin (DESIGN §3.3) — so a missing
+//     plugin surfaces 503 AFTER the PDP is reached (not before), and an
+//     unreachable PDP surfaces 503 before any plugin dispatch.
 //   - Happy path: 200 OK with the persisted record body, wire-projected
 //     through `UsageRecordDto`.
 // ---------------------------------------------------------------------------
@@ -1315,6 +1090,21 @@ async fn get_with_malformed_uuid_returns_400_before_reaching_service() {
     assert_eq!(
         violation.get("reason").and_then(serde_json::Value::as_str),
         Some("VALIDATION"),
+    );
+    // The envelope echoes the rejected raw segment back. A caller whose id
+    // came out of a template or a copy-paste has nothing else to debug
+    // against: `field` and `reason` say the shape is wrong but not which
+    // value was wrong, and the request never reached the service, so no
+    // server-side log ties the 400 to a row. A constant message would pass
+    // every other assertion here.
+    let description = violation
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        description.contains(raw_uuid.as_str()),
+        "field_violations[0].description MUST echo the rejected raw value \
+         (got `{description}`)",
     );
     assert_eq!(
         resolver.calls(),

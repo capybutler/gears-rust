@@ -1,13 +1,13 @@
 //! PEP gate and per-resource vocabulary for the usage-collector domain.
 //!
-//! Per ADR-0001 (`cpt-cf-usage-collector-adr-pdp-centric-authorization`) the
+//! Per `cpt-cf-usage-collector-adr-pdp-centric-authorization` the
 //! collector keeps NO local policy table and NO PDP-decision cache; every
 //! decision is delegated to the bound `authz-resolver` client. The ingestion
 //! surface declares per-record attribution attributes (tenant, optional
 //! subject, resource type and id) so policy can reason over them, and runs
 //! under `require_constraints(true)`, gating each record's owning tenant
 //! against the PDP-returned row scope, so a tenant-scoped caller cannot
-//! attribute usage to — or read / deactivate a record of — a tenant outside
+//! attribute usage to — or read a record of — a tenant outside
 //! its closure.
 //!
 //! Fail-closed wiring (transport → `AuthorizationUnavailable`, deny /
@@ -230,31 +230,29 @@ pub(crate) mod usage_record {
     /// change against the PDP policy bundle.
     pub mod actions {
         pub const CREATE: &str = "create";
-        pub const DEACTIVATE: &str = "deactivate";
         pub const GET: &str = "get";
         pub const LIST: &str = "list";
     }
 }
 
-/// Run the PDP check for `(usage_record, action)` carrying the caller-supplied
-/// (for `CREATE`) or plugin-loaded (for `DEACTIVATE`) attribution-tuple
-/// attributes lifted off the [`UsageRecord`]: the owning tenant
-/// (`record.tenant_id`), the optional subject reference (its mandatory
-/// `subject_id` plus optional `subject_type` qualifier), and the mandatory
-/// resource reference. `action` selects the verb the PDP authorizes against
-/// (`actions::CREATE` for emission, `actions::DEACTIVATE` for event
-/// deactivation); the per-verb PEP vocabulary is identical so policy authors
-/// reason over a single attribute set. Unlike [`authorize`], this path runs
-/// under `require_constraints(true)` and applies the per-record attribution
-/// gate in [`scope_admits_attribution_tuple`]: `access_scope_with` fails
-/// closed only on an
-/// outright PDP deny / transport / compile error, so a *permit* carrying a
+/// Run the PDP check for `(usage_record, action)` carrying the
+/// caller-supplied attribution-tuple attributes lifted off the
+/// [`UsageRecord`]: the owning tenant (`record.tenant_id`), the optional
+/// subject reference (its mandatory `subject_id` plus optional
+/// `subject_type` qualifier), and the mandatory resource reference.
+/// `action` selects the verb the PDP authorizes against; `actions::CREATE`
+/// for emission is the only one any caller passes today, and
+/// [`AttributionTupleKey`]'s own doc carries the rule that keeps a second
+/// one from silently sharing its decision. Unlike [`authorize`], this path
+/// runs under `require_constraints(true)` and applies the per-record
+/// attribution gate in [`scope_admits_attribution_tuple`]:
+/// `access_scope_with` fails closed only on an outright PDP deny /
+/// transport / compile error, so a *permit* carrying a
 /// row-scope narrowing constraint (e.g. `OWNER_TENANT_ID In [caller's tenant
 /// closure]`) is returned as `Ok(scope)` and the SDK does NOT auto-match it
 /// against the request's resource properties. The record's owning tenant
 /// must therefore be matched against the granted scope here, or cross-tenant
-/// attribution (create) / cross-tenant read (get) / cross-tenant deactivate
-/// would slip through.
+/// attribution (create) or cross-tenant read (get) would slip through.
 ///
 /// # Errors
 ///
@@ -263,7 +261,6 @@ pub(crate) mod usage_record {
 ///   the record's owning tenant.
 /// * [`DomainError::AuthorizationUnavailable`] when the PDP transport fails.
 // @cpt-algo:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1
-// @cpt-algo:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-tenant-attribution:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-resource-attribution:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-subject-attribution:p1
@@ -310,7 +307,6 @@ pub(crate) async fn authorize_attribution_tuple(
     // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-compose-tuple
     // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-compose
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-compose-tuple
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-compose-tuple
     let mut request = AccessRequest::new()
         .require_constraints(true)
         .resource_property(pep_properties::OWNER_TENANT_ID, key.tenant_id.to_string())
@@ -324,7 +320,6 @@ pub(crate) async fn authorize_attribution_tuple(
                 request.resource_property(usage_record::PROP_SUBJECT_TYPE, subject_type.clone());
         }
     }
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-compose-tuple
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-compose-tuple
     // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-compose
     // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-compose-tuple
@@ -333,10 +328,6 @@ pub(crate) async fn authorize_attribution_tuple(
     // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-call
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-deny
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-allow
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-call
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-deny
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-fail-closed
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-allow
     // Per-record attribution gate (see [`scope_admits_attribution_tuple`]),
     // applied as the wrapper's post-permit gate. A permit that narrows the grant
     // (to the caller's tenant closure, and possibly other attribution
@@ -376,10 +367,6 @@ pub(crate) async fn authorize_attribution_tuple(
         },
     )
     .await
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-allow
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-fail-closed
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-deny
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-call
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-allow
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-deny
     // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-call
@@ -394,7 +381,7 @@ pub(crate) async fn authorize_attribution_tuple(
 /// SDK does NOT auto-match that scope against the request's resource
 /// properties — confirming the record falls inside the granted scope is the
 /// gear's responsibility. Without this check a `/tenants/{A}`-scoped caller
-/// could create / read / deactivate records attributed to any other tenant:
+/// could create or read records attributed to any other tenant:
 /// the resolver returns a permit plus an `OWNER_TENANT_ID In [A's closure]`
 /// narrowing, but nothing otherwise rejects an out-of-closure record.
 ///

@@ -1,8 +1,8 @@
 //! Wire DTOs for the foundation REST surface.
 //!
-//! `UsageRecord` create / deactivation — batch create request / response
-//! shapes for `POST /usage-collector/v1/records`. Deactivation returns no
-//! body (HTTP 204 No Content) so it carries no response DTO. List-page
+//! `UsageRecord` create — batch create request / response shapes for
+//! `POST /usage-collector/v1/records`. A withdrawal is an ordinary entry
+//! on that same create surface, so it needs no DTO of its own. List-page
 //! envelopes use [`toolkit_odata::Page`] directly; `OData` query parameters
 //! (`limit`, `cursor`) are parsed by the toolkit `OData` extractor and need
 //! no module-local DTO. Every usage-type declaration is now owned by

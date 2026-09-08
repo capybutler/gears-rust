@@ -79,10 +79,6 @@ impl UsageCollectorPluginV1 for NoopBackend {
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
         Ok(ODataPage::empty(0))
     }
-
-    async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::UsageRecordNotFound { id })
-    }
 }
 
 #[cfg(test)]

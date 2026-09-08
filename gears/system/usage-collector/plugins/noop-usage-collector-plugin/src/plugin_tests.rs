@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 use usage_collector_sdk::{
     IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorPluginError, UsageCollectorPluginV1,
-    UsageRecord, UsageRecordStatus,
+    UsageRecord,
 };
 use uuid::Uuid;
 
@@ -24,8 +24,7 @@ fn sample_record(id: &str, idempotency_key: &str) -> UsageRecord {
         value: Decimal::from(1),
         idempotency_key: IdempotencyKey::new(idempotency_key)
             .expect("valid idempotency key fixture"),
-        corrects_id: None,
-        status: UsageRecordStatus::Active,
+        invalidation: None,
         window_start: time::OffsetDateTime::UNIX_EPOCH,
         window_end: time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
@@ -74,25 +73,4 @@ async fn create_usage_records_rejects_empty_batch_as_internal() {
         matches!(err, UsageCollectorPluginError::Internal(_)),
         "empty batch MUST surface as Internal (non-retryable host-contract breach), got {err:?}",
     );
-}
-
-#[tokio::test]
-async fn deactivate_usage_record_returns_not_found_with_target_id() {
-    let backend = NoopBackend::new();
-    let id = uuid::Uuid::from_u128(0x1234_5678_9ABC_DEF0);
-
-    let err = backend
-        .deactivate_usage_record(id)
-        .await
-        .expect_err("noop backend MUST surface UsageRecordNotFound");
-
-    match err {
-        UsageCollectorPluginError::UsageRecordNotFound { id: returned } => {
-            assert_eq!(
-                returned, id,
-                "the not-found variant MUST echo the supplied target id",
-            );
-        }
-        other => panic!("expected UsageRecordNotFound, got {other:?}"),
-    }
 }

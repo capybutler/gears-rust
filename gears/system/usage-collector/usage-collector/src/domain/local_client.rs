@@ -102,14 +102,6 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
             .await
     }
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
-
-    async fn deactivate_usage_record(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<(), UsageCollectorError> {
-        self.svc.deactivate_usage_record(ctx, id).await
-    }
 }
 
 #[cfg(test)]

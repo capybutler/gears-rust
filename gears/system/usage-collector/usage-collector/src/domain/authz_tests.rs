@@ -236,19 +236,27 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
 }
 
 /// Same attribution attributes, different `action` MUST NOT hash-equal.
+///
+/// `CREATE` is the only verb that composes a tuple key today — the point
+/// lookup authorizes through `authorize_get_usage_record_scope`, which
+/// builds no key at all — so this pins the struct's identity contract
+/// rather than a request the gear can currently issue. That is the point:
+/// `action` is a field of the key, so a second tuple-keyed verb added
+/// later cannot silently collapse onto `CREATE`'s decision. Drop `action`
+/// from the hash and nothing fails until that verb exists, which is the
+/// wrong time to find out.
 #[test]
 fn different_actions_yield_distinct_tuple_keys_for_same_attribution() {
     let record = record_with(Some(
         SubjectRef::new("sub-action", Some("user")).expect("valid subject"),
     ));
     let create = AttributionTupleKey::from_record(&record, usage_record::actions::CREATE);
-    let deactivate = AttributionTupleKey::from_record(&record, usage_record::actions::DEACTIVATE);
+    let get = AttributionTupleKey::from_record(&record, usage_record::actions::GET);
     assert_ne!(
-        create, deactivate,
-        "action MUST participate in AttributionTupleKey hash/eq; \
-         otherwise a batch mixing CREATE and DEACTIVATE for the same \
-         tuple would share a single PDP decision and silently bypass \
-         per-action policy",
+        create, get,
+        "action MUST participate in AttributionTupleKey hash/eq; without it \
+         a second tuple-keyed verb would share CREATE's PDP decision for the \
+         same attribution tuple and silently bypass per-action policy",
     );
 }
 

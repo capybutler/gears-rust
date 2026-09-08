@@ -100,16 +100,4 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError>;
-
-    /// Deactivate a usage event.
-    ///
-    /// On success the targeted record and every active referencing
-    /// compensation row are flipped to `inactive` atomically.
-    // @cpt-begin:cpt-cf-usage-collector-state-event-deactivation-record-lifecycle:p1:inst-state-no-reactivation
-    async fn deactivate_usage_record(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<(), UsageCollectorError>;
-    // @cpt-end:cpt-cf-usage-collector-state-event-deactivation-record-lifecycle:p1:inst-state-no-reactivation
 }

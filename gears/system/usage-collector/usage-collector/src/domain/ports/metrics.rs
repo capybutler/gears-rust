@@ -61,8 +61,6 @@ pub enum PdpOp {
     QueryAggregated,
     /// Read a single usage record by id.
     GetRecord,
-    /// Deactivate a usage record.
-    Deactivate,
 }
 
 impl PdpOp {
@@ -74,7 +72,6 @@ impl PdpOp {
             Self::QueryRaw => "query_raw",
             Self::QueryAggregated => "query_aggregated",
             Self::GetRecord => "get_record",
-            Self::Deactivate => "deactivate",
         }
     }
 }
@@ -97,8 +94,6 @@ pub enum PluginOp {
     ListUsageRecords,
     /// SPI Method 10.
     GetUsageRecord,
-    /// SPI Method 5.
-    DeactivateUsageRecord,
 }
 
 impl PluginOp {
@@ -111,7 +106,6 @@ impl PluginOp {
             Self::QueryAggregatedUsageRecords => "query_aggregated_usage_records",
             Self::ListUsageRecords => "list_usage_records",
             Self::GetUsageRecord => "get_usage_record",
-            Self::DeactivateUsageRecord => "deactivate_usage_record",
         }
     }
 }
@@ -194,9 +188,13 @@ impl PluginErrorCategory {
 
 // ── Phase 2: per-component gateway label vocabularies (DESIGN §3.11.5) ──
 
-/// `outcome` label shared by the query and deactivation request counters
-/// (their §3.11.5 vocabularies are identical: `success` on a successful
-/// return, `denied` on a completed PDP deny, `error` otherwise).
+/// `outcome` label for `uc_query_requests_total` (§3.11.5: `success` on a
+/// successful return, `denied` on a completed PDP deny, `error`
+/// otherwise). A second counter shared this vocabulary until its
+/// instrument was retired; the query counter is its sole consumer now.
+/// `uc_ingestion_requests_total` is also request-scoped but keeps its own
+/// vocabulary in [`IngestRequestOutcome`], because a batch has a partial
+/// outcome the tri-state here cannot express.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestOutcome {
@@ -434,39 +432,6 @@ impl QueryErrorCategory {
     }
 }
 
-/// `error_category` label for `uc_deactivation_requests_total`.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeactivationErrorCategory {
-    /// `outcome` was `success`.
-    None,
-    /// Reserved/defensive — rejected upstream / unreachable on SDK.
-    MissingSecurityContext,
-    /// PDP deny (metric records the true denial) or PDP fail-closed.
-    Authz,
-    /// Prefetch or Method-5 `UsageRecordNotFound`.
-    NotFound,
-    /// Target record was already `inactive`.
-    AlreadyInactive,
-    /// Plugin transport / readiness / persistence fault.
-    PluginError,
-}
-
-impl DeactivationErrorCategory {
-    /// The bounded `error_category` label value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::MissingSecurityContext => "missing_security_context",
-            Self::Authz => "authz",
-            Self::NotFound => "not_found",
-            Self::AlreadyInactive => "already_inactive",
-            Self::PluginError => "plugin_error",
-        }
-    }
-}
-
 /// Outcome of one [`crate::domain::type_resolver::TypeResolver::resolve`]
 /// call, for the failure and staleness instruments DESIGN §3.11.5 requires.
 /// Replaces the deleted catalog-lifecycle instruments
@@ -477,7 +442,8 @@ impl DeactivationErrorCategory {
 /// DESIGN §3.11.5 documents `uc_type_resolution_total{result}` with a
 /// five-value `result` set: `cache_hit`, `cache_miss`, `served_stale`,
 /// `unresolved`, `registry_error`, plus `restored` — a mirror-table restore
-/// path (§3.7 / ADR-0015) this gear does not implement yet, so no variant
+/// path (§3.7 / `cpt-cf-usage-collector-adr-declaration-rehydration`)
+/// this gear does not implement yet, so no variant
 /// below emits it. This enum names the five values `TypeResolver::resolve`
 /// / `populate` (`domain/type_resolver/mod.rs`) actually emit:
 ///
@@ -537,7 +503,7 @@ impl TypeResolutionOutcome {
 /// `uc_plugin_call_duration_seconds`) and the PDP-helper set
 /// (`uc_pdp_ready`, `uc_pdp_failures_total`, `uc_pdp_duration_seconds`,
 /// `uc_authz_decisions_total`). Phase 2 adds the per-component gateway
-/// instruments (ingestion, query, deactivation) plus the Type Resolver
+/// instruments (ingestion, query) plus the Type Resolver
 /// instrument that replaced the deleted usage-type catalog counters.
 pub trait UsageCollectorMetrics: Send + Sync {
     /// `uc_pdp_ready` gauge — set to `1` while the `authz-resolver` client is
@@ -629,18 +595,6 @@ pub trait UsageCollectorMetrics: Send + Sync {
         seconds: f64,
     );
 
-    // ── Deactivation handler (event-deactivation) ──
-
-    /// Observe `uc_deactivation_duration_seconds` plus increment
-    /// `uc_deactivation_requests_total{outcome, error_category}` — once per
-    /// completed deactivation attempt.
-    fn record_deactivation_request(
-        &self,
-        outcome: RequestOutcome,
-        error_category: DeactivationErrorCategory,
-        seconds: f64,
-    );
-
     // ── Type Resolver (usage-type-lifecycle successor) ──
 
     /// Increment `uc_type_resolution_total{result}` once per
@@ -673,8 +627,6 @@ impl UsageCollectorMetrics for NoopMetrics {
     fn query_inflight_dec(&self, _: QueryKind) {}
     fn observe_query_result_rows(&self, _: QueryKind, _: u64) {}
     fn record_query_request(&self, _: QueryKind, _: RequestOutcome, _: QueryErrorCategory, _: f64) {
-    }
-    fn record_deactivation_request(&self, _: RequestOutcome, _: DeactivationErrorCategory, _: f64) {
     }
     fn record_type_resolution(&self, _: TypeResolutionOutcome) {}
 }

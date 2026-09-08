@@ -1,9 +1,9 @@
 //! Unit tests for the local client surface.
 //!
-//! Coverage: the service-delegating methods (usage-record ingestion +
-//! deactivation + read-by-id) clear the trait boundary and hit the PDP
-//! preflight inside the domain service — with an unreachable PDP and/or a
-//! missing storage plugin the surface error is a fail-closed envelope.
+//! Coverage: the service-delegating methods (usage-record ingestion and
+//! read-by-id) clear the trait boundary and hit the PDP preflight inside
+//! the domain service — with an unreachable PDP and/or a missing storage
+//! plugin the surface error is a fail-closed envelope.
 //!
 //! Plus the two read paths' mandatory `TimeRange`: the client is a
 //! forwarding shim, and a shim that silently substituted a range would
@@ -38,31 +38,6 @@ fn authenticated_ctx() -> SecurityContext {
         .subject_tenant_id(Uuid::from_u128(2))
         .build()
         .expect("authenticated context")
-}
-
-#[tokio::test]
-async fn deactivate_usage_record_fails_closed_without_plugin_or_pdp() {
-    // `deactivate_usage_record` now resolves the storage plugin first
-    // (so it can pre-fetch the target record and feed the loaded
-    // attribution tuple into PDP). With NO plugin registered in the hub
-    // AND an unreachable PDP, the call MUST still fail closed — the
-    // observable error here is `PluginUnavailable` (plugin resolution
-    // runs before authz now), which lifts to `ServiceUnavailable` at the
-    // canonical envelope boundary. The point of this smoke test is "the
-    // SDK trait never silently succeeds when the host is misconfigured."
-    let client = make_client();
-    let err = client
-        .deactivate_usage_record(&authenticated_ctx(), Uuid::from_u128(0xFEED))
-        .await
-        .expect_err("misconfigured host must fail closed");
-    // Any of these variants is a fail-closed envelope — the specific one
-    // depends on what the host resolves first (types-registry → plugin
-    // selection → PDP). The invariant the smoke test guards is "never
-    // Ok(()) when the host is misconfigured."
-    assert!(
-        matches!(err, UsageCollectorError::ServiceUnavailable { .. }),
-        "expected fail-closed envelope, got {err:?}"
-    );
 }
 
 #[tokio::test]

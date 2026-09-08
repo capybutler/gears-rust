@@ -1,8 +1,7 @@
 //! Unit tests for the foundation usage-record REST route table.
 //!
-//! Exercises the two record-surface routes
-//! (`POST /usage-collector/v1/records`,
-//! `POST /usage-collector/v1/records/{id}/deactivate`) against the
+//! Exercises the record-surface routes (`POST /usage-collector/v1/records`
+//! and `GET /usage-collector/v1/records/{id}`) against the
 //! [`toolkit::api::openapi_registry::OpenApiRegistryImpl`] that
 //! [`super::register_usage_record_routes`] populates. Each test pulls the
 //! full registered [`toolkit::api::operation_builder::OperationSpec`] and
@@ -160,47 +159,6 @@ async fn get_usage_record_route_is_registered_with_documented_contract() {
         ok_resp.schema_name(),
         Some(expected_response.as_str()),
         "get 200 MUST point at `UsageRecordDto`",
-    );
-
-    assert_standard_errors_registered(&spec);
-}
-
-#[tokio::test]
-async fn deactivate_usage_record_route_is_registered_with_documented_contract() {
-    let (registry, _router) = registry_and_router();
-    let spec = lookup_spec(
-        &registry,
-        &Method::POST,
-        "/usage-collector/v1/records/{id}/deactivate",
-    );
-
-    assert_eq!(
-        spec.operation_id.as_deref(),
-        Some("usage_collector.deactivate_usage_record"),
-    );
-    assert_authenticated_and_no_license(&spec);
-
-    // Path param `id`. Deactivate carries no JSON request body.
-    let id_param = spec
-        .params
-        .iter()
-        .find(|p| p.name == "id" && p.location == ParamLocation::Path)
-        .expect("deactivate route MUST declare path param `id`");
-    assert!(id_param.required, "path param `id` MUST be required");
-    assert!(
-        spec.request_body.is_none(),
-        "deactivate route MUST NOT declare a request body",
-    );
-
-    // Single success response — 204 No Content.
-    let no_content = spec
-        .responses
-        .iter()
-        .find(|r| r.status == StatusCode::NO_CONTENT.as_u16())
-        .expect("deactivate route MUST declare a 204 No Content response");
-    assert!(
-        no_content.schema_name().is_none(),
-        "deactivate 204 MUST NOT carry a body schema",
     );
 
     assert_standard_errors_registered(&spec);

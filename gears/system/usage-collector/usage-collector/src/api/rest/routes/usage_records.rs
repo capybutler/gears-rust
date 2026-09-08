@@ -1,5 +1,5 @@
 //! `OperationBuilder` route registration for the foundation
-//! `/usage-collector/v1/records` create + deactivation surface.
+//! `/usage-collector/v1/records` create + read surface.
 //! Every route is registered with `.no_license_required()` — the
 //! foundation create surface is platform-internal substrate.
 
@@ -202,27 +202,6 @@ pub(super) fn register_usage_record_routes(
         .error_503(openapi)
         .register(router, openapi);
     // @cpt-end:cpt-cf-usage-collector-dod-usage-emission-api-get-records-id:p1:inst-register-route-get-record
-
-    // @cpt-flow:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-api-post-records-id-deactivate:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-component-deactivation-handler:p1
-    router = OperationBuilder::post("/usage-collector/v1/records/{id}/deactivate")
-        .operation_id("usage_collector.deactivate_usage_record")
-        .summary("Deactivate a usage record")
-        .description("Deactivate a usage record by `id`.")
-        .tag(USAGE_RECORDS_TAG)
-        .path_param("id", "Usage-record UUID")
-        // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-no-ctx
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-submit
-        .authenticated()
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-submit
-        // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-no-ctx
-        .no_license_required()
-        .handler(handlers::handle_deactivate_usage_record)
-        .no_content_response(StatusCode::NO_CONTENT, "Deactivation succeeded")
-        .standard_errors(openapi)
-        .error_503(openapi)
-        .register(router, openapi);
 
     router
 }

@@ -24,12 +24,10 @@ use uuid::Uuid;
 
 use toolkit_security::pep_properties;
 
-use super::{classify_deactivation_plugin_error, classify_query_result, classify_record_error};
+use super::{classify_query_result, classify_record_error};
 use crate::domain::Service;
 use crate::domain::authz::usage_record;
-use crate::domain::ports::metrics::{
-    DeactivationErrorCategory, QueryErrorCategory, RecordErrorCategory, RequestOutcome,
-};
+use crate::domain::ports::metrics::{QueryErrorCategory, RecordErrorCategory, RequestOutcome};
 use crate::domain::test_support::{
     CountingPermitResolver, CountingTenantPermitResolver, DenyAllResolver, HappyPathPlugin,
     ServiceFixture, UnreachableResolver, authenticated_ctx, counter_sum_with_label, enforcer_for,
@@ -122,21 +120,27 @@ fn create_record_with_metadata(key: &str, value: &str) -> CreateUsageRecord {
     record
 }
 
-// ── Deactivation handler ─────────────────────────────────────────────
+// ── By-id point lookup ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn deactivation_pdp_deny_records_true_denied_authz_despite_notfound_response() {
-    // Prefetch succeeds; PDP denies → the response is existence-oracle
-    // collapsed to `NotFound`, but the metric records the TRUE `(denied, authz)`.
+async fn point_lookup_pdp_deny_records_a_true_deny_despite_the_notfound_response() {
+    // Labels are operator-facing and the caller surface is not: the point
+    // lookup answers a denied caller with `NotFound` so it cannot be used
+    // as an existence oracle, while `uc_authz_decisions_total` must still
+    // carry the decision the PDP actually returned. Collapsing the metric
+    // along with the response would blind the deny-anomaly alert
+    // (DESIGN §3.11.6) to exactly the reconnaissance the collapse exists
+    // to frustrate. `get_usage_record` is the gear's only by-id surface,
+    // so this is where the rule is pinned.
     let plugin = HappyPathPlugin::new();
     plugin.set_get_record(sample_record());
 
     let (service, provider, exporter) = ServiceFixture::default()
         .with_resolver(Arc::new(DenyAllResolver))
-        .build_with_metrics(plugin, "test.metrics.deact.deny.v1");
+        .build_with_metrics(plugin, "test.metrics.get_record.deny.v1");
 
     let result = service
-        .deactivate_usage_record(&authenticated_ctx(), Uuid::from_u128(0x1234))
+        .get_usage_record(&authenticated_ctx(), Uuid::from_u128(0x1234))
         .await;
     assert!(
         matches!(result, Err(UsageCollectorError::NotFound { .. })),
@@ -145,26 +149,25 @@ async fn deactivation_pdp_deny_records_true_denied_authz_despite_notfound_respon
     provider.force_flush().unwrap();
 
     assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_deactivation_requests_total",
-            "outcome",
-            "denied"
-        ),
+        counter_sum_with_label(&exporter, "uc_authz_decisions_total", "decision", "deny"),
         1,
+        "the operator-facing decision counter MUST record the deny the PDP \
+         returned, not the NotFound the caller was handed",
     );
     assert_eq!(
         counter_sum_with_label(
             &exporter,
-            "uc_deactivation_requests_total",
-            "error_category",
-            "authz",
+            "uc_authz_decisions_total",
+            "operation",
+            "get_record",
         ),
         1,
+        "the deny MUST be attributed to the point-lookup operation",
     );
     assert_eq!(
-        histogram_count(&exporter, "uc_deactivation_duration_seconds"),
-        1,
+        counter_sum_with_label(&exporter, "uc_authz_decisions_total", "decision", "permit"),
+        0,
+        "a denied lookup MUST NOT also record a permit",
     );
 }
 
@@ -922,12 +925,14 @@ async fn ingestion_batch_unready_plugin_increments_unready_counter() {
 
 // ── Metric-label classifiers: exhaustive arm coverage (pure fns) ────────────
 //
-// `classify_record_error`, `classify_query_result` and
-// `classify_deactivation_plugin_error` decide the `error_category` /
-// `outcome` labels operators alert on. The end-to-end tests above exercise only
-// the authz / not-found arms; these table-driven unit tests pin EVERY arm of
-// the closed §3.11.5 vocabularies, so a misrouted variant is caught here rather
-// than as a silently-wrong dashboard series.
+// `classify_record_error` and `classify_query_result` decide the
+// `error_category` / `outcome` labels operators alert on. The end-to-end
+// tests above reach five label values between them (`authz`, `none`,
+// `plugin_error`, `backend_error`, `unready`) — whichever the paths they
+// drive happen to produce — and cannot reach the rest without a fixture
+// per arm. These table-driven unit tests pin EVERY arm of the closed
+// §3.11.5 vocabularies instead, so a misrouted variant is caught here
+// rather than as a silently-wrong dashboard series.
 
 /// The canonical sample `gts_type_id` as a typed id, for classifier
 /// fixtures exercising the record / meter-reference surface
@@ -1071,36 +1076,6 @@ fn classify_query_result_maps_each_arm() {
             "misclassified {result:?}",
         );
     }
-}
-
-#[test]
-fn classify_deactivation_plugin_error_maps_each_arm() {
-    let already = UsageCollectorPluginError::UsageRecordAlreadyInactive {
-        id: Uuid::from_u128(1),
-    };
-    let not_found = UsageCollectorPluginError::UsageRecordNotFound {
-        id: Uuid::from_u128(2),
-    };
-    let transient = UsageCollectorPluginError::transient("backend blip");
-    let internal = UsageCollectorPluginError::internal("boom");
-
-    assert_eq!(
-        classify_deactivation_plugin_error(&already),
-        DeactivationErrorCategory::AlreadyInactive,
-    );
-    assert_eq!(
-        classify_deactivation_plugin_error(&not_found),
-        DeactivationErrorCategory::NotFound,
-    );
-    // Every other plugin fault (retryable or not) is a plugin_error.
-    assert_eq!(
-        classify_deactivation_plugin_error(&transient),
-        DeactivationErrorCategory::PluginError,
-    );
-    assert_eq!(
-        classify_deactivation_plugin_error(&internal),
-        DeactivationErrorCategory::PluginError,
-    );
 }
 
 // ── Query gateway: success + aggregated coverage ────────────────────────────

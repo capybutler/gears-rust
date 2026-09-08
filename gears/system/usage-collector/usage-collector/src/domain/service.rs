@@ -38,9 +38,9 @@ use uuid::Uuid;
 use crate::domain::authz::{self, AttributionTupleKey, usage_record};
 use crate::domain::ports::declarations::UnavailableDeclarationSource;
 use crate::domain::ports::metrics::{
-    DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome, NoopMetrics,
-    PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
-    RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
+    IngestRequestErrorCategory, IngestRequestOutcome, NoopMetrics, PdpOp, PluginErrorCategory,
+    PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory, RecordKind, RecordOutcome,
+    RequestOutcome, UsageCollectorMetrics,
 };
 use crate::domain::query::{
     admit_continuation, compose_query_with_scope, establish_keyset_order, read_fingerprint,
@@ -390,58 +390,37 @@ fn report_unbound_next_cursor<T>(page: &ODataPage<T>, dispatched: Option<&str>) 
     );
 }
 
-/// Project a plugin-side deactivation SPI error onto the closed §3.11.5
-/// `uc_deactivation_requests_total.error_category` vocabulary. The plugin's
-/// `UsageRecordAlreadyInactive` / `UsageRecordNotFound` map to their typed
-/// categories; every other fault (`Transient` / `Internal` / any future
-/// variant) is a `plugin_error`. Extracted (rather than left inline at the
-/// SPI-catch) so the label contract is a pure, table-testable function like
-/// its `classify_*_result` siblings.
-fn classify_deactivation_plugin_error(
-    err: &UsageCollectorPluginError,
-) -> DeactivationErrorCategory {
-    match err {
-        UsageCollectorPluginError::UsageRecordAlreadyInactive { .. } => {
-            DeactivationErrorCategory::AlreadyInactive
-        }
-        UsageCollectorPluginError::UsageRecordNotFound { .. } => {
-            DeactivationErrorCategory::NotFound
-        }
-        _ => DeactivationErrorCategory::PluginError,
-    }
-}
-
 /// A trivially-true `toolkit_odata` filter: "every row satisfies this."
 ///
 /// `UsageCollectorPluginV1::get_usage_record` now takes a compiled-scope
 /// filter on every call, but only `Service::get_usage_record` — the
 /// caller-facing point lookup DESIGN §3.3 requires to read under the
-/// compiled PDP scope — actually has one to give it. The other two call
-/// sites in this module use the same SPI method for a system-internal
-/// lookup that predates (and is out of scope for) that guarantee, and
-/// whose own authorization already happens elsewhere:
+/// compiled PDP scope — actually has one to give it. Two call sites in
+/// this module use the same SPI method for a system-internal lookup that
+/// predates (and is out of scope for) that guarantee, and whose own
+/// authorization already happens elsewhere. Both are the same
+/// `corrects_id` L1 referential check — a same-request existence / shape
+/// check on the record being corrected, run *after* the submitted
+/// record's own PDP authorization already succeeded, so not a
+/// caller-scoped read of a chosen row — reached once per path:
 ///
-/// * [`resolve_l1_lookups`] / [`Service::create_usage_record_inner`]'s
-///   `corrects_id` L1 referential lookup — a same-request existence /
-///   shape check on the record being corrected, run *after* the
-///   submitted record's own PDP authorization already succeeded. It is
-///   not a caller-scoped read of a chosen row.
-/// * [`Service::deactivate_usage_record`]'s attribution prefetch — still
-///   authorized afterward via the unchanged per-record
-///   [`authz::authorize_usage_record`] tuple check (a later slice owns
-///   threading a compiled scope through deactivation).
+/// * [`resolve_l1_lookups`], for the batch create path.
+/// * [`Service::create_usage_record_inner`], for the single-record one.
 ///
-/// Passing `true` at these two call sites asks the plugin for exactly the
-/// "no SPI-level narrowing" behaviour they had before this SPI grew a
-/// `scope` parameter — a deliberate, honest "not this surface's scope to
-/// give," not a shortcut around the point lookup's guarantee.
+/// Passing `true` at both asks the plugin for exactly the "no SPI-level
+/// narrowing" behaviour they had before this SPI grew a `scope`
+/// parameter — a deliberate, honest "not this surface's scope to give,"
+/// not a shortcut around the point lookup's guarantee.
 fn unrestricted_read_filter() -> ast::Expr {
     ast::Expr::Value(ast::Value::Bool(true))
 }
 
-/// Collapse a PDP denial into `NotFound` so the by-id surfaces (`get` /
-/// `deactivate`) never act as an existence oracle; every other error
-/// (notably `ServiceUnavailable`, which leaks nothing) is preserved.
+/// Collapse a PDP denial into `NotFound` so the by-id point lookup
+/// (`get`) never acts as an existence oracle; every other error (notably
+/// `ServiceUnavailable`, which leaks nothing) is preserved. That lookup
+/// is the gear's only by-id surface — a withdrawal is an ordinary
+/// ingested entry on the create path, not a second lookup-then-mutate
+/// operation — so this has one caller.
 fn collapse_deny_to_not_found(
     err: impl Into<UsageCollectorError>,
     id: Uuid,
@@ -580,7 +559,8 @@ pub struct Service {
     // @cpt-dod:cpt-cf-usage-collector-dod-foundation-component-plugin-host:p2
     selector: GtsPluginSelector,
 
-    /// PEP boundary. The PDP is a hard dependency per ADR-0001; the host
+    /// PEP boundary. The PDP is a hard dependency per
+    /// `cpt-cf-usage-collector-adr-pdp-centric-authorization`; the host
     /// fails init if no resolver client is registered, so this field is
     /// always populated at runtime.
     enforcer: PolicyEnforcer,
@@ -1364,202 +1344,6 @@ impl Service {
         // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-return
     }
 
-    /// Deactivate a previously-emitted `UsageRecord` by `uuid`.
-    ///
-    /// The handler first fetches the target row via Plugin SPI Method 10
-    /// `get_usage_record(id)` so PDP can authorize over the full attribution
-    /// tuple (`tenant_id`, `resource_ref`, optional `subject_ref`). It then
-    /// dispatches Plugin SPI Method 5 `deactivate_usage_record(id)` exactly
-    /// once; the plugin performs the atomic depth-1 cascade in one backend
-    /// transaction, and on `Ok(())` every affected row's `status` column is
-    /// now `inactive`.
-    ///
-    /// Existence-oracle guard: the pre-PDP fetch would otherwise let an
-    /// unauthorized caller tell "no such record" (`NotFound`) from "exists
-    /// but denied" (`PermissionDenied`). A PDP denial is therefore collapsed
-    /// into the same `NotFound` the missing-row path returns, so the two are
-    /// indistinguishable on this by-id surface.
-    ///
-    /// # Errors
-    ///
-    /// * [`UsageCollectorError::NotFound`] when the targeted record does not
-    ///   exist (raised by the pre-PDP fetch or a race where the row
-    ///   disappears before SPI Method 5 dispatch), or when the PDP denies
-    ///   (collapsed, see above).
-    /// * [`UsageCollectorError::ServiceUnavailable`] when the PDP is
-    ///   unavailable.
-    /// * Any other [`UsageCollectorError`] variant lifted from a plugin
-    ///   transport / persistence failure.
-    // @cpt-flow:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1
-    // @cpt-flow:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1
-    // @cpt-algo:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1
-    // @cpt-algo:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-component-deactivation-handler:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-nfr-availability:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-principle-fail-closed:p2
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-entity-usage-record:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-entity-security-context:p1
-    pub async fn deactivate_usage_record(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<(), UsageCollectorError> {
-        // Deactivation telemetry is stage-aware: the PDP-deny response is
-        // existence-oracle-collapsed to `NotFound`, but the metric records the
-        // TRUE `(denied, authz)` outcome (labels are operator-facing, never on
-        // the caller surface), and a PDP-transport failure at the authorize
-        // stage is `(error, authz)` — distinct from a plugin-fault
-        // `(error, plugin_error)`. `uc_deactivation_duration_seconds` spans the
-        // whole attempt from this entry to the terminal branch.
-        // @cpt-algo:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2
-        let start = std::time::Instant::now();
-
-        // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-resolve-plugin
-        let plugin = match self.resolve_plugin_for(PluginOp::GetUsageRecord).await {
-            Ok(plugin) => plugin,
-            Err(e) => {
-                return self.finish_deactivation(
-                    start,
-                    RequestOutcome::Error,
-                    DeactivationErrorCategory::PluginError,
-                    Err(UsageCollectorError::from(e)),
-                );
-            }
-        };
-        // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-resolve-plugin
-
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-prefetch
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-prefetch-not-found
-        let record = match instrument_spi(
-            self.metrics.as_ref(),
-            PluginOp::GetUsageRecord,
-            plugin.get_usage_record(id, &unrestricted_read_filter()),
-        )
-        .await
-        {
-            Ok(record) => record,
-            Err(e @ UsageCollectorPluginError::UsageRecordNotFound { .. }) => {
-                return self.finish_deactivation(
-                    start,
-                    RequestOutcome::Error,
-                    DeactivationErrorCategory::NotFound,
-                    Err(UsageCollectorError::from(DomainError::from(e))),
-                );
-            }
-            Err(e) => {
-                return self.finish_deactivation(
-                    start,
-                    RequestOutcome::Error,
-                    DeactivationErrorCategory::PluginError,
-                    Err(UsageCollectorError::from(DomainError::from(e))),
-                );
-            }
-        };
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-prefetch-not-found
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-prefetch
-
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-pdp
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-pdp-deny
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-pdp-unavailable
-        if let Err(e) = authz::authorize_usage_record(
-            &self.enforcer,
-            self.metrics.as_ref(),
-            PdpOp::Deactivate,
-            ctx,
-            &record,
-            usage_record::actions::DEACTIVATE,
-        )
-        .await
-        {
-            // A PDP deny records `(denied, authz)` even though the response is
-            // collapsed to `NotFound`; a PDP-transport failure is `(error, authz)`.
-            let outcome = if matches!(e, DomainError::AuthorizationDenied { .. }) {
-                RequestOutcome::Denied
-            } else {
-                RequestOutcome::Error
-            };
-            return self.finish_deactivation(
-                start,
-                outcome,
-                DeactivationErrorCategory::Authz,
-                Err(collapse_deny_to_not_found(e, id)),
-            );
-        }
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-pdp-unavailable
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-pdp-deny
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-pdp
-
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-dispatch
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-receive-id
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-spi-call
-        // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-spi-call
-        // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-await
-        // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-return-outcome
-        // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-catch
-        // @cpt-begin:cpt-cf-usage-collector-state-event-deactivation-record-lifecycle:p1:inst-state-active-to-inactive
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-outcome-map
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-already-inactive
-        match instrument_spi(
-            self.metrics.as_ref(),
-            PluginOp::DeactivateUsageRecord,
-            plugin.deactivate_usage_record(id),
-        )
-        .await
-        {
-            Ok(()) => self.finish_deactivation(
-                start,
-                RequestOutcome::Success,
-                DeactivationErrorCategory::None,
-                Ok(()),
-            ),
-            Err(e) => {
-                // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-propagate-error
-                let error_category = classify_deactivation_plugin_error(&e);
-                self.finish_deactivation(
-                    start,
-                    RequestOutcome::Error,
-                    error_category,
-                    Err(UsageCollectorError::from(DomainError::from(e))),
-                )
-                // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-propagate-error
-            }
-        }
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-already-inactive
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-outcome-map
-        // @cpt-end:cpt-cf-usage-collector-state-event-deactivation-record-lifecycle:p1:inst-state-active-to-inactive
-        // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-catch
-        // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-return-outcome
-        // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-await
-        // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-monotonic-transition-dispatch:p1:inst-algo-dispatch-spi-call
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-spi-call
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-receive-id
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-dispatch
-    }
-
-    /// Record the deactivation telemetry pair
-    /// (`uc_deactivation_requests_total` + `uc_deactivation_duration_seconds`)
-    /// for a completed attempt and return the caller-facing result unchanged.
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2:inst-algo-telemetry-outcome-counter
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2:inst-algo-telemetry-duration-observe
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2:inst-algo-telemetry-return
-    fn finish_deactivation(
-        &self,
-        start: std::time::Instant,
-        outcome: RequestOutcome,
-        error_category: DeactivationErrorCategory,
-        result: Result<(), UsageCollectorError>,
-    ) -> Result<(), UsageCollectorError> {
-        self.metrics.record_deactivation_request(
-            outcome,
-            error_category,
-            start.elapsed().as_secs_f64(),
-        );
-        result
-    }
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2:inst-algo-telemetry-return
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2:inst-algo-telemetry-duration-observe
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-attempt-telemetry:p2:inst-algo-telemetry-outcome-counter
-
     /// Read a single `UsageRecord` by `uuid` from the bound storage plugin,
     /// scoped to the caller's compiled PDP grant.
     ///
@@ -1574,7 +1358,7 @@ impl Service {
     /// `UsageRecordNotFound` exactly as it would for an `id` that doesn't
     /// exist at all, so this surface cannot be used as an existence oracle.
     /// A PDP deny is additionally collapsed into that same `NotFound`
-    /// (mirrors `deactivate_usage_record`) so a caller denied outright
+    /// (see [`collapse_deny_to_not_found`]) so a caller denied outright
     /// can't distinguish "denied" from "no matching row" either.
     ///
     /// # Errors

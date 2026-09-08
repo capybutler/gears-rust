@@ -10,10 +10,9 @@ use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
 use crate::domain::ports::metrics::{
-    AuthzDecision, DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome,
-    PdpFailureCause, PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind,
-    RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome, TypeResolutionOutcome,
-    UsageCollectorMetrics,
+    AuthzDecision, IngestRequestErrorCategory, IngestRequestOutcome, PdpFailureCause, PdpOp,
+    PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory, RecordKind,
+    RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics,
 };
 use crate::infra::metrics::{UcMetricsMeter, build_default_adapter};
 
@@ -270,7 +269,7 @@ fn plugin_ready_gauge_reflects_structural_fact() {
 fn prefix_is_substituted_into_every_name() {
     let (provider, exporter) = local_provider();
     let m = meter(&provider, "acme");
-    m.record_pdp_decision(PdpOp::Deactivate, AuthzDecision::Permit, 0.01);
+    m.record_pdp_decision(PdpOp::GetRecord, AuthzDecision::Permit, 0.01);
     provider.force_flush().unwrap();
 
     assert_eq!(counter_sum(&exporter, "acme_authz_decisions_total"), 1);
@@ -422,36 +421,6 @@ fn query_instruments_render_names_labels_and_buckets() {
             "uc_query_requests_total",
             "query_kind",
             "aggregated"
-        ),
-        1,
-    );
-}
-
-// ── Phase 2: deactivation-handler instruments ────────────────────────
-
-#[test]
-fn deactivation_instruments_render_names_and_labels() {
-    let (provider, exporter) = local_provider();
-    let m = meter(&provider, TEST_PREFIX);
-
-    m.record_deactivation_request(
-        RequestOutcome::Denied,
-        DeactivationErrorCategory::Authz,
-        0.02,
-    );
-    provider.force_flush().unwrap();
-
-    assert_eq!(
-        histogram_count(&exporter, "uc_deactivation_duration_seconds"),
-        1
-    );
-    assert_eq!(counter_sum(&exporter, "uc_deactivation_requests_total"), 1);
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_deactivation_requests_total",
-            "outcome",
-            "denied"
         ),
         1,
     );

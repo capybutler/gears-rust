@@ -20,10 +20,9 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 
 use crate::domain::ports::metrics::{
-    AuthzDecision, DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome,
-    PdpFailureCause, PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind,
-    RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome, TypeResolutionOutcome,
-    UsageCollectorMetrics, key,
+    AuthzDecision, IngestRequestErrorCategory, IngestRequestOutcome, PdpFailureCause, PdpOp,
+    PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory, RecordKind,
+    RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics, key,
 };
 
 /// Bucket boundaries (seconds) for `uc_pdp_duration_seconds` — brackets the
@@ -36,9 +35,8 @@ const PDP_DURATION_BUCKETS_SECONDS: [f64; 9] =
 const PLUGIN_CALL_DURATION_BUCKETS_SECONDS: [f64; 10] =
     [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0];
 
-/// Buckets (seconds) for `uc_ingestion_duration_seconds` and
-/// `uc_deactivation_duration_seconds` — bracket the 200 ms ingestion p95
-/// budget; deactivation mirrors the ingestion write path (DESIGN §3.11.5).
+/// Buckets (seconds) for `uc_ingestion_duration_seconds` — bracket the
+/// 200 ms ingestion p95 budget (DESIGN §3.11.5).
 const INGESTION_DURATION_BUCKETS_SECONDS: [f64; 9] =
     [0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0];
 
@@ -60,7 +58,7 @@ const QUERY_RESULT_ROWS_BUCKETS: [f64; 8] =
 
 /// The full OpenTelemetry instrument set: the foundation-owned plugin-host +
 /// PDP-helper instruments (Phase 1) plus the per-component gateway
-/// instruments for ingestion, query, and deactivation (Phase 2), plus the
+/// instruments for ingestion and query (Phase 2), plus the
 /// Type Resolver instrument that replaced the deleted usage-type catalog
 /// counters.
 pub struct UcMetricsMeter {
@@ -87,10 +85,6 @@ pub struct UcMetricsMeter {
     query_duration_seconds: Histogram<f64>,
     query_inflight: opentelemetry::metrics::UpDownCounter<i64>,
     query_result_rows: Histogram<f64>,
-
-    // ── Deactivation handler (§2.5 event-deactivation) ──
-    deactivation_requests: Counter<u64>,
-    deactivation_duration_seconds: Histogram<f64>,
 
     // ── Type Resolver (§2.2 usage-type-lifecycle successor) ──
     type_resolution: Counter<u64>,
@@ -199,18 +193,6 @@ impl UcMetricsMeter {
                 .f64_histogram(format!("{prefix}_query_result_rows"))
                 .with_description("Rows/groups returned per successful query by query_kind")
                 .with_boundaries(QUERY_RESULT_ROWS_BUCKETS.to_vec())
-                .build(),
-
-            // ── Deactivation handler ──
-            // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-nfr-operational-visibility:p2
-            deactivation_requests: meter
-                .u64_counter(format!("{prefix}_deactivation_requests_total"))
-                .with_description("Completed deactivation attempts by outcome and error_category")
-                .build(),
-            deactivation_duration_seconds: meter
-                .f64_histogram(format!("{prefix}_deactivation_duration_seconds"))
-                .with_description("Deactivation request wall-clock")
-                .with_boundaries(INGESTION_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
 
             // ── Type Resolver ──
@@ -354,24 +336,6 @@ impl UsageCollectorMetrics for UcMetricsMeter {
             1,
             &[
                 KeyValue::new(key::QUERY_KIND, kind.as_str()),
-                KeyValue::new(key::OUTCOME, outcome.as_str()),
-                KeyValue::new(key::ERROR_CATEGORY, error_category.as_str()),
-            ],
-        );
-    }
-
-    // ── Deactivation handler ──
-
-    fn record_deactivation_request(
-        &self,
-        outcome: RequestOutcome,
-        error_category: DeactivationErrorCategory,
-        seconds: f64,
-    ) {
-        self.deactivation_duration_seconds.record(seconds, &[]);
-        self.deactivation_requests.add(
-            1,
-            &[
                 KeyValue::new(key::OUTCOME, outcome.as_str()),
                 KeyValue::new(key::ERROR_CATEGORY, error_category.as_str()),
             ],

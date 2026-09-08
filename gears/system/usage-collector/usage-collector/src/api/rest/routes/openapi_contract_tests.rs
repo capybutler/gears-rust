@@ -181,9 +181,10 @@ fn harness_sees_the_whole_rest_surface() {
 
     assert_eq!(
         registry_ops(&reg).len(),
-        5,
-        "expected 5 registered operations (usage-record ingestion only; \
-         the usage-type catalog registrar is gone)",
+        4,
+        "expected 4 registered operations (create, list, get, aggregate); \
+         a withdrawal travels the ordinary ingestion path, so there is no \
+         dedicated correction endpoint",
     );
     assert_eq!(yaml_ops(&doc).len(), 7, "expected 7 documented operations");
 }
@@ -243,7 +244,7 @@ fn registry_keys_match_the_generated_document() {
 #[ignore = "Phase 2 documentation landed ahead of its implementation: \
            usage-collector-v1.yaml describes the target contract (adds \
            /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
+           {gts_type_id}, drops the whole usage-type surface) while the \
            routes still register the Phase 1 surface. Re-enable as Phase 2 \
            implementation lands."]
 fn operation_identity_matches() {
@@ -440,7 +441,7 @@ fn registry_params(spec: &OperationSpec) -> BTreeSet<ParamTriple> {
 #[ignore = "Phase 2 documentation landed ahead of its implementation: \
            usage-collector-v1.yaml describes the target contract (adds \
            /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
+           {gts_type_id}, drops the whole usage-type surface) while the \
            routes still register the Phase 1 surface. Re-enable as Phase 2 \
            implementation lands."]
 fn parameters_match() {
@@ -638,7 +639,7 @@ fn registry_success_responses(key: &str, spec: &OperationSpec) -> BTreeSet<Respo
 #[ignore = "Phase 2 documentation landed ahead of its implementation: \
            usage-collector-v1.yaml describes the target contract (adds \
            /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
+           {gts_type_id}, drops the whole usage-type surface) while the \
            routes still register the Phase 1 surface. Re-enable as Phase 2 \
            implementation lands."]
 fn body_schemas_match() {
@@ -791,7 +792,7 @@ fn missing_standard_errors(expected: &BTreeSet<u16>, spec: &OperationSpec) -> Ve
 #[ignore = "Phase 2 documentation landed ahead of its implementation: \
            usage-collector-v1.yaml describes the target contract (adds \
            /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
+           {gts_type_id}, drops the whole usage-type surface) while the \
            routes still register the Phase 1 surface. Re-enable as Phase 2 \
            implementation lands."]
 fn every_operation_declares_the_standard_error_set() {
@@ -915,7 +916,7 @@ fn yaml_operation_authenticated(doc: &Value, key: &str, op: &Value) -> bool {
 #[ignore = "Phase 2 documentation landed ahead of its implementation: \
            usage-collector-v1.yaml describes the target contract (adds \
            /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
+           {gts_type_id}, drops the whole usage-type surface) while the \
            routes still register the Phase 1 surface. Re-enable as Phase 2 \
            implementation lands."]
 fn every_registered_component_is_documented() {
@@ -957,7 +958,7 @@ fn every_registered_component_is_documented() {
 #[ignore = "Phase 2 documentation landed ahead of its implementation: \
            usage-collector-v1.yaml describes the target contract (adds \
            /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
+           {gts_type_id}, drops the whole usage-type surface) while the \
            routes still register the Phase 1 surface. Re-enable as Phase 2 \
            implementation lands."]
 fn security_matches_authenticated_routes() {

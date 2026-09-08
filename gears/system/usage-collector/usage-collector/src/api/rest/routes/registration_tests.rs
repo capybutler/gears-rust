@@ -137,10 +137,6 @@ fn exactly_the_usage_record_routes_are_registered() {
             "GET".to_owned(),
             "/usage-collector/v1/records/{id}".to_owned(),
         ),
-        (
-            "POST".to_owned(),
-            "/usage-collector/v1/records/{id}/deactivate".to_owned(),
-        ),
     ];
     expected.sort();
 

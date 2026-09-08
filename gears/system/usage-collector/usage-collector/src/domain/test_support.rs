@@ -68,7 +68,7 @@ pub(crate) fn test_time_range() -> TimeRange {
 
 /// Minimal mock storage-plugin client.
 ///
-/// The `UsageCollectorPluginV1` SPI surface carries six methods. The mock
+/// The `UsageCollectorPluginV1` SPI surface carries five methods. The mock
 /// here exists purely so the Plugin Host can resolve a concrete
 /// `Arc<dyn UsageCollectorPluginV1>` from `ClientHub` and so cache tests can
 /// assert `Arc::ptr_eq` on the resolved handle. Every method returns a
@@ -129,12 +129,6 @@ impl UsageCollectorPluginV1 for MockPlugin {
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::internal(
             "test_fake: MockPlugin::list_usage_records not implemented",
-        ))
-    }
-
-    async fn deactivate_usage_record(&self, _id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::internal(
-            "test_fake: MockPlugin::deactivate_usage_record not implemented",
         ))
     }
 
@@ -1070,7 +1064,6 @@ pub type CreateRecordsBatchResult = Vec<Result<UsageRecord, UsageCollectorPlugin
 pub struct HappyPathPlugin {
     create_record_response: Mutex<Option<Result<UsageRecord, UsageCollectorPluginError>>>,
     create_records_response: Mutex<Option<CreateRecordsBatchResult>>,
-    deactivate_response: Mutex<Option<()>>,
     get_record_response: Mutex<Option<UsageRecord>>,
     list_usage_records_response: Mutex<Option<ODataPage<UsageRecord>>>,
     query_aggregated_usage_records_response: Mutex<Option<AggregationResult>>,
@@ -1082,7 +1075,6 @@ pub struct HappyPathPlugin {
 
     create_record_input: Mutex<Option<UsageRecord>>,
     create_records_input: Mutex<Option<Vec<UsageRecord>>>,
-    deactivate_input: Mutex<Option<Uuid>>,
     /// Every record `id` ever passed to `get_usage_record`, in call
     /// order. Drives the L1-corrects-id dedup tests.
     get_usage_record_inputs: Mutex<Vec<Uuid>>,
@@ -1128,14 +1120,12 @@ impl HappyPathPlugin {
         Arc::new(Self {
             create_record_response: Mutex::new(None),
             create_records_response: Mutex::new(None),
-            deactivate_response: Mutex::new(None),
             get_record_response: Mutex::new(None),
             list_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_response: Mutex::new(None),
             query_aggregated_usage_records_folds: Mutex::new(Vec::new()),
             create_record_input: Mutex::new(None),
             create_records_input: Mutex::new(None),
-            deactivate_input: Mutex::new(None),
             get_usage_record_inputs: Mutex::new(Vec::new()),
             get_usage_record_not_found: Mutex::new(std::collections::BTreeSet::new()),
             last_get_scope: Mutex::new(None),
@@ -1158,9 +1148,6 @@ impl HappyPathPlugin {
     }
     pub fn set_create_records(&self, results: CreateRecordsBatchResult) {
         *self.create_records_response.lock().expect("mutex") = Some(results);
-    }
-    pub fn set_deactivate_ok(&self) {
-        *self.deactivate_response.lock().expect("mutex") = Some(());
     }
     pub fn set_get_record(&self, record: UsageRecord) {
         *self.get_record_response.lock().expect("mutex") = Some(record);
@@ -1259,9 +1246,6 @@ impl HappyPathPlugin {
     pub fn last_create_records_input(&self) -> Option<Vec<UsageRecord>> {
         self.create_records_input.lock().expect("mutex").clone()
     }
-    pub fn last_deactivate_input(&self) -> Option<Uuid> {
-        *self.deactivate_input.lock().expect("mutex")
-    }
 }
 
 fn not_programmed(method: &'static str) -> UsageCollectorPluginError {
@@ -1339,14 +1323,6 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
             .expect("mutex")
             .clone()
             .ok_or_else(|| not_programmed("list_usage_records"))
-    }
-
-    async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        *self.deactivate_input.lock().expect("mutex") = Some(id);
-        self.deactivate_response
-            .lock()
-            .expect("mutex")
-            .ok_or_else(|| not_programmed("deactivate_usage_record"))
     }
 
     async fn get_usage_record(

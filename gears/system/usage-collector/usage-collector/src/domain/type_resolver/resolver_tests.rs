@@ -91,13 +91,6 @@ impl UsageCollectorMetrics for RecordingMetrics {
         _: f64,
     ) {
     }
-    fn record_deactivation_request(
-        &self,
-        _: crate::domain::ports::metrics::RequestOutcome,
-        _: crate::domain::ports::metrics::DeactivationErrorCategory,
-        _: f64,
-    ) {
-    }
     fn record_type_resolution(&self, outcome: TypeResolutionOutcome) {
         let counter = match outcome {
             TypeResolutionOutcome::CacheHit => &self.cache_hit,

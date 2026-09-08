@@ -285,8 +285,6 @@ impl From<UsageCollectorPluginError> for DomainError {
     fn from(e: UsageCollectorPluginError) -> Self {
         debug_assert!(is_plugin_error_exhaustive_today(&e));
         match e {
-            // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-catch
-            // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-fail
             UsageCollectorPluginError::Transient {
                 detail,
                 retry_after_seconds,
@@ -295,8 +293,6 @@ impl From<UsageCollectorPluginError> for DomainError {
                 retry_after_seconds,
             },
             UsageCollectorPluginError::Internal(detail) => Self::Internal(detail),
-            // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-fail
-            // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-catch
             UsageCollectorPluginError::IdempotencyConflict {
                 idempotency_key,
                 existing_id,

@@ -1,9 +1,9 @@
 //! REST handlers for the foundation `/usage-collector/v1/records`
-//! create + deactivation surface. Each handler is a thin pass-through:
-//! it pulls the gateway-resolved `SecurityContext`, dispatches to the
-//! domain [`Service`], and lifts `UsageCollectorError` through the
-//! host-owned canonical mapping. PDP authorization runs inside each
-//! `Service` create / deactivation method.
+//! create + read surface. Each handler is a thin pass-through: it pulls
+//! the gateway-resolved `SecurityContext`, dispatches to the domain
+//! [`Service`], and lifts `UsageCollectorError` through the host-owned
+//! canonical mapping. PDP authorization runs inside the `Service`
+//! method each handler dispatches to.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -788,41 +788,6 @@ fn require_single_value<'a>(
     Ok(value)
 }
 
-/// `POST /usage-collector/v1/records/{uuid}/deactivate`
-///
-/// Deactivate a previously-emitted record by `uuid`. On success the
-/// targeted row and any active referencing compensation rows have been
-/// flipped from `active` to `inactive` inside a single backend
-/// transaction; the response is HTTP 204 No Content. A malformed `uuid`
-/// path segment surfaces as the canonical `InvalidArgument` problem; a
-/// missing record surfaces as the canonical `NotFound` problem; a Plugin
-/// SPI transport / readiness / persistence fault surfaces as the
-/// canonical `ServiceUnavailable` problem.
-pub async fn handle_deactivate_usage_record(
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-receive-ctx
-    // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-missing-ctx
-    Extension(ctx): Extension<SecurityContext>,
-    // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-missing-ctx
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-receive-ctx
-    Extension(service): Extension<Arc<Service>>,
-    Path(uuid_raw): Path<String>,
-) -> ApiResult<impl IntoResponse> {
-    let id = parse_record_id(&uuid_raw)?;
-    // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-fail
-    // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-fail-propagate
-    service
-        .deactivate_usage_record(&ctx, id)
-        .await
-        .map_err(usage_collector_error_to_canonical)?;
-    // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-fail-propagate
-    // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-fail
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-atomic-outcome-mapping:p1:inst-algo-outcome-transitioned
-    // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-success
-    Ok(StatusCode::NO_CONTENT)
-    // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-success
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-atomic-outcome-mapping:p1:inst-algo-outcome-transitioned
-}
-
 /// Convert one per-record submission into the identity-free domain create
 /// input, lifting `gts_type_id`-, attribution-, `idempotency_key`-, and
 /// metadata-shape failures into per-record `Problem` envelopes. The covered
@@ -903,11 +868,10 @@ fn per_record_outcome(
 }
 // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-return
 
-/// Parse the URL path `{uuid}` segment shared by the GET single-record and
-/// deactivate handlers. A malformed input surfaces as the canonical
-/// `InvalidArgument` `Problem` with a field violation on `id`; this error
-/// shape is host-private (it cannot originate inside the transport-agnostic
-/// SDK).
+/// Parse the URL path `{uuid}` segment the GET single-record handler
+/// takes. A malformed input surfaces as the canonical `InvalidArgument`
+/// `Problem` with a field violation on `id`; this error shape is
+/// host-private (it cannot originate inside the transport-agnostic SDK).
 ///
 fn parse_record_id(uuid_raw: &str) -> Result<Uuid, CanonicalError> {
     Uuid::parse_str(uuid_raw).map_err(|_| {
