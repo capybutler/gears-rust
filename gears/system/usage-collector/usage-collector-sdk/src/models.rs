@@ -989,10 +989,13 @@ impl CreateUsageRecord {
     /// deserialization shadow, while a REST body reaches the host as a DTO
     /// carrying the pair flat — as the served schema declares it — and is
     /// refused where that DTO is folded into this type. The shadow is not
-    /// the only guard, and it is not the one a REST caller meets. The rules an
-    /// invalidation must satisfy against its *target* — that the target
-    /// resolves, is itself a record, and is copied faithfully — need a
-    /// lookup and belong to the ingestion gateway.
+    /// the only guard, and it is not the one a REST caller meets. Three of the
+    /// rules an invalidation must satisfy against its *target* — that the
+    /// target resolves, is itself a record, and is copied faithfully — need a
+    /// lookup and belong to the ingestion gateway. The fourth does not: at
+    /// most one invalidation per record is the **store's**, because only the
+    /// store can make that check atomic with the entry it admits
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
     ///
     /// # Errors
     ///

@@ -26,6 +26,24 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     ///
     /// An exact-equality retry under the same idempotency key returns
     /// the previously persisted row.
+    ///
+    /// **At most one invalidation per record, and this is the only place it
+    /// can be enforced.** Where the entry carries an
+    /// [`UsageRecord::invalidation`], the store MUST reject it if the record
+    /// it names already has an accepted invalidation, and MUST make that
+    /// check atomic with the entry it admits — one backend transaction, not
+    /// a read followed by a write. Report the rejection as
+    /// [`UsageCollectorPluginError::AlreadyInvalidated`], naming the
+    /// invalidation already in place.
+    ///
+    /// The gateway does not pre-read for this and will not: a gateway-side
+    /// check cannot exclude a concurrent second submission, so it would fail
+    /// exactly when it matters
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). Nothing
+    /// upstream of this method enforces the rule, which is why an
+    /// implementation that omits it is not merely permissive — it admits two
+    /// withdrawals of one measurement, and the fold then excludes a pair that
+    /// has three entries in it.
     async fn create_usage_record(
         &self,
         record: UsageRecord,
@@ -34,6 +52,12 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// Persist a batch of usage records.
     ///
     /// Per-record outcomes are aligned with the input order.
+    ///
+    /// The at-most-one obligation on [`Self::create_usage_record`] applies to
+    /// every entry here, and a batch is where it is easiest to get wrong: two
+    /// withdrawals of one record can arrive in the same call, so admitting
+    /// them one at a time against the state each read is not enough. Exactly
+    /// one may be accepted.
     async fn create_usage_records(
         &self,
         records: Vec<UsageRecord>,

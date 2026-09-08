@@ -9,9 +9,11 @@ spec owner's call, not the implementer's.
 **Entries 1-5** came out of slice 3, the time-model slice
 (`usage-collector/implementation-change`, 23 commits ending `74e3d4429`).
 **Entries 6-11** came out of slice 4, the append-only correction-model slice
-(seven commits ending `531227f45`, plus the sweep commit that added them).
+(the ten commits ending `9e36bbf6b`; entries 6-11 were added by the sweep
+commit `4c7d338a1`, the file itself was first committed in `46274f6ba`, and the
+corrections its own review found landed after that).
 
-In **eight of the eleven the code is the correct side** and the document is
+In **nine of the eleven the code is the correct side** and the document is
 imprecise or stale. Three are not that shape, and saying so matters more than a
 tidy summary:
 
@@ -22,8 +24,10 @@ tidy summary:
   contract's shape and the contract does not describe the gear's; closing it is
   a spec decision plus a scheduled slice, and the entry says so rather than
   picking a winner.
-- **Entry 9(c)** — `origin` is unemitted because the slice that builds it has
-  not run. Unbuilt scope, not a document defect.
+- **Entry 9(c)** — a *sub-item*, not an entry: `origin` is unemitted because
+  the slice that builds it has not run. Unbuilt scope, not a document defect.
+  Entry 9's own body is right on (a) and (b), which is why the entry counts
+  among the nine.
 
 **Seven** are load-bearing rather than cosmetic, and each is marked below. The
 sharpest is entry 10: a client generated from the published contract cannot
@@ -164,6 +168,14 @@ Three problems:
   `classify_query_result` maps it to `QueryErrorCategory::FilterMismatch`.
 - **`undeclared_field` is never emitted** by any path. Pre-existing.
 
+**And the same row carries entry 9's defect, which this entry originally
+missed.** `uc_query_requests_total` lists `unresolved_type` while
+`QueryErrorCategory::as_str` emits **`unknown_usage_type`** — the identical
+document-versus-code mismatch entry 9 records for the sibling instrument, on the
+row directly above it. `order_mismatch` is also emitted-capable and absent from
+the documented set. A spec owner acting on this entry as first written would fix
+the ingestion row and leave two dead labels on the query one.
+
 **Load-bearing.** An operator can build an alert on a label that will never
 fire, and will not see the one condition this slice made reachable.
 
@@ -228,7 +240,14 @@ and a client cannot tell "you withdrew the wrong thing" from "your period
 bounds are bad" without one. Collapsing the four back into `VALIDATION` would
 make the ADR's rule unobservable at the boundary that enforces it.
 
-**Load-bearing.** A client writing a typed matcher on `context.reason` has
+**Three of the four ride a different wire slot from the fourth**, and a spec
+owner enumerating them must not put them in one place. `ALREADY_INVALIDATED` is
+a `409 Aborted` and rides `context.reason`, alongside `IDEMPOTENCY_CONFLICT`.
+`INVALIDATION_REFERENCE_INCOMPLETE`, `INVALIDATION_TARGET_NOT_RECORD` and
+`INVALIDATION_FIELD_MISMATCH` are `400`s and ride `field_violations[0].reason`,
+alongside `VALIDATION` — see `usage-collector/src/infra/sdk_error_mapping.rs`.
+
+**Load-bearing.** A client writing a typed matcher has
 nothing in the published contract to match against; it must read the source.
 
 **Proposed wording:** enumerate the four alongside `IDEMPOTENCY_CONFLICT` and
@@ -349,7 +368,7 @@ it from an ordinary `usage_record_not_found`, and a plugin's own
 label by substring match on a caller-facing string and leaves it on
 `semantics_violation`, with the reasoning in the code.
 
-**(b) Three of the seven listed label values are not the values emitted.**
+**(b) Two of the seven listed label values are never emitted, and three emitted values are absent from the list.**
 `RecordErrorCategory::as_str` emits `none`, `authz`, `unknown_usage_type`,
 `semantics_violation`, `invalidation_rule`, `metadata_size`,
 `idempotency_conflict`, `plugin_error` — eight values. So `unresolved_type` and
@@ -476,6 +495,55 @@ attribute plugin-only rules to the plugin alone.
 
 ---
 
+## Not divergences — two things this branch owes someone else
+
+Neither is a spec-owner decision, so neither is numbered above. Both were found
+by the slice's final review, after eight per-task review rounds had missed them,
+and both reach someone outside this branch.
+
+### A. `docs/api/api.json` is stale, and it will fail CI
+
+The generated aggregate contract still advertises
+`POST /usage-collector/v1/records/{id}/deactivate`, both `/usage-types` routes,
+and `status` / `corrects_id` / `created_at` / `gts_id` on the DTOs. It is
+**byte-identical to `main`**, so this is pre-existing debt from slices 1-3 plus
+this slice — but it was recorded nowhere until now.
+
+Two consequences. `.github/workflows/api_contracts.yml` triggers on `**/*.rs`,
+runs `make openapi`, and fails Phase 1 on any diff; this branch changes hundreds
+of `.rs` files, so **it will go red**. Phase 2's `oasdiff` will then flag the
+route and field removals as breaking and require the `breaking-api-acknowledged`
+label — correctly, since routes and fields really are gone.
+
+It is also **the last artifact anywhere on this branch that tells a consumer a
+persisted entry can be mutated.** In code the append-only invariant is total
+(verified against the SDK trait, the SPI, the four registered routes, every
+service dispatch, and the absence of any `&mut UsageRecord`); the published
+contract is the one place still saying otherwise.
+
+The fix is `make openapi` plus a commit, and it was left undone deliberately: it
+needs a build of the example server and a decision about the breaking-change
+label, both of which belong to whoever opens the PR. Slice 6's re-enabled drift
+tests will **not** catch it — they compare the registry against
+`usage-collector-v1.yaml`, a different document.
+
+### B. `uc_ingestion_records_total` renamed a label, and no trailer says so
+
+Commit `6e72ef233` changed the label key `record_kind` → `entry_type` and the
+value `compensation` → `invalidation`. It carries no `!` and no
+`BREAKING CHANGE:` trailer, under a subject that reads as a feature addition.
+
+This is worse for an operator than a deleted series. A deleted series goes
+visibly flat; a renamed label leaves every existing `sum by (record_kind)`
+silently collapsing into an absent-label bucket while the metric keeps
+reporting. The sibling commit `547915dc1` trailered exactly that *lesser* case
+for the two deleted deactivation instruments.
+
+Whoever writes release notes and whoever owns the ingestion dashboards both need
+this, and `git log --format=%s` plus trailers will not give it to them. It was
+recorded here rather than fixed because amending the message means rewriting four
+commits.
+
 ## Evidence
 
 Two dated lines, not one. The slice-3 line is what makes entries 1-5
@@ -511,6 +579,13 @@ put those documents in their current state, and `main` has not caught up:
 different blob hashes for it, `DESIGN.md` and `DECOMPOSITION.md` alike. So do
 not expect these line numbers, or in places these sentences, to resolve against
 `main`.
+
+**Re-verified at the branch head** after the sweep's own review found four
+accuracy defects in this file and one gap in the SPI: **648 passed, 6 skipped**,
+`cargo check --workspace --all-targets` and `cargo clippy --workspace
+--all-targets --all-features` clean, `git diff --stat main --
+gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/` empty.
+The three commits after `531227f45` change no behaviour.
 
 Checked with `git rev-parse HEAD:<path>` against `git rev-parse main:<path>`
 rather than `git diff --quiet`, which reported the three files identical and was
