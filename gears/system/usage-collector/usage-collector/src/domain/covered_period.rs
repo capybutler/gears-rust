@@ -19,6 +19,25 @@
 use time::{Duration, OffsetDateTime};
 use usage_collector_sdk::{RecordOrigin, UsageCollectorError};
 
+/// Default future tolerance (5 minutes), the value DESIGN
+/// `cpt-cf-usage-collector-fr-live-future-time-bound` publishes.
+///
+/// The three constants below are `pub(crate)` for the same reason
+/// [`DEFAULT_METADATA_SIZE_CAP_BYTES`] is: the domain owns the number and
+/// `crate::config` anchors its own default on it, rather than each
+/// spelling the value and drifting.
+///
+/// [`DEFAULT_METADATA_SIZE_CAP_BYTES`]: crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES
+pub(crate) const DEFAULT_LIVE_FUTURE_TOLERANCE_SECS: u64 = 300;
+
+/// Default live past tolerance (48 hours). Covers emitter outage and retry
+/// lag; anything older is history and belongs on the backfill route.
+pub(crate) const DEFAULT_LIVE_PAST_TOLERANCE_SECS: u64 = 172_800;
+
+/// Default backfill window (90 days). Bounds the recomputation obligation a
+/// materialised aggregate carries.
+pub(crate) const DEFAULT_BACKFILL_WINDOW_SECS: u64 = 7_776_000;
+
 /// The three configured covered-period bounds.
 ///
 /// Projected from [`crate::config::UsageCollectorConfig`] — see
@@ -46,6 +65,33 @@ pub struct CoveredPeriodBounds {
     /// arrive as one projection of the configured block rather than in two
     /// instalments.
     pub backfill_window: Duration,
+}
+
+impl Default for CoveredPeriodBounds {
+    /// The published defaults, for a `Service` built without a configured
+    /// block — tests and pre-init contexts.
+    ///
+    /// `UsageCollectorConfig`'s own defaults are the same three constants,
+    /// so this agrees with `UsageCollectorConfig::default()
+    /// .covered_period_bounds()` by construction rather than by
+    /// coincidence. `config_tests` keeps the published numbers asserted on
+    /// the config side, which is what stops the pair drifting silently.
+    fn default() -> Self {
+        Self {
+            future_tolerance: Duration::seconds(seconds(DEFAULT_LIVE_FUTURE_TOLERANCE_SECS)),
+            live_past_tolerance: Duration::seconds(seconds(DEFAULT_LIVE_PAST_TOLERANCE_SECS)),
+            backfill_window: Duration::seconds(seconds(DEFAULT_BACKFILL_WINDOW_SECS)),
+        }
+    }
+}
+
+/// A configured bound's seconds as the `i64` [`Duration::seconds`] takes.
+///
+/// Saturates rather than panics, and `UsageCollectorConfig::validate`
+/// refuses at bootstrap any value that could saturate it — which is what
+/// makes `UsageCollectorConfig::covered_period_bounds` infallible.
+pub(crate) fn seconds(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
 /// Reject a covered period the ingestion path does not admit.

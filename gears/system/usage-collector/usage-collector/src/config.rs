@@ -130,9 +130,11 @@ impl Default for UsageCollectorConfig {
             type_cache_ttl_secs: 300,
             type_cache_capacity: 10_000,
             metadata_size_cap_bytes: crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
-            live_future_tolerance_secs: 300,
-            live_past_tolerance_secs: 172_800,
-            backfill_window_secs: 7_776_000,
+            live_future_tolerance_secs:
+                crate::domain::covered_period::DEFAULT_LIVE_FUTURE_TOLERANCE_SECS,
+            live_past_tolerance_secs:
+                crate::domain::covered_period::DEFAULT_LIVE_PAST_TOLERANCE_SECS,
+            backfill_window_secs: crate::domain::covered_period::DEFAULT_BACKFILL_WINDOW_SECS,
         }
     }
 }
@@ -214,16 +216,11 @@ impl UsageCollectorConfig {
     /// [`CoveredPeriodBounds`]: crate::domain::covered_period::CoveredPeriodBounds
     #[must_use]
     pub fn covered_period_bounds(&self) -> crate::domain::covered_period::CoveredPeriodBounds {
+        use crate::domain::covered_period::seconds;
         crate::domain::covered_period::CoveredPeriodBounds {
-            future_tolerance: time::Duration::seconds(
-                i64::try_from(self.live_future_tolerance_secs).unwrap_or(i64::MAX),
-            ),
-            live_past_tolerance: time::Duration::seconds(
-                i64::try_from(self.live_past_tolerance_secs).unwrap_or(i64::MAX),
-            ),
-            backfill_window: time::Duration::seconds(
-                i64::try_from(self.backfill_window_secs).unwrap_or(i64::MAX),
-            ),
+            future_tolerance: time::Duration::seconds(seconds(self.live_future_tolerance_secs)),
+            live_past_tolerance: time::Duration::seconds(seconds(self.live_past_tolerance_secs)),
+            backfill_window: time::Duration::seconds(seconds(self.backfill_window_secs)),
         }
     }
 

@@ -3276,8 +3276,16 @@ mod covered_period_bounds_tests {
     /// else: a month back, well beyond the 48-hour live past tolerance and
     /// equally well short of the boundary, so the outcome does not depend on
     /// how loaded the runner is.
+    ///
+    /// Offset from the memoised [`recent_window_end`] rather than from a
+    /// fresh `now_utc()`, so two submissions built by separate calls carry
+    /// the SAME period. A per-call clock read would land them microseconds
+    /// apart, and a withdrawal built that way is not the faithful copy of
+    /// its target it claims to be — it would be refused for
+    /// `InvalidationFieldMismatch` and the test below would pass on the
+    /// wrong rejection.
     fn stale_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
-        let window_end = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+        let window_end = recent_window_end() - time::Duration::days(30);
         CreateUsageRecord {
             window_start: window_end - time::Duration::hours(1),
             window_end,
@@ -3313,6 +3321,52 @@ mod covered_period_bounds_tests {
         assert!(
             detail.contains(BACKFILL_ROUTE_PATH),
             "the rejection MUST name the route the entry belongs on: {detail}",
+        );
+        assert_eq!(
+            plugin.last_create_record_input(),
+            None,
+            "a refused period MUST NOT reach the storage plugin",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_live_path_refuses_a_period_ending_beyond_the_future_tolerance() {
+        // The other side of the bound, and the only test that reaches the
+        // future tolerance THROUGH the Service — the unit tests build
+        // `CoveredPeriodBounds` by hand, so they never exercise the
+        // configured value's route from `[usage_collector]` to this call.
+        // Without this, a projection that fed `backfill_window` in as the
+        // future tolerance would ship green.
+        let plugin = HappyPathPlugin::new();
+        // `recent_window_end()` is an hour BEHIND now, so two hours on from
+        // it is an hour AHEAD — unambiguously outside a five-minute
+        // tolerance and nowhere near the boundary. Anchored on the memoised
+        // fixture rather than on a fresh clock read, for the reason
+        // `stale_record` documents.
+        let window_end = recent_window_end() + time::Duration::hours(2);
+        let submission = CreateUsageRecord {
+            window_start: window_end - time::Duration::hours(1),
+            window_end,
+            ..fresh_record(Uuid::from_u128(0xC5), "idem-future")
+        };
+        plugin.set_create_record(projected(&submission));
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.bounds.live_future.record.v1",
+        );
+
+        let err = service
+            .create_usage_record(&authenticated_ctx(), submission)
+            .await
+            .expect_err("a period ending an hour from now is beyond the 5-minute tolerance");
+
+        let (reason, detail) = invalid_argument(&err);
+        assert_eq!(*reason, ValidationReason::FutureWindow);
+        assert!(
+            !detail.contains(BACKFILL_ROUTE_PATH),
+            "the backfill route lifts the PAST bound only, so pointing a \
+             clock-skewed emitter at it would send a defect somewhere it is \
+             just as invalid: {detail}",
         );
         assert_eq!(
             plugin.last_create_record_input(),

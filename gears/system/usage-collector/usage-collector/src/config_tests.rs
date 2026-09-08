@@ -269,6 +269,49 @@ fn the_covered_period_bounds_survive_an_absent_table() {
 }
 
 #[test]
+fn the_bounds_project_onto_the_field_that_carries_each_key() {
+    // The projection is three same-typed `Duration`s built from three
+    // same-typed `u64`s, so a transposed pair type-checks and reads
+    // plausibly. Nothing else can catch it: `covered_period_bounds()` is
+    // what every enforcement site consumes, and the unit tests over the
+    // rule build `CoveredPeriodBounds` by hand and never see this mapping.
+    //
+    // The overridable values below are deliberately used rather than the
+    // defaults — three DISTINCT non-default numbers, so any swap among the
+    // three moves a value and fails, where a defaults-only assertion would
+    // only be as discriminating as the defaults happen to be.
+    let json = r#"{
+        "live_future_tolerance_secs": 60,
+        "live_past_tolerance_secs": 3600,
+        "backfill_window_secs": 86400
+    }"#;
+    let cfg: UsageCollectorConfig = serde_json::from_str(json).expect("config parses");
+    let bounds = cfg.covered_period_bounds();
+    assert_eq!(bounds.future_tolerance, time::Duration::minutes(1));
+    assert_eq!(bounds.live_past_tolerance, time::Duration::hours(1));
+    assert_eq!(bounds.backfill_window, time::Duration::days(1));
+}
+
+#[test]
+fn the_default_bounds_project_to_five_minutes_forty_eight_hours_and_ninety_days() {
+    // The published numbers, read through the projection every ingestion
+    // path actually consumes rather than off the `u64` keys.
+    // `CoveredPeriodBounds::default()` — what `Service::new` uses — reads
+    // the same three domain constants this config default reads, so
+    // asserting the two agree is what keeps the pair from drifting apart.
+    let projected = UsageCollectorConfig::default().covered_period_bounds();
+    assert_eq!(projected.future_tolerance, time::Duration::minutes(5));
+    assert_eq!(projected.live_past_tolerance, time::Duration::hours(48));
+    assert_eq!(projected.backfill_window, time::Duration::days(90));
+    assert_eq!(
+        projected,
+        crate::domain::covered_period::CoveredPeriodBounds::default(),
+        "a Service built without a configured block MUST enforce the same \
+         bounds a default deployment configures",
+    );
+}
+
+#[test]
 fn the_covered_period_bounds_are_overridable() {
     let json = r#"{
         "live_future_tolerance_secs": 60,

@@ -749,11 +749,11 @@ impl Service {
     /// with no default; production bootstrap passes
     /// `UsageCollectorConfig::metadata_size_cap_bytes` explicitly instead.
     ///
-    /// The covered-period bounds are likewise defaulted here, by projecting
-    /// `UsageCollectorConfig::default()` rather than by restating 5 minutes
-    /// / 48 hours / 90 days: the published defaults live in exactly one
-    /// place, and a deployment that moves them cannot leave this
-    /// constructor behind.
+    /// The covered-period bounds are likewise defaulted here, to
+    /// [`CoveredPeriodBounds::default`] — which reads the same three
+    /// domain constants `UsageCollectorConfig`'s own defaults read, so the
+    /// published values live in exactly one place and a deployment that
+    /// moves them cannot leave this constructor behind.
     #[must_use]
     pub fn new(hub: Arc<ClientHub>, vendor: String, enforcer: PolicyEnforcer) -> Self {
         let metrics: Arc<dyn UsageCollectorMetrics> = Arc::new(NoopMetrics);
@@ -772,7 +772,7 @@ impl Service {
             metrics,
             type_resolver,
             DEFAULT_METADATA_SIZE_CAP_BYTES,
-            crate::config::UsageCollectorConfig::default().covered_period_bounds(),
+            CoveredPeriodBounds::default(),
         )
     }
 
@@ -819,6 +819,37 @@ impl Service {
             metadata_size_cap_bytes,
             covered_period_bounds,
         }
+    }
+
+    /// The first two steps of both ingestion paths: project the submission
+    /// into its persisted shape, then admit or refuse its covered period.
+    ///
+    /// One function rather than a copy per path, because the two are
+    /// obliged to agree and a second spelling is how they stop agreeing —
+    /// the batch path in particular judges every entry of one submission
+    /// against a single `now`, and taking that instant as a parameter is
+    /// what makes it structural rather than conventional. Both failures are
+    /// per-submission: the projection's own period preconditions
+    /// (`cpt-cf-usage-collector-adr-record-identity-derivation` — a bound
+    /// finer than the microsecond, or an inverted period) and the path's
+    /// tolerances alike surface at one entry, never at the batch.
+    ///
+    /// # Errors
+    ///
+    /// * [`UsageCollectorError::InvalidArgument`] from the projection, on a
+    ///   sub-microsecond or inverted covered period.
+    /// * [`UsageCollectorError::InvalidArgument`] with reason
+    ///   `FUTURE_WINDOW` / `PAST_WINDOW` when the period ends outside this
+    ///   path's tolerances — see [`enforce_covered_period_bounds`].
+    fn project_and_admit(
+        &self,
+        submission: CreateUsageRecord,
+        origin: RecordOrigin,
+        now: OffsetDateTime,
+    ) -> Result<UsageRecord, UsageCollectorError> {
+        let record = submission.try_into_usage_record(origin)?;
+        enforce_covered_period_bounds(&self.covered_period_bounds, origin, now, record.window_end)?;
+        Ok(record)
     }
 
     /// Create a single `UsageRecord` through the ingestion path per
@@ -903,17 +934,9 @@ impl Service {
             .invalidation
             .as_ref()
             .map(|invalidation| (record.clone(), invalidation.clone()));
-        let record = record.try_into_usage_record(origin)?;
-        // Read once, so a batch and a single emit are judged the same way:
-        // against one instant, not against a clock that moves under the
-        // pipeline. Between the projection and the PDP call because §3.8
-        // orders period validation (step 3) before authorization (step 5).
-        enforce_covered_period_bounds(
-            &self.covered_period_bounds,
-            origin,
-            OffsetDateTime::now_utc(),
-            record.window_end,
-        )?;
+        // Ahead of the PDP call below, because §3.8 orders period
+        // validation (step 3) before authorization (step 5).
+        let record = self.project_and_admit(record, origin, OffsetDateTime::now_utc())?;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-attrib-authz
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-pdp-deny
         authz::authorize_usage_record(
@@ -1232,7 +1255,13 @@ impl Service {
     /// Per-record failures (a rejected covered period, authorization
     /// denial, an unresolvable declaration, malformed metadata, SPI errors
     /// against individual records) surface in the per-index `Result`
-    /// entries of the returned vector rather than the outer `Err`.
+    /// entries of the returned vector rather than the outer `Err`. "A
+    /// rejected covered period" covers both of
+    /// [`Self::project_and_admit`]'s refusals — the projection's own
+    /// sub-microsecond / inverted preconditions, and the path's
+    /// `FUTURE_WINDOW` / `PAST_WINDOW` tolerances — and every entry of one
+    /// batch is judged against a single `now`, so two entries carrying the
+    /// same period cannot be decided differently.
     ///
     /// `origin` is the caller's route, not a caller's value: the wrapper
     /// that *is* a route passes its own, which is the only thing
@@ -1317,20 +1346,10 @@ impl Service {
                     .as_ref()
                     .map(|invalidation| (submission.clone(), invalidation.clone())),
             );
-            match submission.try_into_usage_record(origin).and_then(|record| {
-                // A covered period outside the path's bounds is a
-                // per-submission rejection at its own input index, exactly
-                // like the projection's own period preconditions above it —
-                // never a batch-level failure, or one stale entry would
-                // discard a whole import.
-                enforce_covered_period_bounds(
-                    &self.covered_period_bounds,
-                    origin,
-                    now,
-                    record.window_end,
-                )?;
-                Ok(record)
-            }) {
+            // Per-submission, at its own input index — never a batch-level
+            // failure, or one out-of-bounds entry would discard a whole
+            // import.
+            match self.project_and_admit(submission, origin, now) {
                 Ok(record) => derived.push((index, record)),
                 Err(e) => {
                     results[index] = Some(Err(e));
