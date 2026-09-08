@@ -151,11 +151,35 @@ wrong, say so in your report and implement it as written anyway.
 *caller-supplied* fields. It is still a pure total function; it now takes one
 server-assigned input alongside the submission.
 
-**Property kept:** `UsageRecord` is still constructed in exactly two places
-(`try_into_usage_record` and `TryFrom<UsageRecordWire>`), there is still no
-struct-update path and no `&mut UsageRecord` anywhere. That is the append-only
-invariant holding at the type level, and it is checkable by grep. Stamping after
-the projection would have cost it.
+**Property kept:** `UsageRecord` is still *constructed* in exactly two places
+(`try_into_usage_record` and `TryFrom<UsageRecordWire>`), so there is one site
+that decides an entry's origin rather than a construct-then-stamp pair whose
+halves can drift apart or be reordered.
+
+**Corrected during execution — this decision originally claimed more than it
+could deliver.** It said "there is still no struct-update path and no
+`&mut UsageRecord` anywhere. That is the append-only invariant holding at the
+type level." Both halves are false, and Task 3's code-quality review falsified
+them:
+
+- `UsageRecord` has 13 `pub` fields, derives `Clone`, and is not
+  `#[non_exhaustive]`, so `UsageRecord { origin: …, ..other }` compiles from
+  anywhere. The workspace already does it at
+  `usage-collector/src/domain/test_support.rs:1592` and
+  `usage-collector/src/domain/authz_tests.rs:70`, and mutates a field directly
+  at `usage-collector-sdk/src/models_tests.rs:586`.
+- `cpt-cf-usage-collector-adr-append-only-invalidation` is a *ledger* property —
+  withdrawals are appended entries and a plugin returns a withdrawn pair as
+  persisted. Immutability of an in-memory Rust value is a different claim, and
+  borrowing the ADR's name for it misleads.
+
+The claim came from the slice-5 handoff and was carried in here unverified, then
+written verbatim into a shipped doc comment. It is the third handoff claim to
+fall, after the marker categories and the config-key count. **Ground rule 2 says
+any claim stating a count deserves a `grep -c`; extend that to any claim stating
+a structural guarantee.** Passing the origin in is still the right call — but for
+the weaker, true reason above, not for a type-level guarantee that does not
+exist.
 
 `origin` is **not** an input to the `id` derivation. The 5-tuple is unchanged:
 `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`. An entry
@@ -780,14 +804,22 @@ reworded ships anyway:
 Add, in the same doc comment:
 
 ```
-/// `origin` is the one field this projection does not read off the
-/// submission. It is server-assigned
+/// `origin` is server-assigned
 /// (`cpt-cf-usage-collector-adr-backfill-isolation`), so it arrives as an
-/// argument: the alternative — stamping it onto a constructed record —
-/// would need a `&mut UsageRecord` or a struct-update path, and the
-/// absence of both is what makes the append-only invariant checkable at
-/// the type level rather than by review.
+/// argument rather than being stamped onto an already-constructed record.
+/// That keeps one site deciding an entry's origin, instead of a
+/// construct-then-stamp pair whose halves can drift apart or be reordered.
+///
+/// It is a convention rather than a guarantee: this type's fields are
+/// public and it is not `#[non_exhaustive]`, so any holder can build a
+/// modified copy with a struct update, and this crate's own fixtures do.
+/// What the argument buys is that no such copy sits on the ingestion path.
 ```
+
+*(Corrected during execution. This block originally claimed the absence of a
+`&mut UsageRecord` and of a struct-update path made "the append-only invariant
+checkable at the type level". See D1 — both halves are false, and the shipped
+version of this comment had to be rewritten.)*
 
 - [ ] **Step 5: Add `origin` to both `UsageRecord` shadows**
 
@@ -816,7 +848,9 @@ The compiler enforces all four edits: both `Self { … }` literals and both
 exhaustive destructures fail to build until every one is done. That is the guard
 described in `UsageRecordWire`'s own doc comment.
 
-- [ ] **Step 6: Fix the 29 call sites in `models_tests.rs` and the 4 in `models.rs`**
+- [ ] **Step 6: Fix the call sites in `models_tests.rs` and `models.rs`**
+
+*(Corrected during execution, twice. The facts table's 47 / 29 are `grep` line **mentions**, which include test names and doc prose; the actual calls are **18** in `models_tests.rs`. `models.rs` has 4 mentions of which 1 is the definition and 3 are doc links. And the step below originally said "two of the three are prose" of `id.rs` / `id_tests.rs` / `error.rs` — **all three** are prose, so none needed editing. Counting mentions as call sites, and then miscounting the exceptions, is the arithmetic residue this branch keeps producing; it took an implementer and a reviewer to catch both halves.)*
 
 ```bash
 grep -rn --include='*.rs' -F 'try_into_usage_record' \
@@ -824,9 +858,9 @@ grep -rn --include='*.rs' -F 'try_into_usage_record' \
 ```
 
 Every call gains an argument. Pass `RecordOrigin::Live` at each existing site
-unless the test's subject is the backfill path — none of them is today. Also fix
-`usage-collector-sdk/src/id.rs`, `id_tests.rs` and `error.rs` if their mentions
-are calls rather than doc prose (check: two of the three are prose).
+unless the test's subject is the backfill path — none of them is today.
+`usage-collector-sdk/src/id.rs`, `id_tests.rs` and `error.rs` each mention
+`try_into_usage_record` in doc prose only, so none of them needs editing.
 
 - [ ] **Step 7: Run the SDK tests**
 
@@ -848,9 +882,8 @@ git commit -s -m "feat(usage-collector-sdk)!: carry the admitting path on every 
 
 UsageRecord gains a server-assigned origin, stamped by the projection that
 already derives id. try_into_usage_record takes it as an argument rather
-than the record being mutated afterwards, which keeps UsageRecord
-constructed in exactly two places and the append-only invariant checkable
-at the type level.
+than the record being mutated afterwards, so one site decides an entry's
+origin instead of a construct-then-stamp pair whose halves can drift.
 
 origin is not one of the five dedup-identity members, so re-importing an
 entry that was once emitted live still collides with it.
@@ -931,10 +964,14 @@ fn sample_backfilled_record() -> UsageRecord {
 }
 ```
 
-Passing the origin as a parameter is the only way to build the second shape:
-`UsageRecord` has no struct-update path and no `&mut`, by design, and Task 3
-exists partly to keep it that way. **Do not write `UsageRecord { origin: …,
-..other }`** — it would compile and it would undo the invariant.
+Parameterising the constructor keeps both fixture shapes built one way, so a
+future field lands in one place rather than two. **Do not reach for
+`UsageRecord { origin: …, ..other }` here instead** — it does compile (the type's
+fields are public and it is not `#[non_exhaustive]`; see D1), which is exactly
+why it is a convention to hold rather than a rule the compiler enforces. A
+struct-update site is also *invisible* to the next field addition: it inherits
+the new field from its base silently instead of failing to build, which is how a
+fixture ends up asserting against a value nobody chose.
 
 Then add:
 
@@ -3039,8 +3076,11 @@ to reorder. Nothing else is coupled.
 that rather than reading it as scope creep:
 
 - **T4** touches ~48 `UsageRecord` construction sites across three packages,
-  because adding a field to a type with no struct-update path is a compile error
-  at every one. That is the guard working, not a design problem.
+  because adding a field is a compile error at every *literal* one. That is the
+  guard working, not a design problem — but note the guard has a hole: the two
+  **struct-update** sites (`test_support.rs:1592`, `authz_tests.rs:70`) compile
+  unchanged and silently inherit the base record's `origin`. Those two need
+  reading, not just building.
 - **T9** re-bases ~75 ingestion-path assertions off a 1970 covered period before
   it enforces anything, in a separate commit. Its enforcement commit should be
   small; if it is not, the re-base leaked into it.
