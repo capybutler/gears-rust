@@ -48,6 +48,47 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
         records: Vec<CreateUsageRecord>,
     ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError>;
 
+    /// Bulk historical import on its own route
+    /// (`cpt-cf-usage-collector-adr-backfill-isolation`).
+    ///
+    /// Stamps [`RecordOrigin::Backfill`] and admits the covered periods the
+    /// live past tolerance rejects. Validation is otherwise identical to
+    /// [`Self::create_usage_records`], the future tolerance included: this
+    /// route lifts the past bound and nothing else. Batch-only — there is
+    /// no single-entry counterpart, because an import is a batch.
+    ///
+    /// It is on this trait rather than on REST alone because it is the only
+    /// route reaching past the live past tolerance, and a defect is
+    /// normally found days later rather than hours later. An in-process
+    /// emitter needs it to import history **and to withdraw it** — an
+    /// invalidation whose covered period is older than the live past
+    /// tolerance is refused there and belongs here, which makes correcting
+    /// closed history the ordinary use of this route rather than an exotic
+    /// one. Confining it to REST would turn every such correction into an
+    /// operator escalation.
+    ///
+    /// An entry whose covered period ends further back than the
+    /// deployment's configured backfill window is authorized against the
+    /// `usage_record` `backfill` action instead of `create` — the elevated
+    /// grant an import job holds and a plain emitter does not. One batch
+    /// may mix the two.
+    ///
+    /// The ADR's *workload* isolation is a gear-level obligation and is
+    /// **not implemented**: this route shares the live path's runtime,
+    /// connection pool and fan-out budget, so a bulk import can still
+    /// degrade live ingestion latency. What it does own is its origin
+    /// marker, its covered-period bounds and its own PDP labelling.
+    ///
+    /// Per-record outcomes are aligned with the input order, as on
+    /// [`Self::create_usage_records`].
+    ///
+    /// [`RecordOrigin::Backfill`]: crate::RecordOrigin::Backfill
+    async fn backfill_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        records: Vec<CreateUsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError>;
+
     /// Get a single usage record by its `id`.
     ///
     /// Returns the persisted record on `Ok`; an unknown `id` surfaces

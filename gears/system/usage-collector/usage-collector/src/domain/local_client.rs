@@ -57,6 +57,19 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
         self.svc.create_usage_records(ctx, records).await
     }
 
+    // The backfill route is a DIFFERENT service method, not
+    // `create_usage_records` under a flag: the origin marker each entry
+    // carries is decided by which one is called here, and forwarding to the
+    // live batch would stamp `live` on an import and refuse every
+    // correction of closed history.
+    async fn backfill_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        records: Vec<CreateUsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError> {
+        self.svc.backfill_usage_records(ctx, records).await
+    }
+
     async fn get_usage_record(
         &self,
         ctx: &SecurityContext,
