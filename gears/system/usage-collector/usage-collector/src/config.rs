@@ -1,8 +1,9 @@
 //! Configuration for the usage-collector gear.
 //!
-//! Carries only the vendor selector used to bind a storage-plugin
-//! implementation. Read once at `Gear::init` via `ctx.config_or_default()`;
-//! changing the binding requires a gear restart. The usage-type catalog is
+//! Carries the storage-plugin vendor selector, the Type Resolver cache
+//! knobs, the metadata size cap, and the three covered-period bounds. Read
+//! once at `Gear::init` via `ctx.config_or_default()`; changing the binding
+//! requires a gear restart. The usage-type catalog is
 //! plugin-owned (ADR-0012 / foundation.md 0.2.0), so no usage-type
 //! declarations are accepted here.
 //!
@@ -266,6 +267,9 @@ impl UsageCollectorConfig {
                  elevated authorization"
             );
         }
+        // Before the ordering check: a u64::MAX past tolerance is also "wider
+        // than the window", and reporting the ordering there would point at
+        // the wrong key.
         for (key, secs) in [
             (
                 "live_future_tolerance_secs",

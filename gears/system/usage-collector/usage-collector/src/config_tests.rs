@@ -254,6 +254,21 @@ fn the_covered_period_defaults_are_the_ones_design_publishes() {
 }
 
 #[test]
+fn the_covered_period_bounds_survive_an_absent_table() {
+    // Distinct from the `Default::default()` assertion above: that reads the
+    // `Default` impl, this reads the path a deployment actually takes when
+    // the config file omits the keys. Container-level `#[serde(default)]`
+    // makes the two the same code today, and this pins that they stay so —
+    // a field-level `#[serde(default = "...")]` disagreeing with `Default`
+    // would silently ship one set of bounds to an explicit config and
+    // another to an absent one.
+    let cfg: UsageCollectorConfig = serde_json::from_str("{}").expect("empty config parses");
+    assert_eq!(cfg.live_future_tolerance_secs, 300);
+    assert_eq!(cfg.live_past_tolerance_secs, 172_800);
+    assert_eq!(cfg.backfill_window_secs, 7_776_000);
+}
+
+#[test]
 fn the_covered_period_bounds_are_overridable() {
     let json = r#"{
         "live_future_tolerance_secs": 60,
