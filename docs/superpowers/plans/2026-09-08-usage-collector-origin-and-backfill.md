@@ -3079,11 +3079,25 @@ that rather than reading it as scope creep:
   because adding a field is a compile error at every *literal* one. That is the
   guard working, not a design problem — but note the guard has a hole: a
   **struct-update** site compiles unchanged and silently inherits the base
-  record's `origin`. There are **five** of them, not the two this plan first
-  listed: `test_support.rs` (`withdrawal_of`), `authz_tests.rs`
-  (`record_with_tenant`), `service_tests.rs` ×2 (`target_row`), and
-  `service_metrics_tests.rs` (`sample_target_row`). They need reading, not just
-  building — a third miscount in this plan, found by the Task 4 implementer.
+  record's `origin`. There are **seven**:
+
+  | Site | Decision |
+  | --- | --- |
+  | `test_support.rs:1607` `withdrawal_of` | takes `origin` explicitly, spelled above the `..` |
+  | `authz_tests.rs:72` `record_with_tenant` | inherits `Live` |
+  | `authz_tests.rs:637` `key_with_resource` | inherits `Live` |
+  | `authz_tests.rs:861` `key` | inherits `Live` |
+  | `service_tests.rs:998` `target_row` | inherits `Live` |
+  | `service_tests.rs:2157` `target_row` | inherits `Live` |
+  | `service_metrics_tests.rs:327` `sample_target_row` | inherits `Live` |
+
+  **This count is the branch's characteristic residue, demonstrated live.** The
+  plan said two. The Task 4 implementer found five. The spec reviewer found
+  seven. A controller grep written to check the reviewer returned six, because
+  its pattern assumed `..record_with(` and two sites are spelled
+  `..super::record_with(`. Four measurements, four answers, each one closer.
+  **A count is not verified by one grep — it is verified by a grep whose pattern
+  you have argued cannot miss a spelling.**
 - **T9** re-bases ~75 ingestion-path assertions off a 1970 covered period before
   it enforces anything, in a separate commit. Its enforcement commit should be
   small; if it is not, the re-base leaked into it.
