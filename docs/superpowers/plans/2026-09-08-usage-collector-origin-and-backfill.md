@@ -41,7 +41,7 @@ where they were paid for. They are current.
    never manufacture a kill, and never delete a working test to make a number
    look better.
 
-   **This plan has now produced three prescribed checks that could not fail**,
+   **This plan has now produced five prescribed checks that could not fail**,
    so the rule extends past mutations to assertions:
 
    - Task 5's `histogram_count(…) == 2` held whether or not the label under
@@ -52,6 +52,15 @@ where they were paid for. They are current.
      alongside it that the message carries something it must carry, or it is
      satisfied by the absence of everything.
    - Task 6's contrast test could not fail unless another test failed first.
+   - Task 8's zero-guard test: a zero `backfill_window_secs` also trips the
+     *ordering* rule, whose message names the same key — so `is_err()`, and even
+     `contains(key)`, stayed green with the zero guard deleted. It had to assert
+     **which** rejection fired.
+   - Task 9's `..._admits_a_period_longer_than_the_past_tolerance_that_ends_inside_it`
+     claimed to catch a rule phrased about the period's *length*, but
+     `enforce_covered_period_bounds` is handed one instant and never sees a
+     start, so that mutation is not expressible against it. It was a duplicate
+     of the inside-both-tolerances test wearing a stronger name.
 
    Before accepting any check — yours or a prescribed one — state the mutation
    that makes it red. If you cannot name one, it is not a test.
@@ -1823,15 +1832,33 @@ The moment the 48-hour past tolerance is enforced, **all of them are rejected
 with `PAST_WINDOW`** — a period ending in 1970 is 56 years beyond the bound.
 Measured:
 
-| File | ingestion call sites | `UNIX_EPOCH` sites |
-| --- | --- | --- |
-| `domain/service_tests.rs` | 44 | 23 |
-| `domain/service_metrics_tests.rs` | 16 | 4 |
-| `api/rest/handlers/usage_records_tests.rs` | 15 | 28 |
-| `domain/test_support.rs` | — | 2 |
+| File | ingestion call sites | `UNIX_EPOCH` sites | of those, actually affected |
+| --- | --- | --- | --- |
+| `domain/service_tests.rs` | 44 | 23 | 9 builders |
+| `domain/service_metrics_tests.rs` | 16 | 4 | 2 builders |
+| `api/rest/handlers/usage_records_tests.rs` | 15 | 28 | 9 periods + 4 id pairs + 3 wire dates |
+| `domain/test_support.rs` | — | 2 | **none — see below** |
+| `domain/authz_tests.rs` | 0 | 6 | **none — see below** |
 
 Command: `grep -c '\.create_usage_record\|handle_create_usage_records' <file>`
 and `grep -c UNIX_EPOCH <file>`.
+
+**Two of those rows were wrong in the first draft of this plan, and one of the
+errors was destructive.** A `UNIX_EPOCH` count is not a count of affected
+fixtures:
+
+- `domain/test_support.rs`'s two sites are **`test_time_range()`** — a *read-path*
+  range, not an ingestion fixture. This plan originally told the implementer to
+  repoint them; doing so would have changed what every read-path test selects,
+  for no reason, and the bound would never have touched them.
+- `domain/authz_tests.rs`'s six sites never reach the `Service` at all —
+  `authorize_usage_record` reads no clock.
+
+**The right method is not to count `UNIX_EPOCH`.** The Task 9 implementer
+applied the enforcement first, let the compiler and the 64 resulting red tests
+name the genuinely affected fixtures, then reverted and re-based exactly those.
+That is strictly better than any grep, because the failing set *is* the affected
+set. Do that instead of trusting the table.
 
 **Not affected, and do not touch them:** `usage-collector-sdk/src/models_tests.rs`
 (it calls `try_into_usage_record` directly, and the bound lives in the Service,
