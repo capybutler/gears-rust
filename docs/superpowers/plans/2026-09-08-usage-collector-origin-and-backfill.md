@@ -2215,10 +2215,13 @@ pub fn ingestion_action(
 ) -> &'static str {
     match origin {
         RecordOrigin::Live => usage_record::actions::CREATE,
-        RecordOrigin::Backfill if now - window_end > bounds.backfill_window => {
-            usage_record::actions::BACKFILL
+        RecordOrigin::Backfill => {
+            if now - window_end > bounds.backfill_window {
+                usage_record::actions::BACKFILL
+            } else {
+                usage_record::actions::CREATE
+            }
         }
-        RecordOrigin::Backfill => usage_record::actions::CREATE,
     }
 }
 ```
