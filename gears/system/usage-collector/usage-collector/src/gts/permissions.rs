@@ -65,6 +65,8 @@ gts_instance! {
 mod tests {
     use toolkit_gts::{GtsId, InventoryInstance, gts_id};
 
+    use super::usage_record;
+
     const PERMISSION_TYPE_ID: &str = gts_id!("cf.toolkit.authz.permission.v1~");
     /// Usage-collector instance-segment coordinates (`cf.core.uc`) — the
     /// vendor / package / namespace every UC permission instance's concrete
@@ -76,14 +78,40 @@ mod tests {
 
     /// One per `(resource_type, action)` in the usage-collector PEP
     /// vocabulary — the grantable set, which is the catalog's job to
-    /// publish. `usage_record_backfill` is declared here before the
-    /// backfill route passes it, because an operator has to be able to
-    /// grant the elevated action to an import job before that job runs.
-    const EXPECTED_PERMISSION_IDS: &[&str] = &[
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_create.v1"),
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_get.v1"),
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_list.v1"),
-        gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_backfill.v1"),
+    /// publish — each id paired with the verb it actually grants.
+    ///
+    /// The single home for the id set: the three tests below all read it,
+    /// so the set cannot be stated in two places and drift between them.
+    ///
+    /// **The pairing is the load-bearing half.** The id set and its size
+    /// are pinned below and the action spellings are pinned in
+    /// `authz_tests`, but neither crosses id to action: a `gts_instance!`
+    /// block pairing the backfill id with `actions::CREATE` satisfies every
+    /// one of those checks. An operator granting a permission by its
+    /// displayed name would then receive a different verb than the name
+    /// promises — here, `create` behind a name offering the elevated
+    /// import.
+    ///
+    /// `usage_record_backfill` is declared before the backfill route passes
+    /// it, because an operator has to be able to grant the elevated action
+    /// to an import job before that job runs.
+    const EXPECTED_ID_ACTIONS: &[(&str, &str)] = &[
+        (
+            gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_create.v1"),
+            usage_record::actions::CREATE,
+        ),
+        (
+            gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_get.v1"),
+            usage_record::actions::GET,
+        ),
+        (
+            gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_list.v1"),
+            usage_record::actions::LIST,
+        ),
+        (
+            gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_backfill.v1"),
+            usage_record::actions::BACKFILL,
+        ),
     ];
 
     fn uc_permission_instances() -> Vec<&'static InventoryInstance> {
@@ -112,9 +140,9 @@ mod tests {
         let entries = uc_permission_instances();
         assert_eq!(
             entries.len(),
-            EXPECTED_PERMISSION_IDS.len(),
+            EXPECTED_ID_ACTIONS.len(),
             "expected {} usage-collector permission instances; found {}: {:?}",
-            EXPECTED_PERMISSION_IDS.len(),
+            EXPECTED_ID_ACTIONS.len(),
             entries.len(),
             entries.iter().map(|e| e.instance_id).collect::<Vec<_>>()
         );
@@ -133,12 +161,41 @@ mod tests {
             .iter()
             .map(|e| e.instance_id)
             .collect();
-        for expected in EXPECTED_PERMISSION_IDS {
+        for (expected, _) in EXPECTED_ID_ACTIONS {
             assert!(
                 actual.contains(expected),
                 "missing permission id: {expected}"
             );
         }
-        assert_eq!(actual.len(), EXPECTED_PERMISSION_IDS.len());
+        assert_eq!(actual.len(), EXPECTED_ID_ACTIONS.len());
+    }
+
+    /// Crosses id to action, which nothing else does.
+    ///
+    /// The catalogued verb is read back off the registered instance's own
+    /// payload — the JSON `types-registry` aggregates and a role editor
+    /// ultimately renders — rather than off the constant the block was
+    /// written with, so the assertion travels the same path an operator's
+    /// grant does.
+    #[test]
+    fn each_permission_id_grants_the_verb_its_entry_names() {
+        let catalogued: std::collections::BTreeMap<&str, serde_json::Value> =
+            uc_permission_instances()
+                .iter()
+                .map(|e| (e.instance_id, (e.payload_fn)()))
+                .collect();
+
+        for (id, expected_action) in EXPECTED_ID_ACTIONS {
+            let payload = catalogued
+                .get(id)
+                .unwrap_or_else(|| panic!("no registered instance for {id}"));
+            assert_eq!(
+                payload.get("action").and_then(serde_json::Value::as_str),
+                Some(*expected_action),
+                "permission {id} is catalogued against the wrong verb; an \
+                 operator granting it by its displayed name would receive \
+                 that verb instead of the one the name promises",
+            );
+        }
     }
 }
