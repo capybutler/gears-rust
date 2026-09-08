@@ -92,9 +92,10 @@ mod tests {
     /// promises — here, `create` behind a name offering the elevated
     /// import.
     ///
-    /// `usage_record_backfill` is declared before the backfill route passes
-    /// it, because an operator has to be able to grant the elevated action
-    /// to an import job before that job runs.
+    /// `usage_record_backfill` was declared ahead of the route that passes
+    /// it, so an operator could grant the elevated action before an import
+    /// job existed. `Service::backfill_usage_records` passes it now, for an
+    /// entry whose covered period ends beyond the configured window.
     const EXPECTED_ID_ACTIONS: &[(&str, &str)] = &[
         (
             gts_id!("cf.toolkit.authz.permission.v1~cf.core.uc.usage_record_create.v1"),

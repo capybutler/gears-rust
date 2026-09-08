@@ -1,10 +1,18 @@
 //! Unit tests for the ingestion path's covered-period bounds.
 //!
-//! Pure: no `Service`, no plugin, no clock. Every offset below is
+//! Pure: no `Service`, no plugin, no clock. Almost every offset below is
 //! unambiguously inside or outside its bound — one hour against five
-//! minutes, 72 hours against 48 — because a test placed on the boundary
-//! would pin the comparison's strictness, which no document fixes, and
-//! would flake on a loaded runner besides.
+//! minutes, 72 hours against 48 — because pinning a comparison's
+//! strictness where no document fixes it turns a free implementation
+//! choice into a test that has to be edited to change it.
+//!
+//! The backfill window is the one exception, and it is exact rather than
+//! generous on purpose. `cpt-cf-usage-collector-adr-backfill-isolation`
+//! fixes that strictness: an entry "ending further back than the
+//! configured backfill window" is the elevated case, so the boundary
+//! itself is NOT. Nothing races here either — [`now`] is a fixed instant
+//! these functions take as a parameter, so the boundary case is as
+//! deterministic as every other one.
 
 use time::{Duration, OffsetDateTime};
 use usage_collector_sdk::{RecordOrigin, UsageCollectorError, ValidationReason};
@@ -163,6 +171,32 @@ fn the_action_is_create_inside_the_backfill_window_and_backfill_beyond_it() {
         actions::BACKFILL,
         "120 days back reaches past the 90-day window, which is the whole \
          reason the elevated action exists",
+    );
+}
+
+#[test]
+fn the_backfill_window_boundary_itself_is_not_the_elevated_case() {
+    // The ADR grants the elevated action to a period ending "further back
+    // than the configured backfill window", which makes the comparison
+    // strict and the boundary ordinary. The sibling test above straddles
+    // the window at 30 and 120 days and cannot tell `>` from `>=`; this is
+    // the case that can, and `>=` is the likelier typo of the two.
+    //
+    // Exact, not approximate: `now` is a parameter, so
+    // `now - window_end == backfill_window` holds to the nanosecond and
+    // nothing here reads a clock.
+    let bounds = default_bounds();
+    let window_end = ending(-bounds.backfill_window);
+    assert_eq!(
+        now() - window_end,
+        bounds.backfill_window,
+        "the fixture must sit exactly ON the bound, or it pins nothing",
+    );
+    assert_eq!(
+        ingestion_action(&bounds, RecordOrigin::Backfill, now(), window_end),
+        actions::CREATE,
+        "an entry ending exactly at the window has not reached PAST it, so \
+         it needs no grant an ordinary emission does not",
     );
 }
 

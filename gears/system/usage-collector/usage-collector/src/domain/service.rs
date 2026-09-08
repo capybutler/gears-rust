@@ -272,14 +272,9 @@ fn entry_type_of(record: &CreateUsageRecord) -> EntryType {
 /// `uc_authz_decisions_total`) carry for an entry admitted by `origin`'s
 /// route.
 ///
-/// A **route** label, not a verb. It is the one thing that keeps a bulk
-/// import's PDP latency and denial rate separable from live emission's on
-/// the same instruments, so it follows the entry point rather than the
-/// covered period: every entry of a backfill batch is `operation="backfill"`,
-/// including the ones authorized against `actions::CREATE` because their
-/// period ends inside the configured window. The verb such an entry is
-/// authorized against comes from [`ingestion_action`] instead, and the two
-/// answers disagree by design — see [`PdpOp::Backfill`].
+/// The label follows the entry point; the verb an entry is authorized
+/// against comes from [`ingestion_action`] and can disagree with it — see
+/// [`PdpOp::Backfill`], which owns that distinction.
 const fn pdp_op_for(origin: RecordOrigin) -> PdpOp {
     match origin {
         RecordOrigin::Live => PdpOp::Ingest,
@@ -1106,9 +1101,11 @@ impl Service {
         let start = std::time::Instant::now();
         let entry_type = entry_type_of(&record);
         // `Live` comes from the route this wrapper *is*, not from a
-        // default: the backfill route stamps `Backfill` through the same
-        // inner path. It is also the `origin` label on both ingestion
-        // instruments below, so the stamp and the telemetry cannot disagree.
+        // default: the batch routes stamp their own origin through their
+        // own shared body (`create_usage_records_for_origin`), and there is
+        // no single-emit backfill counterpart to reach this one. It is also
+        // the `origin` label on both ingestion instruments below, so the
+        // stamp and the telemetry cannot disagree.
         let origin = RecordOrigin::Live;
         let result = self.create_usage_record_inner(ctx, record, origin).await;
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-completion-metrics
@@ -1161,8 +1158,14 @@ impl Service {
             .await
     }
 
-    /// Bulk historical import, isolated from live ingestion
+    /// Bulk historical import on its own route
     /// (`cpt-cf-usage-collector-adr-backfill-isolation`).
+    ///
+    /// The ADR's *workload* isolation is **not implemented**: this route
+    /// shares the live path's runtime, connection pool and fan-out budget,
+    /// so a bulk import can still degrade live ingestion p95. See the TODO
+    /// on this method's source. What the route does own is its origin
+    /// marker, its covered-period bounds and its own PDP labelling.
     ///
     /// Stamps `origin = backfill` and admits the covered periods the live
     /// past tolerance rejects. Validation is otherwise identical to
@@ -1180,9 +1183,9 @@ impl Service {
     /// An entry whose covered period ends further back than the configured
     /// backfill window is authorized against
     /// `usage_record::actions::BACKFILL` instead of `CREATE`
-    /// ([`ingestion_action`]). One batch may mix the two; every entry of it
-    /// is labelled `operation="backfill"` on the PDP instruments either
-    /// way, that label being the route rather than the verb.
+    /// ([`ingestion_action`]). One batch may mix the two; every entry of
+    /// it is labelled `operation="backfill"` on the PDP instruments either
+    /// way — see [`PdpOp::Backfill`], which owns that collision.
     ///
     // TODO(`cpt-cf-usage-collector-nfr-workload-isolation`): this route
     // shares the live path's runtime, connection pool and fan-out budget —
@@ -1362,7 +1365,12 @@ impl Service {
     // fr-usage-type-existence-and-semantics, principle-fail-closed,
     // principle-pluggable-storage, component-ingestion-gateway, seq-emit-usage)
     // are not re-declared here (one `@cpt-dod` per id per file). Workload-
-    // isolation is batch-specific so its marker lands here.
+    // isolation is batch-specific so its marker lands here. That DoD is the
+    // write-vs-read isolation obligation, which this body satisfies — the
+    // gateway is still the sole write entry point and shares no state with
+    // the query gateway. The backfill-vs-live gap is a DIFFERENT obligation,
+    // owned by no feature file, and it is the TODO at
+    // `Self::backfill_usage_records`; do not read this marker as covering it.
     // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-nfr-workload-isolation:p1
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-receive-ctx
     async fn create_usage_records_inner(

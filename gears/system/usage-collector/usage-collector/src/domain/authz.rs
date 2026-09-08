@@ -255,14 +255,16 @@ pub(crate) mod usage_record {
 /// [`UsageRecord`]: the owning tenant (`record.tenant_id`), the optional
 /// subject reference (its mandatory `subject_id` plus optional
 /// `subject_type` qualifier), and the mandatory resource reference.
-/// `action` selects the verb the PDP authorizes against: the single-emit
+/// `action` selects the verb the PDP authorizes against. The batch
 /// ingestion path passes whatever
-/// [`crate::domain::covered_period::ingestion_action`] picks for the
-/// entry — `actions::CREATE`, or `actions::BACKFILL` for one reaching
-/// past the configured backfill window — and
-/// [`AttributionTupleKey`]'s own doc carries the rule that keeps two such
-/// verbs in one batch from silently sharing a decision. Unlike the
-/// query-path helpers,
+/// [`crate::domain::covered_period::ingestion_action`] picks per entry —
+/// `actions::CREATE`, or `actions::BACKFILL` past the configured backfill
+/// window — and [`AttributionTupleKey`]'s own doc carries the rule that
+/// keeps two such verbs in one batch from silently sharing a decision.
+/// This helper is the single-emit path's, which is live-only and therefore
+/// always `CREATE`; the same call is written through `ingestion_action`
+/// rather than that constant so the two paths cannot answer differently if
+/// a single-emit import route is ever added. Unlike the query-path helpers,
 /// which project their constraints into an `OData` filter, this path
 /// runs under `require_constraints(true)` and applies the per-record
 /// attribution gate in [`scope_admits_attribution_tuple`]:

@@ -56,7 +56,8 @@ pub mod key {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdpOp {
-    /// Usage-record ingestion (single + batch emit).
+    /// Live usage-record ingestion (single + batch emit) — see
+    /// [`Self::Backfill`] for the import route's own label.
     Ingest,
     /// Bulk historical import — the backfill route's own ingestion.
     ///
