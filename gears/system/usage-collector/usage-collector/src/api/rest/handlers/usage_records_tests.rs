@@ -3392,7 +3392,7 @@ mod handle_list_usage_records_tests {
 // group-by dimensions in the body — no aggregation parameter; the fold is
 // resolved from the queried type's declaration. The tests here pin only
 // what list tests can't: the stricter allowlist, the body lift through
-// `AggregationRequestDto::into_group_by`, and the result
+// `AggregationRequest::into_group_by`, and the result
 // projection through `AggregationResultDto`.
 // ---------------------------------------------------------------------------
 
@@ -3412,7 +3412,7 @@ mod handle_query_aggregated_usage_records_tests {
     use usage_collector_sdk::{AggregationBucket, AggregationResult};
 
     use super::super::handle_query_aggregated_usage_records;
-    use crate::api::rest::dto::{AggregationDimensionDto, AggregationRequestDto};
+    use crate::api::rest::dto::{AggregationDimensionDto, AggregationRequest};
     use crate::domain::Service;
     use crate::domain::test_support::{
         CountingUnreachableResolver, RECORDING_PLUGIN_SUFFIX, RecordingPlugin, ServiceFixture,
@@ -3430,8 +3430,8 @@ mod handle_query_aggregated_usage_records_tests {
         Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
     }
 
-    fn no_group() -> AggregationRequestDto {
-        AggregationRequestDto {
+    fn no_group() -> AggregationRequest {
+        AggregationRequest {
             time_range: super::range_body(),
             group_by: Vec::new(),
         }
@@ -3517,7 +3517,7 @@ mod handle_query_aggregated_usage_records_tests {
     async fn aggregation_body_with_invalid_metadata_key_lifts_through_tryfrom() {
         // `AggregationDimension::Metadata` carries a typed
         // `MetadataKey` — an empty / oversized key in the body MUST
-        // surface through `AggregationRequestDto::into_group_by`'s
+        // surface through `AggregationRequest::into_group_by`'s
         // host-side canonical lift, NOT bypass the typed boundary. Pinned
         // with the empty-string key, which the SDK rejects on
         // `MetadataKey::new`.
@@ -3528,7 +3528,7 @@ mod handle_query_aggregated_usage_records_tests {
             Extension(service),
             Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
             OData(ODataQuery::new()),
-            Json(AggregationRequestDto {
+            Json(AggregationRequest {
                 time_range: super::range_body(),
                 group_by: vec![AggregationDimensionDto::Metadata(String::new())],
             }),
@@ -3582,7 +3582,7 @@ mod handle_query_aggregated_usage_records_tests {
             Extension(service),
             Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
             OData(ODataQuery::new()),
-            Json(AggregationRequestDto {
+            Json(AggregationRequest {
                 time_range: crate::api::rest::dto::TimeRangeDto {
                     from: super::EPOCH_PLUS_ONE_HOUR,
                     to: time::OffsetDateTime::UNIX_EPOCH,
@@ -3673,7 +3673,7 @@ mod handle_query_aggregated_usage_records_tests {
             Extension(service),
             Query(vec![("gts_type_id".to_owned(), VALID_GTS_ID.to_owned())]),
             OData(ODataQuery::new()),
-            Json(AggregationRequestDto {
+            Json(AggregationRequest {
                 time_range: super::range_body(),
                 group_by: vec![AggregationDimensionDto::ResourceType],
             }),

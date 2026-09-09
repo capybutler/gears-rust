@@ -217,7 +217,7 @@ pub(super) fn register_usage_record_routes(
         .no_license_required()
         // The range is in the body on this path (`AggregationRequest.time_range`),
         // so no `from` / `to` query parameter is declared or accepted here.
-        .json_request::<dto::AggregationRequestDto>(
+        .json_request::<dto::AggregationRequest>(
             openapi,
             "Mandatory time range plus optional group-by dimensions",
         )

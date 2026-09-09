@@ -365,11 +365,17 @@ impl TryFrom<TimeRangeDto> for TimeRange {
 
 /// Request body for `POST /usage-collector/v1/records/aggregate`.
 ///
-/// Published as the `AggregationRequest` component — the drift suite strips
-/// the `Dto` suffix, so this type's name *is* the contract's component name
-/// (`docs/usage-collector-v1.yaml`). Carries the mandatory `time_range` and
-/// the group-by dimensions; the typed `gts_type_id`, the `OData` `$filter`,
-/// and the `metadata.<key>` side-channel remain query parameters (mirroring
+/// Named for the `AggregationRequest` component in
+/// `docs/usage-collector-v1.yaml`, whose field set it mirrors. It carries no
+/// `Dto` suffix deliberately: the suffix elsewhere in this module
+/// disambiguates a DTO from an SDK type of the same bare name, and there is
+/// no `AggregationRequest` in `usage_collector_sdk` to collide with — so the
+/// published component name and the contract's are the same string, with
+/// nothing to reconcile.
+///
+/// Carries the mandatory `time_range` and the group-by dimensions; the
+/// typed `gts_type_id`, the `OData` `$filter`, and the `metadata.<key>`
+/// side-channel remain query parameters (mirroring
 /// `GET /usage-collector/v1/records`). Carries no aggregation parameter:
 /// the fold is resolved from the queried type's declaration, so no request
 /// is well-formed and semantically wrong.
@@ -380,19 +386,19 @@ impl TryFrom<TimeRangeDto> for TimeRange {
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
-pub struct AggregationRequestDto {
+pub struct AggregationRequest {
     pub time_range: TimeRangeDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_by: Vec<AggregationDimensionDto>,
 }
 
-impl AggregationRequestDto {
+impl AggregationRequest {
     /// Projects the wire `group_by` dimensions into their typed SDK form.
     ///
     /// A free method rather than a `TryFrom` impl: the target,
     /// `Vec<AggregationDimension>`, is foreign to this crate (both `Vec`
     /// and `AggregationDimension` live outside it), so a blanket
-    /// `TryFrom<AggregationRequestDto> for Vec<AggregationDimension>`
+    /// `TryFrom<AggregationRequest> for Vec<AggregationDimension>`
     /// would violate the orphan rule.
     ///
     /// # Errors
