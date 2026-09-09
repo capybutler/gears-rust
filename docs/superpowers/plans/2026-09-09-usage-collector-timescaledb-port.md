@@ -455,13 +455,27 @@ of this task listed. Beyond the port, adapter and store:
   a dead function: an operator can build an alert on it and the alert never
   fires. That is the same defect class DIVERGENCES entry 4 is filed under, and
   this task is where it would be introduced rather than inherited.
-- **`src/infra/metrics_tests.rs`** asserts on that metric. Delete with a verdict.
+- ~~**`src/infra/metrics_tests.rs`** asserts on that metric.~~ **This was wrong.**
+  That file contains zero `deactivate` references and never did; Task 2's
+  implementer verified it at the base commit and correctly deleted nothing
+  rather than inventing a deletion to satisfy the step.
 - **`src/config.rs:79` and `src/infra/storage/pool.rs:69`** each cite the
   deactivate `SELECT … FOR UPDATE` as the worked example in a doc comment about
   lock timeouts. The surrounding guidance is still true; only the example is
   dead. **Re-point the example at a live statement rather than deleting the
   paragraph** — the lock-timeout rationale is load-bearing and losing it to
   tidy away one clause would be a real regression.
+
+  **Amended after execution: "re-point at a live `SELECT … FOR UPDATE`" was
+  impossible.** The `deactivate` body held the only `FOR UPDATE`, and indeed the
+  only `UPDATE` or `DELETE`, anywhere in `src/`. After this task the plugin is
+  insert-and-select only and takes no explicit row lock, so no equivalent
+  example existed to point at. The right answer was to cite a *different* real
+  statement and adjust the surrounding claim to match: the example became an
+  ingest `INSERT … ON CONFLICT … DO NOTHING` meeting an uncommitted duplicate,
+  and "row lock" was widened to "contended lock", because that conflict waits
+  on the inserting transaction's XID lock rather than a row lock. Keeping "row
+  lock" would have swapped one invented mechanism for another.
 - Three `tests/*_pg.rs` files. Delete only the deactivate coverage; the rest is
   Task 15's.
 
@@ -746,21 +760,44 @@ dropping the unreachable `"23001"` arm, having verified no DELETE path exists
 in the plugin and that the FK carried no `ON UPDATE` clause. That was a
 behavior narrowing, not just a comment fix, and it is moot once the FK is gone.
 
-- [ ] **Step 3: Check the post-migration setup still matches**
+- [ ] **Step 3: Confirm the retention policy needs no change — it does not**
 
-`src/infra/storage/pool.rs` carries `apply_post_migration_setup`, which installs
-the config-driven retention policy. It names the hypertable's time column.
+**Measured before this plan was revised: `grep -c 'created_at'
+src/infra/storage/pool.rs` returns 0.** An earlier draft of this step asserted
+the file "names the hypertable's time column" and told you to fix it. That was
+wrong, and the correction matters because acting on it would have produced a
+change with nothing behind it.
 
-```bash
-cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
-grep -n 'created_at\|add_retention_policy\|drop_after' src/infra/storage/pool.rs
+`apply_retention_policy` calls:
+
+```sql
+SELECT add_retention_policy('usage_records',
+       drop_after => make_interval(secs => $1::double precision))
 ```
 
-Any `created_at` there is now wrong — the partition column is `window_end`.
-Fix each. Retention measured from the covered period is what
-`cpt-cf-usage-collector-fr-idempotency` requires ("The horizon is the type's
-retention policy, measured from the covered period"), so `window_end` is also
-the semantically right column, not merely the mechanically required one.
+`add_retention_policy` takes **no column argument**. It drops chunks by the
+hypertable's own time dimension, whatever `create_hypertable` partitioned on.
+So re-partitioning on `window_end` in Step 2 is sufficient on its own, and this
+file needs no edit.
+
+Confirm rather than assume:
+
+```bash
+grep -n 'created_at\|add_retention_policy\|drop_after' \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/pool.rs
+```
+
+Expected: the two `retention_policy` calls, no `created_at`.
+
+**Say in your report that you checked and changed nothing here.** A step that
+correctly results in no edit is a finding, not a skipped step.
+
+Worth recording once, because it is the reason the outcome is right rather than
+lucky: retention measured from the covered period is what
+`cpt-cf-usage-collector-fr-idempotency` requires — *"The horizon is the type's
+retention policy, measured from the covered period"* — so `window_end` is the
+semantically correct dimension to age chunks on, not merely the mechanically
+required one. Partitioning on it gets both properties from one decision.
 
 - [ ] **Step 4: Verify the SQL parses**
 
@@ -1712,6 +1749,28 @@ does before relying on it.
 
 Claim from `usage_acceptance_sequence` in the same transaction as the insert.
 
+### You are adding the first transaction in the crate
+
+**Measured after Task 2: the plugin opens no transactions at all.** `deactivate`
+held the store's only one, and its `sqlx::Connection` import went dead when Task
+2 removed it — `grep -rn 'begin()\|Transaction'` over `src/` returns nothing.
+
+That matters because both obligations above are transactional and the SPI is
+explicit that a read-then-write will not do:
+
+> the store MUST reject it if the record it names already has an accepted
+> invalidation, and MUST make that check atomic with the entry it admits —
+> **one backend transaction, not a read followed by a write.**
+
+So Step 4's `claim_acceptance_sequence(tx: &mut sqlx::Transaction<'_, Postgres>, …)`
+is not slotting into existing machinery; you are re-introducing it. Expect to
+restore the `sqlx::Connection` (or `sqlx::Acquire`) import, and expect the
+single-row and batch insert paths to change shape rather than gain a parameter.
+
+Do not read this as "the crate used to have a transaction, so this is a
+revert" — the one Task 2 deleted wrapped a `SELECT … FOR UPDATE`
+read-modify-write, which is the shape the SPI forbids here.
+
 - [ ] **Step 1: Write the failing tests**
 
 These are unit tests over the SQL and the key derivation; the behavioural
@@ -1857,6 +1916,24 @@ If naming the existing invalidation requires a read, that read happens *after*
 the constraint has already rejected the write — so it is diagnostic, not a
 check, and the atomicity obligation is still met by the index. Say that at the
 call site, because it looks like the pre-read the SPI forbids and is not one.
+
+- [ ] **Step 6b: Retire two false transaction claims in this file**
+
+`record_store.rs:778` and `:940` each say a retry attempt "opens a fresh
+transaction". That is false and has been for some time: `:189` and `:536-537`
+correctly say no explicit transaction is required, and after Task 2 the crate
+opens none at all. The only transaction those retries ever had was the implicit
+single-statement one.
+
+Pre-existing rather than introduced, and left alone deliberately by Task 2
+because this task owns `create_batch`. **You are about to make them true for
+the first time** — Step 4's sequence claim and Step 5's insert do need a real
+transaction. Rewrite both comments to describe the transaction you actually
+add, not the one they currently imagine.
+
+`pool.rs:70` is the sibling case and **is** yours: it says "the same dedup
+4-tuple", correct until this task moves identity to the 5-tuple. Update it in
+the same pass.
 
 - [ ] **Step 7: Handle the in-batch collision**
 
@@ -2151,6 +2228,27 @@ parameters."
         group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError>;
 ```
+
+- [ ] **Step 1b: Two things Task 2's review handed to this task**
+
+**A live `status = 'active'` clause now has zero test coverage.** `aggregate`
+still applies it unconditionally (`record_store.rs:1222`, documented at
+`:1172-1182`), and the retired time model's `status` column still exists in the
+migration and in `mapper.rs`. Task 2 deleted `pg_aggregate_excludes_inactive`,
+which was the only test exercising it — correctly, because `deactivate` was the
+only writer of `inactive` and the SDK never let a caller set it, so the test
+could no longer be set up. But that leaves the clause live and unguarded.
+
+**This task is where it goes.** The withdrawal-exclusion clause from Task 8
+replaces it outright: `status` is not a column in the Task 3 schema, so
+`status = 'active'` must be gone from the assembled SQL. Grep the built query
+in a test and assert `status` does not appear in it.
+
+**`UsageRecordStatus` survives in five files, not the two an earlier note
+claimed** — `mapper.rs`, `mapper_tests.rs`, `record_store_tests.rs`,
+`tests/common/mod.rs`, `tests/records_ingest_integration_pg.rs`. Task 5 removes
+it from the mapper; the test files are Task 15's. Neither count is this task's
+to fix, but do not be surprised by the remainder.
 
 - [ ] **Step 2: Rewrite `aggregate`**
 
