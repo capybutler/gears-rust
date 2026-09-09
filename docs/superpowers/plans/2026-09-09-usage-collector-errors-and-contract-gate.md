@@ -139,6 +139,29 @@ All five produce "mutation survived", which argues for deleting a working test.
 - **Do not commit while an implementer subagent is working.** An amend lands on
   the wrong commit. This happened twice in slice 5, both times because the
   *controller* committed documentation mid-task. Batch doc commits between tasks.
+
+  **It happened a third time in slice 6, during Task 2, and the same way.** The
+  controller committed a plan note after the implementer had reported DONE, then
+  resumed that same implementer with review fixes and told it to
+  `git commit --amend`. By then the implementer's commit was no longer `HEAD` —
+  the controller's docs commit was — so the amend absorbed the docs commit and
+  replaced its message. Nothing was lost: the implementer noticed a six-file
+  `--stat` where five were expected, reset the stray path out of the index and
+  re-amended. But the branch ended up carrying two commits under one subject
+  line, and the controller's note back in the working tree, uncommitted.
+
+  So the rule has a second half, and it is the half that was missing:
+  **before telling an implementer to amend, confirm its commit is still `HEAD`.**
+  If you have committed on top of it, say "make a new commit" instead — an amend
+  instruction is only safe against a tip the implementer still owns.
+  `git log --oneline -1` before writing the message costs nothing.
+
+  The corollary, learned in the same minute: **a commit is not made because the
+  `git commit` ran.** The `python` heredoc that was supposed to write this very
+  paragraph aborted on a stale anchor, and the `git add && git commit` after it
+  in the same shell ran anyway — producing a commit whose message described an
+  edit the commit did not contain. Chain the edit to the commit (`&&`), or print
+  `git show --stat` and read it.
 - **Demand per-test verdicts on deletions and repointings.** "Deleted the failing
   test" and "deleted the test whose question no longer exists" look identical in
   a diff.
@@ -2502,6 +2525,15 @@ either. Decision: land it with the feed rather than ship a variant nothing
 constructs and no test can exercise. Not load-bearing today — nothing can raise
 it, so nothing mis-reports — but it becomes so the moment the feed lands without
 it.
+
+**Fold into the existing entries 5 and 14, do not open a new one:** Task 2's
+rename left `docs/DECOMPOSITION.md:573` and `docs/features/usage-query.md:127,139`
+asserting `QueryAggregatedUsageRecordsRequest` is the implemented request body.
+That is now false. Both files are edit-forbidden for this slice and both are
+already recorded as stale wholesale — entry 5 for `DECOMPOSITION.md`, entry 14
+for `docs/features/*`. Add the concrete instance to whichever entry owns the
+file, with the line numbers, rather than opening a twentieth entry for a
+known-stale document. Verify the line numbers still hold when you write it.
 
 **19. Two DESIGN §3.3 contract checks are unwritable.**
 `feed-snapshot-and-replay` and `latest-tie-break`, with what unblocks each.
