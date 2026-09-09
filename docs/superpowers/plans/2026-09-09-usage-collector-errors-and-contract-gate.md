@@ -2526,6 +2526,26 @@ constructs and no test can exercise. Not load-bearing today — nothing can rais
 it, so nothing mis-reports — but it becomes so the moment the feed lands without
 it.
 
+**Extend entry 10 with a third instance, found during Task 2's review.** Entry 10
+records that a generated client cannot submit a record (`quantity` vs `value`)
+and that the emitted `UsageRecord` is not an instance of its declared schema.
+The **aggregate request** is a third case of the same defect, on a third
+operation: `usage-collector-v1.yaml:1045` declares `AggregationRequest` with
+`required: [gts_type_id, time_range]` and `additionalProperties: false`, while
+`AggregationRequest` in `api/rest/dto.rs` carries `#[serde(deny_unknown_fields)]`
+and **no `gts_type_id` field** — the gear takes it as a query parameter. So a
+client generated from the contract sends `gts_type_id` in the body and is
+refused as an unknown field, *and* omits the query parameter the gear requires.
+Two independent 400s, exactly entry 10's shape.
+
+**Nothing in the drift gate catches this, by design.** `body_schemas_match`
+compares content type, `required` and schema *name*; the suite's module header
+lists field-level schema contents under what it deliberately does not enforce.
+Task 3 turning the gate on does not close it and must not be described as
+though it does. Record it under entry 10 rather than as a new entry — same
+defect, same resolution, and entry 10 already says the fix is a spec decision
+plus a scheduled slice rather than an editorial pass.
+
 **Fold into the existing entries 5 and 14, do not open a new one:** Task 2's
 rename left `docs/DECOMPOSITION.md:573` and `docs/features/usage-query.md:127,139`
 asserting `QueryAggregatedUsageRecordsRequest` is the implemented request body.
