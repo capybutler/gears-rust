@@ -340,10 +340,35 @@ For the `tests/*_pg.rs` files, delete only the catalog seeding — the rest of
 each file is rewritten in Task 15, and deleting them wholesale now loses the
 record of what they asserted.
 
+**The `--include='*.rs'` filter above is too narrow and will miss things.** It
+structurally cannot see `README.md`, `migrations/*.sql`, or any doc. Run the
+sweep again without it and handle what it finds:
+
+```bash
+grep -rn -i 'catalog\|usage_type' \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/
+```
+
+The plugin's own `README.md` **is** in scope — no other task owns it, and it
+advertises the catalog in its opening description. `migrations/0001_init.sql`
+is **not**: it still creates `usage_type_catalog`, and Task 3 replaces the
+whole file. The plugin's `docs/` directory is **not**: it is deliberately
+stale, it is where the `@cpt-` traceability marker ids resolve, and DIVERGENCES
+entries 5 and 14 cover it. Leave both alone, and say in your report that you
+did.
+
 **For every deletion in this step, state which of the two it is:** "deleted
 because the thing it tested no longer exists" or "deleted because it fails".
 Those look identical in a diff and only the first is legitimate here. Report a
 per-item verdict.
+
+**A third category is illegitimate and is the one to watch for: "deleted so a
+grep would come back empty."** A test asserting something that still exists is
+a live test even when its subject is scheduled for removal two tasks later.
+`tests/schema_integration_pg.rs` is the specific trap: it probes
+`usage_type_catalog` with raw SQL naming no Rust symbol, so that table still
+exists until Task 3 replaces the schema. If a sweep pressures you toward
+deleting a live assertion, stop and report it — the sweep is what is wrong.
 
 - [ ] **Step 10: Confirm the catalog is gone and the error count dropped**
 
@@ -359,8 +384,19 @@ this is not chained with `&&`.)
 cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | grep -c '^error\[\|^error:'
 ```
 
-Expected: fewer errors than Step 1 recorded, and no error naming
-`UsageType`, `UsageTypeGtsId`, `UsageKind` or `CatalogStore`.
+Expected: fewer errors than Step 1 recorded, and no error naming bare
+`UsageType`, `UsageKind` or `CatalogStore`.
+
+**`UsageTypeGtsId` errors are expected to remain and are not yours.** Step 4
+says to keep it where it is still used, and it survives on `RecordStore::list`
+and `RecordStore::aggregate` (`ports.rs`), on the adapter's two matching
+methods, and throughout `mapper.rs`. Those are *record*-path signatures, not
+catalog ones: the SDK replaced the type with `MeterTypeId`, and Tasks 5, 11 and
+12 do the replacement. `UsageTypeNotFound` likewise stays until Task 9 rewrites
+`map_insert_error`.
+
+**Do not delete anything merely to make a grep return empty.** If a grep hit
+belongs to a later task, leave it and say so in your report.
 
 - [ ] **Step 11: Commit**
 
@@ -604,6 +640,21 @@ CREATE INDEX IF NOT EXISTS usage_records_invalidates_idx
 CREATE INDEX IF NOT EXISTS usage_records_acceptance_seq_idx
     ON usage_records (tenant_id, gts_type_id, acceptance_sequence DESC);
 ```
+
+- [ ] **Step 2b: Note what dropping the catalog table releases**
+
+Task 1 removed the catalog seeding from the surviving `tests/*_pg.rs` fixtures,
+and that seeding was the only thing satisfying `usage_records_gts_id_fk` in the
+retired schema. Until this task lands, every record insert in those suites
+would fail with SQLSTATE 23503. Replacing the schema drops both the constraint
+and the table, which resolves it.
+
+**One test is now green for the wrong reason and Task 15 must delete it:**
+`pg_insert_with_unregistered_gts_id_is_usage_type_not_found` asserted that an
+unregistered `gts_id` is refused. After this task there is no registry for an
+id to be absent from, so the assertion cannot fail and cannot discriminate.
+That is a dead question wearing a green tick. Carry it to Task 15 Step 1's
+inventory as an explicit **delete**, not a repoint.
 
 - [ ] **Step 3: Check the post-migration setup still matches**
 
@@ -1033,6 +1084,20 @@ tasks in this plan do not touch this function, but the file has moved before.
 
 **Files:**
 - Modify: `src/infra/storage/query/translate.rs`, `src/infra/storage/query/translate_tests.rs`
+
+**Two stale doc blocks in this file are yours, and Task 1's spec review found
+them.** Both assert a field list the SDK no longer has:
+
+- **`translate.rs:22-25`** — the module doc claims `UsageRecordFilterField`'s
+  names "are exactly `"id"`, `"created_at"`, … `"corrects_id"`, `"status"`".
+  The SDK's `UsageRecordQuery` (`usage-collector-sdk/src/models.rs`) declares
+  `id`, `window_start`, `window_end`, `tenant_id`, `resource_id`,
+  `resource_type`, `subject_id`, `subject_type`. Task 1 edited this block
+  (stripping its usage-type half) and left the stale list standing.
+- **`record_column`'s own doc** — "only these nine identifiers", corrected by
+  Step 3 below.
+
+Re-verify both line numbers before editing.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1678,6 +1743,12 @@ Both must run inside a transaction that also holds the sequence claim.
 
 - [ ] **Step 6: Translate the new constraint violation**
 
+**First, a stale doc this task inherits.** `map_insert_error`'s doc comment
+describes `UsageTypeNotFound`, an SDK error variant that no longer exists, and
+the code below it still constructs one. Doc and code are stale together, which
+is why Task 1 left both. Rewrite the doc to match what you implement here
+rather than carrying the sentence forward.
+
 `map_insert_error` (`:128`) maps a unique violation to `IdempotencyConflict`.
 It must now discriminate on the constraint name:
 
@@ -2268,6 +2339,18 @@ question** (repoint it), or **a question the model no longer has** (delete it).
 Produce that list in the task report. "Deleted the failing test" and "deleted
 the test whose question no longer exists" look identical in a diff, and only
 the second is legitimate.
+
+**Two items Task 1 handed forward and this task must close:**
+
+- **`tests/common/mod.rs`'s `setup_with_type(_gts, _fields)` ignores both
+  parameters.** Task 1 kept the signature deliberately, to avoid churning 17
+  call sites this task rewrites anyway, and documented that it did. A helper
+  taking two ignored arguments is a trap for anyone who assumes it still
+  registers a type. **It must not survive this task** — either give it a
+  signature matching what it does, or delete it.
+- **`pg_insert_with_unregistered_gts_id_is_usage_type_not_found` must be
+  deleted, not repointed** (see Task 3 Step 2b). It passes for the wrong
+  reason once the catalog table is gone.
 
 - [ ] **Step 2: `schema_integration_pg.rs`**
 
