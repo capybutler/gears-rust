@@ -50,9 +50,11 @@ async fn the_reference_backend_conforms() {
 ///
 /// Without this, `BLOCKED_CHECKS` is prose: a typo, or a row left behind
 /// after a check became writable, reads exactly like an honest gap. The
-/// name says *cannot express* rather than *not implemented* because four of
-/// the seven are unimplemented and only two of those are blocked — the
-/// other two are in `UNWRITTEN_CHECKS`.
+/// name says *cannot express* rather than *not implemented* because the
+/// distinction outlives the counts: `UNWRITTEN_CHECKS` is empty today, so
+/// the two unimplemented checks are exactly the two blocked ones, and a
+/// row that stayed here after its check became writable would be
+/// indistinguishable from one that is genuinely still blocked.
 #[test]
 fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
     let blocked: BTreeSet<&str> = BLOCKED_CHECKS.iter().map(|(check, _)| *check).collect();
@@ -86,11 +88,11 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 /// This is what makes the module's coverage claim structural instead of
 /// narrative. `run_all` returning no violations says nothing about a check
 /// it never ran, and "run this suite" is the acceptance criterion for
-/// porting a storage backend, so a suite that runs three checks must not
+/// porting a storage backend, so a suite that runs five checks must not
 /// read as a suite that ran seven. Asserting the partition means a check cannot
 /// half-land — implemented but still listed unwritten, or written and
-/// listed nowhere — without this failing, and `UNWRITTEN_CHECKS` empties
-/// itself as the work lands rather than needing someone to remember.
+/// listed nowhere — without this failing, and `UNWRITTEN_CHECKS` emptied
+/// itself as the work landed rather than needing someone to remember.
 #[test]
 fn the_three_coverage_constants_partition_the_design_checks() {
     /// The seven names in DESIGN §3.3's "Plugin contract tests" table.

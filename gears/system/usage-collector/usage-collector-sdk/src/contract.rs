@@ -42,23 +42,24 @@
 //! previous one left; the fixtures are keyed so that a repeated run
 //! resubmits identical entries rather than colliding with different ones.
 //!
-//! # Three of seven, and where the other four are
+//! # Five of seven, and where the other two are
 //!
 //! DESIGN §3.3 tabulates seven checks. [`run_all`] currently runs the ones
 //! in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
-//! statement about the rest**. The other four are named, not omitted:
+//! statement about the rest**. The other two are named, not omitted:
 //!
 //! * [`BLOCKED_CHECKS`] — cannot be written against the SPI this gear
 //!   declares, each with what unblocks it.
-//! * [`UNWRITTEN_CHECKS`] — writable today, not yet written.
+//! * [`UNWRITTEN_CHECKS`] — writable today, not yet written. Now empty:
+//!   every check the current SPI can express is written.
 //!
 //! The three constants are asserted to partition DESIGN's seven exactly, so
 //! the split is a fact the test suite keeps rather than a paragraph that
-//! drifts: [`UNWRITTEN_CHECKS`] empties itself as later work lands, and a
+//! drifts: [`UNWRITTEN_CHECKS`] emptied itself as the work landed, and a
 //! check that half-lands fails the partition. A caller reporting coverage
 //! should report all three alongside the violations — which matters
 //! because "run this suite" is the acceptance criterion for porting a
-//! backend, and a suite that runs three checks must not read as a suite
+//! backend, and a suite that runs five checks must not read as a suite
 //! that ran seven.
 //!
 //! # The reference backend
@@ -71,15 +72,17 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
+use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
 use toolkit_gts::gts_id;
 use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir, ast};
 use uuid::Uuid;
 
 use crate::derive_usage_record_id;
+use crate::error::UsageCollectorPluginError;
 use crate::models::{
-    CreateUsageRecord, IdempotencyKey, MeterTypeId, RECORD_ID_FIELD, RecordOrigin, ResourceRef,
-    UsageRecord, WINDOW_END_FIELD,
+    AggregationFold, CreateUsageRecord, IdempotencyKey, Invalidation, MeterTypeId, RECORD_ID_FIELD,
+    ReasonCode, RecordOrigin, ResourceRef, UsageRecord, WINDOW_END_FIELD,
 };
 use crate::plugin_api::UsageCollectorPluginV1;
 use crate::time_range::TimeRange;
@@ -124,6 +127,14 @@ pub const WINDOW_END_SELECTION: &str = "window-end-selection";
 /// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
 pub const DEDUP_IDENTITY_OVER_WINDOW: &str = "dedup-identity-over-window";
 
+/// The DESIGN §3.3 `invalidation-excluded-from-fold` check, spelled as the
+/// table spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const INVALIDATION_EXCLUDED_FROM_FOLD: &str = "invalidation-excluded-from-fold";
+
+/// The DESIGN §3.3 `at-most-one-invalidation` check, spelled as the table
+/// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const AT_MOST_ONE_INVALIDATION: &str = "at-most-one-invalidation";
+
 /// The [`ContractViolation::check`] value a violation carries when the
 /// **suite itself** failed — it could not build a fixture, say — rather
 /// than the plugin.
@@ -143,20 +154,21 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     QUANTITY_ROUND_TRIP,
     WINDOW_END_SELECTION,
     DEDUP_IDENTITY_OVER_WINDOW,
+    INVALIDATION_EXCLUDED_FROM_FOLD,
+    AT_MOST_ONE_INVALIDATION,
 ];
 
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// Every one of them is expressible with the five methods this gear
-/// declares — unlike [`BLOCKED_CHECKS`], which needs the SPI to grow — so
-/// each is work outstanding rather than a gap in the contract. The list
-/// exists so a passing run reports what it did **not** cover; it shrinks to
-/// empty as the checks land.
-pub const UNWRITTEN_CHECKS: &[&str] = &[
-    "invalidation-excluded-from-fold",
-    "at-most-one-invalidation",
-];
+/// **Empty.** Every check expressible with the five methods this gear
+/// declares is written and run by [`run_all`]; what remains unimplemented
+/// is in [`BLOCKED_CHECKS`], which needs the SPI to grow. The constant
+/// stands rather than being deleted: it is one of the three the partition
+/// test holds against DESIGN's seven, so a check that becomes writable and
+/// is not yet written has a place to be named, and a check that half-lands
+/// still fails the partition.
+pub const UNWRITTEN_CHECKS: &[&str] = &[];
 
 /// The two DESIGN §3.3 checks the current SPI cannot express, and why.
 pub const BLOCKED_CHECKS: &[(&str, &str)] = &[
@@ -194,6 +206,8 @@ pub async fn run_all(plugin: &dyn UsageCollectorPluginV1) -> Vec<ContractViolati
     let mut violations = quantity_round_trip(plugin).await;
     violations.extend(window_end_selection(plugin).await);
     violations.extend(dedup_identity_over_window(plugin).await);
+    violations.extend(invalidation_excluded_from_fold(plugin).await);
+    violations.extend(at_most_one_invalidation(plugin).await);
     violations
 }
 
@@ -311,6 +325,38 @@ fn fixture_record(
     }
     .try_into_usage_record(RecordOrigin::Live)
     .map_err(|err| format!("the check's own submission is not projectable: {err}"))
+}
+
+/// The reason every withdrawal this suite submits states.
+///
+/// The vocabulary is deliberately open — the gear records the emitter's
+/// stated intent and infers nothing from it — so any well-formed code
+/// serves and no check reads this one.
+const CONTRACT_REASON_CODE: &str = "contract-suite-withdrawal";
+
+/// Builds one invalidation entry: a fixture record carrying a withdrawal.
+///
+/// The withdrawal is attached after the projection rather than travelling
+/// through it, and the entry's `id` is unaffected — [`Invalidation::target`]
+/// is deliberately excluded from the derived identity
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so the id
+/// [`fixture_record`] derived over the five identity attributes is the id
+/// this entry has. What the exclusion costs is that the idempotency key
+/// alone separates two withdrawals of one target, which is why every caller
+/// here passes a distinct one.
+fn fixture_invalidation(
+    idempotency_key: &IdempotencyKey,
+    value: Decimal,
+    window_start: time::OffsetDateTime,
+    window_end: time::OffsetDateTime,
+    target: Uuid,
+) -> Result<UsageRecord, String> {
+    let reason = ReasonCode::new(CONTRACT_REASON_CODE)
+        .map_err(|err| format!("the check's own reason code is invalid: {err}"))?;
+    Ok(UsageRecord {
+        invalidation: Some(Invalidation { target, reason }),
+        ..fixture_record(idempotency_key, value, window_start, window_end)?
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,10 +1084,741 @@ async fn dedup_page(plugin: &dyn UsageCollectorPluginV1) -> Result<Vec<Uuid>, St
     Ok(page.items.into_iter().map(|item| item.id).collect())
 }
 
+// ---------------------------------------------------------------------------
+// invalidation-excluded-from-fold
+// ---------------------------------------------------------------------------
+
+/// The start of the live entry's covered period, and the inclusive lower
+/// bound of the range this check folds and reads over.
+///
+/// Ninety days past [`FIXTURE_EPOCH`], for the reason
+/// [`WINDOW_SELECTION_FROM`] gives. It matters here for the same reason it
+/// matters there: this check counts the rows a range returns, so a stray
+/// entry from another check inside it would be read as a fourth entry.
+const FOLD_WINDOW_FROM: time::OffsetDateTime =
+    FIXTURE_EPOCH.saturating_add(time::Duration::days(90));
+
+/// The exclusive upper bound of that range, an hour past the end of the
+/// withdrawn pair's period so all three entries are selected by their end.
+const FOLD_WINDOW_TO: time::OffsetDateTime =
+    FOLD_WINDOW_FROM.saturating_add(time::Duration::hours(3));
+
+/// The live entry's quantity, and the whole of the total the fold must
+/// report.
+///
+/// Distinct from [`FOLD_WITHDRAWN_QUANTITY`] and small beside it, so the
+/// three answers a backend can give are three different numbers: `7.25`
+/// when the withdrawn pair is excluded, `1007.25` when only the record is,
+/// and `2007.25` when neither is.
+const FOLD_LIVE_QUANTITY: &str = "7.25";
+
+/// The withdrawn record's quantity, and the quantity the invalidation that
+/// withdraws it carries.
+///
+/// An invalidation **echoes** the quantity it withdraws rather than
+/// negating it (`cpt-cf-usage-collector-adr-append-only-invalidation`),
+/// which is exactly why leaving out only the record double-counts instead
+/// of cancelling: the echoed term stays in the sum with nothing left to
+/// pair it against.
+const FOLD_WITHDRAWN_QUANTITY: &str = "1000";
+
+/// The read limit this check dispatches: twice the three entries it
+/// expects.
+///
+/// The margin is the assertion, for the reason [`DEDUP_PAGE_LIMIT`] gives.
+/// A limit set to the expected three would truncate a fourth row away, and
+/// the half of this check that catches a backend storing something extra
+/// would pass.
+const FOLD_PAGE_LIMIT: u64 = 6;
+
+/// The three entries this check submits, and the total the fold must report
+/// over them.
+struct FoldFixtures {
+    /// The surviving measurement, and the only entry the fold may count.
+    live: UsageRecord,
+    /// The measurement the invalidation withdraws.
+    withdrawn: UsageRecord,
+    /// The invalidation entry naming [`Self::withdrawn`].
+    invalidation: UsageRecord,
+    /// [`Self::live`]'s quantity on the aggregate surface's carrier.
+    expected_total: BigDecimal,
+}
+
+/// `invalidation-excluded-from-fold` — *"A withdrawn pair folds to nothing
+/// while both entries stay readable. Excluding only the record
+/// double-counts the withdrawn measurement."*
+///
+/// **Both sentences are the rule, and the second is the easy half to
+/// lose.** They are two obligations rather than one conditional
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`): the fold leaves
+/// out the invalidation *and* the record it names, and the raw path leaves
+/// out neither.
+///
+/// * Excluding the record but folding the invalidation double-counts the
+///   withdrawn measurement, because the invalidation echoes the quantity it
+///   withdraws rather than negating it. There is no term that cancels.
+/// * Excluding both from the **raw** path instead would make the ledger
+///   unauditable. The append-only correction model exists precisely so a
+///   withdrawal is *visible* rather than a deletion, which is why
+///   `get_usage_record` and `list_usage_records` return a withdrawn pair as
+///   persisted and the exclusion lives in the fold alone.
+///
+/// The fixture is one live entry with a distinctive quantity, plus a second
+/// entry and the invalidation that withdraws it.
+///
+/// **The `SUM` is asserted against the surviving entry's value, never
+/// against zero.** A `SUM` over a withdrawn pair on its own comes back
+/// empty from a backend that folds correctly and from one that computes no
+/// fold at all — the latter is what the noop plugin does, returning no
+/// buckets whatsoever — so an assertion phrased as "the withdrawn pair
+/// contributes nothing" would be satisfied by a backend that answers
+/// nothing. The live entry is what makes the assertion discriminate: the
+/// fold must report [`FOLD_LIVE_QUANTITY`] exactly, not zero, and not that
+/// value plus or minus [`FOLD_WITHDRAWN_QUANTITY`].
+///
+/// The raw half then asserts three entries come back over the same range
+/// and that the invalidation among them still names its target. The two
+/// halves fail independently: a backend that hides the withdrawn pair from
+/// `list_usage_records` folds correctly and fails only the second, and one
+/// that folds the invalidation in returns all three rows and fails only the
+/// first.
+async fn invalidation_excluded_from_fold(
+    plugin: &dyn UsageCollectorPluginV1,
+) -> Vec<ContractViolation> {
+    let fixtures = match fold_fixtures() {
+        Ok(fixtures) => fixtures,
+        Err(detail) => {
+            return vec![violation(
+                HARNESS_FAULT,
+                format!(
+                    "the contract suite could not build its own \
+                     `{INVALIDATION_EXCLUDED_FROM_FOLD}` fixtures, so nothing was submitted. This \
+                     is a fault in the suite, not in the plugin under test: {detail}"
+                ),
+            )];
+        }
+    };
+
+    // A refusal here is reported and the check stops. Unlike the fixture
+    // rows of `window-end-selection`, these three are one scenario: a fold
+    // asserted over a pair that was never admitted, or over a live entry
+    // that was not, would report a total that says nothing about the
+    // exclusion rule.
+    for (role, record) in [
+        ("live", &fixtures.live),
+        ("withdrawn", &fixtures.withdrawn),
+        ("invalidation", &fixtures.invalidation),
+    ] {
+        if let Err(err) = plugin.create_usage_record(record.clone()).await {
+            return vec![violation(
+                INVALIDATION_EXCLUDED_FROM_FOLD,
+                format!(
+                    "`create_usage_record` refused the {role} entry (record {id}), so neither the \
+                     fold nor the ledger read could be asserted over a withdrawn pair: {err}",
+                    id = record.id,
+                ),
+            )];
+        }
+    }
+
+    let mut violations = fold_excludes_the_pair(plugin, &fixtures).await;
+    violations.extend(ledger_keeps_the_pair(plugin, &fixtures).await);
+    violations
+}
+
+/// The fold half: the withdrawn pair contributes nothing, and the live
+/// entry's quantity is the whole of the total.
+async fn fold_excludes_the_pair(
+    plugin: &dyn UsageCollectorPluginV1,
+    fixtures: &FoldFixtures,
+) -> Vec<ContractViolation> {
+    match fold_sum(plugin).await {
+        Ok(Some(total)) if total == fixtures.expected_total => Vec::new(),
+        Ok(observed) => vec![violation(
+            INVALIDATION_EXCLUDED_FROM_FOLD,
+            format!(
+                "`SUM` over the range `[{from}, {to})` reported {observed}, and the live entry's \
+                 own quantity `{expected}` is the whole of it. The range holds that entry, a \
+                 second entry of `{withdrawn}`, and the invalidation withdrawing it - which \
+                 carries the same `{withdrawn}` rather than its negation. An invalidation entry \
+                 contributes nothing to any fold, and so does the record an accepted \
+                 invalidation names: leaving out only the record leaves the echoed `{withdrawn}` \
+                 in the total and double-counts the withdrawn measurement, and leaving out \
+                 neither counts it twice over. The comparison is against the surviving entry \
+                 rather than against zero on purpose - a fold over the withdrawn pair alone is \
+                 empty whether a backend excluded it correctly or computed no fold at all.",
+                from = FOLD_WINDOW_FROM,
+                to = FOLD_WINDOW_TO,
+                observed = observed
+                    .as_ref()
+                    .map_or_else(|| "no value at all".to_owned(), ToString::to_string),
+                expected = FOLD_LIVE_QUANTITY,
+                withdrawn = FOLD_WITHDRAWN_QUANTITY,
+            ),
+        )],
+        Err(detail) => vec![violation(INVALIDATION_EXCLUDED_FROM_FOLD, detail)],
+    }
+}
+
+/// The ledger half: all three entries stay readable on the raw path, and
+/// the invalidation among them still names its target.
+///
+/// Both are what make the correction model auditable rather than a
+/// deletion. A consumer folding entries it read here has to be able to see
+/// the pair *and* to tell which record was withdrawn, and the target
+/// reference is the only thing that says so — an entry known to be an
+/// invalidation still has to name the record it withdrew before anything
+/// can be left out.
+async fn ledger_keeps_the_pair(
+    plugin: &dyn UsageCollectorPluginV1,
+    fixtures: &FoldFixtures,
+) -> Vec<ContractViolation> {
+    let items = match fold_page(plugin).await {
+        Ok(items) => items,
+        Err(detail) => return vec![violation(INVALIDATION_EXCLUDED_FROM_FOLD, detail)],
+    };
+
+    let mut violations = Vec::new();
+    let returned: BTreeSet<Uuid> = items.iter().map(|item| item.id).collect();
+    let expected = BTreeSet::from([
+        fixtures.live.id,
+        fixtures.withdrawn.id,
+        fixtures.invalidation.id,
+    ]);
+    if items.len() != expected.len() || returned != expected {
+        violations.push(violation(
+            INVALIDATION_EXCLUDED_FROM_FOLD,
+            format!(
+                "the range `[{from}, {to})` holds a live entry ({live}), a withdrawn entry \
+                 ({withdrawn}) and the invalidation withdrawing it ({invalidation}), and \
+                 `list_usage_records` answered a row count of {count} over the ids {returned:?}. \
+                 A withdrawn pair is returned as persisted on the ledger paths - both entries - \
+                 because the append-only correction model exists so a withdrawal is visible \
+                 rather than a deletion. Withholding one destroys the audit trail; the exclusion \
+                 belongs to the fold alone.",
+                from = FOLD_WINDOW_FROM,
+                to = FOLD_WINDOW_TO,
+                live = fixtures.live.id,
+                withdrawn = fixtures.withdrawn.id,
+                invalidation = fixtures.invalidation.id,
+                count = items.len(),
+            ),
+        ));
+    }
+
+    // Only asserted when the entry came back at all: its absence is
+    // already reported above, and reporting it twice would read as two
+    // defects.
+    if let Some(entry) = items
+        .iter()
+        .find(|item| item.id == fixtures.invalidation.id)
+    {
+        let target = entry.invalidation.as_ref().map(|inv| inv.target);
+        if target != Some(fixtures.withdrawn.id) {
+            violations.push(violation(
+                INVALIDATION_EXCLUDED_FROM_FOLD,
+                format!(
+                    "the invalidation entry ({invalidation}) came back from \
+                     `list_usage_records` naming {observed} as the entry it withdraws, and it \
+                     withdraws {withdrawn}. The target reference is what makes the pair \
+                     auditable: it is what marks this entry an invalidation at all, and it is \
+                     the only thing that says which record was withdrawn, so a consumer folding \
+                     entries it read here cannot leave the pair out without it.",
+                    invalidation = fixtures.invalidation.id,
+                    observed = target.map_or_else(
+                        || "no entry at all".to_owned(),
+                        |target| format!("`{target}`")
+                    ),
+                    withdrawn = fixtures.withdrawn.id,
+                ),
+            ));
+        }
+    }
+
+    violations
+}
+
+/// The `SUM` one bucket carries over the range under test.
+///
+/// `group_by` is empty, which the aggregate surface fixes as the
+/// no-grouping case: a single bucket with an empty key. A result carrying
+/// any other number of buckets is reported rather than picked from, since
+/// there would be no one total to compare. `Err` carries a ready-to-report
+/// detail.
+async fn fold_sum(plugin: &dyn UsageCollectorPluginV1) -> Result<Option<BigDecimal>, String> {
+    let meter = MeterTypeId::new(CONTRACT_METER_TYPE_ID)
+        .map_err(|err| format!("the check's own meter type id is invalid: {err}"))?;
+    let range = TimeRange::new(FOLD_WINDOW_FROM, FOLD_WINDOW_TO)
+        .map_err(|err| format!("the check could not build its own read range: {err}"))?;
+    let result = plugin
+        .query_aggregated_usage_records(
+            meter,
+            range,
+            AggregationFold::Sum,
+            &contract_query(FOLD_PAGE_LIMIT),
+            &[],
+            &[],
+        )
+        .await
+        .map_err(|err| {
+            format!(
+                "`query_aggregated_usage_records` failed over the range holding the withdrawn \
+                 pair, so the exclusion could not be decided: {err}"
+            )
+        })?;
+    let count = result.buckets.len();
+    let mut buckets = result.buckets.into_iter();
+    match (buckets.next(), buckets.next()) {
+        (Some(bucket), None) => Ok(bucket.value),
+        _ => Err(format!(
+            "`query_aggregated_usage_records` was dispatched with no grouping dimension, which \
+             the aggregate surface fixes as the no-grouping case - a single bucket carrying an \
+             empty key - and it answered {count} buckets. There is no one total to compare the \
+             live entry's quantity against."
+        )),
+    }
+}
+
+/// Every entry the range under test comes back with on the raw path.
+///
+/// A `Vec` rather than a set, because the count is an assertion: a set
+/// would collapse a duplicated row away.
+async fn fold_page(plugin: &dyn UsageCollectorPluginV1) -> Result<Vec<UsageRecord>, String> {
+    let meter = MeterTypeId::new(CONTRACT_METER_TYPE_ID)
+        .map_err(|err| format!("the check's own meter type id is invalid: {err}"))?;
+    let range = TimeRange::new(FOLD_WINDOW_FROM, FOLD_WINDOW_TO)
+        .map_err(|err| format!("the check could not build its own read range: {err}"))?;
+    let page = plugin
+        .list_usage_records(meter, range, &contract_query(FOLD_PAGE_LIMIT), &[])
+        .await
+        .map_err(|err| {
+            format!(
+                "`list_usage_records` failed over the range holding the withdrawn pair, so \
+                 whether both its entries stay readable could not be decided: {err}"
+            )
+        })?;
+    Ok(page.items)
+}
+
+/// Builds the live entry, the entry withdrawn from under it, and the
+/// invalidation that withdraws it.
+///
+/// Two guards keep the check from passing by construction, and both are the
+/// suite's own facts rather than the plugin's:
+///
+/// * The two quantities differ. If they did not, a fold that counted the
+///   withdrawn pair would report the same total as one that excluded it.
+/// * The three entries derive three distinct ids. The ledger half counts
+///   rows under them, and two fixtures sharing an id would collapse into an
+///   idempotent replay rather than into two entries.
+fn fold_fixtures() -> Result<FoldFixtures, String> {
+    let live_value = Decimal::from_str(FOLD_LIVE_QUANTITY).map_err(|err| {
+        format!("the check's own live quantity `{FOLD_LIVE_QUANTITY}` does not parse: {err}")
+    })?;
+    let withdrawn_value = Decimal::from_str(FOLD_WITHDRAWN_QUANTITY).map_err(|err| {
+        format!(
+            "the check's own withdrawn quantity `{FOLD_WITHDRAWN_QUANTITY}` does not parse: {err}"
+        )
+    })?;
+    if live_value == withdrawn_value {
+        return Err(format!(
+            "the live and the withdrawn quantity are both `{FOLD_LIVE_QUANTITY}`, so a fold \
+             counting the withdrawn pair would report the same total as one excluding it and this \
+             check would pass by construction"
+        ));
+    }
+    let expected_total = BigDecimal::from_str(FOLD_LIVE_QUANTITY).map_err(|err| {
+        format!(
+            "the check's own live quantity `{FOLD_LIVE_QUANTITY}` does not widen to the aggregate \
+             carrier: {err}"
+        )
+    })?;
+
+    let live_end = FOLD_WINDOW_FROM.saturating_add(time::Duration::hours(1));
+    let pair_end = FOLD_WINDOW_FROM.saturating_add(time::Duration::hours(2));
+
+    let live = fixture_record(&fold_key("live")?, live_value, FOLD_WINDOW_FROM, live_end)?;
+    let withdrawn = fixture_record(&fold_key("withdrawn")?, withdrawn_value, live_end, pair_end)?;
+    // The invalidation carries its target's covered period, which is the
+    // shape the gateway admits and the shape the SPI reasons about: both
+    // entries carry one covered period, so no `time_range` selects one of
+    // the pair without the other and no placement of the invalidation
+    // changes a result. It carries the target's quantity too, echoed
+    // rather than negated.
+    let invalidation = fixture_invalidation(
+        &fold_key("invalidation")?,
+        withdrawn_value,
+        live_end,
+        pair_end,
+        withdrawn.id,
+    )?;
+
+    let ids = BTreeSet::from([live.id, withdrawn.id, invalidation.id]);
+    if ids.len() != 3 {
+        return Err(format!(
+            "the live entry ({live}), the withdrawn entry ({withdrawn}) and the invalidation \
+             ({invalidation}) do not derive three distinct ids, so two of them would collapse \
+             into an idempotent replay and the row count this check asserts would be meaningless",
+            live = live.id,
+            withdrawn = withdrawn.id,
+            invalidation = invalidation.id,
+        ));
+    }
+
+    Ok(FoldFixtures {
+        live,
+        withdrawn,
+        invalidation,
+        expected_total,
+    })
+}
+
+/// The idempotency key one role of this check's fixture submits under.
+///
+/// Keyed on the role name for the reason [`quantity_fixture`] spells out:
+/// in a ledger with no delete path, an edited fixture must take a fresh
+/// identity rather than inherit an accepted entry's.
+fn fold_key(role: &str) -> Result<IdempotencyKey, String> {
+    IdempotencyKey::new(format!("{INVALIDATION_EXCLUDED_FROM_FOLD}-{role}"))
+        .map_err(|err| format!("the check's own idempotency key is invalid: {err}"))
+}
+
+// ---------------------------------------------------------------------------
+// at-most-one-invalidation
+// ---------------------------------------------------------------------------
+
+/// The start of the sequential half's covered period, and the instant this
+/// check's four entries are arranged from.
+///
+/// A hundred and twenty days past [`FIXTURE_EPOCH`], for the reason
+/// [`WINDOW_SELECTION_FROM`] gives. This check reads nothing back, so the
+/// separation buys less here than elsewhere — it keeps these entries out of
+/// the ranges the checks that *do* read back dispatch.
+const AT_MOST_ONE_WINDOW_FROM: time::OffsetDateTime =
+    FIXTURE_EPOCH.saturating_add(time::Duration::days(120));
+
+/// The quantity every entry of this check carries, withdrawals included: an
+/// invalidation echoes the quantity it withdraws. Nothing here asserts on
+/// a quantity.
+const AT_MOST_ONE_QUANTITY: Decimal = Decimal::ONE;
+
+/// The two targets this check withdraws, and the withdrawals aimed at them.
+struct AtMostOneFixtures {
+    /// The entry the sequential half withdraws twice.
+    sequential_target: UsageRecord,
+    /// The withdrawal that must be accepted.
+    first_withdrawal: UsageRecord,
+    /// The withdrawal that must be rejected.
+    second_withdrawal: UsageRecord,
+    /// The entry the concurrent half withdraws twice, in one batch.
+    concurrent_target: UsageRecord,
+    /// The two withdrawals racing for it. Exactly one may be accepted.
+    racing_withdrawals: [UsageRecord; 2],
+}
+
+/// `at-most-one-invalidation` — *"A second withdrawal of one record is
+/// rejected. Under two concurrent submissions exactly one succeeds."*
+///
+/// **This check is the store's, not the gateway's.** Three of the rules an
+/// invalidation must satisfy against its target need a lookup and belong to
+/// the ingestion gateway; this one does not, because only the store can
+/// make the check atomic with the entry it admits
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`). A gateway-side
+/// pre-read cannot exclude a concurrent second submission, so it would fail
+/// exactly when it matters, and nothing upstream of the SPI enforces the
+/// rule at all.
+///
+/// The sequential half asserts the rejection's **variant**, not merely that
+/// the submission failed. A backend answering
+/// [`UsageCollectorPluginError::Internal`] is not conforming: the gateway
+/// lifts `AlreadyInvalidated` to a `409` naming the invalidation already in
+/// place, and an `Internal` becomes a `500` naming nothing. An `is_err()`
+/// assertion cannot tell the two apart, so it would accept a backend whose
+/// callers can never learn why their withdrawal was refused. The carried
+/// `invalidated_by` is asserted for the same reason: the rejection has to
+/// name the entry that already withdrew the target.
+///
+/// The concurrent half is a **same-batch race**, driven through
+/// `create_usage_records` rather than two overlapping `create_usage_record`
+/// calls. The SPI aligns per-entry outcomes to input order, so two
+/// withdrawals of one target in a single batch make the race expressible
+/// deterministically — exactly one `Ok` and exactly one
+/// `AlreadyInvalidated`, every run, with no timing to lose. A backend that
+/// serialises a batch entry by entry, deciding each against the state the
+/// entries before it left, satisfies this; one that evaluates the whole
+/// batch against *pre-existing* state — decide once, then insert all —
+/// admits both, and that is the defect being hunted. Such a backend passes
+/// the sequential half, because there the two withdrawals arrive in
+/// different calls and the first is already stored by the time the second
+/// is decided.
+async fn at_most_one_invalidation(plugin: &dyn UsageCollectorPluginV1) -> Vec<ContractViolation> {
+    let fixtures = match at_most_one_fixtures() {
+        Ok(fixtures) => fixtures,
+        Err(detail) => {
+            return vec![violation(
+                HARNESS_FAULT,
+                format!(
+                    "the contract suite could not build its own `{AT_MOST_ONE_INVALIDATION}` \
+                     fixtures, so nothing was submitted. This is a fault in the suite, not in the \
+                     plugin under test: {detail}"
+                ),
+            )];
+        }
+    };
+    let mut violations = sequential_second_withdrawal(plugin, &fixtures).await;
+    violations.extend(same_batch_withdrawal_race(plugin, &fixtures).await);
+    violations
+}
+
+/// The sequential half: a second withdrawal of one record, in its own call,
+/// is rejected as `AlreadyInvalidated` naming the invalidation in place.
+async fn sequential_second_withdrawal(
+    plugin: &dyn UsageCollectorPluginV1,
+    fixtures: &AtMostOneFixtures,
+) -> Vec<ContractViolation> {
+    for (role, record) in [
+        ("the entry to be withdrawn", &fixtures.sequential_target),
+        ("the first withdrawal of it", &fixtures.first_withdrawal),
+    ] {
+        if let Err(err) = plugin.create_usage_record(record.clone()).await {
+            return vec![violation(
+                AT_MOST_ONE_INVALIDATION,
+                format!(
+                    "`create_usage_record` refused {role} (record {id}), so there was no accepted \
+                     withdrawal for a second one to be rejected against: {err}",
+                    id = record.id,
+                ),
+            )];
+        }
+    }
+
+    let target = fixtures.sequential_target.id;
+    let already = fixtures.first_withdrawal.id;
+    let detail = match plugin
+        .create_usage_record(fixtures.second_withdrawal.clone())
+        .await
+    {
+        Err(UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by })
+            if id == target && invalidated_by == already =>
+        {
+            return Vec::new();
+        }
+        Err(UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }) => format!(
+            "the second withdrawal of record {target} was rejected as `AlreadyInvalidated`, and \
+             it named the target {id} withdrawn by {invalidated_by} rather than the target \
+             {target} withdrawn by {already}. The variant carries those two so the gateway's \
+             refusal can name the entry that already withdrew the target."
+        ),
+        Err(other) => format!(
+            "the second withdrawal of record {target} was rejected as `{other}`, and the store's \
+             one admission-time invalidation obligation is to report it as `AlreadyInvalidated`, \
+             naming target {target} and the invalidation {already} already in place. Asserting \
+             only that the submission failed would accept this: the gateway lifts \
+             `AlreadyInvalidated` to a conflict naming the entry in place and anything else to an \
+             unclassified failure naming nothing."
+        ),
+        Ok(stored) => format!(
+            "the second withdrawal of record {target} was admitted as record {stored_id}, and \
+             record {target} already carried the accepted invalidation {already}. At most one \
+             invalidation per record is the store's rule and the only place it can be enforced - \
+             the gateway does not pre-read for it - so a record now carries two withdrawals and a \
+             fold that excludes a withdrawn pair has three entries in it.",
+            stored_id = stored.id,
+        ),
+    };
+    vec![violation(AT_MOST_ONE_INVALIDATION, detail)]
+}
+
+/// The concurrent half: two withdrawals of one target in a single batch,
+/// exactly one accepted.
+///
+/// The batch is what makes the race deterministic. `tokio::join!` over two
+/// `create_usage_record` calls would assert the same invariant against the
+/// scheduler, and a check that only sometimes reaches the state it is about
+/// is a check that only sometimes holds a backend to it.
+///
+/// A repeated run against a backend that kept the first run's entries
+/// answers the same pair, which is what keeps the suite re-runnable: the
+/// winner's resubmission collides on its own `id` and is re-admitted as an
+/// idempotent replay — the duplicate branch is checked before the
+/// at-most-one one, precisely so an emitter's retry is not read as a
+/// second withdrawal — while the loser was never stored and is refused
+/// again.
+async fn same_batch_withdrawal_race(
+    plugin: &dyn UsageCollectorPluginV1,
+    fixtures: &AtMostOneFixtures,
+) -> Vec<ContractViolation> {
+    let target = fixtures.concurrent_target.id;
+    if let Err(err) = plugin
+        .create_usage_record(fixtures.concurrent_target.clone())
+        .await
+    {
+        return vec![violation(
+            AT_MOST_ONE_INVALIDATION,
+            format!(
+                "`create_usage_record` refused the entry the racing withdrawals aim at (record \
+                 {target}), so the race had no target to be decided against: {err}"
+            ),
+        )];
+    }
+
+    let outcomes = match plugin
+        .create_usage_records(fixtures.racing_withdrawals.to_vec())
+        .await
+    {
+        Ok(outcomes) => outcomes,
+        Err(err) => {
+            return vec![violation(
+                AT_MOST_ONE_INVALIDATION,
+                format!(
+                    "`create_usage_records` failed the whole batch carrying two withdrawals of \
+                     record {target}: {err}. The obligation is per entry - exactly one of the two \
+                     is accepted - so refusing the batch outright decides neither."
+                ),
+            )];
+        }
+    };
+
+    let mut admitted = Vec::new();
+    let mut refused = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            Ok(stored) => admitted.push(stored.id),
+            Err(err) => refused.push(err),
+        }
+    }
+
+    // Exactly one of each, and the two counts are asserted together: the
+    // SPI aligns one outcome to every input entry, so any answer that is
+    // not one acceptance beside one refusal is a failure to decide the
+    // race.
+    if admitted.len() != 1 || refused.len() != 1 {
+        return vec![violation(
+            AT_MOST_ONE_INVALIDATION,
+            format!(
+                "one `create_usage_records` batch carried two withdrawals of record {target}, and \
+                 it answered {ok} acceptances ({admitted:?}) and {failed} refusals; exactly one \
+                 of the two may be admitted, and the SPI aligns one outcome to every entry. Two \
+                 withdrawals of one record can arrive in the same call, so a backend evaluating \
+                 the whole batch against the state it held before the batch began - decide once, \
+                 then insert all - admits both, while one deciding each entry against the entries \
+                 already admitted ahead of it admits one. The first passes a sequential second \
+                 withdrawal, where the earlier withdrawal is already stored by the time the later \
+                 is decided, which is why the rule is asserted here as well.",
+                ok = admitted.len(),
+                failed = refused.len(),
+            ),
+        )];
+    }
+
+    let mut violations = Vec::new();
+    for err in &refused {
+        let named = matches!(
+            err,
+            UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }
+                if *id == target && admitted.contains(invalidated_by)
+        );
+        if !named {
+            violations.push(violation(
+                AT_MOST_ONE_INVALIDATION,
+                format!(
+                    "the withdrawal of record {target} the batch turned down was refused as \
+                     `{err}`, and the one refusal a losing racer earns is `AlreadyInvalidated` \
+                     naming target {target} and the withdrawal the batch admitted ({admitted:?}). \
+                     Losing a race and being unstorable are different outcomes, and only the \
+                     first is this rule."
+                ),
+            ));
+        }
+    }
+    violations
+}
+
+/// Builds both targets and the three withdrawals aimed at them.
+///
+/// The guard is that the two racing withdrawals derive **different** ids.
+/// If they did not, the second would collide on the first's id and be
+/// re-admitted as an idempotent replay of it — the duplicate-entry branch,
+/// which runs before the at-most-one branch precisely so an emitter's retry
+/// is not reported as a second withdrawal. The batch would then answer two
+/// `Ok`s against a conforming backend, and the check would report the
+/// suite's own fixture as a defect.
+fn at_most_one_fixtures() -> Result<AtMostOneFixtures, String> {
+    let sequential_end = AT_MOST_ONE_WINDOW_FROM.saturating_add(time::Duration::hours(1));
+    let concurrent_end = AT_MOST_ONE_WINDOW_FROM.saturating_add(time::Duration::hours(2));
+
+    let sequential_target = fixture_record(
+        &at_most_one_key("sequential-target")?,
+        AT_MOST_ONE_QUANTITY,
+        AT_MOST_ONE_WINDOW_FROM,
+        sequential_end,
+    )?;
+    let concurrent_target = fixture_record(
+        &at_most_one_key("concurrent-target")?,
+        AT_MOST_ONE_QUANTITY,
+        sequential_end,
+        concurrent_end,
+    )?;
+
+    // Every withdrawal carries its target's covered period and quantity,
+    // which is the shape the gateway admits. Only the idempotency key
+    // separates two withdrawals of one target, and it has to: the target
+    // reference is deliberately not an input to the derived identity, so
+    // two withdrawals sharing a key would be one entry.
+    let withdrawal = |role: &str, target: &UsageRecord| -> Result<UsageRecord, String> {
+        fixture_invalidation(
+            &at_most_one_key(role)?,
+            AT_MOST_ONE_QUANTITY,
+            target.window_start,
+            target.window_end,
+            target.id,
+        )
+    };
+
+    let first_withdrawal = withdrawal("sequential-first", &sequential_target)?;
+    let second_withdrawal = withdrawal("sequential-second", &sequential_target)?;
+    let racing_first = withdrawal("concurrent-first", &concurrent_target)?;
+    let racing_second = withdrawal("concurrent-second", &concurrent_target)?;
+
+    if racing_first.id == racing_second.id {
+        return Err(format!(
+            "the two withdrawals racing for record {target} derive one id ({id}), so the second \
+             would be an idempotent replay of the first rather than a second withdrawal, and a \
+             conforming backend would answer two acceptances",
+            target = concurrent_target.id,
+            id = racing_first.id,
+        ));
+    }
+    if first_withdrawal.id == second_withdrawal.id {
+        return Err(format!(
+            "the two sequential withdrawals of record {target} derive one id ({id}), so the \
+             second would be an idempotent replay of the first and a conforming backend would \
+             accept it",
+            target = sequential_target.id,
+            id = first_withdrawal.id,
+        ));
+    }
+
+    Ok(AtMostOneFixtures {
+        sequential_target,
+        first_withdrawal,
+        second_withdrawal,
+        concurrent_target,
+        racing_withdrawals: [racing_first, racing_second],
+    })
+}
+
+/// The idempotency key one role of this check's fixture submits under,
+/// keyed on the role name for the reason [`quantity_fixture`] gives.
+fn at_most_one_key(role: &str) -> Result<IdempotencyKey, String> {
+    IdempotencyKey::new(format!("{AT_MOST_ONE_INVALIDATION}-{role}"))
+        .map_err(|err| format!("the check's own idempotency key is invalid: {err}"))
+}
+
 /// A [`ContractViolation`] attributed to one check.
 ///
-/// The check name is a parameter rather than baked in. Three checks report
-/// through it and [`HARNESS_FAULT`] is a fourth caller, and the whole point
+/// The check name is a parameter rather than baked in. Five checks report
+/// through it and [`HARNESS_FAULT`] is a sixth caller, and the whole point
 /// of [`ContractViolation::check`] is that a violation says which assertion
 /// produced it — a helper that stamped one name on every report would
 /// quietly undo that.
