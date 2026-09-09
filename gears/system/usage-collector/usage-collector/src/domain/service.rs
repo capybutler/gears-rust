@@ -30,9 +30,9 @@ use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError};
 use usage_collector_sdk::{
     AggregationDimension, AggregationResult, ConflictReason, CreateUsageRecord, EntryType,
-    Invalidation, MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, RecordOrigin, TimeRange,
-    UsageCollectorError, UsageCollectorPluginError, UsageCollectorPluginSpecV1,
-    UsageCollectorPluginV1, UsageRecord, ValidationReason,
+    Invalidation, MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, NotFoundReason,
+    RecordOrigin, TimeRange, UsageCollectorError, UsageCollectorPluginError,
+    UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord, ValidationReason,
 };
 use uuid::Uuid;
 
@@ -304,39 +304,45 @@ fn observe_metadata_bytes(
 fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
     match err {
         UsageCollectorError::PermissionDenied { .. } => RecordErrorCategory::Authz,
-        // An unresolved `gts_type_id` (the Type Resolver's `DeclarationNotFound`)
-        // vs an `invalidates` naming a missing entry are both wire-tagged
-        // `resource_type: USAGE_RECORD_RESOURCE` now that types-registry owns
-        // the catalog — `resource_type` can no longer tell them apart. `name`
-        // still can: a resolved meter's `gts_type_id` never parses as a `Uuid`
-        // and an entry id always does, so that is the discriminator here.
+        // §3.11.5's `invalidation_rule` covers the copy, reference and
+        // at-most-one rules. The reference rule — an `invalidates` resolving
+        // to nothing — is a `NotFound`, and used to be unreachable from
+        // here: the variant carried no discriminator, so separating it from
+        // an ordinary missing entry meant matching a substring of
+        // caller-facing prose, and a bounded metric label classified that way
+        // stops matching the day the prose is reworded. `NotFoundReason` is
+        // the typed discriminator that closes it.
         //
-        // The uuid-named arm stays on semantics_violation and does NOT join
-        // the invalidation family, even though an unresolvable `invalidates`
-        // is the ADR's valid-reference rule. `NotFound` carries no typed
-        // reason (that is the variant's shape, not an omission), so the only
-        // thing separating it from `usage_record_not_found` is prose in
-        // `detail` — and classifying a metric label off a message string is
-        // how a label silently stops matching when the message is reworded.
-        // §3.11.5's `invalidation_rule` therefore under-counts by exactly
-        // this condition; the divergence is recorded rather than paid for
-        // with a fragile discriminator.
-        UsageCollectorError::NotFound { name, .. } if Uuid::parse_str(name).is_err() => {
-            RecordErrorCategory::UnknownUsageType
-        }
-        UsageCollectorError::NotFound { .. } => RecordErrorCategory::SemanticsViolation,
+        // `UsageRecordNotFound` and the wildcard share a body, and the
+        // explicit arm stays: it records that a missing entry is a decided
+        // classification rather than a case nobody considered, which is
+        // exactly what the wildcard cannot say.
+        #[allow(clippy::match_same_arms)]
+        UsageCollectorError::NotFound { reason, .. } => match reason {
+            NotFoundReason::DeclarationNotFound => RecordErrorCategory::UnknownUsageType,
+            NotFoundReason::InvalidationTargetNotFound => RecordErrorCategory::InvalidationRule,
+            NotFoundReason::UsageRecordNotFound => RecordErrorCategory::SemanticsViolation,
+            // `NotFoundReason` is `#[non_exhaustive]` and declared in another
+            // crate, so this arm is required. It counts a future lookup
+            // kind as `semantics_violation` — silently, which is the same
+            // failure mode the typed reason was added to remove. A new
+            // variant must therefore be reviewed against §3.11.5 and given
+            // an explicit arm above rather than left to fall here.
+            _ => RecordErrorCategory::SemanticsViolation,
+        },
         UsageCollectorError::InvalidArgument { reason, .. } => match reason {
             ValidationReason::UnknownMetadataKey | ValidationReason::MetadataValidation => {
                 RecordErrorCategory::MetadataSize
             }
             // Three of the gateway's five invalidation rules, the three that
-            // carry a typed reason: explicit reference (the half-shape the
-            // REST fold point refuses), no-invalidation-of-an-invalidation,
-            // and faithful copy. DESIGN §3.11.5 gives them a category of
-            // their own so a correction backlog is legible without reading
-            // `detail`. Valid reference is the fourth and is on
-            // `SemanticsViolation` for the reason above; reason code is the
-            // fifth and is enforced by the type, so it raises nothing.
+            // arrive as an `InvalidArgument`: explicit reference (the
+            // half-shape the REST fold point refuses),
+            // no-invalidation-of-an-invalidation, and faithful copy. DESIGN
+            // §3.11.5 gives them a category of their own so a correction
+            // backlog is legible without reading `detail`. Valid reference
+            // is the fourth and joins them from the `NotFound` arm above;
+            // reason code is the fifth and is enforced by the type, so it
+            // raises nothing.
             ValidationReason::InvalidationReferenceIncomplete
             | ValidationReason::InvalidationTargetNotRecord
             | ValidationReason::InvalidationFieldMismatch => RecordErrorCategory::InvalidationRule,
@@ -381,6 +387,16 @@ fn classify_query_result<T>(
         Err(UsageCollectorError::PermissionDenied { .. }) => {
             (RequestOutcome::Denied, QueryErrorCategory::Authz)
         }
+        // Collapsed deliberately, not by omission. The only `NotFoundReason`
+        // the query paths raise is `DeclarationNotFound`: both callers of
+        // this classifier are `list_usage_records` /
+        // `query_aggregated_usage_records`, which resolve the queried meter
+        // before dispatch, and the point read that raises
+        // `UsageRecordNotFound` is not instrumented through here at all.
+        // `unknown_usage_type` is defined as exactly that resolver failure
+        // (see `QueryErrorCategory::UnknownUsageType`), so discriminating
+        // would add arms no query path can reach — and there is no query
+        // category a missing *entry* would land on anyway.
         Err(UsageCollectorError::NotFound { .. }) => {
             (RequestOutcome::Error, QueryErrorCategory::UnknownUsageType)
         }
@@ -494,6 +510,14 @@ fn unrestricted_read_filter() -> ast::Expr {
 /// is the gear's only by-id surface — a withdrawal is an ordinary
 /// ingested entry on the create path, not a second lookup-then-mutate
 /// operation — so this has one caller.
+///
+/// Reusing `usage_record_not_found` whole, `NotFoundReason` included, is
+/// the invariant and not an implementation detail. The collapsed denial
+/// must be byte-identical to a genuine miss on every channel a caller can
+/// read, and `NotFoundReason` is now one of those channels for an
+/// in-process consumer. Minting a distinct reason for the denial — however
+/// precise it looks — would restore exactly the oracle this function
+/// exists to deny.
 fn collapse_deny_to_not_found(
     err: impl Into<UsageCollectorError>,
     id: Uuid,

@@ -16,8 +16,8 @@
 
 use toolkit_macros::domain_model;
 use usage_collector_sdk::{
-    MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginError,
-    ValidationReason,
+    MeterTypeId, NotFoundReason, USAGE_RECORD_RESOURCE, UsageCollectorError,
+    UsageCollectorPluginError, ValidationReason,
 };
 use uuid::Uuid;
 
@@ -366,14 +366,19 @@ impl From<DomainError> for UsageCollectorError {
             // marker: `gts_type_id` is a `usage_record`-derived meter type,
             // and this gear declares no other GTS resource on its wire
             // surface now that types-registry owns the catalog.
+            // `reason` is bound as `why` — matching `declaration_incomplete`'s
+            // own parameter — so it does not read as the typed
+            // `NotFoundReason` set four lines below it. The domain field is
+            // prose; the SDK field is a discriminator.
             DomainError::DeclarationNotFound {
                 gts_type_id,
-                reason,
+                reason: why,
             } => {
-                let detail = format!("GTS type `{gts_type_id}` {reason}");
+                let detail = format!("GTS type `{gts_type_id}` {why}");
                 Self::NotFound {
                     resource_type: USAGE_RECORD_RESOURCE.to_owned(),
                     name: gts_type_id,
+                    reason: NotFoundReason::DeclarationNotFound,
                     detail,
                 }
             }

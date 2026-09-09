@@ -48,5 +48,5 @@ pub use models::{
     is_keyset_safe_record_field,
 };
 pub use plugin_api::UsageCollectorPluginV1;
-pub use reason::{ConflictReason, ValidationReason};
+pub use reason::{ConflictReason, NotFoundReason, ValidationReason};
 pub use time_range::TimeRange;

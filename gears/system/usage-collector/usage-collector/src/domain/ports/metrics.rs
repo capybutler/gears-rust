@@ -335,22 +335,28 @@ pub enum RecordErrorCategory {
     /// refuses, and the metadata-adjacent validation reasons that are not
     /// the closed-shape or size-cap pair below.
     ///
-    /// It also carries **one** invalidation rule, which
-    /// [`Self::InvalidationRule`] therefore does not: an `invalidates` that
-    /// resolves to nothing. That rejection is a `NotFound`, which carries
-    /// no typed reason, so nothing but `detail` prose separates it from an
-    /// entry id that resolves to nothing — and a plugin's own
-    /// `UsageRecordNotFound` reaches the same arm. See
-    /// `crate::domain::service`'s `classify_record_error`.
+    /// It also carries a lookup that resolved to nothing without being an
+    /// invalidation rule: an entry id the store does not hold. On the
+    /// ingestion path that is the residual case, **not** the documented
+    /// flow — a plugin's `UsageRecordNotFound` from the invalidation-target
+    /// lookup is converted at the fan-out and counts as
+    /// [`Self::InvalidationRule`], so an operator triaging a
+    /// record-not-found during ingest looks there first. Only a
+    /// `UsageRecordNotFound` raised from some other SPI call, which is a
+    /// misbehaving plugin, lands here. The two share the `NotFound`
+    /// variant and are separated by the typed `NotFoundReason`, not by
+    /// `detail` prose. See `crate::domain::service`'s
+    /// `classify_record_error`.
     SemanticsViolation,
     /// An invalidation rejected against the entry it withdraws. DESIGN
-    /// §3.11.5 gives it "the copy, reference and at-most-one rules alone";
-    /// this carries the copy and at-most-one rules whole, and the
-    /// **typed half** of the reference rule — a target that is itself an
-    /// invalidation, and a half-shaped reference from the REST fold point.
-    /// The untyped half, a reference resolving to nothing, is on
-    /// [`Self::SemanticsViolation`] for the reason stated there, so this
-    /// series under-counts the reference rule by exactly that condition.
+    /// §3.11.5 gives it "the copy, reference and at-most-one rules alone",
+    /// and this carries all three: the copy rule, the at-most-one rule, and
+    /// the reference rule whole — a target that is itself an invalidation,
+    /// a half-shaped reference from the REST fold point, and a reference
+    /// that resolves to nothing. The last of those is a `NotFound` and used
+    /// to fall to [`Self::SemanticsViolation`] for want of a discriminator;
+    /// `usage_collector_sdk::NotFoundReason` supplies one, so the series no
+    /// longer under-counts the reference rule.
     ///
     /// A period-bound rejection is not an invalidation rule for either
     /// entry type, because the bound belongs to the path rather than to the

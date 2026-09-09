@@ -1,13 +1,21 @@
 //! Typed `reason` discriminators carried by the compacted
 //! [`crate::UsageCollectorError`] category variants.
 //!
-//! A typed view over
-//! the stable `SCREAMING_SNAKE` wire codes, with `from_wire` / `as_wire`
-//! round-trips and an [`Unknown`](ValidationReason::Unknown) catch-all that
-//! preserves any future code verbatim. The host-side lift in
+//! Most of them are typed views over the stable `SCREAMING_SNAKE` wire
+//! codes, with `from_wire` / `as_wire` round-trips and an
+//! [`Unknown`](ValidationReason::Unknown) catch-all that preserves any
+//! future code verbatim. The host-side lift in
 //! `usage-collector::infra::sdk_error_mapping` projects each onto the
 //! RFC-9457 `Problem` (`field_violations[].reason` for [`ValidationReason`],
 //! `context.reason` for [`ConflictReason`]).
+//!
+//! [`NotFoundReason`] is the exception: it is **not projected onto the
+//! wire**, because the platform-shared
+//! `toolkit_canonical_errors::NotFoundV1` context has no reason slot for it
+//! to land in. It therefore carries no wire constants and no round-trip,
+//! and serves in-process consumers and the gear's own classification. Read
+//! its own documentation before treating anything in this module as
+//! uniformly wire-facing.
 
 use core::fmt;
 
@@ -234,6 +242,87 @@ impl fmt::Display for ConflictReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_wire())
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// NotFoundReason — 404. In-process only; NOT projected onto the wire.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Which lookup failed, on [`crate::UsageCollectorError::NotFound`].
+///
+/// **Not projected onto the wire, and deliberately not.** An in-process SDK
+/// consumer — one resolving [`crate::api::UsageCollectorClientV1`] through
+/// `ClientHub` — reads this discriminator directly. A REST client does not,
+/// and tells the three cases apart only by `detail` prose. So unlike
+/// [`ValidationReason`] and [`ConflictReason`] these have no
+/// `SCREAMING_SNAKE` constants, no `from_wire` / `as_wire`, and never
+/// appear on a `Problem` body.
+///
+/// Projecting it is a two-part change and the first part is not this
+/// gear's. `toolkit_canonical_errors::NotFoundV1` is an **empty,
+/// platform-shared** context struct with no reason path at all, and the
+/// canonical builder constructs it with none — so every gear's 404 is in
+/// the same position, and a slot has to exist there first. Only then does
+/// the gear's half apply: `usage-collector-v1.yaml` already declares the
+/// 404 `context` as `additionalProperties: true`, so the schema does not
+/// forbid a reason, but its prose enumerates the three categories that
+/// carry one and would have to name 404 as a fourth. Reading the YAML
+/// alone suggests the work is already done; it is not.
+///
+/// What it exists for is the gear's own classification. §3.11.5's
+/// `invalidation_rule` covers "the copy, reference and at-most-one rules",
+/// and the reference rule — an `invalidates` resolving to nothing — is a
+/// `NotFound`. Without a discriminator the only thing separating it from an
+/// ordinary missing entry is the message string, and classifying a bounded
+/// metric label by substring match on caller-facing prose is how a label
+/// stops matching silently when the prose is reworded.
+///
+/// `#[non_exhaustive]` for a different reason than the wire enums, which
+/// need it because unmodeled values arrive at runtime — hence their
+/// `Unknown(String)`. This has no external producer; the value is that the
+/// SDK can add a variant in a minor release without breaking a matcher.
+/// The cost is real and points the same way this type was added to fix: a
+/// consumer's wildcard arm silently absorbs the new kind, and the gear's
+/// own wildcard in `classify_record_error` counts it as
+/// `semantics_violation`. A new variant must therefore be reviewed against
+/// DESIGN §3.11.5 and given an explicit arm, not left to the wildcard.
+// The shared `NotFound` postfix is the point: each variant is named for the
+// error it lifts from (`DomainError::DeclarationNotFound`,
+// `UsageCollectorPluginError::UsageRecordNotFound`, and the invalidation
+// target check), so a reader can follow a reason back to its origin by name.
+// Renaming to satisfy `enum_variant_names` would sever that.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NotFoundReason {
+    /// A `gts_type_id` that does not resolve to a usable declaration —
+    /// the Type Resolver's `DeclarationNotFound`, whether the registry
+    /// never declared it or the declaration was rejected as incomplete.
+    DeclarationNotFound,
+    /// A lookup named a `UsageRecord.id` that did not resolve. Three
+    /// producers, and the third is why this variant must stay one variant:
+    ///
+    /// - the by-id point read, when the store genuinely holds no such row;
+    /// - a plugin's own `UsageRecordNotFound` raised from an SPI call
+    ///   other than the invalidation-target lookup (that one is converted
+    ///   to [`Self::InvalidationTargetNotFound`] at the fan-out);
+    /// - a **PDP denial on the by-id point read**, collapsed into this
+    ///   exact reason by the host so the surface is not an existence
+    ///   oracle. There the row may well exist.
+    ///
+    /// The collapsed denial and the genuine miss are indistinguishable on
+    /// purpose. Splitting them off into a variant of their own — however
+    /// it is spelled, and however precise it looks — hands every
+    /// in-process consumer the oracle the collapse exists to deny. Do not
+    /// do it.
+    UsageRecordNotFound,
+    /// An invalidation's `invalidates` resolved to nothing. The
+    /// valid-reference rule of
+    /// `cpt-cf-usage-collector-adr-append-only-invalidation`. A plugin's
+    /// `UsageRecordNotFound` from the target lookup is converted to this
+    /// at the ingestion fan-out, so on the ingest path it is this reason,
+    /// not [`Self::UsageRecordNotFound`], that the target check raises.
+    InvalidationTargetNotFound,
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 //! tests exercise the plugin->domain and domain->SDK directions only.
 
 use usage_collector_sdk::{
-    ConflictReason, MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError,
+    ConflictReason, MeterTypeId, NotFoundReason, USAGE_RECORD_RESOURCE, UsageCollectorError,
     UsageCollectorPluginError, ValidationReason,
 };
 
@@ -181,10 +181,12 @@ fn plugin_usage_record_not_found_lifts_to_sdk_not_found() {
         UsageCollectorError::NotFound {
             resource_type,
             name,
+            reason,
             ..
         } => {
             assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
             assert_eq!(name, id.to_string());
+            assert_eq!(reason, NotFoundReason::UsageRecordNotFound);
         }
         other => panic!("expected NotFound, got {other:?}"),
     }
@@ -296,10 +298,12 @@ fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_record_resource
         UsageCollectorError::NotFound {
             resource_type,
             name,
+            reason,
             detail,
         } => {
             assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
             assert_eq!(name, id.as_str());
+            assert_eq!(reason, NotFoundReason::DeclarationNotFound);
             assert!(detail.contains(id.as_str()));
             assert!(detail.contains("is not declared"));
         }

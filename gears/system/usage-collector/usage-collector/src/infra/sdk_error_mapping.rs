@@ -186,9 +186,26 @@ fn lift_common(err: UsageCollectorError) -> CanonicalError {
         }
 
         // ---- 404 NotFound ----
+        // `reason` is dropped, by design. `toolkit_canonical_errors`'
+        // `NotFoundV1` context is an empty, platform-shared struct with no
+        // reason path, and the canonical builder constructs it with none —
+        // every gear's 404 is in the same position, so there is nothing
+        // here to project onto. A reader looking for the reason on the
+        // `Problem` body will not find it: a REST client separates a
+        // missing declaration, a missing entry and an unresolvable
+        // `invalidates` by `detail` alone. In-process consumers read the
+        // typed `NotFoundReason` off the SDK error instead.
+        //
+        // Changing that starts upstream, in `NotFoundV1`, not here and not
+        // in the gear's YAML — whose 404 `context` is already
+        // `additionalProperties: true`, so it looks permissive while the
+        // slot it would carry does not exist. The gear's half is the
+        // second half: the spec prose enumerating which categories carry a
+        // reason would have to name 404 as well.
         E::NotFound {
             resource_type,
             name,
+            reason: _,
             detail,
         } => {
             if resource_type == USAGE_RECORD_RESOURCE {

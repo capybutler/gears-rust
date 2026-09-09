@@ -6,8 +6,8 @@
 //!   [`crate::api::UsageCollectorClientV1`] method. A flat, AIP-193-shaped
 //!   set of **eight category variants**: the discriminator
 //!   inside a category is normally a typed [`crate::reason`] sub-enum
-//!   ([`ValidationReason`] / [`ConflictReason`]) rather than a dedicated
-//!   variant per failure. The exception is
+//!   ([`ValidationReason`], [`ConflictReason`], [`NotFoundReason`]) rather
+//!   than a dedicated variant per failure. The exception is
 //!   [`UsageCollectorError::CursorRejected`], the one 400 whose wire code
 //!   belongs to `toolkit_odata` rather than to this gear (Spec §3.13): it
 //!   is a dedicated variant, its discriminator is the upstream
@@ -18,9 +18,13 @@
 //!
 //! This crate does NOT depend on `toolkit-canonical-errors`; the host crate
 //! owns the lift to RFC-9457 `Problem` at the REST boundary. The category +
-//! typed reason + `resource_type` carried here are exactly what the lift
-//! projects onto the canonical envelope, so callers dispatch on the variant
-//! (and, within a category, the typed reason) rather than parsing strings.
+//! typed reason + `resource_type` carried here are what the lift projects
+//! onto the canonical envelope, so callers dispatch on the variant (and,
+//! within a category, the typed reason) rather than parsing strings — with
+//! one reason deliberately held back from the wire: [`NotFoundReason`]
+//! reaches in-process consumers but is not projected, because the
+//! platform-shared `toolkit_canonical_errors::NotFoundV1` context has no
+//! reason slot to project it onto.
 //! `CursorRejected` is again the exception on both counts: the lift reads
 //! its wire `field` and `reason` off the upstream error and supplies the
 //! `USAGE_RECORD_RESOURCE` scope itself, since the variant has none to
@@ -33,7 +37,7 @@ use uuid::Uuid;
 
 use crate::gts::USAGE_RECORD_RESOURCE;
 use crate::models::{BACKFILL_ROUTE_PATH, MeterTypeId, WINDOW_END_FIELD};
-use crate::reason::{ConflictReason, ValidationReason};
+use crate::reason::{ConflictReason, NotFoundReason, ValidationReason};
 
 /// Renders an instant the way a caller-facing `detail` must echo it: RFC
 /// 3339, matching the wire `Timestamp` contract.
@@ -126,13 +130,22 @@ pub enum UsageCollectorError {
     },
 
     /// Referenced resource not found (HTTP 404). `resource_type` is the GTS
-    /// type, `name` the raw identifier (a `gts_type_id` or a record UUID).
+    /// type, `name` the raw identifier (a `gts_type_id` or a record UUID),
+    /// and `reason` says which lookup failed.
     #[error("not found [{resource_type}]: {detail}")]
     NotFound {
         /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
         /// Raw identifier whose row was not present.
         name: String,
+        /// Which lookup failed. **Not projected onto the wire:** an
+        /// in-process consumer reads it, but the platform-shared
+        /// `toolkit_canonical_errors::NotFoundV1` context has no reason
+        /// slot, so the host lift drops it and a REST client still tells
+        /// the cases apart only by `detail`. It exists so the gear can
+        /// classify its own metric labels without matching a substring of
+        /// caller-facing prose.
+        reason: NotFoundReason,
         /// Wire `detail` message.
         detail: String,
     },
@@ -719,6 +732,7 @@ impl UsageCollectorError {
         Self::NotFound {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             name: id.to_string(),
+            reason: NotFoundReason::UsageRecordNotFound,
             detail: format!("usage record not found: {id}"),
         }
     }
@@ -726,18 +740,18 @@ impl UsageCollectorError {
     /// An invalidation's `invalidates` resolved to nothing.
     ///
     /// `NotFound` rather than a conflict: the reference names an entry the
-    /// ledger does not hold. `name` carries the target uuid, which is what
-    /// separates this from the other `NotFound` a submission can raise —
-    /// an unresolvable meter names a `gts_type_id`, and a `gts_type_id`
-    /// never parses as a [`Uuid`] while an entry id always does. A
-    /// consumer telling the two apart has only `name` to do it with,
-    /// because the category carries no wire `context.reason`; the `detail`
-    /// text carries the human distinction.
+    /// ledger does not hold. `name` carries the target uuid, and
+    /// [`NotFoundReason::InvalidationTargetNotFound`] is what separates this
+    /// in-process from the other `NotFound` a submission can raise. That
+    /// discriminator does not reach the wire — the 404 envelope has no
+    /// `context.reason` slot — so a *client* telling the cases apart still
+    /// has only the `detail` text to do it with.
     #[must_use]
     pub fn invalidation_target_not_found(target: Uuid) -> Self {
         Self::NotFound {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             name: target.to_string(),
+            reason: NotFoundReason::InvalidationTargetNotFound,
             detail: format!("invalidates {target} does not reference an existing usage record"),
         }
     }

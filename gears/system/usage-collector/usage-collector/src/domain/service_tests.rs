@@ -1179,6 +1179,7 @@ mod invalidation_target_batch_tests {
                     resource_type,
                     name,
                     detail,
+                    ..
                 }) if resource_type == USAGE_RECORD_RESOURCE => {
                     assert_eq!(
                         name,
@@ -2314,7 +2315,7 @@ mod create_usage_record_path_tests {
         assert!(
             matches!(
                 err,
-                UsageCollectorError::NotFound { ref resource_type, ref name, ref detail }
+                UsageCollectorError::NotFound { ref resource_type, ref name, ref detail, .. }
                     if resource_type == USAGE_RECORD_RESOURCE
                         && name == &missing.to_string()
                         && detail.contains(&missing.to_string())

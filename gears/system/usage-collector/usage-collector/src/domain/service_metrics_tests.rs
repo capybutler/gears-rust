@@ -17,8 +17,8 @@ use toolkit_gts::gts_id;
 use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo};
 use usage_collector_sdk::{
     AggregationBucket, AggregationResult, CreateUsageRecord, IdempotencyKey, Invalidation,
-    MetadataKey, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, UsageCollectorError,
-    UsageRecord,
+    MetadataKey, MeterTypeId, NotFoundReason, ReasonCode, RecordOrigin, ResourceRef,
+    USAGE_RECORD_RESOURCE, UsageCollectorError, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -1209,18 +1209,18 @@ fn classify_record_error_maps_each_arm() {
             unresolved_type_not_found(),
             RecordErrorCategory::UnknownUsageType,
         ),
-        // A uuid-named NotFound stays with the semantics family — NOT
-        // folded into catalog absence, and NOT into the invalidation
-        // family either: `NotFound` carries no typed reason, so an
-        // unresolvable `invalidates` and an unresolvable entry id are the
-        // same shape here and only `detail` prose separates them.
+        // The other two `NotFoundReason`s. Both name a uuid, which is why
+        // the old `name`-parsing discriminator could not separate them and
+        // the invalidation reference rule was unreachable; the typed reason
+        // splits them (see
+        // `not_found_classifies_by_typed_reason_not_by_parsing_the_name`).
         (
             UsageCollectorError::usage_record_not_found(Uuid::from_u128(7)),
             RecordErrorCategory::SemanticsViolation,
         ),
         (
             UsageCollectorError::invalidation_target_not_found(Uuid::from_u128(8)),
-            RecordErrorCategory::SemanticsViolation,
+            RecordErrorCategory::InvalidationRule,
         ),
         // The two metadata reasons are the ONLY InvalidArgument arms that map to
         // metadata_size; any other validation reason is semantics_violation.
@@ -1299,6 +1299,56 @@ fn classify_record_error_maps_each_arm() {
             "misclassified {err:?}"
         );
     }
+}
+
+/// An unresolvable `invalidates` is an invalidation-rule rejection.
+///
+/// DESIGN §3.11.5 gives `invalidation_rule` "the copy, reference and
+/// at-most-one rules". The reference rule is the one that used to be
+/// unreachable: it surfaces as `NotFound`, which carried no typed reason, so
+/// nothing but `detail` prose separated it from an ordinary
+/// `usage_record_not_found` — and a plugin's own `UsageRecordNotFound`
+/// reaches the same variant. A bounded metric label classified by substring
+/// match on a caller-facing string stops matching the day the string is
+/// reworded, so the code declined to guess and the label under-counted.
+///
+/// The three cases are asserted together because the discriminator is what
+/// is under test: any one alone passes against a function that returns a
+/// constant. All three carry the same uuid `name` on purpose, including
+/// the `DeclarationNotFound` one — a pairing production never mints, built
+/// here precisely so the retired `Uuid::parse_str(name)` discriminator and
+/// the typed reason disagree about it. A case with a gts-shaped `name`
+/// would be green under both and prove nothing this test is named for.
+#[test]
+fn not_found_classifies_by_typed_reason_not_by_parsing_the_name() {
+    let target = Uuid::new_v4();
+
+    assert_eq!(
+        classify_record_error(&UsageCollectorError::invalidation_target_not_found(target)),
+        RecordErrorCategory::InvalidationRule,
+        "an `invalidates` resolving to nothing is the ADR's valid-reference \
+         rule and belongs with the other invalidation rules",
+    );
+    assert_eq!(
+        classify_record_error(&UsageCollectorError::usage_record_not_found(target)),
+        RecordErrorCategory::SemanticsViolation,
+        "an ordinary missing entry is not an invalidation rule, and it carries \
+         a uuid `name` exactly like the case above, which is why parsing \
+         `name` could never separate them",
+    );
+    assert_eq!(
+        classify_record_error(&UsageCollectorError::NotFound {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            name: target.to_string(),
+            reason: NotFoundReason::DeclarationNotFound,
+            detail: "GTS type not declared".to_owned(),
+        }),
+        RecordErrorCategory::UnknownUsageType,
+        "the reason decides the category and the `name` does not: the \
+         retired discriminator read a uuid `name` as an ordinary missing \
+         entry and would have counted this as semantics_violation, so this \
+         is the one case of the three that separates the two rules",
+    );
 }
 
 #[test]

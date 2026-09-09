@@ -172,17 +172,18 @@ fn idempotency_conflict_maps_to_409_aborted() {
 #[test]
 fn invalidation_target_not_found_maps_to_404_naming_the_target_uuid() {
     // An unresolvable `invalidates` collapses into the plain record
-    // `NotFound` (404), which carries no machine reason — the canonical
-    // `NotFound` context has no reason slot, so the `detail` text carries
-    // the human distinction and `resource.name` carries the target uuid.
-    // The uuid on `name` is load-bearing beyond diagnostics: the service's
-    // `classify_record_error` tells this apart from an unresolvable meter
-    // by whether `name` parses as a `Uuid`.
+    // `NotFound` (404). The variant now carries a typed `NotFoundReason`,
+    // but the canonical 404 context has no reason slot, so the lift drops
+    // it deliberately and nothing machine-readable distinguishes the three
+    // 404 cases on the wire — the `detail` text carries the human
+    // distinction and `resource.name` carries the target uuid. That the
+    // reason is absent from the `Problem` is asserted below, and is the
+    // remainder `DIVERGENCES.md` entry 9 keeps recorded.
     let target = Uuid::from_u128(0xDEAD_BEEF);
     assert_eq!(
         lift_record(UsageCollectorError::invalidation_target_not_found(target)).resource_name(),
         Some(target.to_string().as_str()),
-        "the target uuid on `name` is what `classify_record_error` parses",
+        "the 404 names the caller-supplied target uuid on `resource.name`",
     );
     let problem =
         usage_record_error_to_problem(UsageCollectorError::invalidation_target_not_found(target));
