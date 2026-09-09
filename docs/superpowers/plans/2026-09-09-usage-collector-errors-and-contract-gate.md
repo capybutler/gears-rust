@@ -1313,6 +1313,14 @@ cargo nextest run -p cf-gears-usage-collector-sdk \
 Expected: FAIL — `from_wire("INVALID_CURSOR")` still returns
 `ValidationReason::InvalidCursor`.
 
+> **One stale doc rides along with the deletion.** `reason.rs:49-52`'s
+> `INVALID_CURSOR` doc says the code is emitted "by `toolkit_odata`'s own cursor
+> decode path **and by the read path's keyset floor**". The second half stopped
+> being true when Task 4 re-pointed the constructors, and Task 4 deliberately
+> left it because this task deletes the const outright. Confirm the whole doc
+> block goes with the const rather than being orphaned onto something else — and
+> if you find you are *keeping* any of that prose, fix the claim first.
+
 - [ ] **Step 3: Delete**
 
 From `reason.rs`, remove:
