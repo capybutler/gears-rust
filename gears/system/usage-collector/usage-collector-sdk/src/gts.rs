@@ -6,7 +6,7 @@ use toolkit_gts::gts_type_schema;
 
 /// Canonical GTS resource type for the **ingestion** surface — the wire
 /// `resource_type` carried by [`crate::UsageCollectorError`] envelopes about
-/// a usage record (`create` / `get` / `list` / `aggregate`).
+/// a usage record (`create` / `backfill` / `get` / `list` / `aggregate`).
 pub const USAGE_RECORD_RESOURCE: &str = gts_id!("cf.core.uc.usage_record.v1~");
 
 /// GTS plugin specification for usage-collector storage backends.

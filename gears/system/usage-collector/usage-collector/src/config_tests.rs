@@ -1,9 +1,11 @@
 //! Unit tests for the `[usage_collector]` configuration surface.
 //!
-//! Only the vendor binding and serde posture (`#[serde(default,
-//! deny_unknown_fields)]`) are exercised here; the metric catalog is plugin-
-//! owned under ADR-0012, so there is no host-side declared-catalog surface
-//! left to test.
+//! Only the vendor binding, the covered-period bounds and the serde posture
+//! (`#[serde(default, deny_unknown_fields)]`) are exercised here.
+//! `types-registry` owns every usage-type declaration and this gear
+//! registers no usage-type surface
+//! (`cpt-cf-usage-collector-adr-registry-owned-typing`), so there is no
+//! host-side declared-catalog surface left to test.
 
 use super::*;
 

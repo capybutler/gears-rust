@@ -24,8 +24,9 @@ use usage_collector_sdk::{USAGE_RECORD_RESOURCE, UsageCollectorError};
 pub(crate) struct UsageRecordResource;
 
 /// Lift the SDK error envelope onto the AIP-193 canonical shape for the
-/// usage-record REST surface — the four routes this gear registers:
+/// usage-record REST surface — the five routes this gear registers:
 /// `POST /usage-collector/v1/records` (single and batch alike),
+/// `POST /usage-collector/v1/records/backfill`,
 /// `GET /usage-collector/v1/records`,
 /// `POST /usage-collector/v1/records/aggregate` and
 /// `GET /usage-collector/v1/records/{id}`. Use this from

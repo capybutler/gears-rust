@@ -1233,10 +1233,13 @@ fn classify_record_error_maps_each_arm() {
             RecordErrorCategory::MetadataSize,
         ),
         // The `InvalidArgument` catch-all, held by a live reason rather than
-        // by prose. Five reasons reach it from a constructor in this
+        // by prose. Seven reasons reach it from a constructor in this
         // workspace — `Validation`, `InvalidCursor`, `FilterMismatch`,
-        // `InvalidBaseGtsId` and `AggregationResultTooLarge` — and
-        // `InvalidCursor` stands for all five. `SemanticsViolation` is NOT
+        // `InvalidBaseGtsId`, `AggregationResultTooLarge`, `FutureWindow`
+        // and `PastWindow` — and `InvalidCursor` stands for all seven; the
+        // last two are the covered-period bounds, which DESIGN §3.11.5
+        // assigns to a `validation` category the gear does not emit (see
+        // `DIVERGENCES.md` entry 9). `SemanticsViolation` is NOT
         // among them: the variant is reserved and no constructor produces
         // it (see `usage_collector_sdk::reason`). Without a case here a
         // mutation of that arm passes, because every other
