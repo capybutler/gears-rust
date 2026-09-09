@@ -821,7 +821,7 @@ label — correctly, since routes and fields really are gone.
 
 It is also **the last artifact anywhere on this branch that tells a consumer a
 persisted entry can be mutated.** In code the append-only invariant is total
-(verified against the SDK trait, the SPI, the four registered routes, every
+(verified against the SDK trait, the SPI, the five registered routes, every
 service dispatch, and the absence of any `&mut UsageRecord`); the published
 contract is the one place still saying otherwise.
 
