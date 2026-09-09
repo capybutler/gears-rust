@@ -680,43 +680,6 @@ async fn pg_aggregate_avg_rounds_non_terminating_quotient() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_excludes_inactive() {
-    let (_h, store) = setup().await;
-    let tenant = Uuid::from_u128(0x3005);
-
-    // Two active rows summing 10 + 5; deactivate the 10 row.
-    let mut keep = record_at(VCPU_GTS, tenant, 0x3005_0001, 0);
-    keep.value = Decimal::new(5, 0);
-    let mut drop_row = record_at(VCPU_GTS, tenant, 0x3005_0002, 1);
-    drop_row.value = Decimal::new(10, 0);
-    let drop_id = drop_row.id;
-    store.create(keep).await.expect("create keep");
-    store.create(drop_row).await.expect("create drop");
-    store.deactivate(drop_id).await.expect("deactivate drop");
-
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: Vec::new(),
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("aggregate excludes inactive");
-
-    assert_eq!(result.buckets.len(), 1, "empty group_by -> one bucket");
-    assert_eq!(
-        result.buckets[0].value,
-        Some(BigDecimal::from(5_i64)),
-        "SUM counts only the active row (5); the deactivated 10 is excluded"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_subject_ref_round_trips_through_create_and_get() {
     let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3006);

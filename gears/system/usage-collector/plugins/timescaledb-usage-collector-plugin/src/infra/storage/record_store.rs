@@ -1,7 +1,7 @@
 //! Postgres-backed [`RecordStore`] over the `usage_records` hypertable.
 //!
-//! All operations — `create` / `create_batch` / `get` / `list` / `aggregate` /
-//! `deactivate` — are real `sqlx`.
+//! All operations — `create` / `create_batch` / `get` / `list` / `aggregate` —
+//! are real `sqlx`.
 
 // Vendored TimescaleDB raw-SQL backend: `sqlx` is required infra (hypertable
 // time-series, `time_bucket` aggregation, keyset pagination — see DESIGN.md). Tenant
@@ -21,7 +21,7 @@ use rand::RngExt as _;
 use rust_decimal::Decimal;
 use sqlx::AssertSqlSafe;
 use sqlx::pool::PoolConnection;
-use sqlx::{Connection, PgPool, Postgres, Row};
+use sqlx::{PgPool, Postgres, Row};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
@@ -1321,77 +1321,6 @@ impl RecordStore for PgRecordStore {
 
         // `_timer` records `query.duration` on drop (success and error alike).
         Ok(AggregationResult { buckets })
-    }
-
-    /// Deactivate a record and its depth-1 active compensations in one
-    /// transaction (§3.6 deactivate-cascade).
-    ///
-    /// Locks the target row `FOR UPDATE` and reads its `status`: a missing row
-    /// is `UsageRecordNotFound`, an already-`inactive` row is
-    /// `UsageRecordAlreadyInactive`. An `active` target and every `active` row
-    /// whose `corrects_id` points at it (depth-1 only) flip to `inactive` in a
-    /// single `UPDATE`. The transition is one-way and mutates no other column;
-    /// rows already `inactive` and unrelated rows are untouched.
-    ///
-    /// `WHERE id = $1` addresses one logical record. The schema does not carry a
-    /// plain `UNIQUE (id)` (a hypertable UNIQUE must include the `created_at`
-    /// partition key, so only the composite PK `(id, created_at)` and the dedup
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` UNIQUE exist), but `id`
-    /// is a `UUIDv5` of that full 4-tuple (ADR-0014), so each stored row carries
-    /// a distinct `id` and this `UPDATE` flips at most one row.
-    // @cpt-flow:cpt-cf-uc-plugin-seq-deactivate-cascade:p2
-    async fn deactivate(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        // Time the full deactivation cascade; the drop-timer records the
-        // duration on every return — including the not-found / already-inactive
-        // and error arms — not just on a successful commit.
-        let _timer = OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Deactivate);
-        let mut conn = self.timed_acquire().await?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
-
-        // Lock + read the target's status. Since `id` is a `UUIDv5` of the full
-        // 4-tuple dedup key including `created_at` (ADR-0014), each stored row
-        // carries a distinct `id`, so this locks the single addressed row and
-        // the `WHERE id = $1` UPDATE below flips exactly that row.
-        let status = sqlx::query_scalar::<_, String>(
-            "SELECT status FROM usage_records WHERE id = $1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| self.record_backend_error(&e))?;
-
-        match status {
-            None => {
-                tx.rollback().await.ok();
-                return Err(UsageCollectorPluginError::UsageRecordNotFound { id });
-            }
-            Some(s) if s == "inactive" => {
-                tx.rollback().await.ok();
-                return Err(UsageCollectorPluginError::UsageRecordAlreadyInactive { id });
-            }
-            Some(_) => {}
-        }
-
-        // Flip the target and its depth-1 active compensations. One-way; the
-        // `status = 'active'` guard on the compensations keeps already-inactive
-        // children untouched and bounds the cascade to a single level.
-        sqlx::query(
-            "UPDATE usage_records SET status = 'inactive' \
-             WHERE id = $1 OR (corrects_id = $1 AND status = 'active')",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| self.record_backend_error(&e))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
-        // `_timer` records `deactivate.duration` on drop.
-        Ok(())
     }
 }
 

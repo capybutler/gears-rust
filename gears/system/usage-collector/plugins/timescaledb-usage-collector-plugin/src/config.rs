@@ -75,11 +75,11 @@ pub struct TimescaleDbPluginConfig {
     pub connection_timeout_secs: u64,
     /// Per-statement timeout in seconds, applied as the Postgres
     /// `statement_timeout` GUC on every request-path pool connection. Bounds how
-    /// long a single query (a hypertable list/aggregate scan, an ingest, a
-    /// deactivate) may run so a wedged backend cannot pin a pool connection
-    /// indefinitely and exhaust the pool. Must be `> 0`: Postgres treats
-    /// `statement_timeout = 0` as *disabled*, which would reintroduce the
-    /// unbounded-query footgun.
+    /// long a single query (a hypertable list/aggregate scan, a single-row
+    /// ingest, a multi-row batch write) may run so a wedged backend cannot pin
+    /// a pool connection indefinitely and exhaust the pool. Must be `> 0`:
+    /// Postgres treats `statement_timeout = 0` as *disabled*, which would
+    /// reintroduce the unbounded-query footgun.
     pub statement_timeout_secs: u64,
     /// `usage_records` retention window in seconds; chunks wholly older are dropped.
     pub retention_period_secs: u64,

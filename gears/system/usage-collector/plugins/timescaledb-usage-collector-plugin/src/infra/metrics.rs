@@ -151,8 +151,6 @@ pub struct Metrics {
     insert_duration: Histogram<f64>,
     /// `uc_timescaledb_query_duration_seconds` — labelled by `query_kind`.
     query_duration: Histogram<f64>,
-    /// `uc_timescaledb_deactivate_duration_seconds`.
-    deactivate_duration: Histogram<f64>,
     /// `uc_timescaledb_pool_acquire_duration_seconds`.
     pool_acquire_duration: Histogram<f64>,
     /// `uc_timescaledb_batch_rows` — row-count distribution per batch write.
@@ -222,11 +220,6 @@ impl Metrics {
         let query_duration = meter
             .f64_histogram("uc_timescaledb_query_duration_seconds")
             .with_description("Duration of usage-record queries, by kind")
-            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
-            .build();
-        let deactivate_duration = meter
-            .f64_histogram("uc_timescaledb_deactivate_duration_seconds")
-            .with_description("Duration of the event-deactivation cascade")
             .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
             .build();
         let pool_acquire_duration = meter
@@ -306,7 +299,6 @@ impl Metrics {
         Self {
             insert_duration,
             query_duration,
-            deactivate_duration,
             pool_acquire_duration,
             batch_rows,
             dedup_absorbed,
@@ -336,11 +328,6 @@ impl Metrics {
     pub fn record_query(&self, kind: QueryKind, secs: f64) {
         self.query_duration
             .record(secs, &[KeyValue::new(label::QUERY_KIND, kind.as_label())]);
-    }
-
-    /// Record a deactivation-cascade duration (seconds).
-    pub fn record_deactivate(&self, secs: f64) {
-        self.deactivate_duration.record(secs, &[]);
     }
 
     /// Record a pool-acquire duration (seconds).
@@ -416,8 +403,6 @@ impl Metrics {
 pub enum TimedOp {
     /// `uc_timescaledb_query_duration_seconds`, labelled by the [`QueryKind`].
     Query(QueryKind),
-    /// `uc_timescaledb_deactivate_duration_seconds`.
-    Deactivate,
 }
 
 /// Records an operation-duration histogram on drop, so the duration is captured
@@ -451,7 +436,6 @@ impl Drop for OpDurationGuard {
         let secs = self.start.elapsed().as_secs_f64();
         match self.op {
             TimedOp::Query(kind) => self.metrics.record_query(kind, secs),
-            TimedOp::Deactivate => self.metrics.record_deactivate(secs),
         }
     }
 }

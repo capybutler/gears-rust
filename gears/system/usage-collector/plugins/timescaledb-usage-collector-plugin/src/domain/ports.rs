@@ -29,5 +29,4 @@ pub trait RecordStore: Send + Sync + 'static {
         metadata_filter: &[MetadataFilter],
         spec: AggregationSpec,
     ) -> Result<AggregationResult, UsageCollectorPluginError>;
-    async fn deactivate(&self, id: Uuid) -> Result<(), UsageCollectorPluginError>;
 }

@@ -2,8 +2,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 //! Regression test for ADR-0014: with `created_at` folded into the derived
 //! `id`, the same `(tenant_id, gts_id, idempotency_key)` at two different
-//! `created_at` values persists as two rows with DISTINCT ids, so `get` and
-//! `deactivate` each address exactly one. Requires Docker.
+//! `created_at` values persists as two rows with DISTINCT ids, so `get`
+//! addresses exactly one. Requires Docker.
 
 mod common;
 
@@ -11,7 +11,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
-use usage_collector_sdk::{UsageRecordStatus, derive_usage_record_id};
+use usage_collector_sdk::derive_usage_record_id;
 
 const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
 
@@ -72,17 +72,4 @@ async fn pg_same_key_different_created_at_are_distinct_and_addressable() {
     assert_eq!(g1.created_at, t1, "get(id1) must return the t1 row");
     let g2 = store.get(id2).await.expect("get row 2");
     assert_eq!(g2.created_at, t2, "get(id2) must return the t2 row");
-
-    // `deactivate` is surgical.
-    store.deactivate(id1).await.expect("deactivate row 1");
-    assert_eq!(
-        store.get(id1).await.expect("re-get row 1").status,
-        UsageRecordStatus::Inactive,
-        "row 1 must be inactive after deactivate(id1)",
-    );
-    assert_eq!(
-        store.get(id2).await.expect("re-get row 2").status,
-        UsageRecordStatus::Active,
-        "row 2 must remain active - deactivate(id1) must not touch it",
-    );
 }

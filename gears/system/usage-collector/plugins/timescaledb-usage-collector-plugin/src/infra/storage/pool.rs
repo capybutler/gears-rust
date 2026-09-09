@@ -65,15 +65,16 @@ fn is_plaintext(mode: PgSslMode) -> bool {
     matches!(mode, PgSslMode::Disable)
 }
 
-/// Fixed upper bound on how long a request-path statement waits to acquire a row
-/// lock (e.g. the deactivate `SELECT ... FOR UPDATE`). A contended lock then fails
-/// fast (`55P03 lock_not_available`) instead of blocking on — and pinning — a
-/// pooled connection.
+/// Fixed upper bound on how long a request-path statement waits on a contended
+/// lock — e.g. an ingest `INSERT ... ON CONFLICT ... DO NOTHING` that meets a
+/// not-yet-committed duplicate of the same dedup 4-tuple and blocks until that
+/// transaction resolves. The wait then fails fast (`55P03 lock_not_available`)
+/// instead of blocking on — and pinning — a pooled connection.
 const LOCK_TIMEOUT: &str = "5s";
 
 /// Session GUCs applied to every request-path pool connection at connect time,
 /// bounding how long a statement may run (`statement_timeout`, config-driven) and
-/// how long it waits on a row lock (`lock_timeout`, fixed [`LOCK_TIMEOUT`]) so a
+/// how long it waits on a contended lock (`lock_timeout`, fixed [`LOCK_TIMEOUT`]) so a
 /// wedged backend cannot pin pool connections indefinitely and exhaust the pool.
 /// Applied as `-c name=value` startup parameters so the bound holds from the
 /// connection's first query, with no extra round-trip.

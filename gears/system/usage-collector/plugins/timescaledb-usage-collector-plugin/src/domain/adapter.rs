@@ -67,8 +67,4 @@ impl UsageCollectorPluginV1 for StorageAdapter {
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
         self.record.list(gts_id, query, metadata_filter).await
     }
-
-    async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        self.record.deactivate(id).await
-    }
 }

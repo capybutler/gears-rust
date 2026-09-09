@@ -140,8 +140,8 @@ pub fn translate_record_filter<F: FilterField>(
     translate_filter(node, ctx, record_column)
 }
 
-/// Recursive walker, parameterized over the column allowlist so every
-/// identifier check funnels through one place.
+/// Recursive walker over the filter AST; identifiers resolve through `col`,
+/// which the single caller fixes to [`record_column`].
 fn translate_filter<F: FilterField>(
     node: &FilterNode<F>,
     ctx: &mut SqlCtx,
