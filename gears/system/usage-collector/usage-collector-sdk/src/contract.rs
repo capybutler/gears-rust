@@ -42,13 +42,24 @@
 //! previous one left; the fixtures are keyed so that a repeated run
 //! resubmits identical entries rather than colliding with different ones.
 //!
-//! # Five of seven
+//! # One of seven, and where the other six are
 //!
-//! DESIGN §3.3 tabulates seven checks. Two of them cannot be written
-//! against the SPI this gear declares, and they are named in
-//! [`BLOCKED_CHECKS`] — with what unblocks each — rather than silently
-//! omitted, so a passing run is never mistaken for a complete one. A caller
-//! reporting coverage should report that constant alongside the violations.
+//! DESIGN §3.3 tabulates seven checks. [`run_all`] currently runs the ones
+//! in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
+//! statement about the rest**. The other six are named, not omitted:
+//!
+//! * [`BLOCKED_CHECKS`] — cannot be written against the SPI this gear
+//!   declares, each with what unblocks it.
+//! * [`UNWRITTEN_CHECKS`] — writable today, not yet written.
+//!
+//! The three constants are asserted to partition DESIGN's seven exactly, so
+//! the split is a fact the test suite keeps rather than a paragraph that
+//! drifts: [`UNWRITTEN_CHECKS`] empties itself as later work lands, and a
+//! check that half-lands fails the partition. A caller reporting coverage
+//! should report all three alongside the violations — which matters
+//! because "run this suite" is the acceptance criterion for porting a
+//! backend, and a suite that runs one check must not read as a suite that
+//! ran seven.
 //!
 //! # The reference backend
 //!
@@ -79,10 +90,23 @@ pub mod reference;
 /// re-deriving which assertion produced which failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractViolation {
-    /// The DESIGN §3.3 check name, spelled as the table spells it.
+    /// The DESIGN §3.3 check name, spelled as the table spells it — or
+    /// [`HARNESS_FAULT`] when the suite itself failed rather than the
+    /// plugin.
     pub check: &'static str,
     /// What was observed, and what the check required instead.
     pub detail: String,
+}
+
+impl std::fmt::Display for ContractViolation {
+    /// One line per violation, `"<check>: <detail>"`.
+    ///
+    /// The `{violations:#?}` in this module's example is right for an
+    /// `assert!` message and wrong for anything that reports per line, so
+    /// the per-line rendering is the type's own rather than each caller's.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.check, self.detail)
+    }
 }
 
 /// The DESIGN §3.3 `quantity-round-trip` check, spelled as the table spells
@@ -90,7 +114,39 @@ pub struct ContractViolation {
 /// from the [`BLOCKED_CHECKS`] entries without matching a string literal.
 pub const QUANTITY_ROUND_TRIP: &str = "quantity-round-trip";
 
-/// The two DESIGN §3.3 checks this suite does not implement, and why.
+/// The [`ContractViolation::check`] value a violation carries when the
+/// **suite itself** failed — it could not build a fixture, say — rather
+/// than the plugin.
+///
+/// Deliberately not a DESIGN §3.3 check name, and deliberately not
+/// [`QUANTITY_ROUND_TRIP`]: a report that attributes the harness's own
+/// fault to a check tells a plugin author their plugin broke a contract it
+/// never got to touch.
+pub const HARNESS_FAULT: &str = "contract-suite-harness-fault";
+
+/// The DESIGN §3.3 checks [`run_all`] actually runs.
+///
+/// Adding a check means adding it here as well as to [`run_all`] and
+/// removing it from [`UNWRITTEN_CHECKS`]; the partition test refuses a
+/// half-landed change.
+pub const IMPLEMENTED_CHECKS: &[&str] = &[QUANTITY_ROUND_TRIP];
+
+/// The DESIGN §3.3 checks that are writable against the current SPI and are
+/// not yet written.
+///
+/// Every one of them is expressible with the five methods this gear
+/// declares — unlike [`BLOCKED_CHECKS`], which needs the SPI to grow — so
+/// each is work outstanding rather than a gap in the contract. The list
+/// exists so a passing run reports what it did **not** cover; it shrinks to
+/// empty as the checks land.
+pub const UNWRITTEN_CHECKS: &[&str] = &[
+    "window-end-selection",
+    "invalidation-excluded-from-fold",
+    "at-most-one-invalidation",
+    "dedup-identity-over-window",
+];
+
+/// The two DESIGN §3.3 checks the current SPI cannot express, and why.
 pub const BLOCKED_CHECKS: &[(&str, &str)] = &[
     (
         "feed-snapshot-and-replay",
@@ -103,9 +159,10 @@ pub const BLOCKED_CHECKS: &[(&str, &str)] = &[
         "latest-tie-break",
         "asserts `greatest window_end, then greatest acceptance_sequence`, \
          and `UsageRecord` carries no `acceptance_sequence` field. DESIGN \
-         section 3.1 has the plugin assign it monotonically per \
-         `(tenant_id, gts_type_id)`; until the field exists there is nothing \
-         for a plugin to assign or a fold to read.",
+         section 1.2 has the plugin assign it strictly monotonic per \
+         `(tenant_id, gts_type_id)`, restated as a storage obligation in \
+         section 3.7; until the field exists there is nothing for a plugin \
+         to assign or a fold to read.",
     ),
 ];
 
@@ -139,6 +196,16 @@ const CONTRACT_METER_TYPE_ID: &str =
 /// scope filter the suite dispatches pins.
 const CONTRACT_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0001);
 
+/// `2020-01-01T00:00:00Z`, the base every fixture covered period is offset
+/// from.
+///
+/// Deliberately not [`time::OffsetDateTime::UNIX_EPOCH`]. A period ending
+/// at the epoch starts an hour *before* it, and a backend whose time column
+/// refuses a negative instant would then fail a check about decimals — the
+/// suite would blame the plugin for the fixture's own choice of date.
+const FIXTURE_EPOCH: time::OffsetDateTime =
+    time::OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::days(18_262));
+
 /// The resource every fixture entry is attributed to. `resource_ref` is
 /// mandatory on a [`UsageRecord`] and no implemented check varies it.
 const CONTRACT_RESOURCE_ID: &str = "contract-suite-resource";
@@ -156,9 +223,17 @@ const CONTRACT_FILTER_HASH: &str = "usage-collector-contract-suite";
 /// The compiled PDP scope the suite dispatches: `tenant_id eq <tenant>`.
 ///
 /// This is the shape `authz::scope_to_odata_filter` projects for a
-/// single-tenant grant — a conjunction pinning the owning tenant. Passing
-/// no filter at all would let a backend that ignores the scope pass the
-/// suite.
+/// single-tenant grant whose constraint carries one filter: a bare
+/// `Compare`, since the projection only builds a conjunction once there is
+/// a second filter to AND.
+///
+/// What dispatching it buys is **shape coverage** — a plugin that chokes on
+/// a filter, or ignores `query.filter` and therefore never exercises its
+/// projection, meets one here. It buys no scope *enforcement*: every
+/// fixture belongs to the tenant this filter pins, and no implemented check
+/// asserts that a row outside the scope is withheld, so a backend that
+/// discarded the filter entirely would still pass. That assertion belongs
+/// to a scope-gating check, which is not written.
 fn contract_scope() -> ast::Expr {
     ast::Expr::Compare(
         Box::new(ast::Expr::Identifier("tenant_id".to_owned())),
@@ -242,16 +317,7 @@ const PUBLISHED_RANGE_CORNERS: &[&str] = &[
 /// exactly one of the things this check exists to catch. Comparing
 /// `to_string()` is what makes "digit for digit" mean what it says.
 async fn quantity_round_trip(plugin: &dyn UsageCollectorPluginV1) -> Vec<ContractViolation> {
-    let fixtures = match quantity_fixtures() {
-        Ok(fixtures) => fixtures,
-        Err(detail) => {
-            return vec![violation(format!(
-                "the check could not build its fixtures, so nothing was asserted: {detail}"
-            ))];
-        }
-    };
-
-    let mut violations = Vec::new();
+    let (fixtures, mut violations) = quantity_fixtures();
     for (literal, record) in fixtures {
         let id = record.id;
         let window_end = record.window_end;
@@ -266,7 +332,7 @@ async fn quantity_round_trip(plugin: &dyn UsageCollectorPluginV1) -> Vec<Contrac
             Ok(observed) => violations.push(violation(format!(
                 "submitted `{literal}` as record {id}; `list_usage_records` read back `{observed}`. \
                  The published range (`docs/usage-collector-v1.yaml:576-583`) obliges every storage \
-                 plugin to round-trip it digit for digit, negative half included — the comparison is \
+                 plugin to round-trip it digit for digit, negative half included. The comparison \
                  on the rendered decimal, so an equal magnitude under a normalised scale is still a \
                  loss."
             ))),
@@ -311,14 +377,37 @@ async fn read_back(
         })
 }
 
-/// One persisted fixture per corner of the published range, paired with the
-/// literal it was submitted as.
-fn quantity_fixtures() -> Result<Vec<(&'static str, UsageRecord)>, String> {
-    PUBLISHED_RANGE_CORNERS
-        .iter()
-        .enumerate()
-        .map(|(index, literal)| quantity_fixture(index, literal))
-        .collect()
+/// A published-range corner, paired with the record built to carry it.
+type QuantityFixture = (&'static str, UsageRecord);
+
+/// One fixture per corner of the published range, paired with the literal
+/// it will be submitted as, alongside a violation per corner that could not
+/// be built.
+///
+/// **Partitioned rather than short-circuited**, and attributed to
+/// [`HARNESS_FAULT`] rather than to the check. Collecting into a `Result`
+/// would let one unbuildable corner suppress the other four and report the
+/// suite's own failure under a DESIGN check name — telling a plugin author
+/// their plugin violated a contract it was never handed a value to violate.
+/// The buildable corners are still submitted, so the run still says
+/// whatever it can about the plugin.
+fn quantity_fixtures() -> (Vec<QuantityFixture>, Vec<ContractViolation>) {
+    let mut built = Vec::new();
+    let mut faults = Vec::new();
+    for (index, literal) in PUBLISHED_RANGE_CORNERS.iter().enumerate() {
+        match quantity_fixture(index, literal) {
+            Ok(fixture) => built.push(fixture),
+            Err(detail) => faults.push(ContractViolation {
+                check: HARNESS_FAULT,
+                detail: format!(
+                    "the contract suite could not build its own `{literal}` fixture, so that \
+                     corner was never submitted. This is a fault in the suite, not in the \
+                     plugin under test: {detail}"
+                ),
+            }),
+        }
+    }
+    (built, faults)
 }
 
 /// Builds the fixture for one corner, refusing to proceed if the carrier
@@ -330,10 +419,7 @@ fn quantity_fixtures() -> Result<Vec<(&'static str, UsageRecord)>, String> {
 /// never asked to store. Failing here says the published bound and the
 /// carrier have diverged, which is a finding about the contract rather
 /// than about any plugin.
-fn quantity_fixture(
-    index: usize,
-    literal: &'static str,
-) -> Result<(&'static str, UsageRecord), String> {
+fn quantity_fixture(index: usize, literal: &'static str) -> Result<QuantityFixture, String> {
     let value = Decimal::from_str(literal).map_err(|err| {
         format!("`{literal}` is inside the published range but `rust_decimal::Decimal` cannot parse it: {err}")
     })?;
@@ -349,7 +435,7 @@ fn quantity_fixture(
     // `window_end` selects that corner alone.
     let hours = i64::try_from(index)
         .map_err(|err| format!("fixture index {index} does not fit an hour offset: {err}"))?;
-    let window_end = time::OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::hours(hours));
+    let window_end = FIXTURE_EPOCH.saturating_add(time::Duration::hours(hours));
     let window_start = window_end.saturating_sub(time::Duration::hours(1));
 
     let submission = CreateUsageRecord {
@@ -361,7 +447,19 @@ fn quantity_fixture(
         subject_ref: None,
         metadata: std::collections::BTreeMap::new(),
         value,
-        idempotency_key: IdempotencyKey::new(format!("{QUANTITY_ROUND_TRIP}-{index}"))
+        // Keyed on the **literal**, never on its position. The entry `id`
+        // derives from `(tenant, gts_type, idempotency_key, window_start,
+        // window_end)` and the quantity is not an input, so an index-keyed
+        // fixture would give a changed corner the id of the corner that used
+        // to sit at that index — and the ledger is append-only with no
+        // delete path, so every backend that ever ran the older suite would
+        // answer `IdempotencyConflict` for ever, and this check would report
+        // it as the plugin refusing a published quantity. Keying on the
+        // literal gives a changed, reordered or inserted corner a fresh
+        // identity instead. `IdempotencyKey` admits 256 bytes and the
+        // longest corner is 29 characters, so the literal fits whole and
+        // needs no hash.
+        idempotency_key: IdempotencyKey::new(format!("{QUANTITY_ROUND_TRIP}-{literal}"))
             .map_err(|err| format!("the check's own idempotency key is invalid: {err}"))?,
         invalidation: None,
         window_start,
