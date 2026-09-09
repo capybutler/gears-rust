@@ -19,6 +19,11 @@
 //!   which is exactly the distinction its accessor names
 //!   (`lower_inclusive` / `upper_exclusive`, not `window_start` /
 //!   `window_end`) keep separate from a record's covered period.
+//! - `contract` (feature-gated, off by default) — the DESIGN §3.3 plugin
+//!   contract suite every conforming storage plugin MUST pass, plus the
+//!   in-memory reference backend it is validated against. A plugin crate
+//!   enables the `contract` feature on its dev-dependency and calls
+//!   `contract::run_all` against its own backend; see the module docs.
 //! - [`UsageCollectorError`] / [`UsageCollectorPluginError`] — flat error envelopes.
 //!   This crate does NOT depend on `toolkit-canonical-errors`; the host crate
 //!   owns the lift to RFC-9457 `Problem` on the REST surface.
@@ -26,6 +31,8 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 pub mod api;
+#[cfg(feature = "contract")]
+pub mod contract;
 pub mod error;
 pub mod gts;
 pub mod id;
