@@ -1917,23 +1917,48 @@ the constraint has already rejected the write — so it is diagnostic, not a
 check, and the atomicity obligation is still met by the index. Say that at the
 call site, because it looks like the pre-read the SPI forbids and is not one.
 
-- [ ] **Step 6b: Retire two false transaction claims in this file**
+- [ ] **Step 6b: Settle every transaction claim in this file, and the 55P03 gap**
 
-`record_store.rs:778` and `:940` each say a retry attempt "opens a fresh
-transaction". That is false and has been for some time: `:189` and `:536-537`
-correctly say no explicit transaction is required, and after Task 2 the crate
-opens none at all. The only transaction those retries ever had was the implicit
-single-statement one.
+**Eight sites, not two.** An earlier draft named `:778` and `:940`; Task 2's
+code review found three more, and a re-count found a further one. Measured
+with `grep -n 'transaction' src/infra/storage/record_store.rs`:
 
-Pre-existing rather than introduced, and left alone deliberately by Task 2
-because this task owns `create_batch`. **You are about to make them true for
-the first time** — Step 4's sequence claim and Step 5's insert do need a real
-transaction. Rewrite both comments to describe the transaction you actually
-add, not the one they currently imagine.
+| Line | Says | Status |
+| --- | --- | --- |
+| `:189` | "no explicit transaction is needed" | true today, **you make it false** |
+| `:536` | "atomic, so no explicit transaction is required" | true today, **you make it false** |
+| `:717` | "the surviving transaction has already committed or aborted" | defensible — true of the server's implicit transaction |
+| `:750` | "the whole transaction rolled back" | defensible, same reason |
+| `:775` | "…transaction. `operation` is an `Fn` invoked fresh each attempt" | check in context |
+| `:778` | "opens a fresh transaction" | **false about the plugin's code** |
+| `:940` | "opens a fresh transaction (`create_batch_inner` does both)" | **false about the plugin's code** |
+| `:942` | "transaction is atomic and the dedup keys make it idempotent" | defensible |
 
-`pool.rs:70` is the sibling case and **is** yours: it says "the same dedup
-4-tuple", correct until this task moves identity to the 5-tuple. Update it in
-the same pass.
+The split matters: `:717`, `:750` and `:942` read as true of *Postgres*, which
+wraps every statement in an implicit transaction, whereas `:778` and `:940` are
+false about *this crate*, which after Task 2 opens none. **Decide all eight
+deliberately** — do not fix the two obvious ones and leave six lookalikes, which
+is how this file got into its current state. Report a per-line verdict.
+
+Note the direction of travel: `:189` and `:536` are correct *now* and your work
+makes them wrong, so they need rewriting too even though they read fine today.
+
+**`pool.rs:70` is the sibling case and is also yours:** "the same dedup
+4-tuple", correct until this task moves identity to the 5-tuple.
+
+**The 55P03 decision, which no other task owns.** `is_transient_sqlstate`
+(`error.rs:18-24`) matches `08*`, `57P01`, `57P02`, `57P03`, `53300`, `40001`,
+`40P01`. **`55P03 lock_not_available` is absent**, so a statement that hits
+`LOCK_TIMEOUT` falls to `Other` → `Internal` → non-retryable, and
+`is_retryable_batch_error` (`:757`) will not retry it.
+
+That is pre-existing, but Task 2 made it visible by electing the ingest
+`ON CONFLICT` path as `LOCK_TIMEOUT`'s worked example — so an inherently
+transient wait is now *documented* as failing into a non-retryable bucket.
+You own the retry path, so you own this call. **Either add `55P03` to the
+transient set, or write down why `Internal` is the intended answer.** Silence
+is the one outcome that is not acceptable, because the next reader will assume
+the omission was considered.
 
 - [ ] **Step 7: Handle the in-batch collision**
 
@@ -2574,6 +2599,37 @@ The behavioural home for Task 9. Cover:
 The concurrency case is worth a real test: two concurrent `create_usage_record`
 calls invalidating one target, exactly one accepted. That is what the atomicity
 obligation is for, and a sequential test cannot see it.
+
+- [ ] **Step 4b: Two tests assert the rule Task 8 inverted — delete, do not repoint**
+
+`tests/records_query_integration_pg.rs` carries two tests that encode the
+*retired* compensation semantics, found during Task 2:
+
+- `pg_aggregate_sum_nets_compensation` (`:336`)
+- `pg_aggregate_count_excludes_active_compensation` (`:383`)
+
+Both set `compensation.corrects_id = Some(original_id)` (`:348`, `:398`), and
+`corrects_id` no longer exists anywhere in the SDK (`grep -rn 'corrects_id'`
+over `usage-collector-sdk/src/` returns nothing). So neither compiles.
+
+**They must be deleted rather than ported, and the reason is semantic, not
+mechanical.** Their subject is the rule Task 8 *inverted*: the old model had
+`SUM` net across signed compensation rows and `COUNT` filter
+`corrects_id IS NULL`. An invalidation echoes the quantity it withdraws rather
+than negating it, so netting now double-counts, and both halves of a withdrawn
+pair are excluded under every fold. A test "ported" by swapping `corrects_id`
+for `invalidates` would assert the opposite of the current contract while
+looking like a faithful translation. That is the most dangerous shape available
+here.
+
+The replacement coverage is Task 8's `every_fold_excludes_both_halves_of_a_withdrawn_pair`
+plus the behavioural cases in Step 5 below. Write the verdict as "deleted
+because the rule it asserted was replaced by its opposite", and name the
+replacement.
+
+**The module doc at `:6-7` still advertises `SUM nets compensation`.** Task 2
+dropped its `active-only` sibling but deliberately left this one, because the
+fold rewrite is yours. Remove it in the same pass.
 
 - [ ] **Step 5: `records_query_integration_pg.rs`**
 
