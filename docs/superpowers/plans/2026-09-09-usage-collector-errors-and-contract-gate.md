@@ -1349,14 +1349,30 @@ recording what left and why:
 
 - [ ] **Step 4: Update the pinning table from Task 1**
 
-`every_wire_constant_spells_its_own_identifier` names all 18 constants and asserts
-the length. Remove the two rows and change `18` to `16`.
+**This step is smaller than it was when the plan was written, and the reason
+matters.** The original text said the table "names all 18 constants and asserts
+the length … change `18` to `16`". That hardcoded literal is gone: Task 1's
+review found `assert_eq!(pinned.len(), 18)` was a tautology — a fixed-size
+array's length always equals the rows written above it — and replaced it with a
+compile-time count of `reason.rs` itself:
 
-**Do not change the count without removing the rows, or the rows without the
-count** — either alone still compiles and the assertion is what makes the pair
-inseparable. Re-run
-`grep -c 'pub const' usage-collector-sdk/src/reason.rs` and confirm it prints
-`16`.
+```rust
+let declared = include_str!("reason.rs")
+    .lines()
+    .filter(|line| line.starts_with("pub const "))
+    .count();
+```
+
+So there is **no number to update.** Delete the two `pin![…]` rows and the
+`declared` count follows the file down from 18 to 16 on its own. Deleting the
+constants without deleting the rows is a compile error (unresolved identifier),
+and deleting the rows without the constants fails the count — the pair is
+inseparable in both directions with nothing to remember.
+
+Confirm afterwards that `grep -c '^pub const ' usage-collector-sdk/src/reason.rs`
+prints `16` and the test passes; if the two disagree, the line-anchored scan has
+met a case it cannot see (a `pub const`-shaped line in a block comment or a raw
+string) and that is worth reporting, not working around.
 
 Also remove the two rows from `validation_reason_round_trips_each_constant`.
 
