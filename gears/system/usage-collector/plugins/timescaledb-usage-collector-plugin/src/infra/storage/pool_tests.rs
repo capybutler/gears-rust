@@ -57,8 +57,9 @@ fn connect_options_rejects_malformed_dsn() {
 
 #[test]
 fn connection_gucs_bind_statement_and_fixed_lock_timeout() {
-    // The statement timeout is config-driven (seconds -> `<n>s`); the lock timeout
-    // is a fixed constant so a contended row lock fails fast rather than blocking.
+    // The statement timeout is config-driven (seconds -> `<n>s`); the lock
+    // timeout is a fixed constant so a contended lock fails fast rather than
+    // blocking.
     let gucs = connection_gucs(45);
     assert_eq!(gucs[0], ("statement_timeout", "45s".to_owned()));
     assert_eq!(gucs[1], ("lock_timeout", LOCK_TIMEOUT.to_owned()));

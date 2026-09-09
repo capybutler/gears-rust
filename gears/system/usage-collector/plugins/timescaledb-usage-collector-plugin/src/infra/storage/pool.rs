@@ -73,11 +73,12 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 const LOCK_TIMEOUT: &str = "5s";
 
 /// Session GUCs applied to every request-path pool connection at connect time,
-/// bounding how long a statement may run (`statement_timeout`, config-driven) and
-/// how long it waits on a contended lock (`lock_timeout`, fixed [`LOCK_TIMEOUT`]) so a
-/// wedged backend cannot pin pool connections indefinitely and exhaust the pool.
-/// Applied as `-c name=value` startup parameters so the bound holds from the
-/// connection's first query, with no extra round-trip.
+/// bounding how long a statement may run (`statement_timeout`, config-driven)
+/// and how long it waits on a contended lock (`lock_timeout`, fixed
+/// [`LOCK_TIMEOUT`]) so a wedged backend cannot pin pool connections
+/// indefinitely and exhaust the pool. Applied as `-c name=value` startup
+/// parameters so the bound holds from the connection's first query, with no
+/// extra round-trip.
 fn connection_gucs(statement_timeout_secs: u64) -> [(&'static str, String); 2] {
     [
         ("statement_timeout", format!("{statement_timeout_secs}s")),
