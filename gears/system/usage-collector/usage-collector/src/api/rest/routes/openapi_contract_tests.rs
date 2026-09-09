@@ -13,11 +13,16 @@
 //! runtime publishes is documented, and that every `$ref` in the
 //! document resolves.
 //!
-//! Deferred: the six checks that compare the documented contract to
-//! the registered routes are `#[ignore]`d while the Phase 2 document
-//! runs ahead of the implementation. The YAML-internal and
-//! registry-internal checks stay live, so neither side is free to rot
-//! on its own.
+//! Scope: the comparison checks run against every operation the gear
+//! registers. Two documented operations are named in
+//! [`NOT_YET_IMPLEMENTED`] because no route registers them yet, and two
+//! registered parameters are named in [`UNDOCUMENTED_PARAMETERS`] because
+//! the contract does not document them. Three more are named in
+//! [`BODY_VS_QUERY_DRIFT`], which is a different thing again: the contract
+//! and the gear both carry those inputs and disagree about whether they
+//! travel in the body or the query string. All three lists are guarded by
+//! tests that fail when a listed gap closes, so none can become a standing
+//! exemption. Everything else is compared on every run.
 //!
 //! Comparison side: every check below reads `OperationSpec` fields, and
 //! no client is served an `OperationSpec` — `/cf/openapi.json` carries
@@ -89,6 +94,107 @@ fn spec_doc() -> Value {
 fn op_key(method: &str, path: &str) -> String {
     format!("{} {}", method.to_uppercase(), path)
 }
+
+/// Operations `usage-collector-v1.yaml` documents that no route registers
+/// yet.
+///
+/// Both are out of scope for the slice that re-enabled this gate: the SPI
+/// declares `read_feed_page` and `get_reconciliation_metadata` in DESIGN
+/// §3.3 and the gear implements neither, so there is nothing to compare.
+/// Naming them here rather than `#[ignore]`ing the whole comparison is the
+/// difference between two known gaps and a blanket exemption: every
+/// operation that *does* ship is checked on every run.
+///
+/// This list shrinks to empty. [`not_yet_implemented_operations_are_really_documented`]
+/// and [`not_yet_implemented_operations_are_really_unregistered`] fail if an
+/// entry stops being true in either direction, so landing `/feed` forces its
+/// row out rather than leaving it silently excusing a live route.
+const NOT_YET_IMPLEMENTED: &[&str] = &[
+    "GET /usage-collector/v1/feed",
+    "GET /usage-collector/v1/reconciliation",
+];
+
+/// `(operation key, parameter name)` pairs the gear registers and the
+/// contract does not document.
+///
+/// The gear serves both, deliberately and with its reasoning recorded at the
+/// registration site: `$top` because the toolkit `OData` extractor binds page
+/// size from `$top` or `limit` onto one slot and publishing one spelling
+/// under-reports the accepted surface, and `metadata.<key>` because the raw
+/// read path accepts repeated metadata filters. `usage-collector-v1.yaml`
+/// documents neither, and the yaml is not this slice's to edit.
+///
+/// **This list only ever excuses registered-but-undocumented.** The reverse —
+/// documented but unregistered — is the dangerous direction (it means the
+/// gear does not serve something the contract promises) and is never
+/// excused here; that is what `NOT_YET_IMPLEMENTED` is for, at whole-operation
+/// granularity where it is visible.
+///
+/// An input the contract carries somewhere *else* — in the request body
+/// rather than the query string — is not this list's business either; that
+/// is [`BODY_VS_QUERY_DRIFT`].
+///
+/// Absence is checked across *every* parameter location, not just `query`,
+/// which is deliberately stricter than the row needs: a row would expire the
+/// day the contract documented this name as a header or cookie parameter
+/// too. That direction is safe — it can only retire a row early, and
+/// [`parameters_match`] immediately catches anything the retirement exposes —
+/// whereas filtering to `query` would let a contract that documents the input
+/// in another location keep the row alive and the mismatch excused.
+/// [`body_vs_query_drift_is_really_drift`] does filter on location, for the
+/// opposite reason spelled out there.
+///
+/// Self-cleaning: [`undocumented_parameters_are_really_undocumented`] fails
+/// on any row whose gap has closed.
+const UNDOCUMENTED_PARAMETERS: &[(&str, &str)] = &[
+    ("GET /usage-collector/v1/records", "$top"),
+    ("GET /usage-collector/v1/records", "metadata.<key>"),
+];
+
+/// Inputs the contract places in the request body and the gear takes from
+/// the query string, as `(operation key, registered query parameter,
+/// contract body property)`.
+///
+/// **This is not a documentation gap**, and it must never be folded into
+/// [`UNDOCUMENTED_PARAMETERS`]: both documents describe the same three
+/// inputs and disagree about where they travel.
+/// `usage-collector-v1.yaml` declares `AggregationRequest` with
+/// `additionalProperties: false` and `required: [gts_type_id, time_range]`,
+/// carrying `gts_type_id`, `filter` and `metadata_filter` as body
+/// properties; the gear registers all three as query parameters and its body
+/// DTO carries only `time_range` and `group_by`. A client written against
+/// the contract sends `gts_type_id` in the body, where
+/// `deny_unknown_fields` refuses it, *and* omits the query parameter the
+/// gear requires. Two independent 400s on every aggregate request.
+///
+/// Excused here rather than fixed because neither repair belongs to this
+/// slice. `$filter` reaches the handler through `toolkit_odata`'s
+/// query-string extractor, so honouring the body placement would mean
+/// abandoning that extractor — which suggests the contract is the side
+/// that is wrong. It belongs in `DIVERGENCES.md` entry 10, beside the
+/// request-side and response-side instances recorded there. Entry 10 already
+/// says of those that the resolution is a spec decision plus a scheduled
+/// slice, not an editorial pass.
+///
+/// Guarded by [`body_vs_query_drift_is_really_drift`], which expires a row
+/// from either side.
+const BODY_VS_QUERY_DRIFT: &[(&str, &str, &str)] = &[
+    (
+        "POST /usage-collector/v1/records/aggregate",
+        "gts_type_id",
+        "gts_type_id",
+    ),
+    (
+        "POST /usage-collector/v1/records/aggregate",
+        "$filter",
+        "filter",
+    ),
+    (
+        "POST /usage-collector/v1/records/aggregate",
+        "metadata.<key>",
+        "metadata_filter",
+    ),
+];
 
 /// The registered operations, keyed the way the *served* document keys
 /// them.
@@ -164,6 +270,22 @@ fn yaml_ops(doc: &Value) -> BTreeMap<String, Value> {
 /// so `yaml_params`'s own `$ref`-resolution path is still exercised.
 fn param_key(doc: &Value, param: &Value) -> (String, String) {
     name_and_location(deref(doc, param))
+}
+
+/// The documented operations this suite compares against the registry: every
+/// documented operation except the ones no route registers yet.
+///
+/// Separate from [`yaml_ops`] on purpose. `yaml_ops` is the whole document
+/// and the YAML-internal checks read it — in particular
+/// [`harness_sees_the_whole_rest_surface`], which asserts the document
+/// carries 7 operations and is what keeps [`NOT_YET_IMPLEMENTED`] from
+/// quietly growing. Filtering inside `yaml_ops` would hide those two
+/// operations from that check too and turn the guard into a tautology.
+fn comparable_yaml_ops(doc: &Value) -> BTreeMap<String, Value> {
+    yaml_ops(doc)
+        .into_iter()
+        .filter(|(key, _)| !NOT_YET_IMPLEMENTED.contains(&key.as_str()))
+        .collect()
 }
 
 /// The registry and the document each carry the whole surface.
@@ -242,18 +364,223 @@ fn registry_keys_match_the_generated_document() {
     );
 }
 
+/// The documented operation a list row names, or a panic that names the row.
+///
+/// Mirrors [`spec_for`] on the document side, for the same reason: every
+/// guard below walks a constant's rows and looks the documented operation up,
+/// so a row naming an operation the contract does not carry reaches this
+/// function. A bare `.expect()` would report an unwrap on a `None` value and
+/// nothing else — no path, no method, and no clue which list holds the row.
+fn documented_op<'a>(documented: &'a BTreeMap<String, Value>, list: &str, key: &str) -> &'a Value {
+    documented.get(key).unwrap_or_else(|| {
+        panic!(
+            "{key}: listed in `{list}` but usage-collector-v1.yaml documents no \
+             such operation; remove the row"
+        )
+    })
+}
+
+/// `(component name, property names)` of the contract's request body for
+/// `op`, or `None` when the operation declares no request body at all.
+///
+/// Goes through [`yaml_request_body`], which already resolves the body's
+/// `$ref` through [`ref_name`] and panics on a dangling one, so both callers
+/// reach `components.schemas` the same way `body_schemas_match` does instead
+/// of re-deriving the pointer.
+fn yaml_body_properties(doc: &Value, key: &str, op: &Value) -> Option<(String, BTreeSet<String>)> {
+    let (_, _, schema_name) = yaml_request_body(doc, key, op)?;
+    let properties = doc
+        .pointer(&format!("/components/schemas/{schema_name}/properties"))
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("{key}: `{schema_name}` must declare a `properties` map"));
+    let names = properties.keys().cloned().collect();
+    Some((schema_name, names))
+}
+
+/// Every `NOT_YET_IMPLEMENTED` key names an operation the document really
+/// carries. A typo, or a row left behind after the document dropped an
+/// operation, would silently excuse nothing while looking like it excused
+/// something.
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
-fn operation_identity_matches() {
+fn not_yet_implemented_operations_are_really_documented() {
+    let doc = spec_doc();
+    let documented = yaml_ops(&doc);
+    for key in NOT_YET_IMPLEMENTED {
+        assert!(
+            documented.contains_key(*key),
+            "`{key}` is listed as not-yet-implemented but \
+             usage-collector-v1.yaml documents no such operation; remove the row",
+        );
+    }
+}
+
+/// No `NOT_YET_IMPLEMENTED` key names an operation that now registers.
+///
+/// This is the row's expiry. The day `/feed` ships, its route registers and
+/// this fails, forcing the row out — instead of leaving an excused live
+/// operation permanently outside the comparison.
+#[test]
+fn not_yet_implemented_operations_are_really_unregistered() {
+    let reg = registry();
+    let registered = registry_ops(&reg);
+    for key in NOT_YET_IMPLEMENTED {
+        assert!(
+            !registered.contains_key(*key),
+            "`{key}` is listed as not-yet-implemented but a route registers it \
+             now; delete the row so the drift gate compares it",
+        );
+    }
+}
+
+/// Every `UNDOCUMENTED_PARAMETERS` row names a parameter that is really
+/// registered, really absent from the document, and really a *documentation*
+/// gap rather than a misfiled placement disagreement.
+///
+/// Each of the three expires the row on its own. If the gear stops
+/// registering the parameter the row excuses nothing; if the yaml starts
+/// documenting it the row hides a comparison that would now pass; and if the
+/// contract turns out to carry the input in the request body, the row is in
+/// the wrong list.
+///
+/// That last one is a cross-check between the two lists, not a property of
+/// this one. Without it every [`BODY_VS_QUERY_DRIFT`] row also satisfies this
+/// guard — `yaml_params` reads only an operation's `parameters:` array, so a
+/// body property is invisible to it — and a client-breaking incompatibility
+/// could be filed as a documentation gap, losing the `body_property` column
+/// that expires it when the contract is fixed. The opposite misfiling is
+/// already caught (a row in `BODY_VS_QUERY_DRIFT` for an operation with no
+/// request body fails there), so without this the weaker list is the one that
+/// accepts anything — exactly the shape where whichever list makes the build
+/// green wins.
+#[test]
+fn undocumented_parameters_are_really_undocumented() {
     let reg = registry();
     let doc = spec_doc();
     let registered = registry_ops(&reg);
     let documented = yaml_ops(&doc);
+
+    for (key, param) in UNDOCUMENTED_PARAMETERS {
+        let spec = spec_for(&registered, key);
+        let registered_names: BTreeSet<String> = registry_params(spec)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            registered_names.contains(*param),
+            "{key}: no longer registers `{param}`, which is listed in \
+             `UNDOCUMENTED_PARAMETERS`; delete the row",
+        );
+
+        let op = documented_op(&documented, "UNDOCUMENTED_PARAMETERS", key);
+        let documented_names: BTreeSet<String> = yaml_params(&doc, op)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            !documented_names.contains(*param),
+            "{key}: usage-collector-v1.yaml now documents `{param}`; delete the \
+             row from `UNDOCUMENTED_PARAMETERS` so `parameters_match` compares it",
+        );
+
+        // Skipped for an operation with no request body -- the `GET` case,
+        // which cannot be placing anything in one.
+        if let Some((schema_name, body_properties)) = yaml_body_properties(&doc, key, op) {
+            assert!(
+                !body_properties.contains(*param),
+                "{key}: usage-collector-v1.yaml declares `{param}` as a property \
+                 of `{schema_name}`, this operation's request body, so the \
+                 contract does carry this input and the disagreement is about \
+                 *where* it travels -- move the row from \
+                 `UNDOCUMENTED_PARAMETERS` to `BODY_VS_QUERY_DRIFT`, whose third \
+                 column expires it when the contract is corrected. Note this \
+                 check matches on the name alone: if the contract carries the \
+                 input in the body under a *different* name (`$filter` in the \
+                 query against `filter` in the body), nothing here can see it \
+                 and the row still belongs in `BODY_VS_QUERY_DRIFT`",
+            );
+        }
+    }
+}
+
+/// Every [`BODY_VS_QUERY_DRIFT`] row still describes a real placement
+/// disagreement — on both sides, in both spellings.
+///
+/// Three assertions, because a row can stop being true three ways and each
+/// one has to expire it:
+///
+/// 1. the gear still registers that query parameter (if it stops, the row
+///    excuses nothing);
+/// 2. the contract still does not document it as a query parameter (if it
+///    starts, the two sides agree and the row hides a passing comparison);
+/// 3. the contract still declares the named body property (if it stops, the
+///    yaml has been corrected and the disagreement is over).
+///
+/// The third is what makes this a *placement* row rather than a
+/// documentation gap, and it is the half that expires the row the day
+/// someone fixes the contract. Checking only the query spelling would leave
+/// the row immortal, since the gear is not expected to change.
+#[test]
+fn body_vs_query_drift_is_really_drift() {
+    let reg = registry();
+    let doc = spec_doc();
+    let registered = registry_ops(&reg);
+    let documented = yaml_ops(&doc);
+
+    for (key, query_param, body_property) in BODY_VS_QUERY_DRIFT {
+        let spec = spec_for(&registered, key);
+        // Filtered to `query` on this side too. `ParamLocation` also spells
+        // `Header` and `Cookie`, and `.param()` takes an explicit location,
+        // so matching on the name alone would keep the row alive if the gear
+        // moved this input to a header -- and `parameters_match` subtracts by
+        // name, so that move would be silently excused rather than compared.
+        let registered_query: BTreeSet<String> = registry_params(spec)
+            .into_iter()
+            .filter(|(_, location, _)| location == "query")
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            registered_query.contains(*query_param),
+            "{key}: no longer registers `{query_param}` as a query parameter, \
+             which is what its `BODY_VS_QUERY_DRIFT` row excuses; delete the row",
+        );
+
+        let op = documented_op(&documented, "BODY_VS_QUERY_DRIFT", key);
+        let documented_query: BTreeSet<String> = yaml_params(&doc, op)
+            .into_iter()
+            .filter(|(_, location, _)| location == "query")
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            !documented_query.contains(*query_param),
+            "{key}: usage-collector-v1.yaml now documents `{query_param}` as a \
+             query parameter, so the placement disagreement is over; delete the \
+             row from `BODY_VS_QUERY_DRIFT` so `parameters_match` compares it",
+        );
+
+        let (schema_name, body_properties) =
+            yaml_body_properties(&doc, key, op).unwrap_or_else(|| {
+                panic!(
+                    "{key}: declares no request body, so it cannot be placing \
+                     `{body_property}` in one; this row does not describe a \
+                     placement disagreement and does not belong in \
+                     `BODY_VS_QUERY_DRIFT`"
+                )
+            });
+        assert!(
+            body_properties.contains(*body_property),
+            "{key}: usage-collector-v1.yaml no longer declares `{body_property}` \
+             on `{schema_name}`; the contract may have been corrected, so delete \
+             the row from `BODY_VS_QUERY_DRIFT`",
+        );
+    }
+}
+
+#[test]
+fn operation_identity_matches() {
+    let reg = registry();
+    let doc = spec_doc();
+    let registered = registry_ops(&reg);
+    let documented = comparable_yaml_ops(&doc);
 
     let registered_keys: BTreeSet<&String> = registered.keys().collect();
     let documented_keys: BTreeSet<&String> = documented.keys().collect();
@@ -440,22 +767,39 @@ fn registry_params(spec: &OperationSpec) -> BTreeSet<ParamTriple> {
 }
 
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn parameters_match() {
     let reg = registry();
     let doc = spec_doc();
     let registered = registry_ops(&reg);
 
-    for (key, op) in yaml_ops(&doc) {
+    for (key, op) in comparable_yaml_ops(&doc) {
         let spec = spec_for(&registered, &key);
+        let mut registered_params = registry_params(spec);
+        // Parameters the gear serves and the contract does not document.
+        // Removed from the registered side rather than added to the
+        // documented one: adding would assert the document says something it
+        // does not, and this suite exists to compare the two documents as
+        // they are.
+        registered_params.retain(|(name, _, _)| {
+            !UNDOCUMENTED_PARAMETERS
+                .iter()
+                .any(|(gap_key, gap_param)| *gap_key == key && *gap_param == name.as_str())
+        });
+        // Inputs the contract places in the request body while the gear
+        // takes them from the query string. Subtracted for a different
+        // reason than `UNDOCUMENTED_PARAMETERS` above: those are absent from
+        // the contract altogether, while these are present in it on the
+        // other side of the request.
+        registered_params.retain(|(name, _, _)| {
+            !BODY_VS_QUERY_DRIFT
+                .iter()
+                .any(|(drift_key, drift_param, _)| {
+                    *drift_key == key.as_str() && *drift_param == name.as_str()
+                })
+        });
         assert_eq!(
             yaml_params(&doc, &op),
-            registry_params(spec),
+            registered_params,
             "{key}: documented parameters differ from the registered ones",
         );
     }
@@ -638,18 +982,12 @@ fn registry_success_responses(key: &str, spec: &OperationSpec) -> BTreeSet<Respo
 }
 
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn body_schemas_match() {
     let reg = registry();
     let doc = spec_doc();
     let registered = registry_ops(&reg);
 
-    for (key, op) in yaml_ops(&doc) {
+    for (key, op) in comparable_yaml_ops(&doc) {
         let spec = spec_for(&registered, &key);
 
         assert_eq!(
@@ -791,19 +1129,13 @@ fn missing_standard_errors(expected: &BTreeSet<u16>, spec: &OperationSpec) -> Ve
 /// A route that genuinely cannot produce these has to say so by editing
 /// this test.
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn every_operation_declares_the_standard_error_set() {
     let reg = registry();
     let doc = spec_doc();
     let registered = registry_ops(&reg);
     let expected = canonical_error_statuses();
 
-    for (key, op) in yaml_ops(&doc) {
+    for (key, op) in comparable_yaml_ops(&doc) {
         let spec = spec_for(&registered, &key);
 
         let responses = op["responses"]
@@ -915,12 +1247,6 @@ fn yaml_operation_authenticated(doc: &Value, key: &str, op: &Value) -> bool {
 /// `CreateUsageRecordResult` branches, …) that the runtime emits inline
 /// and so has no component for.
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn every_registered_component_is_documented() {
     let reg = registry();
     let doc = spec_doc();
@@ -957,12 +1283,6 @@ fn every_registered_component_is_documented() {
 /// root says, and the route registering it would still be
 /// `.authenticated()`.
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn security_matches_authenticated_routes() {
     let reg = registry();
     let doc = spec_doc();
@@ -975,7 +1295,7 @@ fn security_matches_authenticated_routes() {
         "the contract must declare a root-level `security` requirement",
     );
 
-    for (key, op) in yaml_ops(&doc) {
+    for (key, op) in comparable_yaml_ops(&doc) {
         let spec = spec_for(&registered, &key);
         assert_eq!(
             yaml_operation_authenticated(&doc, &key, &op),
