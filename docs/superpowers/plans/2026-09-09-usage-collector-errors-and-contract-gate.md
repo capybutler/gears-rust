@@ -2570,6 +2570,16 @@ though it does. Record it under entry 10 rather than as a new entry — same
 defect, same resolution, and entry 10 already says the fix is a spec decision
 plus a scheduled slice rather than an editorial pass.
 
+**Entry 8's plugin half is closed by Task 7 — say so, and say what is still
+open.** Entry 8 records that the 28-digit quantity guarantee has "no enforcement
+and no test", and names this slice's `quantity-round-trip` as where the plugin
+half lands. It now exists. What entry 8 says remains unowned is the **gateway**
+half — rejecting an out-of-range submission at ingestion, which DESIGN §3.3
+explicitly promises a plugin it need not do — and this slice did not build it,
+deliberately, because entry 8 says not to. Update the entry to distinguish the
+two halves rather than marking it resolved: a contract check proves a *plugin*
+round-trips the range, and proves nothing about what the gear admits.
+
 **Two gaps in the gate itself, to state inside the entry-10 extension rather
 than leave in code comments only:**
 
