@@ -2608,6 +2608,25 @@ for `docs/features/*`. Add the concrete instance to whichever entry owns the
 file, with the line numbers, rather than opening a twentieth entry for a
 known-stale document. Verify the line numbers still hold when you write it.
 
+**Two checks in the suite are not independent, and the TimescaleDB port needs
+to know.** Task 11's discrimination matrix established that a backend selecting
+on `window_start` instead of `window_end` fails **two** checks:
+`window-end-selection` and `quantity-round-trip`. That is a property of the
+suite, not a mutant wrong twice — `quantity_round_trip`'s read-back range is
+`[window_end, window_end + 1s)` while its fixtures start an hour earlier, so a
+`window_start`-selecting backend returns none of the corners and the quantities
+cannot be compared *at all*. Verified independently: all five violations say
+"could not be compared at all", none is a quantity mismatch.
+
+**Why it matters at acceptance time:** when the port is run, a `window_start`
+bug reddens two checks, and an operator must not read the `quantity-round-trip`
+failure as a decimal-fidelity problem. The violation text mitigates it by saying
+the quantity could not be compared, and the coupling is documented in
+`contract_tests.rs` and the commit message — but it belongs in the entry too,
+because the entry is what a porter reads. Decoupling would mean reading a corner
+back through `get_usage_record`, or over a range spanning `window_start`, which
+is a change to a check file and was out of scope for the task that found it.
+
 **A second candidate check, also from Task 7: `group-by-absent-dimension`.**
 The reference backend drops a row with no `subject_ref` from a
 `GROUP BY subject_id` entirely, where naive SQL would put it in a NULL group —
