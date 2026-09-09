@@ -1,6 +1,6 @@
 //! Tests for the contract suite itself.
 //!
-//! Three different things are asserted here, and none is a plugin's
+//! Four different things are asserted here, and none is a plugin's
 //! conformance. The first is that the suite runs and passes against a
 //! backend built to conform, which is what makes a violation reported
 //! against a real plugin worth reading. The second is that the three
@@ -9,11 +9,16 @@
 //! own fail-closed posture, which is not a contract check but is the thing
 //! a plugin author copies.
 //!
-//! What this file cannot establish is that the checks *discriminate*: the
-//! reference backend and the assertions were written alongside each other,
-//! so a check too weak to catch a non-conforming backend passes here
-//! exactly as a good one does. Closing that seam takes a deliberately
-//! non-conforming subject, and it is a separate piece of work.
+//! The fourth is that the checks *discriminate*. The reference backend and
+//! the assertions were written alongside each other, so the first assertion
+//! establishes that the suite **runs** and nothing about whether any check
+//! would notice a non-conforming plugin — and a check that cannot fail is
+//! worse than a missing one, because a port is accepted on it and it reads
+//! as coverage. [`super::contract_mutants`] holds six deliberately
+//! non-conforming subjects, each the reference backend wrong in exactly one
+//! plausible way, and
+//! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
+//! column against each of them.
 
 use std::collections::BTreeSet;
 
@@ -21,10 +26,12 @@ use rust_decimal::Decimal;
 use toolkit_odata::{ODataQuery, ast};
 use uuid::Uuid;
 
+use super::contract_mutants::{Defect, mutant};
 use super::{
-    ADDITIONAL_CHECKS, BLOCKED_CHECKS, HARNESS_FAULT, IMPLEMENTED_CHECKS,
-    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, UNWRITTEN_CHECKS, reference::InMemoryReferencePlugin,
-    run_all,
+    ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, DEDUP_IDENTITY_OVER_WINDOW,
+    HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD, QUANTITY_ROUND_TRIP,
+    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, UNWRITTEN_CHECKS, WINDOW_END_SELECTION,
+    reference::InMemoryReferencePlugin, run_all,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::models::{
@@ -43,6 +50,105 @@ async fn the_reference_backend_conforms() {
         violations.is_empty(),
         "the reference backend is the suite's own subject and must pass every implemented \
          check; it reported: {violations:#?}"
+    );
+}
+
+/// One row per defect: the subject, and the checks `run_all` must report
+/// against it.
+///
+/// The check names are the exported constants rather than string literals.
+/// A literal here would go on matching a constant that had been respelled,
+/// and the row would then assert nothing about the check it names.
+///
+/// **Every row but one names a single check**, which is what makes the
+/// matrix a statement about discrimination. The exception is
+/// [`Defect::SelectsOnWindowStart`], and it is a real overlap between two
+/// checks rather than a mutant wrong twice: `quantity-round-trip` reads its
+/// entries back over a range around each entry's `window_end`, and its
+/// fixtures start an hour earlier, so a backend selecting on `window_start`
+/// returns none of them and the check reports that it could not compare a
+/// quantity at all. The dependency is the suite's, not the subject's — the
+/// quantity check cannot be answered by a backend that fails period-end
+/// selection — so the row names both rather than the assertion being
+/// loosened to admit one.
+const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
+    (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
+    (
+        Defect::SelectsOnWindowStart,
+        &[WINDOW_END_SELECTION, QUANTITY_ROUND_TRIP],
+    ),
+    (Defect::DedupIgnoresThePeriod, &[DEDUP_IDENTITY_OVER_WINDOW]),
+    (
+        Defect::FoldsTheInvalidation,
+        &[INVALIDATION_EXCLUDED_FROM_FOLD],
+    ),
+    (
+        Defect::ChecksThenInsertsTheInvalidation,
+        &[AT_MOST_ONE_INVALIDATION],
+    ),
+    (
+        Defect::IgnoresScopeOnThePointRead,
+        &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH],
+    ),
+];
+
+/// Every check fails against a backend that gets its rule wrong, and passes
+/// against every other backend.
+///
+/// The second half is what makes this a test of *discrimination* rather than
+/// of sensitivity. A check that fails against all six mutants is not
+/// detecting its own rule; it is detecting that something is different. So
+/// each row asserts a full column: the named check fails, and the other five
+/// still pass against the same mutant.
+///
+/// The subjects are in [`super::contract_mutants`], which also says why each
+/// is built by wrapping the reference backend or by carrying a ledger of its
+/// own, and why none of it is a switch inside `reference.rs`.
+///
+/// The closing assertion is against the checks the coverage constants
+/// *declare* — `IMPLEMENTED_CHECKS` together with `ADDITIONAL_CHECKS` — not
+/// against `run_all`'s body. A check added to the suite with no subject to
+/// fail it would otherwise sit in the matrix's blind spot, which is the very
+/// thing this test exists to take away.
+///
+/// The distinction is worth stating because it bounds what this catches. A
+/// check added to `run_all` **and** to a coverage constant, with no mutant,
+/// is caught here. One added to `run_all` and to neither constant escapes
+/// this test and the partition test alike — nothing ties `run_all`'s call
+/// list to the constants, and that gap predates the matrix.
+#[tokio::test]
+async fn each_check_fails_against_its_own_defect_and_no_other() {
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    for (defect, expected) in DISCRIMINATION_MATRIX {
+        let plugin = mutant(*defect);
+        let failed: BTreeSet<&str> = run_all(plugin.as_ref())
+            .await
+            .into_iter()
+            .map(|violation| violation.check)
+            .collect();
+        let expected: BTreeSet<&str> = expected.iter().copied().collect();
+        named.extend(expected.iter().copied());
+
+        assert_eq!(
+            failed, expected,
+            "the `{defect:?}` subject is the reference backend wrong in exactly one way, and \
+             `run_all` must report exactly the checks that rule belongs to. A check missing from \
+             the reported set cannot catch the mistake it exists for; an extra one is either a \
+             subject wrong in a second way or a check detecting difference rather than its own \
+             rule, and both make the suite read as coverage it does not have."
+        );
+    }
+
+    let run_by_run_all: BTreeSet<&str> = IMPLEMENTED_CHECKS
+        .iter()
+        .chain(ADDITIONAL_CHECKS)
+        .copied()
+        .collect();
+    assert_eq!(
+        named, run_by_run_all,
+        "every check `run_all` runs must be named by some row of the discrimination matrix, and \
+         the matrix must name no check `run_all` does not run. A check with no subject built to \
+         fail it is a check nothing here establishes anything about."
     );
 }
 

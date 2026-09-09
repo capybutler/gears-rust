@@ -267,5 +267,10 @@ pub async fn run_all(plugin: &dyn UsageCollectorPluginV1) -> Vec<ContractViolati
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "contract_mutants.rs"]
+mod contract_mutants;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "contract_tests.rs"]
 mod contract_tests;
