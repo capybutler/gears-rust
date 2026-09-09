@@ -11,22 +11,16 @@ use uuid::Uuid;
 
 use usage_collector_sdk::{UsageCollectorPluginError, UsageRecordStatus};
 
-use timescaledb_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
+use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
 
 const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
 
-/// Bring up a container and register `VCPU_GTS` in the catalog so the
-/// `usage_records.gts_id` FK is satisfied for every inserted record.
+/// Bring up a container and a record store over it.
 async fn setup() -> (common::TsHarness, PgRecordStore) {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let catalog = common::catalog_store(&h.pool);
-    catalog
-        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
-        .await
-        .expect("register usage type for FK");
     let store = common::record_store(&h.pool);
     (h, store)
 }
@@ -86,10 +80,10 @@ async fn pg_exact_retry_is_absorbed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_insert_with_unregistered_gts_id_is_usage_type_not_found() {
     // The core pre-checks the usage type exists before inserting, but in the
-    // narrow TOCTOU window where the type is deleted between that check and the
-    // insert the `usage_records.gts_id` -> catalog FK is violated (23503). The
-    // plugin must surface that as the typed `UsageTypeNotFound` (which the core
-    // lifts to a 404), not a generic Internal (500).
+    // narrow TOCTOU window where the type is removed between that check and the
+    // insert the `usage_records.gts_id` FK is violated (23503). The plugin must
+    // surface that as the typed `UsageTypeNotFound` (which the core lifts to a
+    // 404), not a generic Internal (500).
     const UNREGISTERED_GTS: &str =
         "gts.cf.core.uc.usage_record.v1~cf.compute._.unregistered_hours.v1";
     let (_h, store) = setup().await;

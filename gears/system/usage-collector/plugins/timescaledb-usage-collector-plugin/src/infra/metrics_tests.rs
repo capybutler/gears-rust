@@ -135,7 +135,6 @@ async fn remaining_recording_helpers_emit_expected_series() {
     // the full inventory and recording against it must not panic.
     let global = Metrics::new(lazy_pool());
     global.set_ready(true);
-    global.set_catalog_size(0);
     global.inc_dedup_absorbed();
     global.inc_dedup_stale();
     global.record_insert(InsertMode::Single, 0.001);
@@ -176,7 +175,7 @@ async fn remaining_recording_helpers_emit_expected_series() {
 
 /// With an in-memory reader installed, the recording helpers must emit the
 /// expected counter / gauge / histogram series — covering a plain counter, a
-/// label-split counter, both gauge kinds, and a histogram.
+/// label-split counter, a gauge, and a histogram.
 #[tokio::test]
 async fn recording_helpers_emit_expected_series() {
     let (provider, exporter) = local_provider();
@@ -192,8 +191,7 @@ async fn recording_helpers_emit_expected_series() {
     metrics.inc_backend_error(ErrorClass::Transient);
     metrics.inc_backend_error(ErrorClass::Internal);
 
-    // Gauges: last-value semantics.
-    metrics.set_catalog_size(42);
+    // Gauge: last-value semantics.
     metrics.set_ready(true);
 
     // Histogram (labelled): two batch-insert observations.
@@ -218,10 +216,6 @@ async fn recording_helpers_emit_expected_series() {
             label::ERROR_CATEGORY_TRANSIENT,
         ),
         2,
-    );
-    assert_eq!(
-        gauge_last_u64(&exporter, "uc_timescaledb_usage_type_catalog_size"),
-        Some(42),
     );
     assert_eq!(gauge_last_u64(&exporter, "uc_timescaledb_ready"), Some(1));
     assert_eq!(

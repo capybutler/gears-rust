@@ -17,14 +17,10 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use usage_collector_sdk::{
-    IdempotencyKey, MetadataKey, ResourceRef, SubjectRef, UsageKind, UsageRecord, UsageType,
-    UsageTypeGtsId,
-};
+use usage_collector_sdk::{IdempotencyKey, ResourceRef, SubjectRef, UsageRecord, UsageTypeGtsId};
 
 use timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig;
 use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
-use timescaledb_usage_collector_plugin::infra::storage::catalog_store::PgCatalogStore;
 use timescaledb_usage_collector_plugin::infra::storage::pool::{
     MIGRATOR, apply_post_migration_setup, build_pool,
 };
@@ -186,12 +182,6 @@ pub fn record_store(pool: &PgPool) -> PgRecordStore {
     PgRecordStore::new(pool.clone(), metrics(pool), CancellationToken::new())
 }
 
-/// Convenience builder for a [`PgCatalogStore`] with its own metric handle.
-#[must_use]
-pub fn catalog_store(pool: &PgPool) -> PgCatalogStore {
-    PgCatalogStore::new(pool.clone(), metrics(pool), CancellationToken::new())
-}
-
 /// Build a valid [`UsageTypeGtsId`] from a raw string.
 ///
 /// `UsageTypeGtsId::new` validates against the reserved GTS base
@@ -202,24 +192,6 @@ pub fn catalog_store(pool: &PgPool) -> PgCatalogStore {
 #[must_use]
 pub fn fixture_gts_id(gts: &str) -> UsageTypeGtsId {
     UsageTypeGtsId::new(gts).expect("fixture gts_id must be a valid usage-type GTS instance id")
-}
-
-/// Build a [`UsageType`] fixture from raw parts.
-///
-/// `kind` is `"counter"` / `"gauge"` (parsed via the SDK `FromStr`); `fields`
-/// become validated [`MetadataKey`]s.
-#[must_use]
-pub fn fixture_usage_type(gts: &str, kind: &str, fields: &[&str]) -> UsageType {
-    let kind: UsageKind = kind.parse().expect("fixture kind must be counter/gauge");
-    let metadata_fields = fields
-        .iter()
-        .map(|field| MetadataKey::new(*field).expect("fixture metadata field must be valid"))
-        .collect();
-    UsageType {
-        gts_id: fixture_gts_id(gts),
-        kind,
-        metadata_fields,
-    }
 }
 
 /// Build a minimal [`UsageRecord`] fixture referencing `gts_id`.

@@ -23,7 +23,7 @@ use usage_collector_sdk::{
     AggregationDimension, AggregationOp, AggregationSpec, MetadataFilter, MetadataKey, UsageRecord,
 };
 
-use timescaledb_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
+use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
 
 const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
@@ -32,17 +32,15 @@ const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v
 /// the `(created_at, id)` order is observable across a page.
 const BASE_TS: i64 = 1_700_000_000;
 
-/// Bring up a container and register `VCPU_GTS` so the `usage_records.gts_id`
-/// FK is satisfied. Returns the harness and a record store.
-async fn setup_with_type(gts: &str, fields: &[&str]) -> (common::TsHarness, PgRecordStore) {
+/// Bring up a container and a record store over it.
+///
+/// `_gts` / `_fields` are unused: the plugin no longer declares usage types, so
+/// there is nothing to seed. They are kept on the signature so each call site
+/// still records the type and metadata fields its assertions assume.
+async fn setup_with_type(_gts: &str, _fields: &[&str]) -> (common::TsHarness, PgRecordStore) {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let catalog = common::catalog_store(&h.pool);
-    catalog
-        .create(common::fixture_usage_type(gts, "counter", fields))
-        .await
-        .expect("register usage type for FK");
     let store = common::record_store(&h.pool);
     (h, store)
 }

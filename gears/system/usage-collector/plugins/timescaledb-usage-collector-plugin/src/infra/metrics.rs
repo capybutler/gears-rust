@@ -165,8 +165,6 @@ pub struct Metrics {
     backend_error: Counter<u64>,
     /// `uc_timescaledb_idempotency_conflicts_total`.
     idempotency_conflict: Counter<u64>,
-    /// `uc_timescaledb_usage_type_referenced_total`.
-    usage_type_referenced: Counter<u64>,
     /// `uc_timescaledb_migration_failures_total`.
     migration_failure: Counter<u64>,
     /// `uc_timescaledb_compensations_total`.
@@ -182,8 +180,6 @@ pub struct Metrics {
     tls_handshake_failure: Counter<u64>,
 
     // --- Synchronous gauges (set imperatively) ---
-    /// `uc_timescaledb_usage_type_catalog_size`.
-    usage_type_catalog_size: Gauge<u64>,
     /// `uc_timescaledb_ready` — plugin-local backend health (0/1).
     ready: Gauge<u64>,
 
@@ -256,10 +252,6 @@ impl Metrics {
             .u64_counter("uc_timescaledb_idempotency_conflicts_total")
             .with_description("Canonical-field-mismatch idempotency conflicts")
             .build();
-        let usage_type_referenced = meter
-            .u64_counter("uc_timescaledb_usage_type_referenced_total")
-            .with_description("FK ON DELETE RESTRICT rejections on usage-type delete")
-            .build();
         let migration_failure = meter
             .u64_counter("uc_timescaledb_migration_failures_total")
             .with_description("Schema-migration failures at startup")
@@ -285,10 +277,6 @@ impl Metrics {
             .with_description("TLS handshake failures against the backend DSN")
             .build();
 
-        let usage_type_catalog_size = meter
-            .u64_gauge("uc_timescaledb_usage_type_catalog_size")
-            .with_description("Current usage-type catalog row count")
-            .build();
         let ready = meter
             .u64_gauge("uc_timescaledb_ready")
             .with_description("Plugin-local backend readiness (1 = pool + migration ok)")
@@ -324,14 +312,12 @@ impl Metrics {
             dedup_absorbed,
             backend_error,
             idempotency_conflict,
-            usage_type_referenced,
             migration_failure,
             compensation,
             dedup_stale,
             batch_retry,
             query_requests,
             tls_handshake_failure,
-            usage_type_catalog_size,
             ready,
             _pool_active: pool_active,
             _pool_idle: pool_idle,
@@ -379,11 +365,6 @@ impl Metrics {
         self.idempotency_conflict.add(1, &[]);
     }
 
-    /// Increment the usage-type-referenced (FK rejection) counter.
-    pub fn inc_usage_type_referenced(&self) {
-        self.usage_type_referenced.add(1, &[]);
-    }
-
     /// Increment the compensation (`corrects_id` insert) counter.
     pub fn inc_compensation(&self) {
         self.compensation.add(1, &[]);
@@ -423,11 +404,6 @@ impl Metrics {
     }
 
     // --- Synchronous gauge setters ---
-
-    /// Set the current usage-type catalog size.
-    pub fn set_catalog_size(&self, n: u64) {
-        self.usage_type_catalog_size.record(n, &[]);
-    }
 
     /// Set the plugin-local readiness gauge (1 when `ready`, else 0).
     pub fn set_ready(&self, ready: bool) {

@@ -11,9 +11,8 @@ use usage_collector_sdk::{UsageCollectorPluginSpecV1, UsageCollectorPluginV1};
 
 use crate::config::TimescaleDbPluginConfig;
 use crate::domain::adapter::StorageAdapter;
-use crate::domain::ports::{CatalogStore, RecordStore};
+use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
-use crate::infra::storage::catalog_store::PgCatalogStore;
 use crate::infra::storage::pool::{MIGRATOR, apply_post_migration_setup, build_pool};
 use crate::infra::storage::record_store::PgRecordStore;
 
@@ -97,19 +96,14 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
             ready_metrics.set_ready(false);
         });
 
-        // Wire the storage stack: record + catalog stores behind the adapter.
-        // Both stores share the one metric inventory via `Arc<Metrics>`.
+        // Wire the storage stack: the record store behind the adapter. It takes
+        // the one metric inventory built above via `Arc<Metrics>`.
         let record: Arc<dyn RecordStore> = Arc::new(PgRecordStore::new(
-            pool.clone(),
-            metrics.clone(),
-            ctx.cancellation_token().clone(),
-        ));
-        let catalog: Arc<dyn CatalogStore> = Arc::new(PgCatalogStore::new(
-            pool.clone(),
+            pool,
             metrics,
             ctx.cancellation_token().clone(),
         ));
-        let adapter = StorageAdapter::new(record, catalog);
+        let adapter = StorageAdapter::new(record);
 
         // Register the scoped backend client in ClientHub under the GTS
         // instance scope so the plugin host resolves it on first dispatch.

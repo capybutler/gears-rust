@@ -15,7 +15,7 @@ use super::super::bind::{SqlBind, odata_value_to_bind};
 use super::super::keyset::{
     cursor_key_to_bind, ensure_forward_cursor, keyset_predicate, render_order_by,
 };
-use super::{ODataValue, SqlCtx, record_column, translate_record_filter, usage_type_column};
+use super::{ODataValue, SqlCtx, record_column, translate_record_filter};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -69,13 +69,6 @@ fn record_field_columns_are_allowlisted() {
     assert_eq!(record_column("corrects_id"), Some("corrects_id"));
     assert_eq!(record_column("status"), Some("status"));
     assert_eq!(record_column("definitely_not_a_column"), None);
-}
-
-#[test]
-fn usage_type_columns_are_allowlisted() {
-    assert_eq!(usage_type_column("gts_id"), Some("gts_id"));
-    assert_eq!(usage_type_column("kind"), Some("kind"));
-    assert_eq!(usage_type_column("gts_id; DROP TABLE"), None);
 }
 
 // ── Value conversion ─────────────────────────────────────────────────────────
@@ -252,20 +245,37 @@ fn placeholder_numbering_honors_start_offset() {
     assert_eq!(sql, "status = $3");
 }
 
-// `FilterField::from_name` resolves only schema fields, so an unmapped field
-// is rejected at the AST boundary. We still guard the translator against a
-// field whose `name()` is not on the column allowlist by exercising the
-// usage-type column path against a record field that maps to no catalog
-// column (`status`).
+/// A field type whose `name()` is deliberately absent from
+/// [`record_column`], so the translator's fail-closed identifier guard can be
+/// reached from a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UnmappedField;
+
+impl FilterField for UnmappedField {
+    const FIELDS: &'static [Self] = &[Self];
+
+    fn name(&self) -> &'static str {
+        "definitely_not_a_column"
+    }
+
+    fn kind(&self) -> FieldKind {
+        FieldKind::String
+    }
+}
+
+// `FilterField::from_name` resolves only schema fields, so an unmapped field is
+// rejected at the AST boundary. The translator must still fail closed on a
+// field whose `name()` is not on the column allowlist, rather than
+// interpolating it into the SQL.
 #[test]
-fn record_filter_rejects_unmapped_field_against_catalog_allowlist() {
-    let node = binary(
-        "status",
-        FilterOp::Eq,
-        ODataValue::String("active".to_owned()),
-    );
+fn record_filter_rejects_field_not_on_column_allowlist() {
+    let node = FilterNode::Binary {
+        field: UnmappedField,
+        op: FilterOp::Eq,
+        value: ODataValue::String("active".to_owned()),
+    };
     let mut ctx = SqlCtx::new(1);
-    let err = super::translate_usage_type_filter(&node, &mut ctx).unwrap_err();
+    let err = translate_record_filter(&node, &mut ctx).unwrap_err();
     assert!(err.contains("not allowlisted"), "got: {err}");
 }
 

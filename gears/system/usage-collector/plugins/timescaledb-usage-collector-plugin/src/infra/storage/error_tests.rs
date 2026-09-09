@@ -12,16 +12,9 @@ fn unique_violation_on_dedup_is_dedup_conflict() {
     );
 }
 #[test]
-fn unique_violation_on_catalog_pk_is_type_exists() {
-    assert_eq!(
-        classify_db("23505", Some("usage_type_catalog_pkey")),
-        DbErrorClass::CatalogUniqueViolation
-    );
-}
-#[test]
 fn unique_violation_on_unknown_constraint_is_other() {
     // A future second unique constraint (or a records PK collision) must not be
-    // misclassified as a catalog-specific violation.
+    // misclassified as the dedup-specific violation.
     assert_eq!(
         classify_db("23505", Some("usage_records_pkey")),
         DbErrorClass::Other
@@ -32,7 +25,7 @@ fn unique_violation_without_constraint_is_other() {
     assert_eq!(classify_db("23505", None), DbErrorClass::Other);
 }
 #[test]
-fn fk_violation_is_type_referenced() {
+fn fk_violation_is_foreign_key_class() {
     assert_eq!(
         classify_db("23503", Some("usage_records_gts_id_fk")),
         DbErrorClass::ForeignKeyViolation
@@ -40,11 +33,11 @@ fn fk_violation_is_type_referenced() {
 }
 
 /// `PostgreSQL` 18 reports `ON DELETE RESTRICT` as the standard 23001
-/// `restrict_violation`, where <= 17 reported 23503. Both are "the row is
-/// still referenced" for this plugin; dropping either one would turn a
-/// `UsageTypeReferenced` back into an opaque `Internal`.
+/// `restrict_violation`, where <= 17 reported 23503. Both mean the same thing
+/// to this plugin; dropping either one would let it fall through to the opaque
+/// `Other` class.
 #[test]
-fn restrict_violation_is_also_type_referenced() {
+fn restrict_violation_is_also_foreign_key_class() {
     assert_eq!(
         classify_db("23001", Some("usage_records_gts_id_fk")),
         DbErrorClass::ForeignKeyViolation

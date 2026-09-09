@@ -16,11 +16,11 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 
 use usage_collector_sdk::{
-    IdempotencyKey, MetadataKey, ResourceRef, SubjectRef, UsageCollectorPluginError, UsageKind,
-    UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
+    IdempotencyKey, MetadataKey, ResourceRef, SubjectRef, UsageCollectorPluginError, UsageRecord,
+    UsageRecordStatus, UsageTypeGtsId,
 };
 
-use super::entity::{UsageRecordRow, UsageTypeRow};
+use super::entity::UsageRecordRow;
 
 /// Borrow the raw GTS instance id string out of a [`UsageTypeGtsId`] (for
 /// binding).
@@ -65,28 +65,6 @@ pub fn status_to_sql(status: UsageRecordStatus) -> &'static str {
     match status {
         UsageRecordStatus::Active => "active",
         UsageRecordStatus::Inactive => "inactive",
-    }
-}
-
-/// Parse a stored `kind` string into [`UsageKind`] via the SDK `FromStr`
-/// (`counter` / `gauge`).
-///
-/// # Errors
-///
-/// Returns [`UsageCollectorPluginError::Internal`] for any other value.
-pub fn parse_kind(raw: &str) -> Result<UsageKind, UsageCollectorPluginError> {
-    raw.parse::<UsageKind>().map_err(|e| {
-        UsageCollectorPluginError::internal(format!("stored kind `{raw}` invalid: {e}"))
-    })
-}
-
-/// SQL string form of a [`UsageKind`] (inverse of [`parse_kind`]), matching the
-/// DDL `CHECK (kind IN ('counter', 'gauge'))`.
-#[must_use]
-pub fn kind_to_sql(kind: UsageKind) -> &'static str {
-    match kind {
-        UsageKind::Counter => "counter",
-        UsageKind::Gauge => "gauge",
     }
 }
 
@@ -181,35 +159,6 @@ pub fn record_row_to_model(row: UsageRecordRow) -> Result<UsageRecord, UsageColl
         corrects_id: row.corrects_id,
         status,
         created_at: row.created_at,
-    })
-}
-
-/// Map a [`UsageTypeRow`] into a validated [`UsageType`].
-///
-/// # Errors
-///
-/// Returns [`UsageCollectorPluginError::Internal`] when the stored `gts_id`,
-/// `kind`, or any `metadata_fields` entry fails its SDK newtype validation.
-pub fn type_row_to_model(row: UsageTypeRow) -> Result<UsageType, UsageCollectorPluginError> {
-    let gts_id = gts_id_from_str(&row.gts_id)?;
-    let kind = parse_kind(&row.kind)?;
-
-    let mut metadata_fields = std::collections::BTreeSet::new();
-    for field in row.metadata_fields {
-        // `field` is already owned (the loop consumes `metadata_fields` by
-        // value), so move it into the validation; `e` carries the reason.
-        let key = MetadataKey::new(field).map_err(|e| {
-            UsageCollectorPluginError::internal(format!(
-                "stored metadata_fields entry invalid: {e}"
-            ))
-        })?;
-        metadata_fields.insert(key);
-    }
-
-    Ok(UsageType {
-        gts_id,
-        kind,
-        metadata_fields,
     })
 }
 

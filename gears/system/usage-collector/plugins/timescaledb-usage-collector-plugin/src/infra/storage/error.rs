@@ -10,7 +10,6 @@ use usage_collector_sdk::UsageCollectorPluginError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbErrorClass {
     DedupUniqueViolation,
-    CatalogUniqueViolation,
     ForeignKeyViolation,
     Transient,
     Other,
@@ -29,7 +28,7 @@ pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
     match code {
         // Match each unique constraint by name. A new unique constraint (or a
         // records PK `(id, created_at)` collision) must fall through to
-        // `Other` rather than be silently misread as a catalog conflict.
+        // `Other` rather than be silently misread as a dedup conflict.
         //
         // `usage_records_dedup_uniq` is the dedup authority, but the ingest path
         // reaches it via `INSERT … ON CONFLICT … DO NOTHING`, which suppresses
@@ -38,11 +37,10 @@ pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
         // bypasses `ON CONFLICT`), keeping it classified rather than `Other`.
         "23505" => match constraint {
             Some("usage_records_dedup_uniq") => DbErrorClass::DedupUniqueViolation,
-            Some("usage_type_catalog_pkey") => DbErrorClass::CatalogUniqueViolation,
             _ => DbErrorClass::Other,
         },
         // 23503 `foreign_key_violation` is what PostgreSQL <= 17 reports for the
-        // `usage_records.gts_id` -> catalog RESTRICT guard. PostgreSQL 18
+        // `usage_records_gts_id_fk` RESTRICT guard. PostgreSQL 18
         // reports the standard 23001 `restrict_violation` for `ON DELETE
         // RESTRICT` instead ("violates RESTRICT setting of foreign key
         // constraint ..."), so both codes mean the same thing to this plugin:

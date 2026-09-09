@@ -6,13 +6,13 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    MetadataKey, UsageCollectorPluginError, UsageKind, UsageRecordStatus, UsageTypeGtsId,
+    MetadataKey, UsageCollectorPluginError, UsageRecordStatus, UsageTypeGtsId,
 };
 
-use super::super::entity::{UsageRecordRow, UsageTypeRow};
+use super::super::entity::UsageRecordRow;
 use super::{
-    gts_id_from_str, kind_to_sql, metadata_jsonb_to_map, metadata_map_to_jsonb, parse_kind,
-    parse_status, record_row_to_model, status_to_sql, type_row_to_model,
+    gts_id_from_str, metadata_jsonb_to_map, metadata_map_to_jsonb, parse_status,
+    record_row_to_model, status_to_sql,
 };
 
 // ── status round-trip ────────────────────────────────────────────────────────
@@ -28,27 +28,6 @@ fn parse_status_round_trips_through_sql_form() {
 #[test]
 fn parse_status_rejects_unknown() {
     assert!(parse_status("archived").is_err());
-}
-
-// ── kind round-trip ──────────────────────────────────────────────────────────
-
-#[test]
-fn parse_kind_round_trips_through_sql_form() {
-    for kind in [UsageKind::Counter, UsageKind::Gauge] {
-        let sql = kind_to_sql(kind);
-        assert_eq!(parse_kind(sql).unwrap(), kind);
-    }
-}
-
-#[test]
-fn kind_to_sql_emits_lowercase_wire_tokens() {
-    assert_eq!(kind_to_sql(UsageKind::Counter), "counter");
-    assert_eq!(kind_to_sql(UsageKind::Gauge), "gauge");
-}
-
-#[test]
-fn parse_kind_rejects_unknown() {
-    assert!(parse_kind("histogram").is_err());
 }
 
 // ── metadata jsonb <-> map round-trip ────────────────────────────────────────
@@ -227,64 +206,6 @@ fn record_row_unknown_status_is_internal() {
     row.status = "archived".to_owned();
     assert!(matches!(
         record_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
-}
-
-// ── usage-type row -> model ──────────────────────────────────────────────────
-
-fn valid_type_row() -> UsageTypeRow {
-    UsageTypeRow {
-        gts_id: VALID_GTS_ID.to_owned(),
-        kind: "counter".to_owned(),
-        metadata_fields: vec!["region".to_owned(), "tier".to_owned()],
-    }
-}
-
-#[test]
-fn type_row_to_model_maps_a_valid_row() {
-    let model = type_row_to_model(valid_type_row()).expect("a fully valid type row maps");
-    assert_eq!(model.gts_id, UsageTypeGtsId::new(VALID_GTS_ID).unwrap());
-    assert_eq!(model.kind, UsageKind::Counter);
-    assert_eq!(model.metadata_fields.len(), 2);
-    assert!(
-        model
-            .metadata_fields
-            .contains(&MetadataKey::new("region").unwrap())
-    );
-    assert!(
-        model
-            .metadata_fields
-            .contains(&MetadataKey::new("tier").unwrap())
-    );
-}
-
-#[test]
-fn type_row_invalid_gts_id_is_internal() {
-    let mut row = valid_type_row();
-    row.gts_id = "not-a-valid-gts-id".to_owned();
-    assert!(matches!(
-        type_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
-}
-
-#[test]
-fn type_row_invalid_kind_is_internal() {
-    let mut row = valid_type_row();
-    row.kind = "histogram".to_owned();
-    assert!(matches!(
-        type_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
-}
-
-#[test]
-fn type_row_invalid_metadata_field_is_internal() {
-    let mut row = valid_type_row();
-    row.metadata_fields = vec![String::new()]; // empty key fails MetadataKey::new
-    assert!(matches!(
-        type_row_to_model(row),
         Err(UsageCollectorPluginError::Internal(_))
     ));
 }

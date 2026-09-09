@@ -1,11 +1,11 @@
-//! `sqlx` row structs mirroring the `usage_records` hypertable and the
-//! `usage_type_catalog` table (see `migrations/0001_init.sql`).
+//! `sqlx` row structs mirroring the `usage_records` hypertable (see
+//! `migrations/0001_init.sql`).
 //!
 //! These carry the raw storage-typed columns; [`super::mapper`] turns a row
 //! into the validated SDK model (and back where needed). Column types match the
 //! DDL: `numeric` → `rust_decimal::Decimal`, `timestamptz` →
-//! `time::OffsetDateTime`, `jsonb` → `serde_json::Value`, `text[]` →
-//! `Vec<String>`, nullable `text` / `uuid` → `Option<…>`.
+//! `time::OffsetDateTime`, `jsonb` → `serde_json::Value`, nullable `text` /
+//! `uuid` → `Option<…>`.
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -42,15 +42,4 @@ pub struct UsageRecordRow {
     pub metadata: serde_json::Value,
     /// `ingested_at` — server insert timestamp (`DEFAULT now()`).
     pub ingested_at: OffsetDateTime,
-}
-
-/// One row of the `usage_type_catalog` table.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct UsageTypeRow {
-    /// `gts_id` — catalog primary key (raw GTS instance id string).
-    pub gts_id: String,
-    /// `kind` — `'counter'` / `'gauge'`.
-    pub kind: String,
-    /// `metadata_fields` — declared metadata keys (`text[]`).
-    pub metadata_fields: Vec<String>,
 }

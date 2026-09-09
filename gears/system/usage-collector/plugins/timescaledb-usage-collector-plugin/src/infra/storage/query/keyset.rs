@@ -2,7 +2,7 @@
 //! encode/decode for keyset pagination.
 //!
 //! All column identifiers come from a caller-supplied allowlist closure
-//! (`record_column` / `usage_type_column` from [`super::translate`]); cursor
+//! (`record_column` from [`super::translate`]); cursor
 //! key values are always bound. The v1 gateway default order is the
 //! all-ascending `(created_at, id)` tuple, so [`keyset_predicate`] emits the
 //! row-value tuple form for uniform-direction orders and rejects mixed

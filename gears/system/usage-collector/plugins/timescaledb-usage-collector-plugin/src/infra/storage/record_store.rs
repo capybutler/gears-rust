@@ -116,15 +116,15 @@ impl PgRecordStore {
     }
 
     /// Single-row insert error mapping. A foreign-key violation on
-    /// `usage_records.gts_id` means the referenced usage type is absent from the
-    /// catalog — the narrow TOCTOU race where it is deleted between the core's
-    /// pre-insert catalog existence check and this insert. Surface it as the
-    /// typed [`UsageCollectorPluginError::UsageTypeNotFound`] (the core lifts it
-    /// to a 404) instead of a generic Internal (500); every other error falls
-    /// through to [`Self::record_backend_error`] (which also meters it). Mirrors
-    /// the catalog-store FK → `UsageTypeReferenced` mapping. The batch path is
-    /// intentionally excluded: a multi-`gts_id` UNNEST insert cannot attribute a
-    /// single FK violation to one `gts_id`, so a typed mapping there would lie.
+    /// `usage_records.gts_id` means the referenced usage type does not exist —
+    /// the narrow TOCTOU race where it is removed between the core's pre-insert
+    /// existence check and this insert. Surface it as the typed
+    /// [`UsageCollectorPluginError::UsageTypeNotFound`] (the core lifts it to a
+    /// 404) instead of a generic Internal (500); every other error falls
+    /// through to [`Self::record_backend_error`] (which also meters it). The
+    /// batch path is intentionally excluded: a multi-`gts_id` UNNEST insert
+    /// cannot attribute a single FK violation to one `gts_id`, so a typed
+    /// mapping there would lie.
     fn map_insert_error(
         &self,
         err: &sqlx::Error,

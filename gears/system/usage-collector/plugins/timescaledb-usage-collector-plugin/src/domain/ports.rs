@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use usage_collector_sdk::{
     AggregationResult, AggregationSpec, MetadataFilter, UsageCollectorPluginError, UsageRecord,
-    UsageType, UsageTypeGtsId,
+    UsageTypeGtsId,
 };
 
 /// Persistence + query operations on `usage_records`. Implemented by infra.
@@ -30,16 +30,4 @@ pub trait RecordStore: Send + Sync + 'static {
         spec: AggregationSpec,
     ) -> Result<AggregationResult, UsageCollectorPluginError>;
     async fn deactivate(&self, id: Uuid) -> Result<(), UsageCollectorPluginError>;
-}
-
-/// Catalog operations on `usage_type_catalog`. Implemented by infra.
-#[async_trait]
-pub trait CatalogStore: Send + Sync + 'static {
-    async fn create(&self, usage_type: UsageType) -> Result<UsageType, UsageCollectorPluginError>;
-    async fn get(&self, gts_id: UsageTypeGtsId) -> Result<UsageType, UsageCollectorPluginError>;
-    async fn list(
-        &self,
-        query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorPluginError>;
-    async fn delete(&self, gts_id: UsageTypeGtsId) -> Result<(), UsageCollectorPluginError>;
 }

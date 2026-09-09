@@ -9,7 +9,7 @@ mod common;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-use timescaledb_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
+use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::storage::pool::apply_post_migration_setup;
 
 const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
@@ -106,11 +106,6 @@ async fn pg_registered_retention_policy_drops_aged_data() {
     let h = common::bring_up_real_retention()
         .await
         .expect("timescaledb container (Docker required)");
-    let catalog = common::catalog_store(&h.pool);
-    catalog
-        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
-        .await
-        .expect("register usage type (satisfies the gts_id FK)");
     let store = common::record_store(&h.pool);
     let tenant = Uuid::from_u128(0xA6ED);
 
@@ -190,11 +185,6 @@ async fn pg_default_harness_retention_cannot_drop_backdated_fixtures() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let catalog = common::catalog_store(&h.pool);
-    catalog
-        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
-        .await
-        .expect("register usage type (satisfies the gts_id FK)");
     let store = common::record_store(&h.pool);
     let tenant = Uuid::from_u128(0xBAD_11E);
 

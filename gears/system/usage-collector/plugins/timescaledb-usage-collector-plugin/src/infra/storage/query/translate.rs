@@ -1,8 +1,8 @@
 //! Injection-safe filter translation: a validated `FilterNode<F>` becomes a
 //! parameterized `PostgreSQL` `WHERE` fragment plus an ordered bind list.
 //!
-//! Identifiers come only from the closed allowlists ([`record_column`] /
-//! [`usage_type_column`]); values are always bound (`$N`) via
+//! Identifiers come only from the closed allowlist ([`record_column`]); values
+//! are always bound (`$N`) via
 //! [`crate::infra::storage::query::bind::odata_value_to_bind`].
 //!
 //! # Verified `toolkit-odata` / SDK API (Task E1)
@@ -22,16 +22,15 @@
 //!   the macro field's snake-case name — for `UsageRecordFilterField` those are
 //!   exactly `"id"`, `"created_at"`, `"tenant_id"`, `"resource_id"`,
 //!   `"resource_type"`, `"subject_id"`, `"subject_type"`, `"corrects_id"`,
-//!   `"status"`; for `UsageTypeFilterField`, `"gts_id"` and `"kind"`. The
-//!   identity column allowlists below rely on that.
+//!   `"status"`. The identity column allowlist below relies on that.
 //! - `ODataValue` path: `toolkit_odata::filter::ODataValue` is a `pub use` of
 //!   `toolkit_odata::ast::Value`. Variants: `Null`, `Bool(bool)`,
 //!   `Number(bigdecimal::BigDecimal)`, `Uuid(uuid::Uuid)`,
 //!   `DateTime(chrono::DateTime<chrono::Utc>)`, `Date(chrono::NaiveDate)`,
 //!   `Time(chrono::NaiveTime)`, `String(String)`.
-//! - `UsageRecordFilterField` / `UsageTypeFilterField` are SDK re-exports
-//!   (`UsageRecordQueryFilterField` / `UsageTypeQueryFilterField`,
-//!   `#[derive(ODataFilterable)]`-generated). Tests build them via
+//! - `UsageRecordFilterField` is an SDK re-export
+//!   (`UsageRecordQueryFilterField`, `#[derive(ODataFilterable)]`-generated).
+//!   Tests build it via
 //!   `<UsageRecordFilterField as FilterField>::from_name("status")`.
 //! - `UsageTypeGtsId`: `new(impl Into<String>) -> Result<Self,
 //!   UsageCollectorError>` (validated); reads back via `AsRef<str>`
@@ -67,17 +66,6 @@ pub fn record_column(field_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Closed allowlist mapping a `usage_type_catalog` filter-field name to its
-/// column. Identity map over the two filterable catalog fields.
-#[must_use]
-pub fn usage_type_column(field_name: &str) -> Option<&'static str> {
-    match field_name {
-        "gts_id" => Some("gts_id"),
-        "kind" => Some("kind"),
-        _ => None,
-    }
-}
-
 /// Bind accumulator + placeholder counter for a single SQL statement.
 ///
 /// `next` is the next `$N` index to emit; `binds` is the ordered list of
@@ -87,8 +75,8 @@ pub fn usage_type_column(field_name: &str) -> Option<&'static str> {
 pub struct SqlCtx {
     next: usize,
     /// Accumulated binds in placeholder order. Crate-visible: read only by the
-    /// in-crate stores (record/catalog) and the query tests — never by an
-    /// external consumer.
+    /// in-crate record store and the query tests — never by an external
+    /// consumer.
     pub(crate) binds: Vec<SqlBind>,
 }
 
@@ -149,20 +137,6 @@ pub fn translate_record_filter<F: FilterField>(
     ctx: &mut SqlCtx,
 ) -> Result<String, String> {
     translate_filter(node, ctx, record_column)
-}
-
-/// Translate a `usage_type_catalog` filter node into a parameterized `WHERE`
-/// fragment. Identical to [`translate_record_filter`] but resolves identifiers
-/// through [`usage_type_column`].
-///
-/// # Errors
-///
-/// Same conditions as [`translate_record_filter`].
-pub fn translate_usage_type_filter<F: FilterField>(
-    node: &FilterNode<F>,
-    ctx: &mut SqlCtx,
-) -> Result<String, String> {
-    translate_filter(node, ctx, usage_type_column)
 }
 
 /// Shared recursive walker parameterized over the column allowlist.

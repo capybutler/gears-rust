@@ -23,11 +23,6 @@ async fn pg_migrations_create_hypertable_and_retention() {
     .await
     .expect("jobs query");
     assert!(jobs >= 1, "retention policy must be registered");
-
-    sqlx::query("SELECT gts_id, kind, metadata_fields FROM usage_type_catalog LIMIT 0")
-        .fetch_all(&h.pool)
-        .await
-        .expect("usage_type_catalog must exist");
 }
 
 /// Approach A: dedup is the hypertable's own 4-tuple UNIQUE, so there is no

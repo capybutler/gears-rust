@@ -10,7 +10,7 @@ mod common;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-use timescaledb_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
+use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use usage_collector_sdk::{UsageRecordStatus, derive_usage_record_id};
 
 const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
@@ -20,11 +20,6 @@ async fn pg_same_key_different_created_at_are_distinct_and_addressable() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let catalog = common::catalog_store(&h.pool);
-    catalog
-        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
-        .await
-        .expect("register usage type (satisfies the gts_id FK)");
     let store = common::record_store(&h.pool);
     let tenant = Uuid::from_u128(0x00C0_FFEE);
 
