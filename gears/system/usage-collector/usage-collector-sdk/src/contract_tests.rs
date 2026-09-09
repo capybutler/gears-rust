@@ -22,7 +22,7 @@ use toolkit_odata::{ODataQuery, ast};
 use uuid::Uuid;
 
 use super::{
-    BLOCKED_CHECKS, HARNESS_FAULT, IMPLEMENTED_CHECKS, QUANTITY_ROUND_TRIP, UNWRITTEN_CHECKS,
+    BLOCKED_CHECKS, HARNESS_FAULT, IMPLEMENTED_CHECKS, UNWRITTEN_CHECKS,
     reference::InMemoryReferencePlugin, run_all,
 };
 use crate::error::UsageCollectorPluginError;
@@ -50,9 +50,9 @@ async fn the_reference_backend_conforms() {
 ///
 /// Without this, `BLOCKED_CHECKS` is prose: a typo, or a row left behind
 /// after a check became writable, reads exactly like an honest gap. The
-/// name says *cannot express* rather than *not implemented* because six of
+/// name says *cannot express* rather than *not implemented* because four of
 /// the seven are unimplemented and only two of those are blocked — the
-/// other four are in `UNWRITTEN_CHECKS`.
+/// other two are in `UNWRITTEN_CHECKS`.
 #[test]
 fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
     let blocked: BTreeSet<&str> = BLOCKED_CHECKS.iter().map(|(check, _)| *check).collect();
@@ -64,11 +64,13 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
          express; a name that is not in DESIGN's table, or one whose check has since become \
          writable, reads as an honest gap and is not one"
     );
-    assert!(
-        !blocked.contains(QUANTITY_ROUND_TRIP),
-        "`{QUANTITY_ROUND_TRIP}` is implemented and run by `run_all`, so listing it as blocked \
-         would under-report the suite's coverage"
-    );
+    for check in IMPLEMENTED_CHECKS {
+        assert!(
+            !blocked.contains(check),
+            "`{check}` is implemented and run by `run_all`, so listing it as blocked would \
+             under-report the suite's coverage"
+        );
+    }
     for (check, reason) in BLOCKED_CHECKS {
         assert!(
             !reason.trim().is_empty(),
@@ -84,8 +86,8 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 /// This is what makes the module's coverage claim structural instead of
 /// narrative. `run_all` returning no violations says nothing about a check
 /// it never ran, and "run this suite" is the acceptance criterion for
-/// porting a storage backend, so a suite that runs one check must not read
-/// as a suite that ran seven. Asserting the partition means a check cannot
+/// porting a storage backend, so a suite that runs three checks must not
+/// read as a suite that ran seven. Asserting the partition means a check cannot
 /// half-land — implemented but still listed unwritten, or written and
 /// listed nowhere — without this failing, and `UNWRITTEN_CHECKS` empties
 /// itself as the work lands rather than needing someone to remember.
