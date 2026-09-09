@@ -5,10 +5,15 @@
 //! the suite *runs*. It establishes nothing about whether any check would
 //! notice a non-conforming plugin, and a check that cannot fail is worse
 //! than a missing one — a port is accepted on it, and it reads as coverage.
-//! The subjects here are what close that: each is the reference backend
-//! wrong in exactly one plausible way, and
+//! The subjects here are what close that: each is **behaviourally** the
+//! reference backend wrong in exactly one plausible way, and
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
+//!
+//! *Behaviourally* is the exact word. Three subjects wrap a real reference
+//! backend and are that backend plus one interception; the other three
+//! re-implement it, and a re-implementation is the same backend only as far
+//! as the checks can see. [`MutantLedger`] states how far that is.
 //!
 //! # Why none of this lives in `reference`
 //!
@@ -116,6 +121,12 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
 /// Every path the defect is not about is the exemplar's own code, so a
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
+///
+/// One qualification, and it holds for all three wrapped defects:
+/// [`Self::create_usage_records`] is not pure delegation. The inner backend
+/// still decides the batch, but the per-entry alignment around it — which
+/// entries reach it, and where a refusal of this wrapper's own lands in the
+/// answer — is code written here. See that method's doc.
 struct WrappedReference {
     /// The conforming backend everything is delegated to.
     inner: InMemoryReferencePlugin,
@@ -127,10 +138,12 @@ struct WrappedReference {
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
-    /// same transaction. It leaves a claim behind for an entry the inner
-    /// backend then refuses — `at-most-one-invalidation` submits one such
-    /// entry — and that is unobservable here, because no check resubmits a
-    /// refused entry's key over a second period.
+    /// same transaction. It therefore leaves a claim behind for an entry the
+    /// inner backend then refuses, and `at-most-one-invalidation` submits
+    /// **two** such entries: its sequential second withdrawal, and whichever
+    /// of its two racing withdrawals the batch turns down. Both are
+    /// unobservable here, because neither key is resubmitted over a second
+    /// period — the only question this index is ever asked.
     period_blind_keys: Mutex<BTreeMap<PeriodBlindKey, Uuid>>,
 }
 
@@ -166,7 +179,18 @@ impl WrappedReference {
                 ..record
             }),
             Defect::DedupIgnoresThePeriod => self.claim_period_blind_key(record),
-            _ => Ok(record),
+            // Enumerated rather than caught by a wildcard. A seventh wrapped
+            // defect routed here and forgotten would otherwise pass its
+            // entries through untouched and report no violation at all;
+            // spelling the variants out makes that a compile error instead
+            // of a matrix row whose subject does nothing. The point read's
+            // defect is applied on the read path, and the last three never
+            // reach this type at all — `mutant` routes them to
+            // `MutantLedger` — but exhaustiveness is the whole point.
+            Defect::IgnoresScopeOnThePointRead
+            | Defect::SelectsOnWindowStart
+            | Defect::FoldsTheInvalidation
+            | Defect::ChecksThenInsertsTheInvalidation => Ok(record),
         }
     }
 
@@ -244,6 +268,14 @@ impl UsageCollectorPluginV1 for WrappedReference {
             .iter()
             .filter_map(|entry| entry.as_ref().ok().cloned())
             .collect();
+        // A batch every entry of which this wrapper refused must not reach
+        // the inner backend: the reference answers an empty batch with
+        // `Internal`, and this call would then fail outright rather than
+        // reporting the per-entry refusals it already has. Unreachable
+        // today — only `DedupIgnoresThePeriod` refuses anything here, and
+        // the one batch the suite sends it carries two distinct keys — which
+        // is also why the emptiness guard above is repeated rather than left
+        // to the inner backend to raise.
         let inner = if survivors.is_empty() {
             Vec::new()
         } else {
@@ -317,17 +349,25 @@ impl UsageCollectorPluginV1 for WrappedReference {
 
 /// One round trip of a quantity through a binary float.
 ///
-/// The two magnitude corners of the published range lose their low digits
-/// and `42.500` loses its scale, which is what a `double precision` column
-/// costs and what `quantity-round-trip` exists to find.
+/// Three of the published range's five corners move, which is what a
+/// `double precision` column costs and what `quantity-round-trip` exists to
+/// find: both magnitude corners lose their low digits
+/// (`9999999999999999999999999999` comes back
+/// `9999999999999999583119736832`), and `42.500` comes back `42.5`, its
+/// scale normalised away.
 ///
-/// A value the carrier cannot take back from the float survives unchanged
-/// rather than becoming something invented. The two `1e-28` corners are that
-/// case — the float's nearest neighbour needs a scale past `Decimal`'s 28 to
-/// be read back, so `from_f64` answers `None` and they pass through — which
-/// makes this subject *less* wrong than a real float column and never wrong
-/// in a second way. Three of the five corners still move, and one is enough
-/// for the check to fire.
+/// **The two `1e-28` corners survive, and a real float column would not lose
+/// them either.** `to_f64` renders `1e-28` as `1.0000000000000001e-28` and
+/// `from_f64` lands it back exactly, because `Decimal`'s 28-digit scale cap
+/// truncates the float's excess digits onto the original value. Nothing is
+/// being spared here — the smallest published value simply is not where a
+/// binary float loses, so this subject is as wrong as the column it models
+/// rather than kinder than it.
+///
+/// `unwrap_or(value)` is a floor for a value the carrier could not take back
+/// at all, and it is **unreached**: `from_f64` answers `Some` for every
+/// quantity this suite submits. It is here so a future corner cannot turn
+/// this function into a panic, not because any corner takes it.
 fn through_f64(value: Decimal) -> Decimal {
     value.to_f64().and_then(Decimal::from_f64).unwrap_or(value)
 }
@@ -373,6 +413,28 @@ fn only_this_row(id: Uuid) -> ast::Expr {
 ///   A check that grows a second one gets a loud refusal naming this
 ///   backend, which is the right failure: a mutant quietly wrong about a
 ///   fold no row of the matrix accounts for would be wrong in two ways.
+///
+/// # The mirror is pinned, and how far
+///
+/// A hand-written mirror of an exemplar usually rots quietly. This one does
+/// not, and the matrix is what holds it: every check `run_all` runs is
+/// *passed* by at least one subject built on this type. So if the
+/// reference's selection predicate, page order, admission decision or fold
+/// exclusion changed and the checks moved with it, this mirror would keep
+/// the old behaviour, some row would report a violation its expected set
+/// does not name, and `assert_eq!(failed, expected)` would fire. Drift
+/// between the two implementations is a test failure rather than a thing a
+/// reader has to notice.
+///
+/// **What that does not cover is any behaviour no check asserts in a fresh
+/// run**, because a behaviour nothing exercises cannot fail here. The
+/// admission *order* is the live example: [`decide`] tries the duplicate
+/// `id` branch before the at-most-one branch, matching the reference, and
+/// nothing in a single run resubmits an invalidation verbatim to tell the
+/// two orders apart. Swap those branches in `reference.rs` and this mirror
+/// would silently diverge. It is harmless exactly because nothing depends
+/// on it, which is the honest version of the claim rather than "it mirrors
+/// the reference".
 struct MutantLedger {
     /// The entries admitted so far.
     entries: Mutex<Vec<UsageRecord>>,

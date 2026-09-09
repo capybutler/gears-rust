@@ -42,6 +42,17 @@
 //!   declared tie-break reads `acceptance_sequence`, which `UsageRecord`
 //!   does not carry. See `BLOCKED_CHECKS` in the parent module.
 //!
+//! # A test-only mirror of this file exists
+//!
+//! `contract_mutants::MutantLedger` re-implements this backend's selection,
+//! admission decision, withdrawal exclusion and page order so that three
+//! deliberately non-conforming subjects can break one of them each. It is
+//! test-only, it is not a switch in this file, and nothing here should be
+//! written to accommodate it — but an edit to any of those four behaviours
+//! is an edit that mirror may need too. Its own docs say which parts the
+//! contract suite pins automatically and which (the admission *order*) it
+//! does not.
+//!
 //! # Why not the noop plugin
 //!
 //! `noop-usage-collector-plugin` already implements the SPI, and it cannot

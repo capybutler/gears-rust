@@ -1,24 +1,28 @@
 //! Tests for the contract suite itself.
 //!
-//! Four different things are asserted here, and none is a plugin's
-//! conformance. The first is that the suite runs and passes against a
-//! backend built to conform, which is what makes a violation reported
-//! against a real plugin worth reading. The second is that the three
-//! coverage constants still partition DESIGN's seven checks, so a passing
-//! run cannot read as a complete one. The third is the reference backend's
-//! own fail-closed posture, which is not a contract check but is the thing
-//! a plugin author copies.
+//! Four different things are asserted here, in the order the file puts
+//! them, and none is a plugin's conformance.
 //!
-//! The fourth is that the checks *discriminate*. The reference backend and
+//! The first is that the suite runs and passes against a backend built to
+//! conform, which is what makes a violation reported against a real plugin
+//! worth reading.
+//!
+//! The second is that the checks *discriminate*. The reference backend and
 //! the assertions were written alongside each other, so the first assertion
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
 //! as coverage. [`super::contract_mutants`] holds six deliberately
-//! non-conforming subjects, each the reference backend wrong in exactly one
-//! plausible way, and
+//! non-conforming subjects, each behaviourally the reference backend wrong
+//! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
 //! column against each of them.
+//!
+//! The third is that the three coverage constants still partition DESIGN's
+//! seven checks, so a passing run cannot read as a complete one.
+//!
+//! The fourth is the reference backend's own fail-closed posture, which is
+//! not a contract check but is the thing a plugin author copies.
 
 use std::collections::BTreeSet;
 
@@ -131,24 +135,27 @@ async fn each_check_fails_against_its_own_defect_and_no_other() {
 
         assert_eq!(
             failed, expected,
-            "the `{defect:?}` subject is the reference backend wrong in exactly one way, and \
-             `run_all` must report exactly the checks that rule belongs to. A check missing from \
-             the reported set cannot catch the mistake it exists for; an extra one is either a \
-             subject wrong in a second way or a check detecting difference rather than its own \
-             rule, and both make the suite read as coverage it does not have."
+            "the `{defect:?}` subject is behaviourally the reference backend wrong in exactly one \
+             way, and `run_all` must report exactly the checks that rule belongs to. A check \
+             missing from the reported set cannot catch the mistake it exists for; an extra one \
+             is either a subject wrong in a second way or a check detecting difference rather \
+             than its own rule, and both make the suite read as coverage it does not have."
         );
     }
 
-    let run_by_run_all: BTreeSet<&str> = IMPLEMENTED_CHECKS
+    let declared_by_the_coverage_constants: BTreeSet<&str> = IMPLEMENTED_CHECKS
         .iter()
         .chain(ADDITIONAL_CHECKS)
         .copied()
         .collect();
     assert_eq!(
-        named, run_by_run_all,
-        "every check `run_all` runs must be named by some row of the discrimination matrix, and \
-         the matrix must name no check `run_all` does not run. A check with no subject built to \
-         fail it is a check nothing here establishes anything about."
+        named, declared_by_the_coverage_constants,
+        "every check `IMPLEMENTED_CHECKS` and `ADDITIONAL_CHECKS` declare must be named by some \
+         row of the discrimination matrix, and the matrix must name no check they do not declare. \
+         A declared check with no subject built to fail it is a check nothing here establishes \
+         anything about. This is a statement about the coverage constants, not about `run_all`'s \
+         call list: a check added to `run_all` and to neither constant escapes this assertion, \
+         and see this test's doc for why that gap is not this test's to close."
     );
 }
 
