@@ -2608,6 +2608,16 @@ for `docs/features/*`. Add the concrete instance to whichever entry owns the
 file, with the line numbers, rather than opening a twentieth entry for a
 known-stale document. Verify the line numbers still hold when you write it.
 
+**A second candidate check, also from Task 7: `group-by-absent-dimension`.**
+The reference backend drops a row with no `subject_ref` from a
+`GROUP BY subject_id` entirely, where naive SQL would put it in a NULL group —
+so an exemplar and a SQL projection give different sums, and the buckets do not
+add up to the ungrouped total. DESIGN says nothing about an absent dimension,
+and `usage-collector-v1.yaml:1092-1101` types key items as non-nullable
+`string`, so dropping may be the only *representable* answer. It is now in the
+reference backend's stated limits, but no check pins it and nothing records
+which answer is right. Writable against today's SPI; a spec question first.
+
 **A candidate check the suite does not have, surfaced by Task 7.** The
 reference backend serves the canonical `(window_end, id)` order and mints no
 `next_cursor`, so nothing in the suite exercises the SPI's keyset obligations.
