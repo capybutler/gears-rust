@@ -4,7 +4,7 @@
 //! `PgRecordStore::aggregate`: keyset pagination (first page + cursor follow
 //! with no overlap/gap), metadata side-channel filtering, `$filter` by tenant,
 //! and pushed-down aggregation (SUM nets compensation, COUNT, GROUP BY
-//! resource/metadata, active-only). Requires Docker.
+//! resource/metadata). Requires Docker.
 
 mod common;
 

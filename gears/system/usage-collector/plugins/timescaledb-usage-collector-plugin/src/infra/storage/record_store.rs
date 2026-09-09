@@ -183,7 +183,9 @@ impl PgRecordStore {
     ///
     /// `ON CONFLICT DO NOTHING` is the serialization authority: a concurrent
     /// same-key insert blocks on the in-progress speculative tuple until the
-    /// winner commits, then its `DO NOTHING` returns no row and it resolves
+    /// winner commits — bounded by the connection's `lock_timeout`
+    /// ([`crate::infra::storage::pool`]), so the wait cannot pin the connection
+    /// indefinitely — then its `DO NOTHING` returns no row and it resolves
     /// absorb-vs-conflict against the now-visible committed row. The operation is
     /// one `INSERT` plus at most one `SELECT` (both read-committed), so no
     /// explicit transaction is needed.

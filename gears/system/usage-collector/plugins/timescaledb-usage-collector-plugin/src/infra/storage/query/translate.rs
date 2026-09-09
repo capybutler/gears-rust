@@ -140,8 +140,10 @@ pub fn translate_record_filter<F: FilterField>(
     translate_filter(node, ctx, record_column)
 }
 
-/// Recursive walker over the filter AST; identifiers resolve through `col`,
-/// which the single caller fixes to [`record_column`].
+/// Recursive walker over the filter AST. No identifier reaches the SQL from
+/// caller input: every column name is resolved through `col`, a closed
+/// allowlist, and every value is bound as `$N`, so injection safety holds for
+/// any AST shape this walks.
 fn translate_filter<F: FilterField>(
     node: &FilterNode<F>,
     ctx: &mut SqlCtx,
