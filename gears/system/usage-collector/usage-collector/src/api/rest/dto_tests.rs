@@ -696,7 +696,7 @@ fn aggregation_bucket_dto_serializes_none_value_as_null() {
 }
 
 // ---------------------------------------------------------------------------
-// TimeRangeDto / QueryAggregatedUsageRecordsRequest — the aggregate path's
+// TimeRangeDto / AggregationRequestDto — the aggregate path's
 // carrier for the mandatory read range.
 //
 // A `POST` with a declared body puts the range there
@@ -717,7 +717,7 @@ fn minimal_aggregate_request_json() -> serde_json::Value {
 
 #[test]
 fn aggregate_request_parses_the_mandatory_time_range() {
-    let req: super::QueryAggregatedUsageRecordsRequest =
+    let req: super::AggregationRequestDto =
         serde_json::from_value(minimal_aggregate_request_json()).expect("minimal body parses");
     assert_eq!(
         req.time_range.from,
@@ -746,7 +746,7 @@ fn aggregate_request_without_a_time_range_is_rejected() {
     // No `#[serde(default)]` on the field: the contract marks it required,
     // and a body omitting it must fail deserialization rather than reach
     // the service as an unbounded aggregation.
-    let err = serde_json::from_value::<super::QueryAggregatedUsageRecordsRequest>(
+    let err = serde_json::from_value::<super::AggregationRequestDto>(
         serde_json::json!({ "group_by": ["resource_type"] }),
     )
     .expect_err("a body without `time_range` MUST be rejected");
@@ -762,7 +762,7 @@ fn aggregate_request_rejects_an_unknown_body_field() {
     json.as_object_mut()
         .expect("object")
         .insert("op".to_owned(), serde_json::json!("SUM"));
-    let err = serde_json::from_value::<super::QueryAggregatedUsageRecordsRequest>(json)
+    let err = serde_json::from_value::<super::AggregationRequestDto>(json)
         .expect_err("`deny_unknown_fields` MUST refuse an undeclared body field");
     assert!(
         err.to_string().contains("op"),
@@ -779,7 +779,7 @@ fn time_range_dto_rejects_an_offsetless_bound() {
         let mut json = minimal_aggregate_request_json();
         json["time_range"][bound] = serde_json::json!("2026-06-11T12:34:56");
         assert!(
-            serde_json::from_value::<super::QueryAggregatedUsageRecordsRequest>(json).is_err(),
+            serde_json::from_value::<super::AggregationRequestDto>(json).is_err(),
             "an offset-less `{bound}` MUST fail to deserialize rather than \
              being read in some assumed offset",
         );
@@ -790,7 +790,7 @@ fn time_range_dto_rejects_an_offsetless_bound() {
 fn time_range_dto_rejects_an_unknown_field_inside_the_range() {
     let mut json = minimal_aggregate_request_json();
     json["time_range"]["tz"] = serde_json::json!("Europe/Berlin");
-    serde_json::from_value::<super::QueryAggregatedUsageRecordsRequest>(json)
+    serde_json::from_value::<super::AggregationRequestDto>(json)
         .expect_err("`deny_unknown_fields` MUST refuse an undeclared range field");
 }
 

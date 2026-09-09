@@ -24,8 +24,8 @@ use usage_collector_sdk::{
 use uuid::Uuid;
 
 use crate::api::rest::dto::{
-    AggregationResultDto, CreateUsageRecordRequest, CreateUsageRecordResultDto,
-    CreateUsageRecordsRequest, CreateUsageRecordsResponse, QueryAggregatedUsageRecordsRequest,
+    AggregationRequestDto, AggregationResultDto, CreateUsageRecordRequest,
+    CreateUsageRecordResultDto, CreateUsageRecordsRequest, CreateUsageRecordsResponse,
     UsageRecordDto,
 };
 use crate::domain::Service;
@@ -375,7 +375,7 @@ pub async fn handle_list_usage_records(
 /// into the `OData` filter, and the plugin SPI dispatch all happen inside
 /// [`Service::query_aggregated_usage_records`]; this handler is a thin
 /// wrapper that parses the typed query parameters, lifts the
-/// [`QueryAggregatedUsageRecordsRequest`] body into typed group-by
+/// [`AggregationRequestDto`] body into typed group-by
 /// dimensions, dispatches to the service, and projects the result to the
 /// wire [`AggregationResultDto`] shape.
 // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1
@@ -388,7 +388,7 @@ pub async fn handle_query_aggregated_usage_records(
     Extension(service): Extension<Arc<Service>>,
     Query(params): Query<Vec<(String, String)>>,
     OData(query): OData,
-    Json(req): Json<QueryAggregatedUsageRecordsRequest>,
+    Json(req): Json<AggregationRequestDto>,
 ) -> ApiResult<Json<AggregationResultDto>> {
     // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
     let PreparedAggregateRequest {
@@ -448,7 +448,7 @@ struct PreparedAggregateRequest {
 fn prepare_aggregate_request(
     params: &[(String, String)],
     query: ODataQuery,
-    req: QueryAggregatedUsageRecordsRequest,
+    req: AggregationRequestDto,
 ) -> Result<PreparedAggregateRequest, CanonicalError> {
     reject_unknown_aggregate_params(params)?;
     let gts_type_id = parse_required_gts_type_id(params)?;
