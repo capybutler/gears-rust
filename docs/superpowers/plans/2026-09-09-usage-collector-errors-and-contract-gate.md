@@ -2608,6 +2608,26 @@ for `docs/features/*`. Add the concrete instance to whichever entry owns the
 file, with the line numbers, rather than opening a twentieth entry for a
 known-stale document. Verify the line numbers still hold when you write it.
 
+**A candidate check the suite does not have, surfaced by Task 7.** The
+reference backend serves the canonical `(window_end, id)` order and mints no
+`next_cursor`, so nothing in the suite exercises the SPI's keyset obligations.
+That matters more than it looks: `require_cursor_fingerprint` in
+`usage-collector/src/domain/query.rs` states that carrying `query.filter_hash`
+into `next_cursor.f` is **"the one requirement in this gear's Plugin SPI that
+gives an implementor no compiler error — a plugin written before it recompiles
+clean and paginates exactly once"**. An obligation with no compiler backstop and
+no contract check is the strongest candidate for the next check, stronger than
+some of DESIGN's seven. Record it; do not build it in this slice.
+
+Consequence for wording: `the_reference_backend_conforms` passing means the
+backend satisfies *this suite*, not that it is a conforming plugin. Neither the
+harness docs nor the entry may say otherwise.
+
+**Task 7's `LATEST` fold substitutes greatest `id` for the declared tie-break**,
+because `acceptance_sequence` does not exist. It is documented at the fold, and
+it belongs in entry 19 beside `latest-tie-break` — same root cause, and the
+substitution is *not* the declared rule.
+
 **19. Two DESIGN §3.3 contract checks are unwritable.**
 `feed-snapshot-and-replay` and `latest-tie-break`, with what unblocks each.
 Cross-reference `BLOCKED_CHECKS` in `usage-collector-sdk/src/contract.rs` as the
