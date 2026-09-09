@@ -26,8 +26,6 @@ fn validation_reason_round_trips_each_constant() {
             AGGREGATION_RESULT_TOO_LARGE,
             ValidationReason::AggregationResultTooLarge,
         ),
-        (INVALID_CURSOR, ValidationReason::InvalidCursor),
-        (FILTER_MISMATCH, ValidationReason::FilterMismatch),
         (
             INVALIDATION_REFERENCE_INCOMPLETE,
             ValidationReason::InvalidationReferenceIncomplete,
@@ -83,6 +81,30 @@ fn the_retired_compensation_reasons_no_longer_model_themselves() {
     }
 }
 
+/// The two cursor codes now fall through to `Unknown`, preserving the wire
+/// string.
+///
+/// Spec §3.13 gives them to `toolkit_odata`. Because `ValidationReason` is
+/// `#[non_exhaustive]`, removing a variant is silent for a downstream
+/// matcher: it falls through rather than failing to build. So pin that the
+/// fall-through happens *and* that it preserves the raw string, so a
+/// consumer holding a stored envelope that carries either code still reads
+/// what it said.
+///
+/// `ORDER_WITH_CURSOR` is in the list although this gear never modeled it —
+/// the rule §3.13 states covers all three, and a future variant added for it
+/// would be the same mistake.
+#[test]
+fn the_upstream_cursor_reasons_no_longer_model_themselves() {
+    for wire in ["INVALID_CURSOR", "FILTER_MISMATCH", "ORDER_WITH_CURSOR"] {
+        assert_eq!(
+            ValidationReason::from_wire(wire),
+            ValidationReason::Unknown(wire.to_owned()),
+        );
+        assert_eq!(ValidationReason::from_wire(wire).as_wire(), wire);
+    }
+}
+
 #[test]
 fn reasons_preserve_unknown_wire_string() {
     assert_eq!(
@@ -126,8 +148,6 @@ fn every_wire_constant_spells_its_own_identifier() {
         INVALID_METADATA_FIELDS_INVALID_KEY,
         INVALID_METADATA_FIELDS_DUPLICATE,
         AGGREGATION_RESULT_TOO_LARGE,
-        INVALID_CURSOR,
-        FILTER_MISMATCH,
         INVALIDATION_REFERENCE_INCOMPLETE,
         INVALIDATION_TARGET_NOT_RECORD,
         INVALIDATION_FIELD_MISMATCH,

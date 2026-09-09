@@ -45,26 +45,6 @@ pub const INVALID_METADATA_FIELDS_EMPTY_STRING: &str = "INVALID_METADATA_FIELDS_
 pub const INVALID_METADATA_FIELDS_INVALID_KEY: &str = "INVALID_METADATA_FIELDS_INVALID_KEY";
 /// Duplicate `metadata_fields[i]` entry.
 pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUPLICATE";
-/// A continuation token was refused: malformed, or bound to an order that
-/// is not a usable keyset. Emitted by `toolkit_odata`'s own cursor decode
-/// path and by the read path's keyset floor, and enumerated on the wire as
-/// one of the `cursor` field violations in `usage-collector-v1.yaml`.
-pub const INVALID_CURSOR: &str = "INVALID_CURSOR";
-/// A continuation token was minted over a different query than the request
-/// carrying it.
-///
-/// The bound query is **every input that selects rows**: the caller's
-/// `$filter` and all three typed parameters — `gts_type_id`, the `from` /
-/// `to` range, and the `metadata.<key>` filters. None of the three is a
-/// `$filter` conjunct, so changing any one of them between pages surfaces
-/// here exactly as changing `$filter` always did. In particular, keeping
-/// `$filter` and the range fixed while changing the meter or a metadata
-/// value does **not** let a cursor carry over.
-///
-/// Enumerated on the wire as one of the `cursor` field violations in
-/// `usage-collector-v1.yaml`, and the code `toolkit_odata`'s own
-/// filter-hash comparison already emits.
-pub const FILTER_MISMATCH: &str = "FILTER_MISMATCH";
 /// An aggregated query produced more distinct groups than
 /// [`crate::MAX_AGGREGATION_BUCKETS`] — typically a high-cardinality `group_by`
 /// (e.g. a per-record metadata key) over a wide range. Narrow the read-path
@@ -94,6 +74,25 @@ pub const PAST_WINDOW: &str = "PAST_WINDOW";
 
 /// Typed view of the `field_violations[].reason` codes carried by
 /// [`crate::UsageCollectorError::InvalidArgument`].
+///
+/// It does **not** model `INVALID_CURSOR`, `FILTER_MISMATCH` or
+/// `ORDER_WITH_CURSOR`. All three belong to `toolkit_odata`, which declares
+/// them on its own cursor error enum and maps them to `Problem` field
+/// violations. Modeling them here as well would create a second place the
+/// same code can be read and disagree (Spec §3.13).
+///
+/// They do not all reach the wire the same way, and the difference matters
+/// to anyone tracing one back to its origin. `INVALID_CURSOR` and
+/// `FILTER_MISMATCH` are raised by this gear's own continuation checks and
+/// travel through [`crate::UsageCollectorError::CursorRejected`], which
+/// carries the upstream error so the lift can read the code off it.
+/// `ORDER_WITH_CURSOR` never reaches this gear at all: `toolkit_odata`'s
+/// axum extractor refuses `$orderby` alongside a cursor and returns its own
+/// canonical error before the handler runs, so no `CursorRejected` is ever
+/// built for it and looking for one is a dead end.
+///
+/// A consumer matching on any of the three reads it out of the wire string
+/// via [`Self::Unknown`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ValidationReason {
@@ -115,10 +114,6 @@ pub enum ValidationReason {
     MetadataFieldDuplicate,
     /// See [`AGGREGATION_RESULT_TOO_LARGE`].
     AggregationResultTooLarge,
-    /// See [`INVALID_CURSOR`].
-    InvalidCursor,
-    /// See [`FILTER_MISMATCH`].
-    FilterMismatch,
     /// See [`INVALIDATION_REFERENCE_INCOMPLETE`].
     InvalidationReferenceIncomplete,
     /// See [`INVALIDATION_TARGET_NOT_RECORD`].
@@ -148,8 +143,6 @@ impl ValidationReason {
             INVALID_METADATA_FIELDS_INVALID_KEY => Self::MetadataFieldInvalidKey,
             INVALID_METADATA_FIELDS_DUPLICATE => Self::MetadataFieldDuplicate,
             AGGREGATION_RESULT_TOO_LARGE => Self::AggregationResultTooLarge,
-            INVALID_CURSOR => Self::InvalidCursor,
-            FILTER_MISMATCH => Self::FilterMismatch,
             INVALIDATION_REFERENCE_INCOMPLETE => Self::InvalidationReferenceIncomplete,
             INVALIDATION_TARGET_NOT_RECORD => Self::InvalidationTargetNotRecord,
             INVALIDATION_FIELD_MISMATCH => Self::InvalidationFieldMismatch,
@@ -173,8 +166,6 @@ impl ValidationReason {
             Self::MetadataFieldInvalidKey => INVALID_METADATA_FIELDS_INVALID_KEY,
             Self::MetadataFieldDuplicate => INVALID_METADATA_FIELDS_DUPLICATE,
             Self::AggregationResultTooLarge => AGGREGATION_RESULT_TOO_LARGE,
-            Self::InvalidCursor => INVALID_CURSOR,
-            Self::FilterMismatch => FILTER_MISMATCH,
             Self::InvalidationReferenceIncomplete => INVALIDATION_REFERENCE_INCOMPLETE,
             Self::InvalidationTargetNotRecord => INVALIDATION_TARGET_NOT_RECORD,
             Self::InvalidationFieldMismatch => INVALIDATION_FIELD_MISMATCH,
