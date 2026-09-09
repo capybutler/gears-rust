@@ -137,6 +137,77 @@ tests are behind the `postgres` feature and need a reachable Docker daemon.
 
 ---
 
+## Task 0: Make the crate buildable at all — DONE before Task 1
+
+**This was done by the controller before Task 1 was dispatched. It is recorded
+here because it changes every verification command in this plan.**
+
+The plugin could not be compiled *in any form* at the start of this slice.
+`cargo check --manifest-path …/Cargo.toml` does not fall back to a standalone
+build — cargo refuses outright:
+
+```
+error: current package believes it's in a workspace when it's not:
+current:   …/plugins/timescaledb-usage-collector-plugin/Cargo.toml
+workspace: /Users/binarycode/code/virtuozzo/gears-rust/Cargo.toml
+```
+
+An empty `[workspace]` table in the plugin manifest is not a way around it
+either: that makes the crate its own workspace root, and every
+`{ workspace = true }` dependency it declares stops resolving.
+
+So workspace membership — originally Task 16 Step 1 — was moved to the front.
+The single line added to the root `Cargo.toml` `members` array:
+
+```toml
+    "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
+```
+
+**The consequence, and it is not optional: `cargo check --workspace` is RED
+from here until Task 13.** That is the whole point of Task 13, and it was
+always going to be true; what changed is that it is now visible in the
+workspace build rather than hidden behind a crate cargo would not look at.
+
+**Intermediate verification bar, Tasks 1-12.** Use this instead of the
+full bar at the top of this file:
+
+```bash
+# The crate under construction — expect errors, and expect them to shrink.
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | tail -40
+
+# The three packages that must stay green throughout. These are unaffected by
+# the plugin and a regression here means you broke something outside your task.
+cargo nextest run -p cf-gears-usage-collector -p cf-gears-usage-collector-sdk \
+  -p cf-gears-noop-usage-collector-plugin --no-fail-fast
+cargo nextest run -p cf-gears-usage-collector-sdk --features contract --no-fail-fast
+```
+
+The full bar — `--workspace` check, clippy, fmt, doc — resumes at Task 13,
+which is the task whose success criterion is that it passes.
+
+**Measured baseline immediately after adding the member line, at `490d42c8e`:**
+
+```bash
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 \
+  | grep -c '^error\[\|^error:'
+```
+
+| Target | Errors |
+| --- | --- |
+| lib | **44** |
+| lib test | **63** |
+| total `error[…]` / `error:` lines | **74** |
+
+Error codes present: E0050, E0308, E0407, E0425, E0432, E0433, E0560, E0599,
+E0609. This is the "before" picture Task 1 Step 1 asks for. Judge each of
+Tasks 1-12 by whether this number moves in the right direction and by whether
+the errors that remain are the ones the next task owns.
+
+Task 16 keeps the rest of the rewiring — `Cargo.lock`, the `Makefile` target,
+the example server, the e2e config. Only the `members` line moved.
+
+---
+
 ## Task 1: Delete the usage-type catalog
 
 Slice 2 removed the usage-type catalog from the gear entirely. `types-registry`
@@ -153,24 +224,21 @@ total in the crate).
 - Delete: `src/infra/storage/catalog_store.rs`, `src/infra/storage/catalog_store_tests.rs`, `tests/catalog_integration_pg.rs`
 - Modify: `src/infra/storage.rs`, `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/gear.rs`, `src/infra/storage/entity.rs`, `src/infra/storage/mapper.rs`, `src/infra/storage/query/translate.rs`, `src/infra/storage/error.rs`, `src/infra/metrics.rs`
 
-- [ ] **Step 1: Confirm the crate does not compile, and record why**
+- [ ] **Step 1: Confirm the starting error count**
 
-The crate is not a workspace member, so `cargo check -p` cannot see it. Check
-it standalone:
+Task 0 already made the crate visible to cargo and recorded the baseline: **44
+lib errors, 63 lib-test errors, 74 `error…` lines total** at `490d42c8e`.
+Re-confirm it rather than trusting this file:
 
 ```bash
-cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
-cargo check --manifest-path Cargo.toml --all-targets 2>&1 | tail -40
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | tail -40
 ```
 
-Expected: a wall of errors, dominated by unresolved imports of
-`UsageRecordStatus`, `UsageKind`, `UsageType`, `UsageTypeGtsId` and
-`AggregationSpec` from `usage_collector_sdk`. Save the output to the session
-scratchpad — **not to the repository** — as the "before" picture.
+Save the full output to the session scratchpad — **not to the repository**.
 
-This task will not make it compile. Nothing before Task 13 will. Judge each
-task by whether the error count moves in the right direction and by whether the
-errors that remain are the ones the next task owns.
+This task will not make the crate compile. Nothing before Task 13 will. Judge
+it by whether the error count drops and by whether the errors that remain are
+the ones a later task owns.
 
 - [ ] **Step 2: Delete the three catalog-dedicated files**
 
@@ -288,7 +356,7 @@ Expected: no output, `exit=1`. (`grep` exits 1 on no match — the `echo` is why
 this is not chained with `&&`.)
 
 ```bash
-cargo check --manifest-path Cargo.toml --all-targets 2>&1 | grep -c '^error'
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | grep -c '^error\[\|^error:'
 ```
 
 Expected: fewer errors than Step 1 recorded, and no error naming
@@ -747,7 +815,7 @@ and it has shipped here before.
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
-cargo test --manifest-path Cargo.toml --lib mapper 2>&1 | tail -20
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(mapper)' 2>&1 | tail -20
 ```
 
 Expected: compile errors naming `invalidation`, `invalidates` and
@@ -909,7 +977,7 @@ length, and cites "the task skeleton". Rewrite for the types that exist.
 - [ ] **Step 7: Run the tests**
 
 ```bash
-cargo test --manifest-path Cargo.toml --lib mapper 2>&1 | tail -20
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(mapper)' 2>&1 | tail -20
 ```
 
 Expected: the mapper tests pass. Other modules still fail to compile; that is
@@ -1034,7 +1102,7 @@ quietly stale — the failure mode this repository is named for.
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
-cargo test --manifest-path Cargo.toml --lib translate 2>&1 | tail -30
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(translate)' 2>&1 | tail -30
 ```
 
 Expected: tests 1 and 2 fail (`entry_type`, `origin`, `invalidates`,
@@ -1090,7 +1158,7 @@ rather than for a number.
 - [ ] **Step 4: Run the tests**
 
 ```bash
-cargo test --manifest-path Cargo.toml --lib translate 2>&1 | tail -20
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(translate)' 2>&1 | tail -20
 ```
 
 Expected: all three pass.
@@ -1215,7 +1283,7 @@ define.
 - [ ] **Step 4: Run and verify**
 
 ```bash
-cargo test --manifest-path Cargo.toml --lib keyset 2>&1 | tail -20
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(keyset)' 2>&1 | tail -20
 ```
 
 - [ ] **Step 5: Commit**
@@ -1424,7 +1492,7 @@ the task summary so it reaches the DIVERGENCES update in Task 18.
 - [ ] **Step 7: Run and commit**
 
 ```bash
-cargo test --manifest-path Cargo.toml --lib aggregate 2>&1 | tail -20
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(aggregate)' 2>&1 | tail -20
 git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/aggregate.rs \
         gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/aggregate_tests.rs
 git commit -s -m "feat(timescaledb-plugin)!: fold under the append-only withdrawal rules
@@ -1648,7 +1716,7 @@ Write a test for the in-batch case naming its mutation.
 - [ ] **Step 8: Run, verify, commit**
 
 ```bash
-cargo test --manifest-path Cargo.toml --lib record_store 2>&1 | tail -30
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(record_store)' 2>&1 | tail -30
 ```
 
 ```bash
@@ -1762,7 +1830,7 @@ keep.
 - [ ] **Step 6: Run and commit**
 
 ```bash
-cargo test --manifest-path Cargo.toml --lib record_store 2>&1 | tail -20
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(record_store)' 2>&1 | tail -20
 git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/
 git commit -s -m "feat(timescaledb-plugin)!: intersect the compiled scope on the point lookup
 
@@ -1887,7 +1955,7 @@ not a case to paper over. Fail loudly.
 - [ ] **Step 4: Run, prove the mutations, commit**
 
 ```bash
-cargo test --manifest-path Cargo.toml --lib record_store 2>&1 | tail -30
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(record_store)' 2>&1 | tail -30
 git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/
 git commit -s -m "feat(timescaledb-plugin)!: page the ledger on the covered-period end
 
@@ -2018,7 +2086,7 @@ are gear-side or doc-side. Change only what this plugin emits.
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
-cargo check --manifest-path Cargo.toml --all-targets 2>&1 | tail -60
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | tail -60
 ```
 
 Work to zero. The expected remainder after Tasks 1-12 is imports, the gear
@@ -2028,7 +2096,7 @@ wiring, and `src/lib.rs`'s module doc (which describes a `domain` layer holding
 - [ ] **Step 3: `cargo check` must pass**
 
 ```bash
-cargo check --manifest-path Cargo.toml --all-targets
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets
 ```
 
 Expected: exits 0. **This is the first time since slice 4.**
@@ -2036,7 +2104,7 @@ Expected: exits 0. **This is the first time since slice 4.**
 - [ ] **Step 4: Clippy**
 
 ```bash
-cargo clippy --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
+cargo clippy -p cf-gears-timescaledb-usage-collector-plugin --all-targets --all-features -- -D warnings
 ```
 
 Expected: exits 0. `clippy::pedantic` is deny at workspace level. Watch for
@@ -2045,7 +2113,7 @@ Expected: exits 0. `clippy::pedantic` is deny at workspace level. Watch for
 - [ ] **Step 5: Unit tests**
 
 ```bash
-cargo nextest run --manifest-path Cargo.toml --no-fail-fast 2>&1 | tail -10
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast 2>&1 | tail -10
 ```
 
 Report `N passed / M skipped` unfiltered. A count under an `-E` filter is a
@@ -2160,7 +2228,7 @@ assumptions before relying on repeated runs.
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
-cargo nextest run --manifest-path Cargo.toml --features postgres \
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres \
   --no-fail-fast -E 'test(the_timescale_backend_conforms)' 2>&1 | tail -40
 ```
 
@@ -2266,7 +2334,7 @@ the retention horizon is measured from the covered period, which is what
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
-cargo nextest run --manifest-path Cargo.toml --features postgres --no-fail-fast 2>&1 | tail -20
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres --no-fail-fast 2>&1 | tail -20
 ```
 
 Report the unfiltered `N passed / M skipped`.
@@ -2305,18 +2373,21 @@ Measured: 9 files, `.github/workflows/ci.yml` (3 lines),
 **Files:**
 - Modify: `Cargo.toml`, `Cargo.lock`, `Makefile`, `apps/cf-gears-example-server/Cargo.toml`, `apps/cf-gears-example-server/src/registered_gears.rs`, `testing/e2e/suites/usage_collector/config.yaml`
 
-- [ ] **Step 1: Add the workspace member**
+- [ ] **Step 1: Confirm the workspace member line, and add the dependency alias**
 
-In the root `Cargo.toml`, after
-`"gears/system/usage-collector/plugins/noop-usage-collector-plugin",` (line 141
-as measured):
+**The `members` line was already added in Task 0** — it had to be, because the
+crate cannot be compiled in any form without it. Confirm it is still there:
 
-```toml
-    "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
+```bash
+grep -n 'timescaledb-usage-collector-plugin' Cargo.toml
 ```
 
-Add the workspace dependency alias alongside the other two (lines 350 and 365
-as measured) if `8225d8ebd` removed one — check the diff.
+Then check whether `8225d8ebd` also removed a workspace dependency alias
+alongside the other two (lines 350 and 365 as measured), and restore it if so:
+
+```bash
+git show 8225d8ebd -- Cargo.toml
+```
 
 - [ ] **Step 2: Restore the Makefile target**
 
