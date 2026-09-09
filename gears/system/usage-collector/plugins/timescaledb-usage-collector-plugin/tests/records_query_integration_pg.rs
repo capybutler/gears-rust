@@ -33,11 +33,7 @@ const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v
 const BASE_TS: i64 = 1_700_000_000;
 
 /// Bring up a container and a record store over it.
-///
-/// `_gts` / `_fields` are unused: the plugin no longer declares usage types, so
-/// there is nothing to seed. They are kept on the signature so each call site
-/// still records the type and metadata fields its assertions assume.
-async fn setup_with_type(_gts: &str, _fields: &[&str]) -> (common::TsHarness, PgRecordStore) {
+async fn setup() -> (common::TsHarness, PgRecordStore) {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
@@ -93,7 +89,7 @@ fn created_at_id_desc() -> ODataOrderBy {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_list_first_page_returns_limit_and_next_cursor() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x2001);
 
     for i in 0..5 {
@@ -128,7 +124,7 @@ async fn pg_list_first_page_returns_limit_and_next_cursor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_list_following_cursor_has_no_overlap_or_gap() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x2002);
 
     let mut expected: Vec<Uuid> = Vec::new();
@@ -183,7 +179,7 @@ async fn pg_list_following_cursor_has_no_overlap_or_gap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_list_descending_cursor_walk_is_ordered_with_no_overlap_or_gap() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x200D);
 
     let mut expected: Vec<Uuid> = Vec::new();
@@ -247,8 +243,7 @@ async fn pg_list_descending_cursor_walk_is_ordered_with_no_overlap_or_gap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_list_metadata_filter_narrows_results() {
-    // Register a type declaring the `region` metadata field.
-    let (_h, store) = setup_with_type(VCPU_GTS, &["region"]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x2003);
 
     // 3 records: two in us-east-1, one in eu-west-1.
@@ -294,7 +289,7 @@ async fn pg_list_metadata_filter_narrows_results() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_list_filter_by_tenant() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant_a = Uuid::from_u128(0x2004_000A);
     let tenant_b = Uuid::from_u128(0x2004_000B);
 
@@ -339,7 +334,7 @@ async fn pg_list_filter_by_tenant() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_aggregate_sum_nets_compensation() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3001);
 
     // Original +10 row, then an active compensation of -3 that corrects it.
@@ -386,7 +381,7 @@ async fn pg_aggregate_sum_nets_compensation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_aggregate_count_excludes_active_compensation() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x300B);
 
     // One event row, then an active compensation that corrects it. Unlike SUM
@@ -435,7 +430,7 @@ async fn pg_aggregate_count_excludes_active_compensation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_aggregate_count_counts_active_rows() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3002);
 
     for i in 0..3 {
@@ -471,7 +466,7 @@ async fn pg_aggregate_count_counts_active_rows() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_aggregate_group_by_resource_id() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3003);
 
     // res-a: 4 + 6 = 10; res-b: 5. Distinct created_at per row so the
@@ -534,8 +529,7 @@ async fn pg_aggregate_group_by_resource_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_aggregate_group_by_metadata() {
-    // Register a type declaring the `region` metadata field.
-    let (_h, store) = setup_with_type(VCPU_GTS, &["region"]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3004);
 
     // us-east-1: 2 + 3 = 5; eu-west-1: 7.
@@ -595,7 +589,7 @@ async fn pg_aggregate_group_by_metadata() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_aggregate_min_max_avg_over_active_rows() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3008);
 
     // Values {2, 8}: min 2, max 8, avg 5 -- exact, so no fractional precision.
@@ -649,7 +643,7 @@ async fn pg_aggregate_avg_rounds_non_terminating_quotient() {
     // exercises it end-to-end and asserts the rounded value decodes back into
     // `BigDecimal` (the reason the cast/round was added — a raw unbounded quotient
     // would otherwise carry unbounded scale).
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3009);
 
     for (i, v) in [1_i64, 1, 2].into_iter().enumerate() {
@@ -687,7 +681,7 @@ async fn pg_aggregate_avg_rounds_non_terminating_quotient() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_aggregate_excludes_inactive() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3005);
 
     // Two active rows summing 10 + 5; deactivate the 10 row.
@@ -724,7 +718,7 @@ async fn pg_aggregate_excludes_inactive() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_subject_ref_round_trips_through_create_and_get() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3006);
 
     let rec = common::fixture_usage_record_with_subject(
@@ -751,7 +745,7 @@ async fn pg_subject_ref_round_trips_through_create_and_get() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_aggregate_group_by_subject_id_excludes_subjectless() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x3007);
 
     // subj-a: 4 + 6 = 10; subj-b: 5; plus one subject-less row (7) that must be
@@ -827,7 +821,7 @@ async fn pg_aggregate_filter_by_tenant_isolates_sum() {
     // pins that the PDP-injected `tenant_id eq …` `$filter` actually scopes the
     // aggregation, so a regression that dropped the filter (summing across all
     // tenants) is caught.
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let (_h, store) = setup().await;
     let tenant_a = Uuid::from_u128(0x3009_000A);
     let tenant_b = Uuid::from_u128(0x3009_000B);
 
@@ -871,7 +865,7 @@ async fn pg_aggregate_metadata_filter_narrows_sum() {
     // The metadata side-channel filter is shared by `list` and `aggregate` but
     // only `list` exercised it with a real filter; this covers the real billing
     // query shape ("sum where region = us-east-1") through the aggregate path.
-    let (_h, store) = setup_with_type(VCPU_GTS, &["region"]).await;
+    let (_h, store) = setup().await;
     let tenant = Uuid::from_u128(0x300A);
 
     // us-east-1: 2 + 3 = 5; eu-west-1: 7 (must be excluded by the metadata filter).

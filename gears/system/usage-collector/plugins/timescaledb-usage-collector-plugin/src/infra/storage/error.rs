@@ -39,14 +39,18 @@ pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
             Some("usage_records_dedup_uniq") => DbErrorClass::DedupUniqueViolation,
             _ => DbErrorClass::Other,
         },
-        // 23503 `foreign_key_violation` is what PostgreSQL <= 17 reports for the
-        // `usage_records_gts_id_fk` RESTRICT guard. PostgreSQL 18
-        // reports the standard 23001 `restrict_violation` for `ON DELETE
-        // RESTRICT` instead ("violates RESTRICT setting of foreign key
-        // constraint ..."), so both codes mean the same thing to this plugin:
-        // the row is still referenced. Verified against
-        // timescale/timescaledb:2.17.2-pg16 (23503) and 2.29.2-pg18 (23001).
-        "23503" | "23001" => DbErrorClass::ForeignKeyViolation,
+        // 23503 `foreign_key_violation` is raised by an INSERT into
+        // `usage_records` whose `gts_id` has no parent row
+        // (`usage_records_gts_id_fk`). That is the only meaning this class now
+        // carries: its sole consumer is `record_store::map_insert_error`, which
+        // reads it as "the referenced usage type is absent" and surfaces a typed
+        // not-found rather than an opaque Internal.
+        //
+        // The DELETE-side spelling (23001 `restrict_violation`, which PostgreSQL
+        // 18 raises when a RESTRICT-guarded parent row is deleted) is
+        // deliberately not matched: the plugin no longer deletes usage types, so
+        // no path can produce it.
+        "23503" => DbErrorClass::ForeignKeyViolation,
         c if is_transient_sqlstate(c) => DbErrorClass::Transient,
         _ => DbErrorClass::Other,
     }

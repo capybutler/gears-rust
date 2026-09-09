@@ -1,9 +1,10 @@
 //! Injection-safe filter translation: a validated `FilterNode<F>` becomes a
 //! parameterized `PostgreSQL` `WHERE` fragment plus an ordered bind list.
 //!
-//! Identifiers come only from the closed allowlist ([`record_column`]); values
-//! are always bound (`$N`) via
-//! [`crate::infra::storage::query::bind::odata_value_to_bind`].
+//! Identifiers come only from the closed allowlist ([`record_column`]); every
+//! value is bound as `$N` through
+//! [`crate::infra::storage::query::bind::odata_value_to_bind`], never
+//! interpolated.
 //!
 //! # Verified `toolkit-odata` / SDK API (Task E1)
 //!
@@ -139,7 +140,8 @@ pub fn translate_record_filter<F: FilterField>(
     translate_filter(node, ctx, record_column)
 }
 
-/// Shared recursive walker parameterized over the column allowlist.
+/// Recursive walker, parameterized over the column allowlist so every
+/// identifier check funnels through one place.
 fn translate_filter<F: FilterField>(
     node: &FilterNode<F>,
     ctx: &mut SqlCtx,

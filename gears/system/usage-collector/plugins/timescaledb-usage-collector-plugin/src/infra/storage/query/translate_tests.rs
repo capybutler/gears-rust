@@ -19,6 +19,29 @@ use super::{ODataValue, SqlCtx, record_column, translate_record_filter};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// A field name deliberately absent from [`record_column`]. Shared by the
+/// allowlist test and [`UnmappedField`] so the two stay in agreement about what
+/// "not a column" means.
+const UNMAPPED_FIELD_NAME: &str = "definitely_not_a_column";
+
+/// A [`FilterField`] whose `name()` is [`UNMAPPED_FIELD_NAME`], so a test can
+/// reach the translator's fail-closed identifier guard. `FilterField::from_name`
+/// resolves only real schema fields, so no parsed query can produce this shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UnmappedField;
+
+impl FilterField for UnmappedField {
+    const FIELDS: &'static [Self] = &[Self];
+
+    fn name(&self) -> &'static str {
+        UNMAPPED_FIELD_NAME
+    }
+
+    fn kind(&self) -> FieldKind {
+        FieldKind::String
+    }
+}
+
 fn rec_field(name: &str) -> UsageRecordFilterField {
     <UsageRecordFilterField as FilterField>::from_name(name)
         .unwrap_or_else(|| panic!("unknown record field `{name}`"))
@@ -68,7 +91,10 @@ fn record_field_columns_are_allowlisted() {
     assert_eq!(record_column("subject_type"), Some("subject_type"));
     assert_eq!(record_column("corrects_id"), Some("corrects_id"));
     assert_eq!(record_column("status"), Some("status"));
-    assert_eq!(record_column("definitely_not_a_column"), None);
+    assert_eq!(record_column(UNMAPPED_FIELD_NAME), None);
+    // An identifier that would be catastrophic if it were ever interpolated
+    // rather than rejected.
+    assert_eq!(record_column("id; DROP TABLE usage_records"), None);
 }
 
 // ── Value conversion ─────────────────────────────────────────────────────────
@@ -245,28 +271,8 @@ fn placeholder_numbering_honors_start_offset() {
     assert_eq!(sql, "status = $3");
 }
 
-/// A field type whose `name()` is deliberately absent from
-/// [`record_column`], so the translator's fail-closed identifier guard can be
-/// reached from a test.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct UnmappedField;
-
-impl FilterField for UnmappedField {
-    const FIELDS: &'static [Self] = &[Self];
-
-    fn name(&self) -> &'static str {
-        "definitely_not_a_column"
-    }
-
-    fn kind(&self) -> FieldKind {
-        FieldKind::String
-    }
-}
-
-// `FilterField::from_name` resolves only schema fields, so an unmapped field is
-// rejected at the AST boundary. The translator must still fail closed on a
-// field whose `name()` is not on the column allowlist, rather than
-// interpolating it into the SQL.
+// The translator must fail closed on a field whose `name()` is not on the
+// column allowlist, rather than interpolating it into the SQL.
 #[test]
 fn record_filter_rejects_field_not_on_column_allowlist() {
     let node = FilterNode::Binary {
