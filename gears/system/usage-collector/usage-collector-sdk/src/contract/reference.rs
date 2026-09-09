@@ -48,7 +48,7 @@
 //! serve here: it persists nothing. `create_usage_record` echoes its input,
 //! `get_usage_record` always answers `UsageRecordNotFound`,
 //! `list_usage_records` always answers an empty page, and every fold
-//! returns no buckets. It therefore fails all five behavioural checks by
+//! returns no buckets. It therefore fails all six behavioural checks by
 //! construction — not by defect. A null backend exists so the plugin-host
 //! binding resolves end-to-end in development, and answering a well-formed
 //! default to every call is exactly the right behaviour for that job.

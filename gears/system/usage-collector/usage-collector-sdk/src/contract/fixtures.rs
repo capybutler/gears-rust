@@ -67,10 +67,13 @@ const CONTRACT_FILTER_HASH: &str = "usage-collector-contract-suite";
 /// What dispatching it buys is **shape coverage** — a plugin that chokes on
 /// a filter, or ignores `query.filter` and therefore never exercises its
 /// projection, meets one here. It buys no scope *enforcement*: every
-/// fixture belongs to the tenant this filter pins, and no implemented check
-/// asserts that a row outside the scope is withheld, so a backend that
-/// discarded the filter entirely would still pass. That assertion belongs
-/// to a scope-gating check, which is not written.
+/// fixture the other checks build belongs to the tenant this filter pins,
+/// so a backend that discarded the filter entirely would still pass them.
+/// Enforcement is
+/// [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path())'s job, and that
+/// check dispatches a scope of its own through
+/// [`contract_query_with_scope`] rather than this one, because a scope
+/// every fixture satisfies cannot discriminate.
 fn contract_scope() -> ast::Expr {
     ast::Expr::Compare(
         Box::new(ast::Expr::Identifier("tenant_id".to_owned())),
@@ -83,8 +86,21 @@ fn contract_scope() -> ast::Expr {
 /// filter, the canonical `(window_end, id)` keyset as the order, and the
 /// `filter_hash` the gateway guarantees.
 pub fn contract_query(limit: u64) -> ODataQuery {
+    contract_query_with_scope(limit, contract_scope())
+}
+
+/// The same query under a caller-supplied compiled scope.
+///
+/// The gateway ANDs the compiled scope into `query.filter` before it
+/// dispatches, so a plugin reads a scope on the two collection paths
+/// through that slot and nowhere else. A check asserting the scope is
+/// *enforced* rather than merely accepted has to put its own expression
+/// there — one that admits some stored rows and withholds others — which
+/// [`contract_query`]'s single-tenant filter cannot do, since every fixture
+/// it meets belongs to that tenant.
+pub fn contract_query_with_scope(limit: u64, scope: ast::Expr) -> ODataQuery {
     ODataQuery::new()
-        .with_filter(contract_scope())
+        .with_filter(scope)
         .with_order(ODataOrderBy(vec![
             OrderKey {
                 field: WINDOW_END_FIELD.to_owned(),
@@ -117,10 +133,34 @@ pub fn fixture_record(
     window_start: time::OffsetDateTime,
     window_end: time::OffsetDateTime,
 ) -> Result<UsageRecord, String> {
+    fixture_record_for_tenant(
+        CONTRACT_TENANT_ID,
+        idempotency_key,
+        value,
+        window_start,
+        window_end,
+    )
+}
+
+/// The same entry attributed to a caller-chosen tenant.
+///
+/// Only [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path()) needs it,
+/// and it needs it because a scope check has nothing to assert unless two
+/// stored entries fall on opposite sides of the scope it dispatches.
+/// `tenant_id` is one of the five attributes the derived identity reads, so
+/// two entries differing only here are two entries rather than an
+/// idempotent replay of one.
+pub fn fixture_record_for_tenant(
+    tenant_id: Uuid,
+    idempotency_key: &IdempotencyKey,
+    value: Decimal,
+    window_start: time::OffsetDateTime,
+    window_end: time::OffsetDateTime,
+) -> Result<UsageRecord, String> {
     CreateUsageRecord {
         gts_type_id: MeterTypeId::new(CONTRACT_METER_TYPE_ID)
             .map_err(|err| format!("the check's own meter type id is invalid: {err}"))?,
-        tenant_id: CONTRACT_TENANT_ID,
+        tenant_id,
         resource_ref: ResourceRef::new(CONTRACT_RESOURCE_ID, CONTRACT_RESOURCE_TYPE)
             .map_err(|err| format!("the check's own resource reference is invalid: {err}"))?,
         subject_ref: None,
@@ -169,8 +209,8 @@ pub fn fixture_invalidation(
 
 /// A [`ContractViolation`] attributed to one check.
 ///
-/// The check name is a parameter rather than baked in. Five checks report
-/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a sixth
+/// The check name is a parameter rather than baked in. Six checks report
+/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a seventh
 /// caller, and the whole point of [`ContractViolation::check`] is that a
 /// violation says which assertion produced it — a helper that stamped one
 /// name on every report would quietly undo that.

@@ -22,8 +22,9 @@ use toolkit_odata::{ODataQuery, ast};
 use uuid::Uuid;
 
 use super::{
-    BLOCKED_CHECKS, HARNESS_FAULT, IMPLEMENTED_CHECKS, UNWRITTEN_CHECKS,
-    reference::InMemoryReferencePlugin, run_all,
+    ADDITIONAL_CHECKS, BLOCKED_CHECKS, HARNESS_FAULT, IMPLEMENTED_CHECKS,
+    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, UNWRITTEN_CHECKS, reference::InMemoryReferencePlugin,
+    run_all,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::models::{
@@ -83,7 +84,7 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 }
 
 /// Every check DESIGN §3.3 declares is implemented, blocked, or named as
-/// unwritten — exactly once.
+/// unwritten — exactly once, and nothing else is any of the three.
 ///
 /// This is what makes the module's coverage claim structural instead of
 /// narrative. `run_all` returning no violations says nothing about a check
@@ -93,6 +94,14 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 /// half-land — implemented but still listed unwritten, or written and
 /// listed nowhere — without this failing, and `UNWRITTEN_CHECKS` emptied
 /// itself as the work landed rather than needing someone to remember.
+///
+/// `ADDITIONAL_CHECKS` is deliberately outside the partition and asserted
+/// against it rather than folded into it. `run_all` runs a check DESIGN
+/// does not tabulate, and admitting it to `IMPLEMENTED_CHECKS` would force
+/// the equality below down to a subset check — which no longer catches a
+/// DESIGN check written and listed nowhere, the exact failure the partition
+/// exists for. Held disjoint instead, the fourth constant cannot become a
+/// place to park a DESIGN name to escape the accounting.
 #[test]
 fn the_three_coverage_constants_partition_the_design_checks() {
     /// The seven names in DESIGN §3.3's "Plugin contract tests" table.
@@ -128,14 +137,32 @@ fn the_three_coverage_constants_partition_the_design_checks() {
         "`{HARNESS_FAULT}` marks a fault in the suite rather than a DESIGN check, so it must \
          never appear in the coverage constants"
     );
+
+    for check in ADDITIONAL_CHECKS {
+        assert!(
+            !unique.contains(check),
+            "`{check}` is named in `ADDITIONAL_CHECKS`, which is for the checks DESIGN section \
+             3.3 does not tabulate, and it also appears in the three constants that partition \
+             DESIGN's seven. One of the two is wrong: either the name belongs in the partition \
+             and not here, or the partition has grown a name DESIGN never wrote"
+        );
+    }
+    assert!(
+        ADDITIONAL_CHECKS.contains(&SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH),
+        "`run_all` runs the scope check, so leaving it out of `ADDITIONAL_CHECKS` would make a \
+         caller reporting coverage under-report what the run actually covered"
+    );
 }
 
 /// An uninterpretable comparison never admits a row, under `eq` or `ne`.
 ///
 /// This is about the reference backend rather than about the contract, so
 /// it is a unit test here and not a check in [`run_all`]: a plugin's own
-/// scope projection is its business, and the suite has no `scope-gating`
-/// check yet to fold it into.
+/// scope projection is its business. The suite's own
+/// `scope-is-a-filter-on-every-read-path` check asserts the obligation
+/// every backend owes — a row outside the scope is withheld — and says
+/// nothing about how a backend that cannot *read* part of a scope should
+/// dispose of it, which is what this test pins for the exemplar.
 ///
 /// The posture is load-bearing precisely *because* this backend is an
 /// exemplar. Its module docs say a real plugin projects the same

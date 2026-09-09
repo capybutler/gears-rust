@@ -62,6 +62,29 @@
 //! backend, and a suite that runs five checks must not read as a suite
 //! that ran seven.
 //!
+//! # A check DESIGN does not tabulate
+//!
+//! [`run_all`] also runs [`SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH`], which is
+//! **not** one of DESIGN §3.3's seven names. Do not look for it there and
+//! do not read its absence as drift in either direction: DESIGN states the
+//! obligation without tabulating a check for it — §3.3 requires a plugin's
+//! `get_usage_record` to withhold a row outside the compiled scope and
+//! obliges the surface not to be an existence oracle, and §3.2 has the
+//! Query Gateway compose the PDP constraints into the collection paths'
+//! filters *"so the result can only narrow"*. Since the point lookup's
+//! in-process per-record attribution check was retired, that guarantee is
+//! the plugin's alone on all three read paths, and a suite that never
+//! stores a row outside the scope it dispatches cannot see it kept or
+//! broken.
+//!
+//! It is named in [`ADDITIONAL_CHECKS`] rather than in
+//! [`IMPLEMENTED_CHECKS`], so the three-way partition over DESIGN's seven
+//! keeps meaning exactly what it meant, and a fourth assertion holds this
+//! constant disjoint from all three — a DESIGN check cannot be smuggled in
+//! here to escape the partition. A caller reporting coverage should report
+//! it alongside them: [`IMPLEMENTED_CHECKS`] alone under-reports what
+//! [`run_all`] ran.
+//!
 //! # The reference backend
 //!
 //! [`reference::InMemoryReferencePlugin`] is the subject this suite is
@@ -72,7 +95,7 @@
 use crate::plugin_api::UsageCollectorPluginV1;
 use checks::{
     at_most_one_invalidation, dedup_identity_over_window, invalidation_excluded_from_fold,
-    quantity_round_trip, window_end_selection,
+    quantity_round_trip, scope_is_a_filter_on_every_read_path, window_end_selection,
 };
 
 mod checks;
@@ -125,6 +148,24 @@ pub const INVALIDATION_EXCLUDED_FROM_FOLD: &str = "invalidation-excluded-from-fo
 /// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
 pub const AT_MOST_ONE_INVALIDATION: &str = "at-most-one-invalidation";
 
+/// The `scope-is-a-filter-on-every-read-path` check, which DESIGN §3.3 does
+/// **not** tabulate.
+///
+/// Spelled in DESIGN's own style so a report reads uniformly, and named in
+/// [`ADDITIONAL_CHECKS`] rather than [`IMPLEMENTED_CHECKS`] so the
+/// three-way partition over DESIGN's seven stays exact.
+///
+/// DESIGN states the obligation without giving it a row in the table: §3.3
+/// gives the SPI's `get_usage_record` the doc *"`scope` is the compiled PDP
+/// scope, projected into a `toolkit_odata` filter. A row outside it is not
+/// returned"*, and §3.2 has the Query Gateway compose the PDP constraints
+/// with caller filters *"so the result can only narrow"*. With the point
+/// lookup's in-process per-record attribution check retired, every read
+/// path carries the scope as a filter and nothing above the SPI re-checks
+/// the rows a plugin answers with, so the whole of "exists but not yours
+/// reads as `NotFound`" is the plugin's to keep.
+pub const SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH: &str = "scope-is-a-filter-on-every-read-path";
+
 /// The [`ContractViolation::check`] value a violation carries when the
 /// **suite itself** failed — it could not build a fixture, say — rather
 /// than the plugin.
@@ -137,7 +178,12 @@ pub const HARNESS_FAULT: &str = "contract-suite-harness-fault";
 
 /// The DESIGN §3.3 checks [`run_all`] actually runs.
 ///
-/// Adding a check means adding it here as well as to [`run_all`] and
+/// **Not everything [`run_all`] runs** — see [`ADDITIONAL_CHECKS`] for the
+/// checks that are not among DESIGN's seven. This constant is one of the
+/// three that partition those seven, so a check DESIGN does not name has no
+/// business here.
+///
+/// Adding a DESIGN check means adding it here as well as to [`run_all`] and
 /// removing it from [`UNWRITTEN_CHECKS`]; the partition test refuses a
 /// half-landed change.
 pub const IMPLEMENTED_CHECKS: &[&str] = &[
@@ -147,6 +193,23 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     INVALIDATION_EXCLUDED_FROM_FOLD,
     AT_MOST_ONE_INVALIDATION,
 ];
+
+/// The checks [`run_all`] runs that DESIGN §3.3 does not tabulate.
+///
+/// A fourth constant rather than a sixth entry in [`IMPLEMENTED_CHECKS`],
+/// and the choice is what keeps the partition test meaningful. The other
+/// three are asserted to be exactly DESIGN's seven, disjoint; folding a
+/// name DESIGN never wrote into one of them would force that assertion to
+/// be relaxed to a subset check, and a subset check cannot catch the thing
+/// the partition exists to catch — a DESIGN check that half-lands, or one
+/// silently dropped from the accounting. This constant is instead asserted
+/// disjoint from all three, so nothing DESIGN names can hide here either.
+///
+/// A caller reporting coverage should report it alongside the other three.
+/// [`IMPLEMENTED_CHECKS`] on its own under-reports what a run covered,
+/// which is the mirror of the failure the coverage constants exist to
+/// prevent.
+pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
@@ -198,6 +261,7 @@ pub async fn run_all(plugin: &dyn UsageCollectorPluginV1) -> Vec<ContractViolati
     violations.extend(dedup_identity_over_window(plugin).await);
     violations.extend(invalidation_excluded_from_fold(plugin).await);
     violations.extend(at_most_one_invalidation(plugin).await);
+    violations.extend(scope_is_a_filter_on_every_read_path(plugin).await);
     violations
 }
 
