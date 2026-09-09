@@ -187,16 +187,33 @@ which is the task whose success criterion is that it passes.
 
 **Measured baseline immediately after adding the member line, at `490d42c8e`:**
 
+**Read cargo's own summary lines. Do NOT grep-count diagnostics.**
+
 ```bash
 cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 \
-  | grep -c '^error\[\|^error:'
+  | grep 'previous error'
 ```
 
 | Target | Errors |
 | --- | --- |
 | lib | **44** |
 | lib test | **63** |
-| total `error[…]` / `error:` lines | **74** |
+
+**Two ways a grep count lies here, both hit during Task 1.**
+
+1. **`grep -c '^error\[\|^error:'` over-counts by exactly 2**, because cargo's
+   two `error: could not compile … due to N previous errors` summary lines
+   themselves begin with `error:`. This is the same trap this plan's ground
+   rules already record for `cargo doc`'s `generated N warnings` line, made a
+   second time against a different tool. An earlier draft of this file reported
+   the baseline as "74 total" on that basis; the real figure was 44 + 63.
+2. **`grep -c '^error\['` is not stable across runs.** Cargo does not re-emit
+   every diagnostic on a cached rebuild, so two people at the same commit get
+   different numbers — 59 and 56 were both measured at `ba285ff53`. The summary
+   lines are stable because cargo recomputes them per target.
+
+So the progress metric for Tasks 1-12 is **the pair `(lib, lib test)` from
+cargo's own summary**, and a task's report should quote both.
 
 Error codes present: E0050, E0308, E0407, E0425, E0432, E0433, E0560, E0599,
 E0609. This is the "before" picture Task 1 Step 1 asks for. Judge each of
@@ -424,7 +441,29 @@ A correction is no longer a mutation of an existing row, so
 nothing can call it.
 
 **Files:**
-- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
+- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`, `src/infra/metrics.rs`, `src/infra/metrics_tests.rs`, `src/config.rs`, `src/infra/storage/pool.rs`, and three `tests/*_pg.rs`
+
+**Measured blast radius — wider than the trait method.** `grep -rn 'deactivate'
+--include='*.rs'` reports **41 hits across 9 files**, not the 4 an earlier draft
+of this task listed. Beyond the port, adapter and store:
+
+- **`src/infra/metrics.rs` publishes a whole metric for the operation**:
+  `uc_timescaledb_deactivate_duration_seconds`, its `deactivate_duration`
+  histogram field, its registration in `Metrics::new`, the `record_deactivate`
+  recorder, and a `TimedOp::Deactivate` variant with its match arm. **All of it
+  goes.** A metric measuring an operation that cannot be invoked is worse than
+  a dead function: an operator can build an alert on it and the alert never
+  fires. That is the same defect class DIVERGENCES entry 4 is filed under, and
+  this task is where it would be introduced rather than inherited.
+- **`src/infra/metrics_tests.rs`** asserts on that metric. Delete with a verdict.
+- **`src/config.rs:79` and `src/infra/storage/pool.rs:69`** each cite the
+  deactivate `SELECT … FOR UPDATE` as the worked example in a doc comment about
+  lock timeouts. The surrounding guidance is still true; only the example is
+  dead. **Re-point the example at a live statement rather than deleting the
+  paragraph** — the lock-timeout rationale is load-bearing and losing it to
+  tidy away one clause would be a real regression.
+- Three `tests/*_pg.rs` files. Delete only the deactivate coverage; the rest is
+  Task 15's.
 
 - [ ] **Step 1: Delete `deactivate` from the port**
 
@@ -655,6 +694,33 @@ unregistered `gts_id` is refused. After this task there is no registry for an
 id to be absent from, so the assertion cannot fail and cannot discriminate.
 That is a dead question wearing a green tick. Carry it to Task 15 Step 1's
 inventory as an explicit **delete**, not a repoint.
+
+- [ ] **Step 2c: Retire what the dropped constraint stranded**
+
+Dropping `usage_type_catalog` drops `usage_records_gts_id_fk` with it — the
+**only** foreign key in the schema. Three live things exist solely to classify
+its violation and are dead the moment this migration lands:
+
+- `DbErrorClass::ForeignKeyViolation` (`src/infra/storage/error.rs`)
+- its `"23503"` match arm in `classify_db`, and the test
+  `fk_violation_is_foreign_key_class` (`src/infra/storage/error_tests.rs`)
+- `map_insert_error`'s FK branch (`src/infra/storage/record_store.rs`), which
+  returns a `UsageTypeNotFound` the SDK no longer declares
+
+**No other task owns these** — Task 9 is scoped to `map_insert_error` alone, so
+without this step the enum arm and its test survive as live code guarding a
+constraint that no longer exists. Task 1's code review found the gap; this is
+where it closes, because the task that deletes a constraint should delete what
+guards it.
+
+Delete all three, with a per-item verdict. If removing the FK branch from
+`map_insert_error` conflicts with Task 9's rewrite of the same function, leave
+a comment saying so rather than half-doing it, and report it.
+
+**Note for whoever reads this later:** Task 1 already narrowed this class by
+dropping the unreachable `"23001"` arm, having verified no DELETE path exists
+in the plugin and that the FK carried no `ON UPDATE` clause. That was a
+behavior narrowing, not just a comment fix, and it is moot once the FK is gone.
 
 - [ ] **Step 3: Check the post-migration setup still matches**
 
