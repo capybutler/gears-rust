@@ -386,9 +386,15 @@ Test-driven per slice. Beyond porting the existing suites:
 - **Query surface**: `gts_type_id` predicate rejected, window predicate
   rejected, nullable-column order rejected, order alongside cursor rejected.
 
-The plugin contract suite of DESIGN §3.3 is scaffolded in
-`usage-collector-sdk` against the noop plugin, without
-`feed-snapshot-and-replay`.
+The plugin contract suite of DESIGN §3.3 is built in `usage-collector-sdk`
+behind a `contract` feature and validated against a purpose-written
+`InMemoryReferencePlugin` — **not** against the noop plugin, which persists
+nothing and so fails every behavioural check by construction rather than by
+defect. Two of DESIGN's seven checks cannot be written against the SPI this
+gear declares and are named in `BLOCKED_CHECKS` with what unblocks each:
+`feed-snapshot-and-replay`, which needs a feed method the SPI does not declare,
+and `latest-tie-break`, which needs an `acceptance_sequence` the record does
+not carry.
 
 ### Traceability annotations
 

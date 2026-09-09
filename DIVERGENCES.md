@@ -1,8 +1,9 @@
 # Spec divergences in the usage-collector
 
-Sixteen places where `usage-collector-v1.yaml`, `DESIGN.md`,
+Nineteen places where `usage-collector-v1.yaml`, `DESIGN.md`,
 `DECOMPOSITION.md` or a file under `docs/features/` describes behaviour the
-code does not have.
+code does not have — or, in entry 17's case, fails to describe behaviour the
+code does have. The direction varies; the disagreement is the subject.
 
 They were left unedited on purpose. Correcting a governing document is the
 spec owner's call, not the implementer's.
@@ -15,14 +16,24 @@ commit `4c7d338a1`, the file itself was first committed in `46274f6ba`, and the
 corrections its own review found landed after that).
 **Entries 12-16** came out of slice 5, the record-origin and backfill slice
 (the thirteen implementation tasks ending `a94d542cf`).
+**Entries 17-19** came out of slice 6, the errors-and-contract-gate slice (the
+eleven implementation tasks from `9f64cf22f` to `540dfbba0`, this sweep aside).
 
-In **eleven of the sixteen the code is the correct side** and the document is
-imprecise or stale. Five are not that shape, and saying so matters more than a
+Slice 6 also **closed** two things recorded here rather than only adding to
+them, and both are struck in place rather than deleted. Entry 9(a) is struck:
+`UsageCollectorError::NotFound` now carries a typed `NotFoundReason`, so the
+metric label it blocked is emitted. Section D is struck: the reason table now
+pins every wire spelling to its own identifier. Neither entry is *wholly*
+closed, and each says at its strike what is left and where the remainder lives.
+
+In **twelve of the nineteen the code is the correct side** and the document is
+imprecise or stale. Seven are not that shape, and saying so matters more than a
 tidy summary:
 
 - **Entry 8** — the three documents agree with each other and the code
-  implements none of it. The published 28-digit quantity range is enforced by
-  nothing and exercised by no test.
+  implements none of it. Slice 6 built the plugin half — the published 28-digit
+  quantity range is now exercised at its corners by a contract check — and the
+  gateway half is still enforced by nothing. The entry is split, not resolved.
 - **Entry 10** — neither side is simply right. The gear cannot serve the
   contract's shape and the contract does not describe the gear's; closing it is
   a spec decision plus a scheduled slice, and the entry says so rather than
@@ -38,10 +49,20 @@ tidy summary:
   the model no longer has and is missing five the gear needs. The plugin is the
   deficient side, and it is outside both this slice's edit surface and the
   workspace: it has not compiled since slice 4.
+- **Entry 18** — the document is right and the code is deliberately one variant
+  short. `UsageCollectorPluginError` ships five of DESIGN §3.3's six, and the
+  sixth signals a replay refusal on a feed the SPI does not declare. Landing it
+  with the feed was a spec-owner decision, not an oversight.
+- **Entry 19** — two of DESIGN §3.3's seven contract checks cannot be written at
+  all. Neither side is wrong about behaviour; the SPI and the record model are
+  missing the method and the field a check would have to read.
 
-**Eleven** are load-bearing rather than cosmetic, and each is marked below. The
-sharpest is entry 10: a client generated from the published contract cannot
-submit a single record, in two independent ways.
+**Fourteen** are load-bearing rather than cosmetic, and each is marked below.
+The sharpest is still entry 10, and slice 6 widened it: a client generated from
+the published contract cannot submit a single record and cannot make an
+aggregate request either — two independent `400`s on each of those two
+operations — while on a third the emitted body is not an instance of the schema
+the contract declares for it.
 
 ---
 
@@ -192,7 +213,21 @@ fire, and will not see the one condition this slice made reachable.
 Two smaller notes for the same edit. A continuation refused for an *unsound
 order* currently folds into `query_budget`, because neither `cursor_decode` (a
 genuine decode failure) nor `order_mismatch` (a caller `$orderby`) describes it;
-`order_mismatch` is arguably its right home and needs no new label. And the
+`order_mismatch` is arguably its right home and needs no new label.
+
+**But read that recommendation against this entry's own standard before acting
+on it.** `QueryErrorCategory::OrderMismatch` is **constructed nowhere** in
+non-test code — the only occurrences in `usage-collector/src` are the variant
+declaration and its `as_str` arm — so "emitted-capable and absent from the
+documented set" overstates it in exactly the way this entry objects to for
+`undeclared_field` and `missing_time_range`. Entry 3 says why independently: the
+in-process path now takes a continuation's order *from the token* rather than
+from the caller, so the condition `order_mismatch` names is no longer reachable.
+Documenting it as things stand would add a **third** dead label to a row this
+entry exists to clear of two. Either give it the unsound-order refusal a
+producer, and then document it, or leave it undocumented until something emits
+it. Recorded rather than resolved: this is a pre-existing overstatement in the
+entry, not a code defect. And the
 `$orderby` refusals that moved into the domain in this slice — a mixed-direction
 order, an inadmissible order key from an in-process caller — also land on
 `query_budget` today.
@@ -220,6 +255,26 @@ slice-3 handoff named them as such and put refreshing them out of scope. This
 entry exists because that paragraph is *specifically* about the thing slice 3
 replaced, so it is the one most likely to mislead someone reading for the time
 model.
+
+**A second, narrower instance, added by slice 6.**
+`gears/system/usage-collector/docs/DECOMPOSITION.md:573`:
+
+> Request bodies named for their operation (`CreateUsageRecordsRequest`,
+> `QueryAggregatedUsageRecordsRequest`) are the exception to the suffix
+> convention.
+
+There is no `QueryAggregatedUsageRecordsRequest`. Slice 6 renamed it to
+**`AggregationRequest`** in `usage-collector/src/api/rest/dto.rs`, so that the
+component the runtime publishes and the component `usage-collector-v1.yaml`
+declares are the same string — which is what `openapi_contract_tests`'
+`contract_name` rule requires, and the reason the rename happened at all.
+`CreateUsageRecordsRequest` still resolves, so the sentence is half true, which
+is the harder kind to notice.
+
+Folded in here rather than opened as an entry of its own, because this entry
+already owns `DECOMPOSITION.md` and the file is edit-forbidden either way. The
+same rename left a sibling claim in `docs/features/usage-query.md`; that one is
+in entry 14, which owns `docs/features/`.
 
 ---
 
@@ -262,8 +317,12 @@ nothing in the published contract to match against; it must read the source.
 
 **Proposed wording:** enumerate the four alongside `IDEMPOTENCY_CONFLICT` and
 `VALIDATION`, with `INVALIDATION_FIELD_MISMATCH` documented as carrying the
-differing field in `field`. Slice 6 owns the final reason-vocabulary pass and
-may rename; the gap is what needs recording, not the exact spellings.
+differing field in `field`. **The spellings are now settled and can be
+enumerated verbatim.** This entry used to defer them, because slice 6 owned the
+final reason-vocabulary pass and might rename; that pass has run and renamed
+none of the four. It also pinned each of them: as of §D below, every wire
+constant in `reason.rs` is asserted to spell its own identifier, so these four
+strings cannot drift out from under an enumeration written against them.
 
 ---
 
@@ -310,10 +369,13 @@ the criterion covers the next derived field too.
 
 ---
 
-## 8. The 28-digit quantity guarantee has no enforcement and no test
+## 8. The 28-digit quantity guarantee is pinned for a plugin and enforced nowhere
 
 **This is the one entry where the code is the wrong side.** Three documents
-agree with each other and the gear implements none of it.
+agree with each other and the gear implements none of it. Slice 6 built half of
+what was missing and the entry is **split** below rather than marked resolved:
+the half that landed is a check on a *plugin*, and the half that is unowned is
+the one the gear itself would have to do.
 
 `gears/system/usage-collector/docs/usage-collector-v1.yaml:559`, the
 `UsageQuantity` schema:
@@ -328,13 +390,13 @@ agree with each other and the gear implements none of it.
 repeats the range verbatim. §3.3 lists "quantity range" among the gateway
 responsibilities a plugin may therefore skip.
 
-**What the code does.** Nothing checks any of it. `models.rs` and
+**What the code does.** Nothing in the *gear* checks any of it. `models.rs` and
 `validation.rs` validate `ReasonCode` length, `IdempotencyKey` shape and the
-metadata surface, and say nothing about `Decimal` magnitude or scale. No test
-exercises a boundary value — not 10²⁸, not 1×10⁻²⁸, not the negative half. The
+metadata surface, and say nothing about `Decimal` magnitude or scale. The
 yaml's `UsageQuantity` `pattern` caps the *fraction* at 28 digits on the wire
 and bounds the integer part not at all, so even the schema does not enforce the
-prose.
+prose. Until slice 6 no test anywhere exercised a boundary value — not 10²⁸,
+not 1×10⁻²⁸, not the negative half.
 
 The sign half is fine and deliberately so: a negative quantity is an ordinary
 measurement recording a real decrease, never a correction, and that is stated
@@ -346,10 +408,54 @@ rejects a negative quantity showed nothing checks its magnitude either.
 
 **Pre-existing**, not introduced by the correction-model slice.
 
-**What to do:** slice 6's `quantity-round-trip` contract test is where the
-plugin half lands. That leaves the gateway half — rejecting an out-of-range
-submission at ingestion, which §3.3 promises a plugin it need not do — unowned.
-Do not implement it here.
+**The plugin half is closed.** Slice 6 wrote the DESIGN §3.3
+`quantity-round-trip` check
+(`usage-collector-sdk/src/contract/checks/quantity_round_trip.rs`). It persists
+five corners of the published range — `9999999999999999999999999999` and its
+negation, `0.0000000000000000000000000001` and its negation, and `42.500` for
+significant trailing zeros — through `create_usage_record`, reads each back
+through `list_usage_records`, and compares the **rendered** decimals rather than
+using `==`, because `Decimal`'s `PartialEq` calls `42.5` and `42.500` equal and
+a backend that normalises scale on write is one of the things the check exists
+to catch. `quantity_fixture` additionally re-checks per corner that
+`rust_decimal::Decimal` parses and renders the literal unchanged, so a corner
+the carrier itself rounds fails as a finding about the contract rather than
+passing vacuously.
+
+**The gateway half is unowned, and slice 6 deliberately left it that way** — on
+this entry's own instruction. Nothing rejects an out-of-range *submission* at
+ingestion. §3.3 lists "quantity range" (`DESIGN.md:1084`) among the gateway
+responsibilities a plugin may therefore skip, so a plugin author is entitled to
+assume the value already fits before it reaches the SPI.
+
+**Load-bearing**, and unmarked until now only because nobody wrote the marker —
+splitting the entry is the moment to settle it, in either direction, rather than
+leave the file's self-declared most severe entry the one with no verdict. The
+argument is the gap between two ceilings. The published range stops below 10²⁸;
+the carrier every surface uses, `rust_decimal::Decimal`, holds up to
+`79_228_162_514_264_337_593_543_950_335` (~7.9×10²⁸). The wire `pattern` bounds
+the integer part not at all, so a quantity in that band deserializes, passes
+every check the gear applies, and is dispatched to a plugin that §3.3 excused
+from checking it. What happens next is the backend's column, not the contract's:
+one store rejects it as an `Internal`, another rounds it, a third takes it. So
+the same submission gets three answers across three conforming backends, and the
+ledger is append-only — nothing corrects the admitted entry afterwards except an
+invalidation naming a value the caller never sent. That is a silently wrong
+charge, which is the consequence class entries 11 and 12 are marked for.
+
+**A contract check proves a plugin round-trips the range. It proves nothing
+about what the gear admits.** The check runs against a backend through the SPI
+and never through the gear, so the two halves cannot substitute for each other
+in either direction: a conforming plugin still stores whatever the gateway hands
+it, and the gateway still hands it anything the wire `pattern` admits. Reading
+the closed half as closing the entry is the specific mistake this split exists
+to prevent.
+
+The instruction stands for the next slice too, until a spec owner rules on where
+the bound is enforced: a gateway check is a new rejection on the ingestion path
+and needs a wire reason, an `error_category` (see entry 9(b), which records that
+`RecordErrorCategory` has no `Validation` variant to route one to), and a
+published range the yaml's own `pattern` does not currently contradict.
 
 ---
 
@@ -363,25 +469,50 @@ Do not implement it here.
 > `invalidation_rule`, `plugin_error`) … `invalidation_rule` covers the copy,
 > reference and at-most-one rules alone.
 
-Two problems, both on one table row. There was a third — `origin` was not
-emitted at all — and slice 5 closed it: `record_ingestion_record` now takes
-the fourth label and `RecordOrigin` supplies it on both ingestion paths. The
-sub-item is struck rather than rewritten, because nothing about it survives.
+**One problem is left on this table row. There were three.** `origin` was not
+emitted at all, and slice 5 closed it: `record_ingestion_record` now takes the
+fourth label and `RecordOrigin` supplies it on both ingestion paths. **(a)** is
+closed by slice 6. Both are struck rather than rewritten, because nothing about
+either survives.
 
-**(a) `invalidation_rule` cannot cover the reference rule.** The copy and
-at-most-one rules are classifiable — they raise
-`ValidationReason::InvalidationFieldMismatch` /
-`ValidationReason::InvalidationTargetNotRecord` and
-`ConflictReason::AlreadyInvalidated`. The reference rule is not: an
-unresolvable `invalidates` surfaces as `UsageCollectorError::NotFound`, and
-that variant carries **no typed reason** — nothing but `detail` prose separates
-it from an ordinary `usage_record_not_found`, and a plugin's own
-`UsageRecordNotFound` reaches the same arm. `classify_record_error`
-(`usage-collector/src/domain/service.rs`) declines to classify a bounded metric
-label by substring match on a caller-facing string and leaves it on
-`semantics_violation`, with the reasoning in the code.
+**~~(a) `invalidation_rule` cannot cover the reference rule.~~ Closed in code.**
+`UsageCollectorError::NotFound` now carries a typed `NotFoundReason`
+(`usage-collector-sdk/src/reason.rs`), and `classify_record_error`
+(`usage-collector/src/domain/service.rs`) matches on it rather than on prose:
+`DeclarationNotFound` routes to `unknown_usage_type`,
+`InvalidationTargetNotFound` to **`invalidation_rule`** — the ADR's
+valid-reference rule, which is one of the three the document assigns this label
+— and `UsageRecordNotFound` to `semantics_violation`. Nothing parses `name` as
+a UUID any more, and nothing matches a substring of a caller-facing string. The
+label now covers the copy, reference and at-most-one rules exactly as
+`cpt-cf-usage-collector-adr-append-only-invalidation` and §3.11.5 describe it,
+so the correction backlog no longer under-counts by a rule.
 
-**(b) Two of the seven listed label values are never emitted, and three emitted values are absent from the list.**
+**The 404s are still indistinguishable to a client, and closing that is not
+this gear's to do.** `NotFoundReason` is deliberately **not** a wire
+vocabulary: it has no `SCREAMING_SNAKE` constants, no `from_wire` / `as_wire`,
+and never reaches a `Problem` body, and `reason.rs` says so at the type. An
+in-process consumer resolving `UsageCollectorClientV1` through `ClientHub`
+reads the discriminator directly; a **REST client still separates the three
+404s by `detail` prose and nothing else**, exactly as before slice 6.
+
+The blocker is one level above this gear, and naming it precisely matters
+because the obvious place to look is the wrong one.
+`toolkit_canonical_errors::NotFoundV1`
+(`libs/toolkit-canonical-errors/src/context.rs:186`) is `pub struct NotFoundV1
+{}` — an **empty, platform-shared** context struct, which the canonical builder
+constructs with no reason at all. Every gear's 404 is in that same position, so
+a slot has to exist there before any gear can fill one. It is **not** this
+gear's yaml: `Problem.context` at
+`gears/system/usage-collector/docs/usage-collector-v1.yaml:1237` is already
+`additionalProperties: true` and its description already names `reason` among
+the common fields, so the schema forbids nothing. Reading the yaml alone
+suggests the work is done. It is not, and it is a platform change, not an
+editorial one — which is why this entry is struck at (a) and not closed.
+
+**(b) Two of the seven listed label values are never emitted, and three emitted
+values are absent from the list.** Open, and slice 6 declined to close it from
+the code's side — see *"Slice 6 declined the rename"* below.
 `RecordErrorCategory::as_str` emits `none`, `authz`, `unknown_usage_type`,
 `semantics_violation`, `invalidation_rule`, `metadata_size`,
 `idempotency_conflict`, `plugin_error` — eight values. So `unresolved_type` and
@@ -412,34 +543,54 @@ label stops matching silently the day the message is reworded. Renaming
 `semantics_violation` to `validation` to satisfy the document would break every
 existing dashboard for no gain.
 
-This paragraph was headed "Why the code is right **on (a) and (b)**" while
-there were three sub-items, and the qualifier existed to exclude (c) — the one
-place the code was not right, because it had not been written yet. With (c)
+**Slice 6 declined the rename, and this entry's own argument is why.** Slice 6
+owned the error-vocabulary pass and could have moved `semantics_violation` to
+`validation` in an afternoon; it renamed nothing and added no variant — the
+type's variants and `as_str` are byte-identical across the slice. (Its doc
+comments are not: `7cce8db2e` rewrote the ones on `SemanticsViolation` and
+`InvalidationRule`, the two whose meaning 9(a)'s closure changed. The label
+vocabulary is what did not move.) `semantics_violation`
+is an **emitted** series, so a rename does not correct a dashboard, it silently
+empties one: every `sum by (error_category)` keyed on it collapses into an
+absent-label bucket while the metric goes on reporting. That is the exact
+failure §B below records for `record_kind` → `entry_type`, on this same
+instrument, and it is worse for an operator than a deleted series because a
+deleted series at least goes visibly flat. The document is the side to move.
+
+That paragraph was once headed "Why the code is right **on (a) and (b)**",
+while there were three sub-items and the qualifier existed to exclude (c) — the
+one place the code was not right, because it had not been written yet. With (c)
 struck the qualifier named every remaining sub-item, so it excluded nothing
-while still reading as though something were excluded. Dropped rather than
-re-scoped: the entry is now wholly a document defect and says so in one
-place.
+while still reading as though something were excluded, and it was dropped
+rather than re-scoped. It stays dropped now that (a) is struck too: (b) is the
+only sub-item left, it is a document defect, and the residual 404 gap is a
+platform gap argued at its own paragraph above rather than here.
 
 **Load-bearing.** An operator building an alert off this row alerts on two
-labels that can never fire, misses three that do, gets a correction-backlog
-count that under-reports by one rule, and — following the row's own sentence —
-looks for period-bound rejections under a label that is never emitted while
-they accumulate under `semantics_violation` beside unrelated failures.
+labels that can never fire, misses three that do, and — following the row's own
+sentence — looks for period-bound rejections under a label that is never
+emitted while they accumulate under `semantics_violation` beside unrelated
+failures. The correction-backlog under-count is no longer among the
+consequences: as of slice 6 `invalidation_rule` covers all three rules the
+document assigns it.
 
 **Proposed wording:** replace the `error_category` enumeration with the eight
-values `RecordErrorCategory` actually emits; narrow the `invalidation_rule`
-sentence to the rules it can cover, or grow `NotFound` a typed reason so it can
-cover the third. That second option is a design decision, and slice 6's
-reason-vocabulary pass is where it lands. Rewrite the period-bound sentence to
-name the category the bounds actually reach, or give them one; the `origin`
-column needs no change — it is emitted.
+values `RecordErrorCategory` actually emits. The `invalidation_rule` sentence
+now needs **no** change — the second option this entry used to offer, growing
+`NotFound` a typed reason, is the one slice 6 took, and the sentence is true as
+written. Rewrite the period-bound sentence to name the category the bounds
+actually reach, or give them one; the `origin` column needs no change either.
+The rename in the other direction — code to document — is argued against above
+and should not be read out of "replace the enumeration": the enumeration is the
+document's, and it is the document that moves.
 
 ---
 
 ## 10. The REST shapes and `usage-collector-v1.yaml` are incompatible, not merely divergent
 
 Every other entry here is a document that describes working code imprecisely.
-This one is a contract a generated client cannot use at all.
+This one is a contract a generated client cannot use at all — on three
+operations now, not two. Slice 6 added the third.
 
 **Request side — a generated client cannot submit a single record.**
 `CreateUsageRecordRequest` in the yaml (`:810`) lists `quantity` in `required`
@@ -458,6 +609,66 @@ gear emits `value`, which it does not declare. So the body is not a strict
 subset of the contract; it is a non-instance in two independent directions.
 `origin` was a third missing `required` field until slice 5; it is on both
 shapes now and is no longer part of this entry.
+
+**Aggregate request — a third case, on a third operation, found by slice 6.**
+`gears/system/usage-collector/docs/usage-collector-v1.yaml:1045` declares
+`AggregationRequest` with `required: [gts_type_id, time_range]` and
+`additionalProperties: false`, carrying `gts_type_id`, `time_range`, `filter`,
+`metadata_filter` and `group_by` as body properties. `AggregationRequest` in
+`usage-collector/src/api/rest/dto.rs` carries `#[serde(deny_unknown_fields)]`,
+exactly two fields — `time_range` and `group_by` — and **no `gts_type_id`**:
+the gear takes the meter as a mandatory query parameter
+(`api/rest/routes/usage_records.rs`, on `POST
+/usage-collector/v1/records/aggregate`). So a client generated from the
+contract puts `gts_type_id` in the body, where `deny_unknown_fields` refuses it
+as unknown, *and* omits the query parameter the gear requires. **Two
+independent `400`s on every aggregate request**, the same shape as the request
+side above on a different operation. `filter` and `metadata_filter` disagree
+the same way and are excused for the same reason.
+
+The component *name* matches on both sides — slice 6's rename
+(`b353c27fc`, `8b30a288d`) is what made it match, so `AggregationRequest` is
+one string in the yaml and in the registry. That is what the drift gate
+compares, and it is why the gate is green over an incompatibility.
+
+**Nothing in the drift gate catches this, by design, and re-enabling the gate
+did not change that.** `body_schemas_match`
+(`usage-collector/src/api/rest/routes/openapi_contract_tests.rs`) compares
+media type, `required`, and the referenced schema *name*; the module header
+lists "field-level schema contents" among what it deliberately does **not**
+enforce. Two schemas can therefore agree on name and required-ness and disagree
+on every property. Slice 6 turned the gate from six `#[ignore]`d checks to zero
+skipped, and this entry is the standing reminder that a green gate is not a
+compatible contract — do not write the re-enablement up as though it closed
+anything here. What the suite does instead is *record* the disagreement:
+`BODY_VS_QUERY_DRIFT` names all three inputs with their two spellings, and
+`body_vs_query_drift_is_really_drift` expires a row from either side, so the
+list cannot become a standing exemption.
+
+**Two gaps in the gate itself, recorded here rather than only in code
+comments.**
+
+- **The cross-check that keeps a placement disagreement out of
+  `UNDOCUMENTED_PARAMETERS` matches on the property name alone.**
+  `undocumented_parameters_are_really_undocumented` asserts that a row's
+  parameter is not also declared as a body property of the same operation —
+  which is what stops a client-breaking placement disagreement being filed as
+  the weaker "documentation gap" and losing the `body_property` column that
+  expires it. It compares names, so the `$filter` row is the case it **provably
+  cannot police**: the query spelling is `$filter` and the body spelling is
+  `filter`, so re-filing that row from `BODY_VS_QUERY_DRIFT` into
+  `UNDOCUMENTED_PARAMETERS` leaves the suite green. It is correctly filed
+  today, and the assertion message says outright that a differently-named body
+  property is invisible to it — which is the most a name-matching check can do,
+  and the reason this is written down rather than fixed with a stricter
+  assertion that would not be stricter.
+- **This file carried an unpinned evidence line.** "Re-verified at the branch
+  head … **648 passed, 6 skipped**" named no commit, unlike the three
+  commit-pinned lines around it. It was true when written and false by the time
+  slice 6 opened; slice 6 alone moved that count several times and took the
+  skips to zero. It is pinned to `9e36bbf6b` in **Evidence** below rather than
+  renumbered, because an unpinned count re-breaks on the next commit — which is
+  presumably why the others are pinned.
 
 **What the code does, and why it is where it is.** Both gaps are out of the
 correction-model slice by explicit scope, and both are honest scope rather than
@@ -497,12 +708,16 @@ rename. `accepted_at` and `acceptance_sequence` are still absent from both
 emitted key sets.
 
 **Load-bearing**, more decisively than any other entry here: no generated
-client works at all.
+client works at all, on either write path — ingestion or aggregate.
 
 **Proposed resolution:** this one is not a wording fix. Either the code renames
-`value` and grows the three server-assigned fields, or the contract is
-corrected to the shape the gear serves. Whichever way it goes it is a spec
-decision plus a scheduled slice, not an editorial pass.
+`value`, grows the two remaining server-assigned fields and moves the three
+aggregate inputs into the body, or the contract is corrected to the shape the
+gear serves. On the aggregate case the contract looks like the side that is
+wrong: `$filter` reaches the handler through `toolkit_odata`'s query-string
+extractor, so honouring the body placement means abandoning that extractor.
+Whichever way it goes it is a spec decision plus a scheduled slice, not an
+editorial pass.
 
 ---
 
@@ -684,6 +899,38 @@ question the backfill route exists to make askable.
 **Proposed wording:** replace "label-free" with the `origin` label at all
 three, and take the `record_kind` spellings to `entry_type` in the same pass.
 
+**A second file under `docs/features/`, added by slice 6.** This entry is
+titled for `usage-emission.md` because that is where it started; it is the entry
+that owns `docs/features/` and the instance below belongs to it rather than to a
+new number.
+
+`gears/system/usage-collector/docs/features/usage-query.md:127`, inside §1.6
+"Implementation Status" — the subsection whose whole job is to say what is
+*actually* built:
+
+> The implemented body is `QueryAggregatedUsageRecordsRequest`, carrying only
+> `op` and `group_by` … The schema names that once appeared in these sections —
+> `AggregationRequest`, `AggregationSpec`, `MetadataFilter` — no longer exist in
+> `usage-collector-v1.yaml`.
+
+Both halves are now false, and in opposite directions. The implemented body is
+**`AggregationRequest`** — slice 6 renamed it so the registered component name
+and the contract's would be one string — and it carries `time_range` and
+`group_by`, not `op` and `group_by`, because the fold is resolved from the
+queried type's declaration and no request names an operator at all. Meanwhile
+`AggregationRequest` and `MetadataFilter` **do** exist in
+`usage-collector-v1.yaml`, at `:1045` and `:1009`, so the sentence retiring
+those names is retiring one the code has just adopted. Only `AggregationSpec`
+is genuinely absent from the yaml.
+`:139` restates the same claim inside the aggregated-read bullet, alongside the
+retired `created_at` window model entry 5 covers, so it is two sites in one
+file.
+
+**Load-bearing for the same reason the rest of this entry is**, and slightly
+worse: §1.6 exists precisely so a reader who distrusts the surrounding sections
+has one place to trust, and it is the section that is wrong. Its sibling
+instance in `DECOMPOSITION.md:573` is in entry 5.
+
 ---
 
 ## 15. `AggregationDimension` carries five of the eight fixed dimensions DESIGN gives `group_by`
@@ -792,13 +1039,191 @@ already describes. The plugin's own `RECORD_COLUMNS` const, and the
 `UsageRecordRow` it decodes positionally into, still name `value`,
 `created_at`, `corrects_id` and `status` and belong in the same pass.
 
+**Read three other places before starting, because this entry is where a porter
+arrives and none of them is on the way here.** Compiling again and passing the
+allowlist work above is necessary and not sufficient. **Entry 19** says the
+DESIGN §3.3 suite covers five of seven and names what the other two need, so a
+green run is not a conformance certificate. **§F** says two of those five checks
+are not independent — a backend selecting on `window_start` fails
+`quantity-round-trip` for a reason that has nothing to do with decimals — and
+that nothing in the suite exercises the SPI's keyset obligations, which is where
+a port is most likely to be quietly wrong. **§G** names a grouping case where
+this gear's reference answer and a natural SQL projection disagree, and which
+answer is right is not yet decided.
+
 ---
 
-## Not divergences — five things this branch owes someone else
+## 17. `$top` and `metadata.<key>` are served on `GET /records` and documented nowhere
+
+`gears/system/usage-collector/usage-collector/src/api/rest/routes/usage_records.rs`
+registers both on `GET /usage-collector/v1/records` — `metadata.<key>` at
+`:149` and `$top` at `:159` — each with its reasoning written at the
+registration site rather than inferred here.
+
+`$top` is declared by hand (`:104`-`:119`): DE0802 requires every `$`-prefixed
+`OData` parameter to come through `OperationBuilderODataExt`, that trait offers
+`with_odata_filter`, `with_odata_orderby` and `with_odata_select` and **no
+`$top` method**, and #4422 bound `$top` on the wire —
+`ODataParams.limit` gained `#[serde(alias = "$top")]` — without adding one. The
+extractor therefore folds `$top` and `limit` onto one slot (`:153`-`:157`), and
+publishing only `limit` would under-report the accepted surface. `metadata.<key>`
+is declared because the raw read path really does accept repeated metadata
+filters.
+
+`gears/system/usage-collector/docs/usage-collector-v1.yaml` documents **neither**.
+`limit` **is** documented — the `Limit` component parameter (`:469`-`:470`),
+referenced from `GET /usage-collector/v1/records` at `:178` — which is what
+makes the omission easy to miss: the page-size *concept* is in the contract
+under the alias spelling, and the canonical OData spelling the gear equally
+honours is not.
+
+**Load-bearing.** A client generated from the contract cannot set a page size by
+the canonical OData spelling — it gets `limit` or nothing — and does not know
+the metadata filter exists at all, which on a meter with declared metadata
+properties is the difference between a narrow read and pulling the whole range
+and filtering client-side. Neither failure is loud: `$top` is simply absent from
+the generated surface, and an undeclared `metadata.<key>` is a feature nobody
+discovers.
+
+**Pinned, and the pin expires itself.** `UNDOCUMENTED_PARAMETERS` in
+`usage-collector/src/api/rest/routes/openapi_contract_tests.rs:164` names
+exactly these two rows, and
+`undocumented_parameters_are_really_undocumented` fails on any row whose gap has
+closed — including the day the yaml documents the name in *any* parameter
+location, deliberately stricter than the row needs. So this entry expires
+automatically when the contract catches up; nobody has to remember to delete it.
+The list structurally excuses **registered-but-undocumented query parameters
+only**. The reverse direction — documented but unregistered — is the dangerous
+one and is never excused there.
+
+**Proposed wording:** document both on `GET /usage-collector/v1/records` —
+`$top` as an integer page size beside the existing `Limit`, noting that the two
+are aliases folded onto one slot and that sending both in one request is
+rejected, and `metadata.<key>` as a repeated query parameter with the OR-within-
+a-key / AND-across-keys semantics the registration already publishes.
+
+---
+
+## 18. `UsageCollectorPluginError` ships five of DESIGN §3.3's six variants
+
+`gears/system/usage-collector/docs/DESIGN.md:1217`-`:1224` tabulates the SPI
+taxonomy and the envelope each variant lifts to, then states the count outright
+at `:1226`:
+
+> Six variants, deliberately.
+
+**What the code does.** `UsageCollectorPluginError`
+(`usage-collector-sdk/src/error.rs:865`) declares five: `Transient`,
+`IdempotencyConflict`, `UsageRecordNotFound`, `AlreadyInvalidated` and
+`Internal`. The absent one is
+`CursorBeyondRetention { oldest_available }` → `InvalidArgument(CursorBeyondRetention)`
+(`DESIGN.md:1224`).
+
+**This was a spec-owner decision, not an omission.** The missing variant is the
+**feed's replay-refusal signal**: a consumer resuming from a cursor older than
+the retention floor. The feed is not on this gear's SPI — the same absence entry
+19 records as blocking `feed-snapshot-and-replay` — so nothing constructs the
+variant, nothing lifts it, and no test can exercise it. Its `error_category` has
+the same shape: `cursor_beyond_retention` is a label on
+`uc_feed_requests_total` (`DESIGN.md:1781`, and the alert built on it at
+`:1837`), an instrument this gear does not emit at all. Slice 6 owned the plugin
+error taxonomy and chose to land the variant **with the feed** rather than ship
+a public enum arm that nothing raises and no assertion covers.
+
+**Not load-bearing today**, and the reason is worth stating rather than leaving
+to inference: nothing can raise it, so nothing mis-reports. A plugin author
+cannot be misled into thinking they must construct it either — `#[non_exhaustive]`
+on the enum means adding it later is not a breaking change for a matcher, which
+is exactly what makes deferring it safe.
+
+**It becomes load-bearing the moment the feed lands without it.** A feed that
+cannot say "your cursor is past the retention floor" in the taxonomy says it as
+`Internal(detail)`, which lifts to a `500`: the consumer retries, gets the same
+`500`, and an operator reads infrastructure failure where the truth is a
+consumer falling behind. Whoever builds the feed owns this row.
+
+**Proposed resolution:** none for the document — DESIGN is right and says
+"deliberately". The record here is that the code is knowingly one variant
+behind, so that the next reader of `DESIGN.md:1226` does not count five in
+`error.rs` and file it as drift, and so that the feed slice inherits the
+obligation in writing.
+
+---
+
+## 19. Two DESIGN §3.3 contract checks cannot be written against the SPI this gear declares
+
+`gears/system/usage-collector/docs/DESIGN.md:1105`-`:1116` tabulates seven
+plugin contract tests and says every conforming plugin MUST pass the suite in
+`usage-collector-sdk`. Slice 6 built that suite. **Five of the seven are
+written**; two cannot be written at all.
+
+**What the code says, and where.** `BLOCKED_CHECKS` in
+`usage-collector-sdk/src/contract.rs:227` is the in-code record, carrying each
+blocked name with what unblocks it:
+
+- **`feed-snapshot-and-replay`** — the gear's SPI declares no feed method.
+  DESIGN §3.3 gives `UsageCollectorPluginV1` a `read_feed_page`; this gear
+  implements five methods and none reads a feed. Unblocked by the usage feed.
+  This is entry 18's blocker seen from the other side.
+- **`latest-tie-break`** — the check would assert *greatest `window_end`, then
+  greatest `acceptance_sequence`* (`DESIGN.md:1116`), and `UsageRecord` carries
+  no `acceptance_sequence` field. Until it exists there is nothing for a plugin
+  to assign or a fold to read.
+
+The split is not prose that can drift: `IMPLEMENTED_CHECKS`, `UNWRITTEN_CHECKS`
+(empty — everything the current SPI can express is written) and `BLOCKED_CHECKS`
+are asserted to partition DESIGN's seven exactly, and `ADDITIONAL_CHECKS` — one
+check DESIGN states as an obligation without tabulating — is asserted disjoint
+from all three, so a name DESIGN never wrote cannot be smuggled into the
+partition and a check that half-lands fails it.
+
+**This is the second slice to stand next to the same hole, and saying so is the
+point.** `accepted_at` and `acceptance_sequence` are already recorded in
+**entry 10** as blocking a conformant storage plugin — DESIGN §3.1 has the gear
+stamp one and the plugin assign the other monotonically per
+`(tenant_id, gts_type_id)`, and `usage-collector-sdk/src/models.rs` documents
+the `LATEST` tie-break against a field the record does not carry. Slice 5
+flagged it and did not fill it; slice 6 flagged it again from the contract-suite
+side and did not fill it either. **Two flags, one problem.** A third reader must
+not open a third entry.
+
+**The same root cause reaches the suite's own behaviour, not just its
+coverage.** The reference backend's `LATEST` fold breaks a `window_end` tie on
+the **greatest `id`**, because the declared tie-break field does not exist. It
+is documented at the fold
+(`usage-collector-sdk/src/contract/reference.rs`, `fold_value`) and in that
+module's "Stated limits", and it says what it is: a total order is needed there
+or the answer would depend on ledger insertion order, so `id` stands in — it is
+deterministic, it is **not** the declared rule, and no check asserts either way.
+So the suite silently ships one substituted semantic, on the exact rule the
+blocked check would have pinned.
+
+**Load-bearing**, in the same conditional way entries 11 and 16 are: the
+consequence lands on whoever ports a backend, not on a running system. "Run this
+suite" is the acceptance criterion for a port, so a green run that covers five
+of seven must not read as a conformance certificate — which is why the suite
+exports all four constants and why its docs say a caller reporting coverage must
+report them together rather than `IMPLEMENTED_CHECKS` alone. A porter who reads
+the green and ships a `LATEST` fold with its own arbitrary tie-break produces
+answers that differ from another conforming backend's on the same ledger, with
+nothing failing anywhere.
+
+**Proposed resolution:** none is available as a wording fix, and none should be
+attempted as one. `latest-tie-break` unblocks when `acceptance_sequence` exists,
+which is entry 10's contract decision; `feed-snapshot-and-replay` unblocks when
+the feed lands, which is entry 18's slice. Until then the honest statement is
+the one the code already makes: seven tabulated, five written, two blocked, with
+the blocker named per check.
+
+---
+
+## Not divergences — seven things this branch owes someone else
 
 None is a spec-owner decision, so none is numbered above. **A** and **B** were
 found by slice 4's final review, after eight per-task review rounds had missed
-them; **C** and **D** by slice 5's. All four reach someone outside this branch.
+them; **C** and **D** by slice 5's; **F** and **G** by slice 6's. All reach
+someone outside this branch. **D is struck** — slice 6 closed it — and stands
+struck rather than deleted, for the same reason the struck sub-items above do.
 
 ### A. `docs/api/api.json` is stale, and it will fail CI
 
@@ -825,11 +1250,23 @@ persisted entry can be mutated.** In code the append-only invariant is total
 service dispatch, and the absence of any `&mut UsageRecord`); the published
 contract is the one place still saying otherwise.
 
+Slice 6 made it stale by a **renamed component**, which is a third direction
+again. `docs/api/api.json` carries `QueryAggregatedUsageRecordsRequest` — twice
+— and the gear now publishes that request body as `AggregationRequest`
+(`b353c27fc`, then `8b30a288d` for the reason the intermediate spelling was
+wrong: `toolkit_macros::api_dto` registers a schema under the literal Rust
+identifier, so a `Dto` suffix on the type is a `Dto` suffix on the served
+component). So the regeneration renames a component as well as adding a route
+and removing two.
+
 The fix is `make openapi` plus a commit, and it was left undone deliberately: it
 needs a build of the example server and a decision about the breaking-change
-label, both of which belong to whoever opens the PR. Slice 6's re-enabled drift
-tests will **not** catch it — they compare the registry against
-`usage-collector-v1.yaml`, a different document.
+label, both of which belong to whoever opens the PR. It is still
+**byte-identical to `main`** at `540dfbba0`, checked with `git rev-parse` on
+both sides rather than `git diff`. The drift tests slice 6 re-enabled do **not**
+catch any of it — they compare the registry against `usage-collector-v1.yaml`,
+a different document — so turning that gate on changed nothing here, and this
+section is still the only record.
 
 ### B. `uc_ingestion_records_total` renamed a label, and no trailer says so
 
@@ -851,8 +1288,8 @@ commits.
 ### C. Two traceability facts about the ingestion path, before anyone blames slice 5
 
 **A pre-existing marker crossing.** In
-`usage-collector/src/domain/service.rs` — the SPI-dispatch block, around
-`:1053`-`:1073` — `inst-state-usage-record-validated` opens **before**
+`usage-collector/src/domain/service.rs` — the SPI-dispatch block,
+`:1067`-`:1087` — `inst-state-usage-record-validated` opens **before**
 `inst-emit-record-accepted` and closes **before** it as well, so the two spans
 cross rather than nest. Every marker in the block is paired, which is what a
 balance check looks at; the traceability spec asks for well-formed nesting,
@@ -884,23 +1321,42 @@ about isolating the write path from the read-side and operator-side gateways,
 which the code does satisfy. The backfill-vs-live gap is a different obligation,
 from the ADR, and it is entry 12.
 
-### D. The reason round-trip table cannot see a changed wire spelling
+### ~~D. The reason round-trip table cannot see a changed wire spelling~~
 
-`usage-collector-sdk/src/reason_tests.rs` walks a `(constant, variant)` table
-through `from_wire` / `as_wire`. Both sides of every assertion read the same
-constant, so the table proves the two functions are inverses and nothing else:
-change `FUTURE_WINDOW`'s **value** to `"FUTURE_WINDOWX"` and every test still
-passes, while every client matching on the published spelling breaks. The
-spellings are pinned externally by `usage-collector-v1.yaml` and by nothing in
-this crate.
+**Closed by slice 6, at the front of its reason-vocabulary pass, exactly where
+this item asked for it.** The defect was real: `reason_tests.rs`'s round-trip
+tables read the same constant on both sides of every assertion, so they proved
+`from_wire` and `as_wire` are inverses and nothing else — changing
+`FUTURE_WINDOW`'s **value** to `"FUTURE_WINDOWX"` left every test green while
+every client matching the published spelling broke.
 
-This is true of all 18 constants in `reason.rs`, not only the two slice 5 added,
-and it predates the slice. All 18 have `value == identifier`, so a single
-`stringify!` table pins every wire spelling at once in about six lines. It was
-declined in slice 5 on scope grounds: pinning 2 of 18 makes the table
-inconsistent about what it guarantees, and slice 6's reason-vocabulary pass owns
-this vocabulary wholesale. It belongs at the front of that pass, before the
-vocabulary moves.
+`every_wire_constant_spells_its_own_identifier` is the companion that closes it.
+A `stringify!` macro builds a `(identifier, value)` table and asserts the two
+are equal for every constant, so the value is now pinned to something other than
+itself.
+
+**The count moved, and the fix is why the count no longer has to be maintained.**
+This item said "all 18 constants". There are **16**: slice 6 deleted
+`INVALID_CURSOR` and `FILTER_MISMATCH` from `ValidationReason` in `7691b8222`,
+because this gear originates neither — both are `toolkit_odata`'s, and the gear
+now carries the upstream error and reads the wire `field` and `reason` off it
+rather than re-spelling them (`reason.rs` says so where they used to be, and
+`the_upstream_cursor_reasons_no_longer_model_themselves` pins that they are *not*
+modelled here). Any 18 written down in this file was going to be wrong by the
+end of the slice.
+
+So the count is not written down. Coverage is derived instead: an
+`include_str!("reason.rs")` scan counts the module's own `pub const`
+declarations at compile time and asserts it equals the number of rows in the
+table. **The pair is inseparable in both directions** — a constant added to
+`reason.rs` without a row fails the count instead of going unpinned and
+invisible, and a row added without a constant fails it too. A hardcoded length
+could not do the first, since `pinned` is a fixed-size array and its length
+always equals the rows written above it: the assertion would have been a
+tautology. The scan is textual and line-anchored, so it over-counts a
+`pub const`-shaped line at column zero inside a comment; that trade is
+deliberate and documented at the assertion, because every miscount it admits
+fails loudly and points at `reason.rs`.
 
 ### E. Wrong counts in the slice-5 handoff itself
 
@@ -926,11 +1382,106 @@ on before being checked:
   in `DESIGN.md` and are not a marker category in this code at all. Only the two
   compensation ids were genuinely stale, and slice 5's first task removed them.
 
+### F. Two properties of the contract suite a porter has to be told
+
+Neither is a defect and neither is a document divergence, so neither is numbered
+above. Both are things an operator or a porter will get wrong if the suite is
+handed over without them. Entry 19 records what the suite does **not cover**;
+this records two ways the coverage it does have can be misread.
+
+**Two checks are not independent, and the coupling points the wrong way.** A
+backend that selects on `window_start` where the SPI says `window_end` fails
+**both** `window-end-selection` and `quantity-round-trip`.
+`quantity_round_trip`'s read-back range is `[window_end, window_end + 1s)`,
+while each fixture's `window_start` sits an **hour** earlier
+(`quantity_fixture`, `usage-collector-sdk/src/contract/checks/quantity_round_trip.rs`).
+Such a backend therefore returns none of the five corners at all, and the
+quantities cannot be compared *at all*. The check says so — its violation reads
+*"record … was accepted by `create_usage_record` but a `list_usage_records`
+range containing its `window_end` did not return it, so its quantity could not
+be compared at all"* — but a `quantity-round-trip` failure is still the wrong
+place to start looking, and at acceptance time an operator must not read it as a
+decimal-fidelity problem. Both red means diagnose the period rule and re-run.
+Decoupling would mean changing a check file and was out of slice 6's scope; the
+coupling is a property of the fixtures, not a bug in either check.
+
+**`the_reference_backend_conforms` passing means the backend satisfies *this
+suite*, not that it is a conforming plugin.** Nothing in the suite exercises the
+SPI's keyset obligations: `InMemoryReferencePlugin` serves the canonical
+`(window_end, id)` ascending order, ignores `query.order`, and **mints no
+`next_cursor`** — all three are in its own "Stated limits", and a real plugin
+owes all three.
+
+That gap is the strongest candidate for the next check, and the reason is
+written in the gear rather than inferred here. `require_cursor_fingerprint`
+(`usage-collector/src/domain/query.rs`) says carrying `query.filter_hash` into
+`next_cursor.f` is *"the one requirement in this gear's Plugin SPI that gives an
+implementor no compiler error — a plugin written before it recompiles clean and
+paginates exactly once"*. The gear already spends a wire decode in the domain to
+diagnose it one request early (`report_unbound_next_cursor`,
+`usage-collector/src/domain/service.rs`) precisely because the compiler will not.
+**An obligation with neither a compiler backstop nor a contract check is where a
+suite is worth the most.** Recorded, not built: it is a new check plus reference
+support for minting cursors, which is a slice, not a sweep.
+
+### G. `group-by-absent-dimension` is a spec question before it is a check
+
+A second candidate check, and this one cannot be written until someone decides
+what the right answer is.
+
+`InMemoryReferencePlugin` **drops** a row with no `subject_ref` from a
+`GROUP BY subject_id` entirely — `bucket_key` returns `None` and the row joins
+no bucket — where naive SQL would collect those rows into a NULL group. The
+consequence is concrete: grouped buckets need not sum to the ungrouped total, so
+an exemplar backend and a SQL projection give **different sums** for the same
+ledger and the same query, with nothing failing.
+
+It is in the reference backend's stated limits, so it is disclosed rather than
+hidden, and no check pins it in either direction.
+
+**DESIGN says nothing about the case.** And the wire shape may already have
+decided it: `usage-collector-v1.yaml:1092`-`:1101` types every
+`AggregationBucket.key` item as a non-nullable `string`, with no null spelling
+available, so dropping may be the only answer the published response can carry.
+That is an argument, not a ruling — the alternative is a sentinel or a documented
+omission of the bucket — and it is a spec owner's to make.
+
+**Do not write the check first.** A check pins whichever answer its author
+picked, and here that would be a decision made by a test rather than by the
+contract. The order is: DESIGN states the rule, `usage-collector-v1.yaml` gains
+whatever the rule needs on `AggregationBucket.key`, then a check pins it and the
+reference backend either already conforms or is corrected.
+
 ## Evidence
 
-Three dated lines, not one. The slice-3 line is what makes entries 1-5
-checkable and the slice-4 line entries 6-11; overwriting either would strand
-them.
+Four dated lines, not one. The slice-3 line is what makes entries 1-5
+checkable, the slice-4 line entries 6-11, and the slice-5 line entries 12-16;
+overwriting any of them would strand those entries. Every line names the commit
+it was taken at, and a line that names none is not evidence — see the last
+paragraph of this section.
+
+**Slice 6 (errors and the contract gate), verified at `540dfbba0` on
+`usage-collector/implementation-change`, 2026-09-09:** **716 passed, 0
+skipped** across the three usage-collector packages, from the 701-passed /
+6-skipped baseline this slice inherited; plus **166 passed, 0 skipped** for
+`cargo nextest run -p cf-gears-usage-collector-sdk --features contract`, which
+is the DESIGN §3.3 plugin contract suite and its discrimination proofs. **The 6
+skips are gone**: they were the `#[ignore]`d OpenAPI drift tests every earlier
+line on this branch reports, and turning that gate on is what removes them —
+there is no `#[ignore]` left in the gear. `cargo check --workspace
+--all-targets` and `cargo clippy --workspace --all-targets --all-features`
+clean, `cargo +nightly fmt` a no-op; `cargo doc --no-deps` clean on
+`cf-gears-usage-collector-sdk` and the same 35 pre-existing warnings on
+`cf-gears-usage-collector`, neither count grown. `git diff --stat 9f64cf22f --
+gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/` is
+empty, so entry 16 still quotes the plugin exactly as `main` has it.
+
+Entries 17-19 and the additions to 5, 8, 9, 10 and 14 were verified against the
+branch at that commit. The sweep commit that adds them changes `DIVERGENCES.md`
+and one sentence in the governing spec under `docs/superpowers/specs/`, and no
+behaviour and no test. Slice 6 touched no file under
+`gears/system/usage-collector/docs/` either, so the quotations in 17-19 are the
+documents as slices 1-2 left them.
 
 **Slice 5 (record origin and backfill), verified at `a94d542cf` on
 `usage-collector/implementation-change`, 2026-09-09:** **701 passed, 6
@@ -986,12 +1537,19 @@ different blob hashes for it, `DESIGN.md` and `DECOMPOSITION.md` alike. So do
 not expect these line numbers, or in places these sentences, to resolve against
 `main`.
 
-**Re-verified at the branch head** after the sweep's own review found four
-accuracy defects in this file and one gap in the SPI: **648 passed, 6 skipped**,
-`cargo check --workspace --all-targets` and `cargo clippy --workspace
---all-targets --all-features` clean, `git diff --stat main --
+**Re-verified at `9e36bbf6b`** — slice 4's head, three commits after
+`531227f45`, none of which changes behaviour — after that sweep's own review
+found four accuracy defects in this file and one gap in the SPI: **648 passed, 6
+skipped**, `cargo check --workspace --all-targets` and `cargo clippy
+--workspace --all-targets --all-features` clean, `git diff --stat main --
 gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/` empty.
-The three commits after `531227f45` change no behaviour.
+
+That line read "Re-verified at the branch head" and named no commit until slice
+6 pinned it. It was true when written and false soon after — slice 5 moved the
+count to 701 and slice 6 to 716 with the skips gone — and the number was not
+simply refreshed, because an unpinned count re-breaks on the very next commit,
+which is presumably why every other line here carries one. Recorded as entry
+10's second gate gap. **Do not add an evidence line that names no commit.**
 
 Checked with `git rev-parse HEAD:<path>` against `git rev-parse main:<path>`
 rather than `git diff --quiet`, which reported the three files identical and was
