@@ -134,15 +134,30 @@ const NOT_YET_IMPLEMENTED: &[&str] = &[
 /// rather than the query string — is not this list's business either; that
 /// is [`BODY_VS_QUERY_DRIFT`].
 ///
-/// Absence is checked across *every* parameter location, not just `query`,
-/// which is deliberately stricter than the row needs: a row would expire the
-/// day the contract documented this name as a header or cookie parameter
-/// too. That direction is safe — it can only retire a row early, and
-/// [`parameters_match`] immediately catches anything the retirement exposes —
-/// whereas filtering to `query` would let a contract that documents the input
-/// in another location keep the row alive and the mismatch excused.
-/// [`body_vs_query_drift_is_really_drift`] does filter on location, for the
-/// opposite reason spelled out there.
+/// The two sides are filtered differently on purpose, because they are asked
+/// different questions.
+///
+/// On the **documented** side, absence is checked across *every* parameter
+/// location rather than just `query` — deliberately stricter than the row
+/// needs, since a row expires the day the contract documents this name as a
+/// header or cookie parameter too. That direction is safe: it can only retire
+/// a row early, and [`parameters_match`] immediately catches anything the
+/// retirement exposes. Filtering to `query` here would instead let a contract
+/// that documents the input in another location keep the row alive and the
+/// mismatch excused.
+///
+/// On the **registered** side the filter goes the other way, because the
+/// question is not "has the contract started covering this?" but "is the gear
+/// still serving the thing this row excuses?". A parameter the gear moved
+/// from the query string to a header is no longer that thing, and leaving the
+/// row to match on the name alone would go on excusing it in a location
+/// nobody chose for it — while [`parameters_match`] subtracts by name and so
+/// would not compare it either. It follows that **this list structurally
+/// excuses query parameters only**: an exemption for a header or cookie
+/// parameter cannot be added as a row here, because it would match nothing
+/// and quietly excuse nothing; the list has to grow a location column first.
+/// [`body_vs_query_drift_is_really_drift`] filters both of its sides, for the
+/// reasons spelled out there.
 ///
 /// Self-cleaning: [`undocumented_parameters_are_really_undocumented`] fails
 /// on any row whose gap has closed.
@@ -461,14 +476,15 @@ fn undocumented_parameters_are_really_undocumented() {
 
     for (key, param) in UNDOCUMENTED_PARAMETERS {
         let spec = spec_for(&registered, key);
-        let registered_names: BTreeSet<String> = registry_params(spec)
+        let registered_query: BTreeSet<String> = registry_params(spec)
             .into_iter()
+            .filter(|(_, location, _)| location == "query")
             .map(|(name, _, _)| name)
             .collect();
         assert!(
-            registered_names.contains(*param),
-            "{key}: no longer registers `{param}`, which is listed in \
-             `UNDOCUMENTED_PARAMETERS`; delete the row",
+            registered_query.contains(*param),
+            "{key}: no longer registers `{param}` as a query parameter, which \
+             is what its `UNDOCUMENTED_PARAMETERS` row excuses; delete the row",
         );
 
         let op = documented_op(&documented, "UNDOCUMENTED_PARAMETERS", key);
