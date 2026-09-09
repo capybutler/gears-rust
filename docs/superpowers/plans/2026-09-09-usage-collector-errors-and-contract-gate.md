@@ -2546,6 +2546,25 @@ though it does. Record it under entry 10 rather than as a new entry — same
 defect, same resolution, and entry 10 already says the fix is a spec decision
 plus a scheduled slice rather than an editorial pass.
 
+**Two gaps in the gate itself, to state inside the entry-10 extension rather
+than leave in code comments only:**
+
+- The cross-check that keeps a placement disagreement out of
+  `UNDOCUMENTED_PARAMETERS` **matches on the property name alone.** The
+  `$filter` row is the one case it provably cannot police, because the query
+  spelling (`$filter`) and the body spelling (`filter`) differ — re-file that
+  row into the wrong list and the suite stays green. It is correctly filed
+  today and the assertion message says so, which is the most a name-matching
+  check can do. Say it in the entry so the limit is on record outside a
+  comment.
+- **`DIVERGENCES.md:990-995` carries an unpinned evidence line** — "Re-verified
+  at the branch head … 648 passed, 6 skipped" — that, unlike the three
+  commit-pinned lines around it (`:935`, `:959`, `:975`), names no commit. It
+  was true when written and is false now; this slice alone moved the count
+  twice. Pin it to a commit or delete it. Do not simply update the number: an
+  unpinned count re-breaks on the next commit, which is why the other three
+  are pinned.
+
 **Fold into the existing entries 5 and 14, do not open a new one:** Task 2's
 rename left `docs/DECOMPOSITION.md:573` and `docs/features/usage-query.md:127,139`
 asserting `QueryAggregatedUsageRecordsRequest` is the implemented request body.
