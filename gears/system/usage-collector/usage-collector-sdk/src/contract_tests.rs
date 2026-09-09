@@ -239,7 +239,7 @@ async fn an_uninterpretable_comparison_admits_no_row_under_either_operator() {
         Box::new(compare(
             "tenant_id",
             ast::CompareOperator::Eq,
-            ast::Value::Uuid(super::CONTRACT_TENANT_ID),
+            ast::Value::Uuid(super::fixtures::CONTRACT_TENANT_ID),
         )),
         Box::new(compare(
             "resource_type",
@@ -287,17 +287,21 @@ async fn assert_not_found(
 /// The subject-less row every scope above is evaluated against.
 fn scope_probe_record() -> UsageRecord {
     CreateUsageRecord {
-        gts_type_id: MeterTypeId::new(super::CONTRACT_METER_TYPE_ID).expect("valid meter type id"),
-        tenant_id: super::CONTRACT_TENANT_ID,
-        resource_ref: ResourceRef::new(super::CONTRACT_RESOURCE_ID, super::CONTRACT_RESOURCE_TYPE)
-            .expect("valid resource reference"),
+        gts_type_id: MeterTypeId::new(super::fixtures::CONTRACT_METER_TYPE_ID)
+            .expect("valid meter type id"),
+        tenant_id: super::fixtures::CONTRACT_TENANT_ID,
+        resource_ref: ResourceRef::new(
+            super::fixtures::CONTRACT_RESOURCE_ID,
+            super::fixtures::CONTRACT_RESOURCE_TYPE,
+        )
+        .expect("valid resource reference"),
         subject_ref: None,
         metadata: std::collections::BTreeMap::new(),
         value: Decimal::ONE,
         idempotency_key: IdempotencyKey::new("scope-probe").expect("valid idempotency key"),
         invalidation: None,
-        window_start: super::FIXTURE_EPOCH,
-        window_end: super::FIXTURE_EPOCH,
+        window_start: super::fixtures::FIXTURE_EPOCH,
+        window_end: super::fixtures::FIXTURE_EPOCH,
     }
     .try_into_usage_record(RecordOrigin::Live)
     .expect("the probe fixture is projectable")
@@ -377,11 +381,11 @@ async fn an_untranslatable_node_refuses_a_caller_filter_and_excludes_a_scope() {
     let translatable = ODataQuery::new().with_filter(compare(
         "resource_id",
         ast::CompareOperator::Eq,
-        ast::Value::String(super::CONTRACT_RESOURCE_ID.to_owned()),
+        ast::Value::String(super::fixtures::CONTRACT_RESOURCE_ID.to_owned()),
     ));
     let page = plugin
         .list_usage_records(
-            MeterTypeId::new(super::CONTRACT_METER_TYPE_ID).expect("valid meter type id"),
+            MeterTypeId::new(super::fixtures::CONTRACT_METER_TYPE_ID).expect("valid meter type id"),
             range,
             &translatable,
             &[],
