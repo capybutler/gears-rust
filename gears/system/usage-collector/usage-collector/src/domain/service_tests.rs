@@ -5007,9 +5007,7 @@ mod read_path_keyset_floor_tests {
     use toolkit_gts::gts_id;
     use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page as ODataPage, SortDir};
     use toolkit_security::SecurityContext;
-    use usage_collector_sdk::{
-        MeterTypeId, UsageCollectorError, UsageCollectorPluginV1, ValidationReason,
-    };
+    use usage_collector_sdk::{MeterTypeId, UsageCollectorError, UsageCollectorPluginV1};
 
     use crate::domain::Service;
     use crate::domain::query::read_fingerprint;
@@ -5262,15 +5260,17 @@ mod read_path_keyset_floor_tests {
             .await
             .expect_err("a token bound to a non-unique keyset must be refused");
         match err {
-            UsageCollectorError::InvalidArgument { field, reason, .. } => {
-                assert_eq!(
-                    field, "cursor",
-                    "the 400 must blame the token, not an $orderby the caller \
-                     cannot send alongside a cursor",
-                );
-                assert_eq!(reason, ValidationReason::InvalidCursor);
-            }
-            other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+            // The 400 blames the token, not an `$orderby` the caller cannot
+            // send alongside a cursor — but the gear does not spell that
+            // attribution or its wire code (Spec §3.13). Both are
+            // `toolkit_odata`'s, derived from the error carried here, so
+            // this pins the carried error and `infra::sdk_error_mapping`
+            // pins the projection.
+            UsageCollectorError::CursorRejected { source, .. } => assert!(
+                matches!(source, toolkit_odata::Error::InvalidCursor),
+                "expected upstream's InvalidCursor, got {source:?}",
+            ),
+            other => panic!("expected a cursor rejection, got {other:?}"),
         }
         assert!(
             spy.last_list_order().is_none(),
@@ -5305,7 +5305,7 @@ mod read_path_cursor_fingerprint_tests {
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
         MetadataFilter, MeterTypeId, RECORD_ID_FIELD, TimeRange, UsageCollectorError,
-        UsageCollectorPluginV1, ValidationReason, WINDOW_END_FIELD,
+        UsageCollectorPluginV1, WINDOW_END_FIELD,
     };
 
     use crate::domain::Service;
@@ -5459,17 +5459,18 @@ mod read_path_cursor_fingerprint_tests {
         page_two
     }
 
+    /// The 400 blames the token rather than an `$orderby` the caller cannot
+    /// send alongside a cursor, but the gear spells neither that field nor
+    /// the wire code (Spec §3.13): both come from the `toolkit_odata` error
+    /// the refusal carries. So this pins the carried error, and
+    /// `infra::sdk_error_mapping` pins the projection onto the wire.
     fn assert_query_mismatch(err: &UsageCollectorError) {
         match err {
-            UsageCollectorError::InvalidArgument { field, reason, .. } => {
-                assert_eq!(
-                    field, "cursor",
-                    "the 400 must blame the token, not an $orderby the caller \
-                     cannot send alongside a cursor",
-                );
-                assert_eq!(*reason, ValidationReason::FilterMismatch);
-            }
-            other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+            UsageCollectorError::CursorRejected { source, .. } => assert!(
+                matches!(source, toolkit_odata::Error::FilterMismatch),
+                "expected upstream's FilterMismatch, got {source:?}",
+            ),
+            other => panic!("expected a cursor rejection, got {other:?}"),
         }
     }
 
@@ -5855,15 +5856,14 @@ mod read_path_cursor_fingerprint_tests {
             .expect_err("a token whose signed keys do not decode must be refused");
 
         match err {
-            UsageCollectorError::InvalidArgument { field, reason, .. } => {
-                assert_eq!(
-                    field, "cursor",
-                    "a malformed token blames the token, not an $orderby the \
-                     caller cannot send alongside a cursor",
-                );
-                assert_eq!(reason, ValidationReason::InvalidCursor);
-            }
-            other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+            // A malformed token blames the token, not an `$orderby` the
+            // caller cannot send alongside a cursor — an attribution
+            // `toolkit_odata` supplies, from the error carried here.
+            UsageCollectorError::CursorRejected { source, .. } => assert!(
+                matches!(source, toolkit_odata::Error::InvalidCursor),
+                "expected upstream's InvalidCursor, got {source:?}",
+            ),
+            other => panic!("expected a cursor rejection, got {other:?}"),
         }
         assert!(spy.last_list_order().is_none());
     }
@@ -5901,7 +5901,7 @@ mod read_path_cursor_fingerprint_tests {
             .await
             .expect_err("an unsound token must be refused whatever order accompanies it");
 
-        assert!(matches!(err, UsageCollectorError::InvalidArgument { .. }));
+        assert!(matches!(err, UsageCollectorError::CursorRejected { .. }));
         assert!(
             spy.last_list_order().is_none(),
             "a sound caller order MUST NOT launder an unsound token past the check",
@@ -5913,9 +5913,10 @@ mod read_path_cursor_fingerprint_tests {
         // The check order is a documented fact (`require_continuation_keyset`
         // says structure is checked before relevance) and it is
         // caller-visible: a token that is BOTH bound to an unsound keyset
-        // and minted over another query gets `INVALID_CURSOR` today and
-        // would get `FILTER_MISMATCH` if the two checks were swapped —
-        // different reason code on the wire, and a different
+        // and minted over another query carries `toolkit_odata`'s
+        // `InvalidCursor` today and would carry `FilterMismatch` if the two
+        // checks were swapped — a different reason code on the wire, since
+        // that is the value the code is derived from, and a different
         // `error_category` on `uc_query_requests_total` with it. Nothing
         // else in the suite distinguishes the order, because every other
         // cursor test is defective in exactly one way.
@@ -5944,16 +5945,13 @@ mod read_path_cursor_fingerprint_tests {
             .expect_err("a doubly-defective token must be refused");
 
         match err {
-            UsageCollectorError::InvalidArgument { field, reason, .. } => {
-                assert_eq!(field, "cursor");
-                assert_eq!(
-                    reason,
-                    ValidationReason::InvalidCursor,
-                    "the ORDER defect must be reported: it is checked first, \
-                     and a swap would silently re-label this as FILTER_MISMATCH",
-                );
-            }
-            other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+            UsageCollectorError::CursorRejected { source, .. } => assert!(
+                matches!(source, toolkit_odata::Error::InvalidCursor),
+                "the ORDER defect must be reported: it is checked first, and \
+                 a swap would silently re-label this as FilterMismatch; got \
+                 {source:?}",
+            ),
+            other => panic!("expected a cursor rejection, got {other:?}"),
         }
         assert!(spy.last_list_order().is_none());
     }

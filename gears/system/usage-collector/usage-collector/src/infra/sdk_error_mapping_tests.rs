@@ -15,7 +15,7 @@
 //! were batch-only JSON post-injections that the compaction removed. Operator
 //! triage for 503s reads the curated `detail` string instead.
 
-use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_canonical_errors::{CanonicalError, FieldViolation, InvalidArgument, Problem};
 use toolkit_gts::gts_id;
 use usage_collector_sdk::{MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError};
 use uuid::Uuid;
@@ -393,4 +393,107 @@ fn lift_record_covers_every_usage_record_surface_variant() {
             problem.status,
         );
     }
+}
+
+/// The single `field_violations` entry on an `InvalidArgument` canonical
+/// error. Panics loudly on any other shape — a cursor rejection that stopped
+/// being a field violation is the thing under test, not a reason to skip.
+fn first_field_violation(err: &CanonicalError) -> &FieldViolation {
+    match err {
+        CanonicalError::InvalidArgument {
+            ctx: InvalidArgument::FieldViolations { field_violations },
+            ..
+        } => field_violations
+            .first()
+            .expect("a cursor rejection carries one field violation"),
+        other => panic!("expected an InvalidArgument field violation, got {other:?}"),
+    }
+}
+
+/// The wire code on a cursor rejection is `toolkit_odata`'s, read from
+/// `toolkit_odata`.
+///
+/// Spec §3.13 gives the cursor codes to `toolkit_odata` because a second
+/// declaration is a second place the same code can be read and disagree.
+/// Asserting against a `"INVALID_CURSOR"` literal here would *be* that
+/// second place — the test would keep passing if upstream renamed the code,
+/// which is the exact failure the rule exists to prevent. So both sides of
+/// this assertion come from upstream, and the gear's side has to travel
+/// through the gear's own lift to get there.
+#[test]
+fn a_cursor_rejection_carries_the_upstream_wire_code() {
+    for (upstream, gear) in [
+        (
+            toolkit_odata::Error::InvalidCursor,
+            UsageCollectorError::inadmissible_cursor_keyset("mixed directions"),
+        ),
+        (
+            toolkit_odata::Error::FilterMismatch,
+            UsageCollectorError::cursor_query_mismatch(),
+        ),
+    ] {
+        let expected_owned = CanonicalError::from(upstream);
+        let expected = first_field_violation(&expected_owned);
+        let actual_owned = lift_record(gear);
+        let actual = first_field_violation(&actual_owned);
+
+        assert_eq!(
+            actual.reason, expected.reason,
+            "the gear must surface `toolkit_odata`'s reason code verbatim",
+        );
+        assert_eq!(
+            actual.field, expected.field,
+            "the gear must attribute to the same request field as upstream",
+        );
+
+        // The code and the field are upstream's; the resource scope is
+        // not, and the projection would surrender it by default —
+        // `toolkit_odata` scopes its own `InvalidArgument` to
+        // `cf.core.odata.query.v1~`. `resource_type` is the "which entity"
+        // discrimination layer `docs/usage-collector-v1.yaml` documents,
+        // and the entity here is a usage record whichever crate detected
+        // the defect. Asserted as a positive value: "not upstream's" would
+        // pass against `None`.
+        assert_eq!(
+            actual_owned.resource_type(),
+            Some(USAGE_RECORD_RESOURCE),
+            "a cursor rejection must keep the gear's resource identity, not \
+             inherit upstream's",
+        );
+        assert_ne!(
+            actual_owned.resource_type(),
+            expected_owned.resource_type(),
+            "this assertion is only meaningful while upstream scopes to a \
+             different resource; if upstream's scope changed, re-derive what \
+             the gear should advertise rather than deleting this",
+        );
+    }
+}
+
+/// The gear's own caller guidance survives the projection.
+///
+/// The point of carrying `detail` alongside the upstream error is that a
+/// caller is told how to recover; upstream's description is "invalid
+/// cursor". A positive anchor, not just a `!=`: an assertion that the
+/// description merely *differs* from upstream's would pass against an
+/// empty string.
+#[test]
+fn a_cursor_rejection_keeps_the_gear_s_recovery_guidance() {
+    let lifted = lift_record(UsageCollectorError::inadmissible_cursor_keyset(
+        "it carries no cursor",
+    ));
+    let violation = first_field_violation(&lifted);
+
+    assert!(
+        violation.description.contains("it carries no cursor"),
+        "the defect must reach the caller: got {:?}",
+        violation.description,
+    );
+    assert!(
+        violation
+            .description
+            .contains("restart pagination without a cursor"),
+        "the recovery must reach the caller: got {:?}",
+        violation.description,
+    );
 }

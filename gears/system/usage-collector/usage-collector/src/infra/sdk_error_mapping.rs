@@ -14,7 +14,7 @@
 //! every type declaration is owned by `types-registry` — so there is no
 //! catalog-shaped lift entry point any more.
 
-use toolkit_canonical_errors::{CanonicalError, Problem, resource_error};
+use toolkit_canonical_errors::{CanonicalError, InvalidArgument, Problem, resource_error};
 use usage_collector_sdk::{USAGE_RECORD_RESOURCE, UsageCollectorError};
 
 // Resource marker — the single GTS resource type this gear's canonical
@@ -98,6 +98,58 @@ fn lift_common(err: UsageCollectorError) -> CanonicalError {
             } else {
                 unrecognized_resource(&resource_type)
             }
+        }
+
+        // ---- 400 InvalidArgument, upstream-coded ----
+        // The wire `field` and `reason` come from `toolkit_odata`'s own
+        // mapping and are never spelled here (Spec §3.13). Two things are
+        // replaced, because both are the gear's:
+        //
+        // * `description` — it names which check refused and how the caller
+        //   recovers, and upstream has one string for every cursor failure.
+        // * `resource_type` — it names which *entity* the error is about,
+        //   and this one is about a usage record whichever crate detected
+        //   the defect. §3.13 takes the cursor codes away from this gear;
+        //   it says nothing about its resource identity, and surrendering
+        //   that would advertise `cf.core.odata.query.v1~` on one error
+        //   class of an endpoint whose every other error advertises
+        //   `cf.core.uc.usage_record.v1~` — a documented discrimination
+        //   layer (`docs/usage-collector-v1.yaml`, "which entity") quietly
+        //   changing value. It would also walk a resource type past the
+        //   `USAGE_RECORD_RESOURCE` invariant that every other arm here
+        //   enforces through `unrecognized_resource`.
+        E::CursorRejected { source, detail } => {
+            let mut lifted = CanonicalError::from(source);
+            if let CanonicalError::InvalidArgument {
+                ctx: InvalidArgument::FieldViolations { field_violations },
+                resource_type,
+                ..
+            } = &mut lifted
+            {
+                *resource_type = Some(USAGE_RECORD_RESOURCE.to_owned());
+                if let Some(first) = field_violations.first_mut() {
+                    first.description = detail;
+                } else {
+                    debug_assert!(
+                        false,
+                        "toolkit_odata cursor error lifted to an empty field_violations list"
+                    );
+                }
+            } else {
+                // Same posture as `unrecognized_resource`: silently
+                // shipping upstream's one-size-fits-all "invalid cursor"
+                // in place of the gear's recovery guidance, under
+                // upstream's resource type, is a regression no wire
+                // assertion downstream would catch, so break loudly in
+                // debug rather than degrade in the dark.
+                debug_assert!(
+                    false,
+                    "toolkit_odata cursor error no longer lifts to an InvalidArgument \
+                     field violation; the gear's description and resource scope were \
+                     dropped"
+                );
+            }
+            lifted
         }
 
         // ---- 404 NotFound ----

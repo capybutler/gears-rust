@@ -88,6 +88,32 @@ pub enum UsageCollectorError {
         detail: String,
     },
 
+    /// A continuation token refused by the gear, carrying the wire code
+    /// `toolkit_odata` owns.
+    ///
+    /// Spec §3.13 gives `INVALID_CURSOR`, `FILTER_MISMATCH` and
+    /// `ORDER_WITH_CURSOR` to `toolkit_odata`: the gear declares none of
+    /// them, because a second declaration is a second place the same code
+    /// can be read and disagree. `source` is the upstream error and is the
+    /// only thing that decides the wire `field` and `reason`; the host lift
+    /// obtains both by converting it.
+    ///
+    /// `detail` is the gear's own, and is why this variant carries two
+    /// things rather than one. The gear knows which of its checks refused
+    /// and how the caller recovers; upstream's description for every cursor
+    /// failure is "invalid cursor". Propagating the bare upstream error
+    /// would satisfy the naming rule by discarding the guidance, so the
+    /// code comes from upstream and the prose stays here.
+    #[error("cursor rejected [{source}]: {detail}")]
+    CursorRejected {
+        /// The upstream cursor error. Sole source of the wire `field` and
+        /// `reason`.
+        source: toolkit_odata::Error,
+        /// Gear-authored caller guidance, rendered as the violation
+        /// description.
+        detail: String,
+    },
+
     /// Referenced resource not found (HTTP 404). `resource_type` is the GTS
     /// type, `name` the raw identifier (a `gts_type_id` or a record UUID).
     #[error("not found [{resource_type}]: {detail}")]
@@ -525,9 +551,14 @@ impl UsageCollectorError {
     /// did not come from a conforming plugin. Appending a missing key would
     /// leave the order wider than the boundary values the token carries and
     /// hand the plugin a misaligned continuation — a silently wrong page,
-    /// where refusing is merely a refused one. Attributed to `cursor`, the
-    /// parameter the caller actually supplied, with `INVALID_CURSOR` — the
-    /// same field and code `toolkit_odata`'s own decode failures use.
+    /// where refusing is merely a refused one.
+    ///
+    /// The field and the wire code are not chosen here. This carries
+    /// `toolkit_odata`'s own `InvalidCursor`, and the host lift converts it
+    /// to obtain both — so the attribution to `cursor` and the code the
+    /// caller reads are upstream's decode failures' attribution and code by
+    /// construction, not by a matching pair of declarations that could
+    /// drift apart (Spec §3.13).
     ///
     /// The detail names the defect and the recovery, and deliberately does
     /// not blame a component: a token can be forged, truncated or replayed
@@ -537,11 +568,8 @@ impl UsageCollectorError {
     #[must_use]
     pub fn inadmissible_cursor_keyset(defect: impl Into<String>) -> Self {
         let defect = defect.into();
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "cursor".to_owned(),
-            reason: ValidationReason::InvalidCursor,
+        Self::CursorRejected {
+            source: toolkit_odata::Error::InvalidCursor,
             detail: format!(
                 "the cursor's bound order is not a usable keyset ({defect}); \
                  restart pagination without a cursor"
@@ -563,23 +591,21 @@ impl UsageCollectorError {
     /// same cursor against a different meter, range or metadata filter and
     /// be served.
     ///
-    /// Attributed to `cursor` with `FILTER_MISMATCH` — the code
-    /// `usage-collector-v1.yaml` already enumerates for that parameter, and
-    /// the one `toolkit_odata`'s own filter-hash comparison emits, because
-    /// a changed range, meter or metadata filter is a changed query from
-    /// the caller's side. Minting a new code per typed parameter would
-    /// split one caller-visible condition across four.
+    /// This carries `toolkit_odata`'s own `FilterMismatch`, and the host
+    /// lift converts it to obtain the wire field and code; the gear spells
+    /// neither (Spec §3.13). Reusing upstream's filter-hash comparison
+    /// rather than minting a gear code is also the right classification: a
+    /// changed range, meter or metadata filter is a changed query from the
+    /// caller's side, and a new code per typed parameter would split one
+    /// caller-visible condition across four.
     ///
     /// The detail names the recovery rather than the mismatching value: the
     /// fingerprint is opaque and a caller can do nothing with either half
     /// of the comparison.
     #[must_use]
     pub fn cursor_query_mismatch() -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "cursor".to_owned(),
-            reason: ValidationReason::FilterMismatch,
+        Self::CursorRejected {
+            source: toolkit_odata::Error::FilterMismatch,
             detail: "the cursor was minted over a different query: continue a page by \
                      resending the same request, cursor apart, or restart pagination \
                      without a cursor. The cursor binds `gts_type_id`, the `from` / \

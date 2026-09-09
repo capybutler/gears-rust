@@ -849,20 +849,23 @@ fn continuation_ordered_by(keys: &[(&str, SortDir)]) -> ODataQuery {
     continuation_bound_to(&query_ordered_by(keys).order)
 }
 
-/// Assert `err` blames `cursor` — the parameter a continuation request
-/// actually carries — with the wire code the contract enumerates for a
-/// refused token. Blaming `$orderby` here would name a parameter the
-/// caller cannot send alongside a cursor.
+/// Assert `err` is a structural continuation refusal.
+///
+/// The wire code and the `cursor` attribution are `toolkit_odata`'s (Spec
+/// §3.13) and are asserted where the projection happens, in
+/// `infra::sdk_error_mapping`; what this pins is that the refusal carries
+/// upstream's `InvalidCursor` rather than the query-relevance error, since
+/// only that choice decides which code the caller reads. Blaming
+/// `$orderby` would name a parameter the caller cannot send alongside a
+/// cursor, and upstream's `InvalidCursor` cannot.
 fn assert_cursor_rejection(err: UsageCollectorError) {
     match err {
-        UsageCollectorError::InvalidArgument { field, reason, .. } => {
-            assert_eq!(
-                field, "cursor",
-                "a continuation defect must blame the token"
-            );
-            assert_eq!(reason, ValidationReason::InvalidCursor);
-        }
-        other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+        UsageCollectorError::CursorRejected { source, .. } => assert!(
+            matches!(source, toolkit_odata::Error::InvalidCursor),
+            "a structural continuation defect must carry upstream's \
+             InvalidCursor, got {source:?}",
+        ),
+        other => panic!("expected a cursor rejection, got {other:?}"),
     }
 }
 
@@ -1113,18 +1116,20 @@ fn a_cursor_carrying_no_fingerprint_at_all_is_refused() {
     assert_query_mismatch_rejection(err);
 }
 
-/// Assert `err` blames `cursor` with the code the contract enumerates for
-/// a token minted over a different query. `FILTER_MISMATCH` rather than
-/// `INVALID_CURSOR`: the token is structurally fine, it just belongs to
-/// another query — and a changed range is a changed query from the
-/// caller's side.
+/// Assert `err` is a relevance refusal, not a structural one: the token is
+/// structurally fine, it just belongs to another query — and a changed
+/// range is a changed query from the caller's side. The gear spells neither
+/// code (Spec §3.13), so the distinction is pinned on the upstream
+/// `toolkit_odata` error the refusal carries, which is the value the wire
+/// code is derived from.
 fn assert_query_mismatch_rejection(err: UsageCollectorError) {
     match err {
-        UsageCollectorError::InvalidArgument { field, reason, .. } => {
-            assert_eq!(field, "cursor");
-            assert_eq!(reason, ValidationReason::FilterMismatch);
-        }
-        other => panic!("expected InvalidArgument on cursor, got {other:?}"),
+        UsageCollectorError::CursorRejected { source, .. } => assert!(
+            matches!(source, toolkit_odata::Error::FilterMismatch),
+            "a token minted over another query must carry upstream's \
+             FilterMismatch, got {source:?}",
+        ),
+        other => panic!("expected a cursor rejection, got {other:?}"),
     }
 }
 

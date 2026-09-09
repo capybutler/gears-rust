@@ -364,7 +364,9 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
 /// service, by [`require_cursor_fingerprint`], and the REST edge passes
 /// `toolkit_odata::validate_cursor_against` no filter hash at all — so this
 /// seam is now the only place that category can arise, and it is emitted
-/// here. A PDP-transport failure and a plugin fault both surface as
+/// here. Which of the two cursor categories is emitted is read off the
+/// `toolkit_odata` error the refusal carries, not off any code this gear
+/// declares (Spec §3.13). A PDP-transport failure and a plugin fault both surface as
 /// `ServiceUnavailable` at this seam and both map to `plugin_error`; the
 /// authoritative PDP-unavailability signal is the foundation-owned
 /// `uc_pdp_failures_total`.
@@ -379,55 +381,39 @@ fn classify_query_result<T>(
         Err(UsageCollectorError::NotFound { .. }) => {
             (RequestOutcome::Error, QueryErrorCategory::UnknownUsageType)
         }
-        // `InvalidArgument` covers two unrelated conditions on the query
-        // path, so it discriminates on the typed reason rather than
-        // collapsing both into one label.
+        // A cursor rejection is a continuation refused, and the two
+        // conditions behind it do not share a label. The discriminator is
+        // the upstream `toolkit_odata` error the variant carries — the gear
+        // declares no cursor code of its own (Spec §3.13), so the category
+        // is read off the same value that decides the wire code.
         //
-        // `FILTER_MISMATCH` is a continuation refused because the cursor
-        // was minted over a different query: not a budget or surface
-        // rejection at all, and it has its own category. Everything else
-        // is a query-surface rejection — a `$filter` naming a reserved
-        // field, an undeclared `group_by` / `metadata_filter` key, an
-        // over-cap aggregate result, or an `$orderby` that cannot be
-        // floored into a keyset (mixed directions, or a non-mandatory
-        // key), the last of which became reachable here when the keyset
-        // floor moved into the domain.
-        //
-        // One known imprecision, inherited rather than introduced: a
-        // continuation whose bound ORDER is not a keyset arrives as
-        // `INVALID_CURSOR` and folds into `query_budget` too, which it is
-        // not either. Neither `cursor_decode` (a decode failure, genuinely
-        // edge-only) nor `order_mismatch` (a caller `$orderby` against the
-        // token, which the extractor rejects upstream) describes it, so it
-        // needs a category the label vocabulary does not yet carry.
+        // `FilterMismatch` is a cursor minted over a different query: not a
+        // budget or surface rejection at all, and it has its own category.
+        Err(UsageCollectorError::CursorRejected { source, .. }) => match source {
+            toolkit_odata::Error::FilterMismatch => {
+                (RequestOutcome::Error, QueryErrorCategory::FilterMismatch)
+            }
+            // Everything else this gear raises as a cursor rejection is an
+            // `INVALID_CURSOR`, which folds into `query_budget`. That is the
+            // one known imprecision on this seam and it is inherited, not
+            // introduced here: a continuation whose bound order is not a
+            // keyset is not a budget rejection either. Left as it was so the
+            // vocabulary pass does not silently move an operator's series.
+            _ => (RequestOutcome::Error, QueryErrorCategory::QueryBudget),
+        },
+        // Everything else that reaches here is a query-surface rejection —
+        // a `$filter` naming a reserved field, an undeclared `group_by` /
+        // `metadata_filter` key, an over-cap aggregate result, or an
+        // `$orderby` that cannot be floored into a keyset (mixed
+        // directions, or a non-mandatory key), the last of which became
+        // reachable here when the keyset floor moved into the domain.
         //
         // The mandatory range cannot land here at all — it is validated
         // where the typed parameter is parsed, at the edge, before the
         // service is entered.
-        Err(UsageCollectorError::InvalidArgument { reason, .. }) => (
-            RequestOutcome::Error,
-            // `expect` rather than `allow`: the duplicate arm below is a
-            // placeholder for a category the label vocabulary does not
-            // carry yet, so when one is added and the bodies diverge, the
-            // lint stops firing and this attribute becomes an unfulfilled
-            // expectation the compiler reports. It removes itself.
-            #[expect(
-                clippy::match_same_arms,
-                reason = "the InvalidCursor arm is deliberately explicit; see below"
-            )]
-            match reason {
-                ValidationReason::FilterMismatch => QueryErrorCategory::FilterMismatch,
-                // Named where the mapping lives rather than only in the
-                // prose above: a continuation whose bound ORDER is not a
-                // keyset is not a scan-scope rejection either, but neither
-                // `cursor_decode` (a decode failure, genuinely edge-only)
-                // nor `order_mismatch` (a caller `$orderby` against the
-                // token, rejected upstream by the extractor) describes it,
-                // so it folds in here for want of a category that does.
-                ValidationReason::InvalidCursor => QueryErrorCategory::QueryBudget,
-                _ => QueryErrorCategory::QueryBudget,
-            },
-        ),
+        Err(UsageCollectorError::InvalidArgument { .. }) => {
+            (RequestOutcome::Error, QueryErrorCategory::QueryBudget)
+        }
         Err(_) => (RequestOutcome::Error, QueryErrorCategory::PluginError),
     }
 }
@@ -1868,14 +1854,15 @@ impl Service {
     ///   reserved field, `metadata_filter` names an undeclared metadata
     ///   key, or the caller's order is not floorable into a sound keyset
     ///   (mixed sort directions, or a key that is not a mandatory record
-    ///   attribute) — and, on a cursor request, when the order the token
-    ///   was minted under is not one a conforming plugin could have
-    ///   produced, or the token was minted over a different query than the
-    ///   request carrying it — a different `$filter`, `gts_type_id`, range
-    ///   or `metadata_filter`. A malformed range cannot
-    ///   surface here: `time_range` arrives
-    ///   already validated, because [`TimeRange`] has no public fields and
-    ///   `TimeRange::new` is its only constructor.
+    ///   attribute). A malformed range cannot surface here: `time_range`
+    ///   arrives already validated, because [`TimeRange`] has no public
+    ///   fields and `TimeRange::new` is its only constructor.
+    /// * [`UsageCollectorError::CursorRejected`] on a cursor request, when
+    ///   the order the token was minted under is not one a conforming
+    ///   plugin could have produced, or the token was minted over a
+    ///   different query than the request carrying it — a different
+    ///   `$filter`, `gts_type_id`, range or `metadata_filter`. Both carry a
+    ///   wire code `toolkit_odata` owns rather than one this gear defines.
     /// * Any other [`UsageCollectorError`] variant lifted from a plugin
     ///   transport / persistence failure.
     // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-raw:p1

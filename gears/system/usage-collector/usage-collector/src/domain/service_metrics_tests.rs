@@ -1233,20 +1233,23 @@ fn classify_record_error_maps_each_arm() {
             RecordErrorCategory::MetadataSize,
         ),
         // The `InvalidArgument` catch-all, held by a live reason rather than
-        // by prose. Seven reasons reach it from a constructor in this
-        // workspace — `Validation`, `InvalidCursor`, `FilterMismatch`,
-        // `InvalidBaseGtsId`, `AggregationResultTooLarge`, `FutureWindow`
-        // and `PastWindow` — and `InvalidCursor` stands for all seven; the
-        // last two are the covered-period bounds, which DESIGN §3.11.5
-        // assigns to a `validation` category the gear does not emit (see
-        // `DIVERGENCES.md` entry 9). `SemanticsViolation` is NOT
-        // among them: the variant is reserved and no constructor produces
-        // it (see `usage_collector_sdk::reason`). Without a case here a
-        // mutation of that arm passes, because every other
-        // `InvalidArgument` row names a reason the match handles
-        // explicitly.
+        // by prose. Five reasons reach it from a constructor in this
+        // workspace — `Validation`, `InvalidBaseGtsId`,
+        // `AggregationResultTooLarge`, `FutureWindow` and `PastWindow` —
+        // and `Validation` stands for all five; the last two are the
+        // covered-period bounds, which DESIGN §3.11.5 assigns to a
+        // `validation` category the gear does not emit (see
+        // `DIVERGENCES.md` entry 9). The two cursor reasons used to be on
+        // this list and are not any more: a refused continuation is a
+        // `CursorRejected` carrying `toolkit_odata`'s error (Spec §3.13),
+        // and it cannot reach the record path in the first place.
+        // `SemanticsViolation` is NOT among them: the variant is reserved
+        // and no constructor produces it (see
+        // `usage_collector_sdk::reason`). Without a case here a mutation of
+        // that arm passes, because every other `InvalidArgument` row names
+        // a reason the match handles explicitly.
         (
-            UsageCollectorError::inadmissible_cursor_keyset("mixed directions"),
+            UsageCollectorError::invalid_batch_size(0, 1, 1000),
             RecordErrorCategory::SemanticsViolation,
         ),
         // The three typed invalidation rejections carry their own category
@@ -1310,27 +1313,37 @@ fn classify_query_result_maps_each_arm() {
             Err(unresolved_type_not_found()),
             (RequestOutcome::Error, QueryErrorCategory::UnknownUsageType),
         ),
-        // `InvalidArgument` splits on the typed reason. The over-cap
-        // aggregate result stands in for the query-budget / query-surface
-        // family: a `$filter` naming a reserved field, an undeclared
-        // `group_by` / `metadata_filter` key, or this. The mandatory read
-        // range never lands here at all — it is validated at the edge,
-        // where the typed parameter is parsed, before the service is
-        // entered.
+        // Every `InvalidArgument` is one category. The over-cap aggregate
+        // result stands in for the query-budget / query-surface family: a
+        // `$filter` naming a reserved field, an undeclared `group_by` /
+        // `metadata_filter` key, or this. The mandatory read range never
+        // lands here at all — it is validated at the edge, where the typed
+        // parameter is parsed, before the service is entered.
         (
             Err(UsageCollectorError::aggregation_result_too_large(
                 usage_collector_sdk::MAX_AGGREGATION_BUCKETS,
             )),
             (RequestOutcome::Error, QueryErrorCategory::QueryBudget),
         ),
-        // The other arm, and the reason the classifier reads the reason at
-        // all: a continuation refused because its cursor was minted over a
+        // The other arm, and the reason the classifier reads the upstream
+        // `toolkit_odata` error a `CursorRejected` carries at all: a
+        // continuation refused because its cursor was minted over a
         // different query is not a budget rejection, so collapsing both
         // onto `query_budget` would make the metric unable to tell a
         // caller paging wrongly from a caller scanning too widely.
         (
             Err(UsageCollectorError::cursor_query_mismatch()),
             (RequestOutcome::Error, QueryErrorCategory::FilterMismatch),
+        ),
+        // The same variant's other arm, which folds into `query_budget`
+        // for want of a category that fits — the one known imprecision on
+        // this seam, pinned here so a vocabulary pass has to move it
+        // deliberately rather than by accident.
+        (
+            Err(UsageCollectorError::inadmissible_cursor_keyset(
+                "mixed directions",
+            )),
+            (RequestOutcome::Error, QueryErrorCategory::QueryBudget),
         ),
         (
             Err(UsageCollectorError::internal("boom")),

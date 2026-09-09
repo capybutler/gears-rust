@@ -337,17 +337,21 @@ pub(crate) fn establish_keyset_order(query: &mut ODataQuery) -> Result<(), Usage
 /// 3. [`require_cursor_fingerprint`] refuses a token minted over a
 ///    different query.
 ///
-/// They stay separate functions, each with its own reason code and its own
-/// tests, because they are actionable differently: 2 says the token is
-/// structurally unusable (`INVALID_CURSOR`), 3 says it belongs to another
-/// query (`FILTER_MISMATCH`). Structure before relevance, and binding
-/// before both — a rule about the order cannot be applied to an order that
-/// has not been established yet.
+/// They stay separate functions, each with its own upstream error and its
+/// own tests, because they are actionable differently: 2 says the token is
+/// structurally unusable, 3 says it belongs to another query. Structure
+/// before relevance, and binding before both — a rule about the order
+/// cannot be applied to an order that has not been established yet.
+///
+/// The gear declares neither wire code. Each refusal carries the
+/// `toolkit_odata` error that owns it — `InvalidCursor` for structure,
+/// `FilterMismatch` for relevance — and the host lift converts that error
+/// to obtain the field and the code the caller reads (Spec §3.13).
 ///
 /// # Errors
 ///
-/// Returns [`UsageCollectorError::InvalidArgument`] against `cursor` from
-/// whichever rule refuses first.
+/// Returns [`UsageCollectorError::CursorRejected`] from whichever rule
+/// refuses first.
 pub(crate) fn admit_continuation(
     query: &mut ODataQuery,
     fingerprint: &str,
@@ -390,12 +394,14 @@ pub(crate) fn admit_continuation(
 ///
 /// # Errors
 ///
-/// Returns [`UsageCollectorError::InvalidArgument`] against `cursor`, with
-/// `INVALID_CURSOR`, when the token's signed-token payload does not decode
-/// into a non-empty order. That is a malformed token — the same class as a
-/// truncated or forged one — so it is refused in the cursor's own
-/// vocabulary rather than surfacing as an `$orderby` complaint about a
-/// parameter the caller cannot send alongside a cursor.
+/// Returns [`UsageCollectorError::CursorRejected`] carrying
+/// `toolkit_odata`'s `InvalidCursor` when the token's signed-token payload
+/// does not decode into a non-empty order. That is a malformed token — the
+/// same class as a truncated or forged one — so it is refused in the
+/// cursor's own vocabulary, upstream's, rather than surfacing as an
+/// `$orderby` complaint about a parameter the caller cannot send alongside
+/// a cursor. The wire field and code follow from that upstream error and
+/// are not spelled by this gear (Spec §3.13).
 fn bind_continuation_order(query: &mut ODataQuery) -> Result<(), UsageCollectorError> {
     let Some(cursor) = query.cursor.as_ref() else {
         return Ok(());
@@ -451,10 +457,11 @@ fn bind_continuation_order(query: &mut ODataQuery) -> Result<(), UsageCollectorE
 ///
 /// # Errors
 ///
-/// Returns [`UsageCollectorError::InvalidArgument`] against `cursor`, with
-/// `INVALID_CURSOR`, when the order mixes sort directions, names a key
-/// that is not a mandatory record attribute, or does not already name every
-/// [`CANONICAL_KEYSET_FIELDS`] entry.
+/// Returns [`UsageCollectorError::CursorRejected`] carrying
+/// `toolkit_odata`'s `InvalidCursor` — the sole source of the wire field
+/// and code (Spec §3.13) — when the order mixes sort directions, names a
+/// key that is not a mandatory record attribute, or does not already name
+/// every [`CANONICAL_KEYSET_FIELDS`] entry.
 pub(crate) fn require_continuation_keyset(query: &ODataQuery) -> Result<(), UsageCollectorError> {
     let defect = match keyset_defect(&query.order) {
         Some(KeysetDefect::MixedDirection(field)) => {
@@ -675,15 +682,16 @@ fn push_fingerprint_field(out: &mut String, field: &str) {
 /// Separate from [`require_continuation_keyset`] because the two answer
 /// different questions about the same token and are actionable differently:
 /// that one asks whether the token's order could be a keyset at all
-/// (structure, `INVALID_CURSOR`), this one whether the token belongs to
-/// this query (relevance, `FILTER_MISMATCH`). Both run on the continuation
-/// branch, structure first.
+/// (structure, `toolkit_odata`'s `InvalidCursor`), this one whether the
+/// token belongs to this query (relevance, its `FilterMismatch`). Both run
+/// on the continuation branch, structure first.
 ///
 /// # Errors
 ///
-/// Returns [`UsageCollectorError::InvalidArgument`] against `cursor`, with
-/// `FILTER_MISMATCH`, when the token carries no fingerprint or a different
-/// one.
+/// Returns [`UsageCollectorError::CursorRejected`] carrying
+/// `toolkit_odata`'s `FilterMismatch` — the sole source of the wire field
+/// and code (Spec §3.13) — when the token carries no fingerprint or a
+/// different one.
 pub(crate) fn require_cursor_fingerprint(
     cursor: &CursorV1,
     fingerprint: &str,

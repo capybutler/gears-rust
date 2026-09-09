@@ -212,8 +212,11 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// follow-up request back with the order decoded from those signed
     /// tokens and requires it to be a sound keyset: non-empty, one
     /// direction, never-null keys, and naming both canonical fields. A
-    /// token bound to anything else is refused as `INVALID_CURSOR` and the
-    /// caller cannot continue, so minting against a different order breaks
+    /// token bound to anything else is refused with `toolkit_odata`'s
+    /// `InvalidCursor`, which the gateway propagates rather than restates —
+    /// the caller reads `INVALID_CURSOR` because upstream declares it, not
+    /// because this gear does (Spec §3.13). The caller then cannot
+    /// continue, so minting against a different order breaks
     /// pagination for the plugin's own pages. The gateway cannot repair it
     /// instead of refusing: appending a key would leave the order wider
     /// than the boundary values the token carries, which is a silently
@@ -241,7 +244,9 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// none of which is a `$filter` conjunct, so a hash of `$filter` alone
     /// would cover none of them. The gateway recomputes the same string
     /// from the follow-up request and refuses a token carrying a different
-    /// one, or none, as `FILTER_MISMATCH` against `cursor`. A plugin that
+    /// one, or none, with `toolkit_odata`'s `FilterMismatch` — which is
+    /// what the caller reads as `FILTER_MISMATCH` against `cursor`. A
+    /// plugin that
     /// dropped or recomputed it would therefore break pagination for its
     /// own pages, and it MUST NOT interpret the value: it is opaque, and
     /// its shape is the gateway's to change.
