@@ -503,43 +503,43 @@ cd /Users/binarycode/code/virtuozzo/gears-rust/gears/system/usage-collector
 grep -rn 'QueryAggregatedUsageRecordsRequest' --include='*.rs' usage-collector/src
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Capture the red — from real state, not a new unit test**
 
-Add to `usage-collector/src/api/rest/dto_tests.rs`:
+**Do not write a `std::any::type_name::<AggregationRequestDto>()` assertion.**
+It would pass the moment the type compiles, which makes it a tautology: there is
+no mutation to production code that reddens it without also failing the build.
+The property under test is not "a Rust type has a name" — it is "the OpenAPI
+component the registry publishes equals the one the contract declares", and that
+comparison already exists in the drift suite. Task 3 turns it on permanently;
+this task uses it as the red.
 
-```rust
-/// The aggregate path's request component must carry the name the published
-/// contract declares.
-///
-/// `docs/usage-collector-v1.yaml` names it `AggregationRequest`; the drift
-/// suite compares the registered component name minus any `Dto` suffix. A
-/// mismatch here is not cosmetic: a client generated from the contract
-/// names one type and `/cf/openapi.json` advertises another, and the two
-/// documents disagree about the same request body.
-#[test]
-fn the_aggregate_request_dto_is_named_for_its_contract_component() {
-    assert_eq!(
-        std::any::type_name::<super::AggregationRequestDto>()
-            .rsplit("::")
-            .next(),
-        Some("AggregationRequestDto"),
-        "the aggregate request DTO must be `AggregationRequestDto`, so the \
-         registered component reads `AggregationRequest` — the name \
-         usage-collector-v1.yaml declares",
-    );
-}
-```
-
-- [ ] **Step 3: Run it to verify it fails**
+Record the current failures verbatim — you will assert against these exact
+strings in Step 5:
 
 ```bash
-cargo nextest run -p cf-gears-usage-collector -E 'test(the_aggregate_request_dto_is_named)'
+cargo nextest run -p cf-gears-usage-collector --run-ignored all \
+  -E 'test(openapi_contract_tests)' --no-fail-fast 2>&1 | grep -A6 'panicked at'
 ```
 
-Expected: FAIL to **compile** — `cannot find type AggregationRequestDto`. A
-compile failure is the correct red here: the type does not exist yet.
+Two of the six failures must name the DTO. Expect, in substance:
 
-- [ ] **Step 4: Rename**
+```
+body_schemas_match ... POST /usage-collector/v1/records/aggregate: request body
+mismatch (media type, `required`, schema)
+  left: Some(("application/json", true, "AggregationRequest"))
+ right: Some(("application/json", true, "QueryAggregatedUsageRecordsRequest"))
+```
+
+```
+every_registered_component_is_documented ... the runtime document publishes
+components the contract does not declare: ["QueryAggregatedUsageRecordsRequest"]
+```
+
+**Paste both into your report before changing anything.** If either does not
+appear, stop and report — the premise of this task has moved and the rename may
+no longer be the right fix.
+
+- [ ] **Step 3: Rename**
 
 In `usage-collector/src/api/rest/dto.rs`, rename the struct and its inherent
 `impl`, and update the doc comment so it states the relationship rather than
@@ -560,25 +560,35 @@ Then rename every reference found in Step 1. Do it explicitly, file by file — 
 **not** run a repository-wide `sed`, because `docs/`, `DIVERGENCES.md` and this
 plan all mention the old name in prose where it is still correct as history.
 
-- [ ] **Step 5: Run the test and the drift suite**
-
-```bash
-cargo nextest run -p cf-gears-usage-collector -E 'test(the_aggregate_request_dto_is_named)'
-```
-
-Expected: PASS.
+- [ ] **Step 4: Confirm the red went green**
 
 ```bash
 cargo nextest run -p cf-gears-usage-collector --run-ignored all \
-  -E 'test(openapi_contract_tests)' --no-fail-fast 2>&1 | tail -20
+  -E 'test(openapi_contract_tests)' --no-fail-fast 2>&1 | grep -A6 'panicked at'
 ```
 
-Expected: still 6 failures, **but the two whose message named
-`QueryAggregatedUsageRecordsRequest` now fail on the `/feed` cause instead.**
-Read the messages and confirm that specific change — the count alone does not
-show it, because all six were already failing.
+Expected: **still 6 failures — the count does not move, and that is not the
+signal.** All six were already failing on the `/feed` cause, which this task does
+not touch. The signal is that **neither `AggregationRequest` nor
+`QueryAggregatedUsageRecordsRequest` appears anywhere in the output any more**:
+`body_schemas_match` and `every_registered_component_is_documented` now fail on
+`/feed` like the other four.
 
-- [ ] **Step 6: Commit**
+```bash
+cargo nextest run -p cf-gears-usage-collector --run-ignored all \
+  -E 'test(openapi_contract_tests)' --no-fail-fast 2>&1 \
+  | grep -c 'AggregationRequest'
+```
+
+Expected: `0`. Report that number and the two before/after failure messages.
+
+Then confirm nothing else broke:
+
+```bash
+cargo nextest run -p cf-gears-usage-collector --no-fail-fast
+```
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add gears/system/usage-collector/usage-collector/src/api/rest/
