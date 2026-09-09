@@ -366,12 +366,16 @@ impl TryFrom<TimeRangeDto> for TimeRange {
 /// Request body for `POST /usage-collector/v1/records/aggregate`.
 ///
 /// Named for the `AggregationRequest` component in
-/// `docs/usage-collector-v1.yaml`, whose field set it mirrors. It carries no
-/// `Dto` suffix deliberately: the suffix elsewhere in this module
-/// disambiguates a DTO from an SDK type of the same bare name, and there is
-/// no `AggregationRequest` in `usage_collector_sdk` to collide with — so the
-/// published component name and the contract's are the same string, with
-/// nothing to reconcile.
+/// `docs/usage-collector-v1.yaml`. It carries no `Dto` suffix: the suffix on
+/// `UsageRecordDto`, `TimeRangeDto` and their siblings disambiguates a DTO
+/// from an SDK type of the same bare name that this module imports, and
+/// there is no `AggregationRequest` in `usage_collector_sdk` to collide
+/// with — so the published component name and the contract's are the same
+/// string, with nothing to reconcile.
+///
+/// It does **not** mirror that component's field set, and deliberately so:
+/// the contract declares five properties and this carries two. The next
+/// paragraph says which, and why the other three are query parameters.
 ///
 /// Carries the mandatory `time_range` and the group-by dimensions; the
 /// typed `gts_type_id`, the `OData` `$filter`, and the `metadata.<key>`
