@@ -497,19 +497,43 @@ cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
 grep -rn 'deactivate' --include='*.rs' .
 ```
 
-Every hit is a test or a doc reference to a method that no longer exists.
-Delete each, and **report per test whether it was deleted because its question
-no longer exists or because it failed.** All of these should be the former; if
-any is the latter, stop and say so.
+**Not every hit is a deletion.** Sort them into three piles and say which pile
+each went in:
+
+1. **Delete** — the trait method, the adapter method, the store impl, the
+   metric and its recorder, and every test whose subject is one of those. For
+   each, report whether it was deleted "because its question no longer exists"
+   or "because it failed". All should be the former; if any is the latter, stop
+   and say so.
+2. **Re-point** — `src/config.rs:79` and `src/infra/storage/pool.rs:69`. The
+   lock-timeout guidance around the example is still true and load-bearing.
+   Swap the dead `SELECT … FOR UPDATE` example for a live statement; do not
+   delete the paragraph.
+3. **Leave** — anything belonging to a later task. Say what you left and why.
 
 - [ ] **Step 5: Verify**
 
 ```bash
-cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
-grep -rn 'deactivate' --include='*.rs' . ; echo "exit=$?"
+grep -rn 'deactivate' \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/
 ```
 
-Expected: no output, `exit=1`.
+**Expected: a small number of hits, not zero.** The re-pointed doc comments in
+`config.rs` and `pool.rs` may still name the concept if that reads better than
+a contrived substitute — what must be gone is every *executable* reference and
+every metric.
+
+**Do not delete anything merely to make this grep return empty.** Task 1 shows
+what that pressure produces: a live assertion deleted because a sweep wanted a
+clean result. Confirm instead that no surviving hit is code:
+
+```bash
+grep -rn 'deactivate' \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/ \
+  | grep -v '^\s*//' | grep -v '///'
+```
+
+Then read what that leaves and account for each line in your report.
 
 - [ ] **Step 6: Commit**
 
