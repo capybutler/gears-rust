@@ -14,7 +14,9 @@
 //! every type declaration is owned by `types-registry` — so there is no
 //! catalog-shaped lift entry point any more.
 
-use toolkit_canonical_errors::{CanonicalError, InvalidArgument, Problem, resource_error};
+use toolkit_canonical_errors::{
+    CanonicalError, FieldViolation, InvalidArgument as InvalidArgumentCtx, Problem, resource_error,
+};
 use usage_collector_sdk::{USAGE_RECORD_RESOURCE, UsageCollectorError};
 
 // Resource marker — the single GTS resource type this gear's canonical
@@ -61,6 +63,20 @@ fn unrecognized_resource(resource_type: &str) -> CanonicalError {
     CanonicalError::internal(format!("unrecognized resource_type: {resource_type}")).create()
 }
 
+/// The `field_violations` a canonical `InvalidArgument` carries, or `None`
+/// when the error is any other shape. Borrowing rather than destructuring at
+/// the call site keeps the cursor arm free to hand back the untouched
+/// upstream value on the paths it cannot project.
+fn upstream_field_violations(err: &CanonicalError) -> Option<&[FieldViolation]> {
+    match err {
+        CanonicalError::InvalidArgument {
+            ctx: InvalidArgumentCtx::FieldViolations { field_violations },
+            ..
+        } => Some(field_violations),
+        _ => None,
+    }
+}
+
 /// Surface-independent lift for every non-`PermissionDenied` category. The
 /// `resource_type` carried on the variant selects the GTS resource marker;
 /// the typed `reason` / `field` ride straight onto the canonical envelope
@@ -102,54 +118,71 @@ fn lift_common(err: UsageCollectorError) -> CanonicalError {
 
         // ---- 400 InvalidArgument, upstream-coded ----
         // The wire `field` and `reason` come from `toolkit_odata`'s own
-        // mapping and are never spelled here (Spec §3.13). Two things are
-        // replaced, because both are the gear's:
+        // mapping and are never spelled here (Spec §3.13). This arm reads
+        // them off upstream's canonical error and rebuilds through the same
+        // `UsageRecordResource::invalid_argument()` builder every other 400
+        // here goes through, rather than editing the value upstream built:
+        // the `USAGE_RECORD_RESOURCE` scope is then enforced in one place,
+        // by construction, instead of being written back afterwards.
         //
-        // * `description` — it names which check refused and how the caller
-        //   recovers, and upstream has one string for every cursor failure.
-        // * `resource_type` — it names which *entity* the error is about,
-        //   and this one is about a usage record whichever crate detected
-        //   the defect. §3.13 takes the cursor codes away from this gear;
-        //   it says nothing about its resource identity, and surrendering
-        //   that would advertise `cf.core.odata.query.v1~` on one error
-        //   class of an endpoint whose every other error advertises
-        //   `cf.core.uc.usage_record.v1~` — a documented discrimination
-        //   layer (`docs/usage-collector-v1.yaml`, "which entity") quietly
-        //   changing value. It would also walk a resource type past the
-        //   `USAGE_RECORD_RESOURCE` invariant that every other arm here
-        //   enforces through `unrecognized_resource`.
+        // Two halves stay the gear's:
+        //
+        // * `description` — upstream's descriptions name the condition but
+        //   not the recovery. `FilterMismatch` renders as "Filter mismatch
+        //   between cursor and query", which tells a caller nothing about
+        //   resending the query; the gear's names which check refused and
+        //   how to get moving again.
+        // * the resource scope — `resource_type` names which *entity* the
+        //   error is about, and this one is about a usage record whichever
+        //   crate detected the defect. §3.13 takes the cursor codes away
+        //   from this gear; it says nothing about its resource identity.
+        //   Inheriting upstream's would advertise `cf.core.odata.query.v1~`
+        //   on one error class of an endpoint whose every other error
+        //   advertises `cf.core.uc.usage_record.v1~` — a documented
+        //   discrimination layer (`docs/usage-collector-v1.yaml`, "which
+        //   entity") quietly changing value.
         E::CursorRejected { source, detail } => {
-            let mut lifted = CanonicalError::from(source);
-            if let CanonicalError::InvalidArgument {
-                ctx: InvalidArgument::FieldViolations { field_violations },
-                resource_type,
-                ..
-            } = &mut lifted
-            {
-                *resource_type = Some(USAGE_RECORD_RESOURCE.to_owned());
-                if let Some(first) = field_violations.first_mut() {
-                    first.description = detail;
-                } else {
+            let upstream = CanonicalError::from(source);
+            match upstream_field_violations(&upstream) {
+                Some([violation]) => UsageRecordResource::invalid_argument()
+                    .with_field_violation(violation.field.clone(), detail, violation.reason.clone())
+                    .create(),
+
+                // Upstream maps `OrderWithCursor` to *two* violations
+                // (`$orderby` and `cursor`), deliberately, so a client
+                // rendering UI hints sees both halves of the conflict. No
+                // constructor reaches that today, but the variant's own doc
+                // names `ORDER_WITH_CURSOR` as one of the three §3.13
+                // assigns upstream, so a third condition must be handled
+                // deliberately rather than silently acquire one half of a
+                // description. An empty list lands here too, with its
+                // count in the message.
+                Some(violations) => {
                     debug_assert!(
                         false,
-                        "toolkit_odata cursor error lifted to an empty field_violations list"
+                        "a toolkit_odata cursor error lifted to {} field violations; \
+                         the gear's description fits exactly one, so a multi-violation \
+                         condition has to be projected deliberately",
+                        violations.len()
                     );
+                    upstream
                 }
-            } else {
+
                 // Same posture as `unrecognized_resource`: silently
-                // shipping upstream's one-size-fits-all "invalid cursor"
-                // in place of the gear's recovery guidance, under
-                // upstream's resource type, is a regression no wire
-                // assertion downstream would catch, so break loudly in
-                // debug rather than degrade in the dark.
-                debug_assert!(
-                    false,
-                    "toolkit_odata cursor error no longer lifts to an InvalidArgument \
-                     field violation; the gear's description and resource scope were \
-                     dropped"
-                );
+                // shipping upstream's description in place of the gear's
+                // recovery guidance, under upstream's resource type, is a
+                // regression no wire assertion downstream would catch, so
+                // break loudly in debug rather than degrade in the dark.
+                None => {
+                    debug_assert!(
+                        false,
+                        "toolkit_odata cursor error no longer lifts to an InvalidArgument \
+                         field violation; the gear's description and resource scope were \
+                         dropped"
+                    );
+                    upstream
+                }
             }
-            lifted
         }
 
         // ---- 404 NotFound ----

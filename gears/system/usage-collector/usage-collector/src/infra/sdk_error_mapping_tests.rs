@@ -15,7 +15,9 @@
 //! were batch-only JSON post-injections that the compaction removed. Operator
 //! triage for 503s reads the curated `detail` string instead.
 
-use toolkit_canonical_errors::{CanonicalError, FieldViolation, InvalidArgument, Problem};
+use toolkit_canonical_errors::{
+    CanonicalError, FieldViolation, InvalidArgument as InvalidArgumentCtx, Problem,
+};
 use toolkit_gts::gts_id;
 use usage_collector_sdk::{MeterTypeId, USAGE_RECORD_RESOURCE, UsageCollectorError};
 use uuid::Uuid;
@@ -368,6 +370,13 @@ fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
         UsageCollectorError::invalid_subject_ref("r"),
         UsageCollectorError::invalid_idempotency_key("r"),
         UsageCollectorError::unknown_metadata_key(&gts_type_id, "k"),
+        // The two cursor rejections. They are 400s like every other entry,
+        // but the only ones whose `field` and `reason` are read off a
+        // `toolkit_odata` error instead of spelled here, so the fence is
+        // also what catches upstream's mapping ceasing to produce the
+        // single field violation the lift projects.
+        UsageCollectorError::inadmissible_cursor_keyset("mixed directions"),
+        UsageCollectorError::cursor_query_mismatch(),
         UsageCollectorError::usage_record_not_found(uuid),
         UsageCollectorError::idempotency_conflict("idem-fence", uuid),
         UsageCollectorError::invalidation_reference_incomplete("reason_code"),
@@ -401,7 +410,7 @@ fn lift_record_covers_every_usage_record_surface_variant() {
 fn first_field_violation(err: &CanonicalError) -> &FieldViolation {
     match err {
         CanonicalError::InvalidArgument {
-            ctx: InvalidArgument::FieldViolations { field_violations },
+            ctx: InvalidArgumentCtx::FieldViolations { field_violations },
             ..
         } => field_violations
             .first()

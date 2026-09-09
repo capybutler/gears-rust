@@ -246,10 +246,9 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// from the follow-up request and refuses a token carrying a different
     /// one, or none, with `toolkit_odata`'s `FilterMismatch` — which is
     /// what the caller reads as `FILTER_MISMATCH` against `cursor`. A
-    /// plugin that
-    /// dropped or recomputed it would therefore break pagination for its
-    /// own pages, and it MUST NOT interpret the value: it is opaque, and
-    /// its shape is the gateway's to change.
+    /// plugin that dropped or recomputed it would therefore break
+    /// pagination for its own pages, and it MUST NOT interpret the value:
+    /// it is opaque, and its shape is the gateway's to change.
     async fn list_usage_records(
         &self,
         gts_type_id: MeterTypeId,

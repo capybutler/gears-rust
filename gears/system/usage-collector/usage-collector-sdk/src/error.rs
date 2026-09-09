@@ -4,10 +4,15 @@
 //!
 //! - [`UsageCollectorError`] — public envelope returned by every
 //!   [`crate::api::UsageCollectorClientV1`] method. A flat, AIP-193-shaped
-//!   set of **seven category variants**: the discriminator
-//!   inside a category is a typed [`crate::reason`] sub-enum
+//!   set of **eight category variants**: the discriminator
+//!   inside a category is normally a typed [`crate::reason`] sub-enum
 //!   ([`ValidationReason`] / [`ConflictReason`]) rather than a dedicated
-//!   variant per failure.
+//!   variant per failure. The exception is
+//!   [`UsageCollectorError::CursorRejected`], the one 400 whose wire code
+//!   belongs to `toolkit_odata` rather than to this gear (Spec §3.13): it
+//!   is a dedicated variant, its discriminator is the upstream
+//!   `toolkit_odata::Error` it carries, and it carries no `resource_type`
+//!   of its own.
 //! - [`UsageCollectorPluginError`] — plugin-side vocabulary returned by
 //!   every [`crate::plugin_api::UsageCollectorPluginV1`] method.
 //!
@@ -16,6 +21,10 @@
 //! typed reason + `resource_type` carried here are exactly what the lift
 //! projects onto the canonical envelope, so callers dispatch on the variant
 //! (and, within a category, the typed reason) rather than parsing strings.
+//! `CursorRejected` is again the exception on both counts: the lift reads
+//! its wire `field` and `reason` off the upstream error and supplies the
+//! `USAGE_RECORD_RESOURCE` scope itself, since the variant has none to
+//! carry.
 
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
@@ -92,18 +101,20 @@ pub enum UsageCollectorError {
     /// `toolkit_odata` owns.
     ///
     /// Spec §3.13 gives `INVALID_CURSOR`, `FILTER_MISMATCH` and
-    /// `ORDER_WITH_CURSOR` to `toolkit_odata`: the gear declares none of
-    /// them, because a second declaration is a second place the same code
-    /// can be read and disagree. `source` is the upstream error and is the
-    /// only thing that decides the wire `field` and `reason`; the host lift
-    /// obtains both by converting it.
+    /// `ORDER_WITH_CURSOR` to `toolkit_odata`: the gear no longer
+    /// originates any of them, because a second declaration is a second
+    /// place the same code can be read and disagree. `source` is the
+    /// upstream error and is the only thing that decides the wire `field`
+    /// and `reason`; the host lift obtains both by converting it.
     ///
     /// `detail` is the gear's own, and is why this variant carries two
-    /// things rather than one. The gear knows which of its checks refused
-    /// and how the caller recovers; upstream's description for every cursor
-    /// failure is "invalid cursor". Propagating the bare upstream error
-    /// would satisfy the naming rule by discarding the guidance, so the
-    /// code comes from upstream and the prose stays here.
+    /// things rather than one. Upstream's descriptions name the condition
+    /// but not the recovery: `FilterMismatch` renders as "Filter mismatch
+    /// between cursor and query", which tells a caller nothing about
+    /// resending the query. The gear knows which of its checks refused and
+    /// how the caller gets moving again, so propagating the bare upstream
+    /// error would satisfy the naming rule by discarding the guidance —
+    /// the code comes from upstream and the prose stays here.
     #[error("cursor rejected [{source}]: {detail}")]
     CursorRejected {
         /// The upstream cursor error. Sole source of the wire `field` and

@@ -364,9 +364,12 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
 /// service, by [`require_cursor_fingerprint`], and the REST edge passes
 /// `toolkit_odata::validate_cursor_against` no filter hash at all — so this
 /// seam is now the only place that category can arise, and it is emitted
-/// here. Which of the two cursor categories is emitted is read off the
-/// `toolkit_odata` error the refusal carries, not off any code this gear
-/// declares (Spec §3.13). A PDP-transport failure and a plugin fault both surface as
+/// here. Which category a cursor rejection lands on — `filter_mismatch`,
+/// or `query_budget` for a structural defect that has no category of its
+/// own — is read off the `toolkit_odata` error the refusal carries, not
+/// off any code this gear originates (Spec §3.13).
+///
+/// A PDP-transport failure and a plugin fault both surface as
 /// `ServiceUnavailable` at this seam and both map to `plugin_error`; the
 /// authoritative PDP-unavailability signal is the foundation-owned
 /// `uc_pdp_failures_total`.
@@ -384,8 +387,9 @@ fn classify_query_result<T>(
         // A cursor rejection is a continuation refused, and the two
         // conditions behind it do not share a label. The discriminator is
         // the upstream `toolkit_odata` error the variant carries — the gear
-        // declares no cursor code of its own (Spec §3.13), so the category
-        // is read off the same value that decides the wire code.
+        // no longer originates a cursor code of its own (Spec §3.13), so
+        // the category is read off the same value that decides the wire
+        // code.
         //
         // `FilterMismatch` is a cursor minted over a different query: not a
         // budget or surface rejection at all, and it has its own category.

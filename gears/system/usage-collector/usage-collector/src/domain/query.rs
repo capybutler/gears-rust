@@ -343,7 +343,7 @@ pub(crate) fn establish_keyset_order(query: &mut ODataQuery) -> Result<(), Usage
 /// before relevance, and binding before both — a rule about the order
 /// cannot be applied to an order that has not been established yet.
 ///
-/// The gear declares neither wire code. Each refusal carries the
+/// The gear originates neither wire code. Each refusal carries the
 /// `toolkit_odata` error that owns it — `InvalidCursor` for structure,
 /// `FilterMismatch` for relevance — and the host lift converts that error
 /// to obtain the field and the code the caller reads (Spec §3.13).

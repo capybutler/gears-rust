@@ -280,9 +280,9 @@ pub async fn handle_get_usage_record(
 ///   together with `gts_type_id`, the `from` / `to` range and every
 ///   `metadata.<key>` filter — is the comparison, and a mismatch is
 ///   refused with `toolkit_odata`'s `FilterMismatch`, which is what puts
-///   `FILTER_MISMATCH` against `cursor` on the wire. The gear declares no
-///   cursor code of its own (Spec §3.13); it propagates upstream's and the
-///   host lift converts it.
+///   `FILTER_MISMATCH` against `cursor` on the wire. The gear no longer
+///   originates any cursor code of its own (Spec §3.13); it propagates
+///   upstream's and the host lift converts it.
 /// * **`$orderby` admissibility and normalization** — a caller order is
 ///   refused here, naming `$orderby`, when it mixes sort directions or
 ///   names a key that is not a mandatory record attribute; an admissible
@@ -299,7 +299,7 @@ pub async fn handle_get_usage_record(
 ///   checked behind the service instead, and a token bound to an unsound
 ///   keyset is refused with `toolkit_odata`'s `InvalidCursor`, which is
 ///   what puts `INVALID_CURSOR` against `cursor` on the wire — again
-///   upstream's code, not one this gear declares.
+///   upstream's code, not one this gear originates.
 ///
 /// Per-key metadata filtering is the typed side-channel
 /// [`MetadataFilter`] from the SDK — `toolkit-odata` has no surface for
