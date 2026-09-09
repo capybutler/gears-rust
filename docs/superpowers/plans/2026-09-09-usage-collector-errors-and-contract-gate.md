@@ -521,23 +521,28 @@ cargo nextest run -p cf-gears-usage-collector --run-ignored all \
   -E 'test(openapi_contract_tests)' --no-fail-fast 2>&1 | grep -A6 'panicked at'
 ```
 
-Two of the six failures must name the DTO. Expect, in substance:
-
-```
-body_schemas_match ... POST /usage-collector/v1/records/aggregate: request body
-mismatch (media type, `required`, schema)
-  left: Some(("application/json", true, "AggregationRequest"))
- right: Some(("application/json", true, "QueryAggregatedUsageRecordsRequest"))
-```
+**Exactly one** of the six failures names the DTO:
 
 ```
 every_registered_component_is_documented ... the runtime document publishes
 components the contract does not declare: ["QueryAggregatedUsageRecordsRequest"]
 ```
 
-**Paste both into your report before changing anything.** If either does not
-appear, stop and report — the premise of this task has moved and the rename may
-no longer be the right fix.
+**Not two.** The other half of this drift lives in `body_schemas_match`, and you
+will not see it yet: that check iterates `yaml_ops()` — a `BTreeMap` keyed
+`"METHOD /path"` — and `spec_for` panics on the first documented-but-unregistered
+route it reaches. `"GET /usage-collector/v1/feed"` sorts before
+`"POST /usage-collector/v1/records/aggregate"`, so the check short-circuits on
+`/feed` every time and never reaches the aggregate body comparison. The
+`AggregationRequest` / `QueryAggregatedUsageRecordsRequest` mismatch in that
+check is real, and it surfaces only once Task 3 excludes `/feed`.
+
+That ordering artifact is why this task's green is
+`every_registered_component_is_documented` flipping to **pass outright** — it
+compares component-schema sets and calls no `spec_for`, so nothing shadows it.
+
+Paste the failure above into your report before changing anything. If it does not
+appear, stop and report — the premise of this task has moved.
 
 - [ ] **Step 3: Rename**
 
@@ -567,12 +572,13 @@ cargo nextest run -p cf-gears-usage-collector --run-ignored all \
   -E 'test(openapi_contract_tests)' --no-fail-fast 2>&1 | grep -A6 'panicked at'
 ```
 
-Expected: **still 6 failures — the count does not move, and that is not the
-signal.** All six were already failing on the `/feed` cause, which this task does
-not touch. The signal is that **neither `AggregationRequest` nor
-`QueryAggregatedUsageRecordsRequest` appears anywhere in the output any more**:
-`body_schemas_match` and `every_registered_component_is_documented` now fail on
-`/feed` like the other four.
+Expected: **5 failures, down from 6** — `every_registered_component_is_documented`
+now passes outright, because the only component drift was this name. The other
+five still fail on the `/feed` cause, which this task does not touch.
+
+The count alone is still not the signal, because a count cannot tell you *which*
+check moved. The signal is that **neither `AggregationRequest` nor
+`QueryAggregatedUsageRecordsRequest` appears anywhere in the output any more.**
 
 ```bash
 cargo nextest run -p cf-gears-usage-collector --run-ignored all \
