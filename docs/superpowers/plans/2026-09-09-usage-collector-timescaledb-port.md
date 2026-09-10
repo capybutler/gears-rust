@@ -996,10 +996,14 @@ paragraph the two field docs point at: `ingested_at` and `acceptance_sequence`
 are the two columns with no counterpart on the SDK's `UsageRecord`, so nothing
 carries them past this struct — `ingested_at` is the server insert time, and
 `acceptance_sequence` is assigned by this plugin, which the gear's DESIGN §3.7
-obliges to keep it strictly monotonic per `(tenant_id, gts_type_id)`. Say that
-they are decoded rather than left out of the struct, so a row is a faithful
-picture of what was stored. **Both field docs say "see the struct doc"**;
-skipping the paragraph leaves two dangling pointers.
+obliges the plugin to keep strictly monotonic per `(tenant_id, gts_type_id)`.
+Cite that section with its repo-relative path
+(`gears/system/usage-collector/docs/DESIGN.md`), as the shipped source does:
+this plugin has a §3.7 of its own that still describes the retired schema, so
+the path is what makes the citation self-checking. Say that the two columns are
+decoded rather than left out of the struct, so a row is a faithful picture of
+what was stored. **Both field docs say "see the struct doc"**; skipping the
+paragraph leaves two dangling pointers.
 
 - [ ] **Correction: `sqlx::FromRow` decodes by NAME, not by position**
 
@@ -2405,9 +2409,9 @@ BREAKING CHANGE: RecordStore::get takes the compiled scope."
 
 **Selection reads the period end alone.** `from <= window_end < to`
 (`cpt-cf-usage-collector-adr-window-end-selection`). Not overlap, not
-containment — those make adjacent ranges double count or drop entries. **No
-selection predicate reads `window_start`.** DIVERGENCES §F notes that a backend
-selecting on `window_start` fails both `window-end-selection` **and**
+containment — those make adjacent ranges double count or drop entries. **The
+time-range predicate never reads `window_start`.** DIVERGENCES §F notes that a
+backend selecting on `window_start` fails both `window-end-selection` **and**
 `quantity-round-trip`, because the latter's read-back range is
 `[window_end, window_end + 1s)` while each fixture's `window_start` sits an hour
 earlier. **If both go red, diagnose the period rule, not the decimals.**
@@ -2446,9 +2450,9 @@ fn selection_reads_the_period_end_alone() {
     );
     assert!(
         !sql.contains("window_start"),
-        "no selection predicate reads window_start; a backend that selects on \
-         it fails window-end-selection AND quantity-round-trip (DIVERGENCES F). \
-         got: {sql}"
+        "the time-range clause never reads window_start; a backend that \
+         selects on it fails window-end-selection AND quantity-round-trip \
+         (DIVERGENCES F). got: {sql}"
     );
 }
 
