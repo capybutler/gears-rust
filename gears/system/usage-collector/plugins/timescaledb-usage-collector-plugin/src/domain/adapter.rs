@@ -14,14 +14,21 @@ use crate::domain::ports::RecordStore;
 
 /// The single implementation of `UsageCollectorPluginV1`. Delegates every SPI
 /// method to the [`RecordStore`] port.
+///
+/// `pub` for the same reason [`crate::domain`] is: this is the only type in
+/// the crate that implements the SPI, so the DESIGN section 3.3 contract
+/// suite — which takes a `&dyn UsageCollectorPluginV1` — cannot be run from
+/// `tests/contract_conformance_pg.rs` unless the test crate can name it. Not
+/// public API; `#[doc(hidden)]` on the module keeps it off the rendered
+/// surface, and external consumers reach the SPI through `ClientHub`.
 #[domain_model]
-pub(crate) struct StorageAdapter {
+pub struct StorageAdapter {
     record: Arc<dyn RecordStore>,
 }
 
 impl StorageAdapter {
     #[must_use]
-    pub(crate) fn new(record: Arc<dyn RecordStore>) -> Self {
+    pub fn new(record: Arc<dyn RecordStore>) -> Self {
         Self { record }
     }
 }

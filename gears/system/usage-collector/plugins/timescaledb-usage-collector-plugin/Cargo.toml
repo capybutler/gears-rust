@@ -71,6 +71,14 @@ inventory = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# The DESIGN section 3.3 plugin contract suite, run by
+# `tests/contract_conformance_pg.rs`. Keyed by the workspace alias, not the
+# package name. `[dependencies]` above already names it `usage-collector-sdk`,
+# and a second key for one package is a second dependency; the workspace table
+# supplies the `package = "cf-gears-usage-collector-sdk"` rename. Matches how
+# `postgres-cluster-plugin` enables a feature on its own aliased workspace
+# dependency: `cluster-sdk = { workspace = true, features = ["otel"] }`.
+usage-collector-sdk = { workspace = true, features = ["contract"] }
 # Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="postgres")]-gated.
 testcontainers = { workspace = true }
 test-containers = { workspace = true }
