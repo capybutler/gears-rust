@@ -20,10 +20,12 @@
 //! - `FilterField` (`toolkit_odata::filter::FilterField`): `const FIELDS:
 //!   &'static [Self]`, `fn name(&self) -> &'static str`, `fn kind(&self) ->
 //!   FieldKind`, `fn from_name(name: &str) -> Option<Self>`. `name()` returns
-//!   the macro field's snake-case name — for `UsageRecordFilterField` those are
-//!   exactly `"id"`, `"created_at"`, `"tenant_id"`, `"resource_id"`,
-//!   `"resource_type"`, `"subject_id"`, `"subject_type"`, `"corrects_id"`,
-//!   `"status"`. The identity column allowlist below relies on that.
+//!   the macro field's snake-case name — for `UsageRecordFilterField` (the
+//!   `UsageRecordQuery` shape in `usage-collector-sdk/src/models.rs`) those are
+//!   exactly `"id"`, `"window_start"`, `"window_end"`, `"tenant_id"`,
+//!   `"resource_id"`, `"resource_type"`, `"subject_id"`, `"subject_type"`,
+//!   `"invalidates"`, `"entry_type"`, `"origin"`. The identity column
+//!   allowlist below relies on that, and covers all eleven.
 //! - `ODataValue` path: `toolkit_odata::filter::ODataValue` is a `pub use` of
 //!   `toolkit_odata::ast::Value`. Variants: `Null`, `Bool(bool)`,
 //!   `Number(bigdecimal::BigDecimal)`, `Uuid(uuid::Uuid)`,
@@ -32,7 +34,7 @@
 //! - `UsageRecordFilterField` is an SDK re-export
 //!   (`UsageRecordQueryFilterField`, `#[derive(ODataFilterable)]`-generated).
 //!   Tests build it via
-//!   `<UsageRecordFilterField as FilterField>::from_name("status")`.
+//!   `<UsageRecordFilterField as FilterField>::from_name("entry_type")`.
 //! - `UsageTypeGtsId`: `new(impl Into<String>) -> Result<Self,
 //!   UsageCollectorError>` (validated); reads back via `AsRef<str>`
 //!   (`as_ref()`). `ResourceRef::new(resource_id, resource_type) -> Result<_,
@@ -48,21 +50,36 @@ pub use toolkit_odata::filter::ODataValue;
 /// Closed allowlist mapping a `usage_records` filter-field name to its column.
 ///
 /// The map is the identity (field name == column name); the closed `match` is
-/// the security boundary — only these nine identifiers can ever reach the SQL
-/// string. `gts_id` is intentionally absent: it is a typed parameter on the
-/// SPI, not a `$filter` field.
+/// the security boundary — only these eleven identifiers can ever reach the SQL
+/// string. `gts_type_id` is intentionally absent: it is a typed parameter on
+/// the SPI, not a `$filter` field, and neither is the covered period, which
+/// arrives as `time_range`.
+///
+/// The set is the published eight (`usage-collector-v1.yaml:440`) plus `id`,
+/// which the filterable schema carries so a caller can pin one entry and so the
+/// canonical cursor tiebreaker resolves, plus `window_start` and `window_end`.
+/// Those last two are reserved on `$filter` but sit in
+/// [`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`], and `window_end` must
+/// resolve for the canonical `(window_end, id)` keyset to render at all.
+///
+/// `entry_type` resolves to the stored generated column
+/// (`CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END`),
+/// which is why the field is filterable here at all: the SDK stores no such
+/// attribute and its value hook cannot carry one.
 #[must_use]
 pub fn record_column(field_name: &str) -> Option<&'static str> {
     match field_name {
         "id" => Some("id"),
-        "created_at" => Some("created_at"),
         "tenant_id" => Some("tenant_id"),
         "resource_id" => Some("resource_id"),
         "resource_type" => Some("resource_type"),
         "subject_id" => Some("subject_id"),
         "subject_type" => Some("subject_type"),
-        "corrects_id" => Some("corrects_id"),
-        "status" => Some("status"),
+        "entry_type" => Some("entry_type"),
+        "origin" => Some("origin"),
+        "invalidates" => Some("invalidates"),
+        "window_start" => Some("window_start"),
+        "window_end" => Some("window_end"),
         _ => None,
     }
 }

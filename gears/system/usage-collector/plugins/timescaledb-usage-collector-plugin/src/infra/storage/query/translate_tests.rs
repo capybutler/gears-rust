@@ -75,22 +75,77 @@ fn dt_val() -> ODataValue {
     ODataValue::DateTime(chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap())
 }
 
-// ── Column allowlist ─────────────────────────────────────────────────────────
+/// The published `$filter` field set (`usage-collector-v1.yaml:440`). Every
+/// one of these must resolve to a column, or a valid request is answered with
+/// an `Internal`.
+const PUBLISHED_FILTER_FIELDS: &[&str] = &[
+    "tenant_id",
+    "resource_id",
+    "resource_type",
+    "subject_id",
+    "subject_type",
+    "entry_type",
+    "origin",
+    "invalidates",
+];
 
 #[test]
+fn every_published_filter_field_resolves_to_a_column() {
+    for field in PUBLISHED_FILTER_FIELDS {
+        assert!(
+            record_column(field).is_some(),
+            "`$filter={field} eq ...` is a predicate the published contract names \
+             and the gear's reject_reserved_filter_fields guard admits, so an \
+             allowlist that drops it answers a valid request with a 500"
+        );
+    }
+}
+
+#[test]
+fn every_keyset_safe_field_resolves_to_a_column() {
+    for field in usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS {
+        assert!(
+            record_column(field).is_some(),
+            "`{field}` is an admissible `$orderby` key, and the canonical \
+             (window_end, id) keyset cannot render at all unless it resolves"
+        );
+    }
+}
+
+#[test]
+fn no_retired_model_field_resolves_to_a_column() {
+    for field in ["created_at", "corrects_id", "status"] {
+        assert!(
+            record_column(field).is_none(),
+            "`{field}` was removed from the model by slices 3 and 4; an \
+             allowlist that still maps it lets a `$filter` naming it past the \
+             boundary and fail against the table"
+        );
+    }
+}
+
+// ── Column allowlist ─────────────────────────────────────────────────────────
+
+// The three tests above ask only whether a field resolves. This one names the
+// column each field resolves TO: the map is the identity, so a mis-pointed arm
+// (`"origin" => Some("tenant_id")`) would satisfy them and silently filter the
+// wrong column.
+#[test]
 fn record_field_columns_are_allowlisted() {
-    // The record identity column was renamed `uuid` -> `id` (migration 0002),
-    // so `id` maps to itself and bare `uuid` is not an allowlisted field name.
+    // The record identity column is `id`; bare `uuid` is not an allowlisted
+    // field name.
     assert_eq!(record_column("id"), Some("id"));
     assert_eq!(record_column("uuid"), None);
-    assert_eq!(record_column("created_at"), Some("created_at"));
     assert_eq!(record_column("tenant_id"), Some("tenant_id"));
     assert_eq!(record_column("resource_id"), Some("resource_id"));
     assert_eq!(record_column("resource_type"), Some("resource_type"));
     assert_eq!(record_column("subject_id"), Some("subject_id"));
     assert_eq!(record_column("subject_type"), Some("subject_type"));
-    assert_eq!(record_column("corrects_id"), Some("corrects_id"));
-    assert_eq!(record_column("status"), Some("status"));
+    assert_eq!(record_column("entry_type"), Some("entry_type"));
+    assert_eq!(record_column("origin"), Some("origin"));
+    assert_eq!(record_column("invalidates"), Some("invalidates"));
+    assert_eq!(record_column("window_start"), Some("window_start"));
+    assert_eq!(record_column("window_end"), Some("window_end"));
     assert_eq!(record_column(UNMAPPED_FIELD_NAME), None);
     // An identifier that would be catastrophic if it were ever interpolated
     // rather than rejected.
@@ -156,15 +211,15 @@ fn numeric_out_of_decimal_range_is_rejected() {
 #[test]
 fn binary_eq_renders_single_placeholder_and_one_bind() {
     let node = binary(
-        "status",
+        "entry_type",
         FilterOp::Eq,
-        ODataValue::String("active".to_owned()),
+        ODataValue::String("record".to_owned()),
     );
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "status = $1");
+    assert_eq!(sql, "entry_type = $1");
     assert_eq!(ctx.binds.len(), 1);
-    assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "active"));
+    assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "record"));
 }
 
 #[test]
@@ -173,12 +228,12 @@ fn composite_and_renders_grouped_predicate_with_two_binds() {
         op: FilterOp::And,
         children: vec![
             binary("tenant_id", FilterOp::Eq, uuid_val()),
-            binary("created_at", FilterOp::Ge, dt_val()),
+            binary("window_end", FilterOp::Ge, dt_val()),
         ],
     };
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "(tenant_id = $1 AND created_at >= $2)");
+    assert_eq!(sql, "(tenant_id = $1 AND window_end >= $2)");
     assert_eq!(ctx.binds.len(), 2);
     assert!(matches!(&ctx.binds[0], SqlBind::Uuid(_)));
     assert!(matches!(&ctx.binds[1], SqlBind::DateTime(_)));
@@ -206,10 +261,10 @@ fn comparison_operators_render_their_exact_sql() {
         (FilterOp::Lt, "<"),
         (FilterOp::Le, "<="),
     ] {
-        let node = binary("created_at", op, dt_val());
+        let node = binary("window_end", op, dt_val());
         let mut ctx = SqlCtx::new(1);
         let sql = translate_record_filter(&node, &mut ctx).unwrap();
-        assert_eq!(sql, format!("created_at {sql_op} $1"), "op {op:?}");
+        assert_eq!(sql, format!("window_end {sql_op} $1"), "op {op:?}");
     }
 }
 
@@ -219,20 +274,20 @@ fn composite_or_joins_children_with_or_inside_parens() {
         op: FilterOp::Or,
         children: vec![
             binary(
-                "status",
+                "entry_type",
                 FilterOp::Eq,
-                ODataValue::String("active".to_owned()),
+                ODataValue::String("record".to_owned()),
             ),
             binary(
-                "status",
+                "entry_type",
                 FilterOp::Eq,
-                ODataValue::String("inactive".to_owned()),
+                ODataValue::String("invalidation".to_owned()),
             ),
         ],
     };
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "(status = $1 OR status = $2)");
+    assert_eq!(sql, "(entry_type = $1 OR entry_type = $2)");
     assert_eq!(ctx.binds.len(), 2);
 }
 
@@ -250,25 +305,25 @@ fn empty_in_list_is_rejected() {
 #[test]
 fn not_wraps_inner_predicate() {
     let node = FilterNode::Not(Box::new(binary(
-        "status",
+        "entry_type",
         FilterOp::Eq,
-        ODataValue::String("inactive".to_owned()),
+        ODataValue::String("invalidation".to_owned()),
     )));
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "NOT (status = $1)");
+    assert_eq!(sql, "NOT (entry_type = $1)");
 }
 
 #[test]
 fn placeholder_numbering_honors_start_offset() {
     let node = binary(
-        "status",
+        "entry_type",
         FilterOp::Eq,
-        ODataValue::String("active".to_owned()),
+        ODataValue::String("record".to_owned()),
     );
     let mut ctx = SqlCtx::new(3);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "status = $3");
+    assert_eq!(sql, "entry_type = $3");
 }
 
 // The translator must fail closed on a field whose `name()` is not on the
@@ -305,9 +360,9 @@ fn composite_with_non_and_or_operator_is_rejected() {
     let node = FilterNode::Composite {
         op: FilterOp::Eq,
         children: vec![binary(
-            "status",
+            "entry_type",
             FilterOp::Eq,
-            ODataValue::String("active".to_owned()),
+            ODataValue::String("record".to_owned()),
         )],
     };
     let mut ctx = SqlCtx::new(1);
@@ -317,10 +372,13 @@ fn composite_with_non_and_or_operator_is_rejected() {
 
 // ── Order-by + keyset ────────────────────────────────────────────────────────
 
-fn order_created_at_id() -> ODataOrderBy {
+/// The canonical page order this backend renders: `(window_end, id)`, the
+/// tiebreaker the published `$orderby` contract appends to every raw-path
+/// order.
+fn order_window_end_id() -> ODataOrderBy {
     ODataOrderBy(vec![
         OrderKey {
-            field: "created_at".to_owned(),
+            field: "window_end".to_owned(),
             dir: SortDir::Asc,
         },
         OrderKey {
@@ -332,8 +390,8 @@ fn order_created_at_id() -> ODataOrderBy {
 
 #[test]
 fn render_order_by_renders_allowlisted_columns() {
-    let sql = render_order_by(&order_created_at_id(), record_column).unwrap();
-    assert_eq!(sql, "created_at ASC, id ASC");
+    let sql = render_order_by(&order_window_end_id(), record_column).unwrap();
+    assert_eq!(sql, "window_end ASC, id ASC");
 }
 
 #[test]
@@ -372,7 +430,7 @@ fn keyset_predicate_rejects_empty_order_pairs() {
 fn keyset_predicate_rejects_key_order_arity_mismatch() {
     // Two order pairs but a single cursor key: the tuple comparison would be
     // ill-formed, so it must fail closed rather than emit a truncated tuple.
-    let pairs: &[(&str, bool)] = &[("created_at", true), ("id", true)];
+    let pairs: &[(&str, bool)] = &[("window_end", true), ("id", true)];
     let keys = vec!["2026-01-02T03:04:05Z".to_owned()];
     let mut ctx = SqlCtx::new(1);
     let err = keyset_predicate(
@@ -389,7 +447,7 @@ fn keyset_predicate_rejects_key_order_arity_mismatch() {
 
 #[test]
 fn keyset_predicate_ascending_renders_tuple_comparison_with_two_binds() {
-    let pairs: &[(&str, bool)] = &[("created_at", true), ("id", true)];
+    let pairs: &[(&str, bool)] = &[("window_end", true), ("id", true)];
     let keys = vec![
         "2026-01-02T03:04:05Z".to_owned(),
         uuid::Uuid::from_u128(0x1234).to_string(),
@@ -404,7 +462,7 @@ fn keyset_predicate_ascending_renders_tuple_comparison_with_two_binds() {
         &mut ctx,
     )
     .unwrap();
-    assert_eq!(sql, "(created_at, id) > ($1, $2)");
+    assert_eq!(sql, "(window_end, id) > ($1, $2)");
     assert_eq!(ctx.binds.len(), 2);
     assert!(matches!(&ctx.binds[0], SqlBind::DateTime(_)));
     assert!(matches!(&ctx.binds[1], SqlBind::Uuid(_)));
@@ -412,7 +470,7 @@ fn keyset_predicate_ascending_renders_tuple_comparison_with_two_binds() {
 
 #[test]
 fn keyset_predicate_descending_uses_less_than() {
-    let pairs: &[(&str, bool)] = &[("created_at", false), ("id", false)];
+    let pairs: &[(&str, bool)] = &[("window_end", false), ("id", false)];
     let keys = vec![
         "2026-01-02T03:04:05Z".to_owned(),
         uuid::Uuid::from_u128(0x1234).to_string(),
@@ -427,12 +485,12 @@ fn keyset_predicate_descending_uses_less_than() {
         &mut ctx,
     )
     .unwrap();
-    assert_eq!(sql, "(created_at, id) < ($1, $2)");
+    assert_eq!(sql, "(window_end, id) < ($1, $2)");
 }
 
 #[test]
 fn keyset_predicate_rejects_mixed_directions() {
-    let pairs: &[(&str, bool)] = &[("created_at", true), ("id", false)];
+    let pairs: &[(&str, bool)] = &[("window_end", true), ("id", false)];
     let keys = vec!["2026-01-02T03:04:05Z".to_owned(), "x".to_owned()];
     let mut ctx = SqlCtx::new(1);
     assert!(
@@ -479,7 +537,7 @@ fn keyset_predicate_rejects_a_nullable_ordering_column() {
 #[test]
 fn keyset_predicate_binds_uuid_column_as_uuid_not_text() {
     // `tenant_id` is a uuid column whose name is neither `id` nor
-    // `corrects_id`. Typing the cursor key by column NAME (the old behaviour)
+    // `invalidates`. Typing the cursor key by column NAME (the old behaviour)
     // bound it as text, producing a `uuid > text` runtime error. Typing by the
     // field's declared `FieldKind` binds it as Uuid.
     let pairs: &[(&str, bool)] = &[("tenant_id", true)];
@@ -530,7 +588,7 @@ fn ensure_forward_cursor_rejects_backward_direction() {
     let mk = |d: &str| CursorV1 {
         k: vec!["x".to_owned()],
         o: SortDir::Asc,
-        s: "+created_at".to_owned(),
+        s: "+window_end".to_owned(),
         f: None,
         d: d.to_owned(),
     };
@@ -551,7 +609,7 @@ fn ensure_forward_cursor_rejects_backward_direction() {
 
 #[test]
 fn encode_then_decode_cursor_round_trips_keys_and_order() {
-    let order = order_created_at_id();
+    let order = order_window_end_id();
     let keys = vec![
         "2026-01-02T03:04:05Z".to_owned(),
         uuid::Uuid::from_u128(0x1234).to_string(),
@@ -559,7 +617,7 @@ fn encode_then_decode_cursor_round_trips_keys_and_order() {
     let token = super::super::keyset::encode_next_cursor(&order, &keys, Some("hash")).unwrap();
     let decoded = super::super::keyset::decode_cursor(&token).unwrap();
     assert_eq!(decoded.k, keys);
-    assert_eq!(decoded.s, "+created_at,+id");
+    assert_eq!(decoded.s, "+window_end,+id");
     assert_eq!(decoded.d, "fwd");
     assert_eq!(decoded.f.as_deref(), Some("hash"));
 }
@@ -568,7 +626,7 @@ fn encode_then_decode_cursor_round_trips_keys_and_order() {
 fn encode_next_cursor_rejects_row_key_order_arity_mismatch() {
     // A two-key order but a single last-row key: the cursor would encode fewer
     // keys than the order it claims to follow, so it must fail closed.
-    let order = order_created_at_id();
+    let order = order_window_end_id();
     let keys = vec!["2026-01-02T03:04:05Z".to_owned()];
     let err = super::super::keyset::encode_next_cursor(&order, &keys, None).unwrap_err();
     assert!(err.contains("does not match order arity"), "got: {err}");
