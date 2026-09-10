@@ -24,18 +24,6 @@ fn unique_violation_on_unknown_constraint_is_other() {
 fn unique_violation_without_constraint_is_other() {
     assert_eq!(classify_db("23505", None), DbErrorClass::Other);
 }
-/// An INSERT whose `gts_id` has no parent row is the only foreign-key
-/// violation the plugin can still raise. It must stay classified rather than
-/// falling through to the opaque `Other`, which is what lets
-/// `record_store::map_insert_error` return a typed not-found.
-#[test]
-fn fk_violation_is_foreign_key_class() {
-    assert_eq!(
-        classify_db("23503", Some("usage_records_gts_id_fk")),
-        DbErrorClass::ForeignKeyViolation
-    );
-}
-
 #[test]
 fn connection_class_is_transient() {
     assert_eq!(classify_db("08006", None), DbErrorClass::Transient);

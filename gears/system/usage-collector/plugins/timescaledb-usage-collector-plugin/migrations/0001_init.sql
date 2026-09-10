@@ -1,48 +1,116 @@
 -- TimescaleDB Usage Collector storage backend — base schema.
+--
+-- One table, the entry ledger. There is no usage-type catalog: declarations
+-- live in types-registry and the storage SPI never sees one (the gear's
+-- DESIGN §3.7 — not this plugin's, whose §3.7 still describes the retired
+-- schema).
+--
+-- This file replaces the pre-slice-4 schema and its rename migration outright
+-- rather than migrating from them. The gear is unreleased, so no deployment
+-- holds rows worth a migration path; the retired 0002 said as much in its own
+-- header.
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
-CREATE TABLE IF NOT EXISTS usage_type_catalog (
-    gts_id          text PRIMARY KEY,
-    kind            text NOT NULL CHECK (kind IN ('counter', 'gauge')),
-    metadata_fields text[] NOT NULL DEFAULT '{}'
-);
-
 CREATE TABLE IF NOT EXISTS usage_records (
-    uuid            uuid        NOT NULL,
-    tenant_id       uuid        NOT NULL,
-    gts_id          text        NOT NULL,
-    value           numeric     NOT NULL,
-    created_at      timestamptz NOT NULL,
-    resource_id     text        NOT NULL,
-    resource_type   text        NOT NULL,
-    subject_id      text,
-    subject_type    text,
-    idempotency_key text        NOT NULL,
-    corrects_id     uuid,
-    status          text        NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
-    metadata        jsonb       NOT NULL DEFAULT '{}'::jsonb,
-    ingested_at     timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (uuid, created_at),
-    -- Dedup authority: `INSERT … ON CONFLICT (tenant_id, gts_id, idempotency_key,
-    -- created_at) DO NOTHING` serializes concurrent same-key ingest and decides
-    -- insert-vs-absorb-vs-conflict (record_store.rs). A hypertable UNIQUE must
-    -- include the partition column (`created_at`), so the dedup identity is the
-    -- 4-tuple `(tenant_id, gts_id, idempotency_key, created_at)` — the canonical
-    -- dedup key per ADR-0014, not a divergence from the SPI. The plugin's
-    -- remaining divergence is retention-bounded key preservation (the key
-    -- becomes reusable once its chunk is dropped, vs. the SPI's permanent
-    -- preservation); see DESIGN.md §2.2.
+    -- Deterministic gateway-derived entry identity: UUIDv5 over the 5-tuple
+    -- dedup identity (cpt-cf-usage-collector-adr-record-identity-derivation).
+    -- `entry_type` is deliberately not an input to it.
+    id                  uuid        NOT NULL,
+    tenant_id           uuid        NOT NULL,
+    gts_type_id         text        NOT NULL,
+    value               numeric     NOT NULL,
+    -- The covered period [window_start, window_end). The only emitter-supplied
+    -- time attribution. Every selection predicate reads the end alone
+    -- (cpt-cf-usage-collector-adr-window-end-selection), which is why the end
+    -- is the hypertable partition column.
+    window_start        timestamptz NOT NULL,
+    window_end          timestamptz NOT NULL,
+    resource_id         text        NOT NULL,
+    resource_type       text        NOT NULL,
+    subject_id          text,
+    subject_type        text,
+    idempotency_key     text        NOT NULL,
+    -- The append-only invalidation pair. An invalidation entry names the entry
+    -- it withdraws and carries a reason; an ordinary measurement carries
+    -- neither (cpt-cf-usage-collector-adr-append-only-invalidation).
+    invalidates         uuid,
+    reason_code         text,
+    origin              text        NOT NULL
+        CHECK (origin IN ('live', 'backfill')),
+    -- Materialized so `$filter=entry_type eq 'invalidation'` resolves to a
+    -- column. The SDK spells out exactly this expression and notes that the
+    -- value hook cannot carry the field instead (models.rs, UsageRecordQuery).
+    entry_type          text        GENERATED ALWAYS AS
+        (CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END) STORED,
+    -- Strictly monotonic per (tenant_id, gts_type_id); assigned by this plugin,
+    -- never by the gear (the gear's DESIGN §3.7). Claimed from
+    -- `usage_acceptance_sequence` below. Gaps are permitted: the obligation is
+    -- monotonicity, not density, and an absorbed idempotent retry consumes a
+    -- value it does not store.
+    acceptance_sequence bigint      NOT NULL,
+    metadata            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    ingested_at         timestamptz NOT NULL DEFAULT now(),
+
+    -- A hypertable's PRIMARY KEY and every UNIQUE must contain the partition
+    -- column, so both carry `window_end`.
+    PRIMARY KEY (id, window_end),
+
+    -- The gear's DESIGN §3.7 dedup obligation, over the 5-tuple verbatim.
     CONSTRAINT usage_records_dedup_uniq
-        UNIQUE (tenant_id, gts_id, idempotency_key, created_at),
-    CONSTRAINT usage_records_gts_id_fk
-        FOREIGN KEY (gts_id) REFERENCES usage_type_catalog (gts_id) ON DELETE RESTRICT
+        UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end),
+
+    -- A point event is window_start == window_end; a period is strictly
+    -- ordered. Nothing admits window_end < window_start.
+    CONSTRAINT usage_records_window_ordered
+        CHECK (window_start <= window_end),
+
+    -- The pair is all-or-nothing: an invalidation names a target and carries a
+    -- reason, an ordinary measurement does neither. A reason without a target
+    -- would be an unmarked correction, which the model has no room for.
+    CONSTRAINT usage_records_invalidation_pairing
+        CHECK (
+            (invalidates IS NULL AND reason_code IS NULL)
+            OR (invalidates IS NOT NULL AND reason_code IS NOT NULL)
+        )
 );
 
-SELECT create_hypertable('usage_records', 'created_at', if_not_exists => TRUE);
+SELECT create_hypertable('usage_records', 'window_end', if_not_exists => TRUE);
 
-CREATE INDEX IF NOT EXISTS usage_records_tenant_gts_time_idx
-    ON usage_records (tenant_id, gts_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS usage_records_tenant_time_idx
-    ON usage_records (tenant_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS usage_records_corrects_id_idx
-    ON usage_records (corrects_id) WHERE corrects_id IS NOT NULL;
+-- At most one accepted invalidation per entry, enforced by the database rather
+-- than by a read-then-write in the store.
+--
+-- Why this can be a plain UNIQUE despite the hypertable partition-column rule:
+-- an invalidation is a faithful copy of the entry it withdraws, so it shares
+-- that entry's covered period and therefore its `window_end`. Two invalidations
+-- of one target necessarily collide on (invalidates, window_end), so including
+-- the partition column costs nothing and satisfies the constraint rule.
+CREATE UNIQUE INDEX IF NOT EXISTS usage_records_one_invalidation_uniq
+    ON usage_records (invalidates, window_end)
+    WHERE invalidates IS NOT NULL;
+
+-- Per-scope acceptance-sequence counters.
+--
+-- A Postgres SEQUENCE is global, and per-scope monotonicity would need one
+-- sequence per (tenant, meter) — unbounded DDL driven by tenant data. A counter
+-- row claimed with `ON CONFLICT DO UPDATE … RETURNING` is per-scope by
+-- construction and serializes concurrent ingest for one scope on the row lock,
+-- which is what strict monotonicity costs.
+CREATE TABLE IF NOT EXISTS usage_acceptance_sequence (
+    tenant_id   uuid   NOT NULL,
+    gts_type_id text   NOT NULL,
+    next_value  bigint NOT NULL,
+    PRIMARY KEY (tenant_id, gts_type_id)
+);
+
+-- Read paths select on the period end within a (tenant, meter) scope.
+CREATE INDEX IF NOT EXISTS usage_records_tenant_type_window_idx
+    ON usage_records (tenant_id, gts_type_id, window_end DESC);
+CREATE INDEX IF NOT EXISTS usage_records_tenant_window_idx
+    ON usage_records (tenant_id, window_end DESC);
+-- The fold's second withdrawal-exclusion obligation resolves through this:
+-- "is this entry named by an accepted invalidation?"
+CREATE INDEX IF NOT EXISTS usage_records_invalidates_idx
+    ON usage_records (invalidates) WHERE invalidates IS NOT NULL;
+-- The LATEST fold's declared tie-break, and the feed's future keyset.
+CREATE INDEX IF NOT EXISTS usage_records_acceptance_seq_idx
+    ON usage_records (tenant_id, gts_type_id, acceptance_sequence DESC);

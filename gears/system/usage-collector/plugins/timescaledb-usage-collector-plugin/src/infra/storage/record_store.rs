@@ -38,9 +38,7 @@ use usage_collector_sdk::{
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
 use crate::infra::storage::entity::UsageRecordRow;
-use crate::infra::storage::error::{
-    DbErrorClass, acquire_error_clears_readiness, classify_db, db_code_and_constraint, map_sqlx_err,
-};
+use crate::infra::storage::error::{acquire_error_clears_readiness, map_sqlx_err};
 use crate::infra::storage::mapper::{
     gts_id_str, metadata_jsonb_to_map, metadata_map_to_jsonb, record_row_to_model,
 };
@@ -115,28 +113,22 @@ impl PgRecordStore {
         mapped
     }
 
-    /// Single-row insert error mapping. A foreign-key violation on
-    /// `usage_records.gts_id` means the referenced usage type does not exist —
-    /// the narrow TOCTOU race where it is removed between the core's pre-insert
-    /// existence check and this insert. Surface it as the typed
-    /// [`UsageCollectorPluginError::UsageTypeNotFound`] (the core lifts it to a
-    /// 404) instead of a generic Internal (500); every other error falls
-    /// through to [`Self::record_backend_error`] (which also meters it). The
-    /// batch path is intentionally excluded: a multi-`gts_id` UNNEST insert
-    /// cannot attribute a single FK violation to one `gts_id`, so a typed
-    /// mapping there would lie.
-    fn map_insert_error(
-        &self,
-        err: &sqlx::Error,
-        gts_id: &UsageTypeGtsId,
-    ) -> UsageCollectorPluginError {
-        if let Some((code, constraint)) = db_code_and_constraint(err)
-            && classify_db(&code, constraint.as_deref()) == DbErrorClass::ForeignKeyViolation
-        {
-            return UsageCollectorPluginError::UsageTypeNotFound {
-                gts_id: gts_id.clone(),
-            };
-        }
+    /// Single-row insert error mapping.
+    ///
+    /// This currently only defers to [`Self::record_backend_error`], which
+    /// meters the failure and maps transient-vs-internal. It kept a typed
+    /// mapping for one case until now: a foreign-key violation on
+    /// `usage_records.gts_id` meant the referenced usage type was absent. Both
+    /// sides of that mapping are gone — the base migration creates no
+    /// `usage_type_catalog` and so no foreign key to violate, and the SDK no
+    /// longer declares the `UsageTypeNotFound` variant it returned.
+    ///
+    /// The seam is kept rather than inlined because the insert path has more
+    /// than one constraint whose violation is caller-visible rather than
+    /// internal — `usage_records_dedup_uniq` and
+    /// `usage_records_one_invalidation_uniq` — and telling those apart by
+    /// constraint name belongs on the insert error path, not at the call site.
+    fn map_insert_error(&self, err: &sqlx::Error) -> UsageCollectorPluginError {
         self.record_backend_error(err)
     }
 
@@ -237,7 +229,7 @@ impl PgRecordStore {
             .bind(metadata)
             .fetch_optional(&mut *conn)
             .await
-            .map_err(|e| self.map_insert_error(&e, &record.gts_id))?;
+            .map_err(|e| self.map_insert_error(&e))?;
 
         if let Some(row) = inserted {
             // 2a. Won the slot — fresh insert.
