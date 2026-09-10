@@ -15,24 +15,29 @@
 //! nothing in it obliges a particular series here.
 //!
 //! Note what the clause delegates ownership *to*: the plugin's **deployment
-//! guide** — no such document exists under that name here, and `docs/DESIGN.md`
-//! §4 is the closest thing this crate has to one (its own traceability row at
-//! `docs/DESIGN.md:90` claims the role). That table cannot
-//! currently be read as one — it predates the slice-4 record model and still
-//! lists instruments this crate deleted with the usage-type catalog — so **the
-//! code below is what the plugin actually emits, and the gap is a documentation
-//! debt rather than a second opinion**. Instrument names are the **full literal**
-//! Prometheus names (snake_case, `_total` on counters, `_seconds` on duration
-//! histograms) with **no** `.with_unit(...)` hint, so the rendered series name is
-//! identical whether the downstream collector runs with `add_metric_suffixes` on
-//! or off — matching the parent gateway (`usage-collector/src/infra/metrics.rs`)
-//! and the wider application-gear convention. Histogram bucket layouts bracket
-//! the p95 budget of `cpt-cf-usage-collector-nfr-query-latency` and the write
-//! envelope of `cpt-cf-usage-collector-nfr-throughput` — a rate NFR, which has
-//! no p95 — against the gear's `DESIGN.md` §3.11.2 Latency Budgets, and are
-//! part of the contract. Cited by NFR id rather than
-//! through this crate's own `docs/DESIGN.md` §1.2 driver table, whose
-//! surrounding rows still describe the retired record model.
+//! guide** — no such document exists under that name here, and
+//! `docs/DESIGN.md` §4 is the closest thing this crate has to one (its own
+//! traceability row at `docs/DESIGN.md:90` claims the role). That table cannot
+//! currently be read as one: it predates the slice-4 record model and still
+//! lists instruments this crate deleted with the usage-type catalog. **The code
+//! below is what the plugin actually emits, and the gap is a documentation debt
+//! rather than a second opinion.**
+//!
+//! Instrument names are the **full literal** Prometheus names (snake_case,
+//! `_total` on counters, `_seconds` on duration histograms) with **no**
+//! `.with_unit(...)` hint, so the rendered series name is identical whether the
+//! downstream collector runs with `add_metric_suffixes` on or off — matching
+//! the parent gateway (`usage-collector/src/infra/metrics.rs`) and the wider
+//! application-gear convention. `metrics_tests` asserts that shape over the
+//! whole exported inventory rather than leaving it to this paragraph.
+//!
+//! Histogram bucket layouts bracket the p95 budget of
+//! `cpt-cf-usage-collector-nfr-query-latency` and the write envelope of
+//! `cpt-cf-usage-collector-nfr-throughput` — a rate NFR, which has no p95 —
+//! against the gear's `DESIGN.md` §3.11.2 Latency Budgets, and are part of the
+//! contract. Cited by NFR id rather than through this crate's own
+//! `docs/DESIGN.md` §1.2 driver table, whose surrounding rows still describe
+//! the retired record model.
 //!
 //! All labels are bounded to enumerated value sets (see the `label` module):
 //! unbounded identifiers (`tenant_id`, `gts_id`, `id`, ...) MUST NOT appear as
@@ -97,15 +102,6 @@ pub mod label {
     pub const ERROR_CATEGORY_TRANSIENT: &str = "transient";
     /// `error_category` value: a non-retryable internal backend failure.
     pub const ERROR_CATEGORY_INTERNAL: &str = "internal";
-
-    /// Label key for the invalidation-rejection scope dimension.
-    pub const SCOPE: &str = "scope";
-    /// `scope` value: the withdrawal was refused against an earlier entry of
-    /// the same `create_batch` call.
-    pub const SCOPE_IN_BATCH: &str = "in_batch";
-    /// `scope` value: the withdrawal was refused against an entry already in
-    /// the ledger from an earlier call.
-    pub const SCOPE_CROSS_CALL: &str = "cross_call";
 }
 
 /// Insert-mode dimension behind the `mode` label of
@@ -171,48 +167,6 @@ impl ErrorClass {
     }
 }
 
-/// Which of the two at-most-one-invalidation rejection paths refused a
-/// withdrawal, behind the `scope` label of
-/// `uc_timescaledb_invalidation_rejections_total`.
-///
-/// The SPI names at-most-one invalidation as the store's single admission-time
-/// obligation, and the plugin refuses a second withdrawal along two paths that
-/// are asymmetric in every other respect: `plan_batch` pre-rejects a duplicate
-/// inside one `create_batch` call before the multi-row `INSERT` is built, while
-/// the partial unique index refuses one that arrives in a later call. Splitting
-/// the counter on that boundary is what makes the two legible apart, and it is
-/// the refusal rate that shows an operator the obligation being exercised at
-/// all. A closed enum so the label set is enforced by the type.
-///
-/// **The two arms are not addable**, and the instrument's description says so
-/// because a Prometheus series carries no rustdoc. `in_batch` increments once
-/// per refused **row**; `cross_call` increments once per refused **statement**,
-/// because the index aborts a multi-row `INSERT` whole rather than per row.
-///
-/// `cross_call` under-counts within itself for the same reason: one aborted
-/// batch withdrawing two *different* already-withdrawn targets yields a single
-/// increment, since `plan_batch` pre-rejects same-target duplicates only and
-/// nothing splits the statement per row. It answers "how often is a batch refused", not "how many withdrawals
-/// were refused". Read each series alone; a sum of the two counts two different
-/// things in two different units.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InvalidationRejection {
-    /// Refused against an earlier entry of the same batch (`scope = "in_batch"`).
-    InBatch,
-    /// Refused against an entry already in the ledger (`scope = "cross_call"`).
-    CrossCall,
-}
-
-impl InvalidationRejection {
-    /// The bounded `scope` label value for this rejection path.
-    const fn as_label(self) -> &'static str {
-        match self {
-            Self::InBatch => label::SCOPE_IN_BATCH,
-            Self::CrossCall => label::SCOPE_CROSS_CALL,
-        }
-    }
-}
-
 /// The full `OpenTelemetry` metric inventory for the plugin.
 ///
 /// Built once via [`Metrics::new`] and shared through an `Arc<Metrics>`; the
@@ -245,8 +199,12 @@ pub struct Metrics {
     migration_failure: Counter<u64>,
     /// `uc_timescaledb_invalidations_total`.
     invalidation: Counter<u64>,
-    /// `uc_timescaledb_invalidation_rejections_total` — labelled by `scope`.
-    invalidation_rejection: Counter<u64>,
+    /// `uc_timescaledb_invalidation_rejected_rows_total` — the in-batch
+    /// pre-reject, one increment per refused row.
+    invalidation_rejected_rows: Counter<u64>,
+    /// `uc_timescaledb_invalidation_rejected_statements_total` — the index's
+    /// cross-call refusal, one increment per refused statement.
+    invalidation_rejected_statements: Counter<u64>,
     /// `uc_timescaledb_dedup_stale_total`.
     dedup_stale: Counter<u64>,
     /// `uc_timescaledb_batch_retries_total` — bounded in-process `create_batch`
@@ -333,12 +291,20 @@ impl Metrics {
             .u64_counter("uc_timescaledb_invalidations_total")
             .with_description("Accepted invalidation entries (append-only withdrawals)")
             .build();
-        let invalidation_rejection = meter
-            .u64_counter("uc_timescaledb_invalidation_rejections_total")
+        let invalidation_rejected_rows = meter
+            .u64_counter("uc_timescaledb_invalidation_rejected_rows_total")
             .with_description(
-                "Withdrawals refused by the at-most-one rule; scope=in_batch counts refused \
-                 rows, scope=cross_call counts refused statements (a whole aborted batch, \
-                 however many targets) - read each series alone, do not sum",
+                "Withdrawal rows refused by the at-most-one rule before the batch INSERT is \
+                 built, one per refused row",
+            )
+            .build();
+        let invalidation_rejected_statements = meter
+            .u64_counter("uc_timescaledb_invalidation_rejected_statements_total")
+            .with_description(
+                "Write statements refused by the at-most-one-invalidation index, one per \
+                 refused statement however many withdrawals it carried; a retried batch \
+                 counts once per attempt, so read it beside \
+                 uc_timescaledb_batch_retries_total",
             )
             .build();
         let dedup_stale = meter
@@ -394,7 +360,8 @@ impl Metrics {
             idempotency_conflict,
             migration_failure,
             invalidation,
-            invalidation_rejection,
+            invalidation_rejected_rows,
+            invalidation_rejected_statements,
             dedup_stale,
             batch_retry,
             query_requests,
@@ -447,11 +414,42 @@ impl Metrics {
         self.invalidation.add(1, &[]);
     }
 
-    /// Increment the refused-withdrawal counter for the given
-    /// [`InvalidationRejection`] path.
-    pub fn inc_invalidation_rejection(&self, scope: InvalidationRejection) {
-        self.invalidation_rejection
-            .add(1, &[KeyValue::new(label::SCOPE, scope.as_label())]);
+    /// Increment the in-batch refused-withdrawal counter, once per refused
+    /// **row**: `plan_batch` found an earlier entry of this same `create_batch`
+    /// already withdrawing the target, and pre-rejected this one before the
+    /// multi-row `INSERT` was built.
+    ///
+    /// Sibling of [`Self::inc_invalidation_rejected_statement`]. The two are
+    /// separate instruments rather than two values of one label **because their
+    /// units differ**: a label asserts that its arms are one measurement
+    /// partitioned, which is what makes `sum by (...)` meaningful, and rows and
+    /// statements do not sum. Splitting puts the unit in the series name, where
+    /// no dashboard can lose it.
+    pub fn inc_invalidation_rejected_row(&self) {
+        self.invalidation_rejected_rows.add(1, &[]);
+    }
+
+    /// Increment the cross-call refused-withdrawal counter, once per refused
+    /// **statement**: `usage_records_one_invalidation_uniq` refused the write
+    /// because the target was already withdrawn by an entry from an earlier
+    /// call.
+    ///
+    /// Sibling of [`Self::inc_invalidation_rejected_row`]; see there for why
+    /// these are two instruments. Two caveats an operator reading the rate
+    /// needs, both carried in the instrument's own description because a
+    /// Prometheus series carries no rustdoc:
+    ///
+    /// * **It counts statements, not withdrawals.** One aborted multi-row
+    ///   `INSERT` withdrawing two *different* already-withdrawn targets is a
+    ///   single increment — `plan_batch` pre-rejects same-target duplicates
+    ///   only, and nothing splits the statement per row.
+    /// * **A retried batch counts once per attempt.** The refusal can surface
+    ///   as a retryable `Transient` (the retention race in `map_insert_error`),
+    ///   so one request can increment this up to `MAX_BATCH_ATTEMPTS` times.
+    ///   `uc_timescaledb_batch_retries_total` moves alongside, which is how the
+    ///   two are told apart.
+    pub fn inc_invalidation_rejected_statement(&self) {
+        self.invalidation_rejected_statements.add(1, &[]);
     }
 
     /// Increment the stale-dedup counter (dedup hit whose record had aged out).

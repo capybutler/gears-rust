@@ -2,6 +2,18 @@
 //!
 //! All operations — `create` / `create_batch` / `get` / `list` / `aggregate` —
 //! are real `sqlx`.
+//!
+//! **On this file's size.** Task 13 of the `TimescaleDB` port considered
+//! splitting the 23 free functions here (845 lines, none of which touches
+//! `PgRecordStore` or `sqlx`) into a sibling module and **decided against it**.
+//! The argument that motivated the split — letting a future task
+//! `#[path]`-include a real file instead of a regenerated extract — expired
+//! when the crate started compiling, and more than half of what would move is
+//! read-path, so no name describes the boundary except "these don't touch
+//! `sqlx`". Re-open it if this file becomes hard to *edit* for a concrete
+//! reason, not on line count. Full reasoning:
+//! `docs/superpowers/plans/2026-09-09-usage-collector-timescaledb-port.md`,
+//! Task 13 Step 2c.
 
 // Vendored TimescaleDB raw-SQL backend: `sqlx` is required infra (hypertable
 // time-series, `time_bucket` aggregation, keyset pagination — see DESIGN.md). Tenant
@@ -36,9 +48,7 @@ use usage_collector_sdk::{
 };
 
 use crate::domain::ports::RecordStore;
-use crate::infra::metrics::{
-    ErrorClass, InsertMode, InvalidationRejection, Metrics, OpDurationGuard, QueryKind, TimedOp,
-};
+use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
 use crate::infra::storage::entity::UsageRecordRow;
 use crate::infra::storage::error::{
     DbErrorClass, acquire_error_clears_readiness, classify_db, db_code_and_constraint, map_sqlx_err,
@@ -282,8 +292,7 @@ impl PgRecordStore {
         // pre-rejects same-target duplicates only and nothing splits the
         // statement per row. Read it as "batches refused", never as
         // "withdrawals refused".
-        self.metrics
-            .inc_invalidation_rejection(InvalidationRejection::CrossCall);
+        self.metrics.inc_invalidation_rejected_statement();
         match find_existing_invalidation(conn, slots).await {
             Ok(Some((id, invalidated_by))) => {
                 UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }
@@ -682,8 +691,7 @@ impl PgRecordStore {
             // `map_insert_error`. The two arms of `scope` are not addable — see
             // [`InvalidationRejection`].
             if let Some(&invalidated_by) = plan.duplicate_withdrawals.get(&i) {
-                self.metrics
-                    .inc_invalidation_rejection(InvalidationRejection::InBatch);
+                self.metrics.inc_invalidation_rejected_row();
                 results.push(Err(duplicate_withdrawal_in_batch(record, invalidated_by)));
                 continue;
             }

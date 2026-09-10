@@ -403,7 +403,18 @@ fn ddl_column_array_types() -> Vec<(&'static str, &'static str)> {
     migration_probe::insertable_columns()
         .into_iter()
         .map(|(name, ty)| match name {
-            "metadata" => (name, "text"),
+            // Asserted, not assumed: an unconditional substitution would keep
+            // rewriting `metadata` to `text` if the DDL ever stopped saying
+            // `jsonb`, the test would stay green, and the "one deliberate
+            // divergence" above would be a claim outliving the code -- inside
+            // the construct built to hunt exactly that.
+            "metadata" => {
+                assert_eq!(
+                    ty, "jsonb",
+                    "the metadata divergence is jsonb->text; the DDL now says {ty}"
+                );
+                (name, "text")
+            }
             _ => (name, ty),
         })
         .collect()

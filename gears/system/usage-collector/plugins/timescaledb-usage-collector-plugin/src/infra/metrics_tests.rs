@@ -1,4 +1,4 @@
-use super::{ErrorClass, InsertMode, InvalidationRejection, Metrics, QueryKind, label};
+use super::{ErrorClass, InsertMode, Metrics, QueryKind, label};
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -78,19 +78,39 @@ fn counter_sum_with_label(
     0
 }
 
-/// The description the meter recorded for the instrument named `name`.
-fn description_of(exporter: &InMemoryMetricExporter, name: &str) -> String {
+/// The description the meter recorded for the instrument named `name`, or
+/// `None` if no instrument of that name was exported.
+///
+/// `Option` rather than a defaulted `String` so a renamed or unexported
+/// instrument fails as "not found" instead of masquerading as one with an empty
+/// description, which every `contains` assertion below would then report as a
+/// missing phrase.
+fn description_of(exporter: &InMemoryMetricExporter, name: &str) -> Option<String> {
     let metrics = exporter.get_finished_metrics().unwrap();
     for resource_metrics in &metrics {
         for scope_metrics in resource_metrics.scope_metrics() {
             for metric in scope_metrics.metrics() {
                 if metric.name() == name {
-                    return metric.description().to_owned();
+                    return Some(metric.description().to_owned());
                 }
             }
         }
     }
-    String::new()
+    None
+}
+
+/// Every instrument name the meter exported, sorted.
+fn exported_names(exporter: &InMemoryMetricExporter) -> Vec<String> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    let mut names: Vec<String> = metrics
+        .iter()
+        .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .map(|m| m.name().to_owned())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Last value of the `u64` Gauge named `name`, if recorded.
@@ -239,26 +259,28 @@ async fn recording_helpers_emit_expected_series() {
     );
 }
 
-/// The two at-most-one-invalidation counters emit under the names the
-/// inventory declares, and the rejection counter splits on the `scope` label
-/// rather than collapsing both refusal paths onto one series.
+/// The three at-most-one-invalidation counters emit under the names the
+/// inventory declares, and the two rejection counters are **separate
+/// instruments** rather than two values of one label.
 ///
-/// The split is the point: the in-batch pre-reject and the index's cross-call
-/// refusal are two different mechanisms with two different fixes, and a summed
-/// counter cannot tell an operator which one is firing. Asserting the total
-/// alone would stay green with both arms of `InvalidationRejection::as_label`
-/// returning the same string.
+/// That separation is the assertion worth having. A Prometheus label asserts
+/// that its arms are one measurement partitioned — which is what makes
+/// `sum by (...)` meaningful — and these two arms have different units: the
+/// in-batch pre-reject counts refused rows, the index's cross-call refusal
+/// counts refused statements. Under one instrument nothing but prose stands
+/// between an operator and a meaningless sum. Under two, the unit is in the
+/// series name and there is no shared series to sum across.
 #[tokio::test]
-async fn invalidation_counters_emit_under_their_declared_names() {
+async fn the_two_rejection_paths_are_separate_instruments_because_their_units_differ() {
     let (provider, exporter) = local_provider();
     let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
 
     metrics.inc_invalidation();
     metrics.inc_invalidation();
 
-    metrics.inc_invalidation_rejection(InvalidationRejection::InBatch);
-    metrics.inc_invalidation_rejection(InvalidationRejection::InBatch);
-    metrics.inc_invalidation_rejection(InvalidationRejection::CrossCall);
+    metrics.inc_invalidation_rejected_row();
+    metrics.inc_invalidation_rejected_row();
+    metrics.inc_invalidation_rejected_statement();
 
     provider.force_flush().unwrap();
 
@@ -268,59 +290,163 @@ async fn invalidation_counters_emit_under_their_declared_names() {
         "an accepted invalidation entry increments the accepted counter",
     );
     assert_eq!(
-        counter_sum(&exporter, "uc_timescaledb_invalidation_rejections_total"),
-        3,
-        "every refused withdrawal increments the rejection counter",
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_timescaledb_invalidation_rejections_total",
-            label::SCOPE,
-            label::SCOPE_IN_BATCH,
-        ),
+        counter_sum(&exporter, "uc_timescaledb_invalidation_rejected_rows_total"),
         2,
-        "the in-batch pre-reject carries scope=in_batch",
+        "the in-batch pre-reject counts refused rows",
     );
     assert_eq!(
-        counter_sum_with_label(
+        counter_sum(
             &exporter,
-            "uc_timescaledb_invalidation_rejections_total",
-            label::SCOPE,
-            label::SCOPE_CROSS_CALL,
+            "uc_timescaledb_invalidation_rejected_statements_total"
         ),
         1,
-        "the index's cross-call refusal carries scope=cross_call",
+        "the index's cross-call refusal counts refused statements",
     );
-}
 
-/// The rejection counter's **description** carries the not-addable warning.
-///
-/// This is not decoration. `InvalidationRejection`'s rustdoc explains that
-/// `in_batch` counts rows while `cross_call` counts whole aborted statements,
-/// and an operator reading a Prometheus series never sees rustdoc — the
-/// description is the only text that travels with the metric. A dashboard that
-/// sums the two arms is measuring two quantities in two units, and the
-/// description is what stops that.
-#[tokio::test]
-async fn the_rejection_counters_description_warns_against_summing_its_arms() {
-    let (provider, exporter) = local_provider();
-    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
-    metrics.inc_invalidation_rejection(InvalidationRejection::InBatch);
-    provider.force_flush().unwrap();
-
-    let desc = description_of(&exporter, "uc_timescaledb_invalidation_rejections_total");
-
-    for needle in [
-        label::SCOPE_IN_BATCH,
-        label::SCOPE_CROSS_CALL,
-        "rows",
-        "statements",
-        "do not sum",
+    // The separation itself: two names, and no `scope` dimension on either that
+    // would invite adding them together. Collapsing the two helpers onto one
+    // instrument fails the first assert; re-introducing the label fails this.
+    for name in [
+        "uc_timescaledb_invalidation_rejected_rows_total",
+        "uc_timescaledb_invalidation_rejected_statements_total",
     ] {
         assert!(
-            desc.contains(needle),
-            "the description must carry {needle:?} so the units travel with the series, got: {desc:?}"
+            exported_names(&exporter).contains(&name.to_owned()),
+            "{name} must be its own series, not a label value of a shared one",
         );
+        assert_eq!(
+            counter_sum_with_label(&exporter, name, "scope", "in_batch")
+                + counter_sum_with_label(&exporter, name, "scope", "cross_call"),
+            0,
+            "{name} must carry no `scope` dimension; the unit belongs in the name",
+        );
+    }
+}
+
+/// Each rejection counter's **description** carries its own unit, and the
+/// statement counter's carries the retry caveat.
+///
+/// A Prometheus series carries no rustdoc: the description is the only text
+/// that travels with the metric, so the facts an operator needs to read the
+/// rate correctly have to be in it. The phrases are asserted **contiguously**,
+/// not as loose substrings — checking for "rows" and "statements" separately
+/// stays green if the two units are swapped between the instruments, which is
+/// the entire content of the warning.
+#[tokio::test]
+async fn each_rejection_counters_description_carries_its_own_unit() {
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+    metrics.inc_invalidation_rejected_row();
+    metrics.inc_invalidation_rejected_statement();
+    provider.force_flush().unwrap();
+
+    let rows = description_of(&exporter, "uc_timescaledb_invalidation_rejected_rows_total")
+        .expect("the in-batch rejection counter is exported");
+    assert!(
+        rows.contains("one per refused row"),
+        "the row counter's unit must travel with the series, got: {rows:?}",
+    );
+
+    let statements = description_of(
+        &exporter,
+        "uc_timescaledb_invalidation_rejected_statements_total",
+    )
+    .expect("the cross-call rejection counter is exported");
+    for phrase in [
+        "one per refused statement however many withdrawals it carried",
+        "a retried batch counts once per attempt",
+        "uc_timescaledb_batch_retries_total",
+    ] {
+        assert!(
+            statements.contains(phrase),
+            "the statement counter's description must carry {phrase:?}, got: {statements:?}",
+        );
+    }
+}
+
+/// Every instrument the inventory exports obeys the naming convention the
+/// module doc states, over the whole set rather than one name at a time.
+///
+/// The module doc names two rules §3.11.5 binds this crate by. This is the
+/// mechanism for the first; the bounded-label rule is the second, and the
+/// closed `as_label` enums are its mechanism. Without this, the convention is a
+/// paragraph, and a new instrument added with a dotted name, a missing `_total`
+/// or a `.with_unit()` hint is caught by nobody — which is exactly how the
+/// seven phantom dotted citations this task removed came to look plausible.
+///
+/// Deliberately driven off the exported set, not off a hand-kept list of
+/// expected names: a new instrument is covered the day it is added, and a list
+/// would need updating in the same commit that breaks the rule.
+#[tokio::test]
+async fn every_exported_instrument_obeys_the_naming_convention() {
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+
+    // Touch every recording helper so the full inventory is exported. The two
+    // observable pool gauges are collected by their callbacks on flush.
+    metrics.record_insert(InsertMode::Single, 0.001);
+    metrics.record_query(QueryKind::Raw, 0.001);
+    metrics.record_pool_acquire(0.001);
+    metrics.record_batch_rows(1.0);
+    metrics.inc_dedup_absorbed();
+    metrics.inc_dedup_stale();
+    metrics.inc_idempotency_conflict();
+    metrics.inc_migration_failure();
+    metrics.inc_tls_handshake_failure();
+    metrics.inc_batch_retry();
+    metrics.inc_backend_error(ErrorClass::Internal);
+    metrics.inc_query_request(QueryKind::Raw);
+    metrics.inc_invalidation();
+    metrics.inc_invalidation_rejected_row();
+    metrics.inc_invalidation_rejected_statement();
+    metrics.set_ready(true);
+
+    provider.force_flush().unwrap();
+    let names = exported_names(&exporter);
+
+    assert!(
+        names.len() >= 16,
+        "the inventory should export every instrument the helpers touch, got {}: {names:?}",
+        names.len(),
+    );
+
+    for name in &names {
+        assert!(
+            name.starts_with("uc_timescaledb_"),
+            "{name} must sit in the plugin's own sub-namespace",
+        );
+        assert!(
+            name.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "{name} must be a full literal Prometheus name: snake_case, no dots",
+        );
+        assert!(
+            !name.ends_with('_'),
+            "{name} must not end in a bare separator",
+        );
+    }
+
+    // `_total` is the counter suffix and `_seconds` the duration-histogram one,
+    // so that the rendered series name is identical whether the downstream
+    // collector runs with `add_metric_suffixes` on or off.
+    for name in [
+        "uc_timescaledb_dedup_absorbed_total",
+        "uc_timescaledb_backend_errors_total",
+        "uc_timescaledb_invalidations_total",
+        "uc_timescaledb_invalidation_rejected_rows_total",
+        "uc_timescaledb_invalidation_rejected_statements_total",
+    ] {
+        assert!(
+            names.contains(&name.to_owned()),
+            "{name} must be exported; the counter suffix check below depends on it",
+        );
+    }
+    for name in &names {
+        if name.contains("_duration_") {
+            assert!(
+                name.ends_with("_seconds"),
+                "{name} is a duration histogram and must end in _seconds",
+            );
+        }
     }
 }

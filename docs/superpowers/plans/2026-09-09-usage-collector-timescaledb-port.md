@@ -3978,12 +3978,12 @@ nowhere (Step 1's handover). What actually leaves this free is DESIGN
 §3.11.5's own closing paragraph, which delegates backend-internal series to the
 plugin's prefix and names no instrument for a storage plugin at all.
 
-**Decision: yes — added.** `uc_timescaledb_invalidation_rejections_total`,
-labelled `scope` ∈ {`in_batch`, `cross_call`}, incremented on both refusal
-paths: in `map_insert_error` once the classifier has said the partial unique
-index refused the statement (cross-call), and at `resolve_batch`'s
-`duplicate_withdrawals` pre-reject (`plan_batch`, in-batch). Reasoning, in the
-order it carried weight:
+**Decision: yes — added.** Two counters, incremented on the two refusal paths:
+`uc_timescaledb_invalidation_rejected_rows_total` at `resolve_batch`'s
+`duplicate_withdrawals` pre-reject (`plan_batch`, in-batch), and
+`uc_timescaledb_invalidation_rejected_statements_total` in `map_insert_error`
+once the classifier has said the partial unique index refused the statement
+(cross-call). Reasoning, in the order it carried weight:
 
 1. **The plugin's own inventory was already asymmetric, not deliberately
    silent.** It counts its *other* admission-time refusal —
@@ -3996,11 +3996,55 @@ order it carried weight:
    alone. The refusal rate is then the only in-plugin evidence the rule is
    being exercised at all — and the series it belongs beside,
    `uc_timescaledb_invalidations_total`, is the denominator.
-3. **The label split is the content.** The two paths differ in mechanism and in
-   fix (`plan_batch` pre-reject vs. the index aborting a whole multi-row
-   `INSERT` — Task 18 Step 4b item 2), so a summed counter cannot tell an
-   operator which is firing. Two bounded values, no unbounded identifier;
-   §3.11.5's cardinality rule holds.
+3. **The split is the content.** The two paths differ in mechanism and in fix
+   (`plan_batch` pre-reject vs. the index aborting a whole multi-row `INSERT` —
+   Task 18 Step 4b item 2), so a single counter cannot tell an operator which is
+   firing.
+
+**Two instruments, not one instrument with a `scope` label — and this was
+reversed during review, so the reasoning is recorded rather than the outcome
+alone.** The first version was `uc_timescaledb_invalidation_rejections_total`
+with `scope` ∈ {`in_batch`, `cross_call`}, and it was wrong for a reason that
+outlives this counter:
+
+> **A Prometheus label asserts that its arms are one measurement partitioned.**
+> That assertion is what makes `sum by (...)` meaningful, and it is machine-read
+> — every dashboard and alerting tool aggregates on it. These two arms have
+> different units: the in-batch pre-reject counts refused **rows**, the index's
+> cross-call refusal counts refused **statements**. Under one instrument the
+> only thing standing between an operator and a meaningless sum is prose in
+> `with_description`, and **nobody can write a test that stops someone writing
+> the wrong PromQL**. Splitting puts the unit in the series name, where no query
+> can lose it, and leaves nothing to sum across because there is no shared
+> series.
+
+Two consequences worth keeping:
+
+- **The `scope` label and the `InvalidationRejection` enum are both gone.** The
+  crate's own convention decides this: `InsertMode`, `QueryKind` and
+  `ErrorClass` exist because each *has* a label; separate instruments
+  (`inc_dedup_absorbed`, `inc_dedup_stale`, `inc_idempotency_conflict`) get
+  separate methods and no enum. A constant-valued label on a single-series
+  instrument is noise.
+- **`..._statements_total` still needs two caveats, and they are in its
+  description** — where an operator reads them — as well as in rustdoc. It
+  counts statements, not withdrawals: one aborted batch withdrawing two
+  *different* already-withdrawn targets is a single increment, because
+  `plan_batch` pre-rejects same-target duplicates only. And a retried batch
+  counts once per attempt, up to `MAX_BATCH_ATTEMPTS`, because the refusal can
+  surface as a retryable `Transient` — so it is read beside
+  `uc_timescaledb_batch_retries_total`. **The same argument that moved the
+  not-addable warning into the description applies to the retry caveat**, which
+  is why both are there rather than one.
+
+**Alternatives, so the next reader does not re-litigate this.** *One instrument
+plus label* was reviewed and accepted before being reversed; it groups "one
+obligation, two mechanisms" nicely and is what §3.11.5's own tables look like —
+but every label in those tables partitions a single unit, which is exactly the
+property this pair lacks. *Normalising both to rows* would need the index to
+report which rows of an aborted statement offended, which Postgres does not tell
+us. *Dropping the cross-call counter* loses the only signal for the path the SPI
+actually obliges.
 
 **Where the cross-call increment sits, and why it moved.** The first version
 put it in `map_insert_error`'s `Ok(Some(..))` arm — the one that can name the
@@ -4049,19 +4093,39 @@ aggregate, which is what this step asked for; per-event logging on the
 cross-call path is a separate question and the error already reaches the caller
 naming both entries.
 
-**Tests and their mutations** (`metrics_tests.rs::invalidation_counters_emit_under_their_declared_names`,
-each run confirmed to carry a `Compiling` line):
+**Tests and their mutations**, each run confirmed to carry a `Compiling` line:
 
-| Mutation | Result |
+| Mutation | Reds |
 | --- | --- |
-| `InvalidationRejection::InBatch => label::SCOPE_IN_BATCH` → `SCOPE_CROSS_CALL` | red (the label-split assertion; a total-only assertion would have stayed green) |
-| instrument name `"uc_timescaledb_invalidations_total"` → `…_totalX` | red |
-| `self.invalidation.add(1, &[])` → `.add(0, &[])` | red |
+| collapse `inc_invalidation_rejected_row` onto the statements counter | `…separate_instruments_because_their_units_differ` |
+| re-introduce a `scope` label on either instrument | same |
+| `self.invalidation.add(1, &[])` → `.add(0, &[])` | same |
+| instrument name `"uc_timescaledb_invalidations_total"` → `…_totalX` | same |
+| **swap the two descriptions between the instruments** | `…description_carries_its_own_unit` |
+| drop "a retried batch counts once per attempt" | same |
+| a dotted instrument name (`uc_timescaledb.dedup.absorbed`) | `…obeys_the_naming_convention` |
+| `uc_timescaledb_query_duration_seconds` → `…_duration_secs` | same |
+| `metadata jsonb` → `json` in the migration | `each_inserted_column_is_unnested_as_…` |
 
-**Left for Task 15.** The two `record_store.rs` increments are not unit-testable
-— both sit on paths that need a live backend — so this task pins the instrument
-and the label mapping, and Task 15's integration suite is where the call sites
-themselves get observed.
+**The description test asserts contiguous phrases, not loose substrings.** An
+earlier version checked for `"rows"`, `"statements"` and `"do not sum"`
+independently, which stays green when the two units are **swapped between the
+instruments** — and which arm carries which unit is the entire content of the
+warning. That is the mutation row above.
+
+**`every_exported_instrument_obeys_the_naming_convention` is the mechanism for a
+claim the module doc had been making unbacked.** The doc states the two rules
+§3.11.5 binds this crate by; the bounded-label rule has the closed `as_label`
+enums, and the naming rule had nothing. The test drives every recording helper,
+flushes, and asserts over the **exported set** — `uc_timescaledb_` prefix,
+snake_case with no dots, `_seconds` on duration histograms — rather than against
+a hand-kept list of expected names, so a new instrument is covered the day it is
+added instead of on the day someone remembers to extend a list.
+
+**Left for Task 15, and routed into Task 15's own section rather than only
+recorded here.** Both increments sit on paths that need a live backend, so this
+task pins the instruments and their descriptions and Task 15 observes the call
+sites.
 
 - [x] **Step 2c: Decide whether to split `record_store.rs` (from Task 9's review)**
 
@@ -4302,10 +4366,10 @@ happened to the figure this sentence used to carry.)
 **Measured at Task 13: 24**, two ways that agree — `grep -cE '^#\[(tokio::)?test\]'`
 over `src/infra/storage/mapper_tests.rs`, and `cargo nextest list` filtered to
 `infra::storage::mapper::mapper_tests`. All 24 green. **Baseline for whoever
-reads this next: 213 passed / 0 skipped** unfiltered (211 before this task, plus
-two metrics tests). Per module: `record_store_tests` 75,
+reads this next: 214 passed / 0 skipped** unfiltered (211 before this task, plus
+three metrics tests). Per module: `record_store_tests` 75,
 `translate_tests` 46, `mapper_tests` 24, `error_tests` 16, `config_tests` 14,
-`query_tests` 12, `aggregate_tests` 12, `pool_tests` 9, `metrics_tests` 4,
+`query_tests` 12, `aggregate_tests` 12, `pool_tests` 9, `metrics_tests` 5,
 `gear_tests` 1.
 
 If any of them fails to compile in this context, the harness proof does not
@@ -4329,9 +4393,10 @@ mismatch in that direction is impossible; do not spend time on it.
 
 - [x] **Step 6: Commit**
 
-Two commits, because they are two changes: the metric inventory (Steps 1 + 2b)
-and the DDL oracle's move to a shared parse (Step 2c). `src/` only — **never**
-`git add -A`; six paths in this tree are not yours.
+One commit per change, not one per task. Task 13 shipped **five**: the metric
+inventory (Steps 1 + 2b), the DDL oracle's move to a shared parse (Step 2c), the
+plan, and two review rounds. `src/` and this plan only — **never** `git add -A`;
+six paths in this tree are not yours.
 
 ---
 
@@ -4494,6 +4559,35 @@ the statement, and a test pins it against the `GROUP BY` ordinals.
 
 Task 12's `--all-targets` count of zero is a green **without** `--features
 postgres`; with it, these five files carry 61 errors that are yours.
+
+**Three things Task 13 hands you, none of them a defect to fix:**
+
+1. **Two metric increments that no unit test can reach.** Both at-most-one
+   rejection counters —
+   `uc_timescaledb_invalidation_rejected_rows_total` (in `resolve_batch`) and
+   `uc_timescaledb_invalidation_rejected_statements_total` (in
+   `map_insert_error`) — sit on paths that need a live backend. Task 13 pinned
+   the instruments and their descriptions in `metrics_tests`; **the call sites
+   themselves are unobserved until this task**. Assert them where you already
+   drive a duplicate withdrawal.
+2. **`migration_probe` is reachable from your crates — use it, do not write a
+   second parser.** `src/infra/storage/migration_probe.rs` is gated
+   `#[cfg(any(test, feature = "postgres"))] pub mod`, and `postgres` is exactly
+   the feature your five files compile under, so
+   `cf_gears_timescaledb_usage_collector_plugin::infra::storage::migration_probe::{ledger_columns, insertable_columns}`
+   resolves from `tests/`. It yields `(name, type)` parsed from
+   `migrations/0001_init.sql` and is the crate's **one** independent oracle for
+   the column sequence; a second transcription in `tests/common/mod.rs` would
+   undo that.
+3. **One link in the anchoring chain is yours to close, and only you can.**
+   `InsertColumns`' field order reaches the DDL through the `.bind()` sequence
+   at `record_store.rs`, and **nothing in-process observes that sequence**: swap
+   two binds of the same SQL type — `resource_id` and `resource_type` are both
+   `text` and both `NOT NULL` — and Postgres accepts the row,
+   `InsertColumns::build`'s field-by-field test still passes, and
+   `migration_probe` says nothing, because every constant it checks is still
+   correct. **Write one row through `create_batch` and read every column back**;
+   that is the only thing that catches it.
 
 - [ ] **Step 1: Inventory what each suite asserts, before changing any of it**
 
@@ -4904,12 +4998,17 @@ The label goes on the PR, which does not exist yet — the gateway work and this
 port merge together. **Report the enumerated list so whoever opens the PR
 applies the label**; do not open the PR as part of this task unless asked.
 
-- [ ] **Step 4b: Two DIVERGENCES entries Task 9 owes you**
+- [ ] **Step 4b: The DIVERGENCES entries earlier tasks owe you**
 
-Task 9 deliberately did not edit `DIVERGENCES.md` — this task owns it — but it
-found two published-contract gaps and is required to hand them over. Both are
-about the SPI's at-most-one-invalidation obligation, and both are recorded at
-the call site in `record_store.rs`; neither is a defect to fix here.
+**Do not read the count out of this heading or out of the list below** — tasks
+keep adding to it, and a numeral here goes stale the way every other count in
+this plan has. Work the list.
+
+Items 1 and 2 are Task 9's. It deliberately did not edit `DIVERGENCES.md` —
+this task owns it — but it found two published-contract gaps and is required to
+hand them over. Both are about the SPI's at-most-one-invalidation obligation,
+and both are recorded at the call site in `record_store.rs`; neither is a defect
+to fix here.
 
 1. **The at-most-one guarantee is conditional on the gateway.** The SPI says
    "**the store** MUST reject" a second withdrawal of a target and MUST make
@@ -4935,6 +5034,30 @@ the call site in `record_store.rs`; neither is a defect to fix here.
    batch returns an outer `AlreadyInvalidated` rather than per-record outcomes
    aligned to input order, which is what the SPI asks for. Fixing it needs a
    per-row `SAVEPOINT` pass; it was scoped out rather than missed.
+
+3. **Task 13's: the plugin's own `docs/DESIGN.md` is stale wholesale and no
+   entry owns it.** `gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/DESIGN.md`
+   is 710 lines, with `gts_id` on 37 of them, `catalog` on 30, `created_at` on
+   29, `usage_type` on 25, `corrects_id` on 10 and `deactivate` on 7. Its §4
+   Observability table (`:622-686`) still lists
+   `uc_timescaledb_deactivate_duration_seconds`,
+   `uc_timescaledb_usage_type_referenced_total` and
+   `uc_timescaledb_usage_type_catalog_size` — three instruments this crate
+   deleted — and describes `compensations_total` as `corrects_id`-driven.
+
+   **The point of the entry is the ownership gap, not the staleness.** Entry 5
+   owns `gears/system/usage-collector/docs/DECOMPOSITION.md`; entry 14 declares
+   itself "the entry that owns `docs/features/`". **Neither reaches the plugin's
+   directory**, and the plan's self-review registers only those two as
+   out-of-scope-and-known. This file is stale *and* unregistered, which is the
+   worse state — and gear DESIGN §3.11.5 makes that file the nominal **owner**
+   of the `uc_timescaledb_` series, a role its own traceability row (`:90`)
+   claims, so the register needs to say it cannot currently be read as one.
+
+   Task 13 deliberately did not patch the §4 table, on entry 14's own rule
+   about `usage-query.md`: one current paragraph inside a wholesale-stale
+   document is harder to notice than a uniformly stale one. **Register it; do
+   not fix it line by line.**
 
 - [ ] **Step 5: Update `DIVERGENCES.md`**
 
