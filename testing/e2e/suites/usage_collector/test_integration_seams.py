@@ -157,8 +157,8 @@ async def test_invalidation_is_admitted_at_most_once(api, make_meter):
     A correction is an ordinary ingested entry carrying `invalidates` plus
     `reason_code`; nothing about the target row is mutated. The second
     withdrawal of one target is REJECTED with 409 `ALREADY_INVALIDATED`. The
-    partial unique index on `(tenant_id, invalidates, window_end)` is what
-    refuses it, inside the insert's own transaction — the gateway takes no
+    partial unique index on `(invalidates, window_end)` is what refuses it,
+    inside the insert's own transaction — the gateway takes no
     pre-read for this and could not: a pre-read cannot exclude a concurrent
     second submission, which is the case the rule exists for.
 

@@ -5455,18 +5455,28 @@ nothing else could, and one decision it forced.
    which asserts the *translation* and keeps the old shape's refusal as its
    negative half, so it cannot go quiet.
 
-   Neither a unit nor a contract test could have caught this: the in-crate
-   plugin doubles never translate a scope, and DESIGN section 3.3's checks
-   supply their own filters rather than observing this one.
+   **A spy for it already existed and had no assertion behind it.**
+   `test_support.rs`'s `RecordingPlugin::last_get_scope()` - whose own doc
+   says it proves the point lookup "actually handed the plugin a compiled PDP
+   scope" - has exactly one caller, `service_tests.rs:1951`, on the DESIGN
+   section 3.3 path. The invalidation pre-read went through the same spy and
+   nothing ever looked at what it captured. Everything else is blind by
+   construction: the other in-crate doubles take `_scope` or record it as a
+   `Debug` string without translating it, and the contract check builds its
+   own `scope_under_test()`. So this is not "only an E2E could have caught
+   it" - it is one unwritten assertion on a mechanism already in the tree.
 
 2. **The at-most-one-invalidation refusal is top-level, not per-record.** The
-   partial unique index refuses the whole multi-row insert and the transaction
-   rolls back (`record_store.rs`, `map_insert_error` / `create_batch_inner`),
-   so `POST /records` answers `409 ALREADY_INVALIDATED` rather than a 207 with
-   a per-entry rejection. That is the backend's documented statement
-   granularity, not a defect, and the e2e asserts the shipped behaviour. **A
-   consequence worth Task 18's attention: a batch mixing a valid measurement
-   with a colliding withdrawal loses both.**
+   partial unique index on `(invalidates, window_end)` refuses the whole
+   multi-row insert and the transaction rolls back (`record_store.rs`,
+   `map_insert_error` / `create_batch_inner`), so `POST /records` answers
+   `409 ALREADY_INVALIDATED` rather than a 207 with a per-entry rejection.
+   That is the backend's documented statement granularity, not a defect, and
+   the e2e now asserts the shipped behaviour. Task 18 Step 4b item 2 already
+   owns the write-up (including that fixing it needs a per-row `SAVEPOINT`
+   pass); this is the HTTP-level confirmation of it, and the consequence a
+   reader will meet first is that a batch mixing a valid measurement with a
+   colliding withdrawal loses both.
 
 3. **Container budget - decided, not deferred.** The preamble's two options
    were priced and a third, cheaper one taken: the plugin's own harness passes
@@ -5686,6 +5696,33 @@ to fix here.
    **This is routed here because it is otherwise ownerless**: `grep -c
    'artifacts.toml\|cf-studio'` over this plan returned **0** before this
    entry, so nothing would have brought anyone back to the file.
+
+6. **Task 17's: nothing seeds the abstract base type, so no deployment can
+   meter anything out of the box.** A meter is a derived GTS **type** of
+   `gts.cf.core.uc.usage_record.v1~` and the gear resolves it through
+   `types-registry`; the base itself is registered by nothing. usage-collector
+   declares no `#[gts_type_schema]` for it (its only link-time type schema is
+   the storage-plugin spec, `usage-collector-sdk/src/gts.rs`), and no shipped
+   config file carries it in `gears.types-registry.config.entities` — verified
+   by grepping every `*.yaml` / `*.json` in the tree for the id, which finds it
+   only in the gear's own `docs/schemas/` and `docs/usage-collector-v1.yaml`.
+   Until it is registered, every ingest is a 404 "GTS type … is not declared".
+   The E2E suite now posts `docs/schemas/usage_record.v1.schema.json` itself
+   for exactly this reason. Record whether the base is meant to be seeded at
+   link time, shipped in `config/quickstart.yaml` the way the AM platform-root
+   tenant type is, or left as an operator obligation.
+
+7. **Task 17's: the scope spy that existed and was never asserted on.** The
+   `unrestricted_read_filter` defect (Task 17 Step 4, item 1) reached a live
+   deployment through a path that already had the instrument to catch it:
+   `RecordingPlugin::last_get_scope()` (`domain/test_support.rs:1462`) has one
+   caller, `service_tests.rs:1951`, on the DESIGN section 3.3 point-lookup
+   path. The invalidation-target pre-read dispatches through the same spy.
+   This is not a `DIVERGENCES.md` row — it is a note for whoever writes the
+   next SPI-touching slice: **when a scope crosses the SPI, assert that it
+   translates, not that the call returned `Ok`.** The in-crate doubles record
+   scopes as `Debug` strings without translating them, so "the spy captured
+   something" is not evidence a backend can serve it.
 
 - [ ] **Step 5: Update `DIVERGENCES.md`**
 
