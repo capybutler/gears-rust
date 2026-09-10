@@ -549,6 +549,44 @@ fn keyset_predicate_descending_uses_less_than() {
     assert_eq!(sql, "(window_end, id) < ($1, $2)");
 }
 
+// The SPI guarantees the two canonical names are *present* in `query.order`,
+// not that either is last: "a caller ordering by `id` is handed on as `(id,
+// window_end)`. A plugin MUST read the order it is given rather than assume a
+// position for either key." Sorting the pairs into a canonical shape, or
+// hard-coding one, still renders a well-formed tuple and still binds two
+// values, so the breakage is silent: the emitted columns stop lining up with
+// the cursor keys, and the page resumes from the wrong boundary. Lead with
+// `id` so a canonicalising implementation cannot render the same SQL.
+#[test]
+fn the_predicate_follows_the_order_it_is_given_rather_than_a_canonical_position() {
+    let pairs: &[(&str, bool)] = &[("id", true), ("window_end", true)];
+    let keys = vec![
+        uuid::Uuid::from_u128(0x1234).to_string(),
+        "2026-01-02T03:04:05Z".to_owned(),
+    ];
+    let mut ctx = SqlCtx::new(1);
+    let sql = keyset_predicate(
+        pairs,
+        &keys,
+        record_column,
+        rec_kind,
+        rec_keyset_safe,
+        &mut ctx,
+    )
+    .expect("an id-led order is admissible; the SPI guarantees presence, not position");
+    assert_eq!(sql, "(id, window_end) > ($1, $2)");
+    assert!(
+        matches!(&ctx.binds[0], SqlBind::Uuid(_)),
+        "the first bind is the first order key's, got {:?}",
+        ctx.binds[0]
+    );
+    assert!(
+        matches!(&ctx.binds[1], SqlBind::DateTime(_)),
+        "the second bind is the second order key's, got {:?}",
+        ctx.binds[1]
+    );
+}
+
 // A mixed-direction order rendered as a uniform tuple comparison returns the
 // wrong rows and reports nothing, so the rule is fail-closed and its violation
 // is silent. Both cursor keys must therefore be *parseable* for their field's

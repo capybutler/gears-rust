@@ -3,16 +3,16 @@
 //!
 //! All column identifiers come from a caller-supplied allowlist closure
 //! (`record_column` from [`super::translate`]); cursor key values are always
-//! bound. The v1 gateway default order is the all-ascending `(created_at, id)`
+//! bound. The v1 gateway default order is the all-ascending `(window_end, id)`
 //! tuple, so [`keyset_predicate`] emits the row-value tuple form for
-//! uniform-direction orders and rejects mixed directions (documented
-//! limitation — see that fn).
+//! uniform-direction orders and refuses a mixed-direction one, which the
+//! gateway guarantees cannot arrive (see that fn).
 //!
 //! # Verified `toolkit-odata` cursor / order API (Task E1)
 //!
 //! - `ODataOrderBy(pub Vec<OrderKey>)`; `OrderKey { field: String, dir:
 //!   SortDir }`; `SortDir::{Asc, Desc}` with `reverse()`. `ODataOrderBy` has
-//!   `to_signed_tokens() -> String` (`"+created_at,+id"`) and
+//!   `to_signed_tokens() -> String` (`"+window_end,+id"`) and
 //!   `from_signed_tokens(&str) -> Result<Self, toolkit_odata::Error>`.
 //! - `CursorV1 { k: Vec<String>, o: SortDir, s: String, f: Option<String>, d:
 //!   String }`; `encode(&self) -> serde_json::Result<String>` (base64url);
@@ -55,8 +55,14 @@ pub fn ensure_forward_cursor(cursor: &CursorV1) -> Result<(), String> {
     }
 }
 
-/// Render an `ORDER BY` column list (`"created_at ASC, id ASC"`) from an
+/// Render an `ORDER BY` column list (`"window_end ASC, id ASC"`) from an
 /// `ODataOrderBy`, resolving each field through `col`.
+///
+/// This is the caller-supplied `$orderby` path: `col` is handed an arbitrary
+/// caller string here, unlike the `$filter` path where a `FilterField` has
+/// already bounded the input, so the allowlist is the whole boundary between
+/// that string and the rendered SQL. An unresolved field is refused, never
+/// interpolated.
 ///
 /// # Errors
 ///
@@ -93,12 +99,25 @@ pub fn render_order_by(
 /// via [`cursor_key_to_bind`] — keyed by the field's declared [`FieldKind`]
 /// (resolved through `kind`), not its column name — and pushed onto `ctx`.
 ///
-/// # v1 limitation
+/// # Order shape
 ///
-/// Only uniform-direction orders are supported. The v1 gateway always sorts
-/// `(created_at, id)` ascending, so the tuple form covers the live path;
-/// mixed-direction orders return an error (the lexicographic OR-form is not
-/// emitted in v1).
+/// The tuple is rendered in the order `order_pairs` arrives in, each bind
+/// pushed alongside the key it belongs to; nothing here looks up a canonical
+/// name or assumes a canonical slot. That is an obligation, not an incidental
+/// property. `UsageCollectorPluginV1::list_usage_records` says of the two
+/// canonical names that they are "guaranteed to be *present*, not to be last:
+/// a caller ordering by `id` is handed on as `(id, window_end)`. A plugin MUST
+/// read the order it is given rather than assume a position for either key."
+///
+/// # Uniform directions
+///
+/// Only a uniform-direction order renders as a row-value tuple; a
+/// mixed-direction one is refused. It cannot occur: the same SPI doc
+/// guarantees `query.order` "uses one sort direction throughout", so a mixed
+/// order is a gateway breach rather than a caller-reachable shape. The
+/// lexicographic OR-form that would serve one is deliberately not emitted, so
+/// the breach is refused rather than papered over with a tuple comparison that
+/// would silently return the wrong rows and report nothing.
 ///
 /// # NULL safety
 ///
@@ -144,7 +163,11 @@ pub fn keyset_predicate(
     } else if all_desc {
         "<"
     } else {
-        return Err("mixed-direction keyset orders are unsupported in v1".to_owned());
+        return Err(
+            "mixed-direction keyset order refused: the gateway guarantees one sort \
+             direction throughout"
+                .to_owned(),
+        );
     };
 
     let mut columns = Vec::with_capacity(order_pairs.len());
@@ -203,7 +226,7 @@ pub fn cursor_key_to_bind(kind: FieldKind, raw: &str) -> Result<SqlBind, String>
 /// Build and encode the forward (`"fwd"`) cursor for the next page from the
 /// last in-page row's key values, in `order` field order.
 ///
-/// `s` carries the signed sort tokens (`"+created_at,+id"`); `o` is the
+/// `s` carries the signed sort tokens (`"+window_end,+id"`); `o` is the
 /// primary sort direction; `f` carries the optional filter hash for
 /// consistency checks on decode.
 ///
