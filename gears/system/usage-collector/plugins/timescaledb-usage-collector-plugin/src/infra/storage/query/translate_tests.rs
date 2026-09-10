@@ -13,7 +13,7 @@ use usage_collector_sdk::UsageRecordFilterField;
 
 use super::super::bind::{SqlBind, odata_value_to_bind};
 use super::super::keyset::{
-    cursor_key_to_bind, ensure_forward_cursor, keyset_predicate, render_order_by,
+    cursor_key_to_bind, ensure_forward_cursor, keyset_predicate, render_order_by, uniform_dir,
 };
 use super::{ODataValue, SqlCtx, record_column, translate_record_filter};
 
@@ -449,6 +449,76 @@ fn order_window_end_id() -> ODataOrderBy {
     ])
 }
 
+/// `(window_end ASC, id DESC)` — the shape the SPI guarantees never arrives,
+/// and the one every entry point that acts on a direction has to refuse.
+fn mixed_direction_order() -> ODataOrderBy {
+    ODataOrderBy(vec![
+        OrderKey {
+            field: "window_end".to_owned(),
+            dir: SortDir::Asc,
+        },
+        OrderKey {
+            field: "id".to_owned(),
+            dir: SortDir::Desc,
+        },
+    ])
+}
+
+/// The rule itself, at the one place all three entry points now resolve a
+/// direction. The empty arm is unreachable through those three — each checks
+/// emptiness first, with its own message — so it is only nameable here.
+#[test]
+fn uniform_dir_accepts_one_direction_and_refuses_a_mixed_or_empty_order() {
+    assert_eq!(uniform_dir([SortDir::Asc, SortDir::Asc]), Ok(SortDir::Asc));
+    assert_eq!(
+        uniform_dir([SortDir::Desc, SortDir::Desc]),
+        Ok(SortDir::Desc)
+    );
+
+    let err = uniform_dir([SortDir::Asc, SortDir::Desc]).unwrap_err();
+    assert!(err.contains("mixed-direction"), "got: {err}");
+    // The message states a requirement of the call, not the gateway's promise:
+    // it prints through `UsageCollectorError::internal` to a caller who cannot
+    // see the gateway, and would be asserting that promise exactly when it was
+    // broken.
+    assert!(
+        !err.contains("guarantees"),
+        "the reject must not cite a guarantee it is evidence against; got: {err}"
+    );
+
+    let err = uniform_dir([]).unwrap_err();
+    assert!(err.contains("must not be empty"), "got: {err}");
+}
+
+// `render_order_by` runs on the *first* page, before any cursor exists. Mapping
+// each key's direction independently renders `window_end ASC, id DESC` and
+// serves it, leaving `keyset_predicate` to refuse on the continuation — one
+// page too late, and as a 500 over an already-wrong page.
+#[test]
+fn render_order_by_refuses_a_mixed_direction_order() {
+    let err = render_order_by(&mixed_direction_order(), record_column).unwrap_err();
+    assert!(err.contains("mixed-direction"), "got: {err}");
+}
+
+// `encode_next_cursor` records one direction in the cursor's `o`. Taking it
+// from the leading key alone mints a token that *describes* an order its own
+// page was not read in, so the continuation looks sound and returns the wrong
+// rows. Refuse at mint instead.
+#[test]
+fn encode_next_cursor_refuses_a_mixed_direction_order() {
+    let keys = vec![
+        "2026-01-02T03:04:05Z".to_owned(),
+        uuid::Uuid::from_u128(1).to_string(),
+    ];
+    let err = super::super::keyset::encode_next_cursor(
+        &mixed_direction_order(),
+        &keys,
+        Some("filter-hash"),
+    )
+    .unwrap_err();
+    assert!(err.contains("mixed-direction"), "got: {err}");
+}
+
 #[test]
 fn render_order_by_renders_allowlisted_columns() {
     let sql = render_order_by(&order_window_end_id(), record_column).unwrap();
@@ -574,7 +644,11 @@ fn the_predicate_follows_the_order_it_is_given_rather_than_a_canonical_position(
         &mut ctx,
     )
     .expect("an id-led order is admissible; the SPI guarantees presence, not position");
-    assert_eq!(sql, "(id, window_end) > ($1, $2)");
+    assert_eq!(
+        sql, "(id, window_end) > ($1, $2)",
+        "the tuple's columns follow the order handed in, not a canonical one"
+    );
+    assert_eq!(ctx.binds.len(), 2);
     assert!(
         matches!(&ctx.binds[0], SqlBind::Uuid(_)),
         "the first bind is the first order key's, got {:?}",
