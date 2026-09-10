@@ -3338,7 +3338,7 @@ from. `time_range` is a typed parameter and never appears in `query.filter`.
 `next_cursor.f` verbatim. This is the obligation with no compiler backstop: a
 plugin that drops it recompiles clean and paginates exactly once.
 
-- [ ] **Step 1: Change the port signature**
+- [x] **Step 1: Change the port signature** — DONE
 
 ```rust
     async fn list(
@@ -3350,7 +3350,7 @@ plugin that drops it recompiles clean and paginates exactly once.
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests** — DONE
 
 ```rust
 #[test]
@@ -3395,7 +3395,7 @@ mint site (test 2 red).
 
 Test 2's mutation is the important one. Name it out loud in the task report.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement** — DONE
 
 **Translate `query.filter` through `translate_scope`** (Task 10,
 `query/translate.rs`) rather than repeating the
@@ -3448,7 +3448,7 @@ on page two. Turn the breach into a `None` the *caller* must handle, and update
 `encode_next_cursor_rejects_row_key_order_arity_mismatch` (`translate_tests.rs`)
 which currently passes `None`.
 
-- [ ] **Step 4: Run, prove the mutations, commit**
+- [x] **Step 4: Run, prove the mutations, commit** — DONE
 
 ```bash
 cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(record_store)' 2>&1 | tail -30
