@@ -3888,7 +3888,7 @@ new counter here is a judgement call rather than something the doc obliges.
 
 **A decision point, deliberately placed here — and the numbers Task 9 wrote it
 with are stale, so here are measured ones.** `record_store.rs` is **2,290
-lines** (not ~1,840), and **792 of them** (not ~400) are its 22 free functions
+lines** (not ~1,840), and **843 of them** (not ~400) are **23** free functions
 with their doc comments, none of which touches `PgRecordStore` or `sqlx`:
 
 ```
@@ -3897,13 +3897,29 @@ record_row_key, require_filter_hash, build_get_sql, build_list_sql,
 build_list_page, dedup_key, row_dedup_key, dedup_invariant_break,
 dedup_transient, plan_batch, duplicate_withdrawal_in_batch,
 batch_retry_backoff_base, full_jitter, batch_retry_backoff,
-is_retryable_batch_error, canonical_equal, build_aggregate_sql,
+is_retryable_batch_error, with_retry, canonical_equal, build_aggregate_sql,
 aggregate_bucket
 ```
 
-Regenerate that list rather than trusting it — `grep -n '^fn ' src/infra/storage/record_store.rs`
-is the whole measurement, since a free function is exactly one that starts at
-column zero. Tasks 10-12 grew the pure half faster than the impure one:
+Regenerate that list rather than trusting it, and **use this command, not
+`grep -n '^fn '`**:
+
+```bash
+grep -nE '^(pub(\(crate\))? )?(async )?(const )?fn ' src/infra/storage/record_store.rs
+```
+
+A free function is exactly one that starts at column zero — true, and `^fn `
+does not implement it. It misses the five column-zero **`async fn`**s.
+`rollback`, `claim_acceptance_sequence`, `claim_batch_sequences` and
+`find_existing_invalidation` take `sqlx` types and fall outside the move set
+anyway, but **`with_retry` (`:1636`, 51 lines) does not** — it is generic over
+`Op: Fn() -> Fut` and touches neither `PgRecordStore` nor `sqlx`. Run the wrong
+line and you move `batch_retry_backoff_base`, `full_jitter`,
+`batch_retry_backoff` and `is_retryable_batch_error` while leaving their head
+behind, **splitting the retry family across the boundary you just drew** — the
+family Task 9's own scoping named as one unit.
+
+Tasks 10-12 grew the pure half faster than the impure one:
 `build_list_sql`, `build_list_page`, `build_aggregate_sql` and `aggregate_bucket`
 are all read-path builders that arrived in this slice, which is worth noticing
 because **it also means the "write_plan" name Task 9 chose no longer fits** —
@@ -4185,6 +4201,7 @@ the statement, and a test pins it against the `GROUP BY` ordinals.
 2. **`COUNT` over an empty selection is `Some(0)`, not `None`.** That is
    `SELECT COUNT(*)`'s own answer rather than anything the plugin does, which is
    exactly why only a real query demonstrates it.
+
 Task 12's `--all-targets` count of zero is a green **without** `--features
 postgres`; with it, these five files carry 61 errors that are yours.
 

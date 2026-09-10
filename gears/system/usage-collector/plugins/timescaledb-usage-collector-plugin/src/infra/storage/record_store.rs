@@ -1137,7 +1137,9 @@ fn require_filter_hash(query: &ODataQuery) -> Result<&str, String> {
 ///
 /// Binds start at `$2` because the `id` occupies `$1`; [`PgRecordStore::get`]
 /// binds the `id` first, before these, for that reason. **This is the only
-/// seeded caller in the crate.** Both collection paths seed at 1: their leading
+/// seeded caller on a production path** — `aggregate_tests.rs` and
+/// `translate_tests.rs` seed as fixtures, exercising the offset itself. Both
+/// collection paths seed at 1: their leading
 /// value is the meter, and it goes through the same [`SqlCtx`] as everything
 /// else (`push_meter_and_range_clauses`), so there is no bind outside the
 /// counter for them to seed past. Only the ordered bind values are returned,
@@ -1762,9 +1764,22 @@ fn canonical_equal(
 /// the same number of key columns with. Derived a second time at the call site
 /// — from `group_by.len()`, which is equal today — the two could drift with
 /// nothing to notice: no unit test executes a statement, so a decoder reading
-/// the wrong number of columns is invisible until a live query. Returning it
-/// makes "the decoder is handed the count the SELECT list was built from" true
-/// by construction instead of a claim needing a backend to check.
+/// the wrong number of columns is invisible until a live query.
+///
+/// Returning it makes that **one derivation with one restatement rather than
+/// two**, not a construction that cannot be wrong, and
+/// `the_builder_reports_the_dimension_count_its_select_list_was_built_from` is
+/// what holds the restatement. The distinction matters here more than it
+/// usually would: `dim_count` is the one output of [`build_aggregate_sql`] that
+/// leaves no trace in the SQL string. `sql` is pinned by hand-transcribed
+/// oracles and `binds` by value in placeholder order, but a count that merely
+/// *describes* the statement without appearing in it is beyond the reach of any
+/// text oracle — which is why a mutation setting it to a constant left every
+/// SQL assertion in the crate green.
+///
+/// Contrast `dimension_presence_guard`, which really is by construction: the
+/// guard string literally contains the select expression, so making the two
+/// disagree means making the SQL wrong, and the SQL is pinned.
 struct AggregateStatement {
     sql: String,
     binds: Vec<SqlBind>,
@@ -2268,7 +2283,11 @@ impl RecordStore for PgRecordStore {
         //
         // The count comes from the statement that was built, not from a second
         // reading of `group_by` here, so the decoder cannot read a different
-        // number of key columns than the SELECT list emits.
+        // number of key columns than the SELECT list emits. From this call site
+        // that is structural; that the builder reports the count it actually
+        // used is the other half, and
+        // `the_builder_reports_the_dimension_count_its_select_list_was_built_from`
+        // is what holds it.
         //
         // What no unit test can still see is a short circuit placed *after* the
         // fetch, where the branch is a no-op on an empty row set. One placed
