@@ -1189,17 +1189,27 @@ honest options, in order of preference:
 - [ ] **Step 3: Delete the dead helpers**
 
 From `src/infra/storage/mapper.rs` delete `parse_status` and `status_to_sql`
-(slice 4 removed `UsageRecordStatus`), and rename the GTS helpers to the type
-that replaced `UsageTypeGtsId`:
+(slice 4 removed `UsageRecordStatus`), and bring the GTS helpers to the type
+that replaced `UsageTypeGtsId`.
+
+**Only the read direction survives as a helper.** An earlier draft kept a
+`meter_type_id_str(&MeterTypeId) -> &str` beside it, mirroring the old
+`gts_id_str`. It is gone, for the reason that removed `origin_to_sql` in Step 4:
+`MeterTypeId::as_str` (`usage-collector-sdk/src/models.rs:641`) already *is* the
+bind direction, and a wrapper is a second spelling of it — more clearly so here,
+since `as_str` is the obvious name and the wrapper is not. Tasks 9-11 bind
+`record.gts_type_id.as_str()`, the same length with no import. They have to
+touch those sites regardless: the field is renamed `gts_id` → `gts_type_id`.
+
+The read direction earns its keep because it is not a rename:
 
 ```rust
-/// Borrow the raw GTS type id string out of a [`MeterTypeId`] (for binding).
-#[must_use]
-pub fn meter_type_id_str(gts_type_id: &MeterTypeId) -> &str {
-    gts_type_id.as_ref()
-}
-
 /// Reconstruct a validated [`MeterTypeId`] from a stored string.
+///
+/// This is `MeterTypeId::from_str` plus the lift into
+/// [`UsageCollectorPluginError`], and the lift is the whole point: the SDK
+/// reports a bad id as a *caller* error, but a value that is already in the
+/// database is this plugin's invariant to have broken.
 ///
 /// # Errors
 ///
@@ -1285,12 +1295,12 @@ and its doc already claims that ownership ("the wire spelling, shared by the
 REST projection, the `$filter` surface and the metric label"), so Task 9's
 insert binds `record.origin.as_str()` directly. The SDK offers no parsing
 direction (no `FromStr`, no `TryFrom<&str>`), which is why `parse_origin`
-still exists -- but it compares against `RecordOrigin::as_str` rather than
+still exists — but it compares against `RecordOrigin::as_str` rather than
 against bare literals, so the two directions cannot drift.
 
 Verify `ReasonCode`'s constructor name and whether it exposes `as_str` before
 writing the test assertion in Step 1 against it. **It lives in `models.rs`,
-not `reason.rs`** -- `reason.rs` holds `ConflictReason` / `NotFoundReason` /
+not `reason.rs`** — `reason.rs` holds `ConflictReason` / `NotFoundReason` /
 `ValidationReason`, which are unrelated:
 
 ```bash
@@ -1414,34 +1424,56 @@ Mutations run and killed at the Task 5 run:
 | 6 | `parse_origin`'s else branch yields `Ok(RecordOrigin::Live)` | `parse_origin_rejects_unknown`, `record_row_unknown_origin_is_internal` |
 | 7 | `record_row_to_model` hardcodes `let origin = RecordOrigin::Live;` | `a_backfill_row_maps_to_the_backfill_origin`, `record_row_unknown_origin_is_internal` |
 
-**Then sweep the file with body stubs.** The seven above are behaviour
-mutations, and they only reach code some test already calls. Replacing each
-`pub fn`'s body wholesale with a constant of the right type is what finds a
-function nothing exercises at all:
+**Then sweep every `pub fn` for a mutation that survives.** The table above is
+behaviour mutations, which only reach code some test already calls. The
+question this second pass asks is different: *for each function in the file, is
+there any edit to it that compiles and that nothing catches?* The strongest form
+is a whole-body stub — replace the body with a constant of the right type — but
+not every function admits one, so the pass is per-function coverage rather than
+a uniform recipe:
 
-| # | Body stub | Killed by |
+| Function | Mutation used | Killed by |
 |---|---|---|
-| 1 | `meter_type_id_str` returns `""` | `meter_type_id_str_borrows_the_stored_spelling_back` |
-| 2 | `meter_type_id_from_str` ignores `raw`, returns a fixed valid id | `meter_type_id_from_str_accepts_valid_and_rejects_invalid_as_internal`, `record_row_invalid_gts_type_id_is_internal`, `record_row_to_model_maps_a_valid_row_round_trip` |
-| 3 | `metadata_jsonb_to_map` returns `Ok(empty)` | four metadata tests + the row round trip |
-| 4 | `metadata_map_to_jsonb` returns an empty object | `metadata_map_to_jsonb_then_back_round_trips` |
-| 5 | `invalidation_from_row`'s `(Some, Some)` arm returns `Ok(None)` | `an_invalidation_row_maps_to_a_record_carrying_the_pair`, `an_unparseable_stored_reason_is_an_invariant_break` |
-| 6 | the reassembled `Invalidation.target` becomes `Uuid::nil()` | `an_invalidation_row_maps_to_a_record_carrying_the_pair` |
-| 7 | `record_row_to_model` swaps the two period bounds | `record_row_to_model_maps_a_valid_row_round_trip` |
+| `meter_type_id_from_str` | whole body: ignore `raw`, return a fixed valid id | its own test, `record_row_invalid_gts_type_id_is_internal`, the row round trip |
+| `metadata_jsonb_to_map` | whole body: `Ok(empty)` | four metadata tests + the row round trip |
+| `metadata_map_to_jsonb` | whole body: empty object | the metadata round trip and the verbatim-key test |
+| `parse_origin` | no single stub: it has two success arms, so the live arm yielding `Backfill` and the else arm yielding `Ok(Live)` (rows 4 and 6 above) together cover what one body stub would | the two origin tests + two row tests |
+| `invalidation_from_row` | no single stub either: `(Some, Some)` → `Ok(None)`, plus rows 2, 3 and 5 above for the other arms | the four invalidation tests |
+| `record_row_to_model` | **cannot take a constant body** — it returns a `UsageRecord`, which has no `Default` and twelve fields to fabricate. Mutated in place instead: swap the two period bounds; hardcode `origin` (row 7 above) | the row round trip, the backfill test |
 
-`parse_origin` and `record_row_to_model` are covered by the behaviour table
-above, so all seven `pub fn`s in the file are swept. No stub survived.
+Two more the mutation of a *single* function would never reach, each found by
+spec review and each having survived a full green suite:
+
+| Mutation | Killed by |
+|---|---|
+| `SubjectRef::new(subject_id, row.subject_type.or_else(\|\| Some("unknown".to_owned())))` — fabricate a type for every untyped subject | `a_subject_without_a_type_maps_to_an_untyped_subject` |
+| coordinated two-sided: `metadata_map_to_jsonb` writes `md_`-prefixed keys, `metadata_jsonb_to_map` strips the prefix back off | `metadata_map_to_jsonb_writes_the_key_spelling_verbatim` |
+
+The second is the one to learn from. Every round-trip test stays green, because
+both sides move together; only an assertion against a *literal expected value*
+sees it. `empty_metadata_round_trips` asserts a literal but only for the empty
+map, which is why the stub above could be guarded on `!map.is_empty()` and slip
+past. **A round trip proves the pair is self-consistent, never that either side
+is right** — so at least one test per encoded column must name the bytes.
+
+No mutation in either pass survived.
 
 **A test whose mutation cannot be named does not go in — but "cannot be named"
-is a claim to falsify, not to assert.** The Task 5 run first deleted stub 1's
-test, reasoning that the body is `gts_type_id.as_ref()` and no edit to that
-expression both compiles and changes the result. That is true of the
-*expression* and irrelevant: `pub fn meter_type_id_str(_: &MeterTypeId) -> &str
-{ "" }` compiles (`&'static str` coerces to the elided lifetime) and survived
-the whole suite, so the function was shipping with zero coverage while
-`record_store.rs` binds through it at eight sites. Spec review caught it. When
-you cannot find an inner mutation, stub the body before concluding there is
-none.
+is a claim to falsify, not to assert.** The Task 5 run wrote a test for a
+`meter_type_id_str(&MeterTypeId) -> &str` helper, then deleted it, reasoning
+that the body is `gts_type_id.as_ref()` and no edit to that expression both
+compiles and changes the result. True of the *expression*, and irrelevant:
+`pub fn meter_type_id_str(_: &MeterTypeId) -> &str { "" }` compiles (`&'static
+str` coerces to the elided lifetime) and survived the whole suite, so the
+function was shipping with zero coverage. Spec review caught it and the test
+was restored. **When you cannot find an inner mutation, stub the body before
+concluding there is none.**
+
+Code review then removed the helper itself (Step 3), and the test went with it.
+That is not a reversal: a *shipped* function owes coverage, a deleted one owes
+none. The sequence is worth reading in order, because the two rounds answer
+different questions — "is this function tested?" and "should this function
+exist?" — and only the second makes the first moot.
 
 - [ ] **Step 9: Commit**
 
@@ -1464,8 +1496,8 @@ is the SQL spelling, so the two directions cannot drift.
 
 The crate still does not compile (41 lib / 71 lib-test errors, all owned by
 Tasks 6-13), so these tests were run and falsified out of the crate: a
-scratchpad harness path-including mapper.rs and entity.rs alone. 22 green,
-seven named mutations killed and seven body stubs killed."
+scratchpad harness path-including mapper.rs and entity.rs alone. Every test
+green, every mutation in Step 8's two passes killed, none surviving."
 ```
 
 ---
@@ -2112,6 +2144,38 @@ fields one by one. **Omission is the hazard, not order** — see the correction
 in Task 4. A `RECORD_COLUMNS` missing a field fails with
 `no column found for name: <field>`, which names the field; a `RECORD_COLUMNS`
 in a different order than the struct is harmless.
+
+- [ ] **Step 2b: Add `invalidation_to_row` to the mapper**
+
+Task 5 built `invalidation_from_row` and made it go to some trouble to keep
+`(invalidates, reason_code)` inseparable: a half pair is refused as `Internal`
+rather than silently dropped. **The write direction has no such helper, and
+without one this insert will bind the two columns independently** — the exact
+split shape the read direction exists to refuse, reintroduced where nothing
+catches it until Postgres rejects the row on
+`usage_records_invalidation_pairing`, at runtime, in production.
+
+Add it beside its inverse in `src/infra/storage/mapper.rs`, and bind through it:
+
+```rust
+/// Split an [`Invalidation`] back into the two columns that store it.
+///
+/// The inverse of [`invalidation_from_row`], and the reason the insert cannot
+/// bind `invalidates` and `reason_code` separately: going through one function
+/// makes the half-populated pair unrepresentable on the way out, the same way
+/// [`Invalidation`] makes it unrepresentable on the way in.
+#[must_use]
+pub fn invalidation_to_row(invalidation: Option<&Invalidation>) -> (Option<Uuid>, Option<&str>) {
+    match invalidation {
+        None => (None, None),
+        Some(Invalidation { target, reason }) => (Some(*target), Some(reason.as_str())),
+    }
+}
+```
+
+Its test is the round trip against `invalidation_from_row` in both directions,
+plus one assertion that `None` yields `(None, None)`. Name the mutation before
+you accept it: returning `(Some(*target), None)` must go red.
 
 - [ ] **Step 3: Rewrite the dedup helpers**
 
@@ -2813,11 +2877,31 @@ lower bound and is not the number to report.
 
 **This is the first in-crate run of the mapper tests.** Task 5 could not run
 them here — the crate had 41 lib errors and 71 lib-test errors at the time —
-so it ran them, and its seven-mutation falsification, in a scratchpad harness
-that `#[path]`-included `mapper.rs` and `entity.rs` alone (Task 5 Step 8).
-Confirm here that the 21 `mapper_tests` cases are present and green in the
-real crate; if any of them fails to compile in this context, the harness proof
-does not cover it and the gap is yours to close.
+so it ran them, and its mutation falsification, in a scratchpad harness that
+`#[path]`-included `mapper.rs` and `entity.rs` alone (Task 5 Step 8). Confirm
+here that every `mapper_tests` case is present and green in the real crate.
+(Count them in the file rather than trusting a number written down elsewhere:
+a literal here rots the first time a test is added, which is exactly what
+happened to the figure this sentence used to carry.)
+
+If any of them fails to compile in this context, the harness proof does not
+cover it and the gap is yours to close. What the harness cannot see, in the
+order worth checking:
+
+1. **The crate root's `#![cfg_attr(coverage_nightly, feature(coverage_attribute))]`**
+   (`src/lib.rs:1`). The harness has no crate root of the plugin's, so the
+   `#[cfg_attr(coverage_nightly, coverage(off))]` on the test module is inert
+   there and load-bearing here.
+2. **Feature unification.** The harness builds `mapper.rs` alone; the crate
+   builds it alongside the `postgres` feature and everything that turns on.
+3. **Sibling-module name collisions.** `mapper.rs` sits next to `translate.rs`,
+   `keyset.rs`, `aggregate.rs` and `record_store.rs` here and next to nothing
+   there.
+
+**Not** the sqlx feature delta. The harness's set is a strict *subset* of the
+plugin's — the plugin adds `bigdecimal` and `migrate` — and cargo unifies
+features additively, so nothing the harness compiled can narrow here. A
+mismatch in that direction is impossible; do not spend time on it.
 
 - [ ] **Step 6: Commit**
 
