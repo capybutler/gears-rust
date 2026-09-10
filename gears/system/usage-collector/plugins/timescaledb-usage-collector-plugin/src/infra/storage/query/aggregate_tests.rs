@@ -21,7 +21,8 @@ use super::super::{
     ledger_from_clause, push_metadata_filter_clauses, push_meter_and_range_clauses,
 };
 use super::{
-    aggregate_limit_clause, dimension_select_expr, fold_select_expr, withdrawal_exclusion_clause,
+    aggregate_limit_clause, dimension_presence_guard, dimension_select_expr, fold_select_expr,
+    withdrawal_exclusion_clause,
 };
 
 #[test]
@@ -319,6 +320,14 @@ fn misqualified_columns(sql: &str) -> Vec<&'static str> {
 /// column — this module's, all but [`aggregate_limit_clause`] whose output is a
 /// row count, plus the builders both read paths share.
 ///
+/// `translate_scope`'s output is the one fragment of an assembled statement
+/// that is **not** here, and it is the one that does not qualify:
+/// [`record_column`](super::super::translate::record_column) returns bare
+/// column names, so a translated `$filter` reads `tenant_id = $4`. That is
+/// correct SQL — one table is in scope in the outer `WHERE`, so the alias is
+/// implicit — and it is shared with the list path rather than this one's.
+/// `RECORD_COLUMNS` in the list `SELECT` is bare for the same reason.
+///
 /// The two `match` statements are exhaustiveness witnesses and nothing else:
 /// adding a variant to either enum fails to compile *here*, next to the array
 /// that needs its new entry. Without them a new dimension arm reds only
@@ -380,7 +389,15 @@ fn all_fragments() -> Vec<String> {
             | AggregationDimension::SubjectType
             | AggregationDimension::Metadata(_) => {}
         }
-        fragments.push(dimension_select_expr(&dim, &mut ctx));
+        let expr = dimension_select_expr(&dim, &mut ctx);
+        // The `WHERE` half of the same dimension. It is derived from `expr`, so
+        // it inherits the alias qualification rather than choosing one — but
+        // walking it anyway is what keeps that a fact about the code instead of
+        // a fact about how it happens to be written today.
+        if let Some(guard) = dimension_presence_guard(&dim, &expr) {
+            fragments.push(guard);
+        }
+        fragments.push(expr);
     }
     fragments
 }

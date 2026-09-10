@@ -95,8 +95,10 @@ pub fn record_column(field_name: &str) -> Option<&'static str> {
 ///
 /// `next` is the next `$N` index to emit; `binds` is the ordered list of
 /// values to apply (via [`bind_one`]) in `$1, $2, …` order. Callers seed the
-/// start index so a filter fragment can follow leading binds (e.g. a `gts_id`
-/// bound at `$1`).
+/// start index so a filter fragment can follow a bind applied outside the
+/// counter — the point lookup's `id` at `$1` is the one such caller left. The
+/// collection paths seed at 1: their leading value is the meter, and it is
+/// pushed through this counter like everything else.
 pub struct SqlCtx {
     next: usize,
     /// Accumulated binds in placeholder order. Crate-visible: read only by the

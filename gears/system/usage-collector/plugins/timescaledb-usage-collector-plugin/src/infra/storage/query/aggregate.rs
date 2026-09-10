@@ -12,6 +12,8 @@
 //! - [`withdrawal_exclusion_clause`] — the two obligations a withdrawn pair
 //!   places on every fold.
 //! - [`dimension_select_expr`] — a group dimension as a TEXT-returning expr.
+//! - [`dimension_presence_guard`] — the `WHERE` half of that dimension, for the
+//!   three whose column can be `NULL`.
 //! - [`aggregate_limit_clause`] — the distinct-group cardinality bound.
 //!
 //! Every identifier comes from a closed enum match (an allowlist), never from
@@ -136,6 +138,55 @@ pub fn dimension_select_expr(dim: &AggregationDimension, ctx: &mut SqlCtx) -> St
             let n = ctx.push(SqlBind::Str(key.as_str().to_owned()));
             format!("r.metadata ->> ${n}")
         }
+    }
+}
+
+/// The presence guard a grouped dimension needs so a row missing that
+/// dimension is dropped rather than folded into a `NULL` bucket.
+///
+/// Built from `select_expr` — the very string the `GROUP BY` ordinal points
+/// at — so it is by construction the exact negation of "the grouping
+/// expression yields `NULL`" and cannot drift from the expression it guards.
+/// For a metadata dimension that reads `r.metadata ->> $N IS NOT NULL`, whose
+/// bound key is the one [`dimension_select_expr`] already pushed; the key is
+/// therefore bound once, not twice.
+///
+/// `IS NOT NULL` over `->>` rather than the containment operator `?`: they
+/// disagree on a key present with JSON `null`, where `?` is true and `->>` is
+/// `NULL`, and it is `NULL` that decides the bucket. (Where containment really
+/// is wanted the unambiguous spelling is `jsonb_exists(r.metadata, $N)`; a bare
+/// `?` collides with the placeholder syntax of some drivers.)
+///
+/// `None` for the three columns the schema declares `NOT NULL` — a guard on
+/// them would be dead SQL. The match is exhaustive on purpose: a new
+/// [`AggregationDimension`] variant fails to compile here, next to the decision
+/// it needs.
+///
+/// **The consequence is deliberate: grouped buckets need not sum to the
+/// ungrouped total.** Dropping the row is what the SDK both documents and
+/// does: `models.rs:1587-1592` says rows without a subject "are excluded from
+/// the grouping", and `contract/reference.rs:801` reads a grouped metadata key
+/// as `row.metadata.get(key).cloned()`, so an absent key yields `None` and the
+/// row joins no bucket.
+///
+/// **`DIVERGENCES.md` §G is not the citation for this**, though it is where a
+/// reader will look. §G records the question as still *open* — "DESIGN says
+/// nothing about the case", "that is an argument, not a ruling ... and it is a
+/// spec owner's to make", "do not write the check first". The ruling is this
+/// port's Task 18, which rewrites §G; until then the two SDK sites above are
+/// what this guard conforms to (`DIVERGENCES.md` §G, resolved by Task 18).
+///
+/// It was already true of the two subject dimensions; guarding the metadata one
+/// makes it uniform rather than accidental.
+#[must_use]
+pub fn dimension_presence_guard(dim: &AggregationDimension, select_expr: &str) -> Option<String> {
+    match dim {
+        AggregationDimension::SubjectId
+        | AggregationDimension::SubjectType
+        | AggregationDimension::Metadata(_) => Some(format!("{select_expr} IS NOT NULL")),
+        AggregationDimension::TenantId
+        | AggregationDimension::ResourceId
+        | AggregationDimension::ResourceType => None,
     }
 }
 

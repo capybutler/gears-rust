@@ -16,12 +16,12 @@ use usage_collector_sdk::{
 };
 
 use super::{
-    BATCH_INSERT_SQL, ConflictRead, DedupKey, INSERT_COLUMN_ARRAY_TYPES, INSERT_COLUMNS,
-    InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, SINGLE_INSERT_SQL,
-    batch_retry_backoff, batch_retry_backoff_base, build_aggregate_sql, build_get_sql,
-    build_list_page, build_list_sql, canonical_equal, dedup_key, invalidation_index_slots,
-    is_retryable_batch_error, plan_batch, record_row_key, row_dedup_key, scope_runs,
-    sequence_block, with_retry,
+    AggregateStatement, BATCH_INSERT_SQL, ConflictRead, DedupKey, INSERT_COLUMN_ARRAY_TYPES,
+    INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS,
+    SINGLE_INSERT_SQL, batch_retry_backoff, batch_retry_backoff_base, build_aggregate_sql,
+    build_get_sql, build_list_page, build_list_sql, canonical_equal, dedup_key,
+    invalidation_index_slots, is_retryable_batch_error, plan_batch, record_row_key, row_dedup_key,
+    scope_runs, sequence_block, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -2173,25 +2173,54 @@ fn metadata_dimension(key: &str) -> AggregationDimension {
 /// fails to compile in [`dimension_presence_guard`], and this array is what a
 /// reader checks the claim against.
 fn every_dimension() -> Vec<AggregationDimension> {
-    vec![
+    let dims = vec![
         AggregationDimension::TenantId,
         AggregationDimension::ResourceId,
         AggregationDimension::ResourceType,
         AggregationDimension::SubjectId,
         AggregationDimension::SubjectType,
         metadata_dimension(GROUPED_METADATA_KEY),
-    ]
+    ];
+    // The witness, and nothing else: a new variant fails to compile *here*,
+    // next to the array that needs its entry. Without it a new dimension reds
+    // `dimension_select_expr`'s own match in another file, nothing points the
+    // author at this list, and the tests below go on claiming a coverage they
+    // have silently stopped having.
+    for dim in &dims {
+        match dim {
+            AggregationDimension::TenantId
+            | AggregationDimension::ResourceId
+            | AggregationDimension::ResourceType
+            | AggregationDimension::SubjectId
+            | AggregationDimension::SubjectType
+            | AggregationDimension::Metadata(_) => {}
+        }
+    }
+    dims
 }
 
 /// Every fold the SDK declares, in variant order.
 fn every_fold() -> Vec<AggregationFold> {
-    vec![
+    let folds = vec![
         AggregationFold::Sum,
         AggregationFold::Count,
         AggregationFold::Min,
         AggregationFold::Max,
         AggregationFold::Latest,
-    ]
+    ];
+    // Same witness, same reason: a sixth fold would otherwise red
+    // `fold_select_expr` in another file and leave the two "every fold" tests
+    // below quietly covering five of six.
+    for fold in &folds {
+        match fold {
+            AggregationFold::Sum
+            | AggregationFold::Count
+            | AggregationFold::Min
+            | AggregationFold::Max
+            | AggregationFold::Latest => {}
+        }
+    }
+    folds
 }
 
 /// One grouped statement carrying every moving part at once: the meter and
@@ -2203,7 +2232,7 @@ fn every_fold() -> Vec<AggregationFold> {
 /// Two tests read it, because the statement text and the bind vector are two
 /// halves of one oracle and the text is the weaker half: it reads identically
 /// no matter which value lands in which placeholder.
-fn full_fold_statement() -> (String, Vec<SqlBind>) {
+fn full_fold_statement() -> AggregateStatement {
     let query = fold_query().with_filter(parse_scope(&format!(
         "tenant_id eq {SCOPE_TENANT_A} and resource_type eq 'vm'"
     )));
@@ -2225,7 +2254,7 @@ fn full_fold_statement() -> (String, Vec<SqlBind>) {
 
 #[test]
 fn the_fold_assembles_one_statement_from_the_builders_both_read_paths_share() {
-    let (sql, _binds) = full_fold_statement();
+    let sql = full_fold_statement().sql;
 
     // Transcribed by hand, from the shape the SPI describes rather than from
     // anything a builder produces — including the `100001`, which is
@@ -2256,7 +2285,7 @@ fn the_fold_binds_the_meter_and_both_range_bounds_ahead_of_everything() {
     // `query_tests.rs` pins what `push_meter_and_range_clauses` binds in
     // isolation. What is this builder's is that it calls that builder first, so
     // the three land at $1..=$3 with the caller's own values behind them.
-    let (_sql, binds) = full_fold_statement();
+    let binds = full_fold_statement().binds;
 
     assert!(
         matches!(&binds[0], SqlBind::Str(s) if s == VCPU_METER),
@@ -2285,7 +2314,7 @@ fn the_fold_binds_its_callers_values_behind_the_range() {
     // by value in placeholder order, with the length assertion a completeness
     // check on that set rather than the oracle itself. All five are `text` or
     // `uuid` binds into a statement whose text cannot tell them apart.
-    let (_sql, binds) = full_fold_statement();
+    let binds = full_fold_statement().binds;
 
     assert_eq!(
         binds.len(),
@@ -2324,7 +2353,7 @@ fn the_fold_binds_its_callers_values_behind_the_range() {
 
 #[test]
 fn the_folds_from_clause_is_the_one_constant_both_read_paths_read() {
-    let (sql, _binds) = build_aggregate_sql(
+    let AggregateStatement { sql, .. } = build_aggregate_sql(
         &list_meter(),
         list_range(),
         AggregationFold::Sum,
@@ -2352,9 +2381,9 @@ fn no_fold_escapes_the_withdrawal_exclusion() {
     // pins that the statement builder applies it at all, under each fold in
     // turn. Deleting the one `clauses.push` reds all five arms of this loop.
     for fold in every_fold() {
-        let (sql, _binds) =
-            build_aggregate_sql(&list_meter(), list_range(), fold, &fold_query(), &[], &[])
-                .expect("a well-formed fold must render");
+        let sql = build_aggregate_sql(&list_meter(), list_range(), fold, &fold_query(), &[], &[])
+            .expect("a well-formed fold must render")
+            .sql;
 
         assert!(
             sql.contains(withdrawal_exclusion_clause()),
@@ -2384,7 +2413,7 @@ fn the_fold_carries_no_status_predicate() {
     // the right thing to grep, and grouping by every dimension at once is the
     // widest text this builder can produce.
     for fold in every_fold() {
-        let (sql, _binds) = build_aggregate_sql(
+        let AggregateStatement { sql, .. } = build_aggregate_sql(
             &list_meter(),
             list_range(),
             fold,
@@ -2412,7 +2441,7 @@ fn the_no_grouping_case_is_one_bare_aggregate_row() {
     // no dimensions the ordinal list is empty, which is a syntax error, and
     // with a `1` bolted on it would group by the fold itself), and emitting the
     // bucket `LIMIT` when there is no group cardinality to bound.
-    let (sql, binds) = build_aggregate_sql(
+    let AggregateStatement { sql, binds, .. } = build_aggregate_sql(
         &list_meter(),
         list_range(),
         AggregationFold::Count,
@@ -2465,7 +2494,7 @@ fn grouping_numbers_its_ordinals_from_one_and_bounds_the_bucket_count() {
     // every placeholder after it. Ordinals are 1-based — a 0-based list is a
     // `PostgreSQL` error rather than a silently wrong grouping, but only for
     // the first ordinal, so the three-dimension case is what pins the shape.
-    let (sql, binds) = build_aggregate_sql(
+    let AggregateStatement { sql, binds, .. } = build_aggregate_sql(
         &list_meter(),
         list_range(),
         AggregationFold::Max,
@@ -2501,6 +2530,66 @@ fn grouping_numbers_its_ordinals_from_one_and_bounds_the_bucket_count() {
 }
 
 #[test]
+fn the_builder_reports_the_dimension_count_its_select_list_was_built_from() {
+    // `dim_count` travels with the statement so the decoder reads exactly as
+    // many key columns as the SELECT list emits, rather than deriving the
+    // number again from `group_by`. That buys nothing unless the reported count
+    // and the statement agree: they are two separate outputs of one builder,
+    // and pinning the count to a constant leaves every SQL oracle in this file
+    // green.
+    //
+    // Transcribed by hand: k dimensions means k leading key columns, `GROUP BY
+    // 1..=k`, and `dim_count == k`. The empty case carries no `GROUP BY` at
+    // all, which is why the third assertion is a two-way one rather than a
+    // suffix match `""` would satisfy for free.
+    for (group_by, count, tail) in [
+        (vec![], 0usize, ""),
+        (
+            vec![AggregationDimension::TenantId],
+            1,
+            " GROUP BY 1 LIMIT 100001",
+        ),
+        (
+            vec![
+                AggregationDimension::TenantId,
+                AggregationDimension::ResourceId,
+                metadata_dimension(GROUPED_METADATA_KEY),
+            ],
+            3,
+            " GROUP BY 1, 2, 3 LIMIT 100001",
+        ),
+    ] {
+        let statement = build_aggregate_sql(
+            &list_meter(),
+            list_range(),
+            AggregationFold::Sum,
+            &fold_query(),
+            &[],
+            &group_by,
+        )
+        .expect("a well-formed fold must render");
+
+        assert_eq!(
+            statement.dim_count, count,
+            "the statement was built from {count} dimensions and must say so. \
+             got: {}",
+            statement.sql
+        );
+        assert!(
+            statement.sql.ends_with(tail),
+            "the GROUP BY must carry one ordinal per dimension. got: {}",
+            statement.sql
+        );
+        assert_eq!(
+            statement.sql.contains("GROUP BY"),
+            count > 0,
+            "grouping by nothing is what a bare aggregate already does. got: {}",
+            statement.sql
+        );
+    }
+}
+
+#[test]
 fn a_nullable_dimension_drops_the_rows_that_do_not_carry_it() {
     // The absent-dimension rule, uniform across all three dimensions that can
     // be `NULL`: drop the row rather than fold it into a `NULL` bucket. What
@@ -2532,7 +2621,7 @@ fn a_nullable_dimension_drops_the_rows_that_do_not_carry_it() {
             "r.metadata ->> $4 IS NOT NULL",
         ),
     ] {
-        let (sql, _binds) = build_aggregate_sql(
+        let AggregateStatement { sql, .. } = build_aggregate_sql(
             &list_meter(),
             list_range(),
             AggregationFold::Sum,
@@ -2573,7 +2662,7 @@ fn the_three_never_null_dimensions_get_no_dead_guard() {
     // schema, so a presence guard on them is dead SQL that the planner still
     // has to carry. The mutation this kills is the tempting uniform one: guard
     // every dimension because three of them need it.
-    let (sql, _binds) = build_aggregate_sql(
+    let AggregateStatement { sql, .. } = build_aggregate_sql(
         &list_meter(),
         list_range(),
         AggregationFold::Sum,
@@ -2608,7 +2697,7 @@ fn the_folds_disjunctive_scope_survives_the_conjunction_with_the_range() {
          (tenant_id eq {SCOPE_TENANT_B} and resource_type eq 'vm')"
     )));
 
-    let (sql, binds) = build_aggregate_sql(
+    let AggregateStatement { sql, binds, .. } = build_aggregate_sql(
         &list_meter(),
         list_range(),
         AggregationFold::Sum,
@@ -2642,6 +2731,51 @@ fn the_folds_disjunctive_scope_survives_the_conjunction_with_the_range() {
          scope silently narrows to one. got: {:?}",
         binds[5]
     );
+}
+
+#[tokio::test]
+async fn a_fold_that_cannot_be_built_never_reaches_the_pool() {
+    // `aggregate` claims the statement is built before a connection is
+    // acquired. `the_ungrouped_fold_still_reaches_the_pool` does not pin that:
+    // `Transient` is what a pool timeout answers under *either* order, so
+    // swapping the two statements leaves it green. This is the half that pins
+    // the order, and it is the fold analogue of
+    // `a_page_that_cannot_be_built_never_reaches_the_pool`.
+    //
+    // `gts_type_id` is a real column but not a filterable field, so
+    // `record_column` refuses it and `build_aggregate_sql` errs. Against a lazy
+    // pool at a dead DSN, an `Internal` naming the field is proof the fold
+    // stopped before it touched anything; acquiring first would answer
+    // `Transient` and lose the refusal.
+    let store = lazy_store();
+    let query = fold_query().with_filter(parse_scope(
+        "gts_type_id eq 'gts.cf.core.uc.usage_record.v1~'",
+    ));
+
+    let Err(err) = store
+        .aggregate(
+            list_meter(),
+            list_range(),
+            AggregationFold::Sum,
+            &query,
+            &[],
+            &[],
+        )
+        .await
+    else {
+        panic!("an untranslatable filter must not yield an aggregate");
+    };
+
+    match err {
+        UsageCollectorPluginError::Internal(message) => assert!(
+            message.contains("gts_type_id"),
+            "the refusal reaches the caller as-is. got: {message}"
+        ),
+        other => panic!(
+            "an untranslatable filter must stop the fold before it acquires a \
+             connection; reaching the pool would answer Transient. got: {other:?}"
+        ),
+    }
 }
 
 #[tokio::test]
@@ -2716,7 +2850,7 @@ fn the_fold_reads_neither_the_cursor_nor_the_fingerprint_slot() {
     let with_fingerprint = fold_query().with_filter_hash(READ_FINGERPRINT.to_owned());
 
     let render = |query: &ODataQuery| {
-        let (sql, binds) = build_aggregate_sql(
+        let AggregateStatement { sql, binds, .. } = build_aggregate_sql(
             &list_meter(),
             list_range(),
             AggregationFold::Sum,

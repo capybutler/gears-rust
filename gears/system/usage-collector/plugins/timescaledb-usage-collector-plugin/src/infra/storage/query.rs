@@ -95,6 +95,16 @@ pub fn push_meter_and_range_clauses(
 /// list it walks and refuses a bare ledger column — the same test the two
 /// siblings above name.
 ///
+/// "Like every other fragment" is not literally every one: a translated
+/// `$filter` reads `tenant_id = $4`, because
+/// [`translate::record_column`] returns bare column names, and the list
+/// `SELECT`'s own column list is bare for the same reason. Both are correct —
+/// one table is in scope in the outer `WHERE`, so the alias is implicit — and
+/// both are shared with the list path. What the qualification buys here is the
+/// fragments that are *not* implicit: the withdrawal exclusion opens a second
+/// `usage_records` as `w`, and inside a statement holding two, an unqualified
+/// column is the one thing that cannot be read off the page.
+///
 /// An empty value set matches nothing (the gateway rejects it, but be
 /// defensive): a `FALSE` clause is emitted so the result is empty rather than
 /// unfiltered.

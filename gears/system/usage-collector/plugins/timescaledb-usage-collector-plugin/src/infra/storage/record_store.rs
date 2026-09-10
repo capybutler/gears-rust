@@ -45,7 +45,8 @@ use crate::infra::storage::mapper::{
     invalidation_to_row, metadata_jsonb_to_map, metadata_map_to_jsonb, record_row_to_model,
 };
 use crate::infra::storage::query::aggregate::{
-    aggregate_limit_clause, dimension_select_expr, fold_select_expr, withdrawal_exclusion_clause,
+    aggregate_limit_clause, dimension_presence_guard, dimension_select_expr, fold_select_expr,
+    withdrawal_exclusion_clause,
 };
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
@@ -1135,11 +1136,13 @@ fn require_filter_hash(query: &ODataQuery) -> Result<&str, String> {
 /// statement assembly, and that is all this function should ever grow.
 ///
 /// Binds start at `$2` because the `id` occupies `$1`; [`PgRecordStore::get`]
-/// binds the `id` first, before these, for that reason. The seeding matches
-/// [`PgRecordStore::list`] and [`PgRecordStore::aggregate`], which seed the same
-/// way behind their leading `gts_id` bind. Only the ordered bind values are
-/// returned, not the [`SqlCtx`]: the statement is finished, so there is nothing
-/// left for a caller to legitimately push.
+/// binds the `id` first, before these, for that reason. **This is the only
+/// seeded caller in the crate.** Both collection paths seed at 1: their leading
+/// value is the meter, and it goes through the same [`SqlCtx`] as everything
+/// else (`push_meter_and_range_clauses`), so there is no bind outside the
+/// counter for them to seed past. Only the ordered bind values are returned,
+/// not the [`SqlCtx`]: the statement is finished, so there is nothing left for a
+/// caller to legitimately push.
 ///
 /// # Errors
 ///
@@ -1750,52 +1753,22 @@ fn canonical_equal(
         && stored_metadata == incoming.metadata)
 }
 
-/// The presence guard a grouped dimension needs so a row missing that
-/// dimension is dropped rather than folded into a `NULL` bucket.
+/// One assembled aggregate statement: the SQL, the binds in placeholder order,
+/// and **the dimension count the SELECT list was actually built from**.
 ///
-/// Built from `select_expr` — the very string the `GROUP BY` ordinal points
-/// at — so it is by construction the exact negation of "the grouping
-/// expression yields `NULL`" and cannot drift from the expression it guards.
-/// For a metadata dimension that reads `r.metadata ->> $N IS NOT NULL`, whose
-/// bound key is the one [`dimension_select_expr`] already pushed; the key is
-/// therefore bound once, not twice.
-///
-/// `IS NOT NULL` over `->>` rather than the containment operator `?`: they
-/// disagree on a key present with JSON `null`, where `?` is true and `->>` is
-/// `NULL`, and it is `NULL` that decides the bucket. (Where containment really
-/// is wanted the unambiguous spelling is `jsonb_exists(r.metadata, $N)`; a bare
-/// `?` collides with the placeholder syntax of some drivers.)
-///
-/// `None` for the three columns the schema declares `NOT NULL` — a guard on
-/// them would be dead SQL. The match is exhaustive on purpose: a new
-/// [`AggregationDimension`] variant fails to compile here, next to the decision
-/// it needs.
-///
-/// **The consequence is deliberate: grouped buckets need not sum to the
-/// ungrouped total.** Dropping the row is what the SDK both documents and
-/// does: `models.rs:1587-1592` says rows without a subject "are excluded from
-/// the grouping", and `contract/reference.rs:801` reads a grouped metadata key
-/// as `row.metadata.get(key).cloned()`, so an absent key yields `None` and the
-/// row joins no bucket.
-///
-/// **`DIVERGENCES.md` §G is not the citation for this**, though it is where a
-/// reader will look. §G records the question as still *open* — "DESIGN says
-/// nothing about the case", "that is an argument, not a ruling ... and it is a
-/// spec owner's to make", "do not write the check first". The ruling is this
-/// port's Task 18, which rewrites §G; until then the two SDK sites above are
-/// what this guard conforms to (`DIVERGENCES.md` §G, resolved by Task 18).
-///
-/// It was already true of the two subject dimensions; guarding the metadata one
-/// makes it uniform rather than accidental.
-fn dimension_presence_guard(dim: &AggregationDimension, select_expr: &str) -> Option<String> {
-    match dim {
-        AggregationDimension::SubjectId
-        | AggregationDimension::SubjectType
-        | AggregationDimension::Metadata(_) => Some(format!("{select_expr} IS NOT NULL")),
-        AggregationDimension::TenantId
-        | AggregationDimension::ResourceId
-        | AggregationDimension::ResourceType => None,
-    }
+/// `dim_count` is carried rather than recomputed by the caller. It is the count
+/// [`build_aggregate_sql`] used to number the `GROUP BY` ordinals and to place
+/// the fold at the end of the SELECT list, and it is what the decoder must read
+/// the same number of key columns with. Derived a second time at the call site
+/// — from `group_by.len()`, which is equal today — the two could drift with
+/// nothing to notice: no unit test executes a statement, so a decoder reading
+/// the wrong number of columns is invisible until a live query. Returning it
+/// makes "the decoder is handed the count the SELECT list was built from" true
+/// by construction instead of a claim needing a backend to check.
+struct AggregateStatement {
+    sql: String,
+    binds: Vec<SqlBind>,
+    dim_count: usize,
 }
 
 /// Build the pushed-down aggregate statement and its binds, in placeholder
@@ -1827,7 +1800,7 @@ fn dimension_presence_guard(dim: &AggregationDimension, select_expr: &str) -> Op
 /// outside the grant. Nothing at this layer can tell how many constraints the
 /// PDP returned, so the parenthesized spelling is the only safe one.
 ///
-/// **No slot of `query` beyond `filter` and `filter_hash`'s absence is read.**
+/// **No slot of `query` beyond `filter` is read.**
 /// This path paginates nothing and mints no cursor, so `query.cursor`,
 /// `query.filter_hash` and `query.limit` reach neither the statement nor the
 /// binds — the SPI is explicit that an aggregate implementation must not read
@@ -1850,7 +1823,7 @@ fn build_aggregate_sql(
     query: &ODataQuery,
     metadata_filter: &[MetadataFilter],
     group_by: &[AggregationDimension],
-) -> Result<(String, Vec<SqlBind>), String> {
+) -> Result<AggregateStatement, String> {
     let mut ctx = SqlCtx::new(1);
     let mut clauses: Vec<String> = Vec::new();
 
@@ -1903,8 +1876,8 @@ fn build_aggregate_sql(
         format!(" GROUP BY {ordinals}")
     };
 
-    Ok((
-        format!(
+    Ok(AggregateStatement {
+        sql: format!(
             "SELECT {select_list} FROM {} WHERE {}{group_by_sql}{}",
             // Called, never spelled: with a literal here the shared constant
             // would be decorative, and an alias change would red a test that
@@ -1913,8 +1886,11 @@ fn build_aggregate_sql(
             clauses.join(" AND "),
             aggregate_limit_clause(dim_count),
         ),
-        ctx.binds,
-    ))
+        binds: ctx.binds,
+        // The same count the SELECT list above was built from, handed to the
+        // decoder rather than derived again there.
+        dim_count,
+    })
 }
 
 /// Read one aggregate result row into a bucket: `dim_count` dimension columns
@@ -2212,11 +2188,18 @@ impl RecordStore for PgRecordStore {
     ///   reason: it is `SELECT COUNT(*)`'s own answer, not a special case here
     ///   ([`usage_collector_sdk::AggregationBucket::value`]).
     ///
-    /// Both are held rather than asserted:
-    /// `the_ungrouped_fold_still_reaches_the_pool` drives an empty `group_by`
-    /// against a lazy pool at a dead DSN and requires the pool timeout, so the
-    /// ungrouped fold cannot answer without asking, and cannot acquire a
-    /// connection before it has a statement to run.
+    /// Both are held rather than asserted, by one test each against a lazy pool
+    /// at a dead DSN — where reaching the pool answers `Transient` and stopping
+    /// before it answers `Internal`.
+    /// `a_fold_that_cannot_be_built_never_reaches_the_pool` gives the fold a
+    /// filter naming a field the allowlist refuses and requires the `Internal`,
+    /// which is the ordering claim: a statement that cannot be rendered must
+    /// not have acquired a connection first.
+    /// `the_ungrouped_fold_still_reaches_the_pool` gives it a renderable one and
+    /// requires the `Transient`, so the ungrouped fold cannot answer without
+    /// asking. `Transient` alone would not have pinned the order — it is
+    /// consistent with acquiring first — which is why the pair is needed and
+    /// not either half.
     ///
     /// The dimension columns read positionally as `Option<String>` and the fold
     /// at index `k` as `Option<BigDecimal>` — arbitrary precision, so a wide
@@ -2259,7 +2242,7 @@ impl RecordStore for PgRecordStore {
         );
         self.metrics.inc_query_request(QueryKind::Aggregated);
 
-        let (sql, binds) = build_aggregate_sql(
+        let statement = build_aggregate_sql(
             &gts_type_id,
             time_range,
             fold,
@@ -2269,8 +2252,8 @@ impl RecordStore for PgRecordStore {
         )
         .map_err(UsageCollectorPluginError::internal)?;
 
-        let mut q = sqlx::query(AssertSqlSafe(sql));
-        for b in &binds {
+        let mut q = sqlx::query(AssertSqlSafe(statement.sql));
+        for b in &statement.binds {
             q = bind_one_query(q, b);
         }
         let mut conn = self.timed_acquire().await?;
@@ -2283,21 +2266,17 @@ impl RecordStore for PgRecordStore {
         // `map` is what keeps the no-grouping case honest: no branch on
         // `group_by.is_empty()` exists to answer an empty bucket list with.
         //
-        // `group_by.len()` is the same count the SELECT list was built from —
-        // [`build_aggregate_sql`] pushes exactly one dimension expression per
-        // element — but nothing here observes that: no unit test executes a
-        // statement, and `PgRow` cannot be built off a connection. Handing the
-        // decoder a different count survives every test in the crate, and so
-        // would a short circuit placed *after* the fetch. Task 15's integration
-        // tests are where those are caught.
+        // The count comes from the statement that was built, not from a second
+        // reading of `group_by` here, so the decoder cannot read a different
+        // number of key columns than the SELECT list emits.
         //
-        // A short circuit placed where one would actually be written — above
-        // the acquire, to skip the query — is a different matter and is
-        // covered: `the_ungrouped_fold_still_reaches_the_pool` requires the
-        // ungrouped fold to reach the pool.
+        // What no unit test can still see is a short circuit placed *after* the
+        // fetch, where the branch is a no-op on an empty row set. One placed
+        // where it would actually be written — above the acquire, to skip the
+        // query — is covered by `the_ungrouped_fold_still_reaches_the_pool`.
         let buckets = rows
             .iter()
-            .map(|row| aggregate_bucket(row, group_by.len()))
+            .map(|row| aggregate_bucket(row, statement.dim_count))
             .collect::<Result<Vec<_>, _>>()?;
 
         // `_timer` records `query.duration` on drop (success and error alike).
