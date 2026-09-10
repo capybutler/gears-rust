@@ -941,11 +941,11 @@ pub struct UsageRecordRow {
     /// `window_start` — inclusive start of the covered period.
     pub window_start: OffsetDateTime,
     /// `window_end` — exclusive end of the covered period, and the
-    /// hypertable time dimension. A read that carries a `time_range` selects
-    /// on this bound alone, `from <= window_end < to`
-    /// (`cpt-cf-usage-collector-adr-window-end-selection`), and no selection
-    /// predicate reads `window_start`. `get_usage_record` carries no range
-    /// and looks up by `id` instead.
+    /// hypertable time dimension. The time-range predicate reads this bound
+    /// alone, `from <= window_end < to` and never overlap or containment
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`);
+    /// `get_usage_record` carries no range at all and looks up by `id`
+    /// instead.
     pub window_end: OffsetDateTime,
     /// `resource_id` — resource attribution leaf.
     pub resource_id: String,
@@ -975,13 +975,13 @@ pub struct UsageRecordRow {
     /// the DDL `CHECK` pins.
     pub origin: String,
     /// `acceptance_sequence` — plugin-assigned, strictly monotonic per
-    /// `(tenant_id, gts_type_id)`. Not carried on the SDK model; this
-    /// backend assigns it and orders on it, and nothing reads it back out
-    /// through the SPI.
+    /// `(tenant_id, gts_type_id)`. Not carried on the SDK model; see the
+    /// struct doc.
     pub acceptance_sequence: i64,
     /// `metadata` — `jsonb` object of declared metadata keys → string values.
     pub metadata: serde_json::Value,
-    /// `ingested_at` — server insert timestamp (`DEFAULT now()`).
+    /// `ingested_at` — server insert timestamp (`DEFAULT now()`). Not
+    /// carried on the SDK model; see the struct doc.
     pub ingested_at: OffsetDateTime,
 }
 ```
@@ -990,6 +990,16 @@ Note `entry_type` is **not** a field. It is a generated column that exists so
 `$filter` can name it; nothing decodes it, because the SDK model derives the
 same fact from `invalidation.is_some()`. Say that in the struct doc so the next
 reader does not "fix" the omission.
+
+The struct doc above is a placeholder one-liner. It also has to carry the
+paragraph the two field docs point at: `ingested_at` and `acceptance_sequence`
+are the two columns with no counterpart on the SDK's `UsageRecord`, so nothing
+carries them past this struct — `ingested_at` is the server insert time, and
+`acceptance_sequence` is assigned by this plugin, which the gear's DESIGN §3.7
+obliges to keep it strictly monotonic per `(tenant_id, gts_type_id)`. Say that
+they are decoded rather than left out of the struct, so a row is a faithful
+picture of what was stored. **Both field docs say "see the struct doc"**;
+skipping the paragraph leaves two dangling pointers.
 
 - [ ] **Correction: `sqlx::FromRow` decodes by NAME, not by position**
 
@@ -1029,9 +1039,11 @@ this port's characteristic defect committed deliberately.
 A follow-up concern held that the link is ambiguous and needs a `trait@`
 disambiguator, because `sqlx` re-exports `FromRow` at its root in two
 namespaces — the trait from `sqlx_core::from_row`, the derive from
-`sqlx_macros`. **Measured twice, and it does not warn.** A probe crate
+`sqlx_macros`. **Measured, and it does not warn.** A probe crate
 documenting both spellings side by side, plus a deliberately broken control
-link, against sqlx `=0.9.0` with `macros` + `postgres` on rustdoc 1.95.0:
+link, against sqlx `=0.9.0` with `macros` + `postgres`, on rustdoc 1.95.0 and
+again on 1.97.0 — the channel `rust-toolchain.toml` pins, so the result holds
+on the toolchain this repository actually builds with:
 
 - The control (`sqlx::NoSuchItemAnywhere`) warned and was the **only** warning,
   under `cargo doc --no-deps` and under a full `cargo doc` alike — so the
