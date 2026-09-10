@@ -1,10 +1,12 @@
 //! Aggregation SQL: inject-safe SELECT-expression and WHERE-clause builders for
 //! the pushed-down `aggregate` query.
 //!
-//! `aggregate` assembles `SELECT <dim exprs…>, <FOLD> FROM usage_records r
-//! WHERE <scope> AND <withdrawal exclusion> [AND …] [GROUP BY 1, 2, …]`. The
-//! scope predicates are the caller's; the builders here own the pieces it
-//! composes them with:
+//! These fragments compose into
+//! `SELECT <dim exprs…>, <FOLD> FROM usage_records r WHERE <scope> AND
+//! <withdrawal exclusion> [AND …] [GROUP BY 1, 2, …]`. The `FROM` and the scope
+//! predicates are the caller's — including the `r` alias, which is a stated
+//! precondition rather than something this module can emit. The builders here
+//! own the rest:
 //!
 //! - [`agg_select_expr`] — the aggregate column for a fold that is an aggregate
 //!   function.
@@ -46,7 +48,8 @@ use super::translate::SqlCtx;
 /// the latter serves no `LATEST` meter at all.
 ///
 /// The returned string is a `'static` constant from the closed enum match,
-/// never caller text, and qualifies its column with the caller's `r` alias.
+/// never caller text. Every arm that names a column qualifies it with the
+/// caller's `r` alias; `COUNT(*)` names none.
 #[must_use]
 pub fn agg_select_expr(fold: AggregationFold) -> Option<&'static str> {
     match fold {
@@ -75,7 +78,10 @@ pub fn agg_select_expr(fold: AggregationFold) -> Option<&'static str> {
 /// blocked for the same reason (it sits in the SDK's `BLOCKED_CHECKS`;
 /// `DIVERGENCES.md` entries 10 and 19 carry the standing record). **A green
 /// contract run therefore says nothing about this expression in either
-/// direction — nothing asserts it.** What pins it is this module's own tests.
+/// direction.** Not merely because no check asserts the tie-break: the suite in
+/// `usage-collector-sdk/src/contract/checks/` calls the aggregate method twice
+/// and passes `AggregationFold::Sum` both times, so it never reaches this
+/// expression at all. What pins it is this module's own tests.
 ///
 /// `ARRAY_AGG(… ORDER BY …)[1]` renders the pick rather than `DISTINCT ON`
 /// because it composes with a `GROUP BY` over arbitrary dimensions, which
@@ -113,6 +119,11 @@ pub fn latest_select_expr() -> &'static str {
 /// contributes nothing — admitting it would be the echoed quantity reported
 /// with nothing left to pair it against.
 ///
+/// The `invalidation-excluded-from-fold` contract check exercises this, but
+/// under `AggregationFold::Sum` only — the whole suite passes no other fold —
+/// so the property that makes this one clause rather than five, its holding
+/// under every fold, is pinned here and nowhere else.
+///
 /// # Precondition
 ///
 /// The caller MUST alias `usage_records` as `r` in the outer query's `FROM`.
@@ -143,29 +154,35 @@ pub fn withdrawal_exclusion_clause() -> &'static str {
 /// `DIVERGENCES.md` entry 15 holds that gap open, and growing the enum is not
 /// this backend's to do.
 ///
-/// # An open question this expression does not answer
+/// # The absent-dimension rule, which lives at the caller
 ///
 /// A row whose dimension column is `NULL` — no `subject_ref`, or a metadata key
-/// absent from the row — has no dimension value to group by, and the two
-/// implementations of this contract disagree about it. `InMemoryReferencePlugin`
-/// **drops** such a row from the grouping entirely; a bare column in a SQL
-/// `GROUP BY`, which is what this function returns, **collects** them into a
-/// `NULL` group. Grouped buckets then need not sum to the ungrouped total, so
-/// an exemplar backend and a SQL projection give different answers for the same
-/// ledger with nothing failing.
+/// absent from the row — has no dimension value to group by, and this file
+/// cannot say which answer the backend gives: the aggregate caller today guards
+/// the two subject dimensions with an `IS NOT NULL` predicate and guards
+/// [`AggregationDimension::Metadata`] with nothing, so metadata is where the
+/// two backends actually differ. What this function returns is a bare column,
+/// which in a SQL `GROUP BY` **collects** such rows into a `NULL` group;
+/// `InMemoryReferencePlugin` **drops** them, for every dimension including an
+/// absent metadata key.
 ///
-/// `DIVERGENCES.md` §G records this as a spec question before it is a check:
-/// DESIGN says nothing about the case, and the published wire shape may already
-/// have decided it, since `AggregationBucket.key` types every item as a
-/// non-nullable string. The SDK is not wholly silent — the doc on
+/// `DIVERGENCES.md` §G raised this as a spec question rather than a check, and
+/// **the spec owner has since settled it: drop the row.** That matches the
+/// reference backend, and it matches what the SDK had already documented on
 /// [`AggregationDimension::SubjectId`] and
-/// [`AggregationDimension::SubjectType`] says rows without a subject are
-/// excluded from the grouping, which is the drop answer for those two and
-/// leaves [`AggregationDimension::Metadata`] unstated. **The rest is a spec
-/// owner's**, so nothing here picks an answer and no test in this module pins
-/// either behaviour. A caller that wants a row dropped must add its own
-/// not-null guard to the `WHERE` clause; this function neither adds one nor
-/// assumes one.
+/// [`AggregationDimension::SubjectType`] — rows without a subject are excluded
+/// from the grouping — which left only [`AggregationDimension::Metadata`]
+/// unstated. It also fits the published wire shape, where
+/// `AggregationBucket.key` types every item as a non-nullable string with no
+/// null spelling available.
+///
+/// The consequence, now uniform rather than accidental: **grouped buckets need
+/// not sum to the ungrouped total.**
+///
+/// The guard is the caller's to emit, not this expression's — a `GROUP BY`
+/// ordinal cannot carry a `WHERE` predicate — so nothing changes here and no
+/// test in this module pins the rule. The caller owes a not-null predicate for
+/// every dimension it renders, `Metadata` included.
 ///
 /// Returns the SELECT expression string (used positionally; the `GROUP BY`
 /// references it by ordinal so the bound metadata expr is never repeated).

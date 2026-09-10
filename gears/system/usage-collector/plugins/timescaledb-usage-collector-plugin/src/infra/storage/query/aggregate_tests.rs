@@ -171,41 +171,61 @@ fn identity_dimensions_emit_static_columns_and_bind_nothing() {
 
 // ── alias coupling ───────────────────────────────────────────────────────────
 
-/// Column names this module's fragments may reference. Every occurrence must
-/// carry a table qualifier, or the fragment binds to whatever the caller's
-/// `FROM` happens to expose.
+/// The ledger table's full column set, verbatim from `migrations/0001_init.sql`
+/// in declaration order — **not** the subset today's fragments happen to name.
+/// The difference is the whole point of the guard: an arm added later reaches
+/// for a column no fragment mentions yet, and `origin` is the one
+/// `DIVERGENCES.md` entry 15 proposes adding next. Every occurrence of any of
+/// these must carry a table qualifier, or the fragment binds to whatever the
+/// caller's `FROM` happens to expose.
 const LEDGER_COLUMNS: &[&str] = &[
     "id",
-    "value",
-    "window_end",
-    "acceptance_sequence",
     "tenant_id",
+    "gts_type_id",
+    "value",
+    "window_start",
+    "window_end",
     "resource_id",
     "resource_type",
     "subject_id",
     "subject_type",
-    "metadata",
+    "idempotency_key",
     "invalidates",
+    "reason_code",
+    "origin",
+    "entry_type",
+    "acceptance_sequence",
+    "metadata",
+    "ingested_at",
 ];
 
-/// The two aliases a fragment may qualify a column with: `r`, the outer
-/// query's alias for `usage_records`, and `w`, the withdrawal subquery's own.
-const ALIASES: &[u8] = b"rw";
+/// The aliases `sql` may qualify a column with. `r`, the outer query's alias
+/// for `usage_records`, is always admissible. `w` is admissible only in a
+/// fragment that declares it, so a fragment borrowing the withdrawal
+/// subquery's alias without opening the subquery is an offender rather than a
+/// pass.
+fn aliases_for(sql: &str) -> &'static [u8] {
+    if sql.contains("FROM usage_records w") {
+        b"rw"
+    } else {
+        b"r"
+    }
+}
 
-/// Whether the ledger column starting at `at` carries one of [`ALIASES`] as
-/// its qualifier. A bare column, or one qualified with any other alias, is
-/// false.
+/// Whether the ledger column starting at `at` carries one of the aliases
+/// [`aliases_for`] admits. A bare column, or one qualified with any other
+/// alias, is false.
 fn is_qualified(sql: &str, at: usize) -> bool {
     let b = sql.as_bytes();
     at >= 2
         && b[at - 1] == b'.'
-        && ALIASES.contains(&b[at - 2])
+        && aliases_for(sql).contains(&b[at - 2])
         && (at == 2 || !(b[at - 3].is_ascii_alphanumeric() || b[at - 3] == b'_'))
 }
 
-/// Every ledger column in `sql` that is not qualified with `r.` or `w.`.
-/// Splits on identifier boundaries so `subject_id` is one token rather than a
-/// `subject_type` plus an `id`.
+/// Every ledger column in `sql` that is not qualified with an alias
+/// [`aliases_for`] admits. Splits on identifier boundaries so `subject_id` is
+/// one token rather than a `subject_type` plus an `id`.
 fn misqualified_columns(sql: &str) -> Vec<&'static str> {
     let mut offenders = Vec::new();
     let mut start = 0;
@@ -266,10 +286,12 @@ fn every_fragment_qualifies_its_columns_with_the_r_alias() {
     // `usage_records` as `r`; these fragments hard-code it, and a caller that
     // aliases differently produces invalid SQL at runtime with no compile
     // error. This is the half of that coupling this file can pin: no fragment
-    // may name a bare column, and none may reach for an alias the others do
-    // not share, so a fragment drifting off `r` is caught here rather than by
-    // a query failing against a live database. It holds over fragments an arm
-    // added later emits too, which the exact-string tests above cannot.
+    // may name a bare column, and none may reach for an alias it did not open,
+    // so a fragment drifting off `r` is caught here rather than by a query
+    // failing against a live database. Because `LEDGER_COLUMNS` is the
+    // migration's whole column set rather than the subset in use, it holds
+    // over the fragments an arm added later emits too -- an `origin`
+    // dimension, say -- which the exact-string tests above cannot.
     for fragment in all_fragments() {
         assert!(
             misqualified_columns(&fragment).is_empty(),
