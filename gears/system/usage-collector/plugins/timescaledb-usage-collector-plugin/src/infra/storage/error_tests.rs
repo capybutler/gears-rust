@@ -24,6 +24,41 @@ fn unique_violation_on_unknown_constraint_is_other() {
 fn unique_violation_without_constraint_is_other() {
     assert_eq!(classify_db("23505", None), DbErrorClass::Other);
 }
+
+/// The schema has no foreign key — the only one, `usage_records_gts_id_fk`,
+/// went with the `usage_type_catalog` table — so 23503 is unreachable and must
+/// classify as `Other`. This pins in code the claim `classify_db` currently
+/// only makes in a comment.
+///
+/// The mutation it defends against is widening the dedup arm's guard from the
+/// exact `"23505"` to the SQLSTATE *class*, `c if c.starts_with("23")`, which
+/// would read a foreign-key violation as a dedup conflict. `unknown_code_is_other`
+/// structurally cannot see that: `42601` is syntax-class and stays `Other`
+/// under the widening.
+///
+/// The second assertion is the one that kills it, and it is deliberately an
+/// input the database will never produce. Under the widening the *realistic*
+/// pairing (23503 with the FK's own name) still falls to the inner arm's `_`
+/// and stays `Other`, so it would not discriminate on its own; pairing 23503
+/// with the dedup constraint's name is what forces the inner arm to fire.
+/// Together they say the load-bearing thing: it is the *code* that makes
+/// something a dedup conflict, not the constraint name riding along with it.
+#[test]
+fn fk_violation_is_other_because_the_schema_has_no_foreign_key() {
+    assert_eq!(
+        classify_db("23503", Some("usage_records_gts_id_fk")),
+        DbErrorClass::Other,
+        "the base migration creates no foreign key, so 23503 has no meaning to \
+         classify and must not resurrect a dedicated class"
+    );
+    assert_eq!(
+        classify_db("23503", Some("usage_records_dedup_uniq")),
+        DbErrorClass::Other,
+        "23503 shares its SQLSTATE class with the special-cased 23505, so a \
+         guard widened to the class would misread this as a dedup conflict"
+    );
+}
+
 #[test]
 fn connection_class_is_transient() {
     assert_eq!(classify_db("08006", None), DbErrorClass::Transient);
