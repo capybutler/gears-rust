@@ -3633,7 +3633,13 @@ editing the literal; with the call, the two sides cannot drift without the test
 following.
 
 **2. The absent-dimension rule is settled: drop the row — and `Metadata` is the
-dimension that does not yet obey it.** `aggregate` today pushes
+dimension that does not yet obey it.** (Settled by *this plan*, at Task 18.
+**`DIVERGENCES.md` §G still records the question as open** — "DESIGN says
+nothing about the case", "that is an argument, not a ruling", "do not write the
+check first" — and Task 18 rewrites it. So §G is not a citation for the rule;
+the SDK's own `models.rs:1587-1592` and `contract/reference.rs:801` are, and a
+divergence pointer must read "resolved by Task 18". Task 12 corrected three
+sites that cited §G as the ruling, one of them propagated from Task 8.) `aggregate` today pushes
 `subject_id IS NOT NULL` / `subject_type IS NOT NULL` before rendering a subject
 dimension, and pushes nothing for `Metadata`, so a row missing the grouped key
 lands in a `NULL` bucket where `InMemoryReferencePlugin` drops it. **The spec
@@ -3691,18 +3697,29 @@ a hand-written empty-result short circuit that does not.
 
 Write a test for the empty-selection `COUNT` case naming its mutation.
 
-**Done, and the reachable half is smaller than the step assumed.** What a unit
-test can hold is the *statement*: `the_no_grouping_case_is_one_bare_aggregate_row`
-pins that an empty `group_by` emits no `GROUP BY` and no `LIMIT`, so
-`PostgreSQL` answers a bare aggregate with exactly one row and `COUNT(*)` with
-`0` rather than `NULL`. Two mutations die on it (`GROUP BY` emitted
-unconditionally; the bucket `LIMIT` emitted with no grouping). The short circuit
-itself — `if group_by.is_empty() { return Ok(AggregationResult { buckets:
-vec![] }) }` — **survives every test in the crate**, because no unit test
-executes a statement and `PgRow` cannot be built off a connection. The code is
-shaped so the branch has nowhere to go (`aggregate_bucket` is a 1:1 `map` over
-the fetched rows), and the comment at the call site says the mutation survives
-rather than claiming it is covered. Task 15 catches it.
+**Done, and the short circuit is covered.**
+`the_no_grouping_case_is_one_bare_aggregate_row` pins the *statement*: an empty
+`group_by` emits no `GROUP BY` and no `LIMIT`, so `PostgreSQL` answers a bare
+aggregate with exactly one row and `COUNT(*)` with `0` rather than `NULL`. Two
+mutations die on it (`GROUP BY` emitted unconditionally; the bucket `LIMIT`
+emitted with no grouping).
+
+The short circuit this step names —
+`if group_by.is_empty() { return Ok(AggregationResult { buckets: vec![] }) }` —
+**dies too**, and needs no live backend to do it. It is a `return` whose whole
+purpose is to skip the query, so it is written *above* the acquire, and the
+crate already owns the discriminator: `lazy_store()` holds a lazy pool at a dead
+DSN, so a path that reaches the pool answers `Transient` and one that
+short-circuits answers `Ok`.
+`the_ungrouped_fold_still_reaches_the_pool` requires the `Transient`, and also
+pins `aggregate`'s stated order — the statement is built before a connection is
+acquired — for the ungrouped case. (`list` had this test; the fold did not.)
+
+What is left needs Postgres, and only that: a short circuit placed *after* the
+fetch (a no-op on an empty row set), and the dimension count handed to
+`aggregate_bucket`. `aggregate_bucket` is a 1:1 `map` over the fetched rows, so
+neither has a natural place to be written, and the call-site comment names both
+as surviving rather than claiming coverage.
 
 - [x] **Step 4: `MUST NOT` read `filter_hash` here**
 
@@ -3837,7 +3854,8 @@ roughly doubled since Task 9 and this had never been run against the crate.
 cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets
 ```
 
-Expected: exits 0. **This is the first time since slice 4.**
+Expected: exits 0. **This is the first time since slice 4** — for the
+default feature set; `--features postgres` still carries Task 15's 61.
 
 - [ ] **Step 2b: Consider observing the at-most-one rejection (from Task 9's review)**
 
@@ -4119,9 +4137,11 @@ backend, and all three survive every test in the crate today:
 
 1. **A bare aggregate returns exactly one row**, so an empty `group_by` yields
    the single empty-keyed bucket the SPI asks for. Task 12 pins the *statement*
-   (no `GROUP BY`, no `LIMIT`) and shapes the decode as a 1:1 `map`, but a
-   hand-written `if group_by.is_empty() { … vec![] }` short circuit is still a
-   surviving mutation.
+   (no `GROUP BY`, no `LIMIT`), shapes the decode as a 1:1 `map`, and kills the
+   short circuit at the placement it would actually be written — above the
+   acquire, where `the_ungrouped_fold_still_reaches_the_pool` catches it. What
+   survives is only the weaker placement, *after* the fetch, where the branch is
+   a no-op on an empty row set and no unit test can tell.
 2. **`COUNT` over an empty selection is `Some(0)`, not `None`.** That is
    `SELECT COUNT(*)`'s own answer rather than anything the plugin does, which is
    exactly why only a real query demonstrates it.
