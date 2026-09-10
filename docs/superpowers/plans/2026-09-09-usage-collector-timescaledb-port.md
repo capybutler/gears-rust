@@ -3123,8 +3123,10 @@ retry."
 
 > **Inherited from Task 9's review — three citations in the read half point at
 > files that do not exist.** `record_store.rs` cites `plugin-spi.md` at three
-> places in code Tasks 10-12 own: `:1681` and `:1718` (the `corrects_id`
-> partition rationale, §Method 3) and `:1776` (the aggregate cap, §Method 3).
+> places in code Tasks 11-12 own: `:1873` and `:1910` (the `corrects_id`
+> partition rationale, §Method 3) and `:1968` (the aggregate cap, §Method 3).
+> (Line numbers refreshed after Task 10 inserted `build_get_sql`; all three are
+> still inside `aggregate` and still untouched.)
 > **`git ls-files | grep -iE 'plugin-spi|domain-model'` is empty** — neither
 > file is in the tree, and the string "Plugin-specific outputs" appears nowhere
 > but in this one source file. The SPI is rustdoc on
@@ -3156,9 +3158,9 @@ And the obligation that pulls the other way:
 > withhold a withdrawn entry from it as a kindness.
 
 **Files:**
-- Modify: `src/domain/ports.rs`, `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
+- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs` (Step 5), `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
 
-- [ ] **Step 1: Change the port signature**
+- [x] **Step 1: Change the port signature** — DONE
 
 ```rust
     async fn get(
@@ -3168,15 +3170,21 @@ And the obligation that pulls the other way:
     ) -> Result<UsageRecord, UsageCollectorPluginError>;
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test** — DONE
+
+Neither `parse_scope` nor `build_get_sql` existed; `SqlCtx::new(start)` did,
+and `2` is the right offset (`id` occupies `$1`). `build_get_sql` **owns** its
+`SqlCtx` rather than taking one, so that offset sits inside the function under
+test and a mutation to `SqlCtx::new(1)` is killable. `parse_scope` is a test
+helper over `toolkit_odata::parse_filter_string(..).into_expr()`, which yields
+the same `ast::Expr` the gateway's `scope_to_odata_filter` builds. As shipped:
 
 ```rust
 #[test]
 fn the_point_lookup_renders_the_scope_as_its_whole_where_clause() {
-    let mut ctx = SqlCtx::new(2);
-    let scope = parse_scope("tenant_id eq 11111111-1111-1111-1111-111111111111");
+    let scope = parse_scope(&format!("tenant_id eq {SCOPE_TENANT_A}"));
 
-    let sql = build_get_sql(&scope, &mut ctx).expect("a scope must render");
+    let (sql, _ctx) = build_get_sql(&scope).expect("a scope must render");
 
     assert!(
         sql.contains("WHERE id = $1 AND ("),
@@ -3187,13 +3195,24 @@ fn the_point_lookup_renders_the_scope_as_its_whole_where_clause() {
 }
 ```
 
+Five more went with it, each named by the mutation it kills: the scope's binds
+land after the `id`, at `$2`/`$3` (kills `SqlCtx::new(1)`); a disjunctive
+scope — the shape `authz::scope_to_odata_filter` actually compiles — keeps its
+own parentheses, asserted against a hand-transcribed `WHERE` clause (kills
+dropping them, which would bind `id = $1 AND A OR B` as `(id = $1 AND A) OR
+B`); the predicate names neither `invalidates` nor `entry_type` (Step 4, as a
+test rather than only a comment); a scope naming a field off the allowlist is
+refused; and — the one no pure test can reach — `get` over a lazy pool answers
+`Internal` naming the field, not the `Transient` a pool touch would give,
+which is what proves the refusal stops the lookup before it reads a row.
+
 **The mutation:** drop the scope conjunct from `build_get_sql`, leaving
 `WHERE id = $1`. That single edit is exactly the defect slice 3 created the
 obligation to prevent, and it must make this red.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement** — DONE
 
-`get` is at `:982` and builds `SELECT {RECORD_COLUMNS} FROM usage_records WHERE
+`get` was at `:1638`, not `:982` (Task 9 moved the file substantially); it builds `SELECT {RECORD_COLUMNS} FROM usage_records WHERE
 id = $1`. It must now conjoin the translated scope. `translate.rs` already has
 the filter-AST-to-SQL machinery `list` uses; reuse it — a second translator is
 two implementations of one security boundary.
@@ -3203,7 +3222,7 @@ A row outside the scope returns `UsageCollectorPluginError::UsageRecordNotFound
 level a caller could observe through timing or volume; the point is that the
 two cases are indistinguishable.
 
-- [ ] **Step 4: Do not filter withdrawn entries here**
+- [x] **Step 4: Do not filter withdrawn entries here** — DONE
 
 The ledger obligation is explicit and points the opposite way from the fold's.
 Add a comment at the query saying no `invalidates` predicate belongs here and
@@ -3211,7 +3230,7 @@ why — a reader who has just written Task 8's exclusion clause will otherwise
 add one, and it would destroy the audit trail the append-only model exists to
 keep.
 
-- [ ] **Step 5: Update the adapter**
+- [x] **Step 5: Update the adapter** — DONE
 
 ```rust
     async fn get_usage_record(
@@ -3223,7 +3242,7 @@ keep.
     }
 ```
 
-- [ ] **Step 6: Run and commit**
+- [x] **Step 6: Run and commit** — DONE
 
 ```bash
 cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(record_store)' 2>&1 | tail -20
@@ -3240,6 +3259,31 @@ the exclusion belongs to the fold.
 
 BREAKING CHANGE: RecordStore::get takes the compiled scope."
 ```
+
+> **What Task 10 leaves.**
+>
+> * **One named mutation survives, and it is not a silent one.** Deleting
+>   `get`'s `for b in &ctx.binds { q = bind_one(q, b); }` loop is invisible to
+>   every unit test here — no unit test executes a statement. It is not a quiet
+>   bypass: the SQL still *names* `$2…$N`, so Postgres rejects every scoped
+>   lookup outright rather than answering an unscoped row. **Task 15 is where
+>   it dies**, on the first `get` its rewritten suite makes under a scope.
+> * **Three `store.get(id)` call sites in `tests/` now need a second
+>   argument** — `tests/id_uniqueness_integration_pg.rs:71,73`,
+>   `tests/records_ingest_integration_pg.rs:176,500`,
+>   `tests/records_query_integration_pg.rs:699`. Left as they are: Task 15
+>   rewrites all six of those files wholesale and no test binary links before
+>   Task 13.
+> * **The scope's allowlist is the `$filter` allowlist, exactly.** `get`
+>   resolves identifiers through
+>   `convert_expr_to_filter_node::<UsageRecordFilterField>` and then
+>   `record_column` — the same two gates `list` uses — so a scope can name what
+>   a `$filter` can name and nothing more. The host's extra
+>   `reject_reserved_filter_fields` guard (`gts_type_id`, the window bounds) is
+>   a gateway-side `$filter` reservation that does not, and need not, apply to
+>   a compiled scope: the five attributes `scope_to_odata_filter` can emit
+>   (`tenant_id`, `subject_id`, `resource_id`, `resource_type`,
+>   `subject_type`) are all mapped.
 
 ---
 
@@ -3267,7 +3311,7 @@ BREAKING CHANGE: RecordStore::get takes the compiled scope."
 > turn it red.
 
 **Files:**
-- Modify: `src/domain/ports.rs`, `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
+- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
 
 ### The three obligations
 
@@ -3411,7 +3455,7 @@ parameters."
 ## Task 12: `query_aggregated_usage_records`
 
 **Files:**
-- Modify: `src/domain/ports.rs`, `src/infra/storage/record_store.rs`
+- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`
 
 - [ ] **Step 1: Change the port signature**
 
