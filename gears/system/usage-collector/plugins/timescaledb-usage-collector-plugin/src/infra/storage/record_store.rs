@@ -213,7 +213,8 @@ impl PgRecordStore {
     /// it slots into the existing `.map_err(...)` call sites unchanged.
     fn record_backend_error(&self, err: &sqlx::Error) -> UsageCollectorPluginError {
         // A TLS handshake failure is the plugin's one metered transport-security
-        // signal (DESIGN §Observability); count it before the generic mapping.
+        // signal (`uc_timescaledb_tls_handshake_failures_total`); count it
+        // before the generic mapping.
         if matches!(err, sqlx::Error::Tls(_)) {
             self.metrics.inc_tls_handshake_failure();
         }
@@ -259,15 +260,25 @@ impl PgRecordStore {
         if classify_db(&code, constraint.as_deref()) != DbErrorClass::AlreadyInvalidated {
             return self.record_backend_error(err);
         }
+        // The one admission-time obligation the SPI puts on the store, refused
+        // across calls. Counted here rather than in the arms below because this
+        // is the point at which the fact is established and nothing downstream
+        // can change it: `DbErrorClass::AlreadyInvalidated` means
+        // `usage_records_one_invalidation_uniq` refused the statement, whether
+        // or not the read that follows can name the entry that already
+        // withdrew the target. The `Ok(None)` arm is a refusal too — the
+        // refusing entry's chunk aged out between the two — and it is the case
+        // an operator would most want to see, so counting only the attributed
+        // ones would undercount exactly there.
+        //
+        // The in-batch counterpart is in `resolve_batch`. The two arms of the
+        // `scope` label count different things and are not addable: `in_batch`
+        // increments once per refused **row**, `cross_call` once per refused
+        // **statement**, because the index aborts a multi-row `INSERT` whole.
+        self.metrics
+            .inc_invalidation_rejection(InvalidationRejection::CrossCall);
         match find_existing_invalidation(conn, slots).await {
             Ok(Some((id, invalidated_by))) => {
-                // The one admission-time obligation the SPI puts on the store,
-                // refused across calls. Counted here and in-batch at
-                // `assemble_batch_results`, so the refusal rate is visible at
-                // all; without it the only trace of a refused withdrawal is the
-                // error returned to the caller.
-                self.metrics
-                    .inc_invalidation_rejection(InvalidationRejection::CrossCall);
                 UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }
             }
             // The index refused the write, so an accepted invalidation existed
@@ -291,8 +302,9 @@ impl PgRecordStore {
         match self.pool.acquire().await {
             Ok(conn) => {
                 self.metrics.record_pool_acquire(t.elapsed().as_secs_f64());
-                // A successful acquire re-arms readiness (DESIGN §Observability:
-                // `ready` recovers once the pool serves a connection again), but
+                // A successful acquire re-arms readiness (this crate's
+                // readiness contract: `uc_timescaledb_ready` recovers once the
+                // pool serves a connection again), but
                 // only while not shutting down: once `cancel` fires the shutdown
                 // watcher owns the gauge, so a drain-time acquire must not flip it
                 // back to 1. This gate narrows — it does not fully close — the
@@ -1444,9 +1456,9 @@ fn row_dedup_key(row: &UsageRecordRow) -> DedupKey {
 /// Log a dedup-path invariant break (an `Internal`, "this should never happen"
 /// condition) at `error` with the record's identifiers, then return the matching
 /// [`UsageCollectorPluginError::Internal`]. Centralizing the log + build keeps
-/// each silent break observable (DESIGN §Observability puts unbounded
-/// identifiers in logs, not metric labels) without inflating the hot ingest
-/// path's control flow.
+/// each silent break observable (the gear `DESIGN.md` §3.11.5 "Label
+/// cardinality" rule puts unbounded identifiers in logs, not metric labels)
+/// without inflating the hot ingest path's control flow.
 fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
     tracing::error!(
         tenant_id = %record.tenant_id,
@@ -1460,7 +1472,7 @@ fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollec
 /// Log a retryable dedup-path transient at `warn` with the record's identifiers,
 /// then return the matching [`UsageCollectorPluginError::Transient`]. The
 /// degraded path is self-healing on retry but must still surface at `warn` so an
-/// operator can see it (DESIGN §Observability).
+/// operator can see it — it moves no counter of its own.
 fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
     tracing::warn!(
         tenant_id = %record.tenant_id,

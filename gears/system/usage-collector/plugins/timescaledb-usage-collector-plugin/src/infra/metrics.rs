@@ -3,20 +3,33 @@
 //! Realizes design ID `cpt-cf-uc-plugin-design-metric-inventory`: every
 //! backend-internal series the plugin owns under the `uc_timescaledb_`
 //! sub-namespace. The gear's `DESIGN.md` §3.11.5 owns the request-path `uc_`
-//! inventory and delegates the rest — "plugins may expose backend-internal
-//! metrics under their own prefix; those series are owned by the plugin's
-//! deployment guide" — so **this module is the authority on what the plugin
-//! emits**, and the two rules §3.11.5 does bind it by are the naming
-//! convention below and the bounded-label rule further down. The plugin's own
-//! `docs/DESIGN.md` §4 table is not a second authority: it predates the
-//! slice-4 record model and still lists instruments this crate deleted with the
-//! usage-type catalog. Instrument names are the **full literal**
+//! inventory and delegates the rest, verbatim at `DESIGN.md:1821-1822`:
+//!
+//! > Plugins may expose backend-internal metrics under their own prefix. Those
+//! > series are owned by the plugin's deployment guide.
+//!
+//! **§3.11.5 names no instrument for a storage plugin** — every "Emitting
+//! component" cell in its three tables is a gateway, the type-resolver, the
+//! plugin-host or a PDP enforcer — so the two rules it binds this crate by are
+//! the naming convention below and the bounded-label rule further down, and
+//! nothing in it obliges a particular series here.
+//!
+//! Note what the clause delegates ownership *to*: the plugin's **deployment
+//! guide**, which is `docs/DESIGN.md` §4 in this crate. That table cannot
+//! currently be read as one — it predates the slice-4 record model and still
+//! lists instruments this crate deleted with the usage-type catalog — so **the
+//! code below is what the plugin actually emits, and the gap is a documentation
+//! debt rather than a second opinion**. Instrument names are the **full literal**
 //! Prometheus names (snake_case, `_total` on counters, `_seconds` on duration
 //! histograms) with **no** `.with_unit(...)` hint, so the rendered series name is
 //! identical whether the downstream collector runs with `add_metric_suffixes` on
 //! or off — matching the parent gateway (`usage-collector/src/infra/metrics.rs`)
-//! and the wider application-gear convention. Histogram bucket layouts bracket the
-//! NFR p95 budgets in `DESIGN.md` §1.2 and are part of the contract.
+//! and the wider application-gear convention. Histogram bucket layouts bracket
+//! the p95 budgets of `cpt-cf-usage-collector-nfr-query-latency` and
+//! `cpt-cf-usage-collector-nfr-throughput` (the gear's `DESIGN.md` §3.11.2
+//! Latency Budgets) and are part of the contract — cited by NFR id rather than
+//! through this crate's own `docs/DESIGN.md` §1.2 driver table, whose
+//! surrounding rows still describe the retired record model.
 //!
 //! All labels are bounded to enumerated value sets (see the `label` module):
 //! unbounded identifiers (`tenant_id`, `gts_id`, `id`, ...) MUST NOT appear as
@@ -41,7 +54,8 @@ const SCOPE_NAME: &str = "uc.timescaledb";
 
 /// Explicit histogram bucket boundaries (seconds) for backend operation
 /// durations. The `OTel` SDK defaults are count-oriented and meaningless for a
-/// seconds-valued duration; these brackets the §1.2 p95 budgets with finer
+/// seconds-valued duration; these bracket the gear `DESIGN.md` §3.11.2 p95
+/// budgets with finer
 /// low-end resolution so client-side percentiles stay comparable.
 const DURATION_BOUNDARIES_SECS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -55,8 +69,10 @@ const BATCH_ROW_BOUNDARIES: &[f64] = &[1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.
 /// Bounded metric label keys and values.
 ///
 /// Centralizing the `&'static str` constants keeps every call site on the
-/// enumerated value sets from `DESIGN.md` §Observability and prevents an
-/// accidental high-cardinality label from leaking in.
+/// enumerated sets declared in this module — the gear `DESIGN.md` §3.11.5
+/// "Label cardinality" rule, which bounds every label and bars unbounded
+/// identifiers outright — and prevents an accidental high-cardinality label
+/// from leaking in.
 pub mod label {
     /// Label key for the insert mode dimension.
     pub const MODE: &str = "mode";
@@ -161,9 +177,14 @@ impl ErrorClass {
 /// are asymmetric in every other respect: `plan_batch` pre-rejects a duplicate
 /// inside one `create_batch` call before the multi-row `INSERT` is built, while
 /// the partial unique index refuses one that arrives in a later call. Splitting
-/// the counter on that boundary is what makes the two legible apart; summing it
-/// gives the refusal rate an operator needs to see the obligation being
-/// exercised at all. A closed enum so the label set is enforced by the type.
+/// the counter on that boundary is what makes the two legible apart, and it is
+/// the refusal rate that shows an operator the obligation being exercised at
+/// all. A closed enum so the label set is enforced by the type.
+///
+/// **The two arms are not addable.** `in_batch` increments once per refused
+/// **row**; `cross_call` increments once per refused **statement**, because the
+/// index aborts a multi-row `INSERT` whole rather than per row. Read each series
+/// on its own; a sum of the two counts two different things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidationRejection {
     /// Refused against an earlier entry of the same batch (`scope = "in_batch"`).

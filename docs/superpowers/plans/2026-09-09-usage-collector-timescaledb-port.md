@@ -3803,9 +3803,15 @@ had actually left behind was smaller and different, and it is what this step
 removed.
 
 **What §3.11.5 binds this plugin to, and what it does not.** Its closing
-paragraph (`DESIGN.md:1819-1821`) reads *"Plugins may expose backend-internal
-metrics under their own prefix. Those series are owned by the plugin's
-deployment guide."* Every instrument in §3.11.5's three tables is emitted by
+paragraph is `DESIGN.md:1821-1822` — not `:1819-1821`; `:1819` is the
+`MetricsConfig.cardinality_limit` sentence — and reads, verbatim:
+
+> Plugins may expose backend-internal metrics under their own prefix. Those
+> series are owned by the plugin's deployment guide.
+
+Note that it delegates ownership to the plugin's **deployment guide**, a
+document, and not to any piece of code. Every instrument in §3.11.5's three
+tables is emitted by
 ingestion-gateway, query-gateway, feed-gateway, type-resolver or plugin-host —
 **none by a storage plugin**. So the section constrains this crate by exactly
 two rules, both of which it already satisfied: full-literal Prometheus
@@ -3974,9 +3980,10 @@ plugin's prefix and names no instrument for a storage plugin at all.
 
 **Decision: yes — added.** `uc_timescaledb_invalidation_rejections_total`,
 labelled `scope` ∈ {`in_batch`, `cross_call`}, incremented on both refusal
-paths: at `map_insert_error`'s `AlreadyInvalidated` arm (the partial unique
-index, cross-call) and at `assemble_batch_results`' `duplicate_withdrawals`
-pre-reject (`plan_batch`, in-batch). Reasoning, in the order it carried weight:
+paths: in `map_insert_error` once the classifier has said the partial unique
+index refused the statement (cross-call), and at `resolve_batch`'s
+`duplicate_withdrawals` pre-reject (`plan_batch`, in-batch). Reasoning, in the
+order it carried weight:
 
 1. **The plugin's own inventory was already asymmetric, not deliberately
    silent.** It counts its *other* admission-time refusal —
@@ -3994,6 +4001,23 @@ pre-reject (`plan_batch`, in-batch). Reasoning, in the order it carried weight:
    `INSERT` — Task 18 Step 4b item 2), so a summed counter cannot tell an
    operator which is firing. Two bounded values, no unbounded identifier;
    §3.11.5's cardinality rule holds.
+
+**Where the cross-call increment sits, and why it moved.** The first version
+put it in `map_insert_error`'s `Ok(Some(..))` arm — the one that can name the
+entry that already withdrew the target. That undercounts, and undercounts
+precisely where the counter is worth most: the `Ok(None)` arm is a refusal too
+(the index refused, and the refusing entry's chunk aged out before the
+attributing read), and it is the retention-race an operator would most want to
+see. The increment is now above the `match`, at the point where
+`DbErrorClass::AlreadyInvalidated` has established that
+`usage_records_one_invalidation_uniq` refused the statement — a fact no arm
+below can change. The description "refused by the at-most-one rule" is then
+true of every increment rather than of most of them.
+
+**The two arms are not addable, and both the enum's rustdoc and the call site
+say so.** `in_batch` counts refused **rows**; `cross_call` counts refused
+**statements**, because the index aborts a multi-row `INSERT` whole (Task 18
+Step 4b item 2). A dashboard summing them is measuring two different things.
 
 **Not** changed: the logging asymmetry. The in-batch path still `warn`s and the
 cross-call path still does not. The metric is what makes refusals visible in
@@ -4070,10 +4094,15 @@ pull the split forward.** The benefit is largest before the read half is
 rewritten, not after.
 
 **Decision: defer, and do not carry it forward as an open question.**
-Regenerated with the corrected command at Task 13: **28** column-zero `fn`s,
+Regenerated with the corrected command at Task 13: **27** column-zero `fn`s,
 **23** in the move set (the 23 named above, `with_retry` already among them),
-**845** lines of **2,310** — the figures above were one commit stale (2,290 /
-843), which is what regenerating is for.
+**845** lines, **477** of them read-path, in a file of **2,338** lines as Task 13
+leaves it (2,309 at its base commit). The figures this step was written with
+were one commit stale (2,290 / 843), which is what regenerating is for — and the
+first pass at regenerating them produced a 28 and a 2,310 of its own, one from
+miscounting the printed list and one from a `split('\n')` trailing element.
+**Re-run the command; do not trust this paragraph either** — the file length in
+particular moves with every commit that touches it.
 
 Why it does not happen:
 
@@ -4218,9 +4247,10 @@ Expected: exits 0. `clippy::pedantic` is deny at workspace level. Watch for
 **`--all-features` cannot pass at this task and the command above no longer
 carries it.** `--all-features` turns on `postgres`, which pulls in the five
 `tests/` targets and their 61 errors; clippy then aborts on the compile failure
-and lints nothing. It becomes runnable — and required — once **Task 15** rewrites
-those files. Verified at Task 13: `--all-targets` alone exits 0 at zero
-warnings.
+and lints nothing. Verified at Task 13: `--all-targets` alone exits 0 at zero
+warnings. Nothing is owed here — **Task 16 Step 6 already runs
+`cargo clippy --workspace --all-targets --all-features`**, which is the first
+run that reaches these five files, and that step now carries the note.
 
 **One lint the new test-support module tripped**, recorded because the next
 `#[cfg(test)]` shared module will hit it too: `clippy::redundant_pub_crate`
@@ -4248,8 +4278,8 @@ happened to the figure this sentence used to carry.)
 **Measured at Task 13: 24**, two ways that agree — `grep -cE '^#\[(tokio::)?test\]'`
 over `src/infra/storage/mapper_tests.rs`, and `cargo nextest list` filtered to
 `infra::storage::mapper::mapper_tests`. All 24 green. **Baseline for whoever
-reads this next: 212 passed / 0 skipped** unfiltered (211 before this task; the
-new metrics test is the twelfth). Per module: `record_store_tests` 75,
+reads this next: 212 passed / 0 skipped** unfiltered (211 before this task).
+Per module: `record_store_tests` 75,
 `translate_tests` 46, `mapper_tests` 24, `error_tests` 16, `config_tests` 14,
 `query_tests` 12, `aggregate_tests` 12, `pool_tests` 9, `metrics_tests` 3,
 `gear_tests` 1.
@@ -4697,6 +4727,15 @@ cargo doc --no-deps -p cf-gears-usage-collector-sdk -p cf-gears-usage-collector
 Against baseline: **716 + the plugin's own tests, 0 skipped**; contract
 **166 / 0**; doc warnings **35** (host) and **0** (SDK), neither grown. Read the
 `generated N warnings` line.
+
+**This is the first clippy run that reaches the plugin's `tests/`, and expect a
+backlog.** `--all-features` turns on `postgres`, which is what makes those five
+files compile at all; before Task 15 rewrote them they carried 61 errors, and an
+unresolved import suppresses every lint for the whole crate (Task 13 Step 2).
+So the five integration files have **never been linted** — not in this slice and
+not before it. Budget for it here rather than being surprised: Task 13 verified
+that `-p cf-gears-timescaledb-usage-collector-plugin --all-targets` without the
+feature is clean, so anything this run reports comes from `tests/`.
 
 - [ ] **Step 7: Commit**
 
