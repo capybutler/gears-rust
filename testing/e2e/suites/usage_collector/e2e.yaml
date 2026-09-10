@@ -1,12 +1,20 @@
-# NOT RUN IN CI during the type-plane rewrite: the step that invoked this
-# suite has been removed from .github/workflows/e2e.yml. The suite asserts
-# persistence round-trips, and the only persisting plugin is unwired from
-# the build (see docs/superpowers/plans/2026-09-06-usage-collector-type-plane.md,
-# Task 1). `make e2e-usage-collector` still runs it locally and is expected
-# to fail until the TimescaleDB plugin is ported.
+# Self-managed suite (launcher: pytest): the conftest starts its own server
+# and its own TimescaleDB container, so `make e2e-usage-collector` and the
+# workflow step of the same name are the only ways it runs. The shared
+# `make e2e-local` pass does not reach it.
+#
+# `timescaledb-usage-collector` below is load-bearing twice over. It is the
+# only place in CI that compiles the storage plugin into the server, and it
+# is what makes this suite's config.yaml `timescaledb-usage-collector-plugin`
+# block reachable at all: run_e2e.py feeds this list straight to
+# `cargo build --features`, and toolkit looks gear config up per REGISTERED
+# gear, so a block for a gear that was never compiled in is skipped without
+# an error. Drop the line and the suite silently falls back to the noop
+# backend.
 suite: usage-collector
 features:
   - usage-collector
+  - timescaledb-usage-collector
   - static-tenants
   - static-authn
   - static-authz

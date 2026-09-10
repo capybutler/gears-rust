@@ -721,7 +721,11 @@ test-users-info-pg: install-tools
 
 ## Run TimescaleDB usage-collector plugin integration tests (Docker required;
 ## each integration test spins up its own timescale/timescaledb container via
-## testcontainers - ~48 per run, the most container-hungry lane in the repo).
+## testcontainers - 51 per run at this writing, the most container-hungry lane
+## in the repo. The harness caps each container's shared_buffers, so the peak
+## is bounded by nextest's thread count rather than by host RAM; see
+## tests/common/mod.rs. Count with: cargo nextest list -p
+## cf-gears-timescaledb-usage-collector-plugin --features postgres).
 test-usage-collector-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres

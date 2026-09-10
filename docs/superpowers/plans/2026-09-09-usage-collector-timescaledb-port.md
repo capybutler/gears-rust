@@ -5361,7 +5361,7 @@ rewrite that justified deferring them ends with this slice.
 **Files:**
 - Modify: `.github/workflows/ci.yml`, `.github/workflows/e2e.yml`, `testing/e2e/suites/usage_collector/e2e.yaml`, `testing/e2e/suites/usage_collector/test_integration_seams.py`, and whatever Step 1 turns up
 
-- [ ] **Step 1: Read the e2e python before assuming the revert is clean**
+- [x] **Step 1: Read the e2e python before assuming the revert is clean**
 
 ```bash
 cd /Users/binarycode/code/virtuozzo/gears-rust/testing/e2e/suites/usage_collector
@@ -5376,7 +5376,7 @@ retired routes — slice 2 removed two usage-type routes and slice 5 added
 Produce the same live-question / dead-question inventory Task 15 Step 1 asks
 for, and report per-item verdicts.
 
-- [ ] **Step 2: Restore the CI steps**
+- [x] **Step 2: Restore the CI steps**
 
 ```bash
 git show 8225d8ebd -- .github/workflows/ci.yml .github/workflows/e2e.yml
@@ -5392,7 +5392,7 @@ usage-collector suite "is not run here at all during the type-plane rewrite —
 see testing/e2e/suites/usage_collector/e2e.yaml". Leaving that comment beside a
 restored step is exactly the "claim outliving the code" defect.
 
-- [ ] **Step 3a: Rewrite the `e2e.yaml` header**
+- [x] **Step 3a: Rewrite the `e2e.yaml` header**
 
 It currently opens:
 
@@ -5403,7 +5403,7 @@ It currently opens:
 
 Every clause is now false. **Replace the block, do not append to it.**
 
-- [ ] **Step 3b: Restore the `timescaledb-usage-collector` feature line**
+- [x] **Step 3b: Restore the `timescaledb-usage-collector` feature line**
 
 **`8225d8ebd` touched 7 lines in `e2e.yaml` and only 6 of them are the comment
 above.** The seventh is a *deletion*: the `timescaledb-usage-collector` entry in
@@ -5426,7 +5426,7 @@ persistence assertions failing against the noop backend, which looks exactly
 like a plugin defect; Step 4 says "fix the plugin, not the suite", and that
 would send you the wrong way for a missing build feature.
 
-- [ ] **Step 4: Run the suite locally**
+- [x] **Step 4: Run the suite locally**
 
 ```bash
 cd /Users/binarycode/code/virtuozzo/gears-rust
@@ -5438,7 +5438,74 @@ If it does not, the suite is telling you something the unit and contract tests
 could not; fix the plugin, not the suite, unless the inventory in Step 1 says
 the assertion is a dead question.
 
-- [ ] **Step 5: Commit**
+**Outcome: 11 passed, 0 skipped** — after two things the suite surfaced that
+nothing else could, and one decision it forced.
+
+1. **The gear could not withdraw an entry against any conforming backend.**
+   `service::unrestricted_read_filter()` returned `Expr::Value(Bool(true))` for
+   the invalidation-target pre-read. A bare literal in a boolean position is
+   refused by `convert_expr_to_filter_node` (`FilterError::BareLiteral`) **and
+   by the SDK's own reference implementation**, so no plugin can render it: the
+   TimescaleDB backend answered every invalidation submission with a per-record
+   `500 Internal("invalid read predicate")`, before a connection was even
+   acquired. Replaced by `target_pinned_read_filter(target)` - `id eq <target>`,
+   in the published `$filter` vocabulary, selecting exactly the row the `id`
+   argument already selects. Regression test:
+   `service_tests::the_invalidation_target_scope_translates_for_a_conforming_backend`,
+   which asserts the *translation* and keeps the old shape's refusal as its
+   negative half, so it cannot go quiet.
+
+   Neither a unit nor a contract test could have caught this: the in-crate
+   plugin doubles never translate a scope, and DESIGN section 3.3's checks
+   supply their own filters rather than observing this one.
+
+2. **The at-most-one-invalidation refusal is top-level, not per-record.** The
+   partial unique index refuses the whole multi-row insert and the transaction
+   rolls back (`record_store.rs`, `map_insert_error` / `create_batch_inner`),
+   so `POST /records` answers `409 ALREADY_INVALIDATED` rather than a 207 with
+   a per-entry rejection. That is the backend's documented statement
+   granularity, not a defect, and the e2e asserts the shipped behaviour. **A
+   consequence worth Task 18's attention: a batch mixing a valid measurement
+   with a colliding withdrawal loses both.**
+
+3. **Container budget - decided, not deferred.** The preamble's two options
+   were priced and a third, cheaper one taken: the plugin's own harness passes
+   `-c shared_buffers=256MB` at its single `test_containers::timescaledb()`
+   call site (`tests/common/mod.rs`). Measured on a live container: `1959MB`
+   with no override, `256MB` with it, readiness still logged exactly twice, and
+   `work_mem` still the tuned `7837kB`. `.config/nextest.toml` was **not**
+   created - it would cap concurrency without capping per-container memory, and
+   would put a first-of-its-kind repo-wide nextest config in the tree to solve
+   a one-lane problem. `test_containers::timescaledb()` was **not** changed
+   either: it has exactly one caller in the workspace, and the concurrency that
+   makes the tuner's default bite is this lane's alone.
+
+   Preamble item 2's `schema_integration_pg` `OnceCell` reduction was **not**
+   taken. Measured on the capped lane: the whole 265-test run (214 lib + 51
+   integration) finishes in **29.8 s**, and the seven schema tests cost 2.7 -
+   5.2 s each while eight containers run concurrently. The reduction buys six
+   containers inside a half-minute lane, and costs a `TsHarness` held in a
+   `static` that Rust never drops - cleanup would move off
+   `ContainerAsync::drop` and onto the testcontainers reaper. The memory
+   problem it was offered against is already priced by the cap above.
+
+   The lane is **51 integration tests across 6 binaries** (`cargo nextest list
+   -p cf-gears-timescaledb-usage-collector-plugin --features postgres`), one
+   container each - not the 48 the preamble measured. The Makefile comment
+   carried the stale number; it now carries this one and the command to recount
+   it.
+
+**What the rewritten python covers.** Both quarantined modules were rewritten
+rather than repointed, because `make_usage_type` had no successor: a meter is
+now a derived GTS **type** registered in `types-registry`, and the suite
+declares one per test by POSTing the published base schema
+(`docs/schemas/usage_record.v1.schema.json`, read off disk so there is no
+second copy) plus a derived meter to `POST /types-registry/v1/entities`.
+Nothing seeds that base - usage-collector declares no `#[gts_type_schema]` for
+it and no shipped config registers it - which is itself worth Task 18's
+attention: a real deployment has to register it too.
+
+- [x] **Step 5: Commit**
 
 ```bash
 git add .github/workflows/ci.yml .github/workflows/e2e.yml \

@@ -95,11 +95,8 @@ jobs:
 
       # `make e2e-local` (no SUITE) runs only the shared-server suites
       # (launcher: e2e-launcher) against a single server. Self-managed suites
-      # (launcher: pytest — mini-chat) and profile lanes (tr-authz) are NOT
-      # covered by it, so they run as their own steps below. The
-      # usage-collector suite is self-managed too but is not run here at all
-      # during the type-plane rewrite — see
-      # testing/e2e/suites/usage_collector/e2e.yaml.
+      # (launcher: pytest — mini-chat, usage-collector) and profile lanes
+      # (tr-authz) are NOT covered by it, so they run as their own steps below.
       - name: Run E2E tests
         env:
           INPUT_MODE: ${{ inputs.mode }}
@@ -120,6 +117,15 @@ jobs:
       # suite), so `make e2e-local` does not run it — keep it as its own step.
       - name: Run RG + AuthZ E2E tests (tr-authz-plugin, AuthZ -> TR -> RG chain)
         run: make e2e-tr-authz
+
+      # Self-managed suite (launcher: pytest): starts its own server plus a
+      # TimescaleDB container, so it needs a reachable Docker daemon. It is
+      # also the only job in CI that compiles the TimescaleDB storage plugin
+      # into the server — the feature is optional and off by default, and the
+      # `timescaledb-usage-collector` entry in this suite's own e2e.yaml
+      # `features:` list is what turns it on.
+      - name: Run usage-collector E2E tests (TimescaleDB container)
+        run: make e2e-usage-collector
 
       - name: Upload E2E logs
         if: failure()

@@ -193,6 +193,34 @@ pub async fn bring_up_with(
             .with_env_var("POSTGRES_USER", "user")
             .with_env_var("POSTGRES_PASSWORD", "pass")
             .with_env_var("POSTGRES_DB", "app")
+            // Cap the shared-memory segment. This lane starts one container
+            // per integration test and nextest runs them at
+            // `test-threads = num_cpus`, so the peak is (num_cpus) live
+            // servers at once. Each one runs
+            // `/docker-entrypoint-initdb.d/001_timescaledb_tune.sh`, which
+            // sizes `shared_buffers` from **host** RAM and has no idea it has
+            // siblings: measured at `1959MB` on this 7.83 GB box, i.e. the
+            // usual quarter of total RAM. Every container believing it owns
+            // the machine is fine at one container and is N x that on a wide
+            // runner.
+            //
+            // `SHOW shared_buffers` was read off a live container both ways:
+            // `1959MB` with no override, `256MB` with the argument below, and
+            // the readiness message still appears exactly twice, so the wait
+            // strategy above is unaffected. `work_mem` stays at the tuned
+            // `7837kB` either way - the argument overrides the one setting it
+            // names and leaves the rest of the tune script's work in place.
+            //
+            // 256 MB is twice PostgreSQL's own compiled default, so no test
+            // here has less headroom than it would get from a stock server;
+            // the largest fixture in the suite is a hundred rows.
+            //
+            // Set at THIS call site rather than in `test_containers::
+            // timescaledb()`: the concurrency that makes the default bite is
+            // this lane's, and the shared helper hands back a bare
+            // `GenericImage` precisely so callers supply their own runtime
+            // arguments.
+            .with_cmd(["postgres", "-c", "shared_buffers=256MB"])
     };
     // Start a container and connect to it, and treat **the whole of that** as
     // one attempt that may be retried with a fresh container.

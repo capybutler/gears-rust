@@ -5,82 +5,38 @@ real TimescaleDB. Storage SQL, aggregation internals, domain validation and
 DTO conversion are covered by unit tests and by
 `make test-usage-collector-pg` — not here.
 
-QUARANTINED — this module does not run. See `pytestmark` below.
+What is here that the plugin's own pg lane cannot reach: the meter comes from
+`types-registry` over the wire rather than from a fixture, the covered-period
+range crosses as query parameters or a request body rather than as a typed
+struct, and the decimal quantity crosses as a JSON string.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
-import pytest
-
-from .conftest import accepted_records, record_payload, window_filter
-
-# ── Quarantine ────────────────────────────────────────────────────────────
-# Every test here is skipped, for two reasons that are worth keeping apart.
-#
-# 1. PRE-EXISTING, and it already covered the whole module. Each test takes
-#    the `make_usage_type` fixture, which POSTs `/usage-types`. The usage-type
-#    catalog and its routes were deleted before the correction-model slice —
-#    `src/api/rest/routes/` has had no usage-types module since — so every
-#    test in this file has been failing at setup independently of anything
-#    below. `test_list_usage_types_includes_created`, `test_get_usage_type`
-#    and `test_delete_usage_type_referenced_by_record_is_rejected` are that
-#    breakage and nothing else: they test the deleted catalog directly.
-#
-#    The catalog is not the only pre-existing cause, and a rewrite owes the
-#    others too. `test_ingest_and_read_record_roundtrip` also asserts
-#    `body["gts_id"]` and `body["created_at"]`; the time-model slice before
-#    this one retired both — the type reference is `gts_type_id` and the
-#    record carries a `window_start` / `window_end` covered period instead
-#    of a `created_at` instant. `record_payload` in `conftest.py` submits
-#    the same two retired keys, and `window_filter()` there builds a
-#    `created_at ge … and created_at lt …` `$filter` that every read test
-#    passes — a shape the gear now rejects outright, because the covered
-#    period is a typed `from` / `to` parameter and a predicate naming a
-#    period bound is a reserved-field `400`.
-#
-# 2. ADDED BY THE CORRECTION-MODEL SLICE, which replaced the mutate-in-place
-#    correction model (a `status` latch plus `POST /records/{id}/deactivate`)
-#    with an append-only one: a correction is an ordinary ingested entry
-#    carrying `invalidates` + `reason_code`, and `entry_type` is derived from
-#    `invalidates` rather than stored. Two tests pin vocabulary that slice
-#    deleted, and each carries a note in place below:
-#      - `test_ingest_and_read_record_roundtrip` asserts
-#        `body["status"] == "active"`; `UsageRecord` carries no `status`, and
-#        the response DTO now projects `entry_type`.
-#      - `test_deactivate_is_monotonic` asserts the route (deleted), the
-#        `inactive` field value (deleted) and the `ALREADY_INACTIVE` reason
-#        code (deleted). Its whole premise — that a correction flips a latch
-#        on the target — is the model that was replaced.
-#
-# Rewriting is deliberately NOT done here: it needs a running deployment plus
-# a TimescaleDB plugin on the append-only model to verify against, and the
-# plugin under `plugins/timescaledb-usage-collector-plugin/` is still on the
-# pre-slice-2 model. A rewrite owes: a replacement for `make_usage_type` that
-# declares a meter through the GTS registry instead of the deleted catalog;
-# `status`/`entry_type` repointed; and `test_deactivate_is_monotonic` replaced
-# by an invalidation test that submits a faithful copy carrying `invalidates`
-# and asserts the second attempt is `409 ALREADY_INVALIDATED` — which is now
-# the storage plugin's atomic obligation, not the gateway's.
-pytestmark = pytest.mark.skip(
-    reason="quarantined: usage-type catalog endpoints deleted (pre-existing), and "
-    "the deactivation surface plus the `status` field were deleted by the "
-    "append-only correction-model slice; needs a running deployment to rewrite"
+from .conftest import (
+    GTS_BASE,
+    accepted_records,
+    covered_period,
+    record_payload,
+    rejected_records,
+    selection_range,
+    unique_suffix,
 )
 
 
-# Quarantine reason 2 (see the module header): `status` no longer exists on
-# the record or on the wire. The seam this test guards — a `Decimal` value
-# crossing as a string and a timestamptz round-trip — is still worth having;
-# only the `status` assertion needs repointing, to the derived `entry_type`.
-async def test_ingest_and_read_record_roundtrip(api, make_usage_type):
+async def test_ingest_and_read_record_roundtrip(api, make_meter):
     """Seam: handler <-> JSON wire format <-> PostgreSQL round-trip.
 
-    A Decimal `value` crosses as a string and comes back byte-identical, and
-    an RFC3339 `created_at` survives the timestamptz round-trip.
+    A Decimal `value` crosses as a string and comes back byte-identical, both
+    covered-period bounds survive the timestamptz round-trip, and the two
+    server-derived projections arrive: `origin` names the route that admitted
+    the entry and `entry_type` is derived from the absent `invalidates`
+    rather than stored.
     """
-    gts_id, _ = await make_usage_type()
-    payload = record_payload(gts_id, value="42.5")
+    meter_id = await make_meter()
+    period = covered_period()
+    payload = record_payload(meter_id, value="42.5", period=period)
 
     async with api() as client:
         created = accepted_records(
@@ -95,33 +51,40 @@ async def test_ingest_and_read_record_roundtrip(api, make_usage_type):
     body = fetched.json()
     assert body["id"] == record_id
     assert body["value"] == "42.5"
-    assert body["gts_id"] == gts_id
+    assert body["gts_type_id"] == meter_id
     assert body["tenant_id"] == payload["tenant_id"]
-    assert body["status"] == "active"
     assert body["resource_ref"]["resource_id"] == "res-1"
-    assert datetime.fromisoformat(body["created_at"].replace("Z", "+00:00")) == \
-        datetime.fromisoformat(payload["created_at"].replace("Z", "+00:00"))
+    assert body["entry_type"] == "record"
+    assert body["origin"] == "live"
+    for bound, submitted in zip(("window_start", "window_end"), period):
+        assert datetime.fromisoformat(body[bound].replace("Z", "+00:00")) == \
+            datetime.fromisoformat(submitted.replace("Z", "+00:00")), bound
 
 
-async def test_list_records_odata_filter_and_cursor(api, make_usage_type):
-    """Seam: OData $filter -> SQL, and the keyset cursor codec over HTTP.
+async def test_list_records_range_filter_and_cursor(api, make_meter):
+    """Seam: the covered-period range -> SQL, and the keyset cursor over HTTP.
 
-    Following a cursor resends the IDENTICAL gts_id/$filter/limit — the
+    Following a cursor resends the IDENTICAL gts_type_id/range/limit — the
     toolkit rejects a cursor replayed under a different filter or order.
     `limit` is the page-size parameter: the toolkit's OData extractor
     (`ODataParams` in libs/toolkit/src/api/odata.rs) is what binds it to
-    `ODataQuery.limit`.
+    `ODataQuery.limit`, under both its own spelling and `$top`.
+
+    A fresh meter per test is what makes the two-page assertion exact: the
+    read path is scoped by `gts_type_id`, so no other test's entries can land
+    in this listing however far the ranges overlap.
     """
-    gts_id, _ = await make_usage_type()
+    meter_id = await make_meter()
+    frm, to = selection_range()
     async with api() as client:
         created = accepted_records(await client.post("/records", json={"records": [
-            record_payload(gts_id, resource_id="res-a", value="1"),
-            record_payload(gts_id, resource_id="res-b", value="2"),
+            record_payload(meter_id, resource_id="res-a", value="1"),
+            record_payload(meter_id, resource_id="res-b", value="2"),
         ]}))
         assert len(created) == 2
         all_ids = {r["id"] for r in created}
 
-        params = {"gts_id": gts_id, "$filter": window_filter(), "limit": 1}
+        params = {"gts_type_id": meter_id, "from": frm, "to": to, "limit": 1}
 
         first = await client.get("/records", params=params)
         assert first.status_code == 200, first.text
@@ -140,132 +103,169 @@ async def test_list_records_odata_filter_and_cursor(api, make_usage_type):
     assert seen == all_ids, "the two pages must be disjoint and cover both records"
 
 
-async def test_aggregate_groups_by_resource(api, make_usage_type):
+async def test_aggregate_folds_by_resource_and_declared_metadata(api, make_meter):
     """Seam: aggregation request -> SQL GROUP BY -> PDP-scoped result.
 
-    `sum` requires a counter usage type (it is a 400 on a gauge). group_by
-    carries closed dimensions as bare snake_case strings.
+    The request carries NO fold. `SUM` is resolved from the meter's
+    `x-gts-traits.aggregation_fold`, so this test also proves the declaration
+    reached the gear through types-registry rather than through a fixture.
+    The range travels in the body here (`time_range`), not as query
+    parameters, because this path has one.
+
+    `group_by` mixes both spellings: a closed dimension is a bare snake_case
+    string, and the metadata form carries the key inline as
+    `{"metadata": "<key>"}`. `region` is groupable only because the meter's
+    schema declares it — the closed surface is what makes a metadata key both
+    submittable and groupable, and an undeclared key is refused at ingest
+    rather than silently dropped.
     """
-    gts_id, _ = await make_usage_type(kind="counter")
+    meter_id = await make_meter(fold="SUM", metadata_keys=("region",))
+    frm, to = selection_range()
     async with api() as client:
         accepted_records(await client.post("/records", json={"records": [
-            record_payload(gts_id, resource_id="res-a", value="10"),
-            record_payload(gts_id, resource_id="res-a", value="5"),
-            record_payload(gts_id, resource_id="res-b", value="7"),
+            record_payload(meter_id, resource_id="res-a", value="10",
+                           metadata={"region": "eu"}),
+            record_payload(meter_id, resource_id="res-a", value="5",
+                           metadata={"region": "us"}),
+            record_payload(meter_id, resource_id="res-b", value="7",
+                           metadata={"region": "eu"}),
         ]}))
 
         resp = await client.post(
             "/records/aggregate",
-            params={"gts_id": gts_id, "$filter": window_filter()},
-            json={"op": "sum", "group_by": ["resource_id"]},
+            params={"gts_type_id": meter_id},
+            json={
+                "time_range": {"from": frm, "to": to},
+                "group_by": ["resource_id", {"metadata": "region"}],
+            },
         )
 
     assert resp.status_code == 200, resp.text
     buckets = resp.json()["buckets"]
     # `value` may arrive as a JSON string or number; Decimal(str(...)) accepts both.
-    sums = {b["key"][0]: Decimal(str(b["value"])) for b in buckets}
-    assert sums == {"res-a": Decimal("15"), "res-b": Decimal("7")}
+    sums = {tuple(b["key"]): Decimal(str(b["value"])) for b in buckets}
+    assert sums == {
+        ("res-a", "eu"): Decimal("10"),
+        ("res-a", "us"): Decimal("5"),
+        ("res-b", "eu"): Decimal("7"),
+    }
 
 
-# Quarantine reason 2 (see the module header): this test has no successor
-# assertion to repoint to. Deactivation was not renamed — the whole
-# mutate-the-target mechanism it describes was replaced by appending a second
-# entry, so the route, the `inactive` value and `ALREADY_INACTIVE` are all
-# gone. A rewrite is a new test, not an edit of this one.
-async def test_deactivate_is_monotonic(api, make_usage_type):
-    """Seam: deactivation is one-way, enforced at the storage transaction.
+async def test_invalidation_is_admitted_at_most_once(api, make_meter):
+    """Seam: at-most-one invalidation per target, enforced at the store.
 
-    First call flips active -> inactive (204). The second is REJECTED with 409
-    `ALREADY_INACTIVE` — the store reads the row FOR UPDATE and refuses an
-    already-inactive target. It is not an idempotent no-op (ADR-0005).
+    A correction is an ordinary ingested entry carrying `invalidates` plus
+    `reason_code`; nothing about the target row is mutated. The second
+    withdrawal of one target is REJECTED with 409 `ALREADY_INVALIDATED`. The
+    partial unique index on `(tenant_id, invalidates, window_end)` is what
+    refuses it, inside the insert's own transaction — the gateway takes no
+    pre-read for this and could not: a pre-read cannot exclude a concurrent
+    second submission, which is the case the rule exists for.
+
+    The refusal is TOP-LEVEL, not a per-record entry inside a 207, and that
+    is the backend's statement granularity showing through: the index refuses
+    the whole multi-row insert and the transaction rolls back, so the call
+    has no partial outcome to report per entry
+    (`record_store.rs`, `map_insert_error` / `create_batch_inner`).
+
+    The two withdrawals differ in `idempotency_key`. An identical resubmission
+    would be absorbed by dedup on the 5-tuple and answer 200 with the same
+    row, which is a different seam and would leave this one untested.
     """
-    gts_id, _ = await make_usage_type()
+    meter_id = await make_meter()
+    period = covered_period()
     async with api() as client:
-        created = accepted_records(
-            await client.post("/records", json={"records": [record_payload(gts_id)]})
-        )
-        record_id = created[0]["id"]
+        created = accepted_records(await client.post("/records", json={
+            "records": [record_payload(meter_id, value="3", period=period)]
+        }))
+        target_id = created[0]["id"]
 
-        first = await client.post(f"/records/{record_id}/deactivate")
-        assert first.status_code == 204, first.text
+        withdrawal = accepted_records(await client.post("/records", json={
+            "records": [record_payload(
+                meter_id, value="3", period=period, invalidates=target_id,
+            )]
+        }))
+        assert withdrawal[0]["entry_type"] == "invalidation"
+        assert withdrawal[0]["invalidates"] == target_id
+        assert withdrawal[0]["reason_code"] == "E2E_CORRECTION"
 
-        after = await client.get(f"/records/{record_id}")
-        assert after.status_code == 200, after.text
-        assert after.json()["status"] == "inactive"
+        second = await client.post("/records", json={
+            "records": [record_payload(
+                meter_id, value="3", period=period, invalidates=target_id,
+            )]
+        })
 
-        second = await client.post(f"/records/{record_id}/deactivate")
+        # The target is untouched by either attempt: an invalidation appends,
+        # and there is no latch on the row it withdraws to flip.
+        target = await client.get(f"/records/{target_id}")
 
     assert second.status_code == 409, f"expected 409, got {second.status_code}: {second.text}"
     assert second.headers["content-type"].startswith("application/problem+json")
     problem = second.json()
     assert problem["status"] == 409
-    assert problem["context"]["reason"] == "ALREADY_INACTIVE"
+    # The reason code, not just the class: a 409 for an idempotency conflict
+    # would otherwise pass here and leave the at-most-one rule untested.
+    assert problem["context"]["reason"] == "ALREADY_INVALIDATED", problem
+
+    assert target.status_code == 200, target.text
+    assert target.json()["entry_type"] == "record"
 
 
-async def test_list_usage_types_includes_created(api, make_usage_type):
-    """Seam: catalog list projects plugin-owned rows onto the wire.
+async def test_undeclared_meter_is_rejected_per_record(api, make_meter):
+    """Seam: type resolution against types-registry, over the wire.
 
-    `limit` is the page-size parameter here too: this endpoint shares the
-    toolkit `OData` extractor with `/records`. A large `limit` keeps this
-    assertion stable as the session accumulates usage types across tests;
-    1000 is the documented ceiling and the plugin's clamp.
+    A syntactically valid meter id that was never declared is a 404 — the gear
+    holds no catalog of its own, so this is types-registry answering not-found
+    and the resolver failing closed on it. It arrives per record inside a 207,
+    alongside an entry against a declared meter that is accepted in the same
+    batch: one unresolvable type does not fail the batch.
     """
-    gts_id, metadata_key = await make_usage_type()
-    async with api() as client:
-        resp = await client.get("/usage-types", params={"limit": 1000})
-
-    assert resp.status_code == 200, resp.text
-    by_id = {item["gts_id"]: item for item in resp.json()["items"]}
-    assert gts_id in by_id, f"{gts_id} missing from the catalog listing"
-    assert by_id[gts_id]["kind"] == "counter"
-    assert by_id[gts_id]["metadata_fields"] == [metadata_key]
-
-
-async def test_get_usage_type(api, make_usage_type):
-    """Seam: single catalog read by GTS id in the path.
-
-    The id contains `~` and `.`; this also proves the path segment survives
-    routing without mangling.
-    """
-    gts_id, metadata_key = await make_usage_type()
-    async with api() as client:
-        resp = await client.get(f"/usage-types/{gts_id}")
-
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["gts_id"] == gts_id
-    assert body["kind"] == "counter"
-    assert body["metadata_fields"] == [metadata_key]
-
-
-async def test_delete_usage_type_referenced_by_record_is_rejected(api, make_usage_type):
-    """Seam: real PostgreSQL FK ON DELETE RESTRICT surfaced as HTTP 409.
-
-    This is the canonical PostgreSQL-only seam: SQLite's default FK behaviour
-    differs, and no unit test can observe the constraint. An unreferenced type
-    deletes cleanly (204), a referenced one is refused (409).
-    """
-    referenced_id, _ = await make_usage_type()
-    unreferenced_id, _ = await make_usage_type()
+    declared_id = await make_meter()
+    undeclared_id = f"{GTS_BASE}cf.uc_e2e._.never_declared_{unique_suffix()}.v1~"
 
     async with api() as client:
-        accepted_records(await client.post(
-            "/records", json={"records": [record_payload(referenced_id)]}
-        ))
+        resp = await client.post("/records", json={"records": [
+            record_payload(declared_id),
+            record_payload(undeclared_id),
+        ]})
 
-        blocked = await client.delete(f"/usage-types/{referenced_id}")
-        allowed = await client.delete(f"/usage-types/{unreferenced_id}")
+    assert resp.status_code == 207, f"expected 207, got {resp.status_code}: {resp.text}"
+    results = resp.json()["results"]
+    assert [r["index"] for r in results] == [0, 1], results
+    assert results[0]["outcome"] == "accepted", results[0]
+    assert results[1]["outcome"] == "rejected", results[1]
+    # `NotFoundReason` has no slot on the wire, so the class is the status and
+    # the cause is the detail; asserting the status alone would not tell an
+    # undeclared meter apart from a missing record.
+    assert results[1]["error"]["status"] == 404, results[1]["error"]
+    assert undeclared_id in results[1]["error"]["detail"], results[1]["error"]
 
-    assert blocked.status_code == 409, (
-        f"a referenced usage type must not be deletable, got "
-        f"{blocked.status_code}: {blocked.text}"
-    )
-    assert blocked.headers["content-type"].startswith("application/problem+json")
-    # Reason code from ConflictReason::UsageTypeReferenced (usage-collector-sdk/src/reason.rs),
-    # constructed by UsageCollectorError::usage_type_referenced (usage-collector-sdk/src/error.rs)
-    # and lifted onto `context.reason` in usage-collector/src/infra/sdk_error_mapping.rs. Asserting
-    # on it (not just the status code) keeps this test tied to the real FK RESTRICT seam: an
-    # application-level pre-check returning a bare 409 for a different reason would stay green
-    # on `status_code == 409` alone.
-    assert blocked.json()["context"]["reason"] == "USAGE_TYPE_REFERENCED"
-    assert allowed.status_code == 204, allowed.text
+
+async def test_backfill_admits_a_period_the_live_path_refuses(api, make_meter):
+    """Seam: the two ingestion routes disagree about one covered period.
+
+    The live route admits an entry whose period ENDS within 48 hours of now;
+    the backfill route exists for exactly the periods that bound refuses, and
+    stamps what it admits `origin: backfill`. The same payload is submitted to
+    both, so the routes are the only difference between the two outcomes.
+
+    A week back is past the live bound and well inside the 90-day backfill
+    window, so the entry is authorized against the ordinary `create` action
+    and needs no elevated permission.
+    """
+    meter_id = await make_meter()
+    period = covered_period(ends_ago=timedelta(days=7))
+    payload = record_payload(meter_id, value="8", period=period)
+
+    async with api() as client:
+        live = await client.post("/records", json={"records": [payload]})
+        imported = accepted_records(
+            await client.post("/records/backfill", json={"records": [payload]})
+        )
+
+    assert rejected_records(live)[0]["status"] == 400, live.text
+    assert imported[0]["origin"] == "backfill"
+    # The period is carried verbatim, not clamped to the live route's bound:
+    # the route exists for exactly the periods that bound refuses.
+    assert datetime.fromisoformat(imported[0]["window_end"].replace("Z", "+00:00")) == \
+        datetime.fromisoformat(period[1].replace("Z", "+00:00"))

@@ -366,6 +366,12 @@ jobs:
       - name: Test users_info with Postgres (integration)
         run: make test-users-info-pg
 
+      # The most container-hungry lane in the repo: one TimescaleDB container
+      # per integration test. The harness caps `shared_buffers` per container
+      # (tests/common/mod.rs) so the count does not scale with runner width.
+      - name: Test timescaledb usage-collector plugin (pg integration)
+        run: make test-usage-collector-pg
+
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
 
