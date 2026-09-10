@@ -15,7 +15,9 @@
 //! nothing in it obliges a particular series here.
 //!
 //! Note what the clause delegates ownership *to*: the plugin's **deployment
-//! guide**, which is `docs/DESIGN.md` §4 in this crate. That table cannot
+//! guide** — no such document exists under that name here, and `docs/DESIGN.md`
+//! §4 is the closest thing this crate has to one (its own traceability row at
+//! `docs/DESIGN.md:90` claims the role). That table cannot
 //! currently be read as one — it predates the slice-4 record model and still
 //! lists instruments this crate deleted with the usage-type catalog — so **the
 //! code below is what the plugin actually emits, and the gap is a documentation
@@ -25,9 +27,10 @@
 //! identical whether the downstream collector runs with `add_metric_suffixes` on
 //! or off — matching the parent gateway (`usage-collector/src/infra/metrics.rs`)
 //! and the wider application-gear convention. Histogram bucket layouts bracket
-//! the p95 budgets of `cpt-cf-usage-collector-nfr-query-latency` and
-//! `cpt-cf-usage-collector-nfr-throughput` (the gear's `DESIGN.md` §3.11.2
-//! Latency Budgets) and are part of the contract — cited by NFR id rather than
+//! the p95 budget of `cpt-cf-usage-collector-nfr-query-latency` and the write
+//! envelope of `cpt-cf-usage-collector-nfr-throughput` — a rate NFR, which has
+//! no p95 — against the gear's `DESIGN.md` §3.11.2 Latency Budgets, and are
+//! part of the contract. Cited by NFR id rather than
 //! through this crate's own `docs/DESIGN.md` §1.2 driver table, whose
 //! surrounding rows still describe the retired record model.
 //!
@@ -55,8 +58,8 @@ const SCOPE_NAME: &str = "uc.timescaledb";
 /// Explicit histogram bucket boundaries (seconds) for backend operation
 /// durations. The `OTel` SDK defaults are count-oriented and meaningless for a
 /// seconds-valued duration; these bracket the gear `DESIGN.md` §3.11.2 p95
-/// budgets with finer
-/// low-end resolution so client-side percentiles stay comparable.
+/// budgets with finer low-end resolution so client-side percentiles stay
+/// comparable.
 const DURATION_BOUNDARIES_SECS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
@@ -181,10 +184,17 @@ impl ErrorClass {
 /// the refusal rate that shows an operator the obligation being exercised at
 /// all. A closed enum so the label set is enforced by the type.
 ///
-/// **The two arms are not addable.** `in_batch` increments once per refused
-/// **row**; `cross_call` increments once per refused **statement**, because the
-/// index aborts a multi-row `INSERT` whole rather than per row. Read each series
-/// on its own; a sum of the two counts two different things.
+/// **The two arms are not addable**, and the instrument's description says so
+/// because a Prometheus series carries no rustdoc. `in_batch` increments once
+/// per refused **row**; `cross_call` increments once per refused **statement**,
+/// because the index aborts a multi-row `INSERT` whole rather than per row.
+///
+/// `cross_call` under-counts within itself for the same reason: one aborted
+/// batch withdrawing two *different* already-withdrawn targets yields a single
+/// increment, since `plan_batch` pre-rejects same-target duplicates only and
+/// nothing splits the statement per row. It answers "how often is a batch refused", not "how many withdrawals
+/// were refused". Read each series alone; a sum of the two counts two different
+/// things in two different units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidationRejection {
     /// Refused against an earlier entry of the same batch (`scope = "in_batch"`).
@@ -325,7 +335,11 @@ impl Metrics {
             .build();
         let invalidation_rejection = meter
             .u64_counter("uc_timescaledb_invalidation_rejections_total")
-            .with_description("Withdrawals refused by the at-most-one rule, by scope")
+            .with_description(
+                "Withdrawals refused by the at-most-one rule; scope=in_batch counts refused \
+                 rows, scope=cross_call counts refused statements (a whole aborted batch, \
+                 however many targets) - read each series alone, do not sum",
+            )
             .build();
         let dedup_stale = meter
             .u64_counter("uc_timescaledb_dedup_stale_total")

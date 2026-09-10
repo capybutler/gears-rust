@@ -4014,10 +4014,34 @@ see. The increment is now above the `match`, at the point where
 below can change. The description "refused by the at-most-one rule" is then
 true of every increment rather than of most of them.
 
-**The two arms are not addable, and both the enum's rustdoc and the call site
-say so.** `in_batch` counts refused **rows**; `cross_call` counts refused
-**statements**, because the index aborts a multi-row `INSERT` whole (Task 18
-Step 4b item 2). A dashboard summing them is measuring two different things.
+**The two arms are not addable, and `cross_call` under-counts within itself.**
+`in_batch` counts refused **rows**; `cross_call` counts refused **statements**,
+because the index aborts a multi-row `INSERT` whole (Task 18 Step 4b item 2).
+Sharper than "the units differ", and it is the reason they differ: one aborted
+batch withdrawing two *different* already-withdrawn targets is a **single**
+increment, because `plan_batch` pre-rejects same-target duplicates only and
+nothing splits the statement per row. `cross_call` answers "how often is a batch
+refused", never "how many withdrawals were refused".
+
+**That warning lives in the instrument's `description`, not only in rustdoc** —
+`InvalidationRejection`'s rustdoc, both call sites *and* the description all
+carry it, because **a Prometheus series carries no rustdoc**. The description an
+operator actually reads is the only one that can stop the sum, and the first
+version of it ("Withdrawals refused by the at-most-one rule, by scope") invited
+exactly the sum the rustdoc forbade.
+`metrics_tests::the_rejection_counters_description_warns_against_summing_its_arms`
+pins it: both label values, both unit nouns, and "do not sum" must be present.
+Mutations, both red with a `Compiling` line — delete the "do not sum" clause;
+change "counts refused statements" to "counts refused batches".
+
+**One consequence of the hoist that did not exist before it.** The `Ok(None)`
+arm returns `Transient`, which `is_retryable_batch_error` admits, so a
+retention-race batch re-enters `map_insert_error` on each of up to
+`MAX_BATCH_ATTEMPTS` (3) attempts and increments `cross_call` every time.
+Correct under that label's unit — three attempts are three refused statements —
+and `uc_timescaledb_batch_retries_total` moves beside it, so neither masks the
+other. Recorded because **before the hoist the counter could not fire twice for
+one request**, and the `with_retry` call site now says so.
 
 **Not** changed: the logging asymmetry. The in-batch path still `warn`s and the
 cross-call path still does not. The metric is what makes refusals visible in
@@ -4278,10 +4302,10 @@ happened to the figure this sentence used to carry.)
 **Measured at Task 13: 24**, two ways that agree — `grep -cE '^#\[(tokio::)?test\]'`
 over `src/infra/storage/mapper_tests.rs`, and `cargo nextest list` filtered to
 `infra::storage::mapper::mapper_tests`. All 24 green. **Baseline for whoever
-reads this next: 212 passed / 0 skipped** unfiltered (211 before this task).
-Per module: `record_store_tests` 75,
+reads this next: 213 passed / 0 skipped** unfiltered (211 before this task, plus
+two metrics tests). Per module: `record_store_tests` 75,
 `translate_tests` 46, `mapper_tests` 24, `error_tests` 16, `config_tests` 14,
-`query_tests` 12, `aggregate_tests` 12, `pool_tests` 9, `metrics_tests` 3,
+`query_tests` 12, `aggregate_tests` 12, `pool_tests` 9, `metrics_tests` 4,
 `gear_tests` 1.
 
 If any of them fails to compile in this context, the harness proof does not

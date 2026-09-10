@@ -78,6 +78,21 @@ fn counter_sum_with_label(
     0
 }
 
+/// The description the meter recorded for the instrument named `name`.
+fn description_of(exporter: &InMemoryMetricExporter, name: &str) -> String {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    for resource_metrics in &metrics {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name {
+                    return metric.description().to_owned();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 /// Last value of the `u64` Gauge named `name`, if recorded.
 fn gauge_last_u64(exporter: &InMemoryMetricExporter, name: &str) -> Option<u64> {
     let metrics = exporter.get_finished_metrics().unwrap();
@@ -277,4 +292,35 @@ async fn invalidation_counters_emit_under_their_declared_names() {
         1,
         "the index's cross-call refusal carries scope=cross_call",
     );
+}
+
+/// The rejection counter's **description** carries the not-addable warning.
+///
+/// This is not decoration. `InvalidationRejection`'s rustdoc explains that
+/// `in_batch` counts rows while `cross_call` counts whole aborted statements,
+/// and an operator reading a Prometheus series never sees rustdoc — the
+/// description is the only text that travels with the metric. A dashboard that
+/// sums the two arms is measuring two quantities in two units, and the
+/// description is what stops that.
+#[tokio::test]
+async fn the_rejection_counters_description_warns_against_summing_its_arms() {
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+    metrics.inc_invalidation_rejection(InvalidationRejection::InBatch);
+    provider.force_flush().unwrap();
+
+    let desc = description_of(&exporter, "uc_timescaledb_invalidation_rejections_total");
+
+    for needle in [
+        label::SCOPE_IN_BATCH,
+        label::SCOPE_CROSS_CALL,
+        "rows",
+        "statements",
+        "do not sum",
+    ] {
+        assert!(
+            desc.contains(needle),
+            "the description must carry {needle:?} so the units travel with the series, got: {desc:?}"
+        );
+    }
 }
