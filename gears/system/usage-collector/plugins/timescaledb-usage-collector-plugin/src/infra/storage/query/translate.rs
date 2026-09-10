@@ -36,8 +36,9 @@
 //!   Tests build it via
 //!   `<UsageRecordFilterField as FilterField>::from_name("entry_type")`.
 //! - `MeterTypeId`: `new(impl Into<String>) -> Result<Self,
-//!   UsageCollectorError>` (validated); reads back via `as_str()`. It replaced
-//!   the retired `UsageTypeGtsId` this list used to name.
+//!   UsageCollectorError>` (validated); reads back via `as_str()`, or through
+//!   its `AsRef<str>`, which forwards to it. It replaced the retired
+//!   `UsageTypeGtsId` this list used to name.
 //!   `ResourceRef::new(resource_id, resource_type) -> Result<_,
 //!   _>`; `SubjectRef::new(subject_id, Option<subject_type>) -> Result<_, _>`;
 //!   `MetadataKey::new(impl Into<String>) -> Result<_, _>`;

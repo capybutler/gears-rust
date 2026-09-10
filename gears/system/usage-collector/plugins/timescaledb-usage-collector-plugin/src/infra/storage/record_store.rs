@@ -1772,10 +1772,21 @@ fn canonical_equal(
 /// it needs.
 ///
 /// **The consequence is deliberate: grouped buckets need not sum to the
-/// ungrouped total.** Dropping the row is the spec owner's decision
-/// (`DIVERGENCES.md` §G), matching the SDK's reference backend and its own
-/// dimension docs. It was already true of the two subject dimensions; guarding
-/// the metadata one makes it uniform rather than accidental.
+/// ungrouped total.** Dropping the row is what the SDK both documents and
+/// does: `models.rs:1587-1592` says rows without a subject "are excluded from
+/// the grouping", and `contract/reference.rs:801` reads a grouped metadata key
+/// as `row.metadata.get(key).cloned()`, so an absent key yields `None` and the
+/// row joins no bucket.
+///
+/// **`DIVERGENCES.md` §G is not the citation for this**, though it is where a
+/// reader will look. §G records the question as still *open* — "DESIGN says
+/// nothing about the case", "that is an argument, not a ruling ... and it is a
+/// spec owner's to make", "do not write the check first". The ruling is this
+/// port's Task 18, which rewrites §G; until then the two SDK sites above are
+/// what this guard conforms to (`DIVERGENCES.md` §G, resolved by Task 18).
+///
+/// It was already true of the two subject dimensions; guarding the metadata one
+/// makes it uniform rather than accidental.
 fn dimension_presence_guard(dim: &AggregationDimension, select_expr: &str) -> Option<String> {
     match dim {
         AggregationDimension::SubjectId
@@ -2270,9 +2281,14 @@ impl RecordStore for PgRecordStore {
         // [`build_aggregate_sql`] pushes exactly one dimension expression per
         // element — but nothing here observes that: no unit test executes a
         // statement, and `PgRow` cannot be built off a connection. Handing the
-        // decoder a different count, or restoring the short circuit above,
-        // survives every test in the crate. Task 15's integration tests are
-        // where both are caught.
+        // decoder a different count survives every test in the crate, and so
+        // would a short circuit placed *after* the fetch. Task 15's integration
+        // tests are where those are caught.
+        //
+        // A short circuit placed where one would actually be written — above
+        // the acquire, to skip the query — is a different matter and is
+        // covered: `the_ungrouped_fold_still_reaches_the_pool` requires the
+        // ungrouped fold to reach the pool.
         let buckets = rows
             .iter()
             .map(|row| aggregate_bucket(row, group_by.len()))

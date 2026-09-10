@@ -2503,11 +2503,17 @@ fn grouping_numbers_its_ordinals_from_one_and_bounds_the_bucket_count() {
 #[test]
 fn a_nullable_dimension_drops_the_rows_that_do_not_carry_it() {
     // The absent-dimension rule, uniform across all three dimensions that can
-    // be `NULL`: drop the row rather than fold it into a `NULL` bucket
-    // (`DIVERGENCES.md` §G, matching the SDK's reference backend). Before Task
-    // 12 the two subject dimensions were guarded and the metadata one was not,
-    // so five of six dimensions obeyed the rule and the sixth did so by
-    // accident of the SDK's own docs.
+    // be `NULL`: drop the row rather than fold it into a `NULL` bucket. What
+    // says so is the SDK itself — `models.rs:1587-1592` for the two subject
+    // dimensions, and `contract/reference.rs:801` for a metadata key, which the
+    // reference backend reads as an `Option` and drops the row on. Not
+    // `DIVERGENCES.md` §G, which still records the question as open and the
+    // ruling as a spec owner's to make; that is this port's Task 18
+    // (`DIVERGENCES.md` §G, resolved by Task 18).
+    //
+    // Before Task 12 the two subject dimensions were guarded and the metadata
+    // one was not, so five of six dimensions obeyed the rule and the sixth did
+    // so by accident of the SDK's own docs.
     //
     // The guard is spelled against the grouping expression itself, so it is the
     // exact negation of "this expression yields NULL". `?` would not be: for a
@@ -2635,6 +2641,54 @@ fn the_folds_disjunctive_scope_survives_the_conjunction_with_the_range() {
         "$6 is the second admitted tenant; both grants must be bound, or the \
          scope silently narrows to one. got: {:?}",
         binds[5]
+    );
+}
+
+#[tokio::test]
+async fn the_ungrouped_fold_still_reaches_the_pool() {
+    // The half every pure test above is blind to: that the single empty-keyed
+    // bucket is `PostgreSQL`'s answer to a bare aggregate rather than something
+    // this method shortcuts to. The mutation is a `return` whose whole purpose
+    // is to skip the query, so its natural home is above the acquire:
+    //
+    //     if group_by.is_empty() {
+    //         return Ok(AggregationResult { buckets: Vec::new() });
+    //     }
+    //
+    // The store's pool is lazy and points at nothing, so a path that got as far
+    // as acquiring a connection answers `Transient` (a pool timeout) and one
+    // that short-circuited answers `Ok`. The same discriminator
+    // `a_page_that_cannot_be_built_never_reaches_the_pool` uses, read the other
+    // way round: there an `Internal` proves the read stopped early, here a
+    // `Transient` proves it did not.
+    //
+    // It also pins `aggregate`'s stated order — the statement is built before a
+    // connection is acquired — for the ungrouped case, which is where an
+    // empty-result guard would otherwise sit unobserved.
+    let store = lazy_store();
+
+    let Err(err) = store
+        .aggregate(
+            list_meter(),
+            list_range(),
+            AggregationFold::Count,
+            &fold_query(),
+            &[],
+            &[],
+        )
+        .await
+    else {
+        panic!(
+            "an empty group_by must still be answered by a query: COUNT over an \
+             empty selection is 0 rather than absent, and that is the backend's \
+             answer, not this method's"
+        );
+    };
+
+    assert!(
+        matches!(err, UsageCollectorPluginError::Transient { .. }),
+        "the ungrouped fold must reach the pool; anything else means it \
+         answered without asking. got: {err:?}"
     );
 }
 

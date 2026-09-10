@@ -114,8 +114,11 @@ pub fn withdrawal_exclusion_clause() -> &'static str {
 /// entry 15 holds that gap open; growing the enum is not this backend's to do.
 ///
 /// **Absent dimensions.** This returns a bare column, and a `NULL` in one forms
-/// a `NULL` group. The rule is to drop the row instead — a spec owner's
-/// decision, recorded at `DIVERGENCES.md` §G — and enforcing it is the caller's,
+/// a `NULL` group. The rule is to drop the row instead — what the SDK
+/// documents at `models.rs:1587-1592` and what its reference backend does at
+/// `contract/reference.rs:801`, not a ruling recorded in `DIVERGENCES.md` §G,
+/// which still holds the question open for a spec owner (`DIVERGENCES.md` §G,
+/// resolved by this port's Task 18). Enforcing it is the caller's,
 /// since a `GROUP BY` ordinal carries no `WHERE` predicate. Only `subject_id`,
 /// `subject_type` and an absent metadata key can be `NULL`; the other columns
 /// are `NOT NULL` in the schema, so a guard on them would be dead SQL.
