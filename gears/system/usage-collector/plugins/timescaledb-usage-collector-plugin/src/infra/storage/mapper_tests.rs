@@ -10,8 +10,21 @@ use usage_collector_sdk::{MetadataKey, MeterTypeId, RecordOrigin, UsageCollector
 use super::super::entity::UsageRecordRow;
 use super::{
     invalidation_from_row, metadata_jsonb_to_map, metadata_map_to_jsonb, meter_type_id_from_str,
-    meter_type_id_str, parse_origin, record_row_to_model,
+    parse_origin, record_row_to_model,
 };
+
+/// Assert a mapper call failed as [`UsageCollectorPluginError::Internal`].
+///
+/// `#[track_caller]` keeps the panic pointing at the test that called it, and
+/// the message names what was expected and prints what came back — a bare
+/// `assert!(matches!(..))` prints neither.
+#[track_caller]
+fn assert_internal<T: std::fmt::Debug>(result: Result<T, UsageCollectorPluginError>, what: &str) {
+    match result {
+        Err(UsageCollectorPluginError::Internal(_)) => {}
+        other => panic!("{what} must be Internal (a stored-invariant break), got {other:?}"),
+    }
+}
 
 // ── origin round-trip ────────────────────────────────────────────────────────
 
@@ -24,10 +37,7 @@ fn parse_origin_round_trips_through_the_sdk_spelling() {
 
 #[test]
 fn parse_origin_rejects_unknown() {
-    assert!(matches!(
-        parse_origin("imported"),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
+    assert_internal(parse_origin("imported"), "an origin outside the DDL CHECK");
 }
 
 // ── metadata jsonb <-> map round-trip ────────────────────────────────────────
@@ -41,6 +51,22 @@ fn metadata_map_to_jsonb_then_back_round_trips() {
     let json = metadata_map_to_jsonb(&map);
     let back = metadata_jsonb_to_map(json).unwrap();
     assert_eq!(back, map);
+}
+
+#[test]
+fn metadata_map_to_jsonb_writes_the_key_spelling_verbatim() {
+    let mut map = BTreeMap::new();
+    map.insert(MetadataKey::new("region").unwrap(), "eu-west".to_owned());
+
+    let mut expected = serde_json::Map::new();
+    expected.insert("region".to_owned(), JsonValue::String("eu-west".to_owned()));
+
+    assert_eq!(
+        metadata_map_to_jsonb(&map),
+        JsonValue::Object(expected),
+        "the stored jsonb key is the MetadataKey verbatim; $filter and every \
+         other reader of the column depend on it"
+    );
 }
 
 #[test]
@@ -80,16 +106,10 @@ fn meter_type_id_from_str_accepts_valid_and_rejects_invalid_as_internal() {
     assert!(meter_type_id_from_str(VALID_METER_TYPE_ID).is_ok());
     // A stored value that no longer validates is a plugin invariant break, not
     // a caller error — it MUST surface as `Internal`.
-    assert!(matches!(
+    assert_internal(
         meter_type_id_from_str("not-a-valid-meter-type-id"),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
-}
-
-#[test]
-fn meter_type_id_str_borrows_the_stored_spelling_back() {
-    let id = MeterTypeId::new(VALID_METER_TYPE_ID).unwrap();
-    assert_eq!(meter_type_id_str(&id), VALID_METER_TYPE_ID);
+        "a stored gts_type_id that no longer validates",
+    );
 }
 
 // ── invalidation pair ────────────────────────────────────────────────────────
@@ -108,12 +128,12 @@ fn a_reason_without_a_target_is_an_invariant_break() {
 #[test]
 fn an_unparseable_stored_reason_is_an_invariant_break() {
     // `ReasonCode::new` rejects the empty string. The column is plain `text`
-    // with no content check of its own -- only the pairing constraint -- so
+    // with no content check of its own — only the pairing constraint — so
     // the store can hold one.
-    let err = invalidation_from_row(Some(Uuid::new_v4()), Some(String::new()))
-        .expect_err("an invalid reason must not map");
-
-    assert!(matches!(err, UsageCollectorPluginError::Internal(_)));
+    assert_internal(
+        invalidation_from_row(Some(Uuid::new_v4()), Some(String::new())),
+        "a complete pair whose reason_code fails ReasonCode validation",
+    );
 }
 
 // ── record row -> model ──────────────────────────────────────────────────────
@@ -245,15 +265,37 @@ fn record_row_absent_subject_maps_to_none() {
 }
 
 #[test]
+fn a_subject_without_a_type_maps_to_an_untyped_subject() {
+    // The third shape `usage_records_subject_pairing` admits, between both-set
+    // and both-NULL: an identified subject whose type is unknown. `SubjectRef`
+    // models it as `subject_type: None`, so the mapper must carry the absence
+    // rather than invent a placeholder.
+    let row = UsageRecordRow {
+        subject_type: None,
+        ..sample_row()
+    };
+
+    let model = record_row_to_model(row).expect("an untyped subject maps");
+
+    let subject = model.subject_ref.as_ref().expect("subject present");
+    assert_eq!(subject.subject_id(), "subj-1");
+    assert_eq!(
+        subject.subject_type(),
+        None,
+        "a NULL subject_type is an untyped subject, not a fabricated one"
+    );
+}
+
+#[test]
 fn record_row_invalid_gts_type_id_is_internal() {
     let row = UsageRecordRow {
         gts_type_id: "not-a-valid-meter-type-id".to_owned(),
         ..sample_row()
     };
-    assert!(matches!(
+    assert_internal(
         record_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
+        "a stored gts_type_id that no longer validates",
+    );
 }
 
 #[test]
@@ -263,10 +305,7 @@ fn record_row_invalid_resource_ref_is_internal() {
         resource_id: String::new(),
         ..sample_row()
     };
-    assert!(matches!(
-        record_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
+    assert_internal(record_row_to_model(row), "an empty stored resource_id");
 }
 
 #[test]
@@ -276,10 +315,10 @@ fn record_row_invalid_subject_ref_is_internal() {
         subject_id: Some(String::new()),
         ..sample_row()
     };
-    assert!(matches!(
+    assert_internal(
         record_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
+        "a present-but-empty stored subject_id",
+    );
 }
 
 #[test]
@@ -288,10 +327,7 @@ fn record_row_invalid_idempotency_key_is_internal() {
         idempotency_key: String::new(),
         ..sample_row()
     };
-    assert!(matches!(
-        record_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
+    assert_internal(record_row_to_model(row), "an empty stored idempotency_key");
 }
 
 #[test]
@@ -300,10 +336,10 @@ fn record_row_non_object_metadata_is_internal() {
         metadata: JsonValue::String("not-an-object".to_owned()),
         ..sample_row()
     };
-    assert!(matches!(
+    assert_internal(
         record_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
+        "stored metadata that is not a JSON object",
+    );
 }
 
 #[test]
@@ -312,8 +348,5 @@ fn record_row_unknown_origin_is_internal() {
         origin: "imported".to_owned(),
         ..sample_row()
     };
-    assert!(matches!(
-        record_row_to_model(row),
-        Err(UsageCollectorPluginError::Internal(_))
-    ));
+    assert_internal(record_row_to_model(row), "an origin outside the DDL CHECK");
 }

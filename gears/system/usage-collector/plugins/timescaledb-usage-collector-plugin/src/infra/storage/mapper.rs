@@ -4,17 +4,16 @@
 //! [`UsageCollectorPluginError::Internal`] — a row already in the database that
 //! cannot be reconstituted is a plugin invariant break, not a caller error.
 //!
-//! `id`, `tenant_id`, `value` and the two period bounds move across unchanged.
-//! Every other column is validated on the way in: `resource_id` and
-//! `resource_type` through [`ResourceRef::new`], `subject_id` and
-//! `subject_type` through [`SubjectRef::new`], `idempotency_key` through
+//! Of the columns the model carries, `id`, `tenant_id`, `value` and the two
+//! period bounds move across unchanged. The rest are validated on the way in:
+//! `resource_id` and `resource_type` through [`ResourceRef::new`], `subject_id`
+//! and `subject_type` through [`SubjectRef::new`], `idempotency_key` through
 //! [`IdempotencyKey::new`], `metadata` through [`metadata_jsonb_to_map`], and
-//! the rest through the helpers below, which take more explaining:
+//! these through the helpers below, which take more explaining:
 //!
-//! - `gts_type_id` becomes a [`MeterTypeId`], whose constructor validates, so
-//!   the read direction ([`meter_type_id_from_str`]) returns a `Result` while
-//!   the bind direction ([`meter_type_id_str`]) is an infallible `AsRef<str>`
-//!   borrow.
+//! - `gts_type_id` becomes a [`MeterTypeId`] via [`meter_type_id_from_str`].
+//!   There is no borrowing helper beside it: `MeterTypeId::as_str` is the bind
+//!   direction, and a wrapper would be a second spelling of it.
 //! - `origin` becomes a [`RecordOrigin`]. There is deliberately no
 //!   `origin_to_sql` counterpart to [`parse_origin`]: [`RecordOrigin::as_str`]
 //!   already is the SQL form, and [`parse_origin`] compares against that same
@@ -35,13 +34,13 @@ use usage_collector_sdk::{
 
 use super::entity::UsageRecordRow;
 
-/// Borrow the raw GTS type id string out of a [`MeterTypeId`] (for binding).
-#[must_use]
-pub fn meter_type_id_str(gts_type_id: &MeterTypeId) -> &str {
-    gts_type_id.as_ref()
-}
-
 /// Reconstruct a validated [`MeterTypeId`] from a stored string.
+///
+/// This is `MeterTypeId::from_str` plus the lift into
+/// [`UsageCollectorPluginError`], and the lift is the whole point: the SDK
+/// reports a bad id as a *caller* error, but a value that is already in the
+/// database is this plugin's invariant to have broken. The reverse direction
+/// needs no helper at all — `MeterTypeId::as_str` is what the insert binds.
 ///
 /// # Errors
 ///
@@ -168,28 +167,51 @@ pub fn metadata_map_to_jsonb(map: &BTreeMap<MetadataKey, String>) -> JsonValue {
 /// Neither travels back out through the SPI. This is not an oversight; see
 /// [`UsageRecordRow`]'s own doc for why they are decoded at all.
 ///
+/// The two stored pairs are treated asymmetrically, deliberately. A
+/// half-populated invalidation pair is *refused*, because [`Invalidation`] has
+/// a shape to reconstruct into and half of it is not that shape. A
+/// `subject_type` with no `subject_id` is *dropped* — the `match` on
+/// `row.subject_id` never looks at the type — because [`SubjectRef`] requires
+/// an id and makes only the type optional, so there is no half-built subject
+/// to refuse on behalf of. Both shapes are already refused at the table by
+/// `usage_records_invalidation_pairing` and `usage_records_subject_pairing`;
+/// the difference here is only in what a mapper can say about them.
+///
 /// # Errors
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] when any stored component
 /// fails its SDK newtype validation (`gts_type_id`, `resource_ref`,
-/// `subject_ref`, `idempotency_key`, `metadata`, `origin`) or when the stored
-/// invalidation pair is half-populated (see [`invalidation_from_row`]).
+/// `subject_ref`, `idempotency_key`, `metadata`, `origin`), or when the stored
+/// invalidation pair is half-populated or carries a `reason_code` that fails
+/// [`ReasonCode`] validation (both via [`invalidation_from_row`]).
 pub fn record_row_to_model(row: UsageRecordRow) -> Result<UsageRecord, UsageCollectorPluginError> {
+    // The composite primary key, captured before the row is picked apart.
+    // `ResourceRef::new`, `SubjectRef::new` and `IdempotencyKey::new` all
+    // report a fixed reason and never echo the value they rejected, so without
+    // this an operator is told a stored row is malformed and not which one.
+    let (id, window_end) = (row.id, row.window_end);
+
     let gts_type_id = meter_type_id_from_str(&row.gts_type_id)?;
 
     let resource_ref = ResourceRef::new(row.resource_id, row.resource_type).map_err(|e| {
-        UsageCollectorPluginError::internal(format!("stored resource_ref invalid: {e}"))
+        UsageCollectorPluginError::internal(format!(
+            "stored row `{id}` (window_end {window_end}): resource_ref invalid: {e}"
+        ))
     })?;
 
     let subject_ref = match row.subject_id {
         Some(subject_id) => Some(SubjectRef::new(subject_id, row.subject_type).map_err(|e| {
-            UsageCollectorPluginError::internal(format!("stored subject_ref invalid: {e}"))
+            UsageCollectorPluginError::internal(format!(
+                "stored row `{id}` (window_end {window_end}): subject_ref invalid: {e}"
+            ))
         })?),
         None => None,
     };
 
     let idempotency_key = IdempotencyKey::new(row.idempotency_key).map_err(|e| {
-        UsageCollectorPluginError::internal(format!("stored idempotency_key invalid: {e}"))
+        UsageCollectorPluginError::internal(format!(
+            "stored row `{id}` (window_end {window_end}): idempotency_key invalid: {e}"
+        ))
     })?;
 
     let metadata = metadata_jsonb_to_map(row.metadata)?;
