@@ -38,7 +38,11 @@ pub trait RecordStore: Send + Sync + 'static {
     ///
     /// Entries are returned as persisted: a withdrawn record and the
     /// invalidation that withdrew it both appear, because this is a ledger path
-    /// rather than a derived view.
+    /// rather than a derived view — though **not necessarily on one page**. The
+    /// pair shares a `window_end` but not an `id`, and an admissible order
+    /// names both, so a page boundary can fall between them whichever of the
+    /// two the order leads with. A consumer folding the pair out folds over a
+    /// range it has read whole, not over a single page.
     async fn list(
         &self,
         gts_type_id: MeterTypeId,

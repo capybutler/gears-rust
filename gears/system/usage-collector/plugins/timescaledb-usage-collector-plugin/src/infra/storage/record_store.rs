@@ -1188,8 +1188,10 @@ fn build_get_sql(scope: &ast::Expr) -> Result<(String, Vec<SqlBind>), String> {
 /// The `WHERE` is assembled in bind order: the meter at `$1`, the covered
 /// period's two bounds at `$2` and `$3`, then the caller's composed `$filter`,
 /// the metadata side channel, and the keyset continuation. Identifiers come
-/// from the [`record_column`] allowlist and the static [`RECORD_COLUMNS`];
-/// every value is bound.
+/// from the [`record_column`] allowlist, the static [`RECORD_COLUMNS`], and
+/// this function's own literal column names — `r.gts_type_id`, `r.window_end`,
+/// and the side channel's `metadata ->>`. None of the three is caller input;
+/// every caller-derived value is bound.
 ///
 /// **Selection reads the covered-period end alone** — `from <= window_end <
 /// to`, per `cpt-cf-usage-collector-adr-window-end-selection` — and the
@@ -1246,9 +1248,11 @@ fn build_list_sql(
     ];
 
     // The composed `$filter`, through the seam every read path shares. What
-    // arrives is the gateway's `And`-composition of the caller's filter with
-    // the compiled PDP scope, so the two halves are one expression by the time
-    // they get here. [`translate_scope`] returns a parenthesized fragment,
+    // arrives is the caller's filter `And`-composed with the compiled PDP
+    // scope, or the scope alone when the caller supplied none — either way one
+    // expression, and in the second case the scope's own outermost node, which
+    // for a multi-constraint grant is an `Or`.
+    // [`translate_scope`] returns a parenthesized fragment,
     // which is what makes pushing it into a `join(" AND ")` safe; the
     // `convert_expr_to_filter_node` + `translate_record_filter` pair this call
     // replaces returned a bare one.

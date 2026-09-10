@@ -3402,9 +3402,11 @@ Test 2's mutation is the important one. Name it out loud in the task report.
 `convert_expr_to_filter_node` + `translate_record_filter` pair inline. It
 returns a parenthesized fragment, so pushing it into `clauses` is safe; the
 inline version here is not, and what arrives in `query.filter` is the
-gateway's `And`-composition of the caller's filter with the compiled scope;
-the scope half may be a disjunction of tenant-pinned conjunctions, and nothing
-at this layer can tell how many constraints the PDP returned.
+caller's filter `And`-composed with the compiled scope, **or the scope alone
+when the caller supplied none** — in which case the scope's own outermost
+node is the outermost node. A multi-constraint grant compiles that to a
+disjunction of tenant-pinned conjunctions, and nothing at this layer can tell
+how many constraints the PDP returned.
 
 Rewrite `list` (`:1028`). The shape:
 
@@ -3527,10 +3529,12 @@ to fix, but do not be surprised by the remainder.
 **Translate `query.filter` through `translate_scope`** (Task 10,
 `query/translate.rs`), for the reason Task 11's Step 3 gives: the inline pair
 this file still carries pushes an unparenthesized fragment into a
-`clauses.join(" AND ")`, and what arrives is the gateway's `And`-composition of
-the caller's filter with the compiled scope; the scope half may be a
-disjunction of tenant-pinned conjunctions, and nothing at this layer can tell
-how many constraints the PDP returned.
+`clauses.join(" AND ")`, and what arrives is the caller's filter
+`And`-composed with the compiled scope, **or the scope alone when the caller
+supplied none** — in which case the scope's own outermost node is the
+outermost node. A multi-constraint grant compiles that to a disjunction of
+tenant-pinned conjunctions, and nothing at this layer can tell how many
+constraints the PDP returned.
 
 At `:1204`. The shape:
 

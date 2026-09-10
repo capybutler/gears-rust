@@ -1650,7 +1650,28 @@ fn selection_reads_the_period_end_alone() {
          latter because its read-back range is one second wide at the period \
          end while the period began an hour earlier. got: {tail}"
     );
+    // The clause text above pins the predicate; these pin what is bound into
+    // it. Without them the two bounds can be swapped — inverting the range to
+    // `window_end >= to AND window_end < from`, which selects nothing, ever —
+    // or bound from one end twice, or the meter can be bound as an empty
+    // string, which drops the scoping to one meter without changing a
+    // character of the SQL.
     assert_eq!(binds.len(), 3, "the meter and the two range bounds");
+    assert!(
+        matches!(&binds[0], SqlBind::Str(s) if s == VCPU_METER),
+        "$1 is the meter this page reads. got: {:?}",
+        binds[0]
+    );
+    assert!(
+        matches!(&binds[1], SqlBind::DateTime(t) if t.unix_timestamp() == RANGE_FROM_UNIX),
+        "$2 is the range's inclusive lower bound. got: {:?}",
+        binds[1]
+    );
+    assert!(
+        matches!(&binds[2], SqlBind::DateTime(t) if t.unix_timestamp() == RANGE_TO_UNIX),
+        "$3 is the range's exclusive upper bound. got: {:?}",
+        binds[2]
+    );
 }
 
 #[test]
@@ -1702,6 +1723,30 @@ fn a_page_that_did_not_fill_mints_no_continuation() {
 }
 
 #[test]
+fn an_exactly_full_page_mints_no_continuation() {
+    // The boundary case the look-ahead comparison decides, and the only one
+    // that tells `>` from `>=`. A page holding exactly `limit` rows had no
+    // look-ahead row, so there is nothing after it. Under `>=` it would be
+    // treated as overfull: the last row would be truncated away — dropped from
+    // the caller's results entirely — and a continuation minted from the row
+    // before it.
+    let query = list_query();
+
+    let page =
+        build_list_page(vec![list_row(1)], &query, 1).expect("an exactly-full page must assemble");
+
+    assert_eq!(
+        page.items.len(),
+        1,
+        "an exactly-full page serves every row it read"
+    );
+    assert!(
+        page.page_info.next_cursor.is_none(),
+        "no look-ahead row was read, so nothing follows this page"
+    );
+}
+
+#[test]
 fn the_minted_boundary_is_read_in_the_order_it_was_handed() {
     // `window_end` and `id` are guaranteed present in the order, not guaranteed
     // last: a caller ordering by `id` is handed on as `(id, window_end)`. The
@@ -1721,23 +1766,35 @@ fn the_minted_boundary_is_read_in_the_order_it_was_handed() {
         ]))
         .with_filter_hash(READ_FINGERPRINT.to_owned());
 
-    let page = build_list_page(vec![list_row(1), list_row(2)], &query, 1)
+    // Three rows for a page of two, so the page's last row is not also its
+    // first: with two rows at a limit of one the two coincide and a boundary
+    // minted from `first()` reads exactly like one minted from `last()`. The
+    // boundary has to be the row the caller last saw, or the continuation
+    // re-serves rows this page already delivered.
+    let page = build_list_page(vec![list_row(1), list_row(2), list_row(3)], &query, 2)
         .expect("an id-led page must assemble");
+
+    assert_eq!(
+        page.items.len(),
+        2,
+        "the look-ahead row is dropped, not served"
+    );
     let token = page
         .page_info
         .next_cursor
         .expect("a look-ahead row means a next page");
     let decoded = CursorV1::decode(&token).expect("the minted token round-trips");
 
-    // Transcribed by hand: `list_row(1)`'s id, then the covered-period end
-    // every fixture shares.
+    // Transcribed by hand: `list_row(2)`'s id — the last row of the page, not
+    // its first — then the covered-period end every fixture shares.
     assert_eq!(
         decoded.k,
         vec![
-            "00000000-0000-0000-0000-000000000001".to_owned(),
+            "00000000-0000-0000-0000-000000000002".to_owned(),
             "2023-11-14T23:13:20Z".to_owned(),
         ],
-        "one key per order field, in the order's own field order"
+        "one key per order field, in the order's own field order, read off the \
+         last row of the page"
     );
     assert_eq!(
         decoded.s, "+id,+window_end",
@@ -1766,12 +1823,13 @@ fn a_page_minted_without_a_fingerprint_is_refused_rather_than_shipped() {
 
 #[test]
 fn the_composed_filter_survives_the_conjunction_with_the_range() {
-    // What arrives in `query.filter` is the gateway's `And`-composition of the
-    // caller's filter with the compiled PDP scope; a multi-constraint grant
-    // makes the scope half a disjunction of tenant-pinned conjunctions. Pushed
-    // into the `AND` join without parentheses of its own, `… AND A OR B` binds
-    // as `(… AND A) OR B` and answers every row matching the last disjunct,
-    // across every tenant the range covers.
+    // What arrives in `query.filter` is the caller's filter `And`-composed with
+    // the compiled PDP scope, or — as here — the scope alone, which is what the
+    // gateway passes on when the caller supplied no `$filter`. A
+    // multi-constraint grant then puts an `Or` of tenant-pinned conjunctions at
+    // the outermost node. Pushed into the `AND` join without parentheses of its
+    // own, `… AND A OR B` binds as `(… AND A) OR B` and answers every row
+    // matching the last disjunct, across every tenant the range covers.
     //
     // It pins the other half too, which nothing structural does: that the
     // fragment is pushed at all. Dropped, the read runs unscoped over the whole
