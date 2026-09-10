@@ -11,19 +11,19 @@ use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 use toolkit_odata::ast;
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
-use usage_collector_sdk::{UsageCollectorPluginError, UsageTypeGtsId};
+use usage_collector_sdk::UsageCollectorPluginError;
 
 use super::{
     BATCH_INSERT_SQL, ConflictRead, DedupKey, INSERT_COLUMN_ARRAY_TYPES, INSERT_COLUMNS,
     InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, SINGLE_INSERT_SQL,
-    batch_retry_backoff, batch_retry_backoff_base, build_get_sql, canonical_equal, dedup_key,
-    invalidation_index_slots, is_retryable_batch_error, plan_batch, row_dedup_key, scope_runs,
-    sequence_block, with_retry,
+    batch_retry_backoff, batch_retry_backoff_base, build_get_sql, build_list_page, build_list_sql,
+    canonical_equal, dedup_key, invalidation_index_slots, is_retryable_batch_error, plan_batch,
+    record_row_key, row_dedup_key, scope_runs, sequence_block, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
 use crate::infra::storage::entity::UsageRecordRow;
-use crate::infra::storage::query::translate::SqlBind;
+use crate::infra::storage::query::translate::{SqlBind, record_column};
 
 /// A valid meter type id: the reserved base plus one derivation segment,
 /// `~`-terminated, which is what `MeterTypeId::new` validates.
@@ -1247,12 +1247,17 @@ fn parse_scope(raw: &str) -> ast::Expr {
         .into_expr()
 }
 
-/// The `WHERE …` tail of a built statement, so an expectation can be written
-/// out by hand without restating [`RECORD_COLUMNS`] — which has its own,
-/// independent, oracle elsewhere.
+/// Everything a built statement says after its `FROM`, so an expectation can be
+/// written out by hand without restating [`RECORD_COLUMNS`] — which has its
+/// own, independent, oracle elsewhere.
+///
+/// For the point lookup that is the `WHERE` alone; for the keyset page it also
+/// carries the table alias, the `ORDER BY` and the `LIMIT`, which is what lets
+/// one hand-transcribed string pin that the keyset tuple and the `ORDER BY`
+/// read the same order.
 fn where_clause(sql: &str) -> String {
     sql.split_once(" FROM usage_records ")
-        .unwrap_or_else(|| panic!("the point lookup must read `usage_records`. got: {sql}"))
+        .unwrap_or_else(|| panic!("a built statement must read `usage_records`. got: {sql}"))
         .1
         .to_owned()
 }
@@ -1307,11 +1312,13 @@ fn the_point_lookup_binds_the_scope_values_after_the_id() {
 }
 
 #[test]
-fn the_point_lookup_wraps_a_disjunctive_scope_in_its_own_parentheses() {
-    // The shape `authz::scope_to_odata_filter` compiles: a disjunction of
-    // tenant-pinned conjunctions. Conjoined without parentheses of its own,
+fn the_point_lookups_disjunctive_scope_survives_the_conjunction_with_the_id() {
+    // The shape a multi-constraint grant compiles to through
+    // `authz::scope_to_odata_filter`: a disjunction of tenant-pinned
+    // conjunctions. Conjoined without parentheses of its own,
     // `id = $1 AND A OR B` binds as `(id = $1 AND A) OR B` and answers every
-    // row matching the last disjunct, whatever id was asked for.
+    // row matching the last disjunct, whatever id was asked for. The wrap that
+    // prevents that is `translate_scope`'s, not this builder's.
     let scope = parse_scope(&format!(
         "(tenant_id eq {SCOPE_TENANT_A} and resource_type eq 'vm') or \
          (tenant_id eq {SCOPE_TENANT_B} and resource_type eq 'vm')"
@@ -1425,100 +1432,638 @@ async fn a_scope_that_fails_to_translate_never_reaches_the_pool() {
     }
 }
 
-// --- Read-half tests (Tasks 11-12) ------------------------------------------
+// --- The cursor key on the row (Task 11) ------------------------------------
 //
-// These still exercise the retired column model and the pre-port `list`
-// signature. They are `list`'s and `aggregate`'s to bring current; nothing
-// below this line is Task 9's or Task 10's.
+// `record_row_key` is the inverse of `record_column` on the pagination path:
+// one resolves an order field to the column the `ORDER BY` and the keyset tuple
+// are rendered from, the other resolves the same field to the boundary value
+// the minted cursor carries. Nothing in the type system couples them, and after
+// the row model was ported the two disagreed silently — `record_column`
+// resolved `window_start`, `window_end` and `origin` while `record_row_key`
+// answered `None` for all three, which is a `500` at the mint on the canonical
+// `(window_end, id)` order and no compile error anywhere.
 
-#[tokio::test]
-async fn list_rejects_cursor_whose_sort_order_differs_from_query() {
-    let store = lazy_store();
-    let gts_id = UsageTypeGtsId::new(VCPU_METER).expect("valid gts id");
+/// A row whose every keyset-safe column carries a value distinguishable from
+/// every other one, so an arm reading a neighbouring column produces a visibly
+/// wrong string rather than a plausible one.
+///
+/// `subject_id` and `subject_type` are deliberately *present*: a `None` from
+/// `record_row_key` on either has to be "not a keyset key", not "the column was
+/// NULL".
+fn keyed_row() -> UsageRecordRow {
+    UsageRecordRow {
+        id: uuid::Uuid::from_u128(0xA1),
+        tenant_id: uuid::Uuid::from_u128(0xB2),
+        gts_type_id: VCPU_METER.to_owned(),
+        value: rust_decimal::Decimal::new(7, 0),
+        window_start: time::OffsetDateTime::from_unix_timestamp(WINDOW_START_UNIX)
+            .expect("valid ts"),
+        window_end: time::OffsetDateTime::from_unix_timestamp(WINDOW_END_UNIX).expect("valid ts"),
+        resource_id: "res-keyed".to_owned(),
+        resource_type: "compute.vm".to_owned(),
+        subject_id: Some("subject-keyed".to_owned()),
+        subject_type: Some("user".to_owned()),
+        idempotency_key: "idem-keyed".to_owned(),
+        invalidates: None,
+        reason_code: None,
+        origin: "backfill".to_owned(),
+        acceptance_sequence: 9,
+        metadata: serde_json::json!({}),
+        ingested_at: time::OffsetDateTime::from_unix_timestamp(WINDOW_END_UNIX).expect("valid ts"),
+    }
+}
 
-    // The live query sorts (created_at asc, id asc); the cursor was minted
-    // under a different order (id first). The keys are individually valid, so
-    // without the guard the request binds old key strings against new columns —
-    // silently wrong pagination. The filter hash agrees (both unset), so only
-    // the sort-order guard can reject this.
+/// Every keyset-safe order field paired with the boundary value
+/// [`keyed_row`] must yield for it, transcribed by hand rather than read back
+/// out of the row.
+///
+/// The field names are asserted against the SDK's own list below, so this
+/// pairing cannot quietly cover a subset of it.
+const KEYED_ROW_BOUNDARIES: [(&str, &str); 7] = [
+    ("id", "00000000-0000-0000-0000-0000000000a1"),
+    ("window_start", "2023-11-14T22:13:20Z"),
+    ("window_end", "2023-11-14T23:13:20Z"),
+    ("tenant_id", "00000000-0000-0000-0000-0000000000b2"),
+    ("resource_id", "res-keyed"),
+    ("resource_type", "compute.vm"),
+    ("origin", "backfill"),
+];
+
+#[test]
+fn every_keyset_safe_order_field_has_a_cursor_key_on_the_row() {
+    // Driven off the SDK's list rather than a local copy, so a field added
+    // there fails here — at build time, on a named arm — instead of at the
+    // mint, in production, on whichever caller first ordered by it.
+    let row = keyed_row();
+
+    for field in usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS {
+        assert!(
+            record_row_key(&row, field).is_some(),
+            "`{field}` is an admissible $orderby key, so a page ending on this \
+             row has to be able to mint a boundary for it"
+        );
+    }
+}
+
+#[test]
+fn each_cursor_key_reads_the_column_its_order_field_names() {
+    // The half an `is_some()` sweep cannot see. Every arm returns *a* string
+    // either way; only a named value tells `window_end` reading `window_start`
+    // apart from `window_end` reading `window_end`, and that mis-pointing
+    // renders a boundary the `ORDER BY` never sorted by — the page resumes
+    // somewhere else and reports nothing.
+    let row = keyed_row();
+
+    let named: Vec<&str> = KEYED_ROW_BOUNDARIES
+        .iter()
+        .map(|(field, _)| *field)
+        .collect();
+    assert_eq!(
+        named.as_slice(),
+        usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS,
+        "the hand-written pairing has to cover the SDK's whole keyset vocabulary"
+    );
+
+    for (field, expected) in KEYED_ROW_BOUNDARIES {
+        assert_eq!(
+            record_row_key(&row, field).as_deref(),
+            Some(expected),
+            "`{field}` must read the column `record_column` resolves it to"
+        );
+    }
+}
+
+#[test]
+fn a_field_that_is_not_a_keyset_key_mints_no_boundary() {
+    // All four resolve through `record_column`, so all four can appear in an
+    // `ORDER BY` that renders. None is keyset-safe: three are domain-optional
+    // and `entry_type` is derived from an optional attribute, so a row-value
+    // tuple over any of them can compare as NULL and drop rows out of the page
+    // silently. Refusing to mint is the fail-closed answer, and `subject_id` /
+    // `subject_type` are populated on this row so the refusal cannot be read as
+    // a NULL column.
+    let row = keyed_row();
+
+    for field in ["subject_id", "subject_type", "invalidates", "entry_type"] {
+        assert!(
+            record_column(field).is_some(),
+            "the premise of this test: `{field}` is an allowlisted column"
+        );
+        assert!(
+            !usage_collector_sdk::is_keyset_safe_record_field(field),
+            "the premise of this test: `{field}` is not keyset-safe"
+        );
+        assert!(
+            record_row_key(&row, field).is_none(),
+            "`{field}` is not a keyset key, so it must not seed a boundary"
+        );
+    }
+}
+
+// --- The keyset page (Task 11) ----------------------------------------------
+//
+// `build_list_sql` and `build_list_page` are the two pure halves of `list`;
+// what is left in `list` itself is the round trip between them. Everything
+// below is asserted on those two, without a database — which is the only way
+// the fingerprint obligation is testable at all, since it has no compiler
+// backstop and no visible effect until page two.
+
+/// The gateway's read fingerprint. Opaque to the plugin: it covers the
+/// caller's `$filter` together with all three typed parameters, and nothing
+/// here may interpret or recompute it.
+const READ_FINGERPRINT: &str = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+/// `[2023-11-14T00:00:00Z, 2023-11-15T00:00:00Z)` — the day that contains
+/// every fixture's covered period.
+const RANGE_FROM_UNIX: i64 = 1_699_920_000;
+const RANGE_TO_UNIX: i64 = 1_700_006_400;
+
+fn list_meter() -> usage_collector_sdk::MeterTypeId {
+    usage_collector_sdk::MeterTypeId::new(VCPU_METER).expect("valid meter id")
+}
+
+fn list_range() -> usage_collector_sdk::TimeRange {
+    usage_collector_sdk::TimeRange::new(
+        time::OffsetDateTime::from_unix_timestamp(RANGE_FROM_UNIX).expect("valid ts"),
+        time::OffsetDateTime::from_unix_timestamp(RANGE_TO_UNIX).expect("valid ts"),
+    )
+    .expect("a strictly ordered range")
+}
+
+/// The gateway's default page order: `(window_end, id)`, both ascending.
+fn canonical_order() -> ODataOrderBy {
+    ODataOrderBy(vec![
+        OrderKey {
+            field: "window_end".to_owned(),
+            dir: SortDir::Asc,
+        },
+        OrderKey {
+            field: "id".to_owned(),
+            dir: SortDir::Asc,
+        },
+    ])
+}
+
+/// A first-page query in the shape the gateway guarantees: a non-empty
+/// single-direction order naming both canonical fields, and a fingerprint.
+fn list_query() -> ODataQuery {
+    ODataQuery::new()
+        .with_order(canonical_order())
+        .with_filter_hash(READ_FINGERPRINT.to_owned())
+}
+
+/// One stored row, distinct by `id`, mappable back to the SDK model.
+fn list_row(seq: u128) -> UsageRecordRow {
+    row_matching(
+        &unit_record(uuid::Uuid::from_u128(0xD0), &format!("idem-{seq}"), seq),
+        serde_json::json!({}),
+    )
+}
+
+#[test]
+fn selection_reads_the_period_end_alone() {
+    // `from <= window_end < to`
+    // (`cpt-cf-usage-collector-adr-window-end-selection`). Not overlap, which
+    // selects one entry into two adjacent ranges, and not containment, which
+    // drops it out of both — a covered period longer than the range is what
+    // tells the three apart. The predicate therefore never reads
+    // `window_start`, and the negative half of this assertion is the half that
+    // says so.
+    let query = list_query();
+
+    let (sql, binds) = build_list_sql(&list_meter(), list_range(), &query, &[], 25)
+        .expect("the canonical first page must render");
+    let tail = where_clause(&sql);
+
+    assert!(
+        tail.contains("r.window_end >= $2"),
+        "the lower bound is inclusive on the period end. got: {tail}"
+    );
+    assert!(
+        tail.contains("r.window_end < $3"),
+        "the upper bound is exclusive on the period end. got: {tail}"
+    );
+    assert!(
+        !tail.contains("window_start"),
+        "the time-range predicate must not read the period start: selecting on \
+         it fails window-end-selection and quantity-round-trip alike, the \
+         latter because its read-back range is one second wide at the period \
+         end while the period began an hour earlier. got: {tail}"
+    );
+    assert_eq!(binds.len(), 3, "the meter and the two range bounds");
+}
+
+#[test]
+fn the_minted_cursor_carries_the_gateways_filter_hash_verbatim() {
+    // The one SPI requirement with no compiler backstop of its own: a plugin
+    // that drops it recompiles clean and paginates exactly once. The gateway
+    // recomputes the same string from the follow-up request and refuses a token
+    // carrying a different one, or none, with FilterMismatch.
+    //
+    // Two rows for a page of one: the look-ahead row is what makes a cursor get
+    // minted at all.
+    let query = list_query();
+
+    let page = build_list_page(vec![list_row(1), list_row(2)], &query, 1)
+        .expect("a look-ahead page must assemble");
+
+    assert_eq!(
+        page.items.len(),
+        1,
+        "the look-ahead row is dropped, not served"
+    );
+    let token = page
+        .page_info
+        .next_cursor
+        .expect("a look-ahead row means a next page");
+    let decoded = CursorV1::decode(&token).expect("the minted token round-trips");
+    assert_eq!(
+        decoded.f.as_deref(),
+        Some(READ_FINGERPRINT),
+        "the fingerprint travels through untouched: not recomputed, not \
+         dropped, not replaced"
+    );
+}
+
+#[test]
+fn a_page_that_did_not_fill_mints_no_continuation() {
+    // No look-ahead row, so there is nothing after this page and a cursor would
+    // invite the caller to read an empty one.
+    let query = list_query();
+
+    let page = build_list_page(vec![list_row(1)], &query, 25).expect("a short page must assemble");
+
+    assert_eq!(page.items.len(), 1);
+    assert!(page.page_info.next_cursor.is_none());
+    assert_eq!(
+        page.page_info.limit, 25,
+        "the clamped page size, not the row count"
+    );
+}
+
+#[test]
+fn the_minted_boundary_is_read_in_the_order_it_was_handed() {
+    // `window_end` and `id` are guaranteed present in the order, not guaranteed
+    // last: a caller ordering by `id` is handed on as `(id, window_end)`. The
+    // keys are read in that order, so a mint that assumed a canonical slot
+    // would encode them transposed and the continuation would compare a uuid
+    // against a timestamptz.
     let query = ODataQuery::new()
         .with_order(ODataOrderBy(vec![
-            OrderKey {
-                field: "created_at".to_owned(),
-                dir: SortDir::Asc,
-            },
             OrderKey {
                 field: "id".to_owned(),
                 dir: SortDir::Asc,
             },
+            OrderKey {
+                field: "window_end".to_owned(),
+                dir: SortDir::Asc,
+            },
         ]))
+        .with_filter_hash(READ_FINGERPRINT.to_owned());
+
+    let page = build_list_page(vec![list_row(1), list_row(2)], &query, 1)
+        .expect("an id-led page must assemble");
+    let token = page
+        .page_info
+        .next_cursor
+        .expect("a look-ahead row means a next page");
+    let decoded = CursorV1::decode(&token).expect("the minted token round-trips");
+
+    // Transcribed by hand: `list_row(1)`'s id, then the covered-period end
+    // every fixture shares.
+    assert_eq!(
+        decoded.k,
+        vec![
+            "00000000-0000-0000-0000-000000000001".to_owned(),
+            "2023-11-14T23:13:20Z".to_owned(),
+        ],
+        "one key per order field, in the order's own field order"
+    );
+    assert_eq!(
+        decoded.s, "+id,+window_end",
+        "the token is bound to that order"
+    );
+}
+
+#[test]
+fn a_page_minted_without_a_fingerprint_is_refused_rather_than_shipped() {
+    // An absent `query.filter_hash` is a gateway breach, not a case to paper
+    // over. Papering over it means minting `f: None` — a token the gateway
+    // refuses on page two, from a page the plugin reported as healthy.
+    let query = ODataQuery::new().with_order(canonical_order());
+
+    let err = build_list_page(vec![list_row(1), list_row(2)], &query, 1)
+        .expect_err("a mint without a fingerprint must fail loudly");
+
+    match err {
+        UsageCollectorPluginError::Internal(msg) => assert!(
+            msg.contains("filter_hash"),
+            "the refusal names what was missing. got: {msg}"
+        ),
+        other => panic!("expected an Internal gateway-breach error, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_composed_filter_survives_the_conjunction_with_the_range() {
+    // What arrives in `query.filter` is the gateway's `And`-composition of the
+    // caller's filter with the compiled PDP scope; a multi-constraint grant
+    // makes the scope half a disjunction of tenant-pinned conjunctions. Pushed
+    // into the `AND` join without parentheses of its own, `… AND A OR B` binds
+    // as `(… AND A) OR B` and answers every row matching the last disjunct,
+    // across every tenant the range covers.
+    //
+    // It pins the other half too, which nothing structural does: that the
+    // fragment is pushed at all. Dropped, the read runs unscoped over the whole
+    // meter and this assertion is the only thing that notices.
+    let query = list_query().with_filter(parse_scope(&format!(
+        "(tenant_id eq {SCOPE_TENANT_A} and resource_type eq 'vm') or \
+         (tenant_id eq {SCOPE_TENANT_B} and resource_type eq 'vm')"
+    )));
+
+    let (sql, binds) = build_list_sql(&list_meter(), list_range(), &query, &[], 25)
+        .expect("a disjunctive composed filter must render");
+
+    // Transcribed by hand, not derived from anything the builder produces.
+    assert_eq!(
+        where_clause(&sql),
+        "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
+         AND (((tenant_id = $4 AND resource_type = $5) \
+         OR (tenant_id = $6 AND resource_type = $7))) \
+         ORDER BY window_end ASC, id ASC LIMIT 26",
+        "every disjunct has to survive the conjunction with the meter and the range"
+    );
+    assert_eq!(
+        binds.len(),
+        7,
+        "the meter, the two bounds, and four operands"
+    );
+}
+
+#[test]
+fn a_composed_filter_that_cannot_be_translated_is_refused_never_dropped() {
+    // `gts_type_id` is a typed SPI parameter, deliberately absent from the
+    // filterable schema. Dropping the unrenderable conjunct would leave the
+    // meter and the range as the whole `WHERE` — a translation failure turned
+    // into an authorization bypass across every tenant in that range.
+    let query = list_query().with_filter(parse_scope(
+        "gts_type_id eq 'gts.cf.core.uc.usage_record.v1~'",
+    ));
+
+    let Err(err) = build_list_sql(&list_meter(), list_range(), &query, &[], 25) else {
+        panic!("a filter naming a field off the schema must not render");
+    };
+
+    assert!(
+        err.contains("gts_type_id"),
+        "the refusal names the field it refused. got: {err}"
+    );
+}
+
+#[test]
+fn the_keyset_tuple_and_the_order_by_read_one_order() {
+    // Non-canonical in both respects the SPI warns about: `id` leads, and the
+    // direction is descending. `render_order_by` and `keyset_predicate` consume
+    // `query.order` separately, and if they disagreed on field order or on
+    // direction the page would resume from the wrong boundary and report
+    // nothing — so one hand-written string pins the tuple, its comparison
+    // operator and the `ORDER BY` together.
+    let query = ODataQuery::new()
+        .with_order(ODataOrderBy(vec![
+            OrderKey {
+                field: "id".to_owned(),
+                dir: SortDir::Desc,
+            },
+            OrderKey {
+                field: "window_end".to_owned(),
+                dir: SortDir::Desc,
+            },
+        ]))
+        .with_filter_hash(READ_FINGERPRINT.to_owned())
         .with_cursor(CursorV1 {
             k: vec![
-                "2024-01-01T00:00:00Z".to_owned(),
+                "00000000-0000-0000-0000-000000000001".to_owned(),
+                "2023-11-14T23:13:20Z".to_owned(),
+            ],
+            o: SortDir::Desc,
+            s: "-id,-window_end".to_owned(),
+            f: Some(READ_FINGERPRINT.to_owned()),
+            d: "fwd".to_owned(),
+        });
+
+    let (sql, binds) = build_list_sql(&list_meter(), list_range(), &query, &[], 25)
+        .expect("a descending id-led continuation must render");
+
+    // Transcribed by hand.
+    assert_eq!(
+        where_clause(&sql),
+        "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
+         AND (id, window_end) < ($4, $5) \
+         ORDER BY id DESC, window_end DESC LIMIT 26",
+        "the tuple's columns, its operator and the ORDER BY all read one order"
+    );
+    assert_eq!(
+        binds.len(),
+        5,
+        "the meter, the two bounds, and two cursor keys"
+    );
+}
+
+#[test]
+fn the_metadata_side_channel_is_bound_after_the_range() {
+    // AND across filters, OR within one filter's values. Asserted here because
+    // the side channel shares its bind context with the range and the filter,
+    // so a builder that seeded it wrongly would renumber every placeholder
+    // after the third.
+    let query = list_query();
+    let filters = [
+        usage_collector_sdk::MetadataFilter::new("region", ["eu-west-1", "eu-west-2"])
+            .expect("valid metadata filter"),
+    ];
+
+    let (sql, binds) = build_list_sql(&list_meter(), list_range(), &query, &filters, 25)
+        .expect("a metadata-filtered page must render");
+
+    assert_eq!(
+        where_clause(&sql),
+        "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
+         AND metadata ->> $4 IN ($5, $6) \
+         ORDER BY window_end ASC, id ASC LIMIT 26"
+    );
+    assert_eq!(
+        binds.len(),
+        6,
+        "the meter, the two bounds, the key and two values"
+    );
+}
+
+#[test]
+fn the_ledger_page_withholds_no_withdrawn_entry() {
+    // The asymmetry with the fold, as a test rather than only a comment. A
+    // total that counts a withdrawn entry is a wrong total, so `aggregate`
+    // excludes the pair; that is a derived view and this is the ledger itself.
+    // The SPI says it for this method in as many words — "a withdrawn pair MUST
+    // likewise be returned as persisted here" — and hiding either half destroys
+    // the audit trail the append-only model exists to keep
+    // (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    let query = list_query();
+
+    let (sql, _) = build_list_sql(&list_meter(), list_range(), &query, &[], 25)
+        .expect("the canonical first page must render");
+    let tail = where_clause(&sql);
+
+    assert!(
+        !tail.contains("invalidates"),
+        "no withdrawal exclusion belongs on this path. got: {tail}"
+    );
+    assert!(
+        !tail.contains("entry_type"),
+        "nor an entry-type restriction, which withholds the same rows by \
+         another name. got: {tail}"
+    );
+}
+
+#[test]
+fn a_cursor_is_refused_when_the_query_carries_no_fingerprint() {
+    // The hole an `Option`-to-`Option` comparison leaves: an absent `cursor.f`
+    // and an absent `query.filter_hash` compare *equal*, so the guard passed on
+    // exactly the breach it exists to catch and left the gateway to refuse the
+    // token a page later. Resolving the live fingerprint first turns it into a
+    // refusal here.
+    let query = ODataQuery::new()
+        .with_order(canonical_order())
+        .with_cursor(CursorV1 {
+            k: vec![
+                "2023-11-14T23:13:20Z".to_owned(),
                 "00000000-0000-0000-0000-000000000001".to_owned(),
             ],
             o: SortDir::Asc,
-            s: "+id,+created_at".to_owned(),
+            s: "+window_end,+id".to_owned(),
             f: None,
             d: "fwd".to_owned(),
         });
 
-    let err = store
-        .list(gts_id, &query, &[])
-        .await
-        .expect_err("a cursor minted under a different order must be rejected");
+    let Err(err) = build_list_sql(&list_meter(), list_range(), &query, &[], 25) else {
+        panic!("a continuation without a live fingerprint must be refused");
+    };
 
-    match err {
-        UsageCollectorPluginError::Internal(msg) => {
-            assert!(
-                msg.contains("sort order"),
-                "unexpected error message: {msg}"
-            );
-        }
-        other => panic!("expected an Internal sort-order mismatch, got {other:?}"),
-    }
+    assert!(
+        err.contains("filter_hash"),
+        "the refusal names what was missing. got: {err}"
+    );
+}
+
+#[test]
+fn a_cursor_minted_under_a_different_filter_is_refused() {
+    // The guard's ordinary case: the caller changed their query between pages,
+    // so the boundary the token carries was read under a predicate that no
+    // longer applies.
+    let query = list_query().with_cursor(CursorV1 {
+        k: vec![
+            "2023-11-14T23:13:20Z".to_owned(),
+            "00000000-0000-0000-0000-000000000001".to_owned(),
+        ],
+        o: SortDir::Asc,
+        s: "+window_end,+id".to_owned(),
+        f: Some("sha256:a-fingerprint-of-some-other-query".to_owned()),
+        d: "fwd".to_owned(),
+    });
+
+    let Err(err) = build_list_sql(&list_meter(), list_range(), &query, &[], 25) else {
+        panic!("a cursor minted under a different filter must be refused");
+    };
+
+    assert!(err.contains("filter hash"), "unexpected message: {err}");
+}
+
+#[test]
+fn a_cursor_minted_under_a_different_sort_order_is_refused() {
+    // The live query sorts `(window_end, id)`; the cursor was minted under
+    // `(id, window_end)`. The keys are individually valid and the arity agrees,
+    // so without this guard the old key strings bind against the new columns —
+    // silently wrong pagination. The fingerprints agree, so only the sort-order
+    // guard can reject this.
+    let query = list_query().with_cursor(CursorV1 {
+        k: vec![
+            "00000000-0000-0000-0000-000000000001".to_owned(),
+            "2023-11-14T23:13:20Z".to_owned(),
+        ],
+        o: SortDir::Asc,
+        s: "+id,+window_end".to_owned(),
+        f: Some(READ_FINGERPRINT.to_owned()),
+        d: "fwd".to_owned(),
+    });
+
+    let Err(err) = build_list_sql(&list_meter(), list_range(), &query, &[], 25) else {
+        panic!("a cursor minted under a different order must be refused");
+    };
+
+    assert!(err.contains("sort order"), "unexpected message: {err}");
+}
+
+#[test]
+fn a_backward_cursor_is_refused() {
+    // The keyset operator is derived from the sort direction, not from
+    // `cursor.d`, so a backward cursor would silently page forward and return
+    // the wrong page. Its fingerprint and its order both agree with the query,
+    // so only the direction guard can reject it.
+    let query = list_query().with_cursor(CursorV1 {
+        k: vec![
+            "2023-11-14T23:13:20Z".to_owned(),
+            "00000000-0000-0000-0000-000000000001".to_owned(),
+        ],
+        o: SortDir::Asc,
+        s: "+window_end,+id".to_owned(),
+        f: Some(READ_FINGERPRINT.to_owned()),
+        d: "bwd".to_owned(),
+    });
+
+    let Err(err) = build_list_sql(&list_meter(), list_range(), &query, &[], 25) else {
+        panic!("a backward cursor must be refused");
+    };
+
+    assert!(err.contains("direction"), "unexpected message: {err}");
+}
+
+#[test]
+fn an_empty_order_is_refused_rather_than_served_unpaginated() {
+    // A gateway breach: the SPI guarantees `query.order` is non-empty on every
+    // surface, because it is the keyset the continuation is built from. Served
+    // with no `ORDER BY`, the pages would overlap and drop rows against a
+    // backend free to return them in any order.
+    let query = ODataQuery::new().with_filter_hash(READ_FINGERPRINT.to_owned());
+
+    let Err(err) = build_list_sql(&list_meter(), list_range(), &query, &[], 25) else {
+        panic!("an empty order must be refused");
+    };
+
+    assert!(err.contains("empty"), "unexpected message: {err}");
 }
 
 #[tokio::test]
-async fn list_rejects_backward_cursor() {
+async fn a_page_that_cannot_be_built_never_reaches_the_pool() {
+    // The half the pure tests above cannot see: that `list` propagates the
+    // refusal instead of reading without it. The store's pool is lazy and
+    // points at nothing, so any path that got as far as acquiring a connection
+    // answers `Transient` (a pool timeout). An `Internal` naming the field is
+    // therefore proof the read stopped before it touched anything.
     let store = lazy_store();
-    let gts_id = UsageTypeGtsId::new(VCPU_METER).expect("valid gts id");
+    let query = list_query().with_filter(parse_scope(
+        "gts_type_id eq 'gts.cf.core.uc.usage_record.v1~'",
+    ));
 
-    // A backward cursor whose filter hash and sort order both agree with the
-    // query, so only the direction guard can reject it. Without the guard the
-    // request would page FORWARD (the keyset operator is derived from the sort
-    // direction, not `d`) and silently return the wrong page.
-    let query = ODataQuery::new()
-        .with_order(ODataOrderBy(vec![
-            OrderKey {
-                field: "created_at".to_owned(),
-                dir: SortDir::Asc,
-            },
-            OrderKey {
-                field: "id".to_owned(),
-                dir: SortDir::Asc,
-            },
-        ]))
-        .with_cursor(CursorV1 {
-            k: vec![
-                "2024-01-01T00:00:00Z".to_owned(),
-                "00000000-0000-0000-0000-000000000001".to_owned(),
-            ],
-            o: SortDir::Asc,
-            s: "+created_at,+id".to_owned(),
-            f: None,
-            d: "bwd".to_owned(),
-        });
-
-    let err = store
-        .list(gts_id, &query, &[])
-        .await
-        .expect_err("a backward cursor must be rejected before any DB access");
+    let Err(err) = store.list(list_meter(), list_range(), &query, &[]).await else {
+        panic!("an untranslatable filter must not yield a page");
+    };
 
     match err {
-        UsageCollectorPluginError::Internal(msg) => {
-            assert!(msg.contains("direction"), "unexpected error message: {msg}");
-        }
-        other => panic!("expected an Internal direction error, got {other:?}"),
+        UsageCollectorPluginError::Internal(message) => assert!(
+            message.contains("gts_type_id"),
+            "the refusal reaches the caller as-is. got: {message}"
+        ),
+        other => panic!(
+            "an untranslatable filter must stop the read before it acquires a \
+             connection; reaching the pool would answer Transient. got: {other:?}"
+        ),
     }
 }

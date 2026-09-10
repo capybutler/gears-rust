@@ -513,12 +513,9 @@ fn encode_next_cursor_refuses_a_mixed_direction_order() {
         "2026-01-02T03:04:05Z".to_owned(),
         uuid::Uuid::from_u128(1).to_string(),
     ];
-    let err = super::super::keyset::encode_next_cursor(
-        &mixed_direction_order(),
-        &keys,
-        Some("filter-hash"),
-    )
-    .unwrap_err();
+    let err =
+        super::super::keyset::encode_next_cursor(&mixed_direction_order(), &keys, "filter-hash")
+            .unwrap_err();
     assert!(err.contains("mixed-direction"), "got: {err}");
 }
 
@@ -802,7 +799,7 @@ fn encode_then_decode_cursor_round_trips_keys_and_order() {
         "2026-01-02T03:04:05Z".to_owned(),
         uuid::Uuid::from_u128(0x1234).to_string(),
     ];
-    let token = super::super::keyset::encode_next_cursor(&order, &keys, Some("hash")).unwrap();
+    let token = super::super::keyset::encode_next_cursor(&order, &keys, "hash").unwrap();
     let decoded = super::super::keyset::decode_cursor(&token).unwrap();
     assert_eq!(decoded.k, keys);
     assert_eq!(decoded.s, "+window_end,+id");
@@ -816,7 +813,7 @@ fn encode_next_cursor_rejects_row_key_order_arity_mismatch() {
     // keys than the order it claims to follow, so it must fail closed.
     let order = order_window_end_id();
     let keys = vec!["2026-01-02T03:04:05Z".to_owned()];
-    let err = super::super::keyset::encode_next_cursor(&order, &keys, None).unwrap_err();
+    let err = super::super::keyset::encode_next_cursor(&order, &keys, "hash").unwrap_err();
     assert!(err.contains("does not match order arity"), "got: {err}");
 }
 
@@ -848,9 +845,11 @@ fn scope_expr(raw: &str) -> toolkit_odata::ast::Expr {
 
 #[test]
 fn translate_scope_parenthesizes_a_bare_comparison() {
-    // The narrowest shape, and the one whose fragment is NOT self-delimiting
-    // on its own: `translate_record_filter` returns `tenant_id = $1` bare, so
-    // the parentheses here are this function's, not the walker's.
+    // A bare comparison is already safe to conjoin, so this is not the shape
+    // the wrap exists for. It is the shape that makes the wrap *observable*:
+    // the walker adds no parentheses to a `Binary` — `translate_record_filter`
+    // returns `tenant_id = $1` bare — so any parentheses seen on one are
+    // demonstrably this function's.
     let mut ctx = SqlCtx::new(1);
 
     let sql = translate_scope(
@@ -913,7 +912,7 @@ fn translate_scope_refuses_a_field_the_filterable_schema_does_not_carry() {
     let err = translate_scope(&scope_expr("gts_type_id eq 'x'"), &mut ctx)
         .expect_err("a field off the filterable schema must not render");
 
-    assert!(err.starts_with("invalid scope: "), "got: {err}");
+    assert!(err.starts_with("invalid read predicate: "), "got: {err}");
     assert!(
         err.contains("gts_type_id"),
         "the refusal names the field. got: {err}"
@@ -925,13 +924,15 @@ fn translate_scope_refuses_a_field_the_filterable_schema_does_not_carry() {
 fn translate_scope_refuses_an_operator_the_second_gate_rejects() {
     // Second gate. `contains` converts cleanly — `resource_id` is a string
     // field, so the converter admits it — and dies at `op_sql`, which carries
-    // no `LIKE` family. Both refusal paths therefore carry the same prefix, so
-    // neither can be read as a caller's `$filter` error.
+    // no `LIKE` family. Both refusal paths therefore carry the same prefix,
+    // which names neither half of the composed expression: on a collection
+    // path the caller's `$filter` and the compiled scope arrive already
+    // composed, so nothing here can attribute the refusal to one of them.
     let mut ctx = SqlCtx::new(1);
 
     let err = translate_scope(&scope_expr("contains(resource_id, 'abc')"), &mut ctx)
         .expect_err("the scope vocabulary is exact-match only");
 
-    assert!(err.starts_with("invalid scope: "), "got: {err}");
+    assert!(err.starts_with("invalid read predicate: "), "got: {err}");
     assert!(err.contains("unsupported operator"), "got: {err}");
 }

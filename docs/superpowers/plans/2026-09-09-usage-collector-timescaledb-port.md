@@ -3261,8 +3261,8 @@ BREAKING CHANGE: RecordStore::get takes the compiled scope."
 > matching the last disjunct. `list` and `aggregate` push their translated
 > `$filter` fragment exactly that way today — both `clauses.push(fragment)`
 > sites, named by symbol because these line numbers move every task — and get
-> none of the protection `get` has. **Replace those four-line blocks with `translate_scope`; do not
-> transcribe them a third and fourth time.**
+> none of the protection `get` has. **Replace those four-line blocks with
+> `translate_scope`; do not transcribe them a third and fourth time.**
 >
 > **What Task 10 leaves.**
 >
@@ -3402,8 +3402,9 @@ Test 2's mutation is the important one. Name it out loud in the task report.
 `convert_expr_to_filter_node` + `translate_record_filter` pair inline. It
 returns a parenthesized fragment, so pushing it into `clauses` is safe; the
 inline version here is not, and what arrives in `query.filter` is the
-gateway's composition of the compiled PDP scope with the caller's filter —
-a disjunction of tenant-pinned conjunctions at its outermost level.
+gateway's `And`-composition of the caller's filter with the compiled scope;
+the scope half may be a disjunction of tenant-pinned conjunctions, and nothing
+at this layer can tell how many constraints the PDP returned.
 
 Rewrite `list` (`:1028`). The shape:
 
@@ -3526,7 +3527,10 @@ to fix, but do not be surprised by the remainder.
 **Translate `query.filter` through `translate_scope`** (Task 10,
 `query/translate.rs`), for the reason Task 11's Step 3 gives: the inline pair
 this file still carries pushes an unparenthesized fragment into a
-`clauses.join(" AND ")`, and the compiled scope's outermost node is an `Or`.
+`clauses.join(" AND ")`, and what arrives is the gateway's `And`-composition of
+the caller's filter with the compiled scope; the scope half may be a
+disjunction of tenant-pinned conjunctions, and nothing at this layer can tell
+how many constraints the PDP returned.
 
 At `:1204`. The shape:
 

@@ -166,27 +166,36 @@ fn op_sql(op: FilterOp) -> Result<&'static str, String> {
 /// lookup after `id = $1`, the collection paths inside a `clauses.join(" AND
 /// ")` — and `AND` binds tighter than `OR`, so an unparenthesized `A OR B`
 /// conjoined after another predicate `P` reads as `(P AND A) OR B`: every row
-/// matching `B`, whatever `P` said. What the host gear's
-/// `authz::scope_to_odata_filter` compiles is exactly that shape — a
-/// left-nested `or` chain of tenant-pinned conjunctions — so this is the
-/// realistic case, not a corner one. The recursive walker below already
+/// matching `B`, whatever `P` said. A multi-constraint grant compiles to
+/// exactly that shape through the host gear's
+/// `authz::scope_to_odata_filter` — a left-nested `or` chain of tenant-pinned
+/// conjunctions — and nothing downstream can tell how many constraints the PDP
+/// returned, so the wrap is unconditional. The recursive walker below already
 /// parenthesizes a `Composite`, and `composite_or_joins_children_with_or_inside_parens`
 /// pins that; the wrap here means a caller never has to know it, and never has
 /// to re-check it when the translator grows a node kind.
 ///
 /// # Errors
 ///
-/// Returns `invalid scope: …` when either gate refuses — an identifier off the
-/// schema or off the allowlist, an operator SQL cannot express, an empty `IN`
-/// list, or a value that cannot be bound. **A caller must propagate it.** A
-/// scope that fails to translate and is dropped instead leaves the read
-/// unscoped, which turns a translation failure into an authorization bypass;
-/// there is deliberately no "renders to nothing" success here to drop.
+/// Returns `invalid read predicate: …` when either gate refuses — an identifier
+/// off the schema or off the allowlist, an operator SQL cannot express, an
+/// empty `IN` list, or a value that cannot be bound. The prefix names neither
+/// half on purpose: on the collection paths the two are composed into one
+/// expression before this function sees it, so which of them is malformed is
+/// not knowable at this layer.
+///
+/// **A caller must propagate it.** A scope that fails to translate and is
+/// dropped instead leaves the read unscoped, which turns a translation failure
+/// into an authorization bypass; there is deliberately no "renders to nothing"
+/// success here to drop. Nor is recovering and continuing without the scope
+/// sound even if it were permitted: this is **not atomic on failure** — a
+/// partially-walked `Composite` has already pushed its binds onto `ctx`, so
+/// `ctx` is only usable by a caller that abandons the whole statement.
 pub fn translate_scope(scope: &ast::Expr, ctx: &mut SqlCtx) -> Result<String, String> {
     let node = convert_expr_to_filter_node::<UsageRecordFilterField>(scope)
-        .map_err(|e| format!("invalid scope: {e}"))?;
+        .map_err(|e| format!("invalid read predicate: {e}"))?;
     let fragment =
-        translate_record_filter(&node, ctx).map_err(|e| format!("invalid scope: {e}"))?;
+        translate_record_filter(&node, ctx).map_err(|e| format!("invalid read predicate: {e}"))?;
     Ok(format!("({fragment})"))
 }
 
@@ -196,6 +205,11 @@ pub fn translate_scope(scope: &ast::Expr, ctx: &mut SqlCtx) -> Result<String, St
 /// Identifiers resolve through [`record_column`]; an unmapped field is an
 /// error (never interpolated). Values resolve through
 /// [`odata_value_to_bind`].
+///
+/// **Returns the walker's fragment as-is** — parenthesized only for a
+/// `Composite`. To translate a compiled scope, or a composed `$filter`, for
+/// conjoining with another predicate, use [`translate_scope`]: a bare `A OR B`
+/// pushed into a `clauses.join(" AND ")` reads as `(P AND A) OR B`.
 ///
 /// # Errors
 ///

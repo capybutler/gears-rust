@@ -30,8 +30,8 @@ use uuid::Uuid;
 
 use usage_collector_sdk::{
     AggregationBucket, AggregationDimension, AggregationResult, AggregationSpec, MetadataFilter,
-    UsageCollectorPluginError, UsageRecord, UsageRecordFilterField, UsageTypeGtsId,
-    canonical_period_bound, is_keyset_safe_record_field,
+    MeterTypeId, TimeRange, UsageCollectorPluginError, UsageRecord, UsageRecordFilterField,
+    UsageTypeGtsId, canonical_period_bound, is_keyset_safe_record_field,
 };
 
 use crate::domain::ports::RecordStore;
@@ -1097,24 +1097,52 @@ fn push_metadata_filter_clauses(
 /// Extract a single order-field value from a row as its cursor-key string.
 ///
 /// Inverse of [`cursor_key_to_bind`](crate::infra::storage::query::keyset::cursor_key_to_bind):
-/// `id` / `corrects_id` render via [`Uuid::to_string`], `created_at` as
-/// RFC 3339, `tenant_id` via its `Uuid` string, and the text columns
-/// (`resource_id` / `resource_type` / `subject_id` / `subject_type` / `status`)
-/// as-is. Returns `None` for an unknown field or a `NULL` optional column (a
-/// `NULL` value can't seed a stable keyset boundary).
+/// the `uuid` columns render via [`Uuid::to_string`], the `timestamptz` bounds
+/// as RFC 3339, and the text columns as-is — each the spelling that helper
+/// parses back for the field's declared kind, so a minted boundary re-binds to
+/// the value it was read from.
+///
+/// **The arms are [`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`], and that
+/// is the whole rule.** A key that is not on that list is one the SDK does not
+/// promise every entry carries, so it cannot seed a boundary at all — a `NULL`
+/// compares as `NULL` inside the row-value tuple and silently drops the row.
+/// `None` therefore means "this order field is not a keyset key on the row",
+/// which is a refusal to mint rather than a missing value.
+///
+/// This is one half of a two-sided map: [`record_column`] resolves an order
+/// field to the column the `ORDER BY` and the keyset tuple are rendered from,
+/// and this resolves the same field to the value the boundary carries. Nothing
+/// in the type system couples them — the two-sided coupling test in
+/// `record_store_tests.rs` does, by naming the value each arm must produce
+/// from a row whose columns are all distinguishable.
 fn record_row_key(row: &UsageRecordRow, field: &str) -> Option<String> {
     match field {
         "id" => Some(row.id.to_string()),
-        "corrects_id" => row.corrects_id.map(|id| id.to_string()),
-        "created_at" => row.created_at.format(&Rfc3339).ok(),
+        "window_start" => row.window_start.format(&Rfc3339).ok(),
+        "window_end" => row.window_end.format(&Rfc3339).ok(),
         "tenant_id" => Some(row.tenant_id.to_string()),
         "resource_id" => Some(row.resource_id.clone()),
         "resource_type" => Some(row.resource_type.clone()),
-        "subject_id" => row.subject_id.clone(),
-        "subject_type" => row.subject_type.clone(),
-        "status" => Some(row.status.clone()),
+        "origin" => Some(row.origin.clone()),
         _ => None,
     }
+}
+
+/// The gateway's fingerprint of the query a page is read under, or a refusal.
+///
+/// The SPI guarantees `query.filter_hash` "on this method": the gateway
+/// populates it for every `list_usage_records` dispatch, first page included,
+/// "so an implementation of this method never has to handle `None`, and an
+/// absent value is a gateway breach rather than a case to paper over". This is
+/// where that `None` is turned into the refusal, for the two places the value
+/// is load-bearing — the continuation guard, whose `Option`-to-`Option`
+/// comparison would otherwise *pass* with both sides absent, and the mint,
+/// where [`encode_next_cursor`] now takes a `&str` precisely so the decision
+/// cannot be made by accident.
+fn require_filter_hash(query: &ODataQuery) -> Result<&str, String> {
+    query.filter_hash.as_deref().ok_or_else(|| {
+        "list_usage_records dispatched without query.filter_hash (gateway breach)".to_owned()
+    })
 }
 
 /// Build the point-lookup SQL and the binds that go with it: the asked-for
@@ -1151,6 +1179,213 @@ fn build_get_sql(scope: &ast::Expr) -> Result<(String, Vec<SqlBind>), String> {
     Ok((
         format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1 AND {fragment}"),
         ctx.binds,
+    ))
+}
+
+/// Build the keyset page's SQL and the binds that go with it, and be the only
+/// producer of this path's statement.
+///
+/// The `WHERE` is assembled in bind order: the meter at `$1`, the covered
+/// period's two bounds at `$2` and `$3`, then the caller's composed `$filter`,
+/// the metadata side channel, and the keyset continuation. Identifiers come
+/// from the [`record_column`] allowlist and the static [`RECORD_COLUMNS`];
+/// every value is bound.
+///
+/// **Selection reads the covered-period end alone** — `from <= window_end <
+/// to`, per `cpt-cf-usage-collector-adr-window-end-selection` — and the
+/// predicate never names `window_start`. This is a rule about which bound is
+/// read, not an optimization: overlap would select an entry into two adjacent
+/// ranges and containment would drop one out of both, and a period longer than
+/// the range is the case that tells the three apart. `time_range` is a typed
+/// parameter and is deliberately not reachable through `query.filter`, which
+/// the gateway refuses to let name either bound.
+///
+/// **No withdrawal exclusion, and none belongs here.** `aggregate` excludes a
+/// withdrawn pair because a total that counts one is a wrong total; that is a
+/// derived view and this is the ledger. The SPI says it in as many words for
+/// this method — "a withdrawn pair MUST likewise be returned as persisted
+/// here" — and [`PgRecordStore::get`] carries no exclusion either
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+///
+/// `query.order` is rendered as handed, and the keyset tuple is built from the
+/// same `query.order` in the same field order a few lines above, so the two
+/// cannot name different columns or disagree about direction. That the tuple
+/// and the `ORDER BY` agree is what makes a continuation resume from the
+/// boundary the previous page ended on.
+///
+/// # Errors
+///
+/// Returns an error string when the composed `$filter` cannot be translated
+/// (propagated from [`translate_scope`] unchanged, and never dropped — a
+/// dropped scope leaves the read unscoped), when a cursor is backward, carries
+/// a different fingerprint or a different order, when an order or keyset field
+/// is off the allowlist or not keyset-safe, or when the order is empty or
+/// mixed-direction. A caller must propagate it: this is the only producer of
+/// the statement, so a partial one is never returned in its place.
+fn build_list_sql(
+    gts_type_id: &MeterTypeId,
+    time_range: TimeRange,
+    query: &ODataQuery,
+    metadata_filter: &[MetadataFilter],
+    limit: u64,
+) -> Result<(String, Vec<SqlBind>), String> {
+    let mut ctx = SqlCtx::new(1);
+    let mut clauses = vec![
+        format!(
+            "r.gts_type_id = ${}",
+            ctx.push(SqlBind::Str(gts_type_id.as_str().to_owned()))
+        ),
+        format!(
+            "r.window_end >= ${}",
+            ctx.push(SqlBind::DateTime(time_range.lower_inclusive()))
+        ),
+        format!(
+            "r.window_end < ${}",
+            ctx.push(SqlBind::DateTime(time_range.upper_exclusive()))
+        ),
+    ];
+
+    // The composed `$filter`, through the seam every read path shares. What
+    // arrives is the gateway's `And`-composition of the caller's filter with
+    // the compiled PDP scope, so the two halves are one expression by the time
+    // they get here. [`translate_scope`] returns a parenthesized fragment,
+    // which is what makes pushing it into a `join(" AND ")` safe; the
+    // `convert_expr_to_filter_node` + `translate_record_filter` pair this call
+    // replaces returned a bare one.
+    if let Some(expr) = query.filter() {
+        clauses.push(translate_scope(expr, &mut ctx)?);
+    }
+
+    // Metadata side-channel: AND across filters, OR within one filter's
+    // values (see [`push_metadata_filter_clauses`]).
+    push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
+
+    if let Some(cursor) = query.cursor.as_ref() {
+        // Forward-only: the keyset operator is derived from the sort
+        // direction, not from `cursor.d`, so a backward cursor would silently
+        // page forward. Reject it fail-closed.
+        ensure_forward_cursor(cursor)?;
+        // Resolved rather than compared as an `Option`: `cursor.f == None` and
+        // `query.filter_hash == None` are equal, so the old comparison passed
+        // on exactly the breach it exists to catch and left the gateway to
+        // refuse the token on page two.
+        let filter_hash = require_filter_hash(query)?;
+        if cursor.f.as_deref() != Some(filter_hash) {
+            return Err("cursor filter hash mismatch".to_owned());
+        }
+        // The cursor's keys (`cursor.k`) are positional, bound against the
+        // live `query.order` columns below. If the order changed between pages
+        // at the same arity, old keys would bind to new columns — silently
+        // wrong pagination. The cursor carries the signed sort tokens
+        // (`cursor.s`) precisely to detect this, mirroring the guard above.
+        if !query.order.equals_signed_tokens(&cursor.s) {
+            return Err("cursor sort order mismatch".to_owned());
+        }
+        let order_pairs: Vec<(&str, bool)> = query
+            .order
+            .0
+            .iter()
+            .map(|key| (key.field.as_str(), matches!(key.dir, SortDir::Asc)))
+            .collect();
+        clauses.push(keyset_predicate(
+            &order_pairs,
+            &cursor.k,
+            record_column,
+            |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
+            is_keyset_safe_record_field,
+            &mut ctx,
+        )?);
+    }
+
+    let order_sql = render_order_by(&query.order, record_column)?;
+
+    Ok((
+        format!(
+            "SELECT {RECORD_COLUMNS} FROM usage_records r WHERE {} ORDER BY {order_sql} \
+             LIMIT {}",
+            clauses.join(" AND "),
+            // The look-ahead: one row past the page, to tell "this is the last
+            // page" from "there is another" without a second query.
+            limit.saturating_add(1),
+        ),
+        ctx.binds,
+    ))
+}
+
+/// Turn the look-ahead read into the page the caller gets: drop the extra row,
+/// mint the continuation from the last in-page row, and map the rest.
+///
+/// **`query.filter_hash` is carried into `next_cursor.f` verbatim**, which is
+/// the one SPI requirement with no compiler backstop of its own —
+/// `require_cursor_fingerprint` calls it "the one requirement in this gear's
+/// Plugin SPI that gives an implementor no compiler error — a plugin written
+/// before it recompiles clean and paginates exactly once". The gateway
+/// recomputes the same string from the follow-up request and refuses a token
+/// carrying a different one, or none. Nothing here interprets the value: it is
+/// opaque, and its shape is the gateway's to change.
+///
+/// The boundary values are read in `query.order` field order, one per key, so a
+/// caller ordering by `id` gets its keys in that order rather than in a
+/// canonical one this function assumed.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] when `query.filter_hash` is
+/// absent (a gateway breach, not a case to paper over), when an order field is
+/// not a keyset key on the row, when the cursor cannot be encoded, or when a
+/// stored row cannot be mapped to the SDK model.
+fn build_list_page(
+    mut rows: Vec<UsageRecordRow>,
+    query: &ODataQuery,
+    limit: u64,
+) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
+    let page_size = usize::try_from(limit).unwrap_or(usize::MAX);
+
+    // Look-ahead row present -> a next page exists; drop it before mapping.
+    let has_next = rows.len() > page_size;
+    if has_next {
+        rows.truncate(page_size);
+    }
+
+    let next_cursor = if has_next {
+        let last = rows
+            .last()
+            .ok_or_else(|| UsageCollectorPluginError::internal("non-empty page lost its tail"))?;
+        let filter_hash =
+            require_filter_hash(query).map_err(UsageCollectorPluginError::internal)?;
+        let keys = query
+            .order
+            .0
+            .iter()
+            .map(|key| {
+                record_row_key(last, &key.field).ok_or_else(|| {
+                    UsageCollectorPluginError::internal(format!(
+                        "order field `{}` is not a keyset key on the row",
+                        key.field
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Some(
+            encode_next_cursor(&query.order, &keys, filter_hash)
+                .map_err(UsageCollectorPluginError::internal)?,
+        )
+    } else {
+        None
+    };
+
+    let items = rows
+        .into_iter()
+        .map(record_row_to_model)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ODataPage::new(
+        items,
+        PageInfo {
+            next_cursor,
+            prev_cursor: None,
+            limit,
+        },
     ))
 }
 
@@ -1696,27 +1931,34 @@ impl RecordStore for PgRecordStore {
         }
     }
 
-    /// Keyset-paginated `usage_records` list, scoped to `gts_id` (bound at
-    /// `$1`), with optional `$filter`, metadata side-channel filters, and a
-    /// cursor.
+    /// Keyset-paginated ledger read over one meter and one covered-period
+    /// range, with the caller's composed `$filter`, the metadata side channel
+    /// and an optional cursor.
     ///
-    /// Builds `SELECT {RECORD_COLUMNS} FROM usage_records WHERE gts_id = $1
-    /// [AND <filter>] [AND <metadata>] [AND <keyset>] ORDER BY <order> LIMIT
-    /// <n+1>`. The extra `+1` row is the look-ahead that detects a following
-    /// page; it is truncated before mapping. All identifiers come from the
-    /// [`record_column`] allowlist and the static [`RECORD_COLUMNS`]; every
-    /// value is bound (`$N`).
+    /// The statement is [`build_list_sql`]'s and the page is
+    /// [`build_list_page`]'s; what is left here is the round trip between
+    /// them. Both halves are pure, so both are tested without a database —
+    /// which is the only way the fingerprint obligation below is testable at
+    /// all.
+    ///
+    /// Selection reads the covered-period end alone, `from <= window_end <
+    /// to`; entries are returned as persisted, withdrawn pairs included; and
+    /// `query.filter_hash` is carried into `next_cursor.f` verbatim. Each of
+    /// the three is stated where it is enforced rather than only here.
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorPluginError::Internal`] when the filter AST
-    /// references an unknown field, the cursor's filter hash disagrees with
-    /// `query.filter_hash`, an order/keyset field is off the allowlist, a stored
-    /// row cannot be mapped, or the DB query fails.
+    /// Returns [`UsageCollectorPluginError::Internal`] when the statement
+    /// cannot be built (an untranslatable `$filter`, an order or keyset field
+    /// off the allowlist, a refused cursor) or the page cannot be assembled (an
+    /// absent `query.filter_hash`, an order field that is not a keyset key, a
+    /// stored row that cannot be mapped), and the mapped backend error when the
+    /// query itself fails.
     // @cpt-flow:cpt-cf-uc-plugin-seq-list-keyset:p2
     async fn list(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
@@ -1726,135 +1968,29 @@ impl RecordStore for PgRecordStore {
         let _timer =
             OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Query(QueryKind::Raw));
         self.metrics.inc_query_request(QueryKind::Raw);
+
         // Defense-in-depth: clamp the caller's `$top` to `MAX_PAGE_SIZE` so a
         // value that slipped past the core gateway's `$top` cap can never drive
         // an unbounded `LIMIT n+1 ... fetch_all`.
         let limit = effective_page_size(query.limit, DEFAULT_PAGE_SIZE);
 
-        // `$1` is reserved for the `gts_id` scope bind; every translated bind
-        // therefore starts at `$2`.
-        let mut ctx = SqlCtx::new(2);
-        let mut clauses: Vec<String> = vec!["gts_id = $1".to_owned()];
-
-        // `$filter` (validated AST -> typed node -> parameterized fragment).
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment = translate_record_filter(&node, &mut ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Metadata side-channel: AND across filters, OR within one filter's
-        // values (see [`push_metadata_filter_clauses`]).
-        push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
-
-        // Keyset continuation (forward only). The cursor's filter hash must
-        // match the live query's so a cursor is never replayed against a
-        // different filter.
-        if let Some(cursor) = query.cursor.as_ref() {
-            // Forward-only: the keyset operator is derived from the sort
-            // direction, not from `cursor.d`, so a backward cursor would
-            // silently page forward. Reject it fail-closed.
-            ensure_forward_cursor(cursor).map_err(UsageCollectorPluginError::internal)?;
-            if cursor.f.as_deref() != query.filter_hash.as_deref() {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor filter hash mismatch",
-                ));
-            }
-            // The cursor's keys (`cursor.k`) are positional, bound against the
-            // live `query.order` columns below. If the order changed between
-            // pages at the same arity, old keys would bind to new columns —
-            // silently wrong pagination. The cursor carries the signed sort
-            // tokens (`cursor.s`) precisely to detect this, mirroring the
-            // filter-hash guard above.
-            if !query.order.equals_signed_tokens(&cursor.s) {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor sort order mismatch",
-                ));
-            }
-            let order_pairs: Vec<(&str, bool)> = query
-                .order
-                .0
-                .iter()
-                .map(|key| (key.field.as_str(), matches!(key.dir, SortDir::Asc)))
-                .collect();
-            let predicate = keyset_predicate(
-                &order_pairs,
-                &cursor.k,
-                record_column,
-                |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
-                is_keyset_safe_record_field,
-                &mut ctx,
-            )
-            .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(predicate);
-        }
-
-        let order_sql = render_order_by(&query.order, record_column)
+        // Built before a connection is acquired, so a query that cannot be
+        // rendered never reaches the pool and never reads a row.
+        let (sql, binds) = build_list_sql(&gts_type_id, time_range, query, metadata_filter, limit)
             .map_err(UsageCollectorPluginError::internal)?;
 
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records WHERE {} ORDER BY {order_sql} LIMIT {}",
-            clauses.join(" AND "),
-            limit.saturating_add(1),
-        );
-
-        let mut q =
-            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).bind(gts_id_str(&gts_id));
-        for b in &ctx.binds {
+        let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql));
+        for b in &binds {
             q = bind_one(q, b);
         }
         let mut conn = self.timed_acquire().await?;
-        let mut rows = q
+        let rows = q
             .fetch_all(&mut *conn)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        // Look-ahead row present -> a next page exists; drop it before mapping.
-        let has_next = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
-        if has_next {
-            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        }
-
-        let next_cursor = if has_next {
-            let last = rows.last().ok_or_else(|| {
-                UsageCollectorPluginError::internal("non-empty page lost its tail")
-            })?;
-            let keys = query
-                .order
-                .0
-                .iter()
-                .map(|key| {
-                    record_row_key(last, &key.field).ok_or_else(|| {
-                        UsageCollectorPluginError::internal(format!(
-                            "order field `{}` has no cursor key on the row",
-                            key.field
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let token = encode_next_cursor(&query.order, &keys, query.filter_hash.as_deref())
-                .map_err(UsageCollectorPluginError::internal)?;
-            Some(token)
-        } else {
-            None
-        };
-
-        let items = rows
-            .into_iter()
-            .map(record_row_to_model)
-            .collect::<Result<Vec<_>, _>>()?;
-
         // `_timer` records `query.duration` on drop (success and error alike).
-        Ok(ODataPage::new(
-            items,
-            PageInfo {
-                next_cursor,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+        build_list_page(rows, query, limit)
     }
 
     /// Pushed-down aggregation over `usage_records`, scoped to `gts_id` (bound

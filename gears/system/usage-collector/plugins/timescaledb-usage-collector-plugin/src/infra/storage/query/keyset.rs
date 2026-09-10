@@ -274,16 +274,19 @@ pub fn cursor_key_to_bind(kind: FieldKind, raw: &str) -> Result<SqlBind, String>
 /// one sort direction, resolved through [`uniform_dir`] rather than read off
 /// the leading key, so `o` cannot describe an order the page was not read in.
 ///
-/// `f` is **not** an optional extra. The SPI requires that "a `next_cursor`
-/// MUST carry that value through verbatim as its `f`", and guarantees
-/// `query.filter_hash` is populated on every `list_usage_records` dispatch,
-/// first page included — so `None` here is a gateway breach, not an absent
-/// option. Nothing in this function can enforce that: the caller must pass
-/// `query.filter_hash` through untouched. It is the obligation the gear singles
-/// out as having no compiler backstop — `require_cursor_fingerprint` calls it
-/// "the one requirement in this gear's Plugin SPI that gives an implementor no
-/// compiler error — a plugin written before it recompiles clean and paginates
-/// exactly once", the gateway refusing the fingerprint-less token on page two.
+/// `f` is **not** an optional extra, and the parameter is `&str` for that
+/// reason. The SPI requires that "a `next_cursor` MUST carry that value through
+/// verbatim as its `f`", and guarantees `query.filter_hash` is populated on
+/// every `list_usage_records` dispatch, first page included — so an absent
+/// value is a gateway breach, not an absent option. This signature is the
+/// compiler error the gear says does not exist: `require_cursor_fingerprint`
+/// calls the obligation "the one requirement in this gear's Plugin SPI that
+/// gives an implementor no compiler error — a plugin written before it
+/// recompiles clean and paginates exactly once", the gateway refusing the
+/// fingerprint-less token on page two. A caller holding an
+/// `Option<String>` must now decide what its `None` means before it can call
+/// this at all; it may not resolve one to `None` or to `""` without saying so
+/// in its own code.
 ///
 /// # Errors
 ///
@@ -292,7 +295,7 @@ pub fn cursor_key_to_bind(kind: FieldKind, raw: &str) -> Result<SqlBind, String>
 pub fn encode_next_cursor(
     order: &ODataOrderBy,
     last_row_keys: &[String],
-    filter_hash: Option<&str>,
+    filter_hash: &str,
 ) -> Result<String, String> {
     if order.is_empty() {
         return Err("cursor order must not be empty".to_owned());
@@ -309,7 +312,7 @@ pub fn encode_next_cursor(
         k: last_row_keys.to_vec(),
         o: dir,
         s: order.to_signed_tokens(),
-        f: filter_hash.map(str::to_owned),
+        f: Some(filter_hash.to_owned()),
         d: "fwd".to_owned(),
     };
     cursor
