@@ -207,13 +207,27 @@ pub async fn bring_up_with(
     //    containers each, i.e. under 1%.
     // 2. `start()` exceeds its startup timeout waiting for a readiness message
     //    a loaded box is slow to produce.
-    // 3. **The published port answers, and it is not this container's
-    //    PostgreSQL.** Observed once as `pool connect failed … UnexpectedEof
-    //    "expected to read 1414811696 bytes, got 47 bytes at EOF"` - and
-    //    `1414811696` is `0x54524150`, the ASCII bytes `TRAP`, read as a
-    //    length prefix. A Postgres server does not send that; something else
-    //    was on the port. It happened in the one run of six that also retried
-    //    a container, which is what ties it to the same race.
+    // 3. **The published port answers, and an HTTP server is behind it.**
+    //    Observed once as `pool connect failed … UnexpectedEof "expected to
+    //    read 1414811696 bytes, got 47 bytes at EOF"`. Decoded against the
+    //    `sqlx-postgres` this workspace locks (0.9.0):
+    //    `connection/stream.rs` reads a five-byte header, requires byte 0 to
+    //    be a valid `BackendMessageFormat` (`message/mod.rs`, or the error
+    //    would read `unknown message type` instead), takes bytes 1..5 as
+    //    `message_len`, and reports `expected_len = message_len + 1`. So the
+    //    length prefix on the wire was `1414811695 = 0x5454502F`, the ASCII
+    //    bytes `TTP/`, and byte 0 was `b'H'` (`CopyOutResponse`) - the only
+    //    valid format byte that precedes `TTP/` in a real payload. **The first
+    //    five bytes were `HTTP/`**, and
+    //    `HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n` is exactly
+    //    the 47 bytes the error reports.
+    //
+    //    So the peer was an HTTP server - a Docker Desktop port-forwarder or
+    //    API endpoint, or another local service holding that ephemeral port -
+    //    and not a Postgres that was merely slow. It happened in the one run
+    //    of six that also retried a container, which ties it to the same race.
+    //    On a recurrence, that is a checkable culprit class: find what is
+    //    listening on the port and whether it speaks HTTP.
     //
     // (3) is why the pool connect is **inside** this loop rather than after it:
     // no amount of retrying `build_pool` against a wrong port can help, because
@@ -221,12 +235,15 @@ pub async fn bring_up_with(
     // the only thing that can, and it is what the earlier shape - retry the
     // port lookup, then retry the pool separately for 30 s - could not do.
     //
-    // Bounded at three containers, and the last attempt's error is returned
-    // **unchanged**, so an image that genuinely does not expose 5432, or a
-    // config that genuinely cannot connect, still fails with the message that
-    // says so rather than with a message about retries. That is also why this
-    // is here rather than `nextest --retries`: a blanket retry cannot tell a
-    // harness failure from an assertion failure, and would mask the second.
+    // Bounded at three containers. The two `start()` / port arms return the
+    // last attempt's error **unchanged**, so an image that genuinely does not
+    // expose 5432 still fails with the message that says so; the pool arm
+    // wraps, because "every one of three containers refused a connection" is
+    // itself the diagnosis - but it carries the underlying `sqlx` error
+    // verbatim, which is how failure mode 3 above was decoded at all. That is
+    // also why this is here rather than `nextest --retries`: a blanket retry
+    // cannot tell a harness failure from an assertion failure, and would mask
+    // the second.
     //
     // The backoff is not decoration - the stated cause is contention, so an
     // immediate restart re-enters exactly what just lost.

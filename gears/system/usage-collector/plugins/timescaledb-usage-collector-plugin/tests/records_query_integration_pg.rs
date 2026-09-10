@@ -1011,10 +1011,12 @@ async fn an_orphan_invalidation_contributes_nothing() {
 /// the entry `id` is a `UUIDv5` over the 5-tuple, so which of two keys sorts
 /// higher is not something a fixture author can predict. The pair is therefore
 /// arranged so the later-accepted entry is the one with the **lower** `id`, and
-/// `the_later_accepted_entry_must_hold_the_lower_id` below asserts exactly that
-/// before the fold is asked anything. Without that assertion the discrimination
-/// would be luck, and the plausible edit — making this plugin substitute
-/// `MAX(id)` to unblock `latest-tie-break` — would leave the test green.
+/// the `assert!(later.id < earlier.id, …)` in the body below pins that before
+/// the fold is asked anything - an inline assertion rather than a test of its
+/// own, because it is a precondition of this fixture and has no meaning apart
+/// from it. Without it the discrimination would be luck, and the plausible edit
+/// — making this plugin substitute `MAX(id)` to unblock `latest-tie-break` —
+/// would leave the test green.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_five_folds_answer_over_a_known_population() {
     let (_h, store) = setup().await;

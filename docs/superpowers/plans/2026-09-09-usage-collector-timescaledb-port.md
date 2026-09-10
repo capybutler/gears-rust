@@ -5055,14 +5055,28 @@ the CI lane and inherits the numbers.
    `BothStd` with `times(3)` never fires - so there are exactly two and they
    are split across the streams. Do not "tighten" it to `stderr`.
 
-2. **The published port sometimes answers and is not this container's
-   PostgreSQL.** Observed once as `pool connect failed … UnexpectedEof
-   "expected to read 1414811696 bytes, got 47 bytes at EOF"`; `1414811696` is
-   `0x54524150`, the ASCII bytes `TRAP` read as a length prefix. It occurred in
-   the one run of six that also retried a container, which ties it to the same
-   port-publication race. **Retrying `build_pool` cannot help** - the port stays
-   wrong - so the pool connect now sits **inside** the container retry loop and
-   a container whose port will not serve a pool is discarded for a fresh one.
+2. **The published port sometimes answers, with an HTTP server behind it.**
+   Observed once as `pool connect failed … UnexpectedEof "expected to read
+   1414811696 bytes, got 47 bytes at EOF"`. Decoded against the
+   `sqlx-postgres` this workspace locks (0.9.0), whose `connection/stream.rs`
+   requires byte 0 to be a valid `BackendMessageFormat` and reports
+   `expected_len = message_len + 1`: the wire prefix was
+   `1414811695 = 0x5454502F` (`TTP/`) behind a byte 0 of `b'H'`
+   (`CopyOutResponse`) - **the first five bytes were `HTTP/`** - and
+   `HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n` is exactly the 47
+   bytes reported. So the peer was a Docker Desktop port-forwarder or API
+   endpoint, or another local HTTP service holding that ephemeral port, and
+   **not** a slow Postgres. It occurred in the one run of six that also retried
+   a container, which ties it to the same port-publication race. **Retrying
+   `build_pool` cannot help** - the port stays wrong - so the pool connect now
+   sits **inside** the container retry loop and a container whose port will not
+   serve a pool is discarded for a fresh one. On a recurrence this names a
+   checkable culprit class rather than a mystery.
+
+   (Task 15 first decoded this as `TRAP` / `0x54524150`. That is a different
+   number - 1 414 676 816 - and it ignored the `+ 1` framing. The third
+   load-bearing measurement this task got wrong on first writing, and the third
+   caught by review; each is corrected in place rather than quietly amended.)
 
 3. **Measured before and after**, full unfiltered runs of ~265 tests, one
    container per integration test:

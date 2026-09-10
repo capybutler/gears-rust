@@ -99,6 +99,12 @@ async fn setup_metered() -> (
 ///
 /// Named in one place so [`the_asserted_counter_names_are_all_declared`] can
 /// check every one of them against the crate's own inventory.
+///
+/// **It checks the names listed here, not the names actually passed to
+/// [`counter_sum`]**, so a new call site naming an instrument that was never
+/// added to this list is still invisible. Closing that would need the call
+/// sites to go through a wrapper taking a checked name, which buys less than
+/// it costs at four assertions; add the name here when you add the call.
 const ASSERTED_COUNTERS: &[&str] = &[
     "uc_timescaledb_invalidation_rejected_statements_total",
     "uc_timescaledb_invalidation_rejected_rows_total",
@@ -1037,6 +1043,14 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// locks in one order" from "deadlocked and recovered". It must be **zero**:
 /// the sort is supposed to make the deadlock unreachable, not survivable.
 ///
+/// The counter is a slightly wider oracle than the property, and the failure
+/// message says so rather than over-claiming: `is_retryable_batch_error` admits
+/// **any** `Transient`, so this really asserts "no transient at all". The one
+/// realistic alternative on a loaded runner is `55P03 lock_not_available`
+/// waiting on that same counter row, which needs the whole `statement_timeout`
+/// to elapse first - unlikely, but it would retry identically, and a message
+/// confidently naming a deadlock that did not happen is worse than a wider one.
+///
 /// Several rounds rather than one, because a deadlock needs the two
 /// transactions to interleave and one round can miss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1093,11 +1107,15 @@ async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock(
     assert_eq!(
         counter_sum(&exporter, "uc_timescaledb_batch_retries_total"),
         0,
-        "a batch was retried, which means two concurrent batches took the per-scope \
-         acceptance-sequence row locks in different orders and one was aborted as a \
-         deadlock victim. plan_batch sorts its representatives by dedup key - whose \
-         leading components are the scope - precisely so that cannot happen; the retry \
-         is the backstop, not the mechanism."
+        "a batch was retried. The expected cause is the one this test exists for: two \
+         concurrent batches took the per-scope acceptance-sequence row locks in \
+         different orders and one was aborted as a deadlock victim, which plan_batch's \
+         reps.sort_by is supposed to make unreachable rather than survivable. \
+         `is_retryable_batch_error` admits any Transient, though, so check the run's \
+         logs before concluding that: a 55P03 lock_not_available on the counter row \
+         retries identically, and on a loaded box that is the one other way to get \
+         here - it needs the whole statement_timeout to elapse first, so it is \
+         unlikely, not impossible."
     );
 
     // And the ledger holds one row per key, in both scopes.
