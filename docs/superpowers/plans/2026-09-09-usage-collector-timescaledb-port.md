@@ -20,6 +20,19 @@ optional and they are not restated per task.
   one, it is not a test. Tautological length assertions over fixed-size arrays,
   `std::any::type_name` checks, and fixtures that are green under the old
   behaviour too have all shipped here before.
+- **A surviving mutation is a claim about a build, so check the build.** The
+  `#[path]` harness (Task 5 Step 8) compiles files that live outside its own
+  package, and cargo decides staleness by **mtime**, so any mutation vehicle
+  that carries an mtime across leaves the harness running the *old* object
+  code: `Finished` with no `Compiling` line, every test green, and "the
+  mutation survived" — which argues for deleting a working test. Measured in
+  this tree at the Task 6 run: `shutil.copy2` (and `cp -p`, `rsync -t`,
+  `install -p`, editors that preserve timestamps) reproduces it exactly;
+  writing the file then `touch`ing it does **not** — four runs, all rebuilt.
+  Two defences, use both: **`touch` the harness's own `src/lib.rs`** as well
+  as the mutated file — verified to force the rebuild even when the mutated
+  file's mtime is stale — and **treat a missing `Compiling` line as a failed
+  run, not as a result.**
 - **Do not run a workspace-wide test build.** `target/` reaches ~110 GB and
   fills the disk. Scope every run with `-p`. **This bites harder now**: Task 16
   adds this crate to the workspace, so `--workspace` grows.
@@ -1408,9 +1421,20 @@ the working tree is never edited and no restore step can go wrong — which
 matters because `git checkout` restores from HEAD and there is uncommitted work
 here. Confirm the copy is faithful (`diff -r`) and green before mutating
 anything; then for each mutation assert the anchor matches **exactly once**,
-`touch` the file (`mv`/`cp` can preserve mtime and cargo skips the rebuild),
-confirm a `Compiling` line, grep the mutated line to confirm the edit landed,
-and confirm the *named* test goes red.
+`touch` **both** the mutated file and the harness's own `src/lib.rs`, confirm a
+`Compiling` line, grep the mutated line to confirm the edit landed, and confirm
+the *named* test goes red.
+
+The `src/lib.rs` touch is not belt-and-braces. A `#[path]`-included file sits
+outside the harness package and cargo judges it by mtime alone, so any
+vehicle that preserves one — `mv`, `cp -p`, `shutil.copy2`, `rsync -t`,
+`install -p` — leaves the harness running the previous object code and
+reports every test
+green with no `Compiling` line. Measured at the Task 6 run: `shutil.copy2`
+reproduces that exactly, `shutil.copyfile` + `touch` never did in four runs,
+and touching `src/lib.rs` forces the rebuild even with the mutated file's mtime
+left stale. **A run with no `Compiling` line is a failed run, not a surviving
+mutation.**
 
 Mutations run and killed at the Task 5 run:
 

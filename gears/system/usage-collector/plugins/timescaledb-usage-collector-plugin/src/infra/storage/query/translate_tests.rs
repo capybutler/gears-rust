@@ -83,7 +83,17 @@ fn dt_val() -> ODataValue {
 /// so they are coupled to the code and structurally cannot see the code and the
 /// published contract drifting apart. This list is transcribed from the YAML,
 /// which is a different source, and so it is the only thing here that catches
-/// that drift. Refresh it from the YAML, never from the SDK.
+/// that drift. Because the published eight are a subset of
+/// `<UsageRecordFilterField as FilterField>::FIELDS`, any change to the code
+/// alone reds the declared-fields test too; this one fires *alone* exactly when
+/// the SDK and the YAML disagree. Refresh it from the YAML, never from the SDK.
+///
+/// **It guards one direction only.** Nothing here notices the YAML growing a
+/// ninth `$filter` field and this transcription not being refreshed: it would
+/// stay green while the contract moved out from under it. That is the same
+/// staleness the plan warns about, accepted deliberately because the check it
+/// buys is unobtainable from any SDK-coupled source — but it is not a safety
+/// net in both directions, and a reader should not treat it as one.
 const PUBLISHED_FILTER_FIELDS: &[&str] = &[
     "tenant_id",
     "resource_id",
@@ -132,7 +142,7 @@ fn every_declared_filter_field_maps_to_its_own_column() {
             record_column(field.name()),
             Some(field.name()),
             "`{}` is a declared filter field, so a conjunct naming it reaches \
-             `col(field.name())` and must resolve — to its own column, since \
+             `col(field.name())` and must resolve to its own column, since \
              the map is documented as the identity",
             field.name()
         );
