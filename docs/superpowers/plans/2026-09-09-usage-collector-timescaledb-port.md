@@ -941,15 +941,26 @@ pub struct UsageRecordRow {
     /// `window_start` — inclusive start of the covered period.
     pub window_start: OffsetDateTime,
     /// `window_end` — exclusive end of the covered period, and the
-    /// hypertable time dimension. Every selection predicate reads this.
+    /// hypertable time dimension. A read that carries a `time_range` selects
+    /// on this bound alone, `from <= window_end < to`
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`), and no selection
+    /// predicate reads `window_start`. `get_usage_record` carries no range
+    /// and looks up by `id` instead.
     pub window_end: OffsetDateTime,
     /// `resource_id` — resource attribution leaf.
     pub resource_id: String,
     /// `resource_type` — resource attribution leaf.
     pub resource_type: String,
-    /// `subject_id` — optional subject attribution leaf.
+    /// `subject_id` — optional subject attribution leaf. `NULL` means the
+    /// entry has no subject at all, which is `UsageRecord::subject_ref`
+    /// being `None`.
     pub subject_id: Option<String>,
-    /// `subject_type` — optional subject attribution leaf.
+    /// `subject_type` — the subject's type, optional *within* a subject.
+    /// `NULL` alongside a present `subject_id` is an untyped subject. The
+    /// reverse is unrepresentable: `SubjectRef` requires a `subject_id` and
+    /// makes only the type an `Option`, and the
+    /// `usage_records_subject_pairing` constraint refuses a stored type
+    /// without an id.
     pub subject_type: Option<String>,
     /// `idempotency_key` — caller-supplied dedup key.
     pub idempotency_key: String,
@@ -959,8 +970,9 @@ pub struct UsageRecordRow {
     /// `reason_code` — why the withdrawal was issued. Present exactly when
     /// `invalidates` is, by table constraint.
     pub reason_code: Option<String>,
-    /// `origin` — `'live'` / `'backfill'`; the ingestion path that admitted
-    /// this entry.
+    /// `origin` — the ingestion path that admitted this entry, stored in the
+    /// spelling [`RecordOrigin`](usage_collector_sdk::RecordOrigin) owns and
+    /// the DDL `CHECK` pins.
     pub origin: String,
     /// `acceptance_sequence` — plugin-assigned, strictly monotonic per
     /// `(tenant_id, gts_type_id)`. Not carried on the SDK model; this
@@ -1011,6 +1023,31 @@ Keep the struct in DDL order anyway — it makes the file readable against the
 migration — but document it as a convention, **not** as a correctness
 requirement. Writing the load-bearing claim into a doc comment would have been
 this port's characteristic defect committed deliberately.
+
+- [ ] **Measured: the bare `sqlx::FromRow` intra-doc link does not warn**
+
+A follow-up concern held that the link is ambiguous and needs a `trait@`
+disambiguator, because `sqlx` re-exports `FromRow` at its root in two
+namespaces — the trait from `sqlx_core::from_row`, the derive from
+`sqlx_macros`. **Measured twice, and it does not warn.** A probe crate
+documenting both spellings side by side, plus a deliberately broken control
+link, against sqlx `=0.9.0` with `macros` + `postgres` on rustdoc 1.95.0:
+
+- The control (`sqlx::NoSuchItemAnywhere`) warned and was the **only** warning,
+  under `cargo doc --no-deps` and under a full `cargo doc` alike — so the
+  `rustdoc::broken_intra_doc_links` lint was live in both runs.
+- Under the full `cargo doc`, the bare `sqlx::FromRow` and the explicit
+  `trait@sqlx::FromRow` emitted the byte-identical href
+  `../sqlx_core/from_row/trait.FromRow.html` — resolved to the trait, not the
+  derive. (Under `--no-deps` there are no dependency docs to point at, so both
+  hrefs stay the raw path text; that run answers the warning question, not the
+  href one.)
+
+So `trait@` is not needed, and this line will not grow the doc-warning count
+when Task 16 puts the crate back in the workspace. Note the shape of the
+original concern: "a re-export in two namespaces must warn" was a plausible
+mechanism asserted without measurement — the same defect this port keeps
+producing, one step removed.
 
 - [ ] **Step 2: Fix the module doc**
 
