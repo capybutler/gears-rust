@@ -180,3 +180,19 @@ gears:
   usage-collector:
     config:
       vendor: "cyberfabric"
+
+  timescaledb-usage-collector-plugin:
+    config:
+      vendor: "cyberfabric"
+      priority: 10
+      # sslmode=disable is the deliberate opt-out build_pool honours; the test
+      # container serves no TLS, and a DSN with no explicit sslmode is upgraded
+      # to `require`.
+      database_url: "postgres://uc:uc@127.0.0.1:__E2E_TS_PORT__/uc?sslmode=disable"
+      pool_size_min: 2
+      pool_size_max: 16
+      connection_timeout_secs: 10
+      statement_timeout_secs: 30
+      # ~100 years. Long enough that no retention job can drop test rows
+      # mid-run.
+      retention_period_secs: 3153600000

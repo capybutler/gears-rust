@@ -2344,6 +2344,7 @@ dependencies = [
  "cf-gears-static-license-plugin",
  "cf-gears-static-tr-plugin",
  "cf-gears-tenant-resolver",
+ "cf-gears-timescaledb-usage-collector-plugin",
  "cf-gears-toolkit",
  "cf-gears-tr-authz-plugin",
  "cf-gears-types-registry",

@@ -24,7 +24,7 @@ COMMA := ,
 EXAMPLE_SERVER_BIN ?= cf-gears-example-server
 EXAMPLE_SERVER_DEBUG_BINARY ?= target/debug/$(EXAMPLE_SERVER_BIN)
 EXAMPLE_SERVER_MANIFEST ?= apps/cf-gears-example-server/Cargo.toml
-EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example
+EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example timescaledb-usage-collector
 EXAMPLE_SERVER_ALL_FEATURES := $(strip $(shell cargo gears ls features --manifest $(EXAMPLE_SERVER_MANIFEST) 2>/dev/null))
 EXAMPLE_SERVER_FEATURES ?= $(subst $(SPACE),$(COMMA),$(filter-out $(EXAMPLE_SERVER_FEATURE_EXCLUDES),$(EXAMPLE_SERVER_ALL_FEATURES)))
 EXAMPLE_SERVER_FEATURE_ARGS ?= $(if $(EXAMPLE_SERVER_FEATURES),--features $(EXAMPLE_SERVER_FEATURES),)
@@ -666,7 +666,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -714,6 +714,12 @@ test-db: test-sqlite test-pg test-mysql
 test-users-info-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p users-info --features "integration"
+
+## Run TimescaleDB usage-collector plugin integration tests (Docker required;
+## the suite spins up its own timescale/timescaledb container via testcontainers)
+test-usage-collector-pg: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres
 
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
@@ -1257,7 +1263,7 @@ ci_docs: lychee gts-docs
 	$(call print_target_banner)
 
 # Run CI pipeline locally, requires docker
-ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-types-registry-db lychee gts-docs dylint
+ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-types-registry-db lychee gts-docs dylint
 	$(call print_target_banner)
 
 ## Build the cf-gears-example-server release binary, or a single gear when GEAR=<gear> is set
