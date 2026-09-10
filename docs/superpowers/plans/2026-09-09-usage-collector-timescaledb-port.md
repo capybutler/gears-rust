@@ -1414,10 +1414,34 @@ Mutations run and killed at the Task 5 run:
 | 6 | `parse_origin`'s else branch yields `Ok(RecordOrigin::Live)` | `parse_origin_rejects_unknown`, `record_row_unknown_origin_is_internal` |
 | 7 | `record_row_to_model` hardcodes `let origin = RecordOrigin::Live;` | `a_backfill_row_maps_to_the_backfill_origin`, `record_row_unknown_origin_is_internal` |
 
-A test whose mutation cannot be named does not go in. The Task 5 run wrote and
-then deleted a `meter_type_id_str_borrows_the_stored_spelling_back` test for
-exactly that reason: the body is `gts_type_id.as_ref()`, and there is no edit
-to it that both compiles and changes the result.
+**Then sweep the file with body stubs.** The seven above are behaviour
+mutations, and they only reach code some test already calls. Replacing each
+`pub fn`'s body wholesale with a constant of the right type is what finds a
+function nothing exercises at all:
+
+| # | Body stub | Killed by |
+|---|---|---|
+| 1 | `meter_type_id_str` returns `""` | `meter_type_id_str_borrows_the_stored_spelling_back` |
+| 2 | `meter_type_id_from_str` ignores `raw`, returns a fixed valid id | `meter_type_id_from_str_accepts_valid_and_rejects_invalid_as_internal`, `record_row_invalid_gts_type_id_is_internal`, `record_row_to_model_maps_a_valid_row_round_trip` |
+| 3 | `metadata_jsonb_to_map` returns `Ok(empty)` | four metadata tests + the row round trip |
+| 4 | `metadata_map_to_jsonb` returns an empty object | `metadata_map_to_jsonb_then_back_round_trips` |
+| 5 | `invalidation_from_row`'s `(Some, Some)` arm returns `Ok(None)` | `an_invalidation_row_maps_to_a_record_carrying_the_pair`, `an_unparseable_stored_reason_is_an_invariant_break` |
+| 6 | the reassembled `Invalidation.target` becomes `Uuid::nil()` | `an_invalidation_row_maps_to_a_record_carrying_the_pair` |
+| 7 | `record_row_to_model` swaps the two period bounds | `record_row_to_model_maps_a_valid_row_round_trip` |
+
+`parse_origin` and `record_row_to_model` are covered by the behaviour table
+above, so all seven `pub fn`s in the file are swept. No stub survived.
+
+**A test whose mutation cannot be named does not go in — but "cannot be named"
+is a claim to falsify, not to assert.** The Task 5 run first deleted stub 1's
+test, reasoning that the body is `gts_type_id.as_ref()` and no edit to that
+expression both compiles and changes the result. That is true of the
+*expression* and irrelevant: `pub fn meter_type_id_str(_: &MeterTypeId) -> &str
+{ "" }` compiles (`&'static str` coerces to the elided lifetime) and survived
+the whole suite, so the function was shipping with zero coverage while
+`record_store.rs` binds through it at eight sites. Spec review caught it. When
+you cannot find an inner mutation, stub the body before concluding there is
+none.
 
 - [ ] **Step 9: Commit**
 
@@ -1436,7 +1460,12 @@ break rather than a shape the model can carry.
 
 parse_origin compares against RecordOrigin::as_str instead of its own string
 literals, and there is no origin_to_sql beside it: the SDK accessor already
-is the SQL spelling, so the two directions cannot drift."
+is the SQL spelling, so the two directions cannot drift.
+
+The crate still does not compile (41 lib / 71 lib-test errors, all owned by
+Tasks 6-13), so these tests were run and falsified out of the crate: a
+scratchpad harness path-including mapper.rs and entity.rs alone. 22 green,
+seven named mutations killed and seven body stubs killed."
 ```
 
 ---
