@@ -22,7 +22,9 @@ use types_registry_sdk::TypesRegistryClient;
 use types_registry_sdk::testing::{
     MockTypesRegistryClient, internal as canonical_internal, make_test_instance,
 };
-use usage_collector_sdk::{UsageCollectorPluginSpecV1, UsageCollectorPluginV1};
+use usage_collector_sdk::{
+    UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecordFilterField,
+};
 
 use super::*;
 use crate::domain::ports::declarations::DeclarationSource;
@@ -33,6 +35,54 @@ use crate::domain::test_support::{MockPlugin, UnreachableResolver, enforcer_for}
 /// when no authz call is made.
 fn dummy_enforcer() -> PolicyEnforcer {
     enforcer_for(Arc::new(UnreachableResolver))
+}
+
+/// The system-internal invalidation-target read must hand the plugin a scope
+/// a conforming backend can actually render.
+///
+/// This is a regression test with a field report behind it. The scope used to
+/// be a bare `true` literal, which reads as "no narrowing" and is refused in
+/// a boolean position by BOTH `convert_expr_to_filter_node`
+/// (`FilterError::BareLiteral`) and the SDK's own reference implementation
+/// (`contract/reference.rs`). Every invalidation submitted to the `TimescaleDB`
+/// backend therefore came back `500 Internal("invalid read predicate")`. No
+/// unit test caught it because the in-crate plugin doubles never translate a
+/// scope, and no contract check caught it because the SPI's checks supply
+/// their own filters rather than observing this one.
+///
+/// So the assertion is the translation itself, not the shape: a future filter
+/// that renders differently but still translates is fine, and one that
+/// happens to look plausible but cannot be served is not.
+#[test]
+fn the_invalidation_target_scope_translates_for_a_conforming_backend() {
+    let target = Uuid::from_u128(0xF11E);
+    let scope = target_pinned_read_filter(target);
+
+    let node = toolkit_odata::filter::convert_expr_to_filter_node::<UsageRecordFilterField>(&scope)
+        .expect("the invalidation-target scope must be translatable by any conforming plugin");
+
+    // And it must pin the row already named by the `id` argument, so the
+    // "narrows nothing" claim in the helper's own doc is checked rather than
+    // asserted: a scope that translated but selected a different row would
+    // turn a legitimate withdrawal into a spurious target-not-found.
+    let rendered = format!("{node:?}");
+    assert!(
+        rendered.contains(&target.to_string()),
+        "the scope must pin the target id, got {rendered}"
+    );
+
+    // The negative half, and it is what keeps the positive one from going
+    // quiet: the shape this replaced has to still be refused. If the
+    // converter ever grows a bare-literal arm, the assertion above would pass
+    // for a scope that no longer needed replacing and this test would stop
+    // saying anything.
+    assert!(
+        toolkit_odata::filter::convert_expr_to_filter_node::<UsageRecordFilterField>(
+            &ast::Expr::Value(ast::Value::Bool(true))
+        )
+        .is_err(),
+        "a bare literal in a boolean position is what made this fix necessary"
+    );
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────

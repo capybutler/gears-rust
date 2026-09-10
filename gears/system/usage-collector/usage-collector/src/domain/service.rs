@@ -31,7 +31,7 @@ use types_registry_sdk::{InstanceQuery, TypesRegistryClient, TypesRegistryError}
 use usage_collector_sdk::{
     AggregationDimension, AggregationResult, ConflictReason, CreateUsageRecord, EntryType,
     Invalidation, MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, NotFoundReason,
-    RecordOrigin, TimeRange, UsageCollectorError, UsageCollectorPluginError,
+    RECORD_ID_FIELD, RecordOrigin, TimeRange, UsageCollectorError, UsageCollectorPluginError,
     UsageCollectorPluginSpecV1, UsageCollectorPluginV1, UsageRecord, ValidationReason,
 };
 use uuid::Uuid;
@@ -474,34 +474,49 @@ fn report_unbound_next_cursor<T>(page: &ODataPage<T>, dispatched: Option<&str>) 
     );
 }
 
-/// A trivially-true `toolkit_odata` filter: "every row satisfies this."
+/// The scope for a system-internal read of one entry by id: `id eq
+/// <target>`, which narrows nothing the `id` argument has not already
+/// narrowed.
 ///
-/// `UsageCollectorPluginV1::get_usage_record` now takes a compiled-scope
-/// filter on every call, but only `Service::get_usage_record` — the
-/// caller-facing point lookup DESIGN §3.3 requires to read under the
-/// compiled PDP scope — actually has one to give it. Two call sites in
-/// this module use the same SPI method for a system-internal lookup that
-/// predates (and is out of scope for) that guarantee, and whose own
-/// authorization already happens elsewhere. Both are the same
-/// invalidation-target pre-check — a same-request existence / shape check
-/// on the entry a submission proposes to withdraw, run *after* the
-/// submitting caller's own PDP authorization already succeeded, so not a
-/// caller-scoped read of a chosen row — one call site per path:
+/// `UsageCollectorPluginV1::get_usage_record` takes a compiled-scope filter
+/// on every call, but only `Service::get_usage_record` — the caller-facing
+/// point lookup DESIGN §3.3 requires to read under the compiled PDP scope —
+/// actually has one to give it. Two call sites in this module use the same
+/// SPI method for a system-internal lookup that predates (and is out of
+/// scope for) that guarantee, and whose own authorization already happens
+/// elsewhere. Both are the same invalidation-target pre-check — a
+/// same-request existence / shape check on the entry a submission proposes
+/// to withdraw, run *after* the submitting caller's own PDP authorization
+/// already succeeded, so not a caller-scoped read of a chosen row — one call
+/// site per path:
 ///
 /// * [`resolve_invalidation_targets`], for the batch create path.
 /// * [`Service::create_usage_record_inner`], for the single-record one.
 ///
-/// Because the row comes back unscoped, nothing derived from it may reach
+/// Because the row comes back unnarrowed, nothing derived from it may reach
 /// the caller. [`verify_invalidation_target`] is written to that rule: its
 /// rejections name the caller's own reference and the field that differs,
 /// never the target's identity or any of its values.
 ///
-/// Passing `true` at both asks the plugin for exactly the "no SPI-level
-/// narrowing" behaviour they had before this SPI grew a `scope`
-/// parameter — a deliberate, honest "not this surface's scope to give,"
-/// not a shortcut around the point lookup's guarantee.
-fn unrestricted_read_filter() -> ast::Expr {
-    ast::Expr::Value(ast::Value::Bool(true))
+/// **Why a restatement of the id rather than a literal `true`.** "No
+/// SPI-level narrowing" has no spelling in the `toolkit_odata` AST that a
+/// plugin can serve. A bare literal in a boolean position is refused by
+/// `convert_expr_to_filter_node` (`FilterError::BareLiteral`) and by the
+/// SDK's own reference implementation (`contract/reference.rs`, "a bare
+/// literal in a boolean position"), so a conforming backend cannot render
+/// it: the `TimescaleDB` plugin answered every invalidation submission with
+/// `Internal("invalid read predicate")`, which the E2E suite caught and no
+/// unit or contract test could. `id eq <target>` is in the published
+/// `$filter` vocabulary (`UsageRecordQuery::id`, kind `Uuid`), so both the
+/// reference and the plugin translate it, and it selects exactly the row the
+/// `id` argument already selects — the narrowing is a no-op by
+/// construction, not by convention.
+fn target_pinned_read_filter(target: Uuid) -> ast::Expr {
+    ast::Expr::Compare(
+        Box::new(ast::Expr::Identifier(RECORD_ID_FIELD.to_owned())),
+        ast::CompareOperator::Eq,
+        Box::new(ast::Expr::Value(ast::Value::Uuid(target))),
+    )
 }
 
 /// Collapse a PDP denial into `NotFound` so the by-id point lookup
@@ -602,7 +617,7 @@ async fn resolve_invalidation_targets(
             let outcome = instrument_spi(
                 metrics,
                 PluginOp::GetUsageRecord,
-                plugin.get_usage_record(target, &unrestricted_read_filter()),
+                plugin.get_usage_record(target, &target_pinned_read_filter(target)),
             )
             .await
             .map_err(DomainError::from);
@@ -1014,7 +1029,10 @@ impl Service {
             let target = match instrument_spi(
                 self.metrics.as_ref(),
                 PluginOp::GetUsageRecord,
-                plugin.get_usage_record(invalidation.target, &unrestricted_read_filter()),
+                plugin.get_usage_record(
+                    invalidation.target,
+                    &target_pinned_read_filter(invalidation.target),
+                ),
             )
             .await
             {

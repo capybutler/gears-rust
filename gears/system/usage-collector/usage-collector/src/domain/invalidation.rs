@@ -238,10 +238,12 @@ fn faithful_copy_mismatch(entry: &CreateUsageRecord, target: &UsageRecord) -> Op
 /// field as well, or the test cannot fail when the two are swapped.
 ///
 /// **A rejection names what differs, never what it differs from, and that is
-/// a security rule rather than a style one.** The target is read under an
-/// unrestricted filter — a same-request shape check run after the
-/// *submitter's* own PDP authorization, explicitly not a caller-scoped read
-/// — so the target row was never authorized to this caller. A message
+/// a security rule rather than a style one.** The target is read under a
+/// filter that narrows nothing beyond the id already being fetched
+/// (`service::target_pinned_read_filter`) — a same-request shape check run
+/// after the *submitter's* own PDP authorization, explicitly not a
+/// caller-scoped read — so the target row was never authorized to this
+/// caller. A message
 /// carrying the target's value would be an oracle: submit a faithful copy
 /// with one field deliberately wrong, read the real value out of the 400,
 /// iterate per field, and a record the caller has no scope for is
