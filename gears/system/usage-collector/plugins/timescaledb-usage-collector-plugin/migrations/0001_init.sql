@@ -1,9 +1,9 @@
 -- TimescaleDB Usage Collector storage backend — base schema.
 --
--- One table, the entry ledger. There is no usage-type catalog: declarations
--- live in types-registry and the storage SPI never sees one (the gear's
--- DESIGN §3.7 — not this plugin's, whose §3.7 still describes the retired
--- schema).
+-- One ledger table plus its per-scope sequence counters. There is no
+-- usage-type catalog: declarations live in types-registry and the storage SPI
+-- never sees one (the gear's DESIGN §3.7 — not this plugin's, whose §3.7 still
+-- describes the retired schema).
 --
 -- This file replaces the pre-slice-4 schema and its rename migration outright
 -- rather than migrating from them. The gear is unreleased, so no deployment
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     invalidates         uuid,
     reason_code         text,
     origin              text        NOT NULL
+        CONSTRAINT usage_records_origin_valid
         CHECK (origin IN ('live', 'backfill')),
     -- Materialized so `$filter=entry_type eq 'invalidation'` resolves to a
     -- column. The SDK spells out exactly this expression and notes that the
@@ -47,12 +48,25 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- `usage_acceptance_sequence` below. Gaps are permitted: the obligation is
     -- monotonicity, not density, and an absorbed idempotent retry consumes a
     -- value it does not store.
+    --
+    -- The counter row is the sole authority and the ledger does not re-check
+    -- what it hands out, because no constraint here could. A hypertable UNIQUE
+    -- must contain the partition column, and unlike the invalidation index
+    -- below there is no reason two entries in one scope would share a
+    -- `window_end` — so `UNIQUE (tenant_id, gts_type_id, acceptance_sequence,
+    -- window_end)` admits a repeated sequence instead of rejecting it, and the
+    -- form that would reject it is refused by the hypertable.
     acceptance_sequence bigint      NOT NULL,
     metadata            jsonb       NOT NULL DEFAULT '{}'::jsonb,
     ingested_at         timestamptz NOT NULL DEFAULT now(),
 
     -- A hypertable's PRIMARY KEY and every UNIQUE must contain the partition
     -- column, so both carry `window_end`.
+    --
+    -- This is the same key as the dedup UNIQUE below, since `id` is a UUIDv5
+    -- over that same 5-tuple. It is kept as defense in depth: while the
+    -- derivation is correct the two are redundant, and a defect in it cannot
+    -- then produce two rows for one identity.
     PRIMARY KEY (id, window_end),
 
     -- The gear's DESIGN §3.7 dedup obligation, over the 5-tuple verbatim.
@@ -71,7 +85,14 @@ CREATE TABLE IF NOT EXISTS usage_records (
         CHECK (
             (invalidates IS NULL AND reason_code IS NULL)
             OR (invalidates IS NOT NULL AND reason_code IS NOT NULL)
-        )
+        ),
+
+    -- `SubjectRef` makes `subject_id` required and `subject_type` optional
+    -- (models.rs), so a type without an id is unrepresentable upstream. Pinned
+    -- here for the same reason as the invalidation pair above: the ledger
+    -- should not accept a shape the model cannot describe.
+    CONSTRAINT usage_records_subject_pairing
+        CHECK (subject_type IS NULL OR subject_id IS NOT NULL)
 );
 
 SELECT create_hypertable('usage_records', 'window_end', if_not_exists => TRUE);
@@ -84,6 +105,11 @@ SELECT create_hypertable('usage_records', 'window_end', if_not_exists => TRUE);
 -- that entry's covered period and therefore its `window_end`. Two invalidations
 -- of one target necessarily collide on (invalidates, window_end), so including
 -- the partition column costs nothing and satisfies the constraint rule.
+--
+-- It also answers the fold's second withdrawal-exclusion obligation — "is this
+-- entry named by an accepted invalidation?" — since `invalidates` leads it
+-- under exactly that partial predicate. A separate index on (invalidates)
+-- would be wholly subsumed by this one; there deliberately is not one.
 CREATE UNIQUE INDEX IF NOT EXISTS usage_records_one_invalidation_uniq
     ON usage_records (invalidates, window_end)
     WHERE invalidates IS NOT NULL;
@@ -102,15 +128,15 @@ CREATE TABLE IF NOT EXISTS usage_acceptance_sequence (
     PRIMARY KEY (tenant_id, gts_type_id)
 );
 
--- Read paths select on the period end within a (tenant, meter) scope.
+-- Read paths select on the period end within a (tenant, meter) scope. The
+-- trailing `acceptance_sequence` carries the LATEST fold's declared tie-break,
+-- which is greatest `window_end` *then* greatest `acceptance_sequence` — so the
+-- tie-break column has to follow the period end in the same index to be usable.
 CREATE INDEX IF NOT EXISTS usage_records_tenant_type_window_idx
-    ON usage_records (tenant_id, gts_type_id, window_end DESC);
+    ON usage_records (tenant_id, gts_type_id, window_end DESC, acceptance_sequence DESC);
 CREATE INDEX IF NOT EXISTS usage_records_tenant_window_idx
     ON usage_records (tenant_id, window_end DESC);
--- The fold's second withdrawal-exclusion obligation resolves through this:
--- "is this entry named by an accepted invalidation?"
-CREATE INDEX IF NOT EXISTS usage_records_invalidates_idx
-    ON usage_records (invalidates) WHERE invalidates IS NOT NULL;
--- The LATEST fold's declared tie-break, and the feed's future keyset.
+-- The feed's future keyset: it orders by arrival rather than by the column
+-- selection reads, scoped per (tenant, meter).
 CREATE INDEX IF NOT EXISTS usage_records_acceptance_seq_idx
     ON usage_records (tenant_id, gts_type_id, acceptance_sequence DESC);

@@ -22,6 +22,8 @@ fn is_transient_sqlstate(code: &str) -> bool {
         )
 }
 
+/// 23503 `foreign_key_violation` has no arm: the schema declares no foreign
+/// key, so it is unreachable and falls to `Other`.
 #[must_use]
 pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
     match code {
@@ -39,10 +41,6 @@ pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
             Some("usage_records_dedup_uniq") => DbErrorClass::DedupUniqueViolation,
             _ => DbErrorClass::Other,
         },
-        // There is no 23503 `foreign_key_violation` arm because the schema has
-        // no foreign key: the only one, `usage_records_gts_id_fk`, went with the
-        // `usage_type_catalog` table the base migration no longer creates. An
-        // FK violation is therefore unreachable and falls to `Other`.
         c if is_transient_sqlstate(c) => DbErrorClass::Transient,
         _ => DbErrorClass::Other,
     }

@@ -113,15 +113,8 @@ impl PgRecordStore {
         mapped
     }
 
-    /// Single-row insert error mapping.
-    ///
-    /// This currently only defers to [`Self::record_backend_error`], which
-    /// meters the failure and maps transient-vs-internal. It kept a typed
-    /// mapping for one case until now: a foreign-key violation on
-    /// `usage_records.gts_id` meant the referenced usage type was absent. Both
-    /// sides of that mapping are gone — the base migration creates no
-    /// `usage_type_catalog` and so no foreign key to violate, and the SDK no
-    /// longer declares the `UsageTypeNotFound` variant it returned.
+    /// Single-row insert error mapping, currently a plain deferral to
+    /// [`Self::record_backend_error`].
     ///
     /// The seam is kept rather than inlined because the insert path has more
     /// than one constraint whose violation is caller-visible rather than
@@ -229,6 +222,7 @@ impl PgRecordStore {
             .bind(metadata)
             .fetch_optional(&mut *conn)
             .await
+            // typed constraint mapping lands here; see map_insert_error
             .map_err(|e| self.map_insert_error(&e))?;
 
         if let Some(row) = inserted {
