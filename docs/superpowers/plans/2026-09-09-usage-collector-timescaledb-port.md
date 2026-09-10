@@ -2040,40 +2040,62 @@ withdrew it. That orphan still contributes nothing.
 **Files:**
 - Modify: `src/infra/storage/query/aggregate.rs`, `src/infra/storage/query/aggregate_tests.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
+
+**Corrected in flight.** The version of this step written before the task ran
+prescribed a single test looping over all five folds, called the zero-argument
+`withdrawal_exclusion_clause()` inside the loop, and named the mutation "make
+`withdrawal_exclusion_clause` return `None`/empty for `Sum`". Those contradict:
+the function takes no fold, so the loop asserts the same two substrings against
+the same string five times, and the named mutation cannot be written against
+the real signature at all. The claim that "the loop is doing real work here and
+is not decoration" was false. It is replaced by what shipped.
+
+Fold-independence is a property of the *signature*, not of an assertion: a
+reintroduced per-fold branch fails to compile against these tests rather than
+failing one. So drop the loop and give each obligation its own test, since the
+clause has two conjuncts implementing two independently-stated obligations and
+neither should ride on the other's coverage:
 
 ```rust
 #[test]
-fn every_fold_excludes_both_halves_of_a_withdrawn_pair() {
-    for fold in [
-        AggregationFold::Sum,
-        AggregationFold::Count,
-        AggregationFold::Max,
-        AggregationFold::Min,
-        AggregationFold::Latest,
-    ] {
-        let clause = withdrawal_exclusion_clause();
-        assert!(
-            clause.contains("invalidates IS NULL"),
-            "an invalidation entry contributes nothing to {fold:?}, whether or \
-             not its target is in the selection"
-        );
-        assert!(
-            clause.contains("NOT EXISTS"),
-            "an entry an accepted invalidation names contributes nothing to \
-             {fold:?} either; leaving out only the invalidation double-counts \
-             the measurement the withdrawal was meant to remove"
-        );
-    }
+fn an_invalidation_entry_is_excluded_under_every_fold() {
+    assert!(
+        withdrawal_exclusion_clause().contains("r.invalidates IS NULL"),
+        "an invalidation entry must contribute nothing to any fold, got {}",
+        withdrawal_exclusion_clause()
+    );
+}
+
+#[test]
+fn a_record_an_accepted_invalidation_names_is_excluded_under_every_fold() {
+    assert!(
+        withdrawal_exclusion_clause()
+            .contains("NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id)"),
+        "the entry an accepted invalidation names must contribute nothing either, got {}",
+        withdrawal_exclusion_clause()
+    );
+}
+
+#[test]
+fn no_fold_gets_its_own_withdrawal_rule() {
+    assert_eq!(
+        withdrawal_exclusion_clause(),
+        "r.invalidates IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id)"
+    );
 }
 ```
 
-The loop is doing real work here and is not decoration: the old rule made `SUM`
-the exception, so a clause that reintroduces a per-fold branch is exactly what
-this catches.
+**The mutations**, all writable against the real signature and each verified to
+red a test:
 
-**The mutation:** make `withdrawal_exclusion_clause` return `None`/empty for
-`Sum`, restoring the netting behaviour.
+- delete the `r.invalidates IS NULL AND ` conjunct — reds obligation 1's test
+  (and the whole-clause test), obligation 2's survives;
+- delete the ` AND NOT EXISTS (…)` conjunct — reds obligation 2's test (and the
+  whole-clause test), obligation 1's survives;
+- turn the `AND` between them into an `OR` — reds only the whole-clause test,
+  which is what keeps that third test from being redundant.
 
 - [ ] **Step 2: Replace `corrects_id_partition_clause`**
 
@@ -2196,11 +2218,32 @@ whichever answer its author picked, and here that would be a decision made by a
 test rather than by the contract.**
 
 So: in SQL, `GROUP BY subject_id` over a NULL column produces a NULL group, and
-`dimension_select_expr` returns a bare column. That means this backend will
-**collect** them where the reference backend **drops** them. Do not silently
-pick either. Add a doc comment at `dimension_select_expr` recording that the
-two disagree, naming §G, and saying the answer is a spec owner's. Report it in
-the task summary so it reaches the DIVERGENCES update in Task 18.
+`dimension_select_expr` returns a bare column. Do not silently pick either
+answer. Add a doc comment at `dimension_select_expr` recording that the two
+disagree, naming §G, and saying the answer is a spec owner's. Report it in the
+task summary so it reaches the DIVERGENCES update in Task 18.
+
+**Corrected in flight — the divergence is not where this step said it was.**
+The sentence "that means this backend will **collect** them where the reference
+backend **drops** them" was written from `dimension_select_expr` alone and is
+false about the backend. `record_store.rs`'s `aggregate` pushes
+`subject_id IS NOT NULL` / `subject_type IS NOT NULL` into the `WHERE` clause
+before rendering a subject dimension, so the shipped backend **drops**
+subject-less rows exactly as the reference does. The exclusion decision lives at
+the caller, not in this file, and Task 12 owns whether it survives — so the doc
+comment states the property of the returned expression (a bare column, which on
+its own collects a NULL group, with no not-null guard added or assumed here)
+rather than a claim about the backend that this file cannot make good on.
+
+Two things the divergence write-up must carry that §G does not:
+the same disagreement reaches `Metadata(key)` — the reference's `bucket_key`
+returns `None` for an absent key and drops the row, while `r.metadata ->> $N`
+yields SQL `NULL` — and the caller emits **no** guard for it, so the metadata
+dimension is where the two backends actually disagree today. And the SDK is not
+silent after all: `AggregationDimension::SubjectId`/`SubjectType` document
+"rows without a subject are excluded from the grouping", which reads as the
+drop answer already given for the two subject dimensions and still unstated for
+metadata.
 
 - [ ] **Step 7: Run and commit**
 
@@ -3385,8 +3428,11 @@ for `invalidates` would assert the opposite of the current contract while
 looking like a faithful translation. That is the most dangerous shape available
 here.
 
-The replacement coverage is Task 8's `every_fold_excludes_both_halves_of_a_withdrawn_pair`
-plus the behavioural cases in Step 5 below. Write the verdict as "deleted
+The replacement coverage is the three withdrawal-exclusion tests Task 8
+shipped in `aggregate_tests.rs` (`an_invalidation_entry_is_excluded_under_every_fold`,
+`a_record_an_accepted_invalidation_names_is_excluded_under_every_fold` and
+`no_fold_gets_its_own_withdrawal_rule`) plus the behavioural cases in Step 5
+below. Write the verdict as "deleted
 because the rule it asserted was replaced by its opposite", and name the
 replacement.
 
