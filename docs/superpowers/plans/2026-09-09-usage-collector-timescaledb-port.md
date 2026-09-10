@@ -2137,8 +2137,23 @@ pub fn withdrawal_exclusion_clause() -> &'static str {
 }
 ```
 
-The caller must alias the table as `r` for this to bind. Make that a documented
-precondition, and grep the call sites in Task 12 to confirm it holds.
+**Corrected in flight.** The clause shipped as written. What changed is how the
+`r` alias is carried: prose plus a Task 12 grep was judged too weak for a
+coupling with no compile-time backstop, so the module also exports
+
+```rust
+#[must_use]
+pub fn aggregate_from_clause() -> &'static str {
+    "usage_records r"
+}
+```
+
+and `withdrawal_exclusion_clause`'s precondition names *it* rather than naming
+the letter `r`. Task 12 builds its `FROM` from the function (Step 1b there), and
+its assembled-SQL test asserts `sql.contains(aggregate_from_clause())` rather
+than a literal, which is what makes the constant load-bearing rather than
+decorative. Two tests in this file back it: every fragment must qualify its
+columns with an alias it opened, and the `FROM` clause must declare `r`.
 
 - [ ] **Step 3: Rewrite `agg_select_expr` for the new fold set**
 
@@ -2170,14 +2185,25 @@ not leave the module-header paragraph explaining the rounding scale** — it
 would be a doc explaining a mechanism that no longer exists, which is this
 repository's characteristic defect.
 
+**Corrected in flight — the `Option` is gone and the function is renamed.** What
+shipped is `fold_select_expr(fold) -> &'static str` with **five** arms, `Latest`
+returning the constant Step 4 describes. The `Option` above modelled no absence:
+`(ARRAY_AGG(r.value ORDER BY …))[1]` composes in a grouped SELECT list exactly
+as `SUM(r.value)` does, and the sole consumer joins the string into a SELECT
+list without inspecting it — so no caller ever needed the distinction, while
+four doc lines, a dedicated test and a prescribed `.unwrap_or_else(…)` at the
+caller existed to explain it. The "ordered pick, not an aggregate function"
+observation survives as doc on the constant, which is where it belongs rather
+than in a return type.
+
 - [ ] **Step 4: Implement `LATEST` with the declared tie-break**
 
 ```rust
 /// SQL expression picking the [`AggregationFold::Latest`] quantity.
 ///
 /// DESIGN §3.1 declares the rule as *greatest `window_end`, then greatest
-/// `acceptance_sequence`*, and it terminates because the sequence is strictly
-/// monotonic inside the group's scope.
+/// `acceptance_sequence`*, and it terminates because the sequence is monotonic
+/// inside the group's scope.
 ///
 /// This backend can implement the declared rule exactly, because it assigns
 /// and stores `acceptance_sequence` itself (DESIGN §3.7). That is worth
@@ -2195,6 +2221,28 @@ pub fn latest_select_expr() -> &'static str {
 `ARRAY_AGG(… ORDER BY …)[1]` is used rather than `DISTINCT ON` because it
 composes with `GROUP BY` over arbitrary dimensions, which `DISTINCT ON` does
 not. Note that in the doc; a reader will otherwise reach for `DISTINCT ON`.
+
+**Corrected in flight, three ways.**
+
+1. **Not a public function.** This shipped as a private `LATEST_SELECT_EXPR`
+   constant, reached only through `fold_select_expr`'s `Latest` arm — see
+   Step 3's note. The doc block above is the constant's doc.
+2. **The termination argument is two claims from two sections, and the sketch
+   above conflated them.** DESIGN §3.1:581 says the sequence is *monotonic
+   inside the group's scope*; "strictly monotonic per `(tenant_id,
+   gts_type_id)`" is §3.7's storage obligation. Those are different scopes, and
+   they coincide only when the group sits inside one tenant. A `group_by
+   resource_id` over a multi-tenant authorized scope is reachable and lies
+   outside the argument DESIGN makes — §3.1:582 disclaims any cross-tenant
+   total order. State it as DESIGN states it, and say where it stops.
+3. **"A green contract run says nothing" is if anything too weak.** The suite in
+   `usage-collector-sdk/src/contract/checks/` reaches the aggregate method at two
+   call sites and passes `AggregationFold::Sum` at both, so it never evaluates
+   this expression at all — and never exercises the withdrawal clause under any
+   other fold either. Do not restate the call-site count in the shipped doc: it
+   is a fact about another crate that an SDK contributor can falsify silently.
+   The stable, reader-actionable half is that `latest-tie-break` is in
+   `BLOCKED_CHECKS`, so nothing asserts the tie-break.
 
 - [ ] **Step 5: Add `Origin` to the dimension match — or confirm it is absent**
 
@@ -3089,11 +3137,21 @@ fold". Push `fold_select_expr(fold).to_owned()` and nothing else. The "ordered
 pick, not an aggregate function" observation survives as doc on the arm's
 constant, which is where it belongs.
 
-**1b. Build the `FROM` from `aggregate_from_clause()`.** The `r` alias is no
-longer a convention two files honour separately — the module exports the clause
-(`"usage_records r"`), a test asserts it declares `r`, and every other fragment
-binds to it. Write `format!("SELECT {select_list} FROM {} WHERE …",
-aggregate_from_clause())` rather than spelling the table and alias again here.
+**1b. Build the `FROM` from `aggregate_from_clause()`, and assert it in the
+test.** The `r` alias is no longer a convention two files honour separately —
+the module exports the clause (`"usage_records r"`), a test asserts it declares
+`r`, and every other fragment binds to it. Write
+`format!("SELECT {select_list} FROM {} WHERE …", aggregate_from_clause())`
+rather than spelling the table and alias again here.
+
+**The last link is yours, and it is one character of test.** Nothing forces this
+task to *call* the function: the fragments still spell `r` in their own text,
+and Task 8's tests can only pin that they agree with each other. So the
+assembled-SQL test must assert `sql.contains(aggregate_from_clause())` and
+**not** a literal `"usage_records r"`. With the literal, the constant is
+decorative and a future alias change reds a test that then gets "fixed" by
+editing the literal; with the call, the two sides cannot drift without the test
+following.
 
 **2. The absent-dimension rule is settled: drop the row — and `Metadata` is the
 dimension that does not yet obey it.** `aggregate` today pushes
@@ -3900,7 +3958,7 @@ Changes owed:
   each plugin's deployment guide to state the bounds it can hold, and this is
   one it cannot hold under a `LATEST` meter with a wide window. Write the entry
   against the measurement Task 15 takes, not against this description.
-- **Any twentieth entry** this port turned up.
+- **Any further entry** this port turned up, beyond the `LATEST` one above.
 
 - [ ] **Step 6: Full verification bar, one last time**
 
