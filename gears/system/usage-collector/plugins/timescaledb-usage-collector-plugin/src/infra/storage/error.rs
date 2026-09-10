@@ -34,10 +34,11 @@ pub enum DbErrorClass {
 /// Every request-path connection carries a fixed `lock_timeout`
 /// ([`crate::infra::storage::pool`]), so a statement that waits too long on a
 /// contended lock fails with `55P03` rather than pinning a pooled connection.
-/// The ingest path takes two such locks per entry — the `usage_acceptance_sequence`
-/// row for the entry's `(tenant_id, gts_type_id)` scope, and the speculative
-/// tuple an in-flight same-key insert holds — so losing that race is an
-/// ordinary contention outcome on a hot scope, self-healing on retry. Left in
+/// The ingest path takes one such lock on **every** entry — the
+/// `usage_acceptance_sequence` row for the entry's `(tenant_id, gts_type_id)`
+/// scope — and waits on a second only when it meets one: the speculative tuple
+/// an in-flight same-key insert holds. Losing either race is an ordinary
+/// contention outcome on a hot scope, self-healing on retry. Left in
 /// `Other` it maps to a non-retryable `Internal` and
 /// `is_retryable_batch_error` refuses to re-run a batch that is idempotent by
 /// construction.
@@ -45,9 +46,11 @@ pub enum DbErrorClass {
 /// The one coupling worth naming: `acquire_error_clears_readiness` routes a
 /// backend-reported `Database` error through this same predicate, so a
 /// transient SQLSTATE there clears the `ready` gauge. `55P03` cannot arrive on
-/// that path — `pool.acquire()` establishes a connection and applies its GUCs
-/// as startup parameters, running no lock-taking statement — so the gauge is
-/// unaffected.
+/// that path: `pool.acquire()` usually hands back an idle pooled connection and
+/// runs nothing at all, and when it does have to open a new one the session
+/// GUCs travel as startup parameters ([`crate::infra::storage::pool`]) rather
+/// than as `SET` statements — so no lock-taking statement runs either way and
+/// the gauge is unaffected.
 fn is_transient_sqlstate(code: &str) -> bool {
     code.starts_with("08")
         || matches!(
@@ -75,9 +78,11 @@ fn is_transient_sqlstate(code: &str) -> bool {
 /// `migrations/0001_init.sql` is a suffix of any other — note in particular
 /// that `usage_records_tenant_window_idx` is *not* a suffix of
 /// `usage_records_tenant_type_window_idx`. One rule follows for future
-/// migrations: Postgres truncates identifiers at 63 bytes measured from the
-/// tail and the chunk prefix is prepended, so a long enough name loses its
-/// suffix entirely. Keep constraint names under ~45 characters.
+/// migrations: Postgres truncates an identifier to its **first** 63 bytes, and
+/// the chunk prefix is *prepended* — so it is the tail that gets cut, and a
+/// long enough name loses the suffix this function matches on entirely. Keep
+/// constraint names under ~45 characters, which leaves room for the longest
+/// chunk prefix observed (`_hyper_<ht>_<chunk>_chunk_`).
 fn is_constraint(actual: &str, name: &str) -> bool {
     actual == name || actual.strip_suffix(name).is_some_and(|p| p.ends_with('_'))
 }

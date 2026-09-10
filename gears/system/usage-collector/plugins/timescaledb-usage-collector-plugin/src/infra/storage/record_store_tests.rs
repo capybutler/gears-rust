@@ -13,9 +13,9 @@ use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use usage_collector_sdk::{UsageCollectorPluginError, UsageTypeGtsId};
 
 use super::{
-    ConflictRead, DedupKey, MAX_BATCH_ATTEMPTS, PgRecordStore, batch_retry_backoff,
-    batch_retry_backoff_base, canonical_equal, dedup_key, invalidation_target_pairs,
-    is_retryable_batch_error, plan_batch, row_dedup_key, with_retry,
+    ConflictRead, DedupKey, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, batch_retry_backoff,
+    batch_retry_backoff_base, canonical_equal, dedup_key, invalidation_index_slots,
+    is_retryable_batch_error, plan_batch, row_dedup_key, scope_runs, sequence_block, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -462,19 +462,153 @@ fn plan_batch_leaves_an_identical_repeat_withdrawal_to_the_dedup_path() {
 }
 
 #[test]
-fn invalidation_target_pairs_names_only_the_withdrawals() {
+fn invalidation_index_slots_names_only_the_withdrawals() {
     let tenant = uuid::Uuid::from_u128(0xC3);
     let target = uuid::Uuid::from_u128(0xC300);
     let plain = unit_record(tenant, "plain", 0xC301);
     let with = withdrawal(tenant, "w", 0xC302, target);
 
     assert_eq!(
-        invalidation_target_pairs(&[&plain, &with]),
-        vec![(target, with.window_end)],
+        invalidation_index_slots(&[&plain, &with]),
+        vec![(tenant, target, with.window_end)],
         "the partial index covers `invalidates IS NOT NULL` only, so an ordinary \
-         measurement contributes no slot to look up"
+         measurement contributes no slot to look up, and the withdrawal's slot \
+         carries the tenant its diagnostic lookup is scoped by"
     );
-    assert!(invalidation_target_pairs(&[&plain]).is_empty());
+    assert!(invalidation_index_slots(&[&plain]).is_empty());
+}
+
+// --- The batch insert's column pivot and sequence-block arithmetic ---
+//
+// Both are pure and both are places a defect is invisible everywhere else: a
+// swapped push in the pivot corrupts every batched row while every other test
+// still passes, and an off-by-one in the block expansion reuses or skips a
+// sequence value that no constraint can object to (the counter row is the sole
+// authority, `migrations/0001_init.sql`).
+
+#[test]
+fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
+    // Two records whose leaves are all distinguishable from one another, so a
+    // swapped push pair (`resource_ids`/`resource_types`,
+    // `subject_ids`/`subject_types`, the two bounds, the invalidation pair)
+    // cannot land on an equal value and pass.
+    let tenant = uuid::Uuid::from_u128(0xD1);
+    let target = uuid::Uuid::from_u128(0xD100);
+    let mut plain = unit_record(tenant, "idem-a", 0xD101);
+    plain.resource_ref = usage_collector_sdk::ResourceRef::new("res-a", "type-a")
+        .expect("valid resource_ref");
+    plain.subject_ref = Some(
+        usage_collector_sdk::SubjectRef::new("subj-a", Some("subjtype-a".to_owned()))
+            .expect("valid subject_ref"),
+    );
+    plain.metadata.insert(
+        usage_collector_sdk::MetadataKey::new("region").expect("valid metadata key"),
+        "eu-west".to_owned(),
+    );
+    let with = withdrawal(tenant, "idem-b", 0xD102, target);
+
+    let cols = InsertColumns::build(&[&plain, &with], &[7, 8]);
+
+    assert_eq!(cols.ids, vec![plain.id, with.id]);
+    assert_eq!(cols.tenants, vec![tenant, tenant]);
+    assert_eq!(
+        cols.gts_type_ids,
+        vec![VCPU_METER.to_owned(), VCPU_METER.to_owned()]
+    );
+    assert_eq!(cols.values, vec![plain.value, with.value]);
+    assert_eq!(
+        cols.window_starts,
+        vec![plain.window_start, with.window_start]
+    );
+    assert_eq!(cols.window_ends, vec![plain.window_end, with.window_end]);
+    assert_eq!(
+        cols.resource_ids,
+        vec!["res-a".to_owned(), "res-1".to_owned()],
+        "resource_id, not resource_type"
+    );
+    assert_eq!(
+        cols.resource_types,
+        vec!["type-a".to_owned(), "compute.vm".to_owned()],
+        "resource_type, not resource_id"
+    );
+    assert_eq!(
+        cols.subject_ids,
+        vec![Some("subj-a".to_owned()), None],
+        "subject_id, not subject_type"
+    );
+    assert_eq!(
+        cols.subject_types,
+        vec![Some("subjtype-a".to_owned()), None],
+        "subject_type, not subject_id"
+    );
+    assert_eq!(
+        cols.idem_keys,
+        vec!["idem-a".to_owned(), "idem-b".to_owned()]
+    );
+    assert_eq!(
+        cols.invalidates,
+        vec![None, Some(target)],
+        "only the withdrawal names a target"
+    );
+    assert_eq!(
+        cols.reason_codes,
+        vec![None, Some("duplicate_submission".to_owned())],
+        "and the pair travels together"
+    );
+    assert_eq!(cols.origins, vec!["live".to_owned(), "live".to_owned()]);
+    assert_eq!(
+        cols.sequences,
+        vec![7, 8],
+        "the claimed acceptance sequences, in representative order"
+    );
+    assert_eq!(
+        cols.metadata,
+        vec![r#"{"region":"eu-west"}"#.to_owned(), "{}".to_owned()],
+        "metadata is carried as text and cast ::jsonb per row in the query"
+    );
+}
+
+#[test]
+fn scope_runs_groups_the_contiguous_same_scope_representatives() {
+    // `reps` reach this sorted by DedupKey, whose first two components are the
+    // scope — so same-scope entries are contiguous and one pass finds them.
+    let t1 = uuid::Uuid::from_u128(0xD2);
+    let t2 = uuid::Uuid::from_u128(0xD3);
+    let other_meter =
+        usage_collector_sdk::MeterTypeId::new("gts.cf.core.uc.usage_record.v1~cf.storage._.gb_hours.v1~")
+            .expect("valid meter id");
+
+    let a1 = unit_record(t1, "a1", 0xD201);
+    let a2 = unit_record(t1, "a2", 0xD202);
+    let mut b = unit_record(t1, "b", 0xD203);
+    b.gts_type_id = other_meter;
+    let c = unit_record(t2, "c", 0xD204);
+
+    assert_eq!(
+        scope_runs(&[&a1, &a2, &b, &c]),
+        vec![(0, 2), (2, 3), (3, 4)],
+        "one run per scope: two entries on (t1, vcpu), then (t1, gb_hours), then (t2, vcpu)"
+    );
+    assert_eq!(scope_runs(&[]), vec![], "an empty batch claims nothing");
+    assert_eq!(scope_runs(&[&a1]), vec![(0, 1)]);
+}
+
+#[test]
+fn a_claimed_block_expands_to_the_values_below_its_returned_last() {
+    // `claim_acceptance_sequence` returns the block's LAST value, because
+    // `RETURNING next_value` yields the counter after adding `count`. On a
+    // scope's first claim the counter goes 0 -> 3 and the block is 1, 2, 3.
+    assert_eq!(sequence_block(3, 3), vec![1, 2, 3]);
+    assert_eq!(sequence_block(1, 1), vec![1], "the single-row case");
+    assert_eq!(
+        sequence_block(10, 3),
+        vec![8, 9, 10],
+        "a later claim continues from wherever the counter stood"
+    );
+    assert!(
+        sequence_block(5, 0).is_empty(),
+        "an empty scope run claims no values"
+    );
 }
 
 // --- `resolve_batch` invariant-break / defensive arms (DB-free) ---

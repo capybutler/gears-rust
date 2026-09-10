@@ -152,7 +152,7 @@ fn invalidation_to_row_names_the_two_columns_it_writes() {
     assert_eq!(
         invalidation_to_row(Some(&invalidation)),
         (Some(target), Some("duplicate_submission")),
-        "a present withdrawal writes both columns: the target it names and the          reason it carries"
+        "a present withdrawal writes both columns: the target it names, and the reason it carries"
     );
     assert_eq!(
         invalidation_to_row(None),

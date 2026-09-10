@@ -135,10 +135,12 @@ impl PgRecordStore {
     /// `23505`, and this is the arm that turns it into
     /// [`UsageCollectorPluginError::AlreadyInvalidated`].
     ///
-    /// `targets` are the `(invalidation target, window_end)` pairs the failed
-    /// statement tried to write. They are used to name the invalidation already
-    /// in place — and **that lookup is a read taken after the write was already
-    /// rejected, so it is diagnostic and not a check.** The SPI's atomicity
+    /// `slots` are the `(tenant_id, invalidation target, window_end)` index
+    /// slots the failed statement tried to occupy. They are used to name the
+    /// invalidation already in place — and **that lookup is a read taken after
+    /// the write was already
+    /// rejected, so it is diagnostic and not a check.**
+    /// The SPI's atomicity
     /// obligation is discharged by the index, inside the transaction, before
     /// this function is reached; this runs afterwards on a rolled-back
     /// connection purely so the rejection can name an entry. It looks like the
@@ -147,7 +149,7 @@ impl PgRecordStore {
         &self,
         conn: &mut sqlx::PgConnection,
         err: &sqlx::Error,
-        targets: &[(Uuid, OffsetDateTime)],
+        slots: &[(Uuid, Uuid, OffsetDateTime)],
     ) -> UsageCollectorPluginError {
         let Some((code, constraint)) = db_code_and_constraint(err) else {
             return self.record_backend_error(err);
@@ -155,7 +157,7 @@ impl PgRecordStore {
         if classify_db(&code, constraint.as_deref()) != DbErrorClass::AlreadyInvalidated {
             return self.record_backend_error(err);
         }
-        match find_existing_invalidation(conn, targets).await {
+        match find_existing_invalidation(conn, slots).await {
             Ok(Some((id, invalidated_by))) => {
                 UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }
             }
@@ -320,8 +322,8 @@ impl PgRecordStore {
                 // before the diagnostic read below: a further query on a failed
                 // transaction is refused with `25P02`, not answered.
                 rollback(tx).await;
-                let targets = invalidation_target_pairs(&[&record]);
-                return Err(self.map_insert_error(&mut conn, &e, &targets).await);
+                let slots = invalidation_index_slots(&[&record]);
+                return Err(self.map_insert_error(&mut conn, &e, &slots).await);
             }
         };
 
@@ -660,8 +662,8 @@ impl PgRecordStore {
                 // The failed statement aborted the transaction; roll it back so
                 // the mapping's diagnostic read has a usable connection.
                 rollback(tx).await;
-                let targets = invalidation_target_pairs(&plan.reps);
-                return Err(self.map_insert_error(&mut conn, &e, &targets).await);
+                let slots = invalidation_index_slots(&plan.reps);
+                return Err(self.map_insert_error(&mut conn, &e, &slots).await);
             }
         };
         let won: HashSet<DedupKey> = inserted.keys().cloned().collect();
@@ -671,7 +673,15 @@ impl PgRecordStore {
             .copied()
             .filter(|r| !won.contains(&dedup_key(r)))
             .collect();
-        let conflict = self.read_conflict_records(&mut tx, &not_won).await?;
+        let conflict = match self.read_conflict_records(&mut tx, &not_won).await {
+            Ok(conflict) => conflict,
+            Err(e) => {
+                // Every other failure path here rolls back explicitly; `?` would
+                // leave this one to the lazy drop-rollback alone.
+                rollback(tx).await;
+                return Err(e);
+            }
+        };
         tx.commit()
             .await
             .map_err(|e| self.record_backend_error(&e))?;
@@ -851,60 +861,112 @@ async fn claim_batch_sequences(
     reps: &[&UsageRecord],
 ) -> Result<Vec<i64>, sqlx::Error> {
     let mut out: Vec<i64> = Vec::with_capacity(reps.len());
-    let mut start = 0usize;
-    while start < reps.len() {
-        let scope = (reps[start].tenant_id, reps[start].gts_type_id.as_str());
-        let mut end = start;
-        while end < reps.len() && (reps[end].tenant_id, reps[end].gts_type_id.as_str()) == scope {
-            end += 1;
-        }
+    for (start, end) in scope_runs(reps) {
         // `end - start` is a slice length, so it fits an i64 on every target
         // this builds for; saturating keeps the conversion total regardless.
         let count = i64::try_from(end - start).unwrap_or(i64::MAX);
-        let last = claim_acceptance_sequence(tx, scope.0, scope.1, count).await?;
-        let first = last - count + 1;
-        for offset in 0..count {
-            out.push(first + offset);
-        }
-        start = end;
+        let last = claim_acceptance_sequence(
+            tx,
+            reps[start].tenant_id,
+            reps[start].gts_type_id.as_str(),
+            count,
+        )
+        .await?;
+        out.extend(sequence_block(last, count));
     }
     Ok(out)
 }
 
-/// The `(invalidation target, window_end)` pairs `records` would write into
-/// `usage_records_one_invalidation_uniq`.
+/// The half-open `[start, end)` runs of `reps` that share one
+/// `(tenant_id, gts_type_id)` acceptance-sequence scope.
+///
+/// Split out of [`claim_batch_sequences`] because it is the half that can be
+/// wrong without a database noticing: it assumes `reps` is sorted by
+/// [`DedupKey`], whose first two components *are* the scope, so same-scope
+/// representatives are contiguous. A run that ended early would claim two
+/// blocks for one scope — still monotonic, so no constraint would object —
+/// and a run that ran on would hand one scope's values to another's entries.
+fn scope_runs(reps: &[&UsageRecord]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = 0usize;
+    while start < reps.len() {
+        let scope = (reps[start].tenant_id, reps[start].gts_type_id.as_str());
+        let mut end = start + 1;
+        while end < reps.len() && (reps[end].tenant_id, reps[end].gts_type_id.as_str()) == scope {
+            end += 1;
+        }
+        runs.push((start, end));
+        start = end;
+    }
+    runs
+}
+
+/// Expand a claimed block into the values it covers.
+///
+/// [`claim_acceptance_sequence`] returns the block's **last** value, because
+/// that is what `RETURNING next_value` yields after adding `count`; the block
+/// is `[last - count + 1, last]`. Getting the off-by-one wrong here reuses one
+/// scope's sequence value or skips one, and nothing in the schema can object —
+/// the counter row is the sole authority and the ledger does not re-check what
+/// it hands out (`migrations/0001_init.sql`).
+fn sequence_block(last: i64, count: i64) -> Vec<i64> {
+    let first = last - count + 1;
+    (0..count).map(|offset| first + offset).collect()
+}
+
+/// The `(tenant_id, invalidation target, window_end)` slots `records` would
+/// occupy in `usage_records_one_invalidation_uniq`.
 ///
 /// Empty for ordinary measurements, which the partial index does not cover.
-/// The pair is the index's own key, so a lookup on it finds exactly the row
-/// that refused a write.
-fn invalidation_target_pairs(records: &[&UsageRecord]) -> Vec<(Uuid, OffsetDateTime)> {
+/// The last two components are the index's own key, so a lookup on them finds
+/// exactly the row that refused a write; `tenant_id` rides along so the lookup
+/// can carry the tenant predicate every other query in this module carries.
+fn invalidation_index_slots(records: &[&UsageRecord]) -> Vec<(Uuid, Uuid, OffsetDateTime)> {
     records
         .iter()
-        .filter_map(|r| r.invalidation.as_ref().map(|i| (i.target, r.window_end)))
+        .filter_map(|r| {
+            r.invalidation
+                .as_ref()
+                .map(|i| (r.tenant_id, i.target, r.window_end))
+        })
         .collect()
 }
 
-/// Read back the accepted invalidation occupying one of `targets`'
-/// `(invalidates, window_end)` slots, as `(withdrawn target, withdrawing entry
-/// id)`.
+/// Read back the accepted invalidation occupying one of `slots`, as
+/// `(withdrawn target, withdrawing entry id)`.
 ///
 /// Diagnostic only — it runs after a write was already rejected, never before
 /// one; see [`PgRecordStore::map_insert_error`].
+///
+/// `tenant_id` is bound even though the index key `(invalidates, window_end)`
+/// already determines the row: this module enforces tenant isolation by hand
+/// with parameterized `tenant_id` predicates (see the module header), and a
+/// query that returns another row's `id` into a caller-visible error is the
+/// last place to take an exception to that. The exception would in fact be
+/// safe — `invalidates` is a `UUIDv5` over a tenant-scoped 5-tuple, so a
+/// cross-tenant match is not constructible — but that is a supporting mechanism
+/// a future reader would have to re-derive, and one bind is cheaper than the
+/// argument.
 async fn find_existing_invalidation(
     conn: &mut sqlx::PgConnection,
-    targets: &[(Uuid, OffsetDateTime)],
+    slots: &[(Uuid, Uuid, OffsetDateTime)],
 ) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
-    if targets.is_empty() {
+    if slots.is_empty() {
         return Ok(None);
     }
-    let ids: Vec<Uuid> = targets.iter().map(|(target, _)| *target).collect();
-    let ends: Vec<OffsetDateTime> = targets.iter().map(|(_, end)| *end).collect();
+    let tenants: Vec<Uuid> = slots.iter().map(|(tenant, _, _)| *tenant).collect();
+    let ids: Vec<Uuid> = slots.iter().map(|(_, target, _)| *target).collect();
+    let ends: Vec<OffsetDateTime> = slots.iter().map(|(_, _, end)| *end).collect();
     sqlx::query_as::<_, (Uuid, Uuid)>(
         "SELECT t.target, r.id FROM usage_records AS r \
-         JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS t(target, window_end) \
-           ON r.invalidates = t.target AND r.window_end = t.window_end \
+         JOIN UNNEST($1::uuid[], $2::uuid[], $3::timestamptz[]) \
+           AS t(tenant_id, target, window_end) \
+           ON r.tenant_id = t.tenant_id \
+          AND r.invalidates = t.target \
+          AND r.window_end = t.window_end \
          LIMIT 1",
     )
+    .bind(&tenants)
     .bind(&ids)
     .bind(&ends)
     .fetch_optional(&mut *conn)
@@ -1263,10 +1325,12 @@ enum ConflictRead {
 /// idempotency key is being used for two different entries and that is an
 /// `IdempotencyConflict`.
 ///
-/// The compared set is therefore *everything the caller supplies*: `id`, the
-/// covered period, `value`, `resource_ref`, `subject_ref`, `origin`, the
-/// invalidation pair, and `metadata`. Only the server-managed columns are
-/// excluded — `acceptance_sequence`, which this plugin assigns, and
+/// The compared set is `id`, the covered period, `value`, `resource_ref`,
+/// `subject_ref`, `origin`, the invalidation pair, and `metadata` — that is,
+/// every caller-supplied field except `tenant_id`, `gts_type_id` and
+/// `idempotency_key`, which are the remaining three dedup components and so
+/// have already matched (see the second NOTE). The two server-managed columns
+/// are excluded outright: `acceptance_sequence`, which this plugin assigns, and
 /// `ingested_at`, the insert time. `metadata` is compared after decoding the
 /// stored `jsonb` back to the typed map; the invalidation pair is compared
 /// through [`invalidation_to_row`], the same helper the insert binds through,
@@ -1280,15 +1344,21 @@ enum ConflictRead {
 /// loud (the pair compares unequal and conflicts) instead of silently absorbing
 /// the withdrawal as a duplicate of the entry it meant to withdraw.
 ///
-/// NOTE — the record `id` and the two covered-period bounds are compared even
-/// though all three are determined by the dedup key that has already matched:
-/// `id` is a `UUIDv5` projection of it, and the bounds are two of its five
-/// components. Both comparisons are defensive tautologies rather than
-/// fail-closed guards on caller data, kept so a corrupted stored row surfaces
-/// as an `IdempotencyConflict` rather than a silent absorb. The bounds are
-/// compared through the same canonical rendering the key uses, so a stored
-/// value that round-tripped through `timestamptz` cannot compare unequal to the
-/// caller's on precision or offset alone.
+/// NOTE — five fields are settled by the dedup key before this function runs,
+/// and they are not treated alike. `tenant_id`, `gts_type_id` and
+/// `idempotency_key` are three of the key's five components and are **not**
+/// compared: the row was fetched by that key, so comparing them would restate
+/// the lookup. `window_start` and `window_end` are the other two, and `id` is a
+/// `UUIDv5` projection of all five — those three **are** compared, as
+/// deliberate defensive tautologies rather than fail-closed guards on caller
+/// data, kept so a corrupted stored row surfaces as an `IdempotencyConflict`
+/// rather than a silent absorb. The asymmetry is a judgement about cost, not
+/// about correctness: the three cheap `String`/`Uuid` restatements buy nothing
+/// the lookup did not, while a mismatching `id` or bound is the shape a
+/// corrupted row would actually take. The bounds are compared through the same
+/// canonical rendering the key uses, so a stored value that round-tripped
+/// through `timestamptz` cannot compare unequal to the caller's on precision or
+/// offset alone.
 ///
 /// Comparing `id` here is explicitly sanctioned by the SPI contract:
 /// plugin-spi.md §"Plugin-specific outputs" (Create single record output) and
@@ -1409,17 +1479,16 @@ impl RecordStore for PgRecordStore {
     async fn get(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
         // Lookup by the public `id`. This relies on a one-record-per-`id`
         // contract, which the hypertable schema cannot enforce on its own — a
-        // `UNIQUE` there must include the `created_at` partition key, so only the
-        // composite PK `(id, created_at)` is enforced. `fetch_optional` therefore
-        // returns the first matching row.
+        // `UNIQUE` there must include the `window_end` partition column, so only
+        // the composite PK `(id, window_end)` is enforced. `fetch_optional`
+        // therefore returns the first matching row.
         //
-        // `id` is a `UUIDv5` of the full 4-tuple dedup key
-        // `(tenant_id, gts_id, idempotency_key, created_at)` (ADR-0014), which is
-        // exactly this plugin's dedup identity, so each stored row carries a
-        // distinct `id`: `WHERE id = $1` matches at most one row. (Before
-        // ADR-0014 `id` excluded `created_at`, so the same 3-tuple at two
-        // `created_at` values shared one `id`; folding `created_at` into the
-        // derivation closed that collision — see DESIGN.md §2.2.)
+        // `id` is a `UUIDv5` over the 5-tuple dedup identity
+        // `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+        // (`cpt-cf-usage-collector-adr-record-identity-derivation`), which is
+        // exactly this plugin's dedup identity — the same five inputs
+        // `usage_records_dedup_uniq` is built over — so each stored row carries
+        // a distinct `id` and `WHERE id = $1` matches at most one row.
         let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1");
         let mut conn = self.timed_acquire().await?;
         let row = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
