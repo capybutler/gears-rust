@@ -1,6 +1,8 @@
 //! Unit tests for the aggregation SQL builders. Pure (no DB): they pin the
-//! exact SQL each [`AggregationFold`] emits, so a cast regression is caught
-//! without Docker.
+//! exact SQL each [`AggregationFold`] and [`AggregationDimension`] emits, that
+//! the one caller-derived value is bound rather than interpolated, and that
+//! every fragment qualifies its columns with the alias the `FROM` clause
+//! declares.
 
 use usage_collector_sdk::{
     AggregationDimension, AggregationFold, MAX_AGGREGATION_BUCKETS, MetadataKey,
@@ -9,36 +11,31 @@ use usage_collector_sdk::{
 use super::super::bind::SqlBind;
 use super::super::translate::SqlCtx;
 use super::{
-    agg_select_expr, aggregate_limit_clause, dimension_select_expr, latest_select_expr,
+    aggregate_from_clause, aggregate_limit_clause, dimension_select_expr, fold_select_expr,
     withdrawal_exclusion_clause,
 };
 
 #[test]
-fn every_aggregate_function_fold_casts_to_numeric() {
+fn every_fold_casts_to_numeric() {
     assert_eq!(
-        agg_select_expr(AggregationFold::Sum),
-        Some("SUM(r.value)::numeric")
+        fold_select_expr(AggregationFold::Sum),
+        "SUM(r.value)::numeric"
     );
     assert_eq!(
-        agg_select_expr(AggregationFold::Count),
-        Some("COUNT(*)::numeric")
+        fold_select_expr(AggregationFold::Count),
+        "COUNT(*)::numeric"
     );
     assert_eq!(
-        agg_select_expr(AggregationFold::Min),
-        Some("MIN(r.value)::numeric")
+        fold_select_expr(AggregationFold::Min),
+        "MIN(r.value)::numeric"
     );
     assert_eq!(
-        agg_select_expr(AggregationFold::Max),
-        Some("MAX(r.value)::numeric")
+        fold_select_expr(AggregationFold::Max),
+        "MAX(r.value)::numeric"
     );
-}
-
-#[test]
-fn latest_is_not_an_aggregate_function() {
-    // `LATEST` is an ordered pick, not an aggregate function, so it has no
-    // arm here and the caller must reach for `latest_select_expr` instead.
-    // `None` means "rendered elsewhere", never "unsupported fold".
-    assert_eq!(agg_select_expr(AggregationFold::Latest), None);
+    // `LATEST` is an ordered pick rather than an aggregate function, but it
+    // casts like the rest so every fold reads back as `Option<BigDecimal>`.
+    assert!(fold_select_expr(AggregationFold::Latest).ends_with("::numeric"));
 }
 
 #[test]
@@ -50,7 +47,7 @@ fn latest_picks_the_greatest_window_end_then_acceptance_sequence() {
     // answers differently on the same ledger, and no contract check catches
     // it: `latest-tie-break` is in the SDK's `BLOCKED_CHECKS`.
     assert_eq!(
-        latest_select_expr(),
+        fold_select_expr(AggregationFold::Latest),
         "(ARRAY_AGG(r.value ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric"
     );
 }
@@ -145,8 +142,8 @@ fn metadata_dimension_binds_the_key_and_emits_json_extract() {
 #[test]
 fn metadata_dimension_placeholder_honors_start_offset() {
     // The placeholder index comes from `ctx`, not a hardcoded `$1`, so the
-    // dimension expr composes correctly after leading binds (e.g. `gts_id` at
-    // `$1`).
+    // dimension expr composes correctly after leading binds (e.g. the meter
+    // scope at `$1`).
     let dim = AggregationDimension::Metadata(MetadataKey::new("tier").unwrap());
     let mut ctx = SqlCtx::new(3);
     assert_eq!(dimension_select_expr(&dim, &mut ctx), "r.metadata ->> $3");
@@ -171,13 +168,14 @@ fn identity_dimensions_emit_static_columns_and_bind_nothing() {
 
 // ── alias coupling ───────────────────────────────────────────────────────────
 
-/// The ledger table's full column set, verbatim from `migrations/0001_init.sql`
-/// in declaration order — **not** the subset today's fragments happen to name.
-/// The difference is the whole point of the guard: an arm added later reaches
-/// for a column no fragment mentions yet, and `origin` is the one
-/// `DIVERGENCES.md` entry 15 proposes adding next. Every occurrence of any of
-/// these must carry a table qualifier, or the fragment binds to whatever the
-/// caller's `FROM` happens to expose.
+/// The ledger table's full column set, in declaration order.
+/// [`ledger_columns_are_the_migrations_columns`] holds it to
+/// `migrations/0001_init.sql`, so it is the schema's columns and not the subset
+/// today's fragments happen to name. That difference is the point of the guard:
+/// an arm added later reaches for a column no fragment mentions yet, and
+/// `origin` is the one `DIVERGENCES.md` entry 15 proposes adding next. Every
+/// occurrence of any of these must carry a table qualifier, or the fragment
+/// binds to whatever the caller's `FROM` happens to expose.
 const LEDGER_COLUMNS: &[&str] = &[
     "id",
     "tenant_id",
@@ -199,9 +197,52 @@ const LEDGER_COLUMNS: &[&str] = &[
     "ingested_at",
 ];
 
-/// The aliases `sql` may qualify a column with. `r`, the outer query's alias
-/// for `usage_records`, is always admissible. `w` is admissible only in a
-/// fragment that declares it, so a fragment borrowing the withdrawal
+/// The schema itself, so [`LEDGER_COLUMNS`] cannot drift from it. The path
+/// resolves from this file's own directory, which is the real one even when a
+/// scratch harness `#[path]`-includes this module.
+const MIGRATION_SQL: &str = include_str!("../../../../migrations/0001_init.sql");
+
+/// The ledger table's columns as declared, in declaration order. Reads the
+/// `CREATE TABLE` block and keeps the lines that are `<name> <sql type>`, which
+/// leaves out the comments, the table constraints and the generated-column
+/// continuation lines. The type token sheds a trailing comma, which is what a
+/// nullable column's declaration ends on.
+fn migration_ledger_columns() -> Vec<&'static str> {
+    const SQL_TYPES: &[&str] = &["uuid", "text", "numeric", "timestamptz", "bigint", "jsonb"];
+    let start = MIGRATION_SQL
+        .find("CREATE TABLE IF NOT EXISTS usage_records (")
+        .expect("the ledger table is declared");
+    let block = &MIGRATION_SQL[start..];
+    let end = block.find("\n);").expect("the declaration is closed");
+    block[..end]
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.strip_prefix("    ")?.split_whitespace();
+            let name = parts.next()?;
+            let sql_type = parts.next()?.trim_end_matches(',');
+            let is_column = SQL_TYPES.contains(&sql_type)
+                && name.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+            is_column.then_some(name)
+        })
+        .collect()
+}
+
+#[test]
+fn ledger_columns_are_the_migrations_columns() {
+    // Without this the constant is a hand-kept list, and the alias guard below
+    // is silent for exactly the columns someone forgot to add to it -- which is
+    // the defect this whole section exists to close. Order is asserted too, so
+    // the constant stays readable against the schema.
+    assert_eq!(
+        migration_ledger_columns().as_slice(),
+        LEDGER_COLUMNS,
+        "LEDGER_COLUMNS must be migrations/0001_init.sql's usage_records columns, in order"
+    );
+}
+
+/// The aliases `sql` may qualify a column with. `r`, the alias
+/// [`aggregate_from_clause`] declares, is always admissible. `w` is admissible
+/// only in a fragment that declares it, so a fragment borrowing the withdrawal
 /// subquery's alias without opening the subquery is an offender rather than a
 /// pass.
 fn aliases_for(sql: &str) -> &'static [u8] {
@@ -250,13 +291,19 @@ fn misqualified_columns(sql: &str) -> Vec<&'static str> {
     offenders
 }
 
-/// Every SQL fragment this module emits, with a metadata dimension standing in
-/// for the one caller-derived shape.
+/// Every fragment this module emits that can name a column — which is all of
+/// them but [`aggregate_limit_clause`], whose output is a row count.
+///
+/// The two `match` statements are exhaustiveness witnesses and nothing else:
+/// adding a variant to either enum fails to compile *here*, next to the array
+/// that needs its new entry. Without them a new dimension arm reds only
+/// `dimension_select_expr`'s own match, and the alias guard below would go on
+/// reporting a coverage it had silently stopped having.
 fn all_fragments() -> Vec<String> {
     let mut ctx = SqlCtx::new(1);
     let mut fragments: Vec<String> = vec![
+        aggregate_from_clause().to_owned(),
         withdrawal_exclusion_clause().to_owned(),
-        latest_select_expr().to_owned(),
     ];
     for fold in [
         AggregationFold::Sum,
@@ -265,7 +312,14 @@ fn all_fragments() -> Vec<String> {
         AggregationFold::Max,
         AggregationFold::Latest,
     ] {
-        fragments.extend(agg_select_expr(fold).map(str::to_owned));
+        match fold {
+            AggregationFold::Sum
+            | AggregationFold::Count
+            | AggregationFold::Min
+            | AggregationFold::Max
+            | AggregationFold::Latest => {}
+        }
+        fragments.push(fold_select_expr(fold).to_owned());
     }
     for dim in [
         AggregationDimension::TenantId,
@@ -275,27 +329,36 @@ fn all_fragments() -> Vec<String> {
         AggregationDimension::SubjectType,
         AggregationDimension::Metadata(MetadataKey::new("region").unwrap()),
     ] {
+        match dim {
+            AggregationDimension::TenantId
+            | AggregationDimension::ResourceId
+            | AggregationDimension::ResourceType
+            | AggregationDimension::SubjectId
+            | AggregationDimension::SubjectType
+            | AggregationDimension::Metadata(_) => {}
+        }
         fragments.push(dimension_select_expr(&dim, &mut ctx));
     }
     fragments
 }
 
 #[test]
-fn every_fragment_qualifies_its_columns_with_the_r_alias() {
-    // Nothing in the crate enforces that the aggregate caller aliases
-    // `usage_records` as `r`; these fragments hard-code it, and a caller that
-    // aliases differently produces invalid SQL at runtime with no compile
-    // error. This is the half of that coupling this file can pin: no fragment
-    // may name a bare column, and none may reach for an alias it did not open,
-    // so a fragment drifting off `r` is caught here rather than by a query
-    // failing against a live database. Because `LEDGER_COLUMNS` is the
-    // migration's whole column set rather than the subset in use, it holds
-    // over the fragments an arm added later emits too -- an `origin`
-    // dimension, say -- which the exact-string tests above cannot.
+fn every_fragment_qualifies_its_columns_with_the_alias_the_from_clause_declares() {
+    // The alias is one constant both sides read (`aggregate_from_clause`), but
+    // the fragments still hard-code `r` in their text, so the two can drift.
+    // This is the half of that coupling this file can pin: no fragment may name
+    // a bare column, and none may reach for an alias it did not open, so a
+    // fragment drifting off `r` is caught here rather than by a query failing
+    // against a live database.
+    assert!(
+        aggregate_from_clause().ends_with(" r"),
+        "the FROM clause must declare the `r` every other fragment binds to, got {}",
+        aggregate_from_clause()
+    );
     for fragment in all_fragments() {
         assert!(
             misqualified_columns(&fragment).is_empty(),
-            "{fragment} names {:?} without the outer query's `r` alias",
+            "{fragment} names {:?} without the alias the FROM clause declares",
             misqualified_columns(&fragment)
         );
     }

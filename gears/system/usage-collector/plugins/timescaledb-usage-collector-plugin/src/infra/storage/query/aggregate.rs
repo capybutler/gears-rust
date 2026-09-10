@@ -1,99 +1,81 @@
-//! Aggregation SQL: inject-safe SELECT-expression and WHERE-clause builders for
-//! the pushed-down `aggregate` query.
+//! Aggregation SQL: inject-safe SQL-fragment builders for the pushed-down
+//! `aggregate` query.
 //!
-//! These fragments compose into
-//! `SELECT <dim exprs…>, <FOLD> FROM usage_records r WHERE <scope> AND
-//! <withdrawal exclusion> [AND …] [GROUP BY 1, 2, …]`. The `FROM` and the scope
-//! predicates are the caller's — including the `r` alias, which is a stated
-//! precondition rather than something this module can emit. The builders here
-//! own the rest:
+//! The fragments compose into `SELECT <dim exprs…>, <fold expr> FROM <from
+//! clause> WHERE <scope> AND <withdrawal exclusion> [AND …] [GROUP BY 1, 2, …]
+//! [LIMIT …]`. Only the scope predicates are the caller's:
 //!
-//! - [`agg_select_expr`] — the aggregate column for a fold that is an aggregate
-//!   function.
-//! - [`latest_select_expr`] — the ordered pick [`AggregationFold::Latest`] is
-//!   instead.
+//! - [`aggregate_from_clause`] — the ledger table and the `r` alias every other
+//!   fragment qualifies its columns with.
+//! - [`fold_select_expr`] — the folded column, one arm per fold.
 //! - [`withdrawal_exclusion_clause`] — the two obligations a withdrawn pair
 //!   places on every fold.
 //! - [`dimension_select_expr`] — a group dimension as a TEXT-returning expr.
 //! - [`aggregate_limit_clause`] — the distinct-group cardinality bound.
 //!
-//! Every fragment that names a column qualifies it with `r`, the alias the
-//! caller MUST give `usage_records`. Nothing in the crate enforces that; see
-//! the precondition on [`withdrawal_exclusion_clause`].
-//!
-//! All identifiers come from the closed [`AggregationFold`] /
-//! [`AggregationDimension`] enum matches (an allowlist — never caller text), so
-//! no identifier is interpolated from untrusted input. The only caller-derived
-//! value, a [`AggregationDimension::Metadata`] key, is bound (`$N`) via the
-//! shared [`SqlCtx`].
+//! Every identifier comes from a closed enum match (an allowlist), never from
+//! caller text. The one caller-derived value, a
+//! [`AggregationDimension::Metadata`] key, is bound (`$N`) via [`SqlCtx`].
 
 use usage_collector_sdk::{AggregationDimension, AggregationFold, MAX_AGGREGATION_BUCKETS};
 
 use super::bind::SqlBind;
 use super::translate::SqlCtx;
 
-/// SQL aggregate expression for an [`AggregationFold`], or `None` when the fold
-/// is not an aggregate function.
+/// The aggregate query's `FROM` clause: the ledger table and the alias every
+/// other fragment here binds to.
 ///
-/// Every fold casts to `numeric` so the result — including the integer-typed
-/// `COUNT(*)` — reads back uniformly as `Option<BigDecimal>` in `aggregate`.
-/// Reading into arbitrary-precision `bigdecimal::BigDecimal` (the type of the
-/// SDK's `AggregationBucket.value`) is why a wide `SUM` no longer hits
-/// `rust_decimal::Decimal`'s ceiling of roughly 7.9e28 and turns into an
-/// `Internal`/500 on decode.
-///
-/// [`AggregationFold::Latest`] has no arm: it is not an aggregate function but
-/// an ordered pick, rendered by [`latest_select_expr`]. Its `None` means
-/// "rendered elsewhere", never "unsupported fold" — a caller that treats it as
-/// the latter serves no `LATEST` meter at all.
-///
-/// The returned string is a `'static` constant from the closed enum match,
-/// never caller text. Every arm that names a column qualifies it with the
-/// caller's `r` alias; `COUNT(*)` names none.
+/// It exists so the alias is one constant both sides read rather than a
+/// convention two files independently honour — a caller spelling its own `FROM`
+/// can pick a different one with no compile error and invalid SQL at runtime.
 #[must_use]
-pub fn agg_select_expr(fold: AggregationFold) -> Option<&'static str> {
-    match fold {
-        AggregationFold::Sum => Some("SUM(r.value)::numeric"),
-        AggregationFold::Count => Some("COUNT(*)::numeric"),
-        AggregationFold::Min => Some("MIN(r.value)::numeric"),
-        AggregationFold::Max => Some("MAX(r.value)::numeric"),
-        AggregationFold::Latest => None,
-    }
+pub fn aggregate_from_clause() -> &'static str {
+    "usage_records r"
 }
 
-/// SQL expression for [`AggregationFold::Latest`], on the declared tie-break.
+/// The [`AggregationFold::Latest`] arm of [`fold_select_expr`].
 ///
 /// DESIGN §3.1 declares the rule as *greatest `window_end`, then greatest
-/// `acceptance_sequence`*, and gives the termination argument as the sequence
-/// being monotonic inside the group's scope — it is strictly monotonic per
-/// `(tenant_id, gts_type_id)`, restated as a storage obligation in DESIGN §3.7.
-/// A group narrower than that scope inherits the order; a group wider than one
-/// tenant is outside the argument DESIGN makes, and no total order is claimed
-/// across tenants. This backend can implement the declared rule exactly,
-/// because it assigns and stores `acceptance_sequence` itself (DESIGN §3.7).
+/// `acceptance_sequence`*, terminating because the sequence is monotonic inside
+/// the group's scope — strictly so per `(tenant_id, gts_type_id)` (DESIGN §3.7).
+/// A narrower group inherits that order; a group spanning tenants is outside the
+/// argument, and no cross-tenant total order is claimed.
 ///
-/// **That is worth stating because the SDK's own reference backend cannot.**
-/// `UsageRecord` carries no such field, so `InMemoryReferencePlugin`
-/// substitutes the greatest `id`, and the `latest-tie-break` contract check is
-/// blocked for the same reason (it sits in the SDK's `BLOCKED_CHECKS`;
-/// `DIVERGENCES.md` entries 10 and 19 carry the standing record). **A green
-/// contract run therefore says nothing about this expression in either
-/// direction.** Not merely because no check asserts the tie-break: the suite in
-/// `usage-collector-sdk/src/contract/checks/` calls the aggregate method twice
-/// and passes `AggregationFold::Sum` both times, so it never reaches this
-/// expression at all. What pins it is this module's own tests.
+/// This backend implements the declared rule exactly, because it assigns
+/// `acceptance_sequence` itself. **The SDK's reference backend cannot:**
+/// `UsageRecord` has no such field, so `InMemoryReferencePlugin` substitutes the
+/// greatest `id` and `latest-tie-break` sits in the SDK's `BLOCKED_CHECKS`
+/// (`DIVERGENCES.md` entries 10 and 19). **No contract check asserts this
+/// expression either way;** this module's tests are what pin it.
 ///
-/// `ARRAY_AGG(… ORDER BY …)[1]` renders the pick rather than `DISTINCT ON`
-/// because it composes with a `GROUP BY` over arbitrary dimensions, which
-/// `DISTINCT ON` does not: `DISTINCT ON` picks per distinct prefix of the
-/// query's own `ORDER BY` and cannot be nested inside a grouped aggregate
-/// SELECT list. A reader will otherwise reach for it.
+/// `LATEST` is an ordered pick, not an aggregate function — but
+/// `ARRAY_AGG(… ORDER BY …)[1]` composes in a grouped SELECT list exactly as
+/// `SUM(…)` does, so the caller needs no separate shape for it. `DISTINCT ON`
+/// does not compose that way (it picks per distinct prefix of the query's own
+/// `ORDER BY`), and is named here because a reader will otherwise reach for it.
+const LATEST_SELECT_EXPR: &str =
+    "(ARRAY_AGG(r.value ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric";
+
+/// SQL expression folding the selected rows, one arm per [`AggregationFold`].
 ///
-/// The returned string is a `'static` constant, never caller text, and
-/// qualifies its columns with the caller's `r` alias.
+/// Every fold casts to `numeric` so the result — including the integer-typed
+/// `COUNT(*)` — reads back uniformly as `Option<BigDecimal>`. That
+/// arbitrary-precision type (the SDK's `AggregationBucket.value`) is why a wide
+/// `SUM` no longer hits `rust_decimal::Decimal`'s ceiling of roughly 7.9e28 and
+/// turns into an `Internal`/500 on decode.
+///
+/// The returned string is a `'static` constant from the closed enum match,
+/// never caller text. Each arm naming a column qualifies it with the alias
+/// [`aggregate_from_clause`] declares; `COUNT(*)` names none.
 #[must_use]
-pub fn latest_select_expr() -> &'static str {
-    "(ARRAY_AGG(r.value ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric"
+pub fn fold_select_expr(fold: AggregationFold) -> &'static str {
+    match fold {
+        AggregationFold::Sum => "SUM(r.value)::numeric",
+        AggregationFold::Count => "COUNT(*)::numeric",
+        AggregationFold::Min => "MIN(r.value)::numeric",
+        AggregationFold::Max => "MAX(r.value)::numeric",
+        AggregationFold::Latest => LATEST_SELECT_EXPR,
+    }
 }
 
 /// Withdrawal-exclusion WHERE clause. One rule, under every fold.
@@ -109,30 +91,21 @@ pub fn latest_select_expr() -> &'static str {
 ///
 /// **This is a change of rule, not only of spelling.** The retired `corrects_id`
 /// model had `SUM` net across signed compensation rows and so deliberately did
-/// *not* filter them; every other op filtered them out. An invalidation echoes
-/// the quantity it withdraws rather than negating it, so netting would now
-/// double-count, and the exception `SUM` used to enjoy is exactly the defect.
+/// *not* filter them. An invalidation echoes the quantity it withdraws rather
+/// than negating it, so netting would now double-count: the exception `SUM` used
+/// to enjoy is exactly the defect.
 ///
-/// Obligation 1 standing alone is not pedantry: retention is plugin-owned
-/// (DESIGN §3.10 "Consistency Contract"), so a conforming deployment can purge
-/// a target and keep the invalidation that withdrew it. That orphan still
-/// contributes nothing — admitting it would be the echoed quantity reported
-/// with nothing left to pair it against.
-///
-/// The `invalidation-excluded-from-fold` contract check exercises this, but
-/// under `AggregationFold::Sum` only — the whole suite passes no other fold —
-/// so the property that makes this one clause rather than five, its holding
-/// under every fold, is pinned here and nowhere else.
+/// Obligation 1 standing alone is not pedantry. Retention is plugin-owned
+/// (DESIGN §3.10 "Consistency Contract"), so a conforming deployment can purge a
+/// target and keep the invalidation that withdrew it; that orphan is the echoed
+/// quantity with nothing left to pair it against.
 ///
 /// # Precondition
 ///
-/// The caller MUST alias `usage_records` as `r` in the outer query's `FROM`.
-/// `r` is what both conjuncts bind against, and the correlated subquery's own
-/// `w` is what keeps `w.invalidates = r.id` unambiguous. A caller that aliases
-/// differently, or omits the alias, produces invalid SQL at runtime with no
-/// compile error; nothing in the crate enforces it.
-///
-/// The returned string is a `'static` constant, never caller text.
+/// The outer query's `FROM` must be [`aggregate_from_clause`] — `r` is what both
+/// conjuncts bind against, and the subquery's own `w` is what keeps
+/// `w.invalidates = r.id` unambiguous. The returned string is a `'static`
+/// constant, never caller text.
 #[must_use]
 pub fn withdrawal_exclusion_clause() -> &'static str {
     "r.invalidates IS NULL \
@@ -142,47 +115,20 @@ pub fn withdrawal_exclusion_clause() -> &'static str {
 /// SQL TEXT-returning expression for a group [`AggregationDimension`].
 ///
 /// The identity columns map through the closed enum match (an allowlist), so
-/// the only caller-derived value — the [`AggregationDimension::Metadata`] key —
+/// the one caller-derived value — the [`AggregationDimension::Metadata`] key —
 /// is bound via `ctx` (`r.metadata ->> $N`) rather than interpolated.
-/// `tenant_id` is a `uuid` column, so it is cast to `text` for a uniform
-/// `Option<String>` positional read in `aggregate`. Every column carries the
-/// caller's `r` alias, matching [`withdrawal_exclusion_clause`].
+/// `tenant_id` is a `uuid`, cast to `text` for a uniform `Option<String>` read.
 ///
-/// The variant set is the SDK's, and it is five fixed dimensions plus the
-/// metadata escape hatch where DESIGN gives `group_by` eight fixed ones;
-/// `entry_type`, `origin` and `invalidates` have no variant to render.
-/// `DIVERGENCES.md` entry 15 holds that gap open, and growing the enum is not
-/// this backend's to do.
+/// The variant set is the SDK's: five fixed dimensions plus the metadata escape
+/// hatch, where DESIGN gives `group_by` eight fixed ones. `DIVERGENCES.md`
+/// entry 15 holds that gap open; growing the enum is not this backend's to do.
 ///
-/// # The absent-dimension rule, which lives at the caller
-///
-/// A row whose dimension column is `NULL` — no `subject_ref`, or a metadata key
-/// absent from the row — has no dimension value to group by, and this file
-/// cannot say which answer the backend gives: the aggregate caller today guards
-/// the two subject dimensions with an `IS NOT NULL` predicate and guards
-/// [`AggregationDimension::Metadata`] with nothing, so metadata is where the
-/// two backends actually differ. What this function returns is a bare column,
-/// which in a SQL `GROUP BY` **collects** such rows into a `NULL` group;
-/// `InMemoryReferencePlugin` **drops** them, for every dimension including an
-/// absent metadata key.
-///
-/// `DIVERGENCES.md` §G raised this as a spec question rather than a check, and
-/// **the spec owner has since settled it: drop the row.** That matches the
-/// reference backend, and it matches what the SDK had already documented on
-/// [`AggregationDimension::SubjectId`] and
-/// [`AggregationDimension::SubjectType`] — rows without a subject are excluded
-/// from the grouping — which left only [`AggregationDimension::Metadata`]
-/// unstated. It also fits the published wire shape, where
-/// `AggregationBucket.key` types every item as a non-nullable string with no
-/// null spelling available.
-///
-/// The consequence, now uniform rather than accidental: **grouped buckets need
-/// not sum to the ungrouped total.**
-///
-/// The guard is the caller's to emit, not this expression's — a `GROUP BY`
-/// ordinal cannot carry a `WHERE` predicate — so nothing changes here and no
-/// test in this module pins the rule. The caller owes a not-null predicate for
-/// every dimension it renders, `Metadata` included.
+/// **Absent dimensions.** This returns a bare column, and a `NULL` in one forms
+/// a `NULL` group. The rule is to drop the row instead — a spec owner's
+/// decision, recorded at `DIVERGENCES.md` §G — and enforcing it is the caller's,
+/// since a `GROUP BY` ordinal carries no `WHERE` predicate. Only `subject_id`,
+/// `subject_type` and an absent metadata key can be `NULL`; the other columns
+/// are `NOT NULL` in the schema, so a guard on them would be dead SQL.
 ///
 /// Returns the SELECT expression string (used positionally; the `GROUP BY`
 /// references it by ordinal so the bound metadata expr is never repeated).
@@ -209,8 +155,11 @@ pub fn dimension_select_expr(dim: &AggregationDimension, ctx: &mut SqlCtx) -> St
 /// list path. `LIMIT MAX_AGGREGATION_BUCKETS + 1` bounds that; the `+ 1` lets the
 /// gateway tell "exactly at the cap" from "over the cap" and reject the latter
 /// with a `400` ([`usage_collector_sdk::reason::AGGREGATION_RESULT_TOO_LARGE`]).
-/// The no-grouping case (`dim_count == 0`) is a single aggregate row and needs no
-/// cap, so it yields an empty clause.
+/// With no grouping (`dim_count == 0`) there is one aggregate row and no
+/// cardinality to bound, so the clause is empty.
+///
+/// It bounds *groups*, not rows per group: [`LATEST_SELECT_EXPR`] materializes a
+/// group's values before picking one, and nothing here caps that.
 #[must_use]
 pub fn aggregate_limit_clause(dim_count: usize) -> String {
     if dim_count == 0 {
