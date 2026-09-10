@@ -1,22 +1,64 @@
 #![cfg(feature = "postgres")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
-//! `TimescaleDB`-backed integration tests for `PgRecordStore` ingest:
-//! single insert with idempotency dedup (insert / absorb / conflict),
-//! compensation persistence, and batch per-row outcomes. Requires Docker.
+//! `PgRecordStore` ingest against a live `TimescaleDB`. Requires Docker.
+//!
+//! The behavioural home for the write path: dedup (absorb / conflict), the
+//! per-scope acceptance sequence, the at-most-one-invalidation guarantee in all
+//! three shapes it can be broken in (a later call, one batch, two concurrent
+//! calls), and per-row batch outcomes aligned with input order.
+//!
+//! Two things here exist nowhere else in the crate:
+//!
+//! * **The `.bind()` sequence.** `InsertColumns`' field order reaches the DDL
+//!   only through the binds in `record_store.rs`, and nothing in-process
+//!   observes that sequence — swap two binds of the same SQL type and
+//!   `PostgreSQL` accepts the row, `InsertColumns::build`'s test still passes,
+//!   and `migration_probe` says nothing, because every constant it checks is
+//!   still correct.
+//!
+//!   Measured, by swapping `resource_id` and `resource_type` in each of the two
+//!   bind sequences and running the whole `--features postgres` suite:
+//!
+//!   * **Batch path** (`insert_records_on_conflict`): all 214 unit tests stay
+//!     green, and so does `contract_conformance_pg`. Three tests red, all in
+//!     this file, and two of them only *indirectly* — the absorb path compares
+//!     the stored attribution for canonical equality, so a transposed write
+//!     turns an absorb into a conflict. Narrow that compared field set and
+//!     those two stop noticing.
+//!     `a_row_written_through_the_batch_insert_reads_back_column_for_column`
+//!     is the one that asks the question directly.
+//!   * **Single-row path** (`create_inner`): `contract_conformance_pg` reds as
+//!     well, because the DESIGN section 3.3 checks round-trip a resource
+//!     reference through `create_usage_record`. That half of the hole was
+//!     already covered; only the batch half was not.
+//! * **The two at-most-one rejection counters.** Both sit on paths that need a
+//!   live backend. The instruments and their descriptions are pinned in
+//!   `metrics_tests`; the call sites are observed here.
 
 mod common;
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 use rust_decimal::Decimal;
+use serde_json::Value as JsonValue;
+use time::{Duration, OffsetDateTime};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use usage_collector_sdk::{UsageCollectorPluginError, UsageRecordStatus};
+use usage_collector_sdk::{
+    IdempotencyKey, Invalidation, MetadataKey, ReasonCode, RecordOrigin, ResourceRef, SubjectRef,
+    UsageCollectorPluginError, UsageRecord,
+};
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
+use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
 
-const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
-
-/// Bring up a container and a record store over it.
+/// A container plus a store over it.
 async fn setup() -> (common::TsHarness, PgRecordStore) {
     let h = common::bring_up()
         .await
@@ -25,530 +67,916 @@ async fn setup() -> (common::TsHarness, PgRecordStore) {
     (h, store)
 }
 
+/// A container plus a store whose metric inventory writes to a **local**
+/// in-memory exporter.
+///
+/// Local rather than the process-global provider, for the reason
+/// `metrics_tests` gives: `Metrics::with_meter` takes the meter explicitly, so
+/// a recording assertion never depends on global state another test binary is
+/// also writing to.
+async fn setup_metered() -> (
+    common::TsHarness,
+    PgRecordStore,
+    SdkMeterProvider,
+    InMemoryMetricExporter,
+) {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    let metrics = Arc::new(Metrics::with_meter(
+        &provider.meter("uc.timescaledb"),
+        h.pool.clone(),
+    ));
+    let store = PgRecordStore::new(h.pool.clone(), metrics, CancellationToken::new());
+    (h, store, provider, exporter)
+}
+
+/// Total of the `u64` counter data points named `name`.
+fn counter_sum(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+    let metrics = exporter.get_finished_metrics().expect("exported metrics");
+    for resource_metrics in &metrics {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data()
+                {
+                    return sum
+                        .data_points()
+                        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                        .sum();
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Every insertable column of one ledger row, decoded by name.
+///
+/// Module scope rather than inside the test that reads it, because an item
+/// after a statement is confusing and clippy says so; the type is only used
+/// there.
+#[derive(sqlx::FromRow)]
+struct Raw {
+    id: Uuid,
+    tenant_id: Uuid,
+    gts_type_id: String,
+    value: Decimal,
+    window_start: OffsetDateTime,
+    window_end: OffsetDateTime,
+    resource_id: String,
+    resource_type: String,
+    subject_id: Option<String>,
+    subject_type: Option<String>,
+    idempotency_key: String,
+    invalidates: Option<Uuid>,
+    reason_code: Option<String>,
+    origin: String,
+    acceptance_sequence: i64,
+    metadata: JsonValue,
+    entry_type: String,
+}
+
+/// The `SELECT` that fills a [`Raw`]: every column an insert writes, plus the
+/// generated `entry_type`, named explicitly and read back by name.
+const RAW_SELECT_SQL: &str = "SELECT id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
+     resource_type, subject_id, subject_type, idempotency_key, invalidates, reason_code, \
+     origin, acceptance_sequence, metadata, entry_type FROM usage_records WHERE id = $1";
+
+/// The acceptance sequences stored for one scope, in insertion order.
+async fn sequences_for(pool: &sqlx::PgPool, tenant: Uuid, meter: &str) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT acceptance_sequence FROM usage_records \
+         WHERE tenant_id = $1 AND gts_type_id = $2 ORDER BY acceptance_sequence",
+    )
+    .bind(tenant)
+    .bind(meter)
+    .fetch_all(pool)
+    .await
+    .expect("acceptance sequence query")
+}
+
+// ---------------------------------------------------------------------------
+// Dedup: absorb and conflict
+// ---------------------------------------------------------------------------
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_insert_new_record_returns_active() {
-    let (_h, store) = setup().await;
+async fn a_fresh_entry_round_trips_through_create() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x1001);
 
-    let record = common::fixture_usage_record(VCPU_GTS, tenant, "idem-new", Decimal::new(5, 0), 1);
-
+    let record = common::entry(&meter, tenant, "idem-new", Decimal::new(5, 0));
     let stored = store
         .create(record.clone())
         .await
-        .expect("create new record");
+        .expect("create a fresh entry");
 
-    assert_eq!(stored.id, record.id, "id round-trips");
-    assert_eq!(stored.value, record.value, "value round-trips");
-    assert_eq!(stored.tenant_id, record.tenant_id, "tenant round-trips");
-    assert_eq!(
-        stored.idempotency_key, record.idempotency_key,
-        "idempotency_key round-trips"
+    assert_eq!(stored.id, record.id, "the derived identity round-trips");
+    assert_eq!(stored.value, record.value);
+    assert_eq!(stored.window_start, record.window_start);
+    assert_eq!(stored.window_end, record.window_end);
+    assert_eq!(stored.origin, RecordOrigin::Live);
+    assert!(
+        stored.invalidation.is_none(),
+        "an ordinary measurement carries no withdrawal"
     );
-    assert_eq!(
-        stored.created_at, record.created_at,
-        "created_at round-trips at second precision"
-    );
-    assert_eq!(
-        stored.status,
-        UsageRecordStatus::Active,
-        "first accept defaults to Active"
-    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE id = $1")
+        .bind(record.id)
+        .fetch_one(&h.pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 1);
 }
 
+/// An exact-equality retry under the same idempotency key is absorbed, and what
+/// comes back is the **previously persisted** row rather than the submission.
+///
+/// "Returns the persisted row" cannot be shown by comparing fields, because an
+/// absorb only happens when the submission and the stored row are canonically
+/// equal — any field that could differ makes it a conflict instead. What is
+/// observable is the ledger: the call succeeds twice and one row exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_exact_retry_is_absorbed() {
-    let (_h, store) = setup().await;
+async fn an_exact_retry_is_absorbed_and_returns_the_persisted_row() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x1002);
 
-    let record =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-retry", Decimal::new(7, 0), 2);
-
+    let record = common::entry(&meter, tenant, "idem-retry", Decimal::new(7, 0));
     let first = store.create(record.clone()).await.expect("first create");
     let second = store
         .create(record.clone())
         .await
-        .expect("exact retry must be absorbed, not conflict");
+        .expect("an exact retry is absorbed, not refused");
 
-    assert_eq!(first.id, second.id, "absorb returns the same stored id");
-    assert_eq!(second.id, record.id, "stored id is the original");
+    assert_eq!(first.id, second.id, "both calls answer with one entry");
+    assert_eq!(second.id, record.id);
+    assert_eq!(second.value, record.value);
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_records WHERE tenant_id = $1 AND idempotency_key = $2",
+    )
+    .bind(tenant)
+    .bind("idem-retry")
+    .fetch_one(&h.pool)
+    .await
+    .expect("count");
     assert_eq!(
-        second.value, record.value,
-        "absorb returns the stored value"
+        rows, 1,
+        "the retry was absorbed against the stored row, not written beside it"
+    );
+
+    // The absorbed retry consumed an acceptance sequence it did not store, and
+    // that is permitted: the obligation is monotonicity, not density. What is
+    // asserted is that it did not store a *second* one.
+    assert_eq!(
+        sequences_for(&h.pool, tenant, common::VCPU_METER)
+            .await
+            .len(),
+        1
     );
 }
 
+/// A divergent write under a key already bound fails closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_insert_with_unregistered_gts_id_is_usage_type_not_found() {
-    // The core pre-checks the usage type exists before inserting, but in the
-    // narrow TOCTOU window where the type is removed between that check and the
-    // insert the `usage_records.gts_id` FK is violated (23503). The plugin must
-    // surface that as the typed `UsageTypeNotFound` (which the core lifts to a
-    // 404), not a generic Internal (500).
-    const UNREGISTERED_GTS: &str =
-        "gts.cf.core.uc.usage_record.v1~cf.compute._.unregistered_hours.v1";
-    let (_h, store) = setup().await;
-    let tenant = Uuid::from_u128(0x1009);
-
-    let record = common::fixture_usage_record(
-        UNREGISTERED_GTS,
-        tenant,
-        "idem-no-type",
-        Decimal::new(1, 0),
-        9,
-    );
-
-    let err = store
-        .create(record)
-        .await
-        .expect_err("insert against an unregistered gts_id must fail the FK");
-
-    match err {
-        UsageCollectorPluginError::UsageTypeNotFound { gts_id } => {
-            assert_eq!(
-                gts_id,
-                common::fixture_gts_id(UNREGISTERED_GTS),
-                "the typed error carries the missing gts_id"
-            );
-        }
-        other => panic!("expected UsageTypeNotFound, got {other:?}"),
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_same_key_conflicting_value_is_idempotency_conflict() {
-    let (_h, store) = setup().await;
+async fn a_divergent_same_key_write_is_an_idempotency_conflict() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x1003);
 
-    let first = common::fixture_usage_record(VCPU_GTS, tenant, "idem-dup", Decimal::new(3, 0), 3);
-    let stored = store.create(first.clone()).await.expect("first create");
+    let first = common::entry(&meter, tenant, "idem-conflict", Decimal::new(1, 0));
+    let first = store.create(first).await.expect("first create");
 
-    // Same (tenant, gts, idempotency_key) but a different value AND a distinct
-    // `id` — a canonical-field mismatch (both `value` and the record `id` are
-    // canonical here), which must surface as a conflict.
-    let conflicting =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-dup", Decimal::new(999, 0), 4);
+    // Same five dedup inputs, different quantity: canonically unequal.
+    let divergent = common::entry(&meter, tenant, "idem-conflict", Decimal::new(2, 0));
+    assert_eq!(
+        divergent.id, first.id,
+        "the two share all five dedup-identity inputs, so they share an identifier"
+    );
 
     let err = store
-        .create(conflicting)
+        .create(divergent)
         .await
-        .expect_err("conflicting value on the same key must fail");
-
+        .expect_err("a divergent same-key write must be refused");
     match err {
         UsageCollectorPluginError::IdempotencyConflict {
             idempotency_key,
             existing_id,
         } => {
-            assert_eq!(idempotency_key, "idem-dup", "conflict carries the key");
-            assert_eq!(
-                existing_id, stored.id,
-                "conflict carries the previously stored row's id"
-            );
+            assert_eq!(idempotency_key, "idem-conflict");
+            assert_eq!(existing_id, first.id);
         }
         other => panic!("expected IdempotencyConflict, got {other:?}"),
     }
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_compensation_persists_corrects_id() {
-    let (_h, store) = setup().await;
-    let tenant = Uuid::from_u128(0x1004);
-
-    let original =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-orig", Decimal::new(10, 0), 5);
-    let original = store.create(original).await.expect("create original");
-
-    // A compensation: negative value, a fresh idempotency key, and corrects_id
-    // pointing at the original row.
-    let mut compensation =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-comp", Decimal::new(-10, 0), 6);
-    compensation.corrects_id = Some(original.id);
-
-    let stored = store
-        .create(compensation.clone())
+    let stored_value: Decimal = sqlx::query_scalar("SELECT value FROM usage_records WHERE id = $1")
+        .bind(first.id)
+        .fetch_one(&h.pool)
         .await
-        .expect("create compensation");
+        .expect("read the stored value");
     assert_eq!(
-        stored.corrects_id,
-        Some(original.id),
-        "create returns the compensation target"
-    );
-
-    let fetched = store.get(stored.id).await.expect("get compensation back");
-    assert_eq!(
-        fetched.corrects_id,
-        Some(original.id),
-        "corrects_id persists and reads back"
-    );
-    assert_eq!(
-        fetched.value,
-        Decimal::new(-10, 0),
-        "negative value persists"
+        stored_value,
+        Decimal::new(1, 0),
+        "fail-closed means the stored entry is untouched"
     );
 }
 
+// ---------------------------------------------------------------------------
+// The acceptance sequence
+// ---------------------------------------------------------------------------
+
+/// Strictly monotonic per `(tenant_id, gts_type_id)`, and two scopes do not
+/// share a sequence.
+///
+/// Both halves matter and neither implies the other. A single global counter
+/// would satisfy monotonicity within each scope while making the second scope's
+/// first value depend on the first scope's traffic — which is what makes feed
+/// order per scope deterministic, and what a global `SEQUENCE` would cost. The
+/// schema comment says why a Postgres `SEQUENCE` cannot be used: per-scope
+/// monotonicity would need one sequence per `(tenant, meter)`, i.e. unbounded
+/// DDL driven by tenant data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_batch_preserves_order_and_isolates_conflict() {
+async fn the_acceptance_sequence_is_strictly_monotonic_per_scope_and_not_shared() {
+    let (h, store) = setup().await;
+    let vcpu = common::meter(common::VCPU_METER);
+    let gb = common::meter(common::GB_METER);
+    let tenant_a = Uuid::from_u128(0x5EA1);
+    let tenant_b = Uuid::from_u128(0x5EA2);
+
+    // Interleave the three scopes so a shared counter would show up as gaps in
+    // each of them rather than as three independent runs.
+    for i in 0..4_i64 {
+        let start = common::fixture_window_start() + Duration::hours(i);
+        let end = common::fixture_window_end() + Duration::hours(i);
+        for (tenant, meter) in [(tenant_a, &vcpu), (tenant_a, &gb), (tenant_b, &vcpu)] {
+            let rec = common::entry_over(
+                meter,
+                tenant,
+                &format!("idem-seq-{i}"),
+                Decimal::from(i + 1),
+                start,
+                end,
+            );
+            store.create(rec).await.expect("create");
+        }
+    }
+
+    for (tenant, meter, label) in [
+        (tenant_a, common::VCPU_METER, "tenant A / vcpu"),
+        (tenant_a, common::GB_METER, "tenant A / gb"),
+        (tenant_b, common::VCPU_METER, "tenant B / vcpu"),
+    ] {
+        let seqs = sequences_for(&h.pool, tenant, meter).await;
+        assert_eq!(seqs.len(), 4, "{label}: four entries");
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "{label}: acceptance_sequence must be strictly increasing, got {seqs:?}"
+        );
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4],
+            "{label}: each scope counts from its own start - a value here that reflects \
+             another scope's traffic means the counter is shared"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// At most one invalidation per entry
+// ---------------------------------------------------------------------------
+
+/// A second withdrawal of one target, arriving in a **later call**, is refused
+/// by `usage_records_one_invalidation_uniq` and named.
+///
+/// This is also where `uc_timescaledb_invalidation_rejected_statements_total`'s
+/// call site is observed: the index aborts the statement, `map_insert_error`
+/// classifies it, and the increment happens there — on a path no unit test can
+/// reach, because it needs the index to fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_withdrawal_in_a_later_call_is_already_invalidated_and_counted() {
+    let (h, store, provider, exporter) = setup_metered().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x1_A710);
+
+    let target = common::entry(&meter, tenant, "idem-target", Decimal::new(10, 0));
+    let target = store.create(target).await.expect("create the target");
+
+    let first = common::withdrawal_of(&target, "idem-w1");
+    let first = store
+        .create(first)
+        .await
+        .expect("the first withdrawal is accepted");
+
+    let second = common::withdrawal_of(&target, "idem-w2");
+    let err = store
+        .create(second)
+        .await
+        .expect_err("a second withdrawal of one target must be refused");
+    match err {
+        UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by } => {
+            assert_eq!(
+                id, target.id,
+                "the refusal names the entry already withdrawn"
+            );
+            assert_eq!(
+                invalidated_by, first.id,
+                "and the withdrawal that already withdrew it"
+            );
+        }
+        other => panic!("expected AlreadyInvalidated, got {other:?}"),
+    }
+
+    let withdrawals: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE invalidates = $1")
+            .bind(target.id)
+            .fetch_one(&h.pool)
+            .await
+            .expect("count withdrawals");
+    assert_eq!(withdrawals, 1, "exactly one withdrawal is admitted");
+
+    provider.force_flush().expect("flush metrics");
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            "uc_timescaledb_invalidation_rejected_statements_total"
+        ),
+        1,
+        "the index's refusal of a whole statement is counted once, in map_insert_error"
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_timescaledb_invalidation_rejected_rows_total"),
+        0,
+        "the in-batch counter is a different instrument and must not move here - the two \
+         count different units and are deliberately not summable"
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_timescaledb_invalidations_total"),
+        1,
+        "one withdrawal was accepted"
+    );
+}
+
+/// The same rule when both withdrawals arrive in **one `create_batch`** — the
+/// case the SPI singles out, because the two would otherwise land in one
+/// multi-row `INSERT` where the index rejects the whole statement and every
+/// other row of the batch loses its outcome.
+///
+/// So the outcome asserted is per-row: the first withdrawal is accepted, the
+/// second is `AlreadyInvalidated`, and the unrelated row beside them is
+/// unaffected. This is also where
+/// `uc_timescaledb_invalidation_rejected_rows_total`'s call site is observed —
+/// **rows**, against the sibling instrument's **statements**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_withdrawals_of_one_target_in_one_batch_yield_exactly_one_acceptance() {
+    let (h, store, provider, exporter) = setup_metered().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x1_A711);
+
+    let target = common::entry(&meter, tenant, "idem-target", Decimal::new(10, 0));
+    let target = store.create(target).await.expect("create the target");
+
+    let w1 = common::withdrawal_of(&target, "idem-w1");
+    let w2 = common::withdrawal_of(&target, "idem-w2");
+    let unrelated = common::entry(&meter, tenant, "idem-unrelated", Decimal::new(3, 0));
+
+    let results = store
+        .create_batch(vec![w1.clone(), w2.clone(), unrelated.clone()])
+        .await
+        .expect("the batch as a whole succeeds and answers per row");
+
+    assert_eq!(
+        results.len(),
+        3,
+        "one outcome per input row, in input order"
+    );
+    assert_eq!(
+        results[0]
+            .as_ref()
+            .expect("the first withdrawal is accepted")
+            .id,
+        w1.id
+    );
+    match results[1].as_ref() {
+        Err(UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }) => {
+            assert_eq!(*id, target.id);
+            assert_eq!(
+                *invalidated_by, w1.id,
+                "the refusal names the earlier row of this same batch"
+            );
+        }
+        other => panic!("row 1 must be AlreadyInvalidated, got {other:?}"),
+    }
+    assert_eq!(
+        results[2]
+            .as_ref()
+            .expect("the unrelated row keeps its outcome")
+            .id,
+        unrelated.id,
+        "a refused withdrawal must not cost the rest of the batch their outcomes"
+    );
+
+    let withdrawals: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE invalidates = $1")
+            .bind(target.id)
+            .fetch_one(&h.pool)
+            .await
+            .expect("count withdrawals");
+    assert_eq!(withdrawals, 1);
+
+    provider.force_flush().expect("flush metrics");
+    assert_eq!(
+        counter_sum(&exporter, "uc_timescaledb_invalidation_rejected_rows_total"),
+        1,
+        "one refused row, counted in resolve_batch"
+    );
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            "uc_timescaledb_invalidation_rejected_statements_total"
+        ),
+        0,
+        "no statement was refused: the in-batch pre-rejection is what keeps the outcome \
+         per-row, so the index never fired"
+    );
+}
+
+/// Two **concurrent** `create` calls withdrawing one target: exactly one is
+/// accepted.
+///
+/// A sequential test cannot see this. The obligation the SPI states is that the
+/// refusal is atomic with the entry it admits — a read followed by a write will
+/// not do — and only two writers racing for the same slot distinguish an index
+/// from a pre-read that happens to be right when nothing else is running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_withdrawals_of_one_target_admit_exactly_one() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x1_A712);
+
+    let target = common::entry(&meter, tenant, "idem-target", Decimal::new(10, 0));
+    let target = store.create(target).await.expect("create the target");
+
+    let a = common::withdrawal_of(&target, "idem-race-a");
+    let b = common::withdrawal_of(&target, "idem-race-b");
+    let (sa, sb) = (store.clone(), store.clone());
+    let (ra, rb) = tokio::join!(
+        tokio::spawn(async move { sa.create(a).await }),
+        tokio::spawn(async move { sb.create(b).await }),
+    );
+    let ra = ra.expect("task a did not panic");
+    let rb = rb.expect("task b did not panic");
+
+    let accepted = usize::from(ra.is_ok()) + usize::from(rb.is_ok());
+    assert_eq!(
+        accepted, 1,
+        "exactly one concurrent withdrawal of one target may be admitted; got a={ra:?} b={rb:?}"
+    );
+    let loser = if ra.is_ok() { &rb } else { &ra };
+    match loser {
+        Err(UsageCollectorPluginError::AlreadyInvalidated { id, .. }) => {
+            assert_eq!(*id, target.id);
+        }
+        other => panic!("the losing withdrawal must be AlreadyInvalidated, got {other:?}"),
+    }
+
+    let withdrawals: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE invalidates = $1")
+            .bind(target.id)
+            .fetch_one(&h.pool)
+            .await
+            .expect("count withdrawals");
+    assert_eq!(withdrawals, 1, "and the ledger holds one, not two");
+}
+
+// ---------------------------------------------------------------------------
+// Batch outcomes
+// ---------------------------------------------------------------------------
+
+/// Per-record outcomes are aligned with input order, and a conflict is isolated
+/// to its own slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_outcomes_are_aligned_with_input_order() {
     let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x1005);
 
-    // Pre-existing record whose key the batch's #2 will collide with using a
-    // conflicting value.
-    let existing =
-        common::fixture_usage_record(VCPU_GTS, tenant, "batch-dup", Decimal::new(1, 0), 7);
-    let existing = store.create(existing).await.expect("seed existing record");
+    let seeded = common::entry(&meter, tenant, "batch-dup", Decimal::new(1, 0));
+    let seeded = store.create(seeded).await.expect("seed the duplicate key");
 
-    let row0 = common::fixture_usage_record(VCPU_GTS, tenant, "batch-0", Decimal::new(2, 0), 8);
-    // #2 reuses `batch-dup` with a different value -> IdempotencyConflict.
-    let row1 = common::fixture_usage_record(VCPU_GTS, tenant, "batch-dup", Decimal::new(42, 0), 9);
-    let row2 = common::fixture_usage_record(VCPU_GTS, tenant, "batch-2", Decimal::new(3, 0), 10);
+    let row0 = common::entry(&meter, tenant, "batch-0", Decimal::new(2, 0));
+    let row1 = common::entry(&meter, tenant, "batch-dup", Decimal::new(42, 0));
+    let row2 = common::entry(&meter, tenant, "batch-2", Decimal::new(3, 0));
 
     let results = store
         .create_batch(vec![row0.clone(), row1, row2.clone()])
         .await
         .expect("batch returns per-row outcomes");
 
-    assert_eq!(results.len(), 3, "one result per input row, in order");
-
-    let r0 = results[0].as_ref().expect("row 0 inserted");
-    assert_eq!(r0.id, row0.id, "row 0 preserves position");
-
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].as_ref().expect("row 0 inserted").id, row0.id);
     match results[1].as_ref() {
         Err(UsageCollectorPluginError::IdempotencyConflict { existing_id, .. }) => {
-            assert_eq!(
-                *existing_id, existing.id,
-                "row 1 conflict points at the seeded row"
-            );
+            assert_eq!(*existing_id, seeded.id);
         }
         other => panic!("row 1 must be IdempotencyConflict, got {other:?}"),
     }
-
-    let r2 = results[2].as_ref().expect("row 2 inserted");
-    assert_eq!(r2.id, row2.id, "row 2 preserves position");
+    assert_eq!(results[2].as_ref().expect("row 2 inserted").id, row2.id);
 }
 
+/// One batch carrying a fresh key, an exact retry of it, and a divergent write
+/// under it: insert, absorb, conflict — resolved against the row this same
+/// batch wrote.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_empty_batch_is_internal_error() {
+async fn an_in_batch_duplicate_resolves_against_the_row_the_batch_wrote() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x001B_A7C0);
+
+    let first = common::entry(&meter, tenant, "intra-dup", Decimal::new(5, 0));
+    let exact = first.clone();
+    let divergent = common::entry(&meter, tenant, "intra-dup", Decimal::new(9, 0));
+
+    let results = store
+        .create_batch(vec![first.clone(), exact, divergent])
+        .await
+        .expect("batch returns per-row outcomes");
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results[0].as_ref().expect("first occurrence inserted").id,
+        first.id
+    );
+    assert_eq!(
+        results[1].as_ref().expect("exact duplicate absorbed").id,
+        first.id,
+        "the absorb answers with the winner's stored row"
+    );
+    match results[2].as_ref() {
+        Err(UsageCollectorPluginError::IdempotencyConflict { existing_id, .. }) => {
+            assert_eq!(*existing_id, first.id);
+        }
+        other => panic!("row 2 must be IdempotencyConflict, got {other:?}"),
+    }
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_records WHERE tenant_id = $1 AND idempotency_key = $2",
+    )
+    .bind(tenant)
+    .bind("intra-dup")
+    .fetch_one(&h.pool)
+    .await
+    .expect("count");
+    assert_eq!(rows, 1, "one dedup key, one row");
+}
+
+/// A batch of distinct entries all insert, and the sequence they were assigned
+/// is strictly monotonic across the whole block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hundred_distinct_entries_all_insert_under_one_monotonic_block() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x1000);
+
+    let mut batch = Vec::with_capacity(100);
+    for i in 0..100_i64 {
+        let mut rec = common::entry_over(
+            &meter,
+            tenant,
+            &format!("bulk-{i}"),
+            Decimal::from(i + 1),
+            common::fixture_window_start() + Duration::minutes(i),
+            common::fixture_window_end() + Duration::minutes(i),
+        );
+        if i % 3 == 0 {
+            rec.subject_ref =
+                Some(SubjectRef::new(format!("subj-{i}"), Some("user")).expect("valid subject"));
+        }
+        if i % 5 == 0 {
+            rec.metadata.insert(
+                MetadataKey::new("region").expect("valid metadata key"),
+                "eu-west-1".to_owned(),
+            );
+        }
+        batch.push(rec);
+    }
+
+    let results = store.create_batch(batch).await.expect("batch ok");
+    assert_eq!(results.len(), 100);
+    for (i, r) in results.iter().enumerate() {
+        assert!(r.is_ok(), "row {i} must insert: {r:?}");
+    }
+
+    let seqs = sequences_for(&h.pool, tenant, common::VCPU_METER).await;
+    assert_eq!(seqs.len(), 100);
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "a batch's block claim must still be strictly monotonic: {seqs:?}"
+    );
+}
+
+/// An empty batch is a host-contract breach, not an empty answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_batch_is_a_host_contract_breach() {
     let (_h, store) = setup().await;
 
     let err = store
         .create_batch(Vec::new())
         .await
-        .expect_err("empty batch is a host-contract breach");
+        .expect_err("an empty batch must not be served");
     assert!(
         matches!(err, UsageCollectorPluginError::Internal(_)),
-        "empty batch must surface as Internal, got {err:?}"
+        "an empty batch must surface as Internal, got {err:?}"
     );
 }
 
-/// Approach A: two submissions sharing an `idempotency_key` but carrying
-/// DIFFERENT `created_at` are distinct 4-tuples, so both insert — a silent
-/// duplicate, never an `IdempotencyConflict`. This is the intentional divergence
-/// from the SPI's 3-tuple contract (DESIGN.md §2.2): only a same-key/SAME-time
-/// replay dedups. Run concurrently to also prove `ON CONFLICT` does not serialize
-/// distinct 4-tuples into one row.
+/// Two batches whose key sets overlap, run concurrently, complete without a
+/// deadlock and leave one row per dedup key.
+///
+/// `plan_batch` sorts its representatives by dedup key so concurrent multi-row
+/// inserts take the same global order; the bounded retry above it absorbs a
+/// victim if one appears anyway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pg_concurrent_same_key_different_created_at_inserts_two_rows() {
+async fn concurrent_overlapping_batches_leave_one_row_per_key() {
     let (h, store) = setup().await;
-    let tenant = Uuid::from_u128(0x1A1A);
-
-    let rec_a =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-a1", Decimal::new(3, 0), 0xA1A);
-    let mut rec_b =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-a1", Decimal::new(4, 0), 0xB1B);
-    // Shift B's created_at by +1s: same dedup key, different 4-tuple.
-    rec_b.created_at = rec_a.created_at + time::Duration::seconds(1);
-
-    let s1 = store.clone();
-    let s2 = store.clone();
-    let (r1, r2) = tokio::join!(
-        tokio::spawn(async move { s1.create(rec_a).await }),
-        tokio::spawn(async move { s2.create(rec_b).await }),
-    );
-    let r1 = r1.expect("task a join");
-    let r2 = r2.expect("task b join");
-
-    assert!(r1.is_ok(), "submission a inserts: {r1:?}");
-    assert!(
-        r2.is_ok(),
-        "submission b (different created_at) inserts too: {r2:?}"
-    );
-
-    let n: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM usage_records \
-         WHERE tenant_id = $1 AND gts_id = $2 AND idempotency_key = $3",
-    )
-    .bind(tenant)
-    .bind(VCPU_GTS)
-    .bind("idem-a1")
-    .fetch_one(&h.pool)
-    .await
-    .expect("count rows for dedup key");
-    assert_eq!(
-        n, 2,
-        "same key with two created_at values -> two distinct records (silent duplicate)"
-    );
-}
-
-/// A batch mixing a fresh insert, an exact retry (absorb), and a canonical
-/// mismatch (conflict) on a pre-seeded key returns one positionally-aligned
-/// result per row; a conflict is isolated to its own slot.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_batch_mixes_insert_absorb_conflict_per_row() {
-    let (_h, store) = setup().await;
-    let tenant = Uuid::from_u128(0xBA7C);
-
-    let seed =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-dup", Decimal::new(5, 0), 0xB01);
-    store.create(seed.clone()).await.expect("seed the dup key");
-
-    let fresh =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-fresh", Decimal::new(2, 0), 0xB02);
-    let absorb = seed.clone(); // exact retry of the seeded row
-    let conflict =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-dup", Decimal::new(9, 0), 0xB03);
-
-    let results = store
-        .create_batch(vec![fresh, absorb, conflict])
-        .await
-        .expect("batch call succeeds");
-
-    assert_eq!(results.len(), 3, "one result per input row, in order");
-    assert!(results[0].is_ok(), "fresh row inserted: {:?}", results[0]);
-    assert!(results[1].is_ok(), "exact retry absorbed: {:?}", results[1]);
-    assert!(
-        matches!(
-            results[2],
-            Err(UsageCollectorPluginError::IdempotencyConflict { .. })
-        ),
-        "canonical mismatch on seeded key conflicts: {:?}",
-        results[2]
-    );
-}
-
-/// Intra-batch duplicate of a FRESH (not pre-seeded) key: first occurrence
-/// inserts, an exact-duplicate later occurrence absorbs against it, and a
-/// canonical-mismatch later occurrence conflicts — all within one batch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_batch_intra_batch_duplicate_fresh_key() {
-    let (h, store) = setup().await;
-    let tenant = Uuid::from_u128(0x001B_A7C0);
-
-    let first =
-        common::fixture_usage_record(VCPU_GTS, tenant, "intra-dup", Decimal::new(5, 0), 0xD01);
-    let exact = first.clone(); // exact retry within the same batch -> absorb
-    let mismatch =
-        common::fixture_usage_record(VCPU_GTS, tenant, "intra-dup", Decimal::new(9, 0), 0xD02);
-
-    let results = store
-        .create_batch(vec![first.clone(), exact, mismatch])
-        .await
-        .expect("batch returns per-row outcomes");
-
-    assert_eq!(results.len(), 3, "one result per input row, in order");
-
-    let r0 = results[0].as_ref().expect("first occurrence inserted");
-    assert_eq!(r0.id, first.id, "winner is the first occurrence");
-
-    let r1 = results[1].as_ref().expect("exact duplicate absorbed");
-    assert_eq!(r1.id, first.id, "absorb returns the winner's stored row");
-
-    match results[2].as_ref() {
-        Err(UsageCollectorPluginError::IdempotencyConflict { existing_id, .. }) => {
-            assert_eq!(
-                *existing_id, first.id,
-                "mismatch conflicts against the winner"
-            );
-        }
-        other => panic!("row 2 must be IdempotencyConflict, got {other:?}"),
-    }
-
-    let n: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM usage_records \
-         WHERE tenant_id = $1 AND gts_id = $2 AND idempotency_key = $3",
-    )
-    .bind(tenant)
-    .bind(VCPU_GTS)
-    .bind("intra-dup")
-    .fetch_one(&h.pool)
-    .await
-    .expect("count");
-    assert_eq!(n, 1, "intra-batch dup persists exactly one record");
-}
-
-/// A batch where every row conflicts against a pre-seeded key: all slots return
-/// `IdempotencyConflict`, none fail the batch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_batch_all_rows_conflict() {
-    let (_h, store) = setup().await;
-    let tenant = Uuid::from_u128(0x000A_11C0);
-
-    let seed =
-        common::fixture_usage_record(VCPU_GTS, tenant, "all-conf", Decimal::new(1, 0), 0xC01);
-    let seed = store.create(seed).await.expect("seed");
-
-    let a = common::fixture_usage_record(VCPU_GTS, tenant, "all-conf", Decimal::new(2, 0), 0xC02);
-    let b = common::fixture_usage_record(VCPU_GTS, tenant, "all-conf", Decimal::new(3, 0), 0xC03);
-
-    let results = store.create_batch(vec![a, b]).await.expect("batch ok");
-    assert_eq!(results.len(), 2);
-    for (i, r) in results.iter().enumerate() {
-        match r {
-            Err(UsageCollectorPluginError::IdempotencyConflict { existing_id, .. }) => {
-                assert_eq!(*existing_id, seed.id, "row {i} conflicts against the seed");
-            }
-            other => panic!("row {i} must be IdempotencyConflict, got {other:?}"),
-        }
-    }
-}
-
-/// Approach A: a batch carrying two rows that share an `idempotency_key` but
-/// differ in `created_at` inserts BOTH (distinct 4-tuples → silent duplicate),
-/// not one-plus-conflict. Contrast `pg_batch_intra_batch_duplicate_fresh_key`,
-/// where the duplicate shares the same `created_at` and so absorbs/conflicts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_batch_same_key_different_created_at_inserts_both() {
-    let (h, store) = setup().await;
-    let tenant = Uuid::from_u128(0x0057_A1EB);
-
-    let first = common::fixture_usage_record(
-        VCPU_GTS,
-        tenant,
-        "batch-dup-time",
-        Decimal::new(7, 0),
-        0xF01,
-    );
-    let mut later = common::fixture_usage_record(
-        VCPU_GTS,
-        tenant,
-        "batch-dup-time",
-        Decimal::new(8, 0),
-        0xF02,
-    );
-    later.created_at = first.created_at + time::Duration::seconds(1);
-
-    let results = store
-        .create_batch(vec![first, later])
-        .await
-        .expect("batch ok");
-    assert_eq!(results.len(), 2);
-    assert!(results[0].is_ok(), "first row inserts: {:?}", results[0]);
-    assert!(
-        results[1].is_ok(),
-        "later row (different created_at) inserts too: {:?}",
-        results[1]
-    );
-
-    let n: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM usage_records \
-         WHERE tenant_id = $1 AND gts_id = $2 AND idempotency_key = $3",
-    )
-    .bind(tenant)
-    .bind(VCPU_GTS)
-    .bind("batch-dup-time")
-    .fetch_one(&h.pool)
-    .await
-    .expect("count rows for dedup key");
-    assert_eq!(
-        n, 2,
-        "same key, two created_at values in one batch -> two stored records"
-    );
-}
-
-/// A 100-row batch of distinct fresh records (the documented cap) round-trips:
-/// every row inserts, including subject-less rows and a row carrying metadata.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_batch_hundred_distinct_rows_all_insert() {
-    let (h, store) = setup().await;
-    let tenant = Uuid::from_u128(0x1000);
-
-    let mut batch = Vec::with_capacity(100);
-    for i in 0..100u128 {
-        let mut r = common::fixture_usage_record(
-            VCPU_GTS,
-            tenant,
-            &format!("bulk-{i}"),
-            Decimal::new(i64::try_from(i).expect("fits i64") + 1, 0),
-            0x1_0000 + i,
-        );
-        if i == 0 {
-            r.metadata.insert(
-                usage_collector_sdk::MetadataKey::new("region").expect("valid key"),
-                "eu-1".to_owned(),
-            );
-        }
-        batch.push(r);
-    }
-
-    let results = store.create_batch(batch).await.expect("bulk batch ok");
-    assert_eq!(results.len(), 100, "one result per row");
-    assert!(
-        results.iter().all(Result::is_ok),
-        "every distinct fresh row inserts"
-    );
-
-    let n: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM usage_records WHERE tenant_id = $1 AND gts_id = $2",
-    )
-    .bind(tenant)
-    .bind(VCPU_GTS)
-    .fetch_one(&h.pool)
-    .await
-    .expect("count");
-    assert_eq!(n, 100, "all 100 rows persisted");
-
-    let first = results[0].as_ref().expect("row 0 ok");
-    let fetched = store.get(first.id).await.expect("get row 0");
-    assert_eq!(
-        fetched
-            .metadata
-            .get(&usage_collector_sdk::MetadataKey::new("region").unwrap()),
-        Some(&"eu-1".to_owned()),
-        "metadata persisted via batch insert"
-    );
-}
-
-/// Two concurrent batches sharing the same two fresh keys (submitted in opposite
-/// input order) must both complete without a deadlock error: the planner sorts
-/// claim keys into one global lock order. Exactly one record persists per key.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pg_concurrent_overlapping_batches_do_not_deadlock() {
-    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x0DEA_D10C);
 
-    // Identical canonical content per key so the loser absorbs (not conflicts).
-    let mk = |idem: &str, seq: u128| {
-        common::fixture_usage_record(VCPU_GTS, tenant, idem, Decimal::new(1, 0), seq)
+    // Every field is a function of the key's own index, not of the position in
+    // the batch: the ten shared keys must carry *identical* entries on both
+    // sides, or the overlap is a canonical mismatch and the answer is
+    // `IdempotencyConflict` rather than the absorb this test is about.
+    let build = |offset: i64| {
+        (0..20_i64)
+            .map(|i| {
+                let n = i + offset;
+                common::entry_over(
+                    &meter,
+                    tenant,
+                    &format!("overlap-{n}"),
+                    Decimal::from(n + 1),
+                    common::fixture_window_start() + Duration::minutes(n),
+                    common::fixture_window_end() + Duration::minutes(n),
+                )
+            })
+            .collect::<Vec<_>>()
     };
-    let b1 = vec![mk("ov-a", 0xA1), mk("ov-b", 0xB1)];
-    let b2 = vec![mk("ov-b", 0xB1), mk("ov-a", 0xA1)]; // opposite input order
-
-    let s1 = store.clone();
-    let s2 = store.clone();
-    let (r1, r2) = tokio::join!(
-        tokio::spawn(async move { s1.create_batch(b1).await }),
-        tokio::spawn(async move { s2.create_batch(b2).await }),
+    // Offsets 0 and 10: ten keys in common, ten unique to each side.
+    let (left, right) = (build(0), build(10));
+    let (sa, sb) = (store.clone(), store.clone());
+    let (ra, rb) = tokio::join!(
+        tokio::spawn(async move { sa.create_batch(left).await }),
+        tokio::spawn(async move { sb.create_batch(right).await }),
     );
-    let r1 = r1.expect("join b1").expect("b1 batch ok (no deadlock)");
-    let r2 = r2.expect("join b2").expect("b2 batch ok (no deadlock)");
-    assert_eq!(r1.len(), 2);
-    assert_eq!(r2.len(), 2);
-    // Every slot is a success (insert or absorb) — never a deadlock-driven error.
-    assert!(
-        r1.iter().chain(r2.iter()).all(Result::is_ok),
-        "r1={r1:?} r2={r2:?}"
-    );
+    let ra = ra
+        .expect("task a did not panic")
+        .expect("batch a completed");
+    let rb = rb
+        .expect("task b did not panic")
+        .expect("batch b completed");
+    for (i, r) in ra.iter().chain(rb.iter()).enumerate() {
+        assert!(
+            r.is_ok(),
+            "every row of both batches must resolve to a stored entry; row {i}: {r:?}"
+        );
+    }
 
-    for idem in ["ov-a", "ov-b"] {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM usage_records \
-             WHERE tenant_id = $1 AND gts_id = $2 AND idempotency_key = $3",
-        )
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE tenant_id = $1")
         .bind(tenant)
-        .bind(VCPU_GTS)
-        .bind(idem)
         .fetch_one(&h.pool)
         .await
         .expect("count");
-        assert_eq!(n, 1, "key {idem} maps to exactly one stored record");
+    assert_eq!(rows, 30, "twenty plus twenty with ten keys in common");
+}
+
+// ---------------------------------------------------------------------------
+// The bind sequence
+// ---------------------------------------------------------------------------
+
+/// Every column a batch insert writes reads back carrying the value it was
+/// given.
+///
+/// **This is the test that asks about the `.bind()` sequence directly**, and on
+/// the batch path it is the only one that observes it other than through a side
+/// effect — the module header carries the measurement.
+/// `InsertColumns`' field order reaches the DDL through those binds and nothing
+/// else does: swap two binds of the same SQL type — `resource_id` and
+/// `resource_type` are both `text NOT NULL` — and `PostgreSQL` accepts the row,
+/// `InsertColumns::build`'s field-by-field test still passes, and
+/// `migration_probe` says nothing, because every constant it checks is still
+/// correct.
+///
+/// So every same-typed column here carries a value distinguishable from every
+/// other column of that type, and each is read back **by name** rather than by
+/// position. The two rows are written in one `create_batch` because the batch
+/// path is where the sixteen binds are arrays: a transposition there is one
+/// array bound to the wrong column, which is the harder case, and the
+/// invalidation pair (`invalidates`, `reason_code`) needs a target to point at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x00B1_9DDE);
+
+    let window_start = common::fixture_window_start();
+    // Distinct from the start, so a transposition of the two `timestamptz`
+    // binds is visible rather than a no-op. The ordering CHECK would also catch
+    // a straight swap; a test that relies on the constraint to notice is not
+    // observing the bind sequence, so both are asserted by value below.
+    let window_end = common::fixture_window_end();
+
+    let mut target = common::entry_over(
+        &meter,
+        tenant,
+        "bind-order-target",
+        Decimal::new(12_345, 3),
+        window_start,
+        window_end,
+    );
+    target.resource_ref =
+        ResourceRef::new("resource-id-value", "resource-type-value").expect("valid resource");
+    target.subject_ref = Some(
+        SubjectRef::new("subject-id-value", Some("subject-type-value")).expect("valid subject"),
+    );
+    target.origin = RecordOrigin::Backfill;
+    target.metadata.insert(
+        MetadataKey::new("region").expect("valid metadata key"),
+        "metadata-value".to_owned(),
+    );
+    // Re-derive: `entry_over` stamped the identity from the key it was handed,
+    // and none of the fields set above is an input to it, so the id still
+    // stands. Asserted rather than assumed, because the whole point of this
+    // test is that a value ends up under the column it belongs to.
+    assert_eq!(
+        target.id,
+        usage_collector_sdk::derive_usage_record_id(
+            tenant,
+            &meter,
+            &IdempotencyKey::new("bind-order-target").expect("valid key"),
+            window_start,
+            window_end,
+        )
+    );
+
+    let withdrawal = UsageRecord {
+        invalidation: Some(Invalidation {
+            target: target.id,
+            reason: ReasonCode::new("late_correction").expect("valid reason code"),
+        }),
+        ..common::entry_over(
+            &meter,
+            tenant,
+            "bind-order-withdrawal",
+            target.value,
+            window_start,
+            window_end,
+        )
+    };
+
+    let results = store
+        .create_batch(vec![target.clone(), withdrawal.clone()])
+        .await
+        .expect("batch ok");
+    assert!(results[0].is_ok() && results[1].is_ok(), "{results:?}");
+
+    // Read every insertable column back by name.
+    let row: Raw = sqlx::query_as(RAW_SELECT_SQL)
+        .bind(target.id)
+        .fetch_one(&h.pool)
+        .await
+        .expect("read the measurement back");
+    assert_eq!(row.id, target.id, "id");
+    assert_eq!(row.tenant_id, tenant, "tenant_id");
+    assert_eq!(row.gts_type_id, common::VCPU_METER, "gts_type_id");
+    assert_eq!(row.value, Decimal::new(12_345, 3), "value");
+    assert_eq!(row.window_start, window_start, "window_start");
+    assert_eq!(row.window_end, window_end, "window_end");
+    assert_eq!(row.resource_id, "resource-id-value", "resource_id");
+    assert_eq!(row.resource_type, "resource-type-value", "resource_type");
+    assert_eq!(
+        row.subject_id.as_deref(),
+        Some("subject-id-value"),
+        "subject_id"
+    );
+    assert_eq!(
+        row.subject_type.as_deref(),
+        Some("subject-type-value"),
+        "subject_type"
+    );
+    assert_eq!(row.idempotency_key, "bind-order-target", "idempotency_key");
+    assert_eq!(row.invalidates, None, "invalidates");
+    assert_eq!(row.reason_code, None, "reason_code");
+    assert_eq!(row.origin, "backfill", "origin");
+    assert!(row.acceptance_sequence > 0, "acceptance_sequence");
+    assert_eq!(
+        row.metadata,
+        serde_json::json!({ "region": "metadata-value" }),
+        "metadata"
+    );
+    assert_eq!(row.entry_type, "record", "entry_type");
+
+    let w: Raw = sqlx::query_as(RAW_SELECT_SQL)
+        .bind(withdrawal.id)
+        .fetch_one(&h.pool)
+        .await
+        .expect("read the withdrawal back");
+    assert_eq!(w.invalidates, Some(target.id), "invalidates");
+    assert_eq!(
+        w.reason_code.as_deref(),
+        Some("late_correction"),
+        "reason_code"
+    );
+    assert_eq!(
+        w.idempotency_key, "bind-order-withdrawal",
+        "idempotency_key"
+    );
+    assert_eq!(w.origin, "live", "origin");
+    assert_eq!(w.subject_id, None, "subject_id");
+    assert_eq!(w.subject_type, None, "subject_type");
+    assert_eq!(
+        w.metadata,
+        JsonValue::Object(serde_json::Map::new()),
+        "metadata"
+    );
+    assert_eq!(w.entry_type, "invalidation", "entry_type");
+    assert!(
+        w.acceptance_sequence > row.acceptance_sequence,
+        "the withdrawal was accepted after its target"
+    );
+
+    // And the same through the single-row insert, whose sixteen binds are a
+    // separate sequence with the same hazard.
+    let single = {
+        let mut r = common::entry_over(
+            &meter,
+            tenant,
+            "bind-order-single",
+            Decimal::new(-42, 1),
+            window_start,
+            window_end,
+        );
+        r.resource_ref =
+            ResourceRef::new("single-resource-id", "single-resource-type").expect("valid resource");
+        r.subject_ref =
+            Some(SubjectRef::new("single-subject-id", Some("single-subject-type")).expect("ok"));
+        r.metadata.insert(
+            MetadataKey::new("zone").expect("valid metadata key"),
+            "single-metadata".to_owned(),
+        );
+        r
+    };
+    store.create(single.clone()).await.expect("single insert");
+    let s: Raw = sqlx::query_as(RAW_SELECT_SQL)
+        .bind(single.id)
+        .fetch_one(&h.pool)
+        .await
+        .expect("read the single-path row back");
+    assert_eq!(s.resource_id, "single-resource-id", "resource_id");
+    assert_eq!(s.resource_type, "single-resource-type", "resource_type");
+    assert_eq!(
+        s.subject_id.as_deref(),
+        Some("single-subject-id"),
+        "subject_id"
+    );
+    assert_eq!(
+        s.subject_type.as_deref(),
+        Some("single-subject-type"),
+        "subject_type"
+    );
+    assert_eq!(s.idempotency_key, "bind-order-single", "idempotency_key");
+    assert_eq!(s.gts_type_id, common::VCPU_METER, "gts_type_id");
+    assert_eq!(s.value, Decimal::new(-42, 1), "value");
+    assert_eq!(s.window_start, window_start, "window_start");
+    assert_eq!(s.window_end, window_end, "window_end");
+    assert_eq!(
+        s.metadata,
+        serde_json::json!({ "zone": "single-metadata" }),
+        "metadata"
+    );
+}
+
+/// The metadata map survives a round trip through `jsonb` on both write paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_round_trips_through_the_model() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x1_ADA7);
+    let scope = common::tenant_scope(tenant);
+
+    let mut rec = common::entry(&meter, tenant, "idem-meta", Decimal::ONE);
+    let mut expected = BTreeMap::new();
+    for (k, v) in [("region", "eu-west-1"), ("tier", "gold")] {
+        let key = MetadataKey::new(k).expect("valid metadata key");
+        rec.metadata.insert(key.clone(), v.to_owned());
+        expected.insert(key, v.to_owned());
     }
+    let id = rec.id;
+    store.create(rec).await.expect("create");
+
+    let got = store.get(id, &scope).await.expect("get");
+    assert_eq!(got.metadata, expected);
 }

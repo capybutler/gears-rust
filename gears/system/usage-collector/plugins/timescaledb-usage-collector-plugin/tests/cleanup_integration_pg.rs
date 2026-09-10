@@ -1,18 +1,26 @@
 #![cfg(feature = "postgres")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-//! TimescaleDB-backed tests for the `usage_records` retention policy
+//! `TimescaleDB`-backed tests for the `usage_records` retention policy:
 //! registration (idempotent re-apply, concurrent-replica serialization) and
 //! end-to-end chunk expiry. Requires Docker.
+//!
+//! **The horizon is measured from `window_end`** — the covered period's end,
+//! which is the hypertable's partition column — and not from when the entry was
+//! ingested. That is what
+//! `cpt-cf-usage-collector-fr-idempotency` requires: the retention horizon has
+//! to be a property of the period an entry covers, because that is what a
+//! consumer reads it back over. Measuring from arrival instead would keep a
+//! decade-old period alive because it was backfilled this morning, and drop a
+//! current period because its late-arriving correction was not.
 
 mod common;
 
+use rust_decimal::Decimal;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::storage::pool::apply_post_migration_setup;
-
-const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
 
 /// Concurrently-initializing replicas must not corrupt the post-migration
 /// setup. The advisory lock in `apply_post_migration_setup` serializes them so
@@ -95,11 +103,17 @@ async fn pg_init_lock_does_not_leak_statement_timeout() {
 }
 
 /// End-to-end retention through the REAL registered policy (not a manual
-/// `drop_chunks`): backdated data is dropped when the policy job is run, while
-/// fresh data survives — proving `apply_retention_policy` wired the right
-/// hypertable + window and that the outbound `gts_id` FK does not block it.
+/// `drop_chunks`): an entry whose **covered period** ended before the horizon is
+/// dropped when the policy job runs, while one whose period ends inside the
+/// window survives.
+///
+/// The two fixtures differ only in their covered period. Both are written now,
+/// through the real ingest path, so `ingested_at` is the same for each and
+/// cannot be what decides which one goes: if the policy measured from arrival,
+/// either both would survive or both would be dropped, and this test would fail
+/// whichever way it went.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_registered_retention_policy_drops_aged_data() {
+async fn the_registered_policy_measures_the_horizon_from_the_covered_period() {
     // The one harness that needs the production 365-day window: the subject here
     // IS retention. `bring_up_real_retention` also unschedules the job so the
     // explicit `CALL run_job` below is the only thing that can drop a chunk.
@@ -107,31 +121,56 @@ async fn pg_registered_retention_policy_drops_aged_data() {
         .await
         .expect("timescaledb container (Docker required)");
     let store = common::record_store(&h.pool);
+    let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0xA6ED);
 
-    // (1) outdated data, 400 days old (> 365d window), via the real ingest path.
-    let mut aged =
-        common::fixture_usage_record(VCPU_GTS, tenant, "aged", rust_decimal::Decimal::ONE, 0xA01);
-    aged.created_at = OffsetDateTime::now_utc() - Duration::days(400);
+    // (1) A period that ended 400 days ago — past the 365-day horizon.
+    let aged_end = OffsetDateTime::now_utc() - Duration::days(400);
+    let aged = common::entry_over(
+        &meter,
+        tenant,
+        "aged",
+        Decimal::ONE,
+        aged_end - Duration::hours(1),
+        aged_end,
+    );
     let aged_id = aged.id;
-    store.create(aged).await.expect("create aged record");
+    store.create(aged).await.expect("create the aged entry");
 
-    // fresh row (now) in a different chunk — must survive.
-    let mut fresh =
-        common::fixture_usage_record(VCPU_GTS, tenant, "fresh", rust_decimal::Decimal::ONE, 0xA02);
-    fresh.created_at = OffsetDateTime::now_utc();
+    // A period ending now, in a different chunk — must survive.
+    let fresh_end = OffsetDateTime::now_utc();
+    let fresh = common::entry_over(
+        &meter,
+        tenant,
+        "fresh",
+        Decimal::ONE,
+        fresh_end - Duration::hours(1),
+        fresh_end,
+    );
     let fresh_id = fresh.id;
-    store.create(fresh).await.expect("create fresh record");
+    store.create(fresh).await.expect("create the fresh entry");
 
-    // (2) verify it exists.
-    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE id = $1")
-        .bind(aged_id)
-        .fetch_one(&h.pool)
-        .await
-        .expect("count before");
-    assert_eq!(before, 1, "aged record must exist before retention runs");
+    // (2) Both are there, and both arrived at the same time — so arrival cannot
+    // be what separates them below.
+    let ingested: Vec<OffsetDateTime> = sqlx::query_scalar(
+        "SELECT ingested_at FROM usage_records WHERE tenant_id = $1 ORDER BY window_end",
+    )
+    .bind(tenant)
+    .fetch_all(&h.pool)
+    .await
+    .expect("read ingested_at");
+    assert_eq!(
+        ingested.len(),
+        2,
+        "both entries exist before retention runs"
+    );
+    assert!(
+        (ingested[1] - ingested[0]).abs() < Duration::minutes(1),
+        "both entries were ingested at effectively the same moment ({ingested:?}), so a \
+         policy measuring from arrival could not drop one and keep the other"
+    );
 
-    // (3) trigger the REAL retention policy now.
+    // (3) Trigger the REAL retention policy now.
     let job_id: i32 = sqlx::query_scalar(
         "SELECT job_id FROM timescaledb_information.jobs \
          WHERE proc_name = 'policy_retention' AND hypertable_name = 'usage_records'",
@@ -143,9 +182,9 @@ async fn pg_registered_retention_policy_drops_aged_data() {
         .bind(job_id)
         .execute(&h.pool)
         .await
-        .expect("running the retention policy must not error (FK must not block it)");
+        .expect("running the retention policy must not error");
 
-    // (4) verify it is gone, and the fresh row survived.
+    // (4) The aged period is gone; the fresh one survived.
     let after_aged: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE id = $1")
         .bind(aged_id)
         .fetch_one(&h.pool)
@@ -158,47 +197,102 @@ async fn pg_registered_retention_policy_drops_aged_data() {
         .expect("count fresh after");
     assert_eq!(
         after_aged, 0,
-        "aged record dropped by the registered retention policy"
+        "an entry whose covered period ended past the horizon is dropped by the registered \
+         policy"
     );
     assert_eq!(
         after_fresh, 1,
-        "fresh record (inside window) survives retention"
+        "an entry whose covered period ends inside the window survives"
     );
 }
 
-/// Guard on the harness itself, and the exact inverse of the test above: the
+/// The complement, and the half that pins *which* bound the horizon is measured
+/// from: an entry whose period **started** before the horizon but **ended**
+/// inside the window survives.
+///
+/// A policy measuring from `window_start` would drop this one. Nothing else in
+/// this suite tells the two bounds apart, because every other fixture has both
+/// bounds on the same side of the horizon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_period_that_began_before_the_horizon_but_ends_inside_it_survives() {
+    let h = common::bring_up_real_retention()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h.pool);
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0xA6EE);
+
+    // A period spanning the horizon: it began 400 days ago and ends today.
+    let now = OffsetDateTime::now_utc();
+    let straddling = common::entry_over(
+        &meter,
+        tenant,
+        "straddling",
+        Decimal::ONE,
+        now - Duration::days(400),
+        now,
+    );
+    let straddling_id = straddling.id;
+    store
+        .create(straddling)
+        .await
+        .expect("create the straddling entry");
+
+    let job_id: i32 = sqlx::query_scalar(
+        "SELECT job_id FROM timescaledb_information.jobs \
+         WHERE proc_name = 'policy_retention' AND hypertable_name = 'usage_records'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .expect("the retention policy must be registered against usage_records");
+    sqlx::query("CALL run_job($1)")
+        .bind(job_id)
+        .execute(&h.pool)
+        .await
+        .expect("running the retention policy must not error");
+
+    let survived: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE id = $1")
+        .bind(straddling_id)
+        .fetch_one(&h.pool)
+        .await
+        .expect("count after");
+    assert_eq!(
+        survived, 1,
+        "the horizon is measured from window_end: a period that began 400 days ago but \
+         ends today is inside the window"
+    );
+}
+
+/// Guard on the harness itself, and the exact inverse of the tests above: the
 /// default [`common::bring_up`] must never register a retention policy that can
-/// reach the deliberately-backdated fixtures the query/ingest suites assert on.
+/// reach the deliberately-backdated fixtures the query and ingest suites assert
+/// on.
 ///
 /// `apply_post_migration_setup` registers a live `policy_retention` job whose
 /// background schedule the image fires ~3s after registration — mid-test. With
-/// the production 365-day default, `fixture_usage_record`'s 2023-11-14 instant is
-/// years past the cutoff and its whole 7-day chunk is drop-eligible the moment it
-/// is created, so a stalled test body loses rows it already inserted (observed in
-/// CI as an aggregation bucket short by one record).
+/// the production 365-day default, `common::entry`'s covered period
+/// (`2023-11-14`) is years past the cutoff and its whole 7-day chunk is
+/// drop-eligible the moment it is written, so a stalled test body loses rows it
+/// already inserted (observed in CI as an aggregation bucket short by one).
 ///
 /// Firing the policy explicitly asserts the property directly instead of waiting
 /// on the scheduler, so this test is fast and deterministic rather than a race
 /// that usually happens not to fire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_default_harness_retention_cannot_drop_backdated_fixtures() {
+async fn the_default_harness_retention_cannot_drop_a_backdated_fixture() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
     let store = common::record_store(&h.pool);
+    let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0xBAD_11E);
 
-    // A stock fixture, at the stock backdated `created_at`, via the real ingest path.
-    let rec = common::fixture_usage_record(
-        VCPU_GTS,
-        tenant,
-        "backdated",
-        rust_decimal::Decimal::ONE,
-        0xB01,
-    );
+    // A stock fixture, at the stock backdated covered period, via the real
+    // ingest path.
+    let rec = common::entry(&meter, tenant, "backdated", Decimal::ONE);
     let rec_id = rec.id;
-    let created_at = rec.created_at;
-    store.create(rec).await.expect("create backdated record");
+    let window_end = rec.window_end;
+    store.create(rec).await.expect("create the backdated entry");
 
     // Fire the harness's own registered policy — whatever window it was given.
     let job_id: i32 = sqlx::query_scalar(
@@ -222,8 +316,8 @@ async fn pg_default_harness_retention_cannot_drop_backdated_fixtures() {
     assert_eq!(
         survived, 1,
         "the default harness registered a retention policy that can delete a stock \
-         fixture row (created_at = {created_at}); every test inserting fixtures is \
-         then racing the background scheduler. bring_up() must pass a window no \
-         fixture can fall outside of — see common::NO_DROP_RETENTION_SECS"
+         fixture row (window_end = {window_end}); every test inserting fixtures is then \
+         racing the background scheduler. bring_up() must pass a window no fixture can \
+         fall outside of - see common::NO_DROP_RETENTION_SECS"
     );
 }

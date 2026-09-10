@@ -15,8 +15,12 @@
 //! `resource_type` are both `text` and both `NOT NULL` — and Postgres accepts
 //! the row, `InsertColumns::build`'s field-by-field test still passes, and this
 //! parse says nothing, because every constant it checks is still correct.
-//! Closing it needs a live backend writing a row and reading it back, which is
-//! Task 15's. Do not read the list above as covering it.
+//! Closing it needs a live backend writing a row and reading it back, and that
+//! now exists:
+//! `records_ingest_integration_pg::a_row_written_through_the_batch_insert_reads_back_column_for_column`
+//! writes one row through each insert path and reads every column back by name.
+//! Do not read the list above as covering it — that test does, and this parse
+//! still does not.
 //!
 //! That makes this parser's quality the whole guarantee, which is why it
 //! recognizes what a column is **not** rather than allowlisting type names —

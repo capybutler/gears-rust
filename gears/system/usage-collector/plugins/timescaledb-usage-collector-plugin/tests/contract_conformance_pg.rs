@@ -20,10 +20,8 @@
 //!   all three. What covers them here is `record_store_tests`'
 //!   cursor-fingerprint pair over `build_list_page`
 //!   (`a_page_minted_without_a_fingerprint_is_refused_rather_than_shipped`,
-//!   `a_cursor_is_refused_when_the_query_carries_no_fingerprint`) and, once
-//!   Task 15 rewrites them, the other pg suites — which today do not
-//!   compile, so they cover nothing yet. Not `keyset`, which carries no
-//!   tests of its own.
+//!   `a_cursor_is_refused_when_the_query_carries_no_fingerprint`) and the
+//!   other pg suites. Not `keyset`, which carries no tests of its own.
 //!
 //! See `contract.rs`'s module header and DIVERGENCES section F.
 

@@ -12,14 +12,23 @@
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 //! Shared `TimescaleDB` testcontainer harness. Requires Docker.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
+use rust_decimal::Decimal;
 use sqlx::PgPool;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use time::{Duration, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
+use toolkit_odata::ast;
+use uuid::Uuid;
+
+use usage_collector_sdk::{
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, TimeRange,
+    UsageRecord, derive_usage_record_id,
+};
 
 use timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig;
 use timescaledb_usage_collector_plugin::domain::adapter::StorageAdapter;
@@ -119,15 +128,53 @@ pub async fn bring_up_with(
     // in sync with `TimescaleDbSidecar.IMAGE` in `testing/e2e/lib/sidecars.py`.
     // A skew means these migrations are validated against a different
     // PostgreSQL major than E2E runs.
-    let image = test_containers::timescaledb()
-        .with_wait_for(WaitFor::message_on_stderr(
-            "database system is ready to accept connections",
-        ))
-        .with_env_var("POSTGRES_USER", "user")
-        .with_env_var("POSTGRES_PASSWORD", "pass")
-        .with_env_var("POSTGRES_DB", "app");
-    let container = image.start().await?;
-    let port = container.get_host_port_ipv4(5432).await?;
+    // A closure, not a value: `ContainerRequest` is consumed by `start()` and is
+    // not `Clone`, so the retry below needs to build a fresh one per attempt.
+    let image = || {
+        test_containers::timescaledb()
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_USER", "user")
+            .with_env_var("POSTGRES_PASSWORD", "pass")
+            .with_env_var("POSTGRES_DB", "app")
+    };
+    // Start, and retry a container that comes up without a published port.
+    //
+    // Measured on this workspace: a full `--features postgres` run starts ~50
+    // containers, and roughly one in thirty comes back from `start()` running
+    // but with no host binding for 5432 - `get_host_port_ipv4` then answers
+    // `container '<id>' does not expose port 5432/tcp`. It is the Docker
+    // daemon's port publication racing the container's own start, not anything
+    // about this image: the same image started by hand, six at a time, publishes
+    // every time.
+    //
+    // Retried rather than tolerated, because a harness failure is not a test
+    // result and nine of them in one run is nine tests whose questions went
+    // unasked. Bounded at three, and the last attempt's error is returned
+    // unchanged - so an image that genuinely does not expose 5432 still fails
+    // with the message that says so, after three seconds rather than
+    // immediately.
+    let mut started = None;
+    for attempt in 1..=3u32 {
+        let container = image().start().await?;
+        match container.get_host_port_ipv4(5432).await {
+            Ok(port) => {
+                started = Some((container, port));
+                break;
+            }
+            Err(err) if attempt == 3 => return Err(err.into()),
+            Err(err) => {
+                eprintln!(
+                    "timescaledb container came up without a published port \
+                     (attempt {attempt}/3): {err}; starting another"
+                );
+                drop(container);
+            }
+        }
+    }
+    let (container, port) =
+        started.ok_or_else(|| anyhow::anyhow!("container start loop ended without a container"))?;
 
     // The test container serves no TLS; `sslmode=disable` is the deliberate
     // opt-out that `build_pool` honors (production DSNs without an explicit
@@ -152,7 +199,7 @@ pub async fn bring_up_with(
             }
             Err(e) => {
                 last = Some(e);
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
     }
@@ -216,4 +263,201 @@ pub async fn start_backend() -> (TsHarness, StorageAdapter) {
         .expect("contract suite needs a migrated TimescaleDB container");
     let store: Arc<dyn RecordStore> = Arc::new(record_store(&harness.pool));
     (harness, StorageAdapter::new(store))
+}
+
+// ---------------------------------------------------------------------------
+// Ledger-entry fixtures
+//
+// Authored here rather than in each suite because four of the five share them,
+// which is the same sharing the file-header `dead_code` allowance is earned by.
+// What Task 14 declined to do was *port* the retired builders; these are built
+// against the current `UsageRecord` and every one of them is run.
+//
+// The one decision a fixture cannot avoid is the covered period, because both
+// bounds are inputs to the derived identity
+// (`cpt-cf-usage-collector-adr-record-identity-derivation`). It is taken once,
+// here, as [`FIXTURE_WINDOW_START`] / [`FIXTURE_WINDOW_END`], so a suite that
+// needs a *different* period says so at the call site instead of every suite
+// picking one.
+// ---------------------------------------------------------------------------
+
+/// A valid meter type id: the reserved base plus one derivation segment,
+/// `~`-terminated, which is what `MeterTypeId::new` validates.
+pub const VCPU_METER: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~";
+
+/// A second meter, for the assertions whose subject is that a scope is per
+/// `(tenant_id, gts_type_id)` rather than per tenant.
+pub const GB_METER: &str = "gts.cf.core.uc.usage_record.v1~cf.storage._.gb_hours.v1~";
+
+/// Inclusive start of the covered period every fixture carries by default:
+/// `2023-11-14T22:13:20Z`.
+pub const FIXTURE_WINDOW_START_UNIX: i64 = 1_700_000_000;
+
+/// Exclusive end of that period, one hour later. Distinct from the start, so a
+/// fixture is a period rather than a point event — a point event is a case the
+/// suites ask for explicitly (`window_start == window_end`) rather than the
+/// shape everything else accidentally inherits.
+pub const FIXTURE_WINDOW_END_UNIX: i64 = 1_700_003_600;
+
+/// The parsed [`FIXTURE_WINDOW_START_UNIX`].
+///
+/// # Panics
+///
+/// Never: the constant is a valid Unix instant.
+#[must_use]
+pub fn fixture_window_start() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(FIXTURE_WINDOW_START_UNIX).expect("valid instant")
+}
+
+/// The parsed [`FIXTURE_WINDOW_END_UNIX`].
+///
+/// # Panics
+///
+/// Never: the constant is a valid Unix instant.
+#[must_use]
+pub fn fixture_window_end() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(FIXTURE_WINDOW_END_UNIX).expect("valid instant")
+}
+
+/// A meter id from its wire string.
+///
+/// # Panics
+///
+/// If `id` is not a valid meter type id; every caller here passes a constant.
+#[must_use]
+pub fn meter(id: &str) -> MeterTypeId {
+    MeterTypeId::new(id).expect("valid meter type id")
+}
+
+/// A read range that contains [`fixture_window_end`] under the selection rule
+/// `from <= window_end < to`, and nothing else in particular.
+///
+/// # Panics
+///
+/// Never: the bounds are ordered.
+#[must_use]
+pub fn fixture_range() -> TimeRange {
+    TimeRange::new(
+        fixture_window_start(),
+        fixture_window_end() + Duration::seconds(1),
+    )
+    .expect("ordered range")
+}
+
+/// An ordinary measurement over an explicit covered period, with the derived
+/// identity the Ingestion Gateway would stamp on it.
+///
+/// The `id` is [`derive_usage_record_id`] over the same five inputs the ledger's
+/// `usage_records_dedup_uniq` is built over — this is the gateway's job, not the
+/// plugin's, so deriving it here is standing in for the gateway rather than
+/// asking the code under test to check itself.
+///
+/// Every field that is **not** one of those five (value, attribution, metadata,
+/// origin, the invalidation pair) can be overwritten with a struct update
+/// afterwards without invalidating the identity. The five that are appear in
+/// this signature for exactly that reason.
+///
+/// # Panics
+///
+/// If `idem` is not a valid idempotency key, or the fixed resource reference
+/// fails to validate; both are constants here.
+#[must_use]
+pub fn entry_over(
+    meter_id: &MeterTypeId,
+    tenant: Uuid,
+    idem: &str,
+    value: Decimal,
+    window_start: OffsetDateTime,
+    window_end: OffsetDateTime,
+) -> UsageRecord {
+    let idempotency_key = IdempotencyKey::new(idem).expect("valid idempotency key");
+    UsageRecord {
+        id: derive_usage_record_id(tenant, meter_id, &idempotency_key, window_start, window_end),
+        gts_type_id: meter_id.clone(),
+        tenant_id: tenant,
+        resource_ref: ResourceRef::new("res-1", "compute.vm").expect("valid resource ref"),
+        subject_ref: None,
+        metadata: BTreeMap::new(),
+        value,
+        idempotency_key,
+        origin: RecordOrigin::Live,
+        invalidation: None,
+        window_start,
+        window_end,
+    }
+}
+
+/// [`entry_over`] at the default covered period.
+#[must_use]
+pub fn entry(meter_id: &MeterTypeId, tenant: Uuid, idem: &str, value: Decimal) -> UsageRecord {
+    entry_over(
+        meter_id,
+        tenant,
+        idem,
+        value,
+        fixture_window_start(),
+        fixture_window_end(),
+    )
+}
+
+/// A faithful withdrawal of `target`: a copy of the entry it withdraws, plus the
+/// invalidation pair, under its own idempotency key.
+///
+/// "A faithful copy of the entry it withdraws" is the schema's own phrase, and
+/// every field copied below is copied for a reason rather than for tidiness:
+///
+/// * **The quantity** — an invalidation echoes what it withdraws rather than
+///   negating it (`cpt-cf-usage-collector-adr-append-only-invalidation`), which
+///   is why netting the two would now double-count.
+/// * **The covered period** — `usage_records_one_invalidation_uniq` is over
+///   `(invalidates, window_end)`, so a withdrawal carrying a different period is
+///   outside the index's reach and the at-most-one guarantee does not hold for
+///   it.
+/// * **The attribution, metadata and origin** — so the only fields separating
+///   the pair are `invalidates`, `reason_code` and the idempotency key. A
+///   withdrawal that quietly differed in, say, `resource_type` would let a
+///   `$filter` test look like it discriminated when it had only found an
+///   asymmetry the fixture put there.
+///
+/// The idempotency key is the one input to the derivation the two do not share,
+/// and is therefore the whole reason their identifiers differ.
+///
+/// # Panics
+///
+/// If `idem` or the fixed reason code fails to validate.
+#[must_use]
+pub fn withdrawal_of(target: &UsageRecord, idem: &str) -> UsageRecord {
+    UsageRecord {
+        invalidation: Some(Invalidation {
+            target: target.id,
+            reason: ReasonCode::new("duplicate_submission").expect("valid reason code"),
+        }),
+        resource_ref: target.resource_ref.clone(),
+        subject_ref: target.subject_ref.clone(),
+        metadata: target.metadata.clone(),
+        origin: target.origin,
+        ..entry_over(
+            &target.gts_type_id,
+            target.tenant_id,
+            idem,
+            target.value,
+            target.window_start,
+            target.window_end,
+        )
+    }
+}
+
+/// The compiled PDP scope a read is intersected with: every entry of `tenant`.
+///
+/// `get` takes the scope as its whole filter, so a test that wants a point
+/// lookup to succeed has to hand it one the row satisfies. This is the narrowest
+/// honest one — a real grant is a disjunction over the tenants a principal
+/// holds, and a single-tenant grant is one arm of it.
+#[must_use]
+pub fn tenant_scope(tenant: Uuid) -> ast::Expr {
+    ast::Expr::Compare(
+        Box::new(ast::Expr::Identifier("tenant_id".to_owned())),
+        ast::CompareOperator::Eq,
+        Box::new(ast::Expr::Value(ast::Value::Uuid(tenant))),
+    )
 }
