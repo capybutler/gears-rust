@@ -4725,17 +4725,33 @@ postgres`; with it, these files carry the errors that are yours.
 **Re-measured at Task 14**, after `tests/common/mod.rs` and
 `tests/contract_conformance_pg.rs` were made to compile. `cargo check -p
 cf-gears-timescaledb-usage-collector-plugin --features postgres --all-targets`
-now reports 91 error lines, 87 of them attributed to four files — the count
-rose against Task 12's 61 because the five targets no longer abort early on
-`common/mod.rs`, so each now reports its own errors in full rather than none:
+now attributes **87** errors to four files, against **61** at `5fc029a75`.
 
-| file | errors |
-| --- | --- |
-| `records_query_integration_pg.rs` | 42 |
-| `records_ingest_integration_pg.rs` | 34 |
-| `id_uniqueness_integration_pg.rs` | 8 |
-| `cleanup_integration_pg.rs` | 3 |
-| `schema_integration_pg.rs` | **0 — it already compiles** |
+**The count rose because this task deleted the four fixture builders**: 50 of
+the 87 are new `error[E0425]: cannot find function … in module common` at
+their call sites (`records_ingest` 26, `records_query` 19, `cleanup` 3,
+`id_uniqueness` 2), while the pre-existing model-drift errors **fell from 55
+to 37**. At base no target aborted early — each already reported its own
+errors alongside `common/mod.rs`'s 6, which is what rustc's base summaries
+say: `due to 32 / 20 / 18 / 9 / 6 previous errors` for `records_query`,
+`records_ingest`, `id_uniqueness`, `cleanup` and `schema`, i.e. 26+6, 14+6,
+12+6, 3+6 and 0+6.
+
+| file | base | HEAD | of which new `E0425` |
+| --- | --- | --- | --- |
+| `records_query_integration_pg.rs` | 26 | 42 | 19 |
+| `records_ingest_integration_pg.rs` | 14 | 34 | 26 |
+| `id_uniqueness_integration_pg.rs` | 12 | **8** | 2 |
+| `cleanup_integration_pg.rs` | 3 | 3 | 3 |
+| `schema_integration_pg.rs` | 0 | **0 — it already compiles** | — |
+| `common/mod.rs` | 6 | 0 | — |
+
+So **the number to plan against is 37, not 87**: 57% of the total is
+call-site breakage this task created, and it clears the moment the fixtures
+are authored. And there are no fixtures to *port* — Task 14 deleted them, so
+Step 1 onwards authors them against the current model. `id_uniqueness` going
+**12 → 8** is the check on any other reading: a decrease is not something a
+"targets stopped aborting early" story can produce.
 
 `schema_integration_pg.rs` compiling is not the same as its assertions being
 right; Step 2 still owns it, and a file that builds against the old schema's
@@ -4811,7 +4827,7 @@ Task 14's `tests/contract_conformance_pg.rs` does `mod common;`, so it could
 not compile until that file did — and each file in `tests/` is its own crate,
 so a broken `records_ingest_integration_pg.rs` does not block it. Task 14
 therefore repaired `common/mod.rs` alone, to the minimum, and the file is now
-**255 lines** (not the 346 in the list above, which was already stale at 318):
+**256 lines** (not the 346 in the list above, which was already stale at 318):
 
 - **Changed.** Dropped the `usage_collector_sdk::{IdempotencyKey, ResourceRef,
   SubjectRef, UsageRecord, UsageTypeGtsId}` import and `time::OffsetDateTime`;

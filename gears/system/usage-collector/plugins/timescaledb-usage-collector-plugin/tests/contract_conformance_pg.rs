@@ -14,8 +14,11 @@
 //! * Nothing in the suite exercises the SPI's keyset obligations: the
 //!   reference backend it was validated against serves the canonical order,
 //!   ignores `query.order` and mints no `next_cursor`, and this plugin owes
-//!   all three. `keyset`'s cursor-fingerprint unit tests and the other pg
-//!   suites are what cover them here.
+//!   all three. What covers them here is `record_store_tests`'
+//!   cursor-fingerprint pair over `build_list_page`
+//!   (`a_page_minted_without_a_fingerprint_is_refused_rather_than_shipped`,
+//!   `a_cursor_is_refused_when_the_query_carries_no_fingerprint`) and the
+//!   other pg suites. Not `keyset`, which carries no tests of its own.
 //!
 //! See `contract.rs`'s module header and DIVERGENCES section F.
 
