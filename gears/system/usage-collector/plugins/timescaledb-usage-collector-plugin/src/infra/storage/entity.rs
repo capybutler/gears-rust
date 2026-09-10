@@ -51,11 +51,11 @@ pub struct UsageRecordRow {
     /// `window_start` — inclusive start of the covered period.
     pub window_start: OffsetDateTime,
     /// `window_end` — exclusive end of the covered period, and the hypertable
-    /// time dimension. A read that carries a `time_range` selects on this
-    /// bound alone, `from <= window_end < to`
-    /// (`cpt-cf-usage-collector-adr-window-end-selection`), and no selection
-    /// predicate reads `window_start`. `get_usage_record` carries no range
-    /// and looks up by `id` instead.
+    /// time dimension. The time-range predicate reads this bound alone,
+    /// `from <= window_end < to` and never overlap or containment
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`);
+    /// `get_usage_record` carries no range at all and looks up by `id`
+    /// instead.
     pub window_end: OffsetDateTime,
     /// `resource_id` — resource attribution leaf.
     pub resource_id: String,
