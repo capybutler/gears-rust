@@ -1979,7 +1979,11 @@ and calls the SDK predicate through its own wrapper. Write it against
 - [ ] **Step 4: Run and verify**
 
 ~~`cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin`~~ cannot
-run: the crate is not a workspace member and does not compile until Task 13.
+run: the crate does not compile until Task 13, so no test binary links. **The
+crate *is* a workspace member** — Task 0 added the `members` line in
+`618e5b67f`, and `-p` resolves — so `cargo check -p … --lib` works and is the
+cheap way to read the error count. It is only `nextest` that is blocked, and by
+the compile errors rather than by membership.
 Use the `translate-harness` from Task 6 (it `#[path]`-includes `keyset.rs` and
 `translate_tests.rs`), unfiltered so the count is not a lower bound:
 
@@ -3072,6 +3076,49 @@ WHERE r.gts_type_id = $1
 The table **must** be aliased `r` — `withdrawal_exclusion_clause` binds to it.
 Grep the assembled SQL in a test rather than assuming.
 
+- [ ] **Step 2b: Three things Task 8 hands to this task**
+
+**1. `agg_select_expr` now returns `Option<&'static str>`, and `Latest` is the
+`None`.** It is not an aggregate function but an ordered pick, rendered by
+`latest_select_expr()`. The `None` means "rendered elsewhere", never
+"unsupported fold" — a caller that treats it as the latter serves no `LATEST`
+meter at all. This arrives as a compile error at `record_store.rs:1253`
+(`expected String, found Option<&str>`), so it cannot be missed, only
+mis-resolved. Branch:
+
+```rust
+let fold_expr = agg_select_expr(fold)
+    .map(str::to_owned)
+    .unwrap_or_else(|| latest_select_expr().to_owned());
+```
+
+**2. The absent-dimension rule is settled: drop the row — and `Metadata` is the
+dimension that does not yet obey it.** `aggregate` today pushes
+`subject_id IS NOT NULL` / `subject_type IS NOT NULL` before rendering a subject
+dimension, and pushes nothing for `Metadata`, so a row missing the grouped key
+lands in a `NULL` bucket where `InMemoryReferencePlugin` drops it. **The spec
+owner has decided in favour of dropping** (see Task 18), matching the reference
+backend and the SDK's own docs at `models.rs:1587-1592`. So emit a presence
+guard for the metadata dimension alongside the two subject ones —
+`r.metadata ? $N` against the same bound key, or an equivalent
+`r.metadata ->> $N IS NOT NULL` — so all six dimensions drop absent-dimension
+rows consistently rather than five doing so by accident. Note in a comment that
+the consequence is deliberate: **grouped buckets need not sum to the ungrouped
+total.** That is already true for subject today; this makes it uniform.
+
+The guard cannot live in `dimension_select_expr` — a `GROUP BY` ordinal carries
+no `WHERE` predicate — which is why it is yours and not Task 8's.
+
+**3. `LATEST` materializes each group; record it, do not fix it.**
+`latest_select_expr()` is `(ARRAY_AGG(r.value ORDER BY …))[1]`, so Postgres
+builds one array holding **every selected value in the group** before taking the
+head. `aggregate_limit_clause` bounds the number of distinct *groups*, not the
+rows per group, and the row scan is bounded only by the gateway's time window.
+`MIN`/`MAX` have no such cost. The expression is correct and was prescribed
+verbatim, but this module is otherwise fastidious about unbounded memory (the
+`LIMIT` exists for exactly that reason), so the asymmetry belongs in this task's
+write-up and, if it survives review, in `DIVERGENCES.md`.
+
 - [ ] **Step 3: Get the no-grouping case right**
 
 The noop plugin's doc records the trap precisely: an empty `buckets` vector is
@@ -3511,19 +3558,32 @@ Measured: 9 files, `.github/workflows/ci.yml` (3 lines),
 
 - [ ] **Step 1: Confirm the workspace member line, and add the dependency alias**
 
-**The `members` line was already added in Task 0** — it had to be, because the
-crate cannot be compiled in any form without it. Confirm it is still there:
+**This step is already done, and the open question in it is answered.** Task 8
+checked both halves so this task's implementer does not re-litigate a settled
+commit.
+
+- **The `members` line is present**, at `Cargo.toml:142`, added by Task 0 in
+  `618e5b67f` — it had to be, because the crate cannot be compiled in any form
+  without it. `cargo metadata` resolves the package and `cargo check -p
+  cf-gears-timescaledb-usage-collector-plugin --lib` works.
+- **No workspace dependency alias was removed.** `git show 8225d8ebd -- Cargo.toml`
+  is a **single hunk** containing only the `members` line, so there is nothing
+  at the measured lines 350/365 to restore.
+- **`Cargo.lock` is done too.** `8225d8ebd` deleted 37 lines; `618e5b67f`
+  restored 36, and cargo reconciles the remainder on the next build.
+
+So Steps 2, 3 and 4 are the whole of the remaining work: the Makefile target
+(12 lines), the example-server registration (`Cargo.toml` 4 lines,
+`registered_gears.rs` 3), and the e2e suite config (16 lines). Confirm rather
+than assume:
 
 ```bash
-grep -n 'timescaledb-usage-collector-plugin' Cargo.toml
+grep -n 'timescaledb\|test-usage-collector-pg' Makefile
+grep -rn 'timescaledb' apps/cf-gears-example-server/
+grep -n 'timescaledb' testing/e2e/suites/usage_collector/config.yaml
 ```
 
-Then check whether `8225d8ebd` also removed a workspace dependency alias
-alongside the other two (lines 350 and 365 as measured), and restore it if so:
-
-```bash
-git show 8225d8ebd -- Cargo.toml
-```
+All three answered empty at Task 8's close.
 
 - [ ] **Step 2: Restore the Makefile target**
 
@@ -3753,9 +3813,35 @@ Changes owed:
   uniformly stale one. Add a paragraph to entry 14 carrying the count and the
   line list, so the register stops implying the file has two stale paragraphs.
 - **§A is discharged** by Steps 2-3.
-- **§G may need a new note** if Task 8 Step 6 found the absent-dimension
-  disagreement. This backend collects NULL groups where the reference backend
-  drops them, and §G says a spec owner decides. Record it there.
+- **§G is resolved by owner decision: drop the row.** Record it as resolved,
+  not as an open divergence. Task 8 Step 6 reframed the question and it went to
+  the owner in that form; the answer matches `InMemoryReferencePlugin` and the
+  published wire shape, where `AggregationBucket.key` types every item as a
+  non-nullable string with no null spelling available. Three things §G's
+  current text gets wrong or omits, all owed to it:
+  - **The live case was metadata, not subject.** §G is written about
+    `GROUP BY subject_id`, but `record_store.rs`'s `aggregate` already pushes
+    `subject_id IS NOT NULL` / `subject_type IS NOT NULL`, so the two backends
+    agreed on subject all along. It pushes nothing for `Metadata`, and
+    `InMemoryReferencePlugin`'s `bucket_key` returns `None` for an absent
+    metadata key too (`contract/reference.rs:801`) — so the metadata dimension
+    was the one place they actually differed. Task 12 closes it with a presence
+    guard.
+  - **"DESIGN says nothing about the case" understates what was already
+    written.** The SDK documents the drop answer on
+    `AggregationDimension::SubjectId` and `SubjectType` at `models.rs:1587-1592`
+    — "rows without a subject are excluded from the grouping". DESIGN is silent;
+    the SDK was not, for four of the six dimensions.
+  - **State the consequence plainly: grouped buckets need not sum to the
+    ungrouped total.** That was already true for subject; the decision makes it
+    uniform rather than accidental, and a consumer reconciling a grouped
+    aggregate against an ungrouped one needs to know it is by design.
+- **Possibly a twentieth entry from Task 8:** `latest_select_expr`'s
+  `(ARRAY_AGG(…))[1]` materializes every value in a group before taking the
+  head, while `aggregate_limit_clause` bounds only the number of groups and the
+  row scan is bounded only by the gateway's time window. `MIN`/`MAX` carry no
+  such cost. Task 12 was asked to carry it in its write-up; decide here whether
+  it earns an entry.
 - **Any twentieth entry** this port turned up.
 
 - [ ] **Step 6: Full verification bar, one last time**
