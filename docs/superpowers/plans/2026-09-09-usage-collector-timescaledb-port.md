@@ -33,6 +33,20 @@ optional and they are not restated per task.
   as the mutated file — verified to force the rebuild even when the mutated
   file's mtime is stale — and **treat a missing `Compiling` line as a failed
   run, not as a result.**
+- **Anchor a mutation to a unique site, or count the occurrences first.** Same
+  family as the rule above, and it cost a wrong conclusion at Task 13. A
+  mutation applied with `str.replace(old, new, 1)` — or `sed` without an address
+  — lands on the *first* match, and test files repeat their setup lines: two
+  mutations "survived" there, both having edited a different test function than
+  the one being measured, and together they produced a confident, false,
+  **"Measured:"** claim that went into the source. **A mutation applied to the
+  wrong site is a false survivor in exactly the way an mtime-stale rebuild is,
+  and argues in the same direction — for deleting a working check.** Count the
+  occurrences before mutating (`grep -c`, remembering it exits non-zero on 0),
+  target the last one with `rindex` when the site you want is the newest, or
+  anchor on surrounding context that is unique. And when a mutation survives,
+  **prove it reached the site**: print the diff, or assert the mutated text is
+  the one you meant.
 - **Do not run a workspace-wide test build.** `target/` reaches ~110 GB and
   fills the disk. Scope every run with `-p`. **This bites harder now**: Task 16
   adds this crate to the workspace, so `--workspace` grows.
@@ -4110,6 +4124,7 @@ naming both entries.
 | `uc_timescaledb_insert_duration_seconds` → `…_insert_latency_ms`, both sides | same (bucket-layout rule; a name-based guard misses this) |
 | drop any single driver call | same (set equality) |
 | re-introduce a label spelled anything at all | `…separate_instruments…` (zero-attribute assert) |
+| `uc_timescaledb_batch_rows` → `…_batch_seconds` | `…obeys_the_naming_convention` (the direction a one-way rule missed) |
 | `metadata jsonb` → `json` in the migration | `each_inserted_column_is_unnested_as_…` |
 
 **The description test asserts contiguous phrases, not loose substrings.** An
@@ -4128,19 +4143,28 @@ It asserts **off each instrument's kind, over the exact exported set**:
 - `_total` on everything the SDK exports as a `Sum` — all **11** counters, where
   the first version enforced it through five hardcoded names, which is the
   hand-kept list its own rustdoc claimed to avoid.
-- `_seconds` on every histogram **built with `DURATION_BOUNDARIES_SECS`**, read
-  back off the exported bucket bounds. Not on every histogram whose *name*
-  contains "duration": that guard only inspects names that already announce
-  themselves, so `uc_timescaledb_insert_latency_ms` sails through it.
-  `uc_timescaledb_batch_rows` is the f64 histogram correctly not in seconds, and
+- The `_seconds` suffix and the **`DURATION_BOUNDARIES_SECS` bucket layout**
+  agree **in both directions**, the layout read back off the exported bounds.
+  Not "every histogram whose *name* contains duration": that guard only inspects
+  names that already announce themselves, so `uc_timescaledb_insert_latency_ms`
+  sails through it. Biconditional rather than one-way, so a non-duration
+  histogram *gaining* the suffix reds too — `uc_timescaledb_batch_rows` renamed
+  to `…_batch_seconds` is the mutation, and the one-way form passed it.
+  `batch_rows` is the f64 histogram correctly not in seconds, and
   `BATCH_ROW_BOUNDARIES` is what says so. The histogram arm also asserts it got
   a data point, so the bounds check cannot pass vacuously.
 - The exported set **equals** `Metrics::declared_instrument_names()`, which
-  destructures `Self` with **no `..`** — so adding a field is a compile error
-  until it is listed. A floor (`>= 16`) was the first version and it was wrong
-  twice over: it cannot notice an instrument disappearing, and it hid an
-  untested belief that the two observable pool gauges are collected by their
-  callbacks on this path. **They are: the set is exactly 18.**
+  destructures `Self` with **no `..`**. Be exact about what that buys: the
+  compiler refuses to let anyone *reach* that list without accounting for a new
+  field (`E0027`), but it does not force the name into the `vec!` beside it —
+  `foo: _`, no string, never driven, and the run is green. Two omissions in one
+  edit, at the one place whose job is to list them, so the risk is low and the
+  mechanism is still far stronger than a hand-kept array; it is not a
+  guarantee, and the rustdoc no longer says it is. A floor (`>= 16`) was the
+  first version and it was wrong twice over: it cannot notice an instrument
+  disappearing, and it hid an untested belief that the two observable pool
+  gauges are collected by their callbacks on this path. **They are: the set is
+  exactly 18.**
 
 **A measurement inside this task came out backwards and was caught by re-running
 it correctly — the mechanism is worth keeping.** Two mutations "survived",
@@ -4152,8 +4176,14 @@ mutation applied to the wrong site is a false survivor exactly as an mtime-stale
 rebuild is — and it argues, in the same direction, for deleting a working check.
 Re-run against the right site, every driver call is load-bearing: **an
 instrument the SDK has built but never recorded on is not exported at all**,
-counter, histogram and gauge alike. **Anchor a mutation to a unique site, or
-count the occurrences first.**
+counter, histogram and gauge alike — independently confirmed against
+`opentelemetry_sdk-0.32.1/src/metrics/pipeline.rs:138-165`, where an aggregation
+returning `len == 0` hits `_ => continue` and is never pushed.
+
+**The rule this produced is in "Ground rules — read before Task 1", beside the
+mtime rule it is a sibling of** — not here, because Tasks 14-18 all write and
+mutate tests and none of them reads a closed task's step. This paragraph is the
+narrative; the rule is the artifact.
 
 **Left for Task 15, and routed into Task 15's own section rather than only
 recorded here.** Both increments sit on paths that need a live backend, so this

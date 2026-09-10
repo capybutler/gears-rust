@@ -406,26 +406,29 @@ async fn each_rejection_counters_description_carries_its_own_unit() {
 /// **Kind, not spelling — including which histograms are durations.** `_total`
 /// is asserted of everything the SDK exports as a `Sum`, so all eleven counters
 /// are covered rather than the five a hardcoded list of names happened to hold.
-/// `_seconds` is asserted of every histogram **built with
-/// `DURATION_BOUNDARIES_SECS`**, read back off the exported bucket bounds — not
-/// of every histogram whose name contains "duration", which would let
+/// The `_seconds` suffix and the **`DURATION_BOUNDARIES_SECS` bucket layout**
+/// must agree **in both directions**, the layout read back off the exported
+/// bounds. Not "every histogram whose name contains duration", which would let
 /// `uc_timescaledb_insert_latency_ms` through for the same reason a comment
 /// lets a rename through: it only inspects names that already announce
-/// themselves. `uc_timescaledb_batch_rows` is the f64 histogram correctly *not*
-/// in seconds, and `BATCH_ROW_BOUNDARIES` is what says so.
+/// themselves. And biconditional rather than one-way, so a non-duration
+/// histogram *gaining* the suffix — `uc_timescaledb_batch_rows` renamed to
+/// `…_batch_seconds` — reds too. `batch_rows` is the f64 histogram correctly
+/// *not* in seconds, and `BATCH_ROW_BOUNDARIES` is what says so.
 ///
 /// **The exported set must equal [`Metrics::declared_instrument_names`]**, not
 /// merely reach some floor. A floor cannot notice an instrument disappearing,
 /// and it hid an untested belief: that the two observable pool gauges are
 /// collected by their callbacks on this path. Equality tests that belief
-/// instead of assuming it — it holds, at 18 — and the declared list cannot be
-/// short, because its destructure has no `..`.
+/// instead of assuming it — it holds, at 18.
 ///
-/// So a new instrument is covered the day it is added, and by two mechanisms
-/// that catch different halves: the compiler refuses
-/// `declared_instrument_names` until it is listed there, and this equality
-/// stays red until it is driven in the block below. Neither is a list anyone
-/// can quietly leave short.
+/// Two mechanisms catch different halves of a new instrument, and neither is
+/// quite a guarantee on its own: `declared_instrument_names`' destructure has
+/// no `..`, so the compiler will not let anyone *reach* that list without being
+/// shown the new field, and this equality stays red until the instrument is
+/// both named there and driven in the block below. Adding `foo: _` to silence
+/// `E0027`, omitting the string, and never driving it would still be green —
+/// two omissions in one edit, while looking at the list.
 #[tokio::test]
 async fn every_exported_instrument_obeys_the_naming_convention() {
     let (provider, exporter) = local_provider();
@@ -518,10 +521,13 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
                         let is_duration = h
                             .data_points()
                             .any(|dp| dp.bounds().eq(DURATION_BOUNDARIES_SECS.iter().copied()));
-                        assert!(
-                            !is_duration || name.ends_with("_seconds"),
-                            "{name} was built with the duration bucket layout and \
-                             must end in _seconds",
+                        assert_eq!(
+                            is_duration,
+                            name.ends_with("_seconds"),
+                            "{name}: the duration bucket layout and the _seconds \
+                             suffix must agree in both directions -- a duration \
+                             histogram that loses the suffix and a non-duration one \
+                             that gains it are both wrong",
                         );
                     }
                     _ => {}

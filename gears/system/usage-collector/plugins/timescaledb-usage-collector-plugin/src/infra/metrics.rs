@@ -496,16 +496,22 @@ impl Metrics {
 
     /// Every instrument name this inventory declares.
     ///
-    /// The destructure below has **no `..`**, on purpose: adding a field to
-    /// [`Metrics`] is a compile error here until it is listed, so this cannot
-    /// be a short list the way a hand-kept array of expected names can. That is
-    /// what lets `metrics_tests` assert the exported set **equals** this one
-    /// rather than merely containing some of it — a new instrument is then
-    /// covered the day it is added, because the test stays red until it is both
-    /// named here and driven there.
+    /// The destructure below has **no `..`**, on purpose — but be exact about
+    /// what that buys. It makes adding a field to [`Metrics`] a compile error
+    /// (`E0027`) **until the field is accounted for in the destructure**; it
+    /// does not force the instrument's name into the `vec!` beside it. Adding
+    /// `foo: _` to silence the compiler and forgetting the string is still
+    /// possible, and if the instrument is also never driven in the test, the
+    /// counts match and the run is green.
+    ///
+    /// What it does do is make it impossible to *reach* this function without
+    /// being shown the new field, at the one place whose whole job is to list
+    /// them — which is strictly more than a hand-kept array elsewhere in the
+    /// tree can offer, and the reason `metrics_tests` can assert the exported
+    /// set **equals** this one rather than merely containing some of it.
     ///
     /// Renaming an instrument in [`Self::with_meter`] without renaming it here
-    /// fails the same assertion, from the other side.
+    /// fails that assertion, from the other side.
     #[cfg(test)]
     #[must_use]
     pub fn declared_instrument_names(&self) -> Vec<&'static str> {

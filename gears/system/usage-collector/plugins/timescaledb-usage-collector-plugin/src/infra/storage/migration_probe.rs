@@ -76,7 +76,9 @@ const MIGRATION_SQL: &str = include_str!("../../../migrations/0001_init.sql");
 /// silently, which is the direction this parser fails in throughout.
 #[expect(
     clippy::expect_used,
-    reason = "a migration this parser cannot read must abort loudly; an Option a caller can               unwrap_or_default() into an empty column list is the silent vanishing this               module exists to prevent"
+    reason = "a migration this parser cannot read must abort loudly; an Option a caller \
+              can unwrap_or_default() into an empty column list is the silent vanishing \
+              this module exists to prevent"
 )]
 #[must_use]
 pub fn ledger_columns() -> Vec<(&'static str, &'static str)> {
