@@ -52,8 +52,9 @@ pub use toolkit_odata::filter::ODataValue;
 /// The map is the identity (field name == column name); the closed `match` is
 /// the security boundary — only these eleven identifiers can ever reach the SQL
 /// string. `gts_type_id` is intentionally absent: it is a typed parameter on
-/// the SPI, not a `$filter` field, and neither is the covered period, which
-/// arrives as `time_range`.
+/// the SPI, not a `$filter` field. The covered period is likewise not
+/// filterable — it arrives as `time_range` — but its columns *are* mapped, for
+/// the reason below.
 ///
 /// The set is the published eight (`usage-collector-v1.yaml:440`) plus `id`,
 /// which the filterable schema carries so a caller can pin one entry and so the
@@ -68,18 +69,20 @@ pub use toolkit_odata::filter::ODataValue;
 /// attribute and its value hook cannot carry one.
 #[must_use]
 pub fn record_column(field_name: &str) -> Option<&'static str> {
+    // Declaration order of `UsageRecordQuery`, so the module doc's list above
+    // and this match can be checked against the SDK side by side.
     match field_name {
         "id" => Some("id"),
+        "window_start" => Some("window_start"),
+        "window_end" => Some("window_end"),
         "tenant_id" => Some("tenant_id"),
         "resource_id" => Some("resource_id"),
         "resource_type" => Some("resource_type"),
         "subject_id" => Some("subject_id"),
         "subject_type" => Some("subject_type"),
+        "invalidates" => Some("invalidates"),
         "entry_type" => Some("entry_type"),
         "origin" => Some("origin"),
-        "invalidates" => Some("invalidates"),
-        "window_start" => Some("window_start"),
-        "window_end" => Some("window_end"),
         _ => None,
     }
 }

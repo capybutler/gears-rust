@@ -78,6 +78,12 @@ fn dt_val() -> ODataValue {
 /// The published `$filter` field set (`usage-collector-v1.yaml:440`). Every
 /// one of these must resolve to a column, or a valid request is answered with
 /// an `Internal`.
+///
+/// **Hand-copied on purpose.** The other allowlist tests iterate SDK constants,
+/// so they are coupled to the code and structurally cannot see the code and the
+/// published contract drifting apart. This list is transcribed from the YAML,
+/// which is a different source, and so it is the only thing here that catches
+/// that drift. Refresh it from the YAML, never from the SDK.
 const PUBLISHED_FILTER_FIELDS: &[&str] = &[
     "tenant_id",
     "resource_id",
@@ -108,6 +114,51 @@ fn every_keyset_safe_field_resolves_to_a_column() {
             record_column(field).is_some(),
             "`{field}` is an admissible `$orderby` key, and the canonical \
              (window_end, id) keyset cannot render at all unless it resolves"
+        );
+    }
+}
+
+/// The invariant the other tests approximate. `translate_filter` resolves a
+/// conjunct with `col(field.name())`, so *every* declared `FilterField` has to
+/// map — a twelfth SDK field would answer a valid `$filter` with a 500 exactly
+/// as `origin` did, and neither the published-eight list nor
+/// `KEYSET_SAFE_RECORD_FIELDS` would necessarily name it. This also asserts the
+/// identity the function's doc claims as a general property rather than as
+/// eleven hand-written equalities.
+#[test]
+fn every_declared_filter_field_maps_to_its_own_column() {
+    for field in <UsageRecordFilterField as FilterField>::FIELDS {
+        assert_eq!(
+            record_column(field.name()),
+            Some(field.name()),
+            "`{}` is a declared filter field, so a conjunct naming it reaches \
+             `col(field.name())` and must resolve — to its own column, since \
+             the map is documented as the identity",
+            field.name()
+        );
+    }
+}
+
+/// The closed half of the boundary. `record_column` is documented as *the*
+/// security boundary, and the `$orderby` path (`render_order_by(&query.order,
+/// record_column)`) hands it an arbitrary caller-supplied string, unlike the
+/// `$filter` path where `FilterField` has already bounded the input. These are
+/// real `usage_records` columns, so an arm added for any of them would render
+/// valid SQL and widen the boundary silently.
+#[test]
+fn a_real_column_that_is_not_a_filter_field_does_not_resolve() {
+    for column in [
+        "reason_code",
+        "gts_type_id",
+        "value",
+        "idempotency_key",
+        "acceptance_sequence",
+        "metadata",
+        "ingested_at",
+    ] {
+        assert!(
+            record_column(column).is_none(),
+            "`{column}` is a real usage_records column but not a filter field"
         );
     }
 }
@@ -488,22 +539,30 @@ fn keyset_predicate_descending_uses_less_than() {
     assert_eq!(sql, "(window_end, id) < ($1, $2)");
 }
 
+// A mixed-direction order rendered as a uniform tuple comparison returns the
+// wrong rows and reports nothing, so the rule is fail-closed and its violation
+// is silent. Both cursor keys must therefore be *parseable* for their field's
+// kind: with an unparseable one (`"x"` for the `Uuid`-kinded `id`) the call
+// errors inside `cursor_key_to_bind` whatever the directions are, and deleting
+// the direction rule outright leaves the assertion green. Assert on the message.
 #[test]
 fn keyset_predicate_rejects_mixed_directions() {
     let pairs: &[(&str, bool)] = &[("window_end", true), ("id", false)];
-    let keys = vec!["2026-01-02T03:04:05Z".to_owned(), "x".to_owned()];
+    let keys = vec![
+        "2026-01-02T03:04:05Z".to_owned(),
+        uuid::Uuid::from_u128(1).to_string(),
+    ];
     let mut ctx = SqlCtx::new(1);
-    assert!(
-        keyset_predicate(
-            pairs,
-            &keys,
-            record_column,
-            rec_kind,
-            rec_keyset_safe,
-            &mut ctx
-        )
-        .is_err()
-    );
+    let err = keyset_predicate(
+        pairs,
+        &keys,
+        record_column,
+        rec_kind,
+        rec_keyset_safe,
+        &mut ctx,
+    )
+    .unwrap_err();
+    assert!(err.contains("mixed-direction"), "got: {err}");
 }
 
 #[test]
@@ -536,10 +595,10 @@ fn keyset_predicate_rejects_a_nullable_ordering_column() {
 
 #[test]
 fn keyset_predicate_binds_uuid_column_as_uuid_not_text() {
-    // `tenant_id` is a uuid column whose name is neither `id` nor
-    // `invalidates`. Typing the cursor key by column NAME (the old behaviour)
-    // bound it as text, producing a `uuid > text` runtime error. Typing by the
-    // field's declared `FieldKind` binds it as Uuid.
+    // `tenant_id` is a uuid column that is not one of the `*_id`-shaped names
+    // the old name-based typing recognized. That heuristic bound it as text,
+    // producing a `uuid > text` runtime error. Typing by the field's declared
+    // `FieldKind` binds it as Uuid.
     let pairs: &[(&str, bool)] = &[("tenant_id", true)];
     let keys = vec![uuid::Uuid::from_u128(7).to_string()];
     let mut ctx = SqlCtx::new(1);
