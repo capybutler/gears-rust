@@ -138,13 +138,11 @@ impl PgRecordStore {
     /// `slots` are the `(tenant_id, invalidation target, window_end)` index
     /// slots the failed statement tried to occupy. They are used to name the
     /// invalidation already in place — and **that lookup is a read taken after
-    /// the write was already
-    /// rejected, so it is diagnostic and not a check.**
-    /// The SPI's atomicity
-    /// obligation is discharged by the index, inside the transaction, before
-    /// this function is reached; this runs afterwards on a rolled-back
-    /// connection purely so the rejection can name an entry. It looks like the
-    /// pre-read the SPI forbids and is not one.
+    /// the write was already rejected, so it is diagnostic and not a check.**
+    /// The SPI's atomicity obligation is discharged by the index, inside the
+    /// transaction, before this function is reached; this runs afterwards on a
+    /// rolled-back connection purely so the rejection can name an entry. It
+    /// looks like the pre-read the SPI forbids and is not one.
     async fn map_insert_error(
         &self,
         conn: &mut sqlx::PgConnection,

@@ -2421,11 +2421,26 @@ by design — so the first blocker is fatal and the approach was abandoned.
   `create_batch`'s futures are `Send` **nor** that they still satisfy the
   trait — precisely the class of breakage a first-transaction change can
   introduce. Both hold in fact: `cargo check --all-targets` emits no `E0277`
-  (non-`Send` future), `E0050` or `E0407` at either method, in a run that *did*
-  emit `E0050` in `adapter.rs` and `E0609` inside this very `impl` block — so
-  the trait-conformance and body-checking passes ran and were silent about
-  these two. But that is cargo saying so, not the instrument this task's
-  confidence otherwise rests on. Everything else in the extract is the
+  (non-`Send` future) and no `E0407` anywhere in the run, and `E0050` only in
+  `adapter.rs` — in a run that *did* emit `E0425`/`E0308` from inside this very
+  `impl` block (`record_store.rs:1609`, `:1752`, `:1783` — in `list` and
+  `aggregate`, against a block spanning `:1398-1819`), so method-body
+  type-checking demonstrably reached the block and was silent about these two.
+  One caveat: `ports.rs:6` carries an unresolved import, so "conformance
+  checking ran" is strictly true only for methods whose signatures do not name
+  the missing types — which `create` and `create_batch` do not, so the claim
+  holds for the two methods it is about. All of which is cargo saying so, not
+  the instrument this task's confidence otherwise rests on.
+
+  **This sentence was itself wrong once, and how it was wrong is worth
+  keeping.** Its first version cited `E0609` "inside this very `impl` block".
+  Those three errors are in `record_row_key`, a free function some 380 lines
+  *above* the block — a correct conclusion resting on a citation that does not
+  check out, which is this port's signature defect, committed in the very
+  sentence added so the disclosure would not rest on bare assertion. The lesson
+  is not "add evidence": it is that **added evidence needs the same
+  verification as the claim it supports**. `extract_writehalf.py`'s own
+  docstring, which makes no evidence claim at all, was correct as written. Everything else in the extract is the
   real file's bytes, and every deletion anchor is asserted unique, so a failed
   anchor raises rather than silently emitting a different extract.
 - **What that does not cover.** Two of these are DB-free and *were* covered
