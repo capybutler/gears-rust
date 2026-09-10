@@ -5134,7 +5134,7 @@ Measured: 9 files, `.github/workflows/ci.yml` (3 lines),
 **Files:**
 - Modify: `Cargo.toml`, `Cargo.lock`, `Makefile`, `apps/cf-gears-example-server/Cargo.toml`, `apps/cf-gears-example-server/src/registered_gears.rs`, `testing/e2e/suites/usage_collector/config.yaml`
 
-- [ ] **Step 1: Confirm the workspace member line, and add the dependency alias**
+- [x] **Step 1: Confirm the workspace member line, and add the dependency alias**
 
 **This step is already done, and the open question in it is answered.** Task 8
 checked both halves so this task's implementer does not re-litigate a settled
@@ -5163,25 +5163,46 @@ grep -n 'timescaledb' testing/e2e/suites/usage_collector/config.yaml
 
 All three answered empty at Task 8's close.
 
-- [ ] **Step 2: Restore the Makefile target**
+**Confirmed empty again at Task 16's start**, so Steps 2-4 were applied as a
+clean `git apply -R` of `8225d8ebd`'s four non-CI file hunks — every
+surrounding context line was byte-identical, so nothing had drifted and no
+adjustment was needed. The eight config keys the e2e block sets all still exist
+on `TimescaleDbPluginConfig`, which carries `deny_unknown_fields`; and
+`retention_period_secs: 3153600000` is exactly `MAX_RETENTION_SECS`, which
+`validate` bounds inclusively.
+
+`Cargo.toml` needed no edit. `Cargo.lock` gained exactly one line — the example
+server's new dependency edge — which is the remainder cargo was expected to
+reconcile.
+
+- [x] **Step 2: Restore the Makefile target**
 
 `git show 8225d8ebd -- Makefile` shows what was removed. Restore
 `test-usage-collector-pg`, adjusting for anything that has changed in the
 Makefile since.
 
-- [ ] **Step 3: Restore the example server registration**
+- [x] **Step 3: Restore the example server registration**
 
 `apps/cf-gears-example-server/Cargo.toml` and `src/registered_gears.rs`.
 
-- [ ] **Step 4: Restore the e2e suite config**
+- [x] **Step 4: Restore the e2e suite config**
 
 `testing/e2e/suites/usage_collector/config.yaml` — the 16 removed lines
 configure the TimescaleDB plugin DSN with the port placeholder `conftest.py`
 substitutes.
 
-Leave `e2e.yaml` for Task 17; its comment is about CI.
+**`e2e.yaml` is left for Task 17 — but it is not only a comment.** The 7 lines
+`8225d8ebd` touched there are 6 added comment lines *and one deletion*: the
+`timescaledb-usage-collector` entry in the suite's own `features:` list. That
+line is the build-half twin of the config restored here, and without it the
+e2e server binary is compiled without the plugin, leaving this config block
+inert. Task 17 Step 3 as written only rewrites the header, so **restoring that
+feature line has to happen there too**, or Task 17 Step 4's `make
+e2e-usage-collector` will fail for a reason that has nothing to do with the
+python. Note also that `config/e2e-features.txt` does not list the feature and
+never did — the per-suite `e2e.yaml` list is what carries it.
 
-- [ ] **Step 5: `cargo check --workspace` for real**
+- [x] **Step 5: `cargo check --workspace` for real**
 
 ```bash
 cd /Users/binarycode/code/virtuozzo/gears-rust
@@ -5190,7 +5211,19 @@ cargo check --workspace --all-targets
 
 This is the first run that includes the plugin. `Cargo.lock` updates itself.
 
-- [ ] **Step 6: Full verification bar**
+**Clean.** But note what it does *not* cover: the example server's
+`timescaledb-usage-collector` feature is optional and off by default, so
+`--workspace` checks the plugin as its own package and never through the
+server. Step 3's registration edge — the only genuinely new wiring in this
+task — needs its own run:
+
+```bash
+cargo check -p cf-gears-example-server --features timescaledb-usage-collector
+```
+
+Also clean; this is the run that compiled the plugin *into* the server.
+
+- [x] **Step 6: Full verification bar**
 
 ```bash
 cargo nextest run -p cf-gears-usage-collector -p cf-gears-usage-collector-sdk \
@@ -5215,7 +5248,51 @@ not before it. Budget for it here rather than being surprised: Task 13 verified
 that `-p cf-gears-timescaledb-usage-collector-plugin --all-targets` without the
 feature is clean, so anything this run reports comes from `tests/`.
 
-- [ ] **Step 7: Commit**
+**The backlog did not materialise: the run is clean, 0 errors and 0 warnings,
+in 3m58s.** Task 15's rewrite had already carried
+`#![allow(clippy::expect_used, clippy::unwrap_used)]` — plus `clippy::panic` on
+the two large suites — at the top of the four files that need it.
+`contract_conformance_pg.rs` needs none, because it calls neither `unwrap` nor
+`expect`.
+
+**Silence here is worth nothing unless the lint provably reaches `tests/`**,
+which is the very failure mode the paragraph above describes. Named mutation:
+inserting `let _clippy_probe: String = "".to_string();` into
+`schema_integration_pg.rs`'s
+`the_ledger_is_a_hypertable_partitioned_on_window_end` makes the scoped run
+fail with `str_to_string` and `manual_string_new`, and cargo names the target —
+`could not compile ... (test "schema_integration_pg")`. Reverted byte-exactly.
+
+**Measured against baseline:**
+
+| Measure | Baseline | This run |
+| --- | --- | --- |
+| four-package `nextest` | 716 + the plugin's | **936 passed / 0 skipped** |
+| contract | 166 / 0 | **166 passed / 0 skipped** |
+| `cargo doc`, `cf-gears-usage-collector` | 35 | **35** |
+| `cargo doc`, `cf-gears-usage-collector-sdk` | 0 | **0** |
+
+The SDK emits no `generated N warnings` line at all, which is how rustdoc
+spells zero. Both crates show a `Documenting` line, so neither count came from
+a cached no-op.
+
+The 936 splits as `cf-gears-usage-collector` 551, `-sdk` 166,
+`noop-usage-collector-plugin` 5, `timescaledb-usage-collector-plugin` 214.
+**The obvious arithmetic is `716 + 214 = 930`, and the extra 6 are not the
+plugin's**: the three baseline packages have themselves grown from 716 to 722
+over Tasks 3-15. Nothing is skipped, so the bar holds.
+
+`cargo +nightly fmt` changed no file.
+
+**The restored Makefile target was run, not merely read.** `make -n
+test-usage-collector-pg` expands to the intended `cargo nextest run -p
+cf-gears-timescaledb-usage-collector-plugin --features postgres`, and that lane
+is **265 tests across 7 binaries**. Rather than spend the 48-container budget
+that Task 17 owns, a single test was run out of it
+(`the_dedup_unique_spans_the_five_tuple`): 1 passed, 264 skipped, container
+reaped.
+
+- [x] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock Makefile apps/cf-gears-example-server \
