@@ -3497,11 +3497,22 @@ parameters."
 > its own paragraph (`canonical_equal`) rather than propagate them; **Task 12
 > rewrites all three of these, so re-point each at the rustdoc that actually
 > says the thing, or drop the reference** — do not carry it across.
+>
+> **Settled.** All three are gone, and none was re-pointed at a `plugin-spi.md`
+> anchor: the rustdoc citation was folded into the sentence that needed it, or
+> the sentence went with the rule. The `corrects_id` partition rationale in
+> `aggregate`'s doc and the partition comment in the body both described the
+> retired netting model, which Task 8's `withdrawal_exclusion_clause` replaced
+> outright, so both were deleted with the code they explained. The aggregate cap
+> comment now names `usage_collector_sdk::MAX_AGGREGATION_BUCKETS`, whose own
+> rustdoc carries the "the gateway rejects a result exceeding this cap with a
+> `400`" sentence the citation was standing in for. `grep -rn 'plugin-spi' src/`
+> is empty.
 
 **Files:**
 - Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`
 
-- [ ] **Step 1: Change the port signature**
+- [x] **Step 1: Change the port signature**
 
 ```rust
     async fn aggregate(
@@ -3515,7 +3526,7 @@ parameters."
     ) -> Result<AggregationResult, UsageCollectorPluginError>;
 ```
 
-- [ ] **Step 1b: Two things Task 2's review handed to this task**
+- [x] **Step 1b: Two things Task 2's review handed to this task**
 
 **A live `status = 'active'` clause now has zero test coverage.** `aggregate`
 still applies it unconditionally (`record_store.rs:1222`, documented at
@@ -3530,13 +3541,25 @@ replaces it outright: `status` is not a column in the Task 3 schema, so
 `status = 'active'` must be gone from the assembled SQL. Grep the built query
 in a test and assert `status` does not appear in it.
 
+**Done, over the whole statement rather than its tail.** Task 10's trap — a
+"column X is absent" assertion matching the SELECT list instead of the WHERE
+clause, because `RECORD_COLUMNS` names `invalidates` — does not reach an
+aggregate statement, and that is a property of what builds an aggregate SELECT
+list rather than of one call: it is the grouped dimension expressions followed
+by the fold expression, never `RECORD_COLUMNS`. None of the six dimension
+expressions and none of the five fold expressions names `status`, and a
+caller-derived metadata key is bound rather than interpolated. So
+`the_fold_carries_no_status_predicate` greps the whole SQL, under every fold,
+grouping by every dimension at once — the widest text the builder can produce —
+and `statement_tail` is not needed here.
+
 **`UsageRecordStatus` survives in five files, not the two an earlier note
 claimed** — `mapper.rs`, `mapper_tests.rs`, `record_store_tests.rs`,
 `tests/common/mod.rs`, `tests/records_ingest_integration_pg.rs`. Task 5 removes
 it from the mapper; the test files are Task 15's. Neither count is this task's
 to fix, but do not be surprised by the remainder.
 
-- [ ] **Step 2: Rewrite `aggregate`**
+- [x] **Step 2: Rewrite `aggregate`**
 
 **Translate `query.filter` through `translate_scope`** (Task 10,
 `query/translate.rs`), for the reason Task 11's Step 3 gives: the inline pair
@@ -3577,7 +3600,7 @@ column. Reading the range predicate rather than transcribing it is the point:
 DIVERGENCES §F says getting it wrong fails `window-end-selection` **and**
 `quantity-round-trip` at once, and `list` already has the test that notices.
 
-- [ ] **Step 2b: Three things Task 8 hands to this task**
+- [x] **Step 2b: Three things Task 8 hands to this task**
 
 **1. `agg_select_expr` is now `fold_select_expr(fold) -> &'static str`, with
 five arms and no branch to take.** An earlier draft of this step prescribed
@@ -3649,7 +3672,12 @@ is reachable in this slice, and any alternative needs `EXPLAIN` rather than
 reasoning. Carry the fact into the write-up; Task 15 measures it and Task 18
 publishes it.
 
-- [ ] **Step 3: Get the no-grouping case right**
+**Recorded, not fixed.** The paragraph now lives on `RecordStore::aggregate`'s
+rustdoc in `record_store.rs`, in the O(rows scanned) phrasing, naming the
+`HashAggregate`/`GroupAggregate` split, `aggregate_limit_clause`'s irrelevance
+to it, and the `time_range` as the only row bound. No SQL was changed.
+
+- [x] **Step 3: Get the no-grouping case right**
 
 The noop plugin's doc records the trap precisely: an empty `buckets` vector is
 **not** the shape a conforming plugin answers with. The no-grouping case is a
@@ -3663,13 +3691,37 @@ a hand-written empty-result short circuit that does not.
 
 Write a test for the empty-selection `COUNT` case naming its mutation.
 
-- [ ] **Step 4: `MUST NOT` read `filter_hash` here**
+**Done, and the reachable half is smaller than the step assumed.** What a unit
+test can hold is the *statement*: `the_no_grouping_case_is_one_bare_aggregate_row`
+pins that an empty `group_by` emits no `GROUP BY` and no `LIMIT`, so
+`PostgreSQL` answers a bare aggregate with exactly one row and `COUNT(*)` with
+`0` rather than `NULL`. Two mutations die on it (`GROUP BY` emitted
+unconditionally; the bucket `LIMIT` emitted with no grouping). The short circuit
+itself — `if group_by.is_empty() { return Ok(AggregationResult { buckets:
+vec![] }) }` — **survives every test in the crate**, because no unit test
+executes a statement and `PgRow` cannot be built off a connection. The code is
+shaped so the branch has nowhere to go (`aggregate_bucket` is a 1:1 `map` over
+the fetched rows), and the comment at the call site says the mutation survives
+rather than claiming it is covered. Task 15 catches it.
+
+- [x] **Step 4: `MUST NOT` read `filter_hash` here**
 
 The SPI is explicit: this method paginates nothing, mints no cursor, and the
 gateway assigns it no fingerprint. **"An aggregate implementation MUST NOT read
 the slot."** Confirm the implementation does not, and say so in a comment.
 
-- [ ] **Step 5: Update the adapter, run, commit**
+**Done, and it did turn out to be testable.** `build_aggregate_sql` reads
+`query.filter` and nothing else, which is stated in its rustdoc. The absence has
+a named mutation after all — not a deliberate read, but the cursor block copied
+across from `build_list_sql`, which resolves `query.filter_hash` through
+`require_filter_hash` and errors when it is absent, then pushes a keyset
+predicate. `the_fold_reads_neither_the_cursor_nor_the_fingerprint_slot` renders
+the same fold three times — plain, with a cursor, with a fingerprint — and
+requires byte-identical SQL and equal binds. What it does **not** reach is a
+read whose value is then discarded: that leaves no trace in either the statement
+or the binds, and the test says so.
+
+- [x] **Step 5: Update the adapter, run, commit**
 
 ```rust
     async fn query_aggregated_usage_records(
@@ -3728,9 +3780,56 @@ cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
 cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | tail -60
 ```
 
-Work to zero. The expected remainder after Tasks 1-12 is imports, the gear
-wiring, and `src/lib.rs`'s module doc (which describes a `domain` layer holding
-"the SPI adapter and store port traits" — plural, and there is one now).
+**As of Task 12 the command above already exits 0**, sooner than this plan
+expected: Task 12 was the last holder of a lib error, and the files this task
+owns turned out to need no signature change to compile. `cargo test -p
+cf-gears-timescaledb-usage-collector-plugin --lib` runs 208 tests green, and
+`cargo clippy --all-targets -- -D warnings` is clean. So Step 2 is a *review*
+step, not a repair one: `src/lib.rs`'s module doc still describes a `domain`
+layer holding "the SPI adapter and store port traits" — plural, and there is one
+now.
+
+**Mind the feature gate — `--all-targets` alone does not reach `tests/`.** Every
+file there opens with `#![cfg(feature = "postgres")]`, so without the feature
+the five integration targets compile to nothing and report nothing. Add the
+feature and the count is **61 errors**, every one of them in `tests/`:
+
+```bash
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets --features postgres
+```
+
+They are the retired time model showing through — `UsageTypeGtsId`,
+`AggregationSpec`, `AggregationOp`, `UsageRecordStatus`, and the `gts_id` /
+`corrects_id` / `status` / `created_at` fields — plus the three SPI signatures
+this slice reshaped. **None is this task's**: Task 15 rewrites all five files
+wholesale. Do not chase them here, and do not read a green `--all-targets` as
+the tests being sound.
+
+**And the lint backlog a resolution error was hiding is narrower than it
+sounds.** An unresolved import suppresses every rustc and clippy lint for the
+whole crate, old code included, and blocks rustdoc too (confirmed with a
+two-line probe crate: one `E0432` gave 0 lints, removing it gave 5). But the
+successive scratch harnesses compiled and linted `record_store.rs`,
+`record_store_tests.rs`, `query.rs`, `query_tests.rs` and all of `query/` under
+the identical deny set throughout, at zero warnings. The genuinely unlinted
+surface was `lib.rs`, `gear.rs` (+tests), `config.rs` (+tests), `domain.rs`,
+`domain/adapter.rs`, `domain/ports.rs`, `infra.rs`, `infra/storage.rs` and
+`pool.rs` (+tests) — and with the crate compiling, clippy reports **nothing**
+across all of those. The five files under `tests/` are still unlinted, because
+they still do not compile; they become lintable when Task 15 rewrites them.
+
+**Add `cargo doc` to this pass.** It has one thing left to say:
+
+```bash
+cargo doc --no-deps -p cf-gears-timescaledb-usage-collector-plugin
+```
+
+Seven `private_intra_doc_links` warnings, all pre-dating Task 12 (`build_pool`
+→ `connect_options`/`connection_gucs`, `apply_post_migration_setup` →
+`acquire_init_lock`, `aggregate_limit_clause` → `LATEST_SELECT_EXPR`,
+`PgRecordStore` → `Self::timed_acquire`/`Self::record_backend_error`,
+`AlreadyInvalidated` → `ONE_INVALIDATION_UNIQUE`). Intra-doc link density has
+roughly doubled since Task 9 and this had never been run against the crate.
 
 - [ ] **Step 3: `cargo check` must pass**
 
@@ -4013,6 +4112,24 @@ Four suites survive Task 1 and every one was written against the old model.
 **This task is also the first point in the slice where Postgres is reachable,
 which makes it the owner of one measurement nobody earlier could take** — see
 Step 1b.
+
+**And of three claims about `aggregate` that no unit test can reach**, handed
+over by Task 12 rather than left implied. None survives contact with a live
+backend, and all three survive every test in the crate today:
+
+1. **A bare aggregate returns exactly one row**, so an empty `group_by` yields
+   the single empty-keyed bucket the SPI asks for. Task 12 pins the *statement*
+   (no `GROUP BY`, no `LIMIT`) and shapes the decode as a 1:1 `map`, but a
+   hand-written `if group_by.is_empty() { … vec![] }` short circuit is still a
+   surviving mutation.
+2. **`COUNT` over an empty selection is `Some(0)`, not `None`.** That is
+   `SELECT COUNT(*)`'s own answer rather than anything the plugin does, which is
+   exactly why only a real query demonstrates it.
+3. **`aggregate_bucket` is handed the same dimension count the SELECT list was
+   built from.** Handing it a different one survives every unit test.
+
+Task 12's `--all-targets` count of zero is a green **without** `--features
+postgres`; with it, these five files carry 61 errors that are yours.
 
 - [ ] **Step 1: Inventory what each suite asserts, before changing any of it**
 
