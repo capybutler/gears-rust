@@ -922,8 +922,8 @@ usage_type_catalog table is dropped. An existing database must be recreated."
 - [ ] **Step 1: Rewrite `UsageRecordRow`**
 
 Replace the struct with one mirroring the Task 3 schema. Column order here is
-load-bearing: `record_store.rs` decodes positionally against a `RECORD_COLUMNS`
-constant, and Task 9 keeps the two in the same order.
+a reading convenience, **not** a correctness requirement — see the correction
+below.
 
 ```rust
 /// One row of the `usage_records` hypertable.
@@ -978,6 +978,39 @@ Note `entry_type` is **not** a field. It is a generated column that exists so
 `$filter` can name it; nothing decodes it, because the SDK model derives the
 same fact from `invalidation.is_some()`. Say that in the struct doc so the next
 reader does not "fix" the omission.
+
+- [ ] **Correction: `sqlx::FromRow` decodes by NAME, not by position**
+
+**An earlier draft of this plan said `record_store.rs` "decodes rows
+positionally" and that a `RECORD_COLUMNS` one column out would "fail at runtime
+with a type error naming neither column". That is wrong**, and it was wrong
+everywhere it appeared — Task 4 and Task 9 both carried it. Task 4's
+implementer measured it two ways rather than accepting it:
+
+1. **In the macro source.** `sqlx-macros-core-0.9.0/src/derives/row.rs:107`
+   generates `__row.try_get(#id_s)` for a **named-field** struct, where `id_s`
+   is the field's own name — a by-name lookup. Positional `try_get(#idx)`
+   appears only at `:286`, the **tuple-struct** arm. `UsageRecordRow` has named
+   fields and no `rename_all`.
+2. **Against a live database.** A standalone sqlx 0.9 probe on
+   `timescale/timescaledb:2.29.2-pg18` selected `charlie, alpha, bravo` into a
+   struct declared `alpha, bravo, charlie` — **including two same-typed `text`
+   columns swapped**, the exact case a positional decode would silently
+   mis-assign — and produced output byte-identical to the DDL-order select.
+   Omitting a column failed with `no column found for name: charlie`.
+
+**What this changes:**
+
+- **Permutation is harmless.** `RECORD_COLUMNS` in a different order than the
+  struct decodes correctly.
+- **Omission is the real hazard, and it is loud.** A missing field fails by
+  name, which is a good diagnostic, not the anonymous type error the old text
+  promised.
+
+Keep the struct in DDL order anyway — it makes the file readable against the
+migration — but document it as a convention, **not** as a correctness
+requirement. Writing the load-bearing claim into a doc comment would have been
+this port's characteristic defect committed deliberately.
 
 - [ ] **Step 2: Fix the module doc**
 
@@ -1893,7 +1926,7 @@ finding the first.
 - [ ] **Step 2: Update `RECORD_COLUMNS`**
 
 At `:65`. It must match `UsageRecordRow`'s field order from Task 4 exactly —
-the store decodes positionally.
+the row struct lists them (a readability convention, not a decode requirement).
 
 ```rust
 const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, \
@@ -1904,8 +1937,10 @@ const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, \
 
 **Seventeen columns, and `entry_type` is deliberately not among them** — it is
 generated, and nothing decodes it. Count the names against `UsageRecordRow`'s
-fields one by one; a positional decode that is one column out fails at runtime
-with a type error that names neither column.
+fields one by one. **Omission is the hazard, not order** — see the correction
+in Task 4. A `RECORD_COLUMNS` missing a field fails with
+`no column found for name: <field>`, which names the field; a `RECORD_COLUMNS`
+in a different order than the struct is harmless.
 
 - [ ] **Step 3: Rewrite the dedup helpers**
 
