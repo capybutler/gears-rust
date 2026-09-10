@@ -3713,15 +3713,25 @@ purpose is to skip the query, so it is written *above* the acquire, and the
 crate already owns the discriminator: `lazy_store()` holds a lazy pool at a dead
 DSN, so a path that reaches the pool answers `Transient` and one that
 short-circuits answers `Ok`.
-`the_ungrouped_fold_still_reaches_the_pool` requires the `Transient`, and also
-pins `aggregate`'s stated order — the statement is built before a connection is
-acquired — for the ungrouped case. (`list` had this test; the fold did not.)
+`the_ungrouped_fold_still_reaches_the_pool` requires the `Transient`.
+
+**A separate test pins the ordering**, and it has to be separate: `Transient` is
+what a pool timeout answers under *either* order, so a swap of the acquire and
+the build leaves the test above green.
+`a_fold_that_cannot_be_built_never_reaches_the_pool` gives the fold a filter
+naming a field the allowlist refuses and requires an `Internal` carrying the
+field name — which acquiring first would have replaced with a `Transient`. It is
+the fold analogue of `a_page_that_cannot_be_built_never_reaches_the_pool`, which
+`list` already had.
 
 What is left needs Postgres, and only that: a short circuit placed *after* the
-fetch (a no-op on an empty row set), and the dimension count handed to
-`aggregate_bucket`. `aggregate_bucket` is a 1:1 `map` over the fetched rows, so
-neither has a natural place to be written, and the call-site comment names both
-as surviving rather than claiming coverage.
+fetch, where the branch is a no-op on an already-fetched empty row set. The
+dimension count is **no longer** on this list: `build_aggregate_sql` returns the
+count its own SELECT list was built from, so the decoder cannot derive a
+different one, and
+`the_builder_reports_the_dimension_count_its_select_list_was_built_from` pins
+the reported count against the `GROUP BY` ordinals — the two outputs of the
+builder that must agree.
 
 - [x] **Step 4: `MUST NOT` read `filter_hash` here**
 
@@ -3802,7 +3812,7 @@ cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | 
 **As of Task 12 the command above already exits 0**, sooner than this plan
 expected: Task 12 was the last holder of a lib error, and the files this task
 owns turned out to need no signature change to compile. `cargo test -p
-cf-gears-timescaledb-usage-collector-plugin --lib` runs 208 tests green, and
+cf-gears-timescaledb-usage-collector-plugin --lib` runs 211 tests green, and
 `cargo clippy --all-targets -- -D warnings` is clean. So Step 2 is a *review*
 step, not a repair one: `src/lib.rs`'s module doc still describes a `domain`
 layer holding "the SPI adapter and store port traits" — plural, and there is one
@@ -3876,18 +3886,37 @@ new counter here is a judgement call rather than something the doc obliges.
 
 - [ ] **Step 2c: Decide whether to split `record_store.rs` (from Task 9's review)**
 
-**A decision point, deliberately placed here.** `record_store.rs` is ~1,840
-lines, and roughly 400 of them — `plan_batch`, `scope_runs`, `sequence_block`,
-`InsertColumns`, the dedup helpers, `canonical_equal`, the `with_retry` family,
-the SQL builders — are pure and touch neither `PgRecordStore` nor `sqlx`.
-Moving them into `record_store/write_plan.rs` would give a real physical
-read/write split in place of the banner comment in `record_store_tests.rs`, and
-would let a future task `#[path]`-include a real file instead of regenerating
-an extract (see Task 9's Verification note for why that mattered).
+**A decision point, deliberately placed here — and the numbers Task 9 wrote it
+with are stale, so here are measured ones.** `record_store.rs` is **2,290
+lines** (not ~1,840), and **792 of them** (not ~400) are its 22 free functions
+with their doc comments, none of which touches `PgRecordStore` or `sqlx`:
+
+```
+placeholders, scope_runs, sequence_block, invalidation_index_slots,
+record_row_key, require_filter_hash, build_get_sql, build_list_sql,
+build_list_page, dedup_key, row_dedup_key, dedup_invariant_break,
+dedup_transient, plan_batch, duplicate_withdrawal_in_batch,
+batch_retry_backoff_base, full_jitter, batch_retry_backoff,
+is_retryable_batch_error, canonical_equal, build_aggregate_sql,
+aggregate_bucket
+```
+
+Regenerate that list rather than trusting it — `grep -n '^fn ' src/infra/storage/record_store.rs`
+is the whole measurement, since a free function is exactly one that starts at
+column zero. Tasks 10-12 grew the pure half faster than the impure one:
+`build_list_sql`, `build_list_page`, `build_aggregate_sql` and `aggregate_bucket`
+are all read-path builders that arrived in this slice, which is worth noticing
+because **it also means the "write_plan" name Task 9 chose no longer fits** —
+about half of what would move is read-path.
+
+Moving them into a sibling module would give a real physical split in place of
+the banner comment in `record_store_tests.rs`, and would let a future task
+`#[path]`-include a real file instead of regenerating an extract (see Task 9's
+Verification note for why that mattered).
 
 **Task 9 deliberately did not do it**: Tasks 10-12 were about to edit this file
-and the merge cost would have landed on them. This task closes the file and is
-where the crate first compiles, so it is the cheapest place to take it.
+and the merge cost would have landed on them. Those are all closed now, so this
+is the cheapest place to take it.
 
 One exception: **if Task 10's implementer finds the extractor painful, they may
 pull the split forward.** The benefit is largest before the read half is
@@ -4133,12 +4162,18 @@ Four suites survive Task 1 and every one was written against the old model.
 which makes it the owner of one measurement nobody earlier could take** — see
 Step 1b.
 
-**And of three claims about `aggregate` that only a live backend can settle**,
-handed over by Task 12 rather than left implied. Each needs a real query to
-decide it; a unit test reaches only the statement that leads there. Claims 2 and
-3 survive every unit test in the crate outright, and claim 1 partly — Task 12
-killed the short circuit at the placement it would actually be written, and item
-1 says which placement is left:
+**And of two claims about `aggregate` that only a live backend can settle**,
+handed over by Task 12 rather than left implied. Both are facts about what
+`PostgreSQL` answers, so a real query decides them and a unit test reaches only
+the statement that leads there. Claim 2 survives every unit test in the crate
+outright, and claim 1 partly — Task 12 killed the short circuit at the placement
+it would actually be written, and item 1 says which placement is left:
+
+A third claim was on this list and has been **retired rather than routed**: that
+`aggregate_bucket` is handed the same dimension count the SELECT list was built
+from. It was the one of the three that was not a Postgres-semantics question, so
+it never needed a backend — `build_aggregate_sql` now returns that count with
+the statement, and a test pins it against the `GROUP BY` ordinals.
 
 1. **A bare aggregate returns exactly one row**, so an empty `group_by` yields
    the single empty-keyed bucket the SPI asks for. Task 12 pins the *statement*
@@ -4150,9 +4185,6 @@ killed the short circuit at the placement it would actually be written, and item
 2. **`COUNT` over an empty selection is `Some(0)`, not `None`.** That is
    `SELECT COUNT(*)`'s own answer rather than anything the plugin does, which is
    exactly why only a real query demonstrates it.
-3. **`aggregate_bucket` is handed the same dimension count the SELECT list was
-   built from.** Handing it a different one survives every unit test.
-
 Task 12's `--all-targets` count of zero is a green **without** `--features
 postgres`; with it, these five files carry 61 errors that are yours.
 
@@ -4670,6 +4702,15 @@ Changes owed:
   each plugin's deployment guide to state the bounds it can hold, and this is
   one it cannot hold under a `LATEST` meter with a wide window. Write the entry
   against the measurement Task 15 takes, not against this description.
+
+  **The four elements above are the entry's content, not a summary of it** —
+  the O(rows scanned) phrasing rather than O(largest group), the
+  HashAggregate/GroupAggregate split, `aggregate_limit_clause`'s zero
+  protection, and the time window being caller input. The weaker phrasing
+  understates the cost by orders of magnitude, so an entry that keeps only the
+  headline is not this entry. If this task slips, the fact is not lost: Task 12
+  put the same four on `RecordStore::aggregate`'s rustdoc, which ships. What
+  does not exist until this entry is written is the register a reviewer reads.
 - **Any further entry** this port turned up, beyond the `LATEST` one above.
 
 - [ ] **Step 6: Full verification bar, one last time**
