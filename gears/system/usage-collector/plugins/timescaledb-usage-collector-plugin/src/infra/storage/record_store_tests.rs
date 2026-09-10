@@ -26,6 +26,7 @@ use super::{
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
 use crate::infra::storage::entity::UsageRecordRow;
+use crate::infra::storage::migration_probe;
 use crate::infra::storage::query::aggregate::{fold_select_expr, withdrawal_exclusion_clause};
 use crate::infra::storage::query::ledger_from_clause;
 use crate::infra::storage::query::translate::{SqlBind, record_column};
@@ -378,42 +379,41 @@ fn names(list: &str) -> Vec<&str> {
 }
 
 /// Every inserted column paired with the array element type the batch insert
-/// must `UNNEST` it as, **transcribed by hand from `migrations/0001_init.sql`**
-/// rather than derived from the code under test.
+/// must `UNNEST` it as, **derived from `migrations/0001_init.sql`** by
+/// [`migration_probe::insertable_columns`] rather than from the code under
+/// test.
 ///
-/// This literal is the whole point of the pairing test below. Checking the
-/// generated SQL against `INSERT_COLUMN_ARRAY_TYPES` proves only that the SQL
-/// was built from that array — transpose two entries and both sides move
-/// together, which is exactly how the first version of this test let such a
-/// mutation survive. A transposition has to be measured against something that
-/// does not move, and the migration is that thing.
+/// This is the whole point of the pairing test below. Checking the generated
+/// SQL against `INSERT_COLUMN_ARRAY_TYPES` proves only that the SQL was built
+/// from that array — transpose two entries and both sides move together, which
+/// is exactly how the first version of this test let such a mutation survive. A
+/// transposition has to be measured against something that does not move, and
+/// the migration is that thing.
 ///
-/// One deliberate divergence from the DDL: `metadata` is `jsonb` in the table
-/// but travels as `text[]` and is cast `::jsonb` per row, because `jsonb[]`
-/// array encoding is the thing being sidestepped.
-const DDL_COLUMN_ARRAY_TYPES: [(&str, &str); 16] = [
-    ("id", "uuid"),
-    ("tenant_id", "uuid"),
-    ("gts_type_id", "text"),
-    ("value", "numeric"),
-    ("window_start", "timestamptz"),
-    ("window_end", "timestamptz"),
-    ("resource_id", "text"),
-    ("resource_type", "text"),
-    ("subject_id", "text"),
-    ("subject_type", "text"),
-    ("idempotency_key", "text"),
-    ("invalidates", "uuid"),
-    ("reason_code", "text"),
-    ("origin", "text"),
-    ("acceptance_sequence", "bigint"),
-    ("metadata", "text"),
-];
+/// It was a hand transcription of the migration until this task, which is the
+/// same failure one step removed: a second spelling of the schema, kept by
+/// hand, silently stale the first time the DDL moves without it. The parse has
+/// nothing of its own to forget.
+///
+/// One deliberate divergence from the DDL, and the only entry still written by
+/// hand here: `metadata` is `jsonb` in the table but travels as `text[]` and is
+/// cast `::jsonb` per row, because `jsonb[]` array encoding is the thing being
+/// sidestepped.
+fn ddl_column_array_types() -> Vec<(&'static str, &'static str)> {
+    migration_probe::insertable_columns()
+        .into_iter()
+        .map(|(name, ty)| match name {
+            "metadata" => (name, "text"),
+            _ => (name, ty),
+        })
+        .collect()
+}
 
 #[test]
 fn each_inserted_column_is_unnested_as_the_type_the_migration_declares() {
-    let want_names: Vec<&str> = DDL_COLUMN_ARRAY_TYPES.iter().map(|(n, _)| *n).collect();
-    let want_types: Vec<&str> = DDL_COLUMN_ARRAY_TYPES.iter().map(|(_, t)| *t).collect();
+    let ddl = ddl_column_array_types();
+    let want_names: Vec<&str> = ddl.iter().map(|(n, _)| *n).collect();
+    let want_types: Vec<&str> = ddl.iter().map(|(_, t)| *t).collect();
 
     assert_eq!(
         names(INSERT_COLUMNS),

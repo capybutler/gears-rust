@@ -15,6 +15,8 @@ use usage_collector_sdk::{
     MeterTypeId, TimeRange,
 };
 
+use crate::infra::storage::migration_probe;
+
 use super::super::bind::SqlBind;
 use super::super::translate::SqlCtx;
 use super::super::{
@@ -207,48 +209,16 @@ const LEDGER_COLUMNS: &[&str] = &[
     "ingested_at",
 ];
 
-/// The schema itself, so [`LEDGER_COLUMNS`] cannot drift from it. The path
-/// resolves from this file's own directory, which is the real one even when a
-/// scratch harness `#[path]`-includes this module.
-const MIGRATION_SQL: &str = include_str!("../../../../migrations/0001_init.sql");
-
-/// The ledger table's columns as declared, in declaration order.
-///
-/// It recognizes what a column is **not**, rather than allowlisting type names.
-/// The table-constraint keywords are closed by the SQL grammar and are upper
-/// case; type names are open-ended, and an allowlist of them fails in the worse
-/// direction — a column whose type is not on it vanishes from the parsed set,
-/// so a developer who forgets to add it to [`LEDGER_COLUMNS`] gets a green run
-/// and a blind alias guard, while one who remembers gets a red run telling a
-/// correct edit it is wrong. Here an unrecognized construct becomes an *extra*
-/// entry and reds the test instead, which is the loud failure.
-///
-/// A column line is indented exactly four spaces, names an all-lower-case
-/// identifier, and has a second token after it. That drops the `--` comments,
-/// the upper-case `PRIMARY KEY`/`CONSTRAINT` lines, and the more deeply
-/// indented constraint bodies and generated-column continuations.
+/// The ledger table's column names as declared, in declaration order — the
+/// name half of [`migration_probe::ledger_columns`], the crate's one parse of
+/// `migrations/0001_init.sql`. The parser lives there rather than here because
+/// `record_store_tests` checks the insert-side constants against the same
+/// parse; a second transcription of the schema is exactly what it exists to
+/// remove.
 fn migration_ledger_columns() -> Vec<&'static str> {
-    let start = MIGRATION_SQL
-        .find("CREATE TABLE IF NOT EXISTS usage_records (")
-        .expect("the ledger table is declared");
-    let block = &MIGRATION_SQL[start..];
-    let end = block.find("\n);").expect("the declaration is closed");
-    block[..end]
-        .lines()
-        .filter_map(|line| {
-            let decl = line.strip_prefix("    ")?;
-            if decl.starts_with(' ') {
-                return None;
-            }
-            let mut parts = decl.split_whitespace();
-            let name = parts.next()?;
-            // A column declaration always has a type after the name.
-            parts.next()?;
-            let is_column = name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-            is_column.then_some(name)
-        })
+    migration_probe::ledger_columns()
+        .into_iter()
+        .map(|(name, _)| name)
         .collect()
 }
 
