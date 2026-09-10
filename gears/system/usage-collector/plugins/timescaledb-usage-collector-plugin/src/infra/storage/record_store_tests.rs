@@ -14,10 +14,9 @@ use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use usage_collector_sdk::{UsageCollectorPluginError, UsageTypeGtsId};
 
 use super::{
-    ConflictRead, DedupKey, INSERT_COLUMNS, INSERT_COLUMN_ARRAY_TYPES, InsertColumns,
-    BATCH_INSERT_SQL, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, SINGLE_INSERT_SQL,
-    batch_retry_backoff,
-    batch_retry_backoff_base, build_get_sql, canonical_equal, dedup_key,
+    BATCH_INSERT_SQL, ConflictRead, DedupKey, INSERT_COLUMN_ARRAY_TYPES, INSERT_COLUMNS,
+    InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, SINGLE_INSERT_SQL,
+    batch_retry_backoff, batch_retry_backoff_base, build_get_sql, canonical_equal, dedup_key,
     invalidation_index_slots, is_retryable_batch_error, plan_batch, row_dedup_key, scope_runs,
     sequence_block, with_retry,
 };
@@ -312,7 +311,9 @@ fn canonical_equal_compares_origin() {
     let tenant = uuid::Uuid::from_u128(11);
     let record = unit_record(tenant, "k", 1100);
     let mut row = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
-    row.origin = usage_collector_sdk::RecordOrigin::Backfill.as_str().to_owned();
+    row.origin = usage_collector_sdk::RecordOrigin::Backfill
+        .as_str()
+        .to_owned();
 
     assert!(
         !canonical_equal(&row, &record).expect("valid metadata decodes"),
@@ -692,8 +693,8 @@ fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
     let tenant = uuid::Uuid::from_u128(0xD1);
     let target = uuid::Uuid::from_u128(0xD100);
     let mut plain = unit_record(tenant, "idem-a", 0xD101);
-    plain.resource_ref = usage_collector_sdk::ResourceRef::new("res-a", "type-a")
-        .expect("valid resource_ref");
+    plain.resource_ref =
+        usage_collector_sdk::ResourceRef::new("res-a", "type-a").expect("valid resource_ref");
     plain.subject_ref = Some(
         usage_collector_sdk::SubjectRef::new("subj-a", Some("subjtype-a".to_owned()))
             .expect("valid subject_ref"),
@@ -771,9 +772,10 @@ fn scope_runs_groups_the_contiguous_same_scope_representatives() {
     // scope — so same-scope entries are contiguous and one pass finds them.
     let t1 = uuid::Uuid::from_u128(0xD2);
     let t2 = uuid::Uuid::from_u128(0xD3);
-    let other_meter =
-        usage_collector_sdk::MeterTypeId::new("gts.cf.core.uc.usage_record.v1~cf.storage._.gb_hours.v1~")
-            .expect("valid meter id");
+    let other_meter = usage_collector_sdk::MeterTypeId::new(
+        "gts.cf.core.uc.usage_record.v1~cf.storage._.gb_hours.v1~",
+    )
+    .expect("valid meter id");
 
     let a1 = unit_record(t1, "a1", 0xD201);
     let a2 = unit_record(t1, "a2", 0xD202);
@@ -866,7 +868,10 @@ async fn resolve_batch_conflicts_an_in_batch_duplicate_whose_canonical_fields_di
     );
 
     let plan = plan_batch(&records);
-    let winner_row = row_matching(&records[0], serde_json::Value::Object(serde_json::Map::new()));
+    let winner_row = row_matching(
+        &records[0],
+        serde_json::Value::Object(serde_json::Map::new()),
+    );
     let inserted: HashMap<DedupKey, UsageRecordRow> =
         HashMap::from([(dedup_key(&records[0]), winner_row)]);
     let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
@@ -886,7 +891,9 @@ async fn resolve_batch_conflicts_an_in_batch_duplicate_whose_canonical_fields_di
                 "the conflict names the row already holding the slot"
             );
         }
-        other => panic!("an in-batch duplicate carrying different data must conflict, got {other:?}"),
+        other => {
+            panic!("an in-batch duplicate carrying different data must conflict, got {other:?}")
+        }
     }
 }
 
@@ -902,7 +909,10 @@ async fn resolve_batch_reports_a_pre_rejected_withdrawal_as_already_invalidated(
     let plan = plan_batch(&records);
 
     // Only the first withdrawal reaches the insert, and it wins its slot.
-    let winner_row = row_matching(&records[0], serde_json::Value::Object(serde_json::Map::new()));
+    let winner_row = row_matching(
+        &records[0],
+        serde_json::Value::Object(serde_json::Map::new()),
+    );
     let inserted: HashMap<DedupKey, UsageRecordRow> =
         HashMap::from([(dedup_key(&records[0]), winner_row)]);
     let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
@@ -917,7 +927,10 @@ async fn resolve_batch_reports_a_pre_rejected_withdrawal_as_already_invalidated(
     );
     match &results[1] {
         Err(UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }) => {
-            assert_eq!(*id, target, "the rejection names the target it tried to withdraw");
+            assert_eq!(
+                *id, target,
+                "the rejection names the target it tried to withdraw"
+            );
             assert_eq!(
                 *invalidated_by,
                 uuid::Uuid::from_u128(0xB501),
@@ -1354,7 +1367,9 @@ fn the_point_lookup_renders_a_membership_scope_over_several_tenants() {
     // `scope_to_odata_filter` pins the owning tenant with `Eq` *or* `In`, so a
     // multi-tenant grant reaches the plugin as a membership test. Every other
     // test here only ever hands it `Eq`.
-    let scope = parse_scope(&format!("tenant_id in ({SCOPE_TENANT_A}, {SCOPE_TENANT_B})"));
+    let scope = parse_scope(&format!(
+        "tenant_id in ({SCOPE_TENANT_A}, {SCOPE_TENANT_B})"
+    ));
 
     let (sql, binds) = build_get_sql(&scope).expect("a scope must render");
 

@@ -111,7 +111,9 @@ pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
         // real hypertable neither reports its bare name.
         "23505" => match constraint {
             Some(c) if is_constraint(c, DEDUP_UNIQUE) => DbErrorClass::DedupUniqueViolation,
-            Some(c) if is_constraint(c, ONE_INVALIDATION_UNIQUE) => DbErrorClass::AlreadyInvalidated,
+            Some(c) if is_constraint(c, ONE_INVALIDATION_UNIQUE) => {
+                DbErrorClass::AlreadyInvalidated
+            }
             _ => DbErrorClass::Other,
         },
         c if is_transient_sqlstate(c) => DbErrorClass::Transient,

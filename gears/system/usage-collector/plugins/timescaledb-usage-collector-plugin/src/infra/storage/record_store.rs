@@ -348,20 +348,27 @@ impl PgRecordStore {
         record: UsageRecord,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         let mut conn = self.timed_acquire().await?;
-        let mut tx = conn.begin().await.map_err(|e| self.record_backend_error(&e))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
 
         // 1. Claim this entry's acceptance_sequence inside the transaction that
         //    will insert it, so the two commit or roll back together.
-        let acceptance_sequence =
-            match claim_acceptance_sequence(&mut tx, record.tenant_id, record.gts_type_id.as_str(), 1)
-                .await
-            {
-                Ok(seq) => seq,
-                Err(e) => {
-                    rollback(tx).await;
-                    return Err(self.record_backend_error(&e));
-                }
-            };
+        let acceptance_sequence = match claim_acceptance_sequence(
+            &mut tx,
+            record.tenant_id,
+            record.gts_type_id.as_str(),
+            1,
+        )
+        .await
+        {
+            Ok(seq) => seq,
+            Err(e) => {
+                rollback(tx).await;
+                return Err(self.record_backend_error(&e));
+            }
+        };
 
         // 2. Insert, deduplicated on the 5-tuple UNIQUE. `RETURNING` yields the
         //    row only when we won the slot — `DO NOTHING` suppresses it on a
@@ -380,25 +387,26 @@ impl PgRecordStore {
         let (invalidates, reason_code) = invalidation_to_row(record.invalidation.as_ref());
         let is_invalidation = invalidates.is_some();
 
-        let attempted = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(SINGLE_INSERT_SQL.as_str()))
-            .bind(record.id)
-            .bind(record.tenant_id)
-            .bind(record.gts_type_id.as_str())
-            .bind(record.value)
-            .bind(record.window_start)
-            .bind(record.window_end)
-            .bind(record.resource_ref.resource_id())
-            .bind(record.resource_ref.resource_type())
-            .bind(subject_id)
-            .bind(subject_type)
-            .bind(record.idempotency_key.as_str())
-            .bind(invalidates)
-            .bind(reason_code)
-            .bind(record.origin.as_str())
-            .bind(acceptance_sequence)
-            .bind(metadata)
-            .fetch_optional(&mut *tx)
-            .await;
+        let attempted =
+            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(SINGLE_INSERT_SQL.as_str()))
+                .bind(record.id)
+                .bind(record.tenant_id)
+                .bind(record.gts_type_id.as_str())
+                .bind(record.value)
+                .bind(record.window_start)
+                .bind(record.window_end)
+                .bind(record.resource_ref.resource_id())
+                .bind(record.resource_ref.resource_type())
+                .bind(subject_id)
+                .bind(subject_type)
+                .bind(record.idempotency_key.as_str())
+                .bind(invalidates)
+                .bind(reason_code)
+                .bind(record.origin.as_str())
+                .bind(acceptance_sequence)
+                .bind(metadata)
+                .fetch_optional(&mut *tx)
+                .await;
 
         let inserted = match attempted {
             Ok(inserted) => inserted,
@@ -705,7 +713,10 @@ impl PgRecordStore {
         let plan = plan_batch(records);
 
         let mut conn = self.timed_acquire().await?;
-        let mut tx = conn.begin().await.map_err(|e| self.record_backend_error(&e))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
 
         let sequences = match claim_batch_sequences(&mut tx, &plan.reps).await {
             Ok(sequences) => sequences,
@@ -1494,7 +1505,8 @@ fn canonical_equal(
     let stored_metadata = metadata_jsonb_to_map(row.metadata.clone())?;
     Ok(row.id == incoming.id
         && row.value == incoming.value
-        && canonical_period_bound(row.window_start) == canonical_period_bound(incoming.window_start)
+        && canonical_period_bound(row.window_start)
+            == canonical_period_bound(incoming.window_start)
         && canonical_period_bound(row.window_end) == canonical_period_bound(incoming.window_end)
         && row.resource_id == incoming.resource_ref.resource_id()
         && row.resource_type == incoming.resource_ref.resource_type()

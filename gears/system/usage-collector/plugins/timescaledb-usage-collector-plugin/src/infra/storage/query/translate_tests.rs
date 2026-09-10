@@ -853,8 +853,11 @@ fn translate_scope_parenthesizes_a_bare_comparison() {
     // the parentheses here are this function's, not the walker's.
     let mut ctx = SqlCtx::new(1);
 
-    let sql = translate_scope(&scope_expr("tenant_id eq 11111111-1111-1111-1111-111111111111"), &mut ctx)
-        .expect("a tenant-pinned scope must render");
+    let sql = translate_scope(
+        &scope_expr("tenant_id eq 11111111-1111-1111-1111-111111111111"),
+        &mut ctx,
+    )
+    .expect("a tenant-pinned scope must render");
 
     assert_eq!(sql, "(tenant_id = $1)");
     assert_eq!(ctx.binds.len(), 1);
@@ -911,7 +914,10 @@ fn translate_scope_refuses_a_field_the_filterable_schema_does_not_carry() {
         .expect_err("a field off the filterable schema must not render");
 
     assert!(err.starts_with("invalid scope: "), "got: {err}");
-    assert!(err.contains("gts_type_id"), "the refusal names the field. got: {err}");
+    assert!(
+        err.contains("gts_type_id"),
+        "the refusal names the field. got: {err}"
+    );
     assert!(ctx.binds.is_empty(), "a refused scope binds nothing");
 }
 
