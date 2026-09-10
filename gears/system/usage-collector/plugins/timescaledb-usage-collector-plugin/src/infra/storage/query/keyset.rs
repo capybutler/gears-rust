@@ -78,8 +78,11 @@ pub fn ensure_forward_cursor(cursor: &CursorV1) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns an error string when `dirs` is empty, or when it carries more than
-/// one direction. Each entry point checks emptiness first, with its own
-/// message; the empty arm here is the fail-closed floor for a direct caller.
+/// one direction. Two of the three entry points check emptiness first, with
+/// their own message — [`keyset_predicate`] and [`encode_next_cursor`], whose
+/// messages name what was empty; [`render_order_by`] relies on this one, which
+/// emits the string its own guard used to. The empty arm is also the
+/// fail-closed floor for a direct caller of this public function.
 pub fn uniform_dir(dirs: impl IntoIterator<Item = SortDir>) -> Result<SortDir, String> {
     let mut dirs = dirs.into_iter();
     let Some(first) = dirs.next() else {
@@ -111,15 +114,13 @@ pub fn uniform_dir(dirs: impl IntoIterator<Item = SortDir>) -> Result<SortDir, S
 ///
 /// # Errors
 ///
-/// Returns an error string when the order is empty, when its directions are
-/// mixed, or when a field is not on the allowlist (never interpolated).
+/// Returns an error string when the order is empty or its directions are mixed
+/// (both from [`uniform_dir`], which sees the order before any column is
+/// resolved), or when a field is not on the allowlist (never interpolated).
 pub fn render_order_by(
     order: &ODataOrderBy,
     col: impl Fn(&str) -> Option<&'static str>,
 ) -> Result<String, String> {
-    if order.is_empty() {
-        return Err("order must not be empty".to_owned());
-    }
     let dir = match uniform_dir(order.0.iter().map(|key| key.dir))? {
         SortDir::Asc => "ASC",
         SortDir::Desc => "DESC",

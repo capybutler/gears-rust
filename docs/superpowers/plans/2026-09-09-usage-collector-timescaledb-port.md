@@ -1869,7 +1869,23 @@ below.**
   in, failing only on page two as a `500` — exactly the papering-over Step 2's
   wording says does not happen. The rule is now hoisted into `uniform_dir` and
   all three entry points resolve their direction through it, each with its own
-  test and its own named mutation.
+  test and its own named mutation. **`N1`-`N3` establish non-redundancy** —
+  bypassing the rule at one entry point reds that entry point's test and no
+  other, so no one of the three stands in for another. **`N4` establishes
+  dependence**: deleting the shared rule reds all four direction tests at once,
+  so it is load-bearing at every site rather than shadowed by a local check.
+  The two claims are different and neither mutation proves the other; the set
+  proves both.
+- **A duplicate empty guard was removed from `render_order_by` in review.** It
+  emitted a message byte-identical to `uniform_dir`'s empty arm, so deleting it
+  left the suite green and `render_order_by_rejects_empty_order` discriminated
+  nothing. Worth recording as its own instance of this slice's recurring shape:
+  the `# Errors` doc claimed "each entry point checks emptiness first, with its
+  own message", which was true of `keyset_predicate` and `encode_next_cursor`
+  and invented for the third — asserted in two places, in code written to fix
+  exactly that defect. `render_order_by` now relies on `uniform_dir` alone, and
+  weakening that arm (`N7`) or changing only its message (`N8`) reds both that
+  function's test and the rule's own.
 - **The reject message no longer cites the guarantee it is evidence against.**
   It reaches a caller through `record_store.rs:1090` ->
   `UsageCollectorPluginError::internal` -> `DomainError::Internal` ->

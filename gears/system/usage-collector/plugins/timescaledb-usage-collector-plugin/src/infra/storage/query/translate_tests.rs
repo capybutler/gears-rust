@@ -465,8 +465,11 @@ fn mixed_direction_order() -> ODataOrderBy {
 }
 
 /// The rule itself, at the one place all three entry points now resolve a
-/// direction. The empty arm is unreachable through those three — each checks
-/// emptiness first, with its own message — so it is only nameable here.
+/// direction. Two of the three check emptiness first with their own message,
+/// so `render_order_by` is the one that relies on the empty arm here — see
+/// [`render_order_by_rejects_empty_order`], which pins the composed behaviour.
+/// The mixed arm, and an empty order reached by a direct caller, are nameable
+/// only here.
 #[test]
 fn uniform_dir_accepts_one_direction_and_refuses_a_mixed_or_empty_order() {
     assert_eq!(uniform_dir([SortDir::Asc, SortDir::Asc]), Ok(SortDir::Asc));
@@ -534,6 +537,10 @@ fn render_order_by_rejects_unknown_column() {
     assert!(render_order_by(&order, record_column).is_err());
 }
 
+/// `render_order_by` has no empty guard of its own: [`uniform_dir`] sees the
+/// order first and refuses it there. A duplicate guard here emitted the
+/// byte-identical message, so this test passed whether or not it existed —
+/// it discriminates the composed path only now that there is one path.
 #[test]
 fn render_order_by_rejects_empty_order() {
     let err = render_order_by(&ODataOrderBy(vec![]), record_column).unwrap_err();
