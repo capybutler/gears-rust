@@ -825,7 +825,8 @@ docker rm -f uc-schema-check
 ```
 
 Expected: `CREATE EXTENSION`, `CREATE TABLE`, a `create_hypertable` row,
-`CREATE INDEX` x4, `CREATE TABLE`. No `ERROR:`.
+`CREATE TABLE`, and **five** `CREATE INDEX` (four read indexes plus the partial
+unique index). No `ERROR:`.
 
 If Docker is unavailable, say so plainly in the task report rather than
 claiming the schema was verified. Task 15 applies it for real.
@@ -1938,6 +1939,41 @@ usage_acceptance_seq  constraint() = Some("usage_acceptance_sequence_pkey")     
    as id `3`. The numeric part is unbounded and unknowable ahead of time, so no
    fixed prefix can be hardcoded.
 
+**The index does NOT fully discharge the SPI obligation, and this was
+measured.** Task 3's spec review provoked the constraint on a live container:
+
+- two invalidations of one target with the **same** `window_end` → correctly
+  rejected by `usage_records_one_invalidation_uniq`
+- two invalidations of one target with **different** `window_end` → **both
+  accepted**; `count(*) WHERE invalidates = target` returns 2
+
+So the database guarantee is conditional on every invalidation being a faithful
+copy of its target's covered period — which is the **Ingestion Gateway's**
+enforcement, upstream of the plugin. The SPI text says "**the store** MUST
+reject it". A caller reaching the SPI directly, which is exactly what the
+contract suite does, is not bound by the gateway.
+
+This is not a schema defect: no hypertable-compatible unique index can do
+better, because a UNIQUE must contain the partition column. **It is a decision
+you have to make**, and you are the first task with the means to make it,
+because you are adding the transaction:
+
+- **Option A — rely on the index alone.** Defensible: a faithful copy shares
+  the target's period by construction, so the uncovered case cannot arise
+  through any conforming ingestion path. Write down that the guarantee is
+  conditional and on whom.
+- **Option B — add an in-transaction check for the general case.** You will
+  have a transaction anyway for the sequence claim. A read-then-write *inside*
+  one transaction is not what the SPI forbids — its objection is to a
+  *gateway-side* pre-read, which "cannot exclude a concurrent second
+  submission". Inside the transaction, with the right locking, it can.
+
+**Do not leave this implicit.** Whichever you choose, say so at the call site
+and say why, because the next reader will otherwise assume the index is
+airtight. Note also that Task 14's `at_most_one_invalidation` contract check may
+pass or fail depending on which `window_end` its fixture uses — read that
+fixture before concluding your implementation is correct.
+
 **Use a boundary-anchored suffix match:**
 
 ```rust
@@ -1988,11 +2024,19 @@ load-bearing.
 
 - [ ] **Step 6: Translate the new constraint violation**
 
-**First, a stale doc this task inherits.** `map_insert_error`'s doc comment
-describes `UsageTypeNotFound`, an SDK error variant that no longer exists, and
-the code below it still constructs one. Doc and code are stale together, which
-is why Task 1 left both. Rewrite the doc to match what you implement here
-rather than carrying the sentence forward.
+**~~First, a stale doc this task inherits.~~ Already done by Task 3 — do not go
+looking for it.** An earlier draft said `map_insert_error`'s doc describes
+`UsageTypeNotFound` "and the code below it still constructs one". **Both halves
+are now false.** Task 3 had to delete that branch: `UsageTypeNotFound` and
+`UsageTypeGtsId` are both gone from the SDK, so it was a hard compile error, not
+a choice. Task 3 also rewrote the doc and dropped the now-unused `gts_id`
+parameter.
+
+What you actually inherit is a clean seam: `map_insert_error` exists, its doc
+names exactly the two constraints you must discriminate, and its parameter list
+is yours to set. Step 1's test already calls it as
+`map_insert_error(&err, &sample_invalidation_record())` — a `&UsageRecord`, not
+the dropped `&UsageTypeGtsId` — so nothing is owed back.
 
 `map_insert_error` (`:128`) maps a unique violation to `IdempotencyConflict`.
 It must now discriminate on the constraint name:
