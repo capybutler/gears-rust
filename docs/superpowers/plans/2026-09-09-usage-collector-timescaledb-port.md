@@ -4699,7 +4699,7 @@ owns both gaps.
 
 ## Task 15: Rewrite the Postgres integration suites
 
-Four suites survive Task 1 and every one was written against the old model.
+Five suites survive Task 1 and every one was written against the old model.
 
 **Files:**
 - Rewrite: `tests/records_ingest_integration_pg.rs` (702), `tests/records_query_integration_pg.rs` (919), `tests/cleanup_integration_pg.rs` (239), `tests/id_uniqueness_integration_pg.rs` (93), `tests/schema_integration_pg.rs` (75), `tests/common/mod.rs` (346)
@@ -5033,6 +5033,26 @@ cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features post
 ```
 
 Report the unfiltered `N passed / M skipped`.
+
+**Two things Task 15 leaves open rather than resolved, recorded so a recurrence
+has a prior:**
+
+1. **The container-start retry, and what it is for.** `bring_up_with` now makes
+   up to three attempts to start a container, because roughly one start in
+   thirty came up *running* with no host binding for 5432 —
+   `get_host_port_ipv4` answering `container '<id>' does not expose port
+   5432/tcp`, always at ~9.5 s. Nine of them landed in one 50-container run,
+   which is nine tests whose questions went unasked. Manual starts, six at a
+   time, publish every time, so it reads as the daemon racing itself rather
+   than anything about the image. The last attempt's error is returned
+   unchanged, so an image that genuinely does not expose 5432 still fails with
+   the message that says so.
+2. **One unexplained full-run failure, not reproduced.** In the run immediately
+   after a rebuild, one test of 261 failed; the run was being grepped for its
+   summary line only, so the identity and the message were not captured. Seven
+   subsequent full unfiltered runs were 261/261, as were six targeted runs of
+   the two concurrency tests. Left as an open observation rather than closed by
+   assertion: if it recurs, this is its prior.
 
 - [x] **Step 8: Commit**
 
@@ -5464,37 +5484,61 @@ Changes owed:
   not O(largest group): under a HashAggregate plan every group's array is live
   at once, and only a sorted GroupAggregate gives the weaker bound, the planner
   chooses" — is false, and the entry must not publish it. Measured on
-  `timescale/timescaledb:2.29.2-pg18` (`PostgreSQL` 18.6), default 4 MB
-  `work_mem`:
+  `timescale/timescaledb:2.29.2-pg18` (`PostgreSQL` 18.6) at the **image's
+  tuned** `work_mem`, not `PostgreSQL`'s compiled 4 MB default: the image runs
+  `001_timescaledb_tune.sh` at initdb, so a fresh container reports
+  `work_mem = 7837kB` and `shared_buffers = 1959MB` on the measuring host. No
+  `SET` was issued. (Task 15 first wrote "default 4 MB `work_mem`" from the
+  compiled default rather than from the `SHOW`; spec review caught it. Nothing
+  downstream moves — hash aggregation is unavailable at any `work_mem`, and the
+  array peak is not `work_mem`-bounded.)
+
+  **The entry must publish the deltas, not the absolutes.** Every RSS figure
+  below is from one host and one fixture table whose shape this plan does not
+  state, and peak RSS counts the shared buffers a backend has touched — so on
+  that tuned 1 959 MB `shared_buffers` the absolutes are an order of magnitude
+  above what an independent replication saw (76.8 / 84.5 / 84.2 / 110.3 MB for
+  the same four queries). **The differences reproduced exactly**, and the
+  differences are the whole claim.
 
   1. **The planner never chooses a HashAggregate here.** An aggregate carrying
      its own `ORDER BY` takes the grouped node off the hash path entirely: with
      `enable_sort` *and* `enable_incremental_sort` off, the plan is still
-     `Sort → GroupAggregate` with the `Sort` reported `Disabled: true`. The same
-     statement with the inner `ORDER BY` dropped plans as a `HashAggregate`
-     immediately, and adding one ordered aggregate beside a plain `MAX` takes
-     that query off the hash path too. It is a property of ordered aggregation,
-     not of this expression.
+     `Sort → GroupAggregate` with the `Sort` reported `Disabled: true` — and a
+     disabled node is chosen only when no alternative path exists, while
+     `HashAggregate` was never disabled. The same statement with the inner
+     `ORDER BY` dropped plans as a `HashAggregate` immediately; adding one
+     ordered aggregate beside a plain `MAX` takes that query off the hash path
+     too; `COUNT(DISTINCT …)` behaves identically; and with an index supplying
+     the order and every scan method disabled the node is *still*
+     `GroupAggregate`. It is a property of ordered and distinct aggregation
+     generally, not of this expression, this data or this row count.
   2. **So the peak is O(largest group), and it is real.** Exactly one array is
      live at a time. On the worst case for it — 1 000 000 rows in one group,
-     parallelism off — peak backend RSS was 1 022.7 MB against 988.6 MB for
-     `MAX(r.value)` over the same rows: **+34 MB, ≈34 bytes per row in the
-     largest group**, reproducible to ±0.2 MB. The array does not spill.
+     parallelism off — peak backend RSS ran **+34 MB over `MAX(r.value)`** on
+     the same rows (1 022.7 MB against 988.6 MB here; +33.5 MB in the
+     independent replication), i.e. **≈34 bytes per row in the largest group**,
+     reproducible to ±0.2 MB across runs. The array does not spill.
   3. **The `Sort` beneath does scan-sized work, and is not this fold's cost.**
      It materializes the whole selection but is `work_mem`-bounded and spills
-     (`external merge`, ~10 MB per worker at 1 000 000 rows). Every candidate
+     rather than growing: `external merge`, ~10 MB in each of four workers under
+     the image's default parallelism at 1 000 000 rows, and 41 MB as a single
+     sort with `max_parallel_workers_per_gather = 0` (33 MB in the independent
+     replication — fixture-dependent absolute, same shape). Every candidate
      formulation needs the same sort.
 
   **Both alternatives were measured and both stay out.** On that single-group
-  worst case `DISTINCT ON` peaked at 997.6 MB and
-  `ROW_NUMBER() OVER (PARTITION BY …) = 1` at 997.4 MB — 25 MB below the shipped
-  form, O(1) per group — with execution times inside run-to-run noise (86-111 ms
-  at 100 000 rows, 257-293 ms at 1 000 000). Neither is a `SELECT`-list
-  expression that composes beside `SUM`, and neither can express the ungrouped
-  fold: `DISTINCT ON ()` is a syntax error, and `PARTITION BY` nothing — like the
-  `ORDER BY … LIMIT 1` rewrite — answers **zero** rows over an empty selection
-  where the SPI owes exactly one empty-keyed bucket. So `aggregate.rs` is
-  unchanged, and the entry publishes a limit rather than a fix.
+  worst case `DISTINCT ON` and `ROW_NUMBER() OVER (PARTITION BY …) = 1` both
+  peaked **~25 MB below** the shipped form (997.6 MB and 997.4 MB here; 25.8 MB
+  and 26.1 MB below in the independent replication), O(1) per group — with
+  execution times inside the run-to-run noise of the parallel plan (86-111 ms at
+  100 000 rows, 257-293 ms at 1 000 000, all three formulations). Neither is a
+  `SELECT`-list expression that composes beside `SUM`, and neither can express
+  the ungrouped fold: `DISTINCT ON ()` is a syntax error, and `PARTITION BY`
+  nothing — like the `ORDER BY … LIMIT 1` rewrite — answers **zero** rows over
+  an empty selection where the SPI owes exactly one empty-keyed bucket. So
+  `aggregate.rs` is unchanged, and the entry publishes a limit rather than a
+  fix.
 
   **This is a limit to publish, not a question to weigh.** DESIGN §3.10 asks
   each plugin's deployment guide to state the bounds it can hold, and this is
@@ -5506,6 +5550,20 @@ Changes owed:
   correction is already on `RecordStore::aggregate`'s rustdoc and on
   `LATEST_SELECT_EXPR`'s, which ship; what does not exist until this entry is
   written is the register a reviewer reads.
+- **One stale SDK doc Task 15 found and correctly did not touch.**
+  `AggregationBucket::value`'s rustdoc
+  (`usage-collector-sdk/src/models.rs`, the `value` field of
+  `AggregationBucket`) still discusses `AVG`: "`AVG` is now exact in magnitude
+  but may still carry a backend/plugin-chosen rounding scale on non-terminating
+  quotients", and names it again in "a wide `SUM` (or large-magnitude `AVG`)".
+  **`AVG` is not an `AggregationFold`** — the set is `Sum`, `Count`, `Max`,
+  `Min`, `Latest` — so the sentence describes a fold no surface can request and
+  no plugin can be asked to serve. It is the retired vocabulary surviving in
+  prose after the enum moved, which is why Task 15 deleted
+  `pg_aggregate_avg_rounds_non_terminating_quotient` outright rather than
+  porting it. The precision paragraph's `SUM`/`MIN`/`MAX`/`COUNT` half is
+  correct and stays; only the two `AVG` clauses go. Outside the plugin crate,
+  so it was routed here rather than fixed in Task 15's commits.
 - **Any further entry** this port turned up, beyond the `LATEST` one above.
 
 - [ ] **Step 6: Full verification bar, one last time**

@@ -634,6 +634,101 @@ async fn an_in_batch_duplicate_resolves_against_the_row_the_batch_wrote() {
     assert_eq!(rows, 1, "one dedup key, one row");
 }
 
+/// A batch in which **every** row conflicts: nothing is inserted at all, and
+/// each outcome still names its own seed.
+///
+/// Its own case rather than a weaker `batch_outcomes_are_aligned_with_input_order`
+/// - that one always wins at least one slot, so the multi-row `INSERT` always
+/// returns rows and `read_conflict_records` is always handed a proper subset.
+/// Here the insert wins nothing, `inserted` is empty, and every key goes down
+/// the conflict-read path at once. Two things could hide in that shape and in
+/// no other: an empty-`RETURNING` path that mistook "won no slot" for "found no
+/// row", and an off-by-one in the alignment, which needs each row to conflict
+/// against a *different* seed to be visible. So the three keys are distinct
+/// rather than three divergent writes of one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_in_which_every_row_conflicts_inserts_nothing_and_stays_aligned() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x000A_11C0);
+
+    // Three distinct keys, each seeded at its own quantity and its own period.
+    let mut seeded = Vec::with_capacity(3);
+    for i in 0..3_i64 {
+        let rec = common::entry_over(
+            &meter,
+            tenant,
+            &format!("all-conf-{i}"),
+            Decimal::from(i + 1),
+            common::fixture_window_start() + Duration::hours(i),
+            common::fixture_window_end() + Duration::hours(i),
+        );
+        seeded.push(store.create(rec).await.expect("seed"));
+    }
+    let sequences_before = sequences_for(&h.pool, tenant, common::VCPU_METER).await;
+    assert_eq!(sequences_before.len(), 3);
+
+    // The same three keys and periods, every one at a divergent quantity.
+    let batch: Vec<UsageRecord> = (0..3_i64)
+        .map(|i| {
+            common::entry_over(
+                &meter,
+                tenant,
+                &format!("all-conf-{i}"),
+                Decimal::from(i + 100),
+                common::fixture_window_start() + Duration::hours(i),
+                common::fixture_window_end() + Duration::hours(i),
+            )
+        })
+        .collect();
+
+    let results = store
+        .create_batch(batch)
+        .await
+        .expect("a batch every row of which conflicts is still a successful call");
+
+    assert_eq!(results.len(), 3, "one outcome per input row");
+    for (i, r) in results.iter().enumerate() {
+        match r {
+            Err(UsageCollectorPluginError::IdempotencyConflict {
+                idempotency_key,
+                existing_id,
+            }) => {
+                assert_eq!(
+                    idempotency_key,
+                    &format!("all-conf-{i}"),
+                    "row {i}'s conflict must name row {i}'s key"
+                );
+                assert_eq!(
+                    *existing_id, seeded[i].id,
+                    "row {i}'s conflict must name row {i}'s seed, not a neighbour's"
+                );
+            }
+            other => panic!("row {i} must be IdempotencyConflict, got {other:?}"),
+        }
+    }
+
+    // Nothing was written, and nothing was overwritten.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(&h.pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 3, "an all-conflict batch inserts nothing");
+    let stored: Vec<Decimal> = sqlx::query_scalar(
+        "SELECT value FROM usage_records WHERE tenant_id = $1 ORDER BY window_end",
+    )
+    .bind(tenant)
+    .fetch_all(&h.pool)
+    .await
+    .expect("read the stored quantities");
+    assert_eq!(
+        stored,
+        vec![Decimal::from(1), Decimal::from(2), Decimal::from(3)],
+        "fail-closed: the seeded quantities are untouched by the divergent batch"
+    );
+}
+
 /// A batch of distinct entries all insert, and the sequence they were assigned
 /// is strictly monotonic across the whole block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
