@@ -47,10 +47,16 @@ use super::translate::SqlCtx;
 /// `ORDER BY`), and is named here because a reader will otherwise reach for it.
 ///
 /// Both `DISTINCT ON` and a `ROW_NUMBER()` window have since been **measured**
-/// against this form rather than only argued about; the numbers, and why the
-/// 25 MB they save on a single-group worst case does not buy back the
-/// composition they cost, are on [`super::super::record_store::PgRecordStore`]'s
-/// `aggregate`.
+/// against this form rather than only argued about, and both stay out. The
+/// decisive fact is not the memory, and belongs here rather than behind a link:
+/// **neither can express the ungrouped fold.** `DISTINCT ON ()` is a syntax
+/// error, and `PARTITION BY` nothing - like the `ORDER BY … LIMIT 1` rewrite -
+/// answers **zero** rows over an empty selection, where the SPI owes exactly
+/// one empty-keyed bucket. Adopting either therefore means a second statement
+/// shape for this one fold, carrying its own empty-selection special case.
+/// The measurement itself - ~25 MB saved on a single-group worst case, and why
+/// that does not buy the composition back - is on
+/// [`super::super::record_store::PgRecordStore`]'s `aggregate`.
 const LATEST_SELECT_EXPR: &str =
     "(ARRAY_AGG(r.value ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric";
 

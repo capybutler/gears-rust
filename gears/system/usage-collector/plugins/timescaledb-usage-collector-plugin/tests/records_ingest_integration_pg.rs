@@ -95,7 +95,53 @@ async fn setup_metered() -> (
     (h, store, provider, exporter)
 }
 
+/// The counters this file asserts on, positively or negatively.
+///
+/// Named in one place so [`the_asserted_counter_names_are_all_declared`] can
+/// check every one of them against the crate's own inventory.
+const ASSERTED_COUNTERS: &[&str] = &[
+    "uc_timescaledb_invalidation_rejected_statements_total",
+    "uc_timescaledb_invalidation_rejected_rows_total",
+    "uc_timescaledb_invalidations_total",
+    "uc_timescaledb_batch_retries_total",
+];
+
+/// Every counter this file names must be one the crate actually declares.
+///
+/// [`counter_sum`] answers **0** for an instrument that was never recorded and
+/// **0** for one that does not exist, and the negative assertions in this file
+/// depend on the first meaning. A rename would turn every one of them into a
+/// tautology while leaving them green, so the ambiguity is resolved here
+/// instead: this is the single place that fails on a rename, and it fails
+/// naming the instrument.
+// `#[tokio::test]` and not `#[test]`: `connect_lazy` opens no connection but
+// does spawn the pool's background maintenance task, which needs a runtime.
+// No Docker, no container - this is the one test in the file that touches
+// neither.
+#[tokio::test]
+async fn the_asserted_counter_names_are_all_declared() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://user:pass@localhost/db")
+        .expect("a syntactically valid DSN yields a lazy pool without connecting");
+    let declared = Metrics::new(pool).declared_instrument_names();
+    for name in ASSERTED_COUNTERS {
+        assert!(
+            declared.contains(name),
+            "`{name}` is asserted on in this file but is not among the crate's declared \
+             instruments, so every assertion naming it reads 0 whatever the code does. \
+             Declared: {declared:?}"
+        );
+    }
+}
+
 /// Total of the `u64` counter data points named `name`.
+///
+/// **0 for an instrument that exists and was never recorded, and 0 for one that
+/// does not exist.** That ambiguity is closed by
+/// [`the_asserted_counter_names_are_all_declared`] rather than here, because
+/// an OpenTelemetry counter with no recorded value need not be exported at all,
+/// so "absent" is the *normal* reading of a legitimate zero and cannot be made
+/// an error at this seam.
 fn counter_sum(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
     let metrics = exporter.get_finished_metrics().expect("exported metrics");
     for resource_metrics in &metrics {
@@ -505,15 +551,25 @@ async fn two_withdrawals_of_one_target_in_one_batch_yield_exactly_one_acceptance
     );
 }
 
-/// Two **concurrent** `create` calls withdrawing one target: exactly one is
-/// accepted.
+/// Two `create` calls withdrawing one target, issued concurrently **in one
+/// scope**: exactly one is accepted.
 ///
-/// A sequential test cannot see this. The obligation the SPI states is that the
-/// refusal is atomic with the entry it admits — a read followed by a write will
-/// not do — and only two writers racing for the same slot distinguish an index
-/// from a pre-read that happens to be right when nothing else is running.
+/// **This one does not race the index, and the reason is worth stating rather
+/// than leaving as an unearned concurrency claim.** `create_inner` claims the
+/// entry's `acceptance_sequence` as step 1, inside the transaction that will
+/// insert it, and both withdrawals below share a `(tenant_id, gts_type_id)`.
+/// So the second blocks on that counter row until the first commits and only
+/// then reaches `usage_records_one_invalidation_uniq` — the calls are
+/// concurrent at the caller and serialised at the backend. A hypothetical
+/// pre-read implementation would pass this test, because there is nothing left
+/// to race.
+///
+/// What it does assert, and what is worth asserting, is that the serialised
+/// second writer is refused rather than admitted, and refused by name. The
+/// case that genuinely races the index is the next test, which crosses scopes
+/// so the counter cannot serialise it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_concurrent_withdrawals_of_one_target_admit_exactly_one() {
+async fn two_withdrawals_of_one_target_in_one_scope_admit_exactly_one() {
     let (h, store) = setup().await;
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x1_A712);
@@ -542,6 +598,91 @@ async fn two_concurrent_withdrawals_of_one_target_admit_exactly_one() {
             assert_eq!(*id, target.id);
         }
         other => panic!("the losing withdrawal must be AlreadyInvalidated, got {other:?}"),
+    }
+
+    let withdrawals: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE invalidates = $1")
+            .bind(target.id)
+            .fetch_one(&h.pool)
+            .await
+            .expect("count withdrawals");
+    assert_eq!(withdrawals, 1, "and the ledger holds one, not two");
+}
+
+/// Two withdrawals of one target from **different `(tenant_id, gts_type_id)`
+/// scopes**, concurrently: exactly one is accepted, and the index is the only
+/// thing that can have decided it.
+///
+/// **This is the test the atomicity obligation is for.** The SPI says the
+/// refusal must be atomic with the entry it admits — a read followed by a write
+/// will not do — and the test above cannot demonstrate that, because the
+/// per-scope acceptance-sequence row serialises two same-scope writers before
+/// either reaches the index. Crossing scopes removes that serialisation: the
+/// two transactions claim different counter rows, proceed concurrently, and
+/// meet for the first time at `usage_records_one_invalidation_uniq`, which is
+/// **not** scope-partitioned — it is over `(invalidates, window_end)` alone.
+/// A pre-read implementation fails here, and passes the test above.
+///
+/// **The shape is deliberately one the Ingestion Gateway would never emit.** A
+/// withdrawal naming a target in another tenant's scope is not a request any
+/// caller should be able to make, and the gateway is what stops it. This test
+/// reaches the SPI directly precisely because the store's own obligation is to
+/// the index rather than to the gateway's shape rules: the store must not admit
+/// two withdrawals of one entry whatever route they arrive by, and this is the
+/// only route on which both can be in flight at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_withdrawals_of_one_target_from_different_scopes_race_on_the_index_alone() {
+    let (h, store) = setup().await;
+    let vcpu = common::meter(common::VCPU_METER);
+    let gb = common::meter(common::GB_METER);
+    let owner = Uuid::from_u128(0x1_A713);
+    let other = Uuid::from_u128(0x1_A714);
+
+    let target = common::entry(&vcpu, owner, "idem-target", Decimal::new(10, 0));
+    let target = store.create(target).await.expect("create the target");
+
+    // Two withdrawals of that one entry, in two scopes that share neither the
+    // tenant nor the meter — so neither the counter row nor anything else
+    // serialises them. Both copy the target's `window_end`, which is what puts
+    // them in the same index slot.
+    let mut a = common::withdrawal_of(&target, "idem-race-a");
+    a.tenant_id = owner;
+    let a = common::rederive(a);
+    let mut b = common::withdrawal_of(&target, "idem-race-b");
+    b.tenant_id = other;
+    b.gts_type_id = gb.clone();
+    let b = common::rederive(b);
+    assert_ne!(
+        (a.tenant_id, a.gts_type_id.as_str()),
+        (b.tenant_id, b.gts_type_id.as_str()),
+        "the two withdrawals must sit in different acceptance-sequence scopes, or the \
+         counter row serialises them and the index is never asked"
+    );
+    assert_eq!(a.window_end, b.window_end, "same index slot");
+
+    let (sa, sb) = (store.clone(), store.clone());
+    let (ra, rb) = tokio::join!(
+        tokio::spawn(async move { sa.create(a).await }),
+        tokio::spawn(async move { sb.create(b).await }),
+    );
+    let ra = ra.expect("task a did not panic");
+    let rb = rb.expect("task b did not panic");
+
+    let accepted = usize::from(ra.is_ok()) + usize::from(rb.is_ok());
+    assert_eq!(
+        accepted, 1,
+        "exactly one withdrawal of one target may be admitted, across scopes as within \
+         one; got a={ra:?} b={rb:?}"
+    );
+    let loser = if ra.is_ok() { &rb } else { &ra };
+    match loser {
+        Err(UsageCollectorPluginError::AlreadyInvalidated { id, .. }) => {
+            assert_eq!(*id, target.id);
+        }
+        // The index refused it and the diagnostic read could not name the
+        // winner in time; still a refusal, and still not an acceptance.
+        Err(UsageCollectorPluginError::Transient { .. }) => {}
+        other => panic!("the losing withdrawal must be refused, got {other:?}"),
     }
 
     let withdrawals: i64 =
@@ -666,7 +807,11 @@ async fn a_batch_in_which_every_row_conflicts_inserts_nothing_and_stays_aligned(
         seeded.push(store.create(rec).await.expect("seed"));
     }
     let sequences_before = sequences_for(&h.pool, tenant, common::VCPU_METER).await;
-    assert_eq!(sequences_before.len(), 3);
+    assert_eq!(
+        sequences_before,
+        vec![1, 2, 3],
+        "three seeded entries, one block each"
+    );
 
     // The same three keys and periods, every one at a divergent quantity.
     let batch: Vec<UsageRecord> = (0..3_i64)
@@ -727,6 +872,18 @@ async fn a_batch_in_which_every_row_conflicts_inserts_nothing_and_stays_aligned(
         vec![Decimal::from(1), Decimal::from(2), Decimal::from(3)],
         "fail-closed: the seeded quantities are untouched by the divergent batch"
     );
+
+    // Nor did the refused batch leave an acceptance sequence behind. It claimed
+    // a block - the claim happens before the insert and cannot know the insert
+    // will win nothing - and rolling the transaction back is what returns it.
+    // Gaps are permitted by the contract, so this is not "the values are
+    // dense"; it is "no *stored* entry acquired a new one", which is the part a
+    // failed batch could get wrong.
+    assert_eq!(
+        sequences_for(&h.pool, tenant, common::VCPU_METER).await,
+        sequences_before,
+        "an all-conflict batch must store no acceptance sequence of its own"
+    );
 }
 
 /// A batch of distinct entries all insert, and the sequence they were assigned
@@ -766,11 +923,17 @@ async fn a_hundred_distinct_entries_all_insert_under_one_monotonic_block() {
         assert!(r.is_ok(), "row {i} must insert: {r:?}");
     }
 
+    // `sequences_for` reads with `ORDER BY acceptance_sequence`, so a
+    // `windows(2)` monotonicity check can only ever fail on a duplicate - it is
+    // very nearly unfalsifiable as an assertion. The scope is fresh and this
+    // batch claimed one block, so the values are knowable exactly, and naming
+    // them is what makes a block claimed twice, claimed short, or expanded with
+    // the off-by-one in `sequence_block` visible.
     let seqs = sequences_for(&h.pool, tenant, common::VCPU_METER).await;
-    assert_eq!(seqs.len(), 100);
-    assert!(
-        seqs.windows(2).all(|w| w[0] < w[1]),
-        "a batch's block claim must still be strictly monotonic: {seqs:?}"
+    assert_eq!(
+        seqs,
+        (1..=100).collect::<Vec<i64>>(),
+        "one batch into a fresh scope claims one contiguous block, 1..=100"
     );
 }
 
@@ -789,12 +952,19 @@ async fn an_empty_batch_is_a_host_contract_breach() {
     );
 }
 
-/// Two batches whose key sets overlap, run concurrently, complete without a
-/// deadlock and leave one row per dedup key.
+/// Two batches whose key sets overlap, run concurrently **in one scope**,
+/// complete and leave one row per dedup key.
 ///
-/// `plan_batch` sorts its representatives by dedup key so concurrent multi-row
-/// inserts take the same global order; the bounded retry above it absorbs a
-/// victim if one appears anyway.
+/// **This one does not exercise `plan_batch`'s lock ordering, and saying it did
+/// would be an unearned claim.** Both batches sit in a single
+/// `(tenant_id, gts_type_id)`, so `claim_batch_sequences` takes that one
+/// counter row first and the second batch waits there: delete
+/// `plan_batch`'s `reps.sort_by` and this test still passes. What it does
+/// assert is the per-row outcome of an overlap - every shared key absorbs
+/// against the batch that won it, rather than conflicting or duplicating.
+///
+/// The deadlock-freedom the sort exists for needs two scopes taken in opposite
+/// orders, which is the next test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_overlapping_batches_leave_one_row_per_key() {
     let (h, store) = setup().await;
@@ -846,6 +1016,97 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
         .await
         .expect("count");
     assert_eq!(rows, 30, "twenty plus twenty with ten keys in common");
+}
+
+/// Two batches spanning **two scopes in opposite input order**, run
+/// concurrently: no deadlock victim is ever produced.
+///
+/// **This is what `plan_batch`'s `reps.sort_by` is for, and the only test that
+/// reaches it.** `claim_batch_sequences` walks `plan.reps` and takes one
+/// `usage_acceptance_sequence` row lock per `(tenant_id, gts_type_id)` run, in
+/// the order the runs appear. Sorted by dedup key, whose first two components
+/// *are* the scope, every batch in the process takes those locks in one global
+/// order. Unsorted, batch A takes vcpu then gb while batch B takes gb then
+/// vcpu - the ABBA deadlock, which `PostgreSQL` breaks by aborting a victim
+/// after `deadlock_timeout`.
+///
+/// **The assertion is on the retry counter, not on the outcome**, because the
+/// outcome hides the defect: `create_batch` wraps itself in a bounded retry, so
+/// a deadlock victim re-runs and succeeds, and every row still comes back
+/// `Ok`. `uc_timescaledb_batch_retries_total` is what distinguishes "took the
+/// locks in one order" from "deadlocked and recovered". It must be **zero**:
+/// the sort is supposed to make the deadlock unreachable, not survivable.
+///
+/// Several rounds rather than one, because a deadlock needs the two
+/// transactions to interleave and one round can miss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock() {
+    let (h, store, provider, exporter) = setup_metered().await;
+    let vcpu = common::meter(common::VCPU_METER);
+    let gb = common::meter(common::GB_METER);
+    let tenant = Uuid::from_u128(0x0DEA_D10D);
+
+    // One round's rows for one scope. Both batches carry byte-identical rows,
+    // so every overlap is an exact retry - a divergent one would be an
+    // `IdempotencyConflict` and would say nothing about lock order.
+    let rows_for = |meter: &_, round: i64| -> Vec<UsageRecord> {
+        (0..4_i64)
+            .map(|i| {
+                let n = round * 4 + i;
+                common::entry_over(
+                    meter,
+                    tenant,
+                    &format!("deadlock-{n}"),
+                    Decimal::from(n + 1),
+                    common::fixture_window_start() + Duration::minutes(n),
+                    common::fixture_window_end() + Duration::minutes(n),
+                )
+            })
+            .collect()
+    };
+
+    for round in 0..6_i64 {
+        let (vcpu_rows, gb_rows) = (rows_for(&vcpu, round), rows_for(&gb, round));
+        // A: vcpu then gb. B: gb then vcpu. Same rows, opposite input order.
+        let mut a = vcpu_rows.clone();
+        a.extend(gb_rows.clone());
+        let mut b = gb_rows;
+        b.extend(vcpu_rows);
+
+        let (sa, sb) = (store.clone(), store.clone());
+        let (ra, rb) = tokio::join!(
+            tokio::spawn(async move { sa.create_batch(a).await }),
+            tokio::spawn(async move { sb.create_batch(b).await }),
+        );
+        let ra = ra
+            .expect("task a did not panic")
+            .expect("batch a completed");
+        let rb = rb
+            .expect("task b did not panic")
+            .expect("batch b completed");
+        for (i, r) in ra.iter().chain(rb.iter()).enumerate() {
+            assert!(r.is_ok(), "round {round} row {i}: {r:?}");
+        }
+    }
+
+    provider.force_flush().expect("flush metrics");
+    assert_eq!(
+        counter_sum(&exporter, "uc_timescaledb_batch_retries_total"),
+        0,
+        "a batch was retried, which means two concurrent batches took the per-scope \
+         acceptance-sequence row locks in different orders and one was aborted as a \
+         deadlock victim. plan_batch sorts its representatives by dedup key - whose \
+         leading components are the scope - precisely so that cannot happen; the retry \
+         is the backstop, not the mechanism."
+    );
+
+    // And the ledger holds one row per key, in both scopes.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE tenant_id = $1")
+        .bind(tenant)
+        .fetch_one(&h.pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 48, "6 rounds x 4 keys x 2 scopes, each written once");
 }
 
 // ---------------------------------------------------------------------------

@@ -512,7 +512,15 @@ impl Metrics {
     ///
     /// Renaming an instrument in [`Self::with_meter`] without renaming it here
     /// fails that assertion, from the other side.
-    #[cfg(test)]
+    /// Gated on `any(test, feature = "postgres")` rather than `test` alone, for
+    /// the same reason [`crate::infra::storage::migration_probe`] is: the
+    /// `tests/*.rs` integration crates are external to this one, and an
+    /// inventory they cannot reach is an inventory they will hand-copy.
+    /// `records_ingest_integration_pg` checks the counter names it asserts on
+    /// against this list, because its `counter_sum` reads a renamed instrument
+    /// as a legitimate zero. `postgres` is a test-only feature, so nothing
+    /// ships with this compiled in.
+    #[cfg(any(test, feature = "postgres"))]
     #[must_use]
     pub fn declared_instrument_names(&self) -> Vec<&'static str> {
         let Self {

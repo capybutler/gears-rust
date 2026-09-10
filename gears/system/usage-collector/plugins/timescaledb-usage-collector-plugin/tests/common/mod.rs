@@ -18,16 +18,18 @@ use std::sync::Arc;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use testcontainers::core::WaitFor;
+use testcontainers::core::logs::LogSource;
+use testcontainers::core::wait::LogWaitStrategy;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use toolkit_odata::ast;
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, TimeRange,
-    UsageRecord, derive_usage_record_id,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, UsageRecord,
+    derive_usage_record_id,
 };
 
 use timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig;
@@ -65,6 +67,25 @@ pub const NO_DROP_RETENTION_SECS: u64 = 100 * 365 * 86_400;
 
 /// The production default (365 days). Only for tests whose subject IS retention.
 pub const REAL_RETENTION_SECS: u64 = 365 * 86_400;
+
+/// How many containers [`bring_up_with`] will burn through before giving up,
+/// and how long it waits before starting the next one.
+///
+/// Three, because the failures it absorbs are contention against the Docker
+/// daemon and a third attempt has never been needed; the backoff is there
+/// because an immediate restart re-enters the contention that just lost.
+const CONTAINER_ATTEMPTS: u32 = 3;
+const CONTAINER_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How many times [`bring_up_with`] tries to open the pool against **one**
+/// container, and how long it waits between tries - 10 seconds per container,
+/// 30 seconds across all three.
+///
+/// Stated rather than inlined as a bare `0..20` because it is the only thing
+/// that absorbs a server which has announced itself but is not yet accepting
+/// connections, so its size decides whether the suite is flaky under load.
+const CONNECT_ATTEMPTS: u32 = 20;
+const CONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub async fn bring_up() -> anyhow::Result<TsHarness> {
     // Default pool bounds and statement timeout (mirrors the config defaults),
@@ -132,78 +153,182 @@ pub async fn bring_up_with(
     // not `Clone`, so the retry below needs to build a fresh one per attempt.
     let image = || {
         test_containers::timescaledb()
-            .with_wait_for(WaitFor::message_on_stderr(
-                "database system is ready to accept connections",
+            // Wait for the **second** "ready", across **both** streams. Both
+            // halves of that are load-bearing.
+            //
+            // *Why the second.* This image announces readiness twice, and only
+            // the second server is one a test can reach. `docker-entrypoint.sh`
+            // runs a temporary bootstrap server for initdb with
+            // `-c listen_addresses=''` (entrypoint line 297), i.e. **unix
+            // socket only**; that one announces itself first. The image then
+            // runs `/docker-entrypoint-initdb.d/001_timescaledb_tune.sh` - which
+            // is also what makes `work_mem` 7837kB rather than the compiled
+            // 4 MB - stops the bootstrap server, and starts the real one, which
+            // announces itself again. Measured on
+            // `timescale/timescaledb:2.29.2-pg18`: the bootstrap server at
+            // `21:42:21.855`, the tune script, `PostgreSQL init process
+            // complete`, then the real server at `21:42:22.498`. Waiting for
+            // the first hands back a container whose published TCP port
+            // refuses connections, leaving `build_pool`'s retry budget below as
+            // the only thing between this suite and `pool connect failed`.
+            //
+            // *Why `BothStd`.* The two lines are not on the same stream as the
+            // Docker API frames them: measured against this exact API,
+            // `LogSource::StdErr` with `times(2)` never fires (45 s timeout),
+            // while `BothStd` with `times(2)` returns in ~1.2 s and `BothStd`
+            // with `times(3)` never fires - so there are exactly two in total
+            // and they are split across the streams. Do not "tighten" this to
+            // `stderr`; it was tried, and it hangs.
+            //
+            // Every container here is freshly created, so the count is always
+            // exactly 2. A reused volume would skip initdb and log it once,
+            // which is one more reason this harness never reuses one.
+            .with_wait_for(WaitFor::log(
+                LogWaitStrategy::new(
+                    LogSource::BothStd,
+                    "database system is ready to accept connections",
+                )
+                .with_times(2),
             ))
             .with_env_var("POSTGRES_USER", "user")
             .with_env_var("POSTGRES_PASSWORD", "pass")
             .with_env_var("POSTGRES_DB", "app")
     };
-    // Start, and retry a container that comes up without a published port.
+    // Start a container and connect to it, and treat **the whole of that** as
+    // one attempt that may be retried with a fresh container.
     //
-    // Measured on this workspace: a full `--features postgres` run starts ~50
-    // containers, and roughly one in thirty comes back from `start()` running
-    // but with no host binding for 5432 - `get_host_port_ipv4` then answers
-    // `container '<id>' does not expose port 5432/tcp`. It is the Docker
-    // daemon's port publication racing the container's own start, not anything
-    // about this image: the same image started by hand, six at a time, publishes
-    // every time.
+    // Three failure modes were measured on a fully loaded run of this suite,
+    // and they are all the same underlying thing - the Docker daemon's port
+    // publication racing a container that is already running - so they are
+    // handled together rather than one at a time:
     //
-    // Retried rather than tolerated, because a harness failure is not a test
-    // result and nine of them in one run is nine tests whose questions went
-    // unasked. Bounded at three, and the last attempt's error is returned
-    // unchanged - so an image that genuinely does not expose 5432 still fails
-    // with the message that says so, after three seconds rather than
-    // immediately.
-    let mut started = None;
-    for attempt in 1..=3u32 {
-        let container = image().start().await?;
-        match container.get_host_port_ipv4(5432).await {
-            Ok(port) => {
-                started = Some((container, port));
-                break;
-            }
-            Err(err) if attempt == 3 => return Err(err.into()),
+    // 1. `get_host_port_ipv4` answers `container '<id>' does not expose port
+    //    5432/tcp`. Measured at ~11 occurrences across 6 full runs of ~264
+    //    containers each, i.e. under 1%.
+    // 2. `start()` exceeds its startup timeout waiting for a readiness message
+    //    a loaded box is slow to produce.
+    // 3. **The published port answers, and it is not this container's
+    //    PostgreSQL.** Observed once as `pool connect failed … UnexpectedEof
+    //    "expected to read 1414811696 bytes, got 47 bytes at EOF"` - and
+    //    `1414811696` is `0x54524150`, the ASCII bytes `TRAP`, read as a
+    //    length prefix. A Postgres server does not send that; something else
+    //    was on the port. It happened in the one run of six that also retried
+    //    a container, which is what ties it to the same race.
+    //
+    // (3) is why the pool connect is **inside** this loop rather than after it:
+    // no amount of retrying `build_pool` against a wrong port can help, because
+    // the port stays wrong. Discarding the container and starting another is
+    // the only thing that can, and it is what the earlier shape - retry the
+    // port lookup, then retry the pool separately for 30 s - could not do.
+    //
+    // Bounded at three containers, and the last attempt's error is returned
+    // **unchanged**, so an image that genuinely does not expose 5432, or a
+    // config that genuinely cannot connect, still fails with the message that
+    // says so rather than with a message about retries. That is also why this
+    // is here rather than `nextest --retries`: a blanket retry cannot tell a
+    // harness failure from an assertion failure, and would mask the second.
+    //
+    // The backoff is not decoration - the stated cause is contention, so an
+    // immediate restart re-enters exactly what just lost.
+    //
+    // **The messages below land on the stderr of a test that then passes**,
+    // which nextest captures and discards. A rate rising from 1-in-100 to
+    // 1-in-3 is therefore invisible until an attempt-3 failure. To see it:
+    // `cargo nextest run … --success-output immediate | grep -c "starting
+    // another"`.
+    let mut brought_up: Option<(
+        ContainerAsync<GenericImage>,
+        PgPool,
+        TimescaleDbPluginConfig,
+    )> = None;
+    for attempt in 1..=CONTAINER_ATTEMPTS {
+        let last = attempt == CONTAINER_ATTEMPTS;
+        let container = match image().start().await {
+            Ok(container) => container,
+            Err(err) if last => return Err(err.into()),
             Err(err) => {
                 eprintln!(
-                    "timescaledb container came up without a published port \
-                     (attempt {attempt}/3): {err}; starting another"
+                    "timescaledb container failed to start (attempt {attempt}/\
+                     {CONTAINER_ATTEMPTS}): {err}; starting another"
+                );
+                tokio::time::sleep(CONTAINER_RETRY_BACKOFF).await;
+                continue;
+            }
+        };
+        let port = match container.get_host_port_ipv4(5432).await {
+            Ok(port) => port,
+            Err(err) if last => return Err(err.into()),
+            Err(err) => {
+                eprintln!(
+                    "timescaledb container came up without a published port (attempt \
+                     {attempt}/{CONTAINER_ATTEMPTS}): {err}; starting another"
                 );
                 drop(container);
+                tokio::time::sleep(CONTAINER_RETRY_BACKOFF).await;
+                continue;
+            }
+        };
+
+        // The test container serves no TLS; `sslmode=disable` is the deliberate
+        // opt-out that `build_pool` honors (production DSNs without an explicit
+        // sslmode are upgraded to `require` - see `connect_options`). Built by
+        // deserialization because the secret-wrapped `database_url` has no
+        // public literal constructor (the production path is always serde +
+        // expand-vars).
+        let cfg: TimescaleDbPluginConfig = serde_json::from_str(&format!(
+            r#"{{ "database_url": "postgres://user:pass@127.0.0.1:{port}/app?sslmode=disable",
+                  "statement_timeout_secs": {statement_timeout_secs},
+                  "pool_size_min": {pool_size_min}, "pool_size_max": {pool_size_max},
+                  "retention_period_secs": {retention_secs} }}"#
+        ))
+        .expect("valid test config json");
+
+        // A server that has announced itself is not the same as one accepting a
+        // TCP connection this instant under load, so a connect gets its own
+        // short budget before the container is written off. Ten seconds per
+        // container, three containers: the same 30 s ceiling the flat loop had,
+        // spent where it can actually help.
+        let mut pool = None;
+        let mut connect_err = None;
+        for _ in 0..CONNECT_ATTEMPTS {
+            match build_pool(&cfg).await {
+                Ok(p) => {
+                    pool = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    connect_err = Some(e);
+                    tokio::time::sleep(CONNECT_INTERVAL).await;
+                }
             }
         }
-    }
-    let (container, port) =
-        started.ok_or_else(|| anyhow::anyhow!("container start loop ended without a container"))?;
-
-    // The test container serves no TLS; `sslmode=disable` is the deliberate
-    // opt-out that `build_pool` honors (production DSNs without an explicit
-    // sslmode are upgraded to `require` — see `connect_options`). Built by
-    // deserialization because the secret-wrapped `database_url` has no public
-    // literal constructor (the production path is always serde + expand-vars).
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(&format!(
-        r#"{{ "database_url": "postgres://user:pass@127.0.0.1:{port}/app?sslmode=disable",
-              "statement_timeout_secs": {statement_timeout_secs},
-              "pool_size_min": {pool_size_min}, "pool_size_max": {pool_size_max},
-              "retention_period_secs": {retention_secs} }}"#
-    ))
-    .expect("valid test config json");
-
-    let mut pool = None;
-    let mut last = None;
-    for _ in 0..20 {
-        match build_pool(&cfg).await {
-            Ok(p) => {
-                pool = Some(p);
+        match pool {
+            Some(pool) => {
+                brought_up = Some((container, pool, cfg));
                 break;
             }
-            Err(e) => {
-                last = Some(e);
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            None if last => {
+                return Err(anyhow::anyhow!(
+                    "pool connect failed on every one of {CONTAINER_ATTEMPTS} containers, \
+                     each given {CONNECT_ATTEMPTS} attempts over {:?}: {connect_err:?}",
+                    CONNECT_INTERVAL * CONNECT_ATTEMPTS,
+                ));
+            }
+            None => {
+                let detail = connect_err
+                    .as_ref()
+                    .map_or_else(|| "no error recorded".to_owned(), ToString::to_string);
+                eprintln!(
+                    "timescaledb container published a port that would not serve a pool \
+                     (attempt {attempt}/{CONTAINER_ATTEMPTS}): {detail}; starting another"
+                );
+                drop(container);
+                tokio::time::sleep(CONTAINER_RETRY_BACKOFF).await;
             }
         }
     }
-    let pool = pool.ok_or_else(|| anyhow::anyhow!("pool connect failed: {last:?}"))?;
+    let (container, pool, cfg) = brought_up
+        .ok_or_else(|| anyhow::anyhow!("container bring-up loop ended without a container"))?;
 
     MIGRATOR.run(&pool).await?;
     apply_post_migration_setup(&pool, cfg.retention_period_secs).await?;
@@ -215,11 +340,14 @@ pub async fn bring_up_with(
 
 /// Build a fresh metric inventory over `pool`.
 ///
+/// Private: [`record_store`] is its only caller, and a `pub` helper here is a
+/// helper the `dead_code` allowance would hide if that caller went away.
+///
 /// The stores now take an `Arc<Metrics>`; tests only need a live handle, not to
 /// assert on it, so each call mints its own inventory against the global meter
 /// provider (recording is a no-op without an exporter installed).
 #[must_use]
-pub fn metrics(pool: &PgPool) -> Arc<Metrics> {
+fn metrics(pool: &PgPool) -> Arc<Metrics> {
     Arc::new(Metrics::new(pool.clone()))
 }
 
@@ -329,21 +457,6 @@ pub fn meter(id: &str) -> MeterTypeId {
     MeterTypeId::new(id).expect("valid meter type id")
 }
 
-/// A read range that contains [`fixture_window_end`] under the selection rule
-/// `from <= window_end < to`, and nothing else in particular.
-///
-/// # Panics
-///
-/// Never: the bounds are ordered.
-#[must_use]
-pub fn fixture_range() -> TimeRange {
-    TimeRange::new(
-        fixture_window_start(),
-        fixture_window_end() + Duration::seconds(1),
-    )
-    .expect("ordered range")
-}
-
 /// An ordinary measurement over an explicit covered period, with the derived
 /// identity the Ingestion Gateway would stamp on it.
 ///
@@ -444,6 +557,35 @@ pub fn withdrawal_of(target: &UsageRecord, idem: &str) -> UsageRecord {
             target.window_start,
             target.window_end,
         )
+    }
+}
+
+/// Restamp `record`'s derived identity after one of the five dedup-identity
+/// inputs was changed by a struct update.
+///
+/// [`entry_over`] takes all five as parameters precisely so this is rarely
+/// needed — every field a caller usually overwrites afterwards (quantity,
+/// attribution, metadata, origin, the invalidation pair) is outside the
+/// derivation. The exception is a test that starts from [`withdrawal_of`] and
+/// then moves the entry into a different scope: `tenant_id` and `gts_type_id`
+/// *are* inputs, so leaving the stamped id alone would store a row whose id no
+/// emitter could reproduce, and the ledger's `id` and its dedup UNIQUE would
+/// disagree about what the entry is.
+///
+/// # Panics
+///
+/// Never: the record already carries a validated key and meter.
+#[must_use]
+pub fn rederive(record: UsageRecord) -> UsageRecord {
+    UsageRecord {
+        id: derive_usage_record_id(
+            record.tenant_id,
+            &record.gts_type_id,
+            &record.idempotency_key,
+            record.window_start,
+            record.window_end,
+        ),
+        ..record
     }
 }
 

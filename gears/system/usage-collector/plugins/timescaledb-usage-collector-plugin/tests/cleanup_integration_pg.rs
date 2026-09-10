@@ -164,8 +164,13 @@ async fn the_registered_policy_measures_the_horizon_from_the_covered_period() {
         2,
         "both entries exist before retention runs"
     );
+    // Five minutes, not one. This is the suite's only wall-clock assertion, and
+    // its job is to rule out arrival as the discriminator against a 400-day
+    // difference in covered period - so the window can be five orders of
+    // magnitude looser than the effect it excludes and still exclude it, while
+    // a stalled box no longer reds it for a non-reason.
     assert!(
-        (ingested[1] - ingested[0]).abs() < Duration::minutes(1),
+        (ingested[1] - ingested[0]).abs() < Duration::minutes(5),
         "both entries were ingested at effectively the same moment ({ingested:?}), so a \
          policy measuring from arrival could not drop one and keep the other"
     );

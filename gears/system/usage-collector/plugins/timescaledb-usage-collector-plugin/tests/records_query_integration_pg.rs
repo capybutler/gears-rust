@@ -998,12 +998,23 @@ async fn an_orphan_invalidation_contributes_nothing() {
 /// tie-break.
 ///
 /// `LATEST` is greatest `window_end`, then greatest `acceptance_sequence`. The
-/// tie-break needs two entries sharing a `window_end`, which is why the fixture
-/// below has one — with the later-accepted of the two carrying the value the
-/// fold must pick. No contract check asserts this expression either way: the
-/// SDK's reference backend has no `acceptance_sequence` to break ties on and
-/// substitutes the greatest `id`, so this is the only place the declared rule is
-/// exercised.
+/// tie-break needs two entries sharing a `window_end`, and the fixture below
+/// has a pair at hour 1 — but sharing a `window_end` is only half of what the
+/// fixture has to do.
+///
+/// **The other half is that the tie-break must disagree with the alternative.**
+/// The SDK's reference backend has no `acceptance_sequence` and substitutes the
+/// greatest `id`, which is why `latest-tie-break` sits in the contract suite's
+/// `BLOCKED_CHECKS` and why this is the only place the declared rule is
+/// exercised. A fixture whose acceptance-order winner *also* holds the greater
+/// `id` passes identically under both rules and so demonstrates neither — and
+/// the entry `id` is a `UUIDv5` over the 5-tuple, so which of two keys sorts
+/// higher is not something a fixture author can predict. The pair is therefore
+/// arranged so the later-accepted entry is the one with the **lower** `id`, and
+/// `the_later_accepted_entry_must_hold_the_lower_id` below asserts exactly that
+/// before the fold is asked anything. Without that assertion the discrimination
+/// would be luck, and the plausible edit — making this plugin substitute
+/// `MAX(id)` to unblock `latest-tie-break` — would leave the test green.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_five_folds_answer_over_a_known_population() {
     let (_h, store) = setup().await;
@@ -1011,12 +1022,15 @@ async fn the_five_folds_answer_over_a_known_population() {
     let tenant = Uuid::from_u128(0x200D);
 
     // Two entries at hour 0 (values 2 and 8), and two sharing hour 1's period
-    // end (values 5 then 7 — 7 accepted second, so it wins the tie-break).
+    // end. `idem-d` (5) is accepted first and `idem-c` (7) second, so 7 is the
+    // acceptance-order winner — and `idem-c` is the one with the lower id, which
+    // is what makes the greatest-id rule answer 5 here instead.
+    let mut hour_one: Vec<UsageRecord> = Vec::new();
     for (i, value, key) in [
         (0_i64, 2_i64, "idem-a"),
         (0, 8, "idem-b"),
-        (1, 5, "idem-c"),
-        (1, 7, "idem-d"),
+        (1, 5, "idem-d"),
+        (1, 7, "idem-c"),
     ] {
         let rec = common::entry_over(
             &meter,
@@ -1026,16 +1040,35 @@ async fn the_five_folds_answer_over_a_known_population() {
             common::fixture_window_start() + Duration::hours(i),
             common::fixture_window_end() + Duration::hours(i),
         );
-        store.create(rec).await.expect("seed");
+        let stored = store.create(rec).await.expect("seed");
+        if i == 1 {
+            hour_one.push(stored);
+        }
     }
+
+    let (earlier, later) = (&hour_one[0], &hour_one[1]);
+    assert_eq!(
+        earlier.window_end, later.window_end,
+        "the pair ties on window_end"
+    );
+    assert!(
+        later.id < earlier.id,
+        "the fixture must pin acceptance order against id order, or this test cannot tell \
+         the declared rule (greatest window_end, then greatest acceptance_sequence) from \
+         the reference backend's greatest-id substitute. later={} earlier={}",
+        later.id,
+        earlier.id
+    );
 
     for (fold, expected) in [
         (AggregationFold::Sum, 22_i64),
         (AggregationFold::Count, 4),
         (AggregationFold::Min, 2),
         (AggregationFold::Max, 8),
-        // Greatest window_end is hour 1; of the two there, `idem-d` was accepted
-        // second and so carries the greater acceptance_sequence.
+        // Greatest window_end is hour 1; of the two there, `idem-c` (7) was
+        // accepted second and so carries the greater acceptance_sequence. Under
+        // greatest-id the answer would be 5, which is the point of the
+        // assertion above.
         (AggregationFold::Latest, 7),
     ] {
         let result = store

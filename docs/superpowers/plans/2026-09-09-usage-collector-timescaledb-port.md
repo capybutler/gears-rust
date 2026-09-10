@@ -5034,25 +5034,57 @@ cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features post
 
 Report the unfiltered `N passed / M skipped`.
 
-**Two things Task 15 leaves open rather than resolved, recorded so a recurrence
-has a prior:**
+**Harness bring-up: what was wrong, what it cost, and what is left.**
 
-1. **The container-start retry, and what it is for.** `bring_up_with` now makes
-   up to three attempts to start a container, because roughly one start in
-   thirty came up *running* with no host binding for 5432 —
-   `get_host_port_ipv4` answering `container '<id>' does not expose port
-   5432/tcp`, always at ~9.5 s. Nine of them landed in one 50-container run,
-   which is nine tests whose questions went unasked. Manual starts, six at a
-   time, publish every time, so it reads as the daemon racing itself rather
-   than anything about the image. The last attempt's error is returned
-   unchanged, so an image that genuinely does not expose 5432 still fails with
-   the message that says so.
-2. **One unexplained full-run failure, not reproduced.** In the run immediately
-   after a rebuild, one test of 261 failed; the run was being grepped for its
-   summary line only, so the identity and the message were not captured. Seven
-   subsequent full unfiltered runs were 261/261, as were six targeted runs of
-   the two concurrency tests. Left as an open observation rather than closed by
-   assertion: if it recurs, this is its prior.
+Spec review and code review between them turned Task 15's "one unexplained
+failure" into a measured defect with a fix. Recorded here because Task 17 owns
+the CI lane and inherits the numbers.
+
+1. **The wait strategy matched the wrong server.** The harness waited for the
+   **first** "database system is ready to accept connections", and this image
+   logs it **twice**: `docker-entrypoint.sh` runs a bootstrap server for initdb
+   with `-c listen_addresses=''` (entrypoint line 297, **unix socket only**),
+   then `001_timescaledb_tune.sh`, then the real server. Measured 0.64 s apart.
+   Waiting for the first handed back a container whose published TCP port
+   refuses connections, leaving `build_pool`'s undocumented 10-second budget as
+   the only thing between the suite and `pool connect failed`.
+
+   Fixed to wait for the second, **across both streams**: measured against the
+   Docker API this harness uses, `LogSource::StdErr` with `times(2)` never
+   fires (45 s timeout) while `BothStd` with `times(2)` returns in ~1.2 s and
+   `BothStd` with `times(3)` never fires - so there are exactly two and they
+   are split across the streams. Do not "tighten" it to `stderr`.
+
+2. **The published port sometimes answers and is not this container's
+   PostgreSQL.** Observed once as `pool connect failed … UnexpectedEof
+   "expected to read 1414811696 bytes, got 47 bytes at EOF"`; `1414811696` is
+   `0x54524150`, the ASCII bytes `TRAP` read as a length prefix. It occurred in
+   the one run of six that also retried a container, which ties it to the same
+   port-publication race. **Retrying `build_pool` cannot help** - the port stays
+   wrong - so the pool connect now sits **inside** the container retry loop and
+   a container whose port will not serve a pool is discarded for a fresh one.
+
+3. **Measured before and after**, full unfiltered runs of ~265 tests, one
+   container per integration test:
+
+   | | port retries | `pool connect failed` |
+   | --- | --- | --- |
+   | before (first "ready", flat 10 s connect budget) | ~9 per run | 2 in 10 runs |
+   | after (second "ready", connect inside the retry) | **3 across 8 runs** | **0 in 8 runs** |
+
+   That is ~0.14% of bring-ups against ~3.4%, and eight consecutive 265/265
+   runs. **The retry stays** - the residual rate is not zero, the last
+   attempt's error is returned unchanged so a genuine failure still says what
+   it is, and it is not `nextest --retries`, which cannot tell a harness
+   failure from an assertion failure.
+
+4. **Still open.** Task 15's original unexplained single failure was never
+   captured, so it cannot be *proved* to have been (1) or (2) - but both were
+   live in that build, and both are now closed. If a bring-up failure recurs,
+   the messages name which of the three modes it was, and
+   `--success-output immediate | grep -c "starting another"` is how the rate is
+   read; the messages land on the stderr of tests that then pass, so nextest
+   discards them by default.
 
 - [x] **Step 8: Commit**
 
@@ -5184,6 +5216,26 @@ suite has its plugin config. The CI steps are restored separately."
 ---
 
 ## Task 17: Un-defer CI and bring the e2e python current
+
+
+**Two things Task 15 measured that this task inherits as decisions, not
+discoveries:**
+
+1. **The container budget.** The pg lane is now **48 integration tests, one
+   container each**, up from 37. `001_timescaledb_tune.sh` sizes
+   `shared_buffers` from **host** RAM - measured at `1959MB` on a 7.8 GB host,
+   with `work_mem = 7837kB` - so N containers each believe they own the box,
+   and on a wide runner that is N x ~2 GB of shared-memory segments. Either pin
+   `test-threads` for this lane in `.config/nextest.toml`, or pass an explicit
+   `-c shared_buffers=` in `test_containers::timescaledb()`. Task 15 deliberately
+   did neither: the first is a CI-lane decision and the second changes an image
+   helper three gears share.
+
+2. **`schema_integration_pg.rs` is the cheapest reduction available** - 7 tests,
+   7 containers, all asserting immutable post-migration catalog state with no
+   writes, so a `OnceCell<TsHarness>` takes it to 1. **Not for ingest, query,
+   id-uniqueness or cleanup**: the per-test container is what makes their keying
+   assumptions safe, and `start_backend`'s rustdoc says so in as many words.
 
 Per the owner's decision, **both** removed CI steps come back. The type-plane
 rewrite that justified deferring them ends with this slice.
