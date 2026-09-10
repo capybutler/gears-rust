@@ -1812,8 +1812,56 @@ and paginates exactly once"*. `encode_next_cursor` already takes a
 `filter_hash` parameter; what matters is that the **caller** in
 `record_store.rs` passes `query.filter_hash` through verbatim (Task 11).
 
+**Done in `00449b23b8`. Measured while executing, correcting the steps
+below.**
+
+- **The Files list was short one file.** `keyset.rs` has no test module of its
+  own; its tests live in `translate_tests.rs`, which `translate.rs:210`
+  `#[path]`-includes. Task 6 swept the `keyset_predicate_*` cases there. Step
+  3's test went there too, and the Files list now names both.
+- **The `usage_type_column` claim was already stale.** No `usage_type_column`
+  survives anywhere in the crate: Task 1's `59f385eea` took it out of
+  `keyset.rs`'s module header along with the catalog. Nothing to do.
+- **The five `created_at` hits Step 1 names are exactly the five in the file**
+  (`keyset.rs:6`, `:15`, `:58`, `:99`, `:206`) — none missed, none extra. The
+  only other `created_at` under `query/` is `translate_tests.rs:178`, where
+  `no_retired_model_field_resolves_to_a_column` names it *deliberately* as a
+  retired field; that one stays.
+- **Both SPI quotations verify verbatim**, in the `list_usage_records` doc:
+  "uses one sort direction throughout" at
+  `usage-collector-sdk/src/plugin_api.rs:197-198`, and "guaranteed to be
+  *present*, not to be last: a caller ordering by `id` is handed on as `(id,
+  window_end)`. A plugin MUST read the order it is given rather than assume a
+  position for either key." at `:203-206`.
+- **Step 2 also reaches the error string, not just the doc.** The reject read
+  `"mixed-direction keyset orders are unsupported in v1"` — the same
+  awaiting-implementation framing the doc carried. It now names the guarantee
+  it rests on. The `keyset_predicate_rejects_mixed_directions` assertion is on
+  `"mixed-direction"`, so it still holds.
+- **Step 3's test names three helpers that do not exist under those names.**
+  `translate_tests.rs` resolves the kind through its own `rec_kind` and the
+  keyset-safety predicate through its own `rec_keyset_safe` (which wraps
+  `usage_collector_sdk::is_keyset_safe_record_field`); there is no
+  `field_kind`. The shipped test uses the file's helpers and its
+  `let pairs: &[(&str, bool)] = …` fixture style, and additionally asserts the
+  *binds* follow the given order — a canonicalising implementation that
+  reordered the columns alone would otherwise leave the binds as the only
+  witness.
+- **Both Step-3 mutations were run, and Task 6's rule-deletion re-run on top
+  of the rewritten doc and message.** Hard-coding the canonical column order
+  (`columns.sort_by_key(|c| u8::from(*c != "window_end"))`) and sorting
+  `order_pairs` before the zip each leave
+  `the_predicate_follows_the_order_it_is_given_rather_than_a_canonical_position`
+  the sole failure; deleting the mixed-direction rule leaves
+  `keyset_predicate_rejects_mixed_directions` the sole failure, so Task 6's
+  repair survives Step 2. Each run showed a `Compiling` line. A first
+  rule-deletion attempt anchored on a regex that swallowed `render_order_by`
+  and failed to build — a failed run, not a survivor; re-anchored on the whole
+  `let cmp = …;` selection.
+
 **Files:**
 - Modify: `src/infra/storage/query/keyset.rs`
+- Modify: `src/infra/storage/query/translate_tests.rs` (Step 3's test)
 
 - [ ] **Step 1: Fix every `created_at` in the docs**
 
@@ -1828,8 +1876,10 @@ all-ascending `(created_at, id)` tuple"), the `to_signed_tokens` example
 `render_order_by` example (`"created_at ASC, id ASC"`), and the
 `encode_next_cursor` doc. Every one becomes `window_end`.
 
-The module header also names `usage_type_column` in the allowlist-closure list.
-That function was deleted in Task 1.
+~~The module header also names `usage_type_column` in the allowlist-closure
+list. That function was deleted in Task 1.~~ **Stale:** Task 1's `59f385eea`
+removed the name from this header at the same time it deleted the function.
+The header's closure list reads `record_column` alone.
 
 - [ ] **Step 2: Correct the mixed-direction claim**
 
@@ -1874,20 +1924,33 @@ fn the_predicate_follows_the_order_it_is_given_rather_than_a_canonical_position(
 **The mutation:** make `keyset_predicate` sort `order_pairs` so `window_end`
 leads, or hard-code the canonical order. Either makes this red.
 
-Confirm the helper names (`field_kind`, `is_keyset_safe_record_field`) against
-the crate and SDK before writing — this test names four things it does not
-define.
+~~Confirm the helper names (`field_kind`, `is_keyset_safe_record_field`)
+against the crate and SDK before writing~~ — done, and they are wrong. The
+sketch above is illustrative only: `translate_tests.rs` has no `field_kind`,
+and calls the SDK predicate through its own wrapper. Write it against
+`rec_kind` and `rec_keyset_safe`, in that file's fixture style.
 
 - [ ] **Step 4: Run and verify**
 
+~~`cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin`~~ cannot
+run: the crate is not a workspace member and does not compile until Task 13.
+Use the `translate-harness` from Task 6 (it `#[path]`-includes `keyset.rs` and
+`translate_tests.rs`), unfiltered so the count is not a lower bound:
+
 ```bash
-cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(keyset)' 2>&1 | tail -20
+cd "$SCRATCH/translate-harness"
+CARGO_TARGET_DIR="$SCRATCH/harness-target" cargo test --no-fail-fast
 ```
+
+38 tests, 38 passing (37 at Task 6's close, plus Step 3's). Then
+`cargo check --all-targets` inside the crate: 33 lib / 52 lib-test errors,
+unchanged from Task 6's close, none naming `query/keyset`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/keyset.rs
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/keyset.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/translate_tests.rs
 git commit -s -m "refactor(timescaledb-plugin): key pagination on the covered-period end
 
 The canonical keyset is (window_end, id); created_at is gone. Corrects every
