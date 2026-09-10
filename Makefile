@@ -24,6 +24,10 @@ COMMA := ,
 EXAMPLE_SERVER_BIN ?= cf-gears-example-server
 EXAMPLE_SERVER_DEBUG_BINARY ?= target/debug/$(EXAMPLE_SERVER_BIN)
 EXAMPLE_SERVER_MANIFEST ?= apps/cf-gears-example-server/Cargo.toml
+# The first four are excluded for build-environment reasons.
+# timescaledb-usage-collector is different: the plugin's validate() rejects an
+# empty database_url and no shipped config (config/quickstart.yaml included)
+# supplies one, so building it in makes the server fail at startup.
 EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example timescaledb-usage-collector
 EXAMPLE_SERVER_ALL_FEATURES := $(strip $(shell cargo gears ls features --manifest $(EXAMPLE_SERVER_MANIFEST) 2>/dev/null))
 EXAMPLE_SERVER_FEATURES ?= $(subst $(SPACE),$(COMMA),$(filter-out $(EXAMPLE_SERVER_FEATURE_EXCLUDES),$(EXAMPLE_SERVER_ALL_FEATURES)))
@@ -716,7 +720,8 @@ test-users-info-pg: install-tools
 	cargo nextest run -p users-info --features "integration"
 
 ## Run TimescaleDB usage-collector plugin integration tests (Docker required;
-## the suite spins up its own timescale/timescaledb container via testcontainers)
+## each integration test spins up its own timescale/timescaledb container via
+## testcontainers - ~48 per run, the most container-hungry lane in the repo).
 test-usage-collector-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres

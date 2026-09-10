@@ -5319,8 +5319,8 @@ suite has its plugin config. The CI steps are restored separately."
 ## Task 17: Un-defer CI and bring the e2e python current
 
 
-**Two things Task 15 measured that this task inherits as decisions, not
-discoveries:**
+**What earlier tasks measured and this task inherits as decisions, not
+discoveries** (items 1 and 2 are Task 15's, item 3 is Task 16's):
 
 1. **The container budget.** The pg lane is now **48 integration tests, one
    container each**, up from 37. `001_timescaledb_tune.sh` sizes
@@ -5332,11 +5332,28 @@ discoveries:**
    did neither: the first is a CI-lane decision and the second changes an image
    helper three gears share.
 
+   **Price the first option knowing `.config/` does not exist** - there is no
+   `nextest.toml` anywhere in the repo, so that route means *creating* the file
+   and inheriting whatever else it then governs, not editing one line of an
+   existing config. Today the lane runs at nextest's default
+   `test-threads = num_cpus`.
+
 2. **`schema_integration_pg.rs` is the cheapest reduction available** - 7 tests,
    7 containers, all asserting immutable post-migration catalog state with no
    writes, so a `OnceCell<TsHarness>` takes it to 1. **Not for ingest, query,
    id-uniqueness or cleanup**: the per-test container is what makes their keying
    assumptions safe, and `start_backend`'s rustdoc says so in as many words.
+
+3. **After this task, the e2e build is the only thing in CI that compiles the
+   plugin into the server.** `test-usage-collector-pg` and the `ci.yml` step
+   Step 2 restores both test the plugin **standalone**; no CI job passes
+   `--features timescaledb-usage-collector` to the example server, because that
+   feature is optional and off by default (`Makefile:27` excludes it
+   deliberately - see the reason recorded there). So the one
+   `timescaledb-usage-collector` line in the suite's `e2e.yaml` `features:` list
+   is simultaneously the only thing that makes the e2e suite functional **and**
+   the only thing that ever exercises `registered_gears.rs:101-102` in CI.
+   **Drop it and both go quiet at once, neither loudly** - see Step 3b.
 
 Per the owner's decision, **both** removed CI steps come back. The type-plane
 rewrite that justified deferring them ends with this slice.
@@ -5375,7 +5392,7 @@ usage-collector suite "is not run here at all during the type-plane rewrite —
 see testing/e2e/suites/usage_collector/e2e.yaml". Leaving that comment beside a
 restored step is exactly the "claim outliving the code" defect.
 
-- [ ] **Step 3: Rewrite the `e2e.yaml` header**
+- [ ] **Step 3a: Rewrite the `e2e.yaml` header**
 
 It currently opens:
 
@@ -5385,6 +5402,29 @@ It currently opens:
 > ported.
 
 Every clause is now false. **Replace the block, do not append to it.**
+
+- [ ] **Step 3b: Restore the `timescaledb-usage-collector` feature line**
+
+**`8225d8ebd` touched 7 lines in `e2e.yaml` and only 6 of them are the comment
+above.** The seventh is a *deletion*: the `timescaledb-usage-collector` entry in
+the suite's own `features:` list (`e2e.yaml:9-10`). Restore it.
+
+It is the build-half twin of the `config.yaml` block Task 16 restored, and
+without it that block is **silently discarded rather than rejected**:
+`run_e2e.py`'s `resolve_features` feeds this list straight to `cargo build
+--features`, the suite uses an explicit `features:` with no `features_file`
+(and `config/e2e-features.txt` does not carry the feature and never did), so
+the server is built without the plugin - and toolkit's bootstrap holds gear
+config as `pub gears: HashMap<String, serde_json::Value>`
+(`libs/toolkit/src/bootstrap/config/mod.rs:115`), looked up per *registered*
+gear, so a block for a gear that was never compiled in is simply never read.
+There is no unknown-key error to warn you.
+
+**This is why it must be done before Step 4, and why Step 4's instruction
+cannot be followed blindly if it is skipped.** The failure mode is the suite's
+persistence assertions failing against the noop backend, which looks exactly
+like a plugin defect; Step 4 says "fix the plugin, not the suite", and that
+would send you the wrong way for a missing build feature.
 
 - [ ] **Step 4: Run the suite locally**
 
@@ -5556,6 +5596,29 @@ to fix here.
    uniform staleness and gets registered, while a 52-line README with three
    wrong lines gets corrected — a mostly-right document is where a wrong line
    does its damage.
+
+5. **Task 16's: the `.cf-studio` ignore block whose trigger has now fired, and
+   which no task mentions.** `.cf-studio/config/artifacts.toml:84-91` ignores
+   the plugin's `docs/`, `src/` and `tests/` from traceability validation,
+   reasoning that "its specs **and code** still describe the superseded model
+   … pending the plugin's own update to aggregation folds and invalidation once
+   the rewrite tracked in PRD section 13 lands."
+
+   **Tasks 3-15 are that rewrite, so the code half of that reason is now
+   false**, and the ignore currently suppresses validation of markers that
+   *are* current — `@cpt-flow:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1`
+   at `src/gear.rs:34`, for one.
+
+   It stays minor rather than a defect because the block's own final clause —
+   "ignoring the specs alone would orphan the plugin's code traceability
+   markers" — keeps it internally coherent for as long as the docs stay stale,
+   and entry 3 above is exactly that docs staleness. **Handle the two
+   together**: whatever entry 3 decides about `docs/DESIGN.md` determines
+   whether this ignore can narrow to `docs/*` or must stand as written.
+
+   **This is routed here because it is otherwise ownerless**: `grep -c
+   'artifacts.toml\|cf-studio'` over this plan returned **0** before this
+   entry, so nothing would have brought anyone back to the file.
 
 - [ ] **Step 5: Update `DIVERGENCES.md`**
 
