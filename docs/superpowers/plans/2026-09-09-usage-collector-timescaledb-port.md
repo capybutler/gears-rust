@@ -1441,8 +1441,8 @@ a uniform recipe:
 | `invalidation_from_row` | no single stub either: `(Some, Some)` → `Ok(None)`, plus rows 2, 3 and 5 above for the other arms | the four invalidation tests |
 | `record_row_to_model` | **cannot take a constant body** — it returns a `UsageRecord`, which has no `Default` and twelve fields to fabricate. Mutated in place instead: swap the two period bounds; hardcode `origin` (row 7 above) | the row round trip, the backfill test |
 
-Two more the mutation of a *single* function would never reach, each found by
-spec review and each having survived a full green suite:
+Two more the mutation of a *single* function would never reach, each found in
+review after the suite was already green:
 
 | Mutation | Killed by |
 |---|---|
@@ -2173,9 +2173,20 @@ pub fn invalidation_to_row(invalidation: Option<&Invalidation>) -> (Option<Uuid>
 }
 ```
 
-Its test is the round trip against `invalidation_from_row` in both directions,
-plus one assertion that `None` yields `(None, None)`. Name the mutation before
-you accept it: returning `(Some(*target), None)` must go red.
+Its test names the bytes rather than round-tripping against
+`invalidation_from_row` — a round trip proves the pair is self-consistent and
+nothing else, which is the rule Step 8 of Task 5 arrived at the hard way:
+
+```rust
+assert_eq!(
+    invalidation_to_row(Some(&inv)),
+    (Some(target), Some("duplicate_submission"))
+);
+assert_eq!(invalidation_to_row(None), (None, None));
+```
+
+Name the mutation before you accept it: returning `(Some(*target), None)` must
+go red.
 
 - [ ] **Step 3: Rewrite the dedup helpers**
 

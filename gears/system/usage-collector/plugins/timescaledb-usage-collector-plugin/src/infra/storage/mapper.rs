@@ -140,7 +140,11 @@ pub fn metadata_jsonb_to_map(
             }
         };
         // `key` is already owned (the loop consumes `obj` by value), so move it
-        // into the validation; the error `e` carries the offending key.
+        // into the validation. The message below cannot name the key and does
+        // not try: `MetadataKey::new` passes a fixed reason to
+        // `invalid_metadata_key`, which drops it into `newtype_validation`
+        // with `resource_name: None`, so the rejected value reaches no field
+        // of the error — and `key` has been moved by the time `e` exists.
         let metadata_key = MetadataKey::new(key).map_err(|e| {
             UsageCollectorPluginError::internal(format!("stored metadata key invalid: {e}"))
         })?;
@@ -189,6 +193,10 @@ pub fn record_row_to_model(row: UsageRecordRow) -> Result<UsageRecord, UsageColl
     // `ResourceRef::new`, `SubjectRef::new` and `IdempotencyKey::new` all
     // report a fixed reason and never echo the value they rejected, so without
     // this an operator is told a stored row is malformed and not which one.
+    //
+    // The binding is required rather than tidy: reading `row.id` inside the
+    // `map_err` closure would borrow `row` in the same expression that moves
+    // `row.resource_id` and `row.resource_type` into `ResourceRef::new`.
     let (id, window_end) = (row.id, row.window_end);
 
     let gts_type_id = meter_type_id_from_str(&row.gts_type_id)?;
