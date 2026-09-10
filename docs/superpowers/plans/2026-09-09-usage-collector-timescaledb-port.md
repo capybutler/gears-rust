@@ -1823,7 +1823,9 @@ below.**
   survives anywhere in the crate: Task 1's `59f385eea` took it out of
   `keyset.rs`'s module header along with the catalog. Nothing to do.
 - **The five `created_at` hits Step 1 names are exactly the five in the file**
-  (`keyset.rs:6`, `:15`, `:58`, `:99`, `:206`) — none missed, none extra. The
+  (`keyset.rs:6`, `:15`, `:58`, `:99`, `:206`, all **at `6e788a4b1`** — after
+  the change `:206` lands inside `cursor_key_to_bind`) — none missed, none
+  extra. The
   only other `created_at` under `query/` is `translate_tests.rs:178`, where
   `no_retired_model_field_resolves_to_a_column` names it *deliberately* as a
   retired field; that one stays.
@@ -1847,6 +1849,34 @@ below.**
   *binds* follow the given order — a canonicalising implementation that
   reordered the columns alone would otherwise leave the binds as the only
   witness.
+- **Step 1 also added a security-boundary paragraph to `render_order_by`
+  (`keyset.rs:61-65`) that neither step asked for.** Recording it because this
+  block is the slice's audit trail: Task 6's review established that
+  `render_order_by(&query.order, record_column)` resolves a caller-supplied
+  string through the allowlist, unlike the `$filter` path where `FilterField`
+  bounds the input, and that property was described nowhere at the function.
+  (Reworded in review from "an arbitrary caller string" to "an untyped caller
+  string": the gateway has already checked every order key against
+  `is_keyset_safe_record_field`, so the string is bounded, just not *typed*.)
+- **The mixed-direction refusal was in one of the three places it had to be,
+  and Step 2 would have documented the hole shut** (`e17722dcc`).
+  `keyset_predicate` refuses a mixed order, but `record_store.rs:1054` calls it
+  only when a cursor is present. `render_order_by` (`:1093`, unconditional)
+  mapped each key's direction independently, and `encode_next_cursor`
+  (`:1136`) took the cursor's `o` from `order.0.first()` alone. So a
+  mixed-direction order reaching the plugin was served as a wrongly ordered
+  first page *plus* a token whose `o` describes an order that page was not read
+  in, failing only on page two as a `500` — exactly the papering-over Step 2's
+  wording says does not happen. The rule is now hoisted into `uniform_dir` and
+  all three entry points resolve their direction through it, each with its own
+  test and its own named mutation.
+- **The reject message no longer cites the guarantee it is evidence against.**
+  It reaches a caller through `record_store.rs:1090` ->
+  `UsageCollectorPluginError::internal` -> `DomainError::Internal` ->
+  `UsageCollectorError::internal`, a caller-facing detail; "the gateway
+  guarantees one sort direction throughout" would print exactly when the
+  gateway did not. It now states a requirement of the call, as every other
+  message in the file does.
 - **Both Step-3 mutations were run, and Task 6's rule-deletion re-run on top
   of the rewritten doc and message.** Hard-coding the canonical column order
   (`columns.sort_by_key(|c| u8::from(*c != "window_end"))`) and sorting
@@ -1938,13 +1968,19 @@ Use the `translate-harness` from Task 6 (it `#[path]`-includes `keyset.rs` and
 `translate_tests.rs`), unfiltered so the count is not a lower bound:
 
 ```bash
-cd "$SCRATCH/translate-harness"
-CARGO_TARGET_DIR="$SCRATCH/harness-target" cargo test --no-fail-fast
+cd <scratchpad>/translate-harness && cargo test --no-fail-fast
 ```
 
-38 tests, 38 passing (37 at Task 6's close, plus Step 3's). Then
-`cargo check --all-targets` inside the crate: 33 lib / 52 lib-test errors,
-unchanged from Task 6's close, none naming `query/keyset`.
+The harness's own `target/` is the warm one; do **not** set
+`CARGO_TARGET_DIR`, or a re-runner pays a cold multi-minute build.
+
+**41 tests, 41 passing** at Task 7's close: 37 at Task 6's close, plus Step 3's
+position test and the three the hoisted direction rule needed
+(`uniform_dir_accepts_one_direction_and_refuses_a_mixed_or_empty_order`,
+`render_order_by_refuses_a_mixed_direction_order`,
+`encode_next_cursor_refuses_a_mixed_direction_order`). Then `cargo check
+--all-targets` inside the crate: 33 lib / 52 lib-test errors, unchanged from
+Task 6's close, none naming `query/keyset`.
 
 - [ ] **Step 5: Commit**
 
@@ -2879,6 +2915,25 @@ already takes the parameter — the defect this task guards against is passing
 An empty `query.order` or an absent `query.filter_hash` is a **gateway breach**,
 not a case to paper over. Fail loudly.
 
+**Change `encode_next_cursor`'s parameter to `filter_hash: &str`** (from
+`Option<&str>`), in `query/keyset.rs`. Task 7 documented the obligation at that
+function and could go no further: nothing inside it can enforce that its caller
+passes `query.filter_hash` through. A non-optional parameter can. The SPI says
+the value is "guaranteed **on this method**", that "an absent value is a gateway
+breach rather than a case to paper over", and that "a `next_cursor` MUST carry
+that value through verbatim as its `f`"; `require_cursor_fingerprint`
+(`usage-collector/src/domain/query.rs:695`) calls this "the one requirement in
+this gear's Plugin SPI that gives an implementor no compiler error — a plugin
+written before it recompiles clean and paginates exactly once". This is that
+compiler error, and it is cheap: `encode_next_cursor` has exactly one
+non-test caller (`record_store.rs:1136`), it is internal to this crate, and the
+plugin-side guard at `record_store.rs:1059`
+(`cursor.f.as_deref() != query.filter_hash.as_deref()`) **passes when both are
+`None`**, so the plugin itself notices nothing — the gateway is what refuses,
+on page two. Turn the breach into a `None` the *caller* must handle, and update
+`encode_next_cursor_rejects_row_key_order_arity_mismatch` (`translate_tests.rs`)
+which currently passes `None`.
+
 - [ ] **Step 4: Run, prove the mutations, commit**
 
 ```bash
@@ -3616,6 +3671,25 @@ Changes owed:
   reason. Worth adding: this backend implements the declared tie-break exactly
   while the reference backend cannot, so the two now differ on a rule no check
   asserts — which sharpens the entry rather than resolving it.
+- **Entry 14's inventory for `docs/features/usage-query.md` is two lines, and
+  the file is stale wholesale.** Entry 14 declares itself "the entry that owns
+  `docs/features/`" and entry 5 defers the file to it (`DIVERGENCES.md:276-277`),
+  so the register is the index a reader trusts for what is stale — and it names
+  only `:127` and `:139`. Measured at Task 7 (verify before writing, these are
+  the numbers this slice keeps paying for):
+  `gears/system/usage-collector/docs/features/usage-query.md` is **951 lines**;
+  the retired `(created_at, id)` order appears on **14** of them — `:147 :215
+  :232 :331 :333 :347 :349 :356 :453 :763 :786 :877 :932 :939` — and
+  `created_at` on **18** lines / **35** occurrences in that file alone
+  (**62** lines / **93** occurrences across
+  `gears/system/usage-collector/docs/`). The whole read-path description is
+  pre-slice-3: `TimeWindow` in `$filter`, `MISSING_TIME_WINDOW` (18 lines),
+  `last_keyset` (15), `page_after` (14), `validate_cursor_against` (17), a
+  `status` filter field (12).
+  **Do not fix the file, and do not fix it line by line** — one current
+  paragraph inside a wholesale-stale document is harder to notice than a
+  uniformly stale one. Add a paragraph to entry 14 carrying the count and the
+  line list, so the register stops implying the file has two stale paragraphs.
 - **§A is discharged** by Steps 2-3.
 - **§G may need a new note** if Task 8 Step 6 found the absent-dimension
   disagreement. This backend collects NULL groups where the reference backend
