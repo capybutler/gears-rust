@@ -2330,7 +2330,86 @@ Three obligations land here, and one of them cannot be met by a read followed
 by a write.
 
 **Files:**
-- Modify: `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
+- Modify: `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`,
+  `src/infra/storage/mapper.rs`, `src/infra/storage/mapper_tests.rs`,
+  `src/infra/storage/error.rs`, `src/infra/storage/error_tests.rs`,
+  `src/infra/storage/pool.rs`
+
+> **FLIGHT CORRECTION (Task 9, as shipped).** Six things below drifted from the
+> files or were settled differently in flight. Each is corrected in place at its
+> step; collected here so a reader does not have to find them.
+>
+> 1. **The insert binds sixteen columns, not fifteen.** Step 5 said "the
+>    seventeen minus `ingested_at` (defaulted) and `acceptance_sequence`
+>    (claimed)". `acceptance_sequence` is `NOT NULL` with no `DEFAULT`, so a
+>    claimed value still has to be *inserted*; only `ingested_at` (defaulted)
+>    and `entry_type` (generated) are omitted.
+> 2. **`claim_acceptance_sequence` gained a `count`.** A batch claims one
+>    contiguous *block* per `(tenant_id, gts_type_id)` scope rather than one
+>    value per row, so a batch of `n` entries in one scope costs one round trip
+>    and takes the counter's row lock once. `count = 1` is the single-row case.
+> 3. **`to_micros` is gone, and so is the SDK function it delegated to.**
+>    `usage_collector_sdk::created_at_micros` no longer exists; the SDK's
+>    canonical microsecond primitive is now
+>    [`canonical_period_bound`], the same rendering the entry `id` is derived
+>    over. The dedup key carries the two bounds in that form, so `DedupKey` is
+>    `(Uuid, String, String, String, String)`.
+> 4. **`map_insert_error` is `async` and takes a connection.** Naming the
+>    invalidation already in place needs a read, and that read must happen after
+>    the aborted transaction is rolled back (a further query on a failed
+>    transaction is refused with `25P02`, not answered). Step 1's sketched
+>    signature `map_insert_error(&err, &record)` is therefore not what shipped —
+>    and the substance of that test moved to `classify_db`, which is
+>    harness-runnable; see the verification note below.
+> 5. **Every line number in Step 6b was stale.** The eight sites are at
+>    `:176 :524 :705 :738 :763 :766 :928 :930`, not `:189 :536 :717 :750 :775
+>    :778 :940 :942`. Verdicts are recorded at the step.
+> 6. **The batch's *cross-call* invalidation collision still fails whole.**
+>    Step 7 fixes the in-batch case in `plan_batch`. A batch carrying a
+>    withdrawal of a target invalidated by an *earlier call* still aborts the
+>    whole multi-row `INSERT` and returns an outer `AlreadyInvalidated` rather
+>    than per-row outcomes. Recorded for Task 18 rather than papered over.
+
+### Verification: the harness does **not** reach `record_store.rs`
+
+**Measured, not assumed.** The Task 5-8 harness pattern — `#[path]`-include the
+real working-tree file into a scratch crate — cannot be applied to
+`record_store.rs`, because a `#[path]` include compiles the *whole file* and
+this file's read half is Tasks 10-12's. Enumerated blockers, all in code Task 9
+must not touch:
+
+- `record_row_key` reads `row.corrects_id` / `row.created_at` / `row.status`,
+  none of which exist on the ported `UsageRecordRow` (Task 11's cursor-key
+  extractor).
+- `list` and `aggregate` take `UsageTypeGtsId` / `AggregationSpec`, both gone
+  from the SDK, and call `gts_id_str`, gone from the mapper (Tasks 11, 12).
+- the `aggregate` dimension loop has a `&AggregationDimension` type mismatch
+  (Task 12).
+
+A shim crate can fake the two missing SDK types and the two missing
+`query::aggregate` functions, but it cannot fake a struct field that is absent
+by design — so the first blocker is fatal and the approach was abandoned.
+
+**What was done instead, and what it does and does not prove:**
+
+- `error.rs` and `mapper.rs` **are** `#[path]`-included as the real files. The
+  `is_constraint` / `classify_db` regression tests and `invalidation_to_row`'s
+  test therefore run against the shipped bytes. Steps 1, 2b, 5b and 6b's
+  substance lives there deliberately, for exactly this reason.
+- For `record_store.rs` the harness compiles a **mechanically regenerated
+  extract** of its write half, produced from the real file by a script on every
+  run (delete the read-half items by anchor, rewrite the `use` block, truncate
+  the sibling test file at its `Read-half tests (Tasks 10-12)` banner). No hand
+  editing; a mutation of the real file propagates into the extract, and the
+  mutation driver greps the mutated line out of the *generated* file so a
+  dropped mutation reads as a failed run rather than a survivor.
+- **What that does not cover:** anything needing a live backend —
+  `create_inner`, `create_batch_inner`, `claim_acceptance_sequence`'s block
+  arithmetic against a real counter row, `find_existing_invalidation`, and every
+  SQL string. Those are Task 15's pg suites and Task 14's contract run.
+- **Task 13 must re-run these tests through `cargo nextest` once the crate
+  compiles**, since the extract is not what ships. That obligation is written
+  into Task 13's Step 3.
 
 ### Obligation 1 — the dedup identity is the 5-tuple
 
@@ -2387,10 +2466,25 @@ Do not read this as "the crate used to have a transaction, so this is a
 revert" — the one Task 2 deleted wrapped a `SELECT … FOR UPDATE`
 read-modify-write, which is the shape the SPI forbids here.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests** — DONE
 
 These are unit tests over the SQL and the key derivation; the behavioural
 proof is the contract suite in Task 14 and the pg integration tests in Task 15.
+
+**As shipped.** `the_dedup_key_is_the_five_tuple` names all five components
+plus the exclusion of `value`, and two siblings pin the canonical bounds
+(`the_dedup_key_names_the_canonical_microsecond_bounds` spells the rendered
+bytes out; `a_sub_microsecond_bound_keys_the_same_as_what_postgres_stores`
+pins the precision the ledger actually stores). The invalidation-constraint
+test moved into `error_tests.rs` as
+`a_chunk_local_one_invalidation_index_is_already_invalidated`, because
+`classify_db` is where the discrimination lives and it is harness-runnable
+where `map_insert_error` is not. `pg_unique_violation` was never needed:
+`classify_db` takes `(code, constraint)` as plain values. The one place in this
+repo that *does* build a fake `sqlx::Error::Database` is
+`gears/system/cluster/plugins/postgres-cluster-plugin/src/pg_error.rs`
+(`FakeDbError`), not this crate's `error_tests.rs` — noted so the next task
+that needs one does not go looking in the wrong file.
 
 ```rust
 #[test]
@@ -2433,7 +2527,7 @@ constraint name. Check how `error_tests.rs` already constructs one — the crate
 has this problem solved somewhere, and inventing a second way is worse than
 finding the first.
 
-- [ ] **Step 2: Update `RECORD_COLUMNS`**
+- [x] **Step 2: Update `RECORD_COLUMNS`** — DONE
 
 At `:65`. It must match `UsageRecordRow`'s field order from Task 4 exactly —
 the row struct lists them (a readability convention, not a decode requirement).
@@ -2452,7 +2546,7 @@ in Task 4. A `RECORD_COLUMNS` missing a field fails with
 `no column found for name: <field>`, which names the field; a `RECORD_COLUMNS`
 in a different order than the struct is harmless.
 
-- [ ] **Step 2b: Add `invalidation_to_row` to the mapper**
+- [x] **Step 2b: Add `invalidation_to_row` to the mapper** — DONE
 
 Task 5 built `invalidation_from_row` and made it go to some trouble to keep
 `(invalidates, reason_code)` inseparable: a half pair is refused as `Internal`
@@ -2495,7 +2589,7 @@ assert_eq!(invalidation_to_row(None), (None, None));
 Name the mutation before you accept it: returning `(Some(*target), None)` must
 go red.
 
-- [ ] **Step 3: Rewrite the dedup helpers**
+- [x] **Step 3: Rewrite the dedup helpers** — DONE
 
 `dedup_key`, `row_dedup_key` and `canonical_equal` (at `:627`, `:638`, `:884`)
 all carry the 4-tuple. Bring each to the 5-tuple. `canonical_equal` compares a
@@ -2503,10 +2597,22 @@ submitted record against a stored row to decide absorb-vs-conflict; it must now
 compare the covered-period pair, `origin`, and the invalidation pair too — an
 exact-equality retry means every caller-supplied field matches.
 
-Check what `to_micros` (`:832`) is for: it normalizes an `OffsetDateTime` for
-comparison. It now has two timestamps to normalize per record, not one.
+`to_micros` (`:832`) normalized an `OffsetDateTime` for comparison by
+delegating to `usage_collector_sdk::created_at_micros`. **That SDK function no
+longer exists**, so the helper was deleted rather than reimplemented: the SDK's
+canonical microsecond primitive is now `canonical_period_bound`, the same
+rendering `derive_usage_record_id` builds its pre-image from, and both bounds
+enter the key through it. Reimplementing a local µs truncation would have been
+a second spelling that could drift from the identity derivation — which is the
+exact property `to_micros`'s doc claimed and delegation is what bought.
 
-- [ ] **Step 4: Claim the acceptance sequence**
+`canonical_equal` compares the two bounds through that same rendering rather
+than as raw `OffsetDateTime`s. Comparing them raw would risk a false
+`IdempotencyConflict` on a value that differs only below the microsecond;
+through the canonical form the comparison is the same defensive tautology `id`
+already is, which is what it is documented as.
+
+- [x] **Step 4: Claim the acceptance sequence** — DONE (with a `count`)
 
 Add to `impl PgRecordStore`:
 
@@ -2526,32 +2632,60 @@ async fn claim_acceptance_sequence(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     tenant_id: Uuid,
     gts_type_id: &str,
+    count: i64,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO usage_acceptance_sequence (tenant_id, gts_type_id, next_value) \
-         VALUES ($1, $2, 1) \
+         VALUES ($1, $2, $3) \
          ON CONFLICT (tenant_id, gts_type_id) \
-         DO UPDATE SET next_value = usage_acceptance_sequence.next_value + 1 \
+         DO UPDATE SET next_value = usage_acceptance_sequence.next_value + $3 \
          RETURNING next_value",
     )
     .bind(tenant_id)
     .bind(gts_type_id)
+    .bind(count)
     .fetch_one(&mut **tx)
     .await
 }
 ```
 
-- [ ] **Step 5: Rewrite the insert**
+**Shipped with a `count`**, returning the block's *last* value — the block is
+`[returned - count + 1, returned]`. A batch would otherwise pay one round trip
+and one row-lock acquisition per entry. `claim_batch_sequences` groups the
+sorted `reps` by scope (contiguous, because the scope is the `DedupKey`'s first
+two components) and claims one block each, which also keeps the counter-row
+locks in the same global order the dedup tuple locks take.
+
+**The gap story is per-path, and the plan's version was only half right.** A
+single-row insert that loses its dedup slot *rolls back*, releasing its claim,
+so that path leaves no gap. A batch claims its blocks up front and commits
+whatever the `ON CONFLICT` let it win, so every value claimed for a lost slot
+is spent without being stored. Monotonic either way; density was never the
+obligation.
+
+- [x] **Step 5: Rewrite the insert** — DONE
 
 `create_inner` (`:197`) and `insert_records_on_conflict` (`:312`) carry the
 `ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING`
 dedup authority. The conflict target becomes the 5-tuple, matching the Task 3
-constraint. The column list and the bind order become the seventeen above,
-minus `ingested_at` (defaulted) and `acceptance_sequence` (claimed per Step 4).
+constraint.
 
-Both must run inside a transaction that also holds the sequence claim.
+**Sixteen columns are bound**, not fifteen: the seventeen above minus
+`ingested_at` (`DEFAULT now()`), and `entry_type` was never among them
+(generated). `acceptance_sequence` is `NOT NULL` with no default, so the value
+Step 4 claims is bound like any other — claiming it elsewhere does not mean
+inserting it elsewhere.
 
-- [ ] **Step 5b: Constraint names arrive chunk-prefixed — exact match is dead**
+Both run inside the transaction that holds the sequence claim.
+
+`insert_records_on_conflict`'s sixteen per-column vectors moved into an
+`InsertColumns::build` so neither function trips `clippy::too_many_lines`, and
+so the column list, the `UNNEST` list and the bind order can be read side by
+side. It returns the raw `sqlx::Error` rather than a mapped one, because the
+caller holds the transaction that has to be rolled back before the mapping's
+diagnostic read can run.
+
+- [x] **Step 5b: Constraint names arrive chunk-prefixed — exact match is dead** — DONE
 
 **Measured with a standalone sqlx 0.9.0 probe against a live
 `timescale/timescaledb:latest-pg16` running this crate's own
@@ -2589,6 +2723,30 @@ usage_acceptance_seq  constraint() = Some("usage_acceptance_sequence_pkey")     
    as id `3`. The numeric part is unbounded and unknowable ahead of time, so no
    fixed prefix can be hardcoded.
 
+**DECIDED: Option A — rely on the index alone, and document the condition.**
+Settled by the owner, after the contract suite's fixture was read directly:
+`at_most_one_fixtures()` in
+`usage-collector-sdk/src/contract/checks/at_most_one_invalidation.rs:274-337`
+builds every withdrawal as
+`fixture_invalidation(&key, quantity, target.window_start, target.window_end,
+target.id)` — so both withdrawals of a target share the target's `window_end`,
+the index catches them, and Task 14's check passes on both the sequential and
+the same-batch-race path. **A green contract run is therefore not evidence that
+the general case is covered**, and this note exists so nobody reads it that
+way.
+
+No in-transaction pre-read and no advisory lock were added. The condition is
+stated at the call site (`create_inner`'s doc) naming *whom* it rests on: a
+faithful withdrawal copies its target's covered period by construction, which
+the Ingestion Gateway enforces upstream; a caller reaching the SPI directly
+with a mismatched period is not bound by that. **Task 18 owns the DIVERGENCES
+entry**; do not write it here.
+
+One partial narrowing fell out of Step 7 for free: *within a single batch* the
+rule is enforced in its true form — at most one withdrawal per target, whatever
+period each carries — because the whole batch is in hand. Only the cross-call
+case depends on the shared `window_end`.
+
 **The index does NOT fully discharge the SPI obligation, and this was
 measured.** Task 3's spec review provoked the constraint on a live container:
 
@@ -2611,18 +2769,10 @@ because you are adding the transaction:
 - **Option A — rely on the index alone.** Defensible: a faithful copy shares
   the target's period by construction, so the uncovered case cannot arise
   through any conforming ingestion path. Write down that the guarantee is
-  conditional and on whom.
-- **Option B — add an in-transaction check for the general case.** You will
-  have a transaction anyway for the sequence claim. A read-then-write *inside*
-  one transaction is not what the SPI forbids — its objection is to a
-  *gateway-side* pre-read, which "cannot exclude a concurrent second
-  submission". Inside the transaction, with the right locking, it can.
-
-**Do not leave this implicit.** Whichever you choose, say so at the call site
-and say why, because the next reader will otherwise assume the index is
-airtight. Note also that Task 14's `at_most_one_invalidation` contract check may
-pass or fail depending on which `window_end` its fixture uses — read that
-fixture before concluding your implementation is correct.
+  conditional and on whom. **← chosen; see the decision note above.**
+- ~~**Option B — add an in-transaction check for the general case.**~~ Not
+  taken. It would have worked, but it buys nothing against a conforming
+  ingestion path and adds a lock the hot path would pay on every withdrawal.
 
 **Use a boundary-anchored suffix match:**
 
@@ -2672,7 +2822,7 @@ admits one arbiter and the ingest insert already spends it on the dedup
 Error-string discrimination is the route, which is why the match rule is
 load-bearing.
 
-- [ ] **Step 6: Translate the new constraint violation**
+- [x] **Step 6: Translate the new constraint violation** — DONE
 
 **~~First, a stale doc this task inherits.~~ Already done by Task 3 — do not go
 looking for it.** An earlier draft said `map_insert_error`'s doc describes
@@ -2695,6 +2845,18 @@ It must now discriminate on the constraint name:
 - `usage_records_one_invalidation_uniq` -> `AlreadyInvalidated`, naming the
   invalidation already in place
 
+**As shipped.** `AlreadyInvalidated { id, invalidated_by }` — `id` is the
+target the submission tried to withdraw, read straight off
+`record.invalidation.target` with no query; `invalidated_by` is the entry that
+already withdrew it, and **that one needs a read**. `find_existing_invalidation`
+does it, keyed on `(invalidates, window_end)` — the partial index's own key, so
+it finds exactly the row that refused the write. It runs *after* the rollback
+of the transaction the constraint aborted, which is also required for a
+mechanical reason: a further query on a failed transaction is refused with
+`25P02`. If the read finds nothing (the invalidation's chunk aged out between
+the rejection and the read) the result is a retryable `Transient`, never a
+fabricated identifier.
+
 `AlreadyInvalidated`'s fields need reading before you populate them:
 
 ```bash
@@ -2707,22 +2869,32 @@ the constraint has already rejected the write — so it is diagnostic, not a
 check, and the atomicity obligation is still met by the index. Say that at the
 call site, because it looks like the pre-read the SPI forbids and is not one.
 
-- [ ] **Step 6b: Settle every transaction claim in this file, and the 55P03 gap**
+- [x] **Step 6b: Settle every transaction claim in this file, and the 55P03 gap** — DONE
 
 **Eight sites, not two.** An earlier draft named `:778` and `:940`; Task 2's
 code review found three more, and a re-count found a further one. Measured
 with `grep -n 'transaction' src/infra/storage/record_store.rs`:
 
-| Line | Says | Status |
-| --- | --- | --- |
-| `:189` | "no explicit transaction is needed" | true today, **you make it false** |
-| `:536` | "atomic, so no explicit transaction is required" | true today, **you make it false** |
-| `:717` | "the surviving transaction has already committed or aborted" | defensible — true of the server's implicit transaction |
-| `:750` | "the whole transaction rolled back" | defensible, same reason |
-| `:775` | "…transaction. `operation` is an `Fn` invoked fresh each attempt" | check in context |
-| `:778` | "opens a fresh transaction" | **false about the plugin's code** |
-| `:940` | "opens a fresh transaction (`create_batch_inner` does both)" | **false about the plugin's code** |
-| `:942` | "transaction is atomic and the dedup keys make it idempotent" | defensible |
+**Every line number here was stale by ~13-14 lines.** Re-measured with
+`grep -n 'transaction' src/infra/storage/record_store.rs` at Task 9's start —
+still eight sites, at `:176 :524 :705 :738 :763 :766 :928 :930`. Verdicts as
+settled:
+
+| Line (real) | Plan said | Says | Verdict as shipped |
+| --- | --- | --- | --- |
+| `:176` | `:189` | "no explicit transaction is needed" | **was true, now false — rewritten.** `create_inner` opens one, and its doc says why it has to. |
+| `:524` | `:536` | "atomic, so no explicit transaction is required" | **was true, now false — rewritten.** `create_batch_inner` opens one; the claim and the insert must commit together. |
+| `:705` | `:717` | "the surviving transaction has already committed or aborted" | **true, kept, sharpened.** True of the server-side transaction that won the deadlock, whoever opened it. Reworded to say "the transaction that survived the deadlock" so it cannot be read as a claim about this crate, and to name the acceptance-sequence lock alongside the dedup lock. |
+| `:738` | `:750` | "the whole transaction rolled back" | **now true of this crate too, and said so.** Rewritten to name `create_batch_inner`'s own transaction, and extended: `55P03` joins the retryable bucket, `AlreadyInvalidated` is explicitly non-retryable (an already-withdrawn target does not become withdrawable by waiting). |
+| `:763` | `:775` | "…transaction. `operation` is an `Fn` invoked fresh each attempt" | **was misleading, rewritten.** It said the mechanics are "unit-tested without a transaction", which read as *there are none*; it now says "without a database at all", which is the actual property. |
+| `:766` | `:778` | "opens a fresh transaction" | **was false, now true — kept and made specific.** Each attempt does open one, and the sentence now says what that buys: a failed attempt leaves neither a claimed acceptance sequence nor a half-written batch. |
+| `:928` | `:940` | "opens a fresh transaction (`create_batch_inner` does both)" | **was false, now true — kept, extended** with the `55P03` case and with "not even the acceptance-sequence block it had claimed". |
+| `:930` | `:942` | "transaction is atomic and the dedup keys make it idempotent" | **was defensible, now literally true** of the transaction this crate opens; "the" changed to "that" so it names it. |
+
+**`pool.rs:70` — done.** "the same dedup 4-tuple" → 5-tuple, and the doc now
+names *both* locks ingest waits on (the `usage_acceptance_sequence` row and the
+speculative dedup tuple), with a pointer to why `55P03` is classified
+transient.
 
 The split matters: `:717`, `:750` and `:942` read as true of *Postgres*, which
 wraps every statement in an implicit transaction, whereas `:778` and `:940` are
@@ -2750,7 +2922,31 @@ transient set, or write down why `Internal` is the intended answer.** Silence
 is the one outcome that is not acceptable, because the next reader will assume
 the omission was considered.
 
-- [ ] **Step 7: Handle the in-batch collision**
+**DECIDED: `55P03` is transient.** Four reasons, in order of weight:
+
+1. The timeout is *self-imposed*. `pool.rs`'s fixed `lock_timeout = 5s` exists
+   so a contended statement fails fast instead of pinning a pooled connection;
+   the failure is the bound doing its job, not the backend reporting a fault.
+2. This task makes lock waits structural rather than incidental.
+   `claim_acceptance_sequence` takes a row lock on `usage_acceptance_sequence`
+   for the entry's scope on **every** write, so a hot `(tenant, meter)` scope
+   now serializes ingest by design. Classifying its ordinary outcome
+   non-retryable would turn contention into 500s.
+3. Re-running is safe by construction: the whole batch is one transaction that
+   rolled back, and the dedup keys make a re-run idempotent — which is exactly
+   what `is_retryable_batch_error`'s doc already argues for `40001` / `40P01`.
+4. The retry is bounded (`MAX_BATCH_ATTEMPTS = 3`, jittered), so a genuinely
+   wedged lock still surfaces after three attempts rather than looping.
+
+One coupling was checked rather than assumed: `acquire_error_clears_readiness`
+routes a backend-reported `Database` error through the same
+`is_transient_sqlstate`, so a transient SQLSTATE there clears the `ready`
+gauge. `55P03` cannot arrive on that path — `pool.acquire()` establishes a
+connection and applies its GUCs as startup parameters, running no lock-taking
+statement — so the gauge is unaffected. Recorded in `is_transient_sqlstate`'s
+doc, which is now the one place the whole set is explained.
+
+- [x] **Step 7: Handle the in-batch collision** — DONE
 
 Two invalidations of one target in one `create_batch` call. Verify what
 happens: if the batch is one multi-row `INSERT`, the index rejects the whole
@@ -2766,15 +2962,53 @@ nobody later deletes the index as redundant.
 
 Write a test for the in-batch case naming its mutation.
 
-- [ ] **Step 8: Run, verify, commit**
+**Measured: that is what happens.** The batch is one multi-row
+`INSERT … SELECT FROM UNNEST(…) ON CONFLICT (5-tuple) DO NOTHING`. A statement
+admits one arbiter and it is spent on the dedup 5-tuple, so
+`usage_records_one_invalidation_uniq` surfaces as a raw `23505` that aborts the
+*statement* — and with it every unrelated entry's outcome.
+
+**Shipped in `plan_batch`.** A `duplicate_withdrawals: HashMap<usize, Uuid>`
+maps the input index of each pre-rejected row to the id of the batch's earlier
+withdrawal of that target; those rows never become `reps`, and `resolve_batch`
+emits `AlreadyInvalidated { id: target, invalidated_by }` for them in input
+order. One subtlety that had to be got right: a row repeating the *same*
+withdrawal (same derived `id`, so all five dedup attributes match) is an
+at-least-once redelivery, not a second withdrawal, and is left to the dedup
+path — guarded by `first_id != record.id`. Both directions are tested and both
+mutations (never pre-reject; pre-reject the identical repeat too) go red.
+
+**The residue, stated rather than hidden.** The cross-call case is still
+whole-batch: a batch carrying a withdrawal of a target invalidated by an
+earlier call aborts the statement and returns an outer `AlreadyInvalidated`,
+not per-row outcomes. Fixing it needs per-row `SAVEPOINT`s, which is a larger
+change than this step scopes. Recorded for Task 18's DIVERGENCES entry.
+
+- [x] **Step 8: Run, verify, commit** — DONE
+
+`cargo nextest` still cannot link a test binary for this crate: the read half
+of `record_store.rs` plus `ports.rs` and `adapter.rs` are Tasks 10-13's. Baseline
+at Task 9's start was **33 lib / 51 lib-test** errors; after Task 9 it is
+**13 lib / 14 lib-test**, and every remaining error is in Tasks 10-13's code
+(`adapter.rs`, `ports.rs`, `record_row_key`, `list`, `aggregate`, and the two
+read-half tests below the banner in `record_store_tests.rs`).
+
+Verified through the harness instead (see the verification note at the top of
+this task): **69 tests pass, 0 fail; clippy `--all-targets` clean; 15
+mutations, all killed, each with a confirmed `Compiling` line.**
 
 ```bash
-cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(record_store)' 2>&1 | tail -30
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets
 ```
 
 ```bash
 git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/record_store.rs \
-        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/record_store_tests.rs
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/record_store_tests.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/mapper.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/mapper_tests.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/error.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/error_tests.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/pool.rs
 git commit -s -m "feat(timescaledb-plugin)!: persist entries under the 5-tuple identity
 
 Moves the dedup authority from the 4-tuple to the 5-tuple DESIGN 3.7 requires,
@@ -3283,6 +3517,29 @@ cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets
 ```
 
 Expected: exits 0. **This is the first time since slice 4.**
+
+- [ ] **Step 3b: Re-run Task 9's deferred unit tests through `cargo nextest`**
+
+**A verification Task 9 could not perform, written down here so it happens.**
+Task 9's write-half tests in `record_store_tests.rs` have never run in the
+build that ships. `record_store.rs` could not be `#[path]`-included into a
+scratch harness — a `#[path]` include compiles the whole file and its read half
+is Tasks 10-12's — so they were run against a *mechanically regenerated
+extract* of the write half instead. The extract is faithful (regenerated from
+the real file on every run, mutations propagate, the driver greps the mutated
+line out of the generated file) but it is not what compiles into the crate.
+
+This is the first step at which they can run for real:
+
+```bash
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast \
+  -E 'test(record_store) + test(mapper) + test(error)' 2>&1 | tail -40
+```
+
+Expected: all pass, unchanged. **If any fails, it is Task 9's defect surfacing,
+not yours to paper over** — report it rather than adjusting the test. The
+mapper and error tests did run against the real files in the harness and should
+be uneventful; `record_store`'s are the ones this step exists for.
 
 - [ ] **Step 4: Clippy**
 
@@ -3875,6 +4132,38 @@ and 12. Every one is a real wire or SPI break, so the label is owed.
 The label goes on the PR, which does not exist yet — the gateway work and this
 port merge together. **Report the enumerated list so whoever opens the PR
 applies the label**; do not open the PR as part of this task unless asked.
+
+- [ ] **Step 4b: Two DIVERGENCES entries Task 9 owes you**
+
+Task 9 deliberately did not edit `DIVERGENCES.md` — this task owns it — but it
+found two published-contract gaps and is required to hand them over. Both are
+about the SPI's at-most-one-invalidation obligation, and both are recorded at
+the call site in `record_store.rs`; neither is a defect to fix here.
+
+1. **The at-most-one guarantee is conditional on the gateway.** The SPI says
+   "**the store** MUST reject" a second withdrawal of a target and MUST make
+   the check atomic with the entry it admits. The store's mechanism is the
+   partial unique index `usage_records_one_invalidation_uniq` over
+   `(invalidates, window_end)` — and a hypertable `UNIQUE` **must** contain the
+   partition column, so no hypertable-compatible index can key on `invalidates`
+   alone. Measured on a live container: two withdrawals of one target with the
+   same `window_end` are rejected; with different `window_end` **both are
+   accepted**. Conformance therefore rests on every withdrawal being a faithful
+   copy of its target's covered period, which the Ingestion Gateway enforces
+   upstream — and a caller reaching the SPI directly is not bound by it. Record
+   what the SPI requires, what the index can enforce, why no
+   hypertable-compatible index can do better, and where the residual guarantee
+   lives. Note also that Task 14's contract check passes either way, because
+   its fixture copies the target's period
+   (`usage-collector-sdk/src/contract/checks/at_most_one_invalidation.rs:274-337`),
+   so a green run is not evidence the general case is covered.
+2. **A cross-call invalidation collision fails a batch whole.** Two withdrawals
+   of one target arriving in the *same* `create_batch` are handled per-row
+   (`plan_batch` pre-rejects all but the first). One arriving in a *later* call
+   is caught by the index, which aborts the whole multi-row `INSERT` — so the
+   batch returns an outer `AlreadyInvalidated` rather than per-record outcomes
+   aligned to input order, which is what the SPI asks for. Fixing it needs a
+   per-row `SAVEPOINT` pass; it was scoped out rather than missed.
 
 - [ ] **Step 5: Update `DIVERGENCES.md`**
 
