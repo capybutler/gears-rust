@@ -45,6 +45,12 @@ use super::translate::SqlCtx;
 /// `SUM(…)` does, so the caller needs no separate shape for it. `DISTINCT ON`
 /// does not compose that way (it picks per distinct prefix of the query's own
 /// `ORDER BY`), and is named here because a reader will otherwise reach for it.
+///
+/// Both `DISTINCT ON` and a `ROW_NUMBER()` window have since been **measured**
+/// against this form rather than only argued about; the numbers, and why the
+/// 25 MB they save on a single-group worst case does not buy back the
+/// composition they cost, are on [`super::super::record_store::PgRecordStore`]'s
+/// `aggregate`.
 const LATEST_SELECT_EXPR: &str =
     "(ARRAY_AGG(r.value ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric";
 

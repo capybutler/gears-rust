@@ -3699,6 +3699,18 @@ rustdoc in `record_store.rs`, in the O(rows scanned) phrasing, naming the
 `HashAggregate`/`GroupAggregate` split, `aggregate_limit_clause`'s irrelevance
 to it, and the `time_range` as the only row bound. No SQL was changed.
 
+> **Superseded by Task 15's measurement — do not carry the phrasing above
+> forward.** This paragraph was reasoning, correctly labelled as such and
+> correctly routed to Task 15 for measurement, and the measurement came back
+> the other way: `PostgreSQL` never plans a `HashAggregate` for an aggregate
+> carrying its own `ORDER BY`, so peak state is **O(largest group)** — about
+> 34 bytes per row in the largest group, measured — and the O(rows-scanned)
+> part is the mandatory `Sort`, which is `work_mem`-bounded, spills, and is
+> needed by every candidate formulation alike. `aggregate_limit_clause`'s zero
+> protection and the time window being caller input both survive unchanged.
+> Task 15 corrected the rustdoc this paragraph describes; the numbers and the
+> two rejected alternatives are in Task 18's twentieth-entry bullet.
+
 - [x] **Step 3: Get the no-grouping case right**
 
 The noop plugin's doc records the trap precisely: an empty `buckets` vector is
@@ -4787,12 +4799,12 @@ expectations is exactly the shape Step 2 exists to catch.
    correct. **Write one row through `create_batch` and read every column back**;
    that is the only thing that catches it.
 
-- [ ] **Step 1: Inventory what each suite asserts, before changing any of it**
+- [x] **Step 1: Inventory what each suite asserts, before changing any of it**
 
 For each file, list the questions it asks. Then mark each: **still a live
 question** (repoint it), or **a question the model no longer has** (delete it).
 
-- [ ] **Step 1b: Measure what `LATEST` costs, and whether another formulation is cheaper**
+- [x] **Step 1b: Measure what `LATEST` costs, and whether another formulation is cheaper**
 
 Task 8 shipped the `Latest` fold as `(ARRAY_AGG(r.value ORDER BY r.window_end
 DESC, r.acceptance_sequence DESC))[1]::numeric`, which materializes a group's
@@ -4918,7 +4930,7 @@ search, and one claim of Task 14's that expires with your Step 7:**
   deleted, not repointed** (see Task 3 Step 2b). It passes for the wrong
   reason once the catalog table is gone.
 
-- [ ] **Step 2: `schema_integration_pg.rs`**
+- [x] **Step 2: `schema_integration_pg.rs`**
 
 Asserts the DDL. Rewrite against Task 3's schema: the hypertable partitions on
 `window_end`, the dedup UNIQUE spans the 5-tuple, the partial unique index on
@@ -4928,14 +4940,14 @@ and `usage_type_catalog` **does not exist**.
 That last one is a real assertion, not a formality — it is what catches a stale
 database surviving a migration change.
 
-- [ ] **Step 3: `id_uniqueness_integration_pg.rs`**
+- [x] **Step 3: `id_uniqueness_integration_pg.rs`**
 
 The id is a UUIDv5 over the 5-tuple. Assert that two entries differing only in
 `window_start` get different ids, and that `entry_type` is **not** an input to
 the derivation (`DESIGN.md:63`) — an invalidation and its target differ in
 `invalidates` and `idempotency_key`, and the latter is what separates their ids.
 
-- [ ] **Step 4: `records_ingest_integration_pg.rs`**
+- [x] **Step 4: `records_ingest_integration_pg.rs`**
 
 The behavioural home for Task 9. Cover:
 
@@ -4953,7 +4965,7 @@ The concurrency case is worth a real test: two concurrent `create_usage_record`
 calls invalidating one target, exactly one accepted. That is what the atomicity
 obligation is for, and a sequential test cannot see it.
 
-- [ ] **Step 4b: Two tests assert the rule Task 8 inverted — delete, do not repoint**
+- [x] **Step 4b: Two tests assert the rule Task 8 inverted — delete, do not repoint**
 
 `tests/records_query_integration_pg.rs` carries two tests that encode the
 *retired* compensation semantics, found during Task 2:
@@ -4987,7 +4999,7 @@ replacement.
 dropped its `active-only` sibling but deliberately left this one, because the
 fold rewrite is yours. Remove it in the same pass.
 
-- [ ] **Step 5: `records_query_integration_pg.rs`**
+- [x] **Step 5: `records_query_integration_pg.rs`**
 
 The behavioural home for Tasks 10, 11 and 12. Cover:
 
@@ -5007,13 +5019,13 @@ The behavioural home for Tasks 10, 11 and 12. Cover:
   contribute nothing to any fold
 - an orphan invalidation whose target was purged still contributes nothing
 
-- [ ] **Step 6: `cleanup_integration_pg.rs`**
+- [x] **Step 6: `cleanup_integration_pg.rs`**
 
 Retention. The policy now measures from `window_end` (Task 3 Step 3). Assert
 the retention horizon is measured from the covered period, which is what
 `cpt-cf-usage-collector-fr-idempotency` requires.
 
-- [ ] **Step 7: Run the whole pg suite**
+- [x] **Step 7: Run the whole pg suite**
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
@@ -5022,7 +5034,7 @@ cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features post
 
 Report the unfiltered `N passed / M skipped`.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/
@@ -5442,27 +5454,58 @@ Changes owed:
 - **A twentieth entry is owed: `LATEST` has an unbounded server-side
   allocation driven by caller input.** The `Latest` fold is
   `(ARRAY_AGG(r.value ORDER BY …))[1]`, which materializes a group's values
-  before picking one. Peak state is **O(rows scanned)**, not O(largest group):
-  under a HashAggregate plan every group's array is live at once, and only a
-  sorted GroupAggregate gives the weaker bound — the planner chooses.
-  `aggregate_limit_clause` gives **zero** protection, because it bounds the
-  number of groups and never the rows within one; the only row bound is the
-  gateway's time window, a request parameter. `MIN`/`MAX`/`SUM`/`COUNT` carry no
-  such cost.
+  before picking one. `aggregate_limit_clause` gives **zero** protection,
+  because it bounds the number of groups and never the rows within one; the only
+  row bound is the gateway's time window, a request parameter.
+  `MIN`/`MAX`/`SUM`/`COUNT` carry no such cost.
+
+  **Task 15 took the measurement, and it overturned two of the four elements
+  this bullet used to carry.** What it said — "peak state is O(rows scanned),
+  not O(largest group): under a HashAggregate plan every group's array is live
+  at once, and only a sorted GroupAggregate gives the weaker bound, the planner
+  chooses" — is false, and the entry must not publish it. Measured on
+  `timescale/timescaledb:2.29.2-pg18` (`PostgreSQL` 18.6), default 4 MB
+  `work_mem`:
+
+  1. **The planner never chooses a HashAggregate here.** An aggregate carrying
+     its own `ORDER BY` takes the grouped node off the hash path entirely: with
+     `enable_sort` *and* `enable_incremental_sort` off, the plan is still
+     `Sort → GroupAggregate` with the `Sort` reported `Disabled: true`. The same
+     statement with the inner `ORDER BY` dropped plans as a `HashAggregate`
+     immediately, and adding one ordered aggregate beside a plain `MAX` takes
+     that query off the hash path too. It is a property of ordered aggregation,
+     not of this expression.
+  2. **So the peak is O(largest group), and it is real.** Exactly one array is
+     live at a time. On the worst case for it — 1 000 000 rows in one group,
+     parallelism off — peak backend RSS was 1 022.7 MB against 988.6 MB for
+     `MAX(r.value)` over the same rows: **+34 MB, ≈34 bytes per row in the
+     largest group**, reproducible to ±0.2 MB. The array does not spill.
+  3. **The `Sort` beneath does scan-sized work, and is not this fold's cost.**
+     It materializes the whole selection but is `work_mem`-bounded and spills
+     (`external merge`, ~10 MB per worker at 1 000 000 rows). Every candidate
+     formulation needs the same sort.
+
+  **Both alternatives were measured and both stay out.** On that single-group
+  worst case `DISTINCT ON` peaked at 997.6 MB and
+  `ROW_NUMBER() OVER (PARTITION BY …) = 1` at 997.4 MB — 25 MB below the shipped
+  form, O(1) per group — with execution times inside run-to-run noise (86-111 ms
+  at 100 000 rows, 257-293 ms at 1 000 000). Neither is a `SELECT`-list
+  expression that composes beside `SUM`, and neither can express the ungrouped
+  fold: `DISTINCT ON ()` is a syntax error, and `PARTITION BY` nothing — like the
+  `ORDER BY … LIMIT 1` rewrite — answers **zero** rows over an empty selection
+  where the SPI owes exactly one empty-keyed bucket. So `aggregate.rs` is
+  unchanged, and the entry publishes a limit rather than a fix.
 
   **This is a limit to publish, not a question to weigh.** DESIGN §3.10 asks
   each plugin's deployment guide to state the bounds it can hold, and this is
-  one it cannot hold under a `LATEST` meter with a wide window. Write the entry
-  against the measurement Task 15 takes, not against this description.
+  one it cannot hold under a `LATEST` meter whose largest group is wide.
 
-  **The four elements above are the entry's content, not a summary of it** —
-  the O(rows scanned) phrasing rather than O(largest group), the
-  HashAggregate/GroupAggregate split, `aggregate_limit_clause`'s zero
-  protection, and the time window being caller input. The weaker phrasing
-  understates the cost by orders of magnitude, so an entry that keeps only the
-  headline is not this entry. If this task slips, the fact is not lost: Task 12
-  put the same four on `RecordStore::aggregate`'s rustdoc, which ships. What
-  does not exist until this entry is written is the register a reviewer reads.
+  **The entry's content is the three numbered facts above plus
+  `aggregate_limit_clause`'s zero protection and the time window being caller
+  input** — an entry that keeps only the headline is not this entry. The same
+  correction is already on `RecordStore::aggregate`'s rustdoc and on
+  `LATEST_SELECT_EXPR`'s, which ship; what does not exist until this entry is
+  written is the register a reviewer reads.
 - **Any further entry** this port turned up, beyond the `LATEST` one above.
 
 - [ ] **Step 6: Full verification bar, one last time**

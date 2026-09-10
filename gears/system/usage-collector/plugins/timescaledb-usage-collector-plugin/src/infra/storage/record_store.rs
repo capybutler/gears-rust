@@ -2288,18 +2288,50 @@ impl RecordStore for PgRecordStore {
     /// at index `k` as `Option<BigDecimal>` — arbitrary precision, so a wide
     /// `SUM` cannot overflow on decode.
     ///
-    /// **`LATEST` materializes before it picks.** Its expression is
-    /// `(ARRAY_AGG(r.value ORDER BY …))[1]`, so `PostgreSQL` builds a group's
-    /// values into an array before taking the head. Peak state is **O(rows
-    /// scanned), not O(largest group)**: under a `HashAggregate` plan every
-    /// group's array is live at once, and only a sorted `GroupAggregate` gives
-    /// the weaker bound — the planner chooses.
+    /// **`LATEST` materializes before it picks, and the peak is O(largest
+    /// group).** Its expression is `(ARRAY_AGG(r.value ORDER BY …))[1]`, so
+    /// `PostgreSQL` builds a group's values into an array before taking the
+    /// head. Measured on `timescale/timescaledb:2.29.2-pg18` (`PostgreSQL`
+    /// 18.6) at the default 4 MB `work_mem`:
+    ///
+    /// * **The planner does not choose between a hash and a sorted plan here;
+    ///   there is nothing to choose.** An aggregate carrying its own `ORDER BY`
+    ///   takes the grouped node off the hash path entirely: with `enable_sort`
+    ///   *and* `enable_incremental_sort` off, the plan is still `Sort →
+    ///   GroupAggregate` with the `Sort` reported `Disabled: true`. The same
+    ///   statement with the inner `ORDER BY` removed plans as a
+    ///   `HashAggregate` immediately, and adding one ordered aggregate beside a
+    ///   plain `MAX` takes that query off the hash path too — so it is a
+    ///   property of ordered aggregation, not of this expression or this data.
+    /// * So exactly one array is live at a time, and the peak is **O(largest
+    ///   group)**. On the worst case for it — 1 000 000 rows in a single group,
+    ///   parallelism off — peak backend RSS was 1 022.7 MB against 988.6 MB for
+    ///   `MAX(r.value)` over the same rows: **+34 MB, about 34 bytes per row in
+    ///   the largest group**, reproducible to ±0.2 MB across runs. The array
+    ///   does not spill.
+    /// * The `Sort` beneath it does materialize the whole selection, but it is
+    ///   `work_mem`-bounded and spills (`external merge`, ~10 MB per worker at
+    ///   1 000 000 rows) — and **every candidate formulation needs that same
+    ///   sort**, so it is not a cost of this one.
+    ///
     /// [`aggregate_limit_clause`] offers no protection, because it bounds
     /// groups and never the rows within one; the only row bound is the
-    /// `time_range`, which is a request parameter. A `LATEST` meter read over a
-    /// wide window is therefore a server-side allocation sized by caller input.
-    /// Recorded rather than reformulated: any alternative needs `EXPLAIN`
-    /// against a real planner rather than reasoning.
+    /// `time_range`, which is a request parameter. A `LATEST` meter read whose
+    /// largest group is wide is therefore a server-side allocation sized by
+    /// caller input.
+    ///
+    /// **Both alternatives were measured and both were kept out.** On that same
+    /// single-group worst case, `DISTINCT ON` peaked at 997.6 MB and
+    /// `ROW_NUMBER() OVER (PARTITION BY …) = 1` at 997.4 MB — 25 MB below this
+    /// form, and O(1) per group rather than O(largest group) — with execution
+    /// times inside the run-to-run noise (86-111 ms at 100 000 rows, 257-293 ms
+    /// at 1 000 000). The 25 MB does not buy the composition it would cost:
+    /// neither is a `SELECT`-list expression a caller can drop in beside `SUM`,
+    /// and neither can express the ungrouped fold — `DISTINCT ON ()` is a
+    /// syntax error and `PARTITION BY` nothing, like the `ORDER BY … LIMIT 1`
+    /// rewrite, answers **zero** rows over an empty selection where this method
+    /// owes exactly one empty-keyed bucket. Adopting either means a second
+    /// statement shape for one fold, with its own empty-selection special case.
     ///
     /// # Errors
     ///
