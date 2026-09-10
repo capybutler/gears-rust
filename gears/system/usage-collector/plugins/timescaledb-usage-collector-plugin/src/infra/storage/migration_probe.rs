@@ -30,21 +30,21 @@
 //!
 //! Widening the gate also takes this module out of clippy's "is a test"
 //! heuristic, which keys on a bare `#[cfg(test)]` — so `allow-expect-in-tests`
-//! no longer covers it and the two `expect`s below are exempted explicitly.
-//! They are the right failure: a migration this parser cannot read must abort
-//! loudly, because the alternative — an `Option` a caller can
+//! no longer covers it and [`ledger_columns`]' two `expect`s are exempted
+//! explicitly. They are the right failure: a migration this parser cannot read
+//! must abort loudly, because the alternative — an `Option` a caller can
 //! `unwrap_or_default()` into an empty column list — is exactly the silent
 //! vanishing every assertion here exists to prevent.
+//!
+//! The exemption is `#[expect]` on that one function rather than `#![allow]` on
+//! the module, so it is **self-retiring**: it covers no `expect` someone adds
+//! later, including one that should have been a `Result`, and
+//! `unfulfilled_lint_expectations` reds if these two ever go away.
 //!
 //! The two functions are `pub` because integration-test crates are external to
 //! this one and `pub(crate)` would put them out of reach; under the `test`-only
 //! half of the gate the module's own visibility caps them anyway, which is also
 //! what `clippy::redundant_pub_crate` wants.
-
-// Both `expect`s abort on a migration this parser cannot read. See the module
-// doc: failing loudly is the design, and clippy's test exemption does not reach
-// this module because the gate is not a bare `#[cfg(test)]`.
-#![allow(clippy::expect_used)]
 
 /// The schema itself, so nothing that names its columns can drift from it. The
 /// path resolves from this file's own directory, which is the real one even
@@ -74,6 +74,10 @@ const MIGRATION_SQL: &str = include_str!("../../../migrations/0001_init.sql");
 /// it; a parenthesized type carrying a space (`numeric(38, 9)`) would split
 /// across tokens and red the pairing test rather than pass a wrong type
 /// silently, which is the direction this parser fails in throughout.
+#[expect(
+    clippy::expect_used,
+    reason = "a migration this parser cannot read must abort loudly; an Option a caller can               unwrap_or_default() into an empty column list is the silent vanishing this               module exists to prevent"
+)]
 #[must_use]
 pub fn ledger_columns() -> Vec<(&'static str, &'static str)> {
     let start = MIGRATION_SQL

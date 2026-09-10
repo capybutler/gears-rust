@@ -29,7 +29,9 @@
 //! downstream collector runs with `add_metric_suffixes` on or off — matching
 //! the parent gateway (`usage-collector/src/infra/metrics.rs`) and the wider
 //! application-gear convention. `metrics_tests` asserts that shape over the
-//! whole exported inventory rather than leaving it to this paragraph.
+//! whole exported inventory, off each instrument's **kind** rather than off its
+//! spelling, so this paragraph is a description of a mechanism and not a
+//! promise on its own.
 //!
 //! Histogram bucket layouts bracket the p95 budget of
 //! `cpt-cf-usage-collector-nfr-query-latency` and the write envelope of
@@ -490,6 +492,63 @@ impl Metrics {
     /// Set the plugin-local readiness gauge (1 when `ready`, else 0).
     pub fn set_ready(&self, ready: bool) {
         self.ready.record(u64::from(ready), &[]);
+    }
+
+    /// Every instrument name this inventory declares.
+    ///
+    /// The destructure below has **no `..`**, on purpose: adding a field to
+    /// [`Metrics`] is a compile error here until it is listed, so this cannot
+    /// be a short list the way a hand-kept array of expected names can. That is
+    /// what lets `metrics_tests` assert the exported set **equals** this one
+    /// rather than merely containing some of it — a new instrument is then
+    /// covered the day it is added, because the test stays red until it is both
+    /// named here and driven there.
+    ///
+    /// Renaming an instrument in [`Self::with_meter`] without renaming it here
+    /// fails the same assertion, from the other side.
+    #[cfg(test)]
+    #[must_use]
+    pub fn declared_instrument_names(&self) -> Vec<&'static str> {
+        let Self {
+            insert_duration: _,
+            query_duration: _,
+            pool_acquire_duration: _,
+            batch_rows: _,
+            dedup_absorbed: _,
+            backend_error: _,
+            idempotency_conflict: _,
+            migration_failure: _,
+            invalidation: _,
+            invalidation_rejected_rows: _,
+            invalidation_rejected_statements: _,
+            dedup_stale: _,
+            batch_retry: _,
+            query_requests: _,
+            tls_handshake_failure: _,
+            ready: _,
+            _pool_active: _,
+            _pool_idle: _,
+        } = self;
+        vec![
+            "uc_timescaledb_insert_duration_seconds",
+            "uc_timescaledb_query_duration_seconds",
+            "uc_timescaledb_pool_acquire_duration_seconds",
+            "uc_timescaledb_batch_rows",
+            "uc_timescaledb_dedup_absorbed_total",
+            "uc_timescaledb_backend_errors_total",
+            "uc_timescaledb_idempotency_conflicts_total",
+            "uc_timescaledb_migration_failures_total",
+            "uc_timescaledb_invalidations_total",
+            "uc_timescaledb_invalidation_rejected_rows_total",
+            "uc_timescaledb_invalidation_rejected_statements_total",
+            "uc_timescaledb_dedup_stale_total",
+            "uc_timescaledb_batch_retries_total",
+            "uc_timescaledb_query_requests_total",
+            "uc_timescaledb_tls_handshake_failures_total",
+            "uc_timescaledb_ready",
+            "uc_timescaledb_pool_connections_active",
+            "uc_timescaledb_pool_connections_idle",
+        ]
     }
 }
 

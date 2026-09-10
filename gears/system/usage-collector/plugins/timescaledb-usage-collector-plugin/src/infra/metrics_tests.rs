@@ -1,4 +1,4 @@
-use super::{ErrorClass, InsertMode, Metrics, QueryKind, label};
+use super::{DURATION_BOUNDARIES_SECS, ErrorClass, InsertMode, Metrics, QueryKind, label};
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -97,6 +97,30 @@ fn description_of(exporter: &InMemoryMetricExporter, name: &str) -> Option<Strin
         }
     }
     None
+}
+
+/// The attribute count of every data point of the `u64` counter named `name`.
+///
+/// An empty vector means the instrument exported no counter data points, which
+/// is a different failure from "every point is unlabelled" and must not read as
+/// a pass.
+fn counter_attribute_counts(exporter: &InMemoryMetricExporter, name: &str) -> Vec<usize> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    for resource_metrics in &metrics {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data()
+                {
+                    return sum
+                        .data_points()
+                        .map(|dp| dp.attributes().count())
+                        .collect();
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Every instrument name the meter exported, sorted.
@@ -303,9 +327,12 @@ async fn the_two_rejection_paths_are_separate_instruments_because_their_units_di
         "the index's cross-call refusal counts refused statements",
     );
 
-    // The separation itself: two names, and no `scope` dimension on either that
-    // would invite adding them together. Collapsing the two helpers onto one
-    // instrument fails the first assert; re-introducing the label fails this.
+    // The separation itself: two names, and **no dimension at all** on either.
+    // Asserting zero attributes rather than the absence of two particular
+    // `scope` values is what makes "the unit belongs in the name" complete — a
+    // reintroduced label spelled any other way is caught too. Collapsing the
+    // two helpers onto one instrument fails the counts above; reintroducing a
+    // label of any spelling fails this.
     for name in [
         "uc_timescaledb_invalidation_rejected_rows_total",
         "uc_timescaledb_invalidation_rejected_statements_total",
@@ -314,11 +341,12 @@ async fn the_two_rejection_paths_are_separate_instruments_because_their_units_di
             exported_names(&exporter).contains(&name.to_owned()),
             "{name} must be its own series, not a label value of a shared one",
         );
-        assert_eq!(
-            counter_sum_with_label(&exporter, name, "scope", "in_batch")
-                + counter_sum_with_label(&exporter, name, "scope", "cross_call"),
-            0,
-            "{name} must carry no `scope` dimension; the unit belongs in the name",
+        let attrs = counter_attribute_counts(&exporter, name);
+        assert!(!attrs.is_empty(), "{name} must export a counter data point");
+        assert!(
+            attrs.iter().all(|n| *n == 0),
+            "{name} must carry no dimension at all; the unit belongs in the \
+             name, not in a label. Attribute counts per point: {attrs:?}",
         );
     }
 }
@@ -365,25 +393,52 @@ async fn each_rejection_counters_description_carries_its_own_unit() {
 }
 
 /// Every instrument the inventory exports obeys the naming convention the
-/// module doc states, over the whole set rather than one name at a time.
+/// module doc states — asserted off each instrument's **kind**, over the exact
+/// exported set.
 ///
-/// The module doc names two rules §3.11.5 binds this crate by. This is the
-/// mechanism for the first; the bounded-label rule is the second, and the
-/// closed `as_label` enums are its mechanism. Without this, the convention is a
-/// paragraph, and a new instrument added with a dotted name, a missing `_total`
-/// or a `.with_unit()` hint is caught by nobody — which is exactly how the
-/// seven phantom dotted citations this task removed came to look plausible.
+/// The doc names two rules §3.11.5 binds this crate by. This is the mechanism
+/// for the naming one; the bounded-label rule has the closed `as_label` enums
+/// as its own. Without this the convention is a paragraph, and a new instrument
+/// added with a dotted name, a missing `_total` or a `_secs` suffix is caught
+/// by nobody — which is how the seven phantom dotted citations this task
+/// removed came to look plausible in the first place.
 ///
-/// Deliberately driven off the exported set, not off a hand-kept list of
-/// expected names: a new instrument is covered the day it is added, and a list
-/// would need updating in the same commit that breaks the rule.
+/// **Kind, not spelling — including which histograms are durations.** `_total`
+/// is asserted of everything the SDK exports as a `Sum`, so all eleven counters
+/// are covered rather than the five a hardcoded list of names happened to hold.
+/// `_seconds` is asserted of every histogram **built with
+/// `DURATION_BOUNDARIES_SECS`**, read back off the exported bucket bounds — not
+/// of every histogram whose name contains "duration", which would let
+/// `uc_timescaledb_insert_latency_ms` through for the same reason a comment
+/// lets a rename through: it only inspects names that already announce
+/// themselves. `uc_timescaledb_batch_rows` is the f64 histogram correctly *not*
+/// in seconds, and `BATCH_ROW_BOUNDARIES` is what says so.
+///
+/// **The exported set must equal [`Metrics::declared_instrument_names`]**, not
+/// merely reach some floor. A floor cannot notice an instrument disappearing,
+/// and it hid an untested belief: that the two observable pool gauges are
+/// collected by their callbacks on this path. Equality tests that belief
+/// instead of assuming it — it holds, at 18 — and the declared list cannot be
+/// short, because its destructure has no `..`.
+///
+/// So a new instrument is covered the day it is added, and by two mechanisms
+/// that catch different halves: the compiler refuses
+/// `declared_instrument_names` until it is listed there, and this equality
+/// stays red until it is driven in the block below. Neither is a list anyone
+/// can quietly leave short.
 #[tokio::test]
 async fn every_exported_instrument_obeys_the_naming_convention() {
     let (provider, exporter) = local_provider();
     let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
 
-    // Touch every recording helper so the full inventory is exported. The two
-    // observable pool gauges are collected by their callbacks on flush.
+    // Every recording helper, and every one of these calls is load-bearing:
+    // measured by deleting them one at a time, an instrument the SDK has built
+    // but never recorded on is **not exported at all** -- counter, histogram
+    // and gauge alike. So the equality assertion below reds until a new
+    // instrument is driven here, which is what makes "covered the day it is
+    // added" true rather than aspirational. The two observable pool gauges have
+    // no helper; the same assertion is what establishes that their callbacks
+    // fire on flush.
     metrics.record_insert(InsertMode::Single, 0.001);
     metrics.record_query(QueryKind::Raw, 0.001);
     metrics.record_pool_acquire(0.001);
@@ -402,51 +457,76 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
     metrics.set_ready(true);
 
     provider.force_flush().unwrap();
-    let names = exported_names(&exporter);
 
-    assert!(
-        names.len() >= 16,
-        "the inventory should export every instrument the helpers touch, got {}: {names:?}",
-        names.len(),
+    let mut declared = metrics.declared_instrument_names();
+    declared.sort_unstable();
+    assert_eq!(
+        exported_names(&exporter),
+        declared,
+        "the exported inventory must be exactly what Metrics declares: an extra \
+         name means an instrument nobody drives here, a missing one means an \
+         instrument that is built but never reaches a reader",
     );
 
-    for name in &names {
-        assert!(
-            name.starts_with("uc_timescaledb_"),
-            "{name} must sit in the plugin's own sub-namespace",
-        );
-        assert!(
-            name.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
-            "{name} must be a full literal Prometheus name: snake_case, no dots",
-        );
-        assert!(
-            !name.ends_with('_'),
-            "{name} must not end in a bare separator",
-        );
-    }
+    let recorded = exporter.get_finished_metrics().unwrap();
+    for resource_metrics in &recorded {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                let name = metric.name();
+                assert!(
+                    name.starts_with("uc_timescaledb_"),
+                    "{name} must sit in the plugin's own sub-namespace",
+                );
+                assert!(
+                    name.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                    "{name} must be a full literal Prometheus name: snake_case, no dots",
+                );
+                assert!(!name.ends_with('_'), "{name} must not end in a separator");
 
-    // `_total` is the counter suffix and `_seconds` the duration-histogram one,
-    // so that the rendered series name is identical whether the downstream
-    // collector runs with `add_metric_suffixes` on or off.
-    for name in [
-        "uc_timescaledb_dedup_absorbed_total",
-        "uc_timescaledb_backend_errors_total",
-        "uc_timescaledb_invalidations_total",
-        "uc_timescaledb_invalidation_rejected_rows_total",
-        "uc_timescaledb_invalidation_rejected_statements_total",
-    ] {
-        assert!(
-            names.contains(&name.to_owned()),
-            "{name} must be exported; the counter suffix check below depends on it",
-        );
-    }
-    for name in &names {
-        if name.contains("_duration_") {
-            assert!(
-                name.ends_with("_seconds"),
-                "{name} is a duration histogram and must end in _seconds",
-            );
+                // The suffix rules, off the exported kind. `_total` on every
+                // Sum and `_seconds` on every duration histogram is what makes
+                // the rendered series name identical whether the downstream
+                // collector runs with `add_metric_suffixes` on or off.
+                match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(_)) => assert!(
+                        name.ends_with("_total"),
+                        "{name} is exported as a counter and must end in _total",
+                    ),
+                    AggregatedMetrics::F64(MetricData::Histogram(h)) => {
+                        // Without a data point there are no bounds to read and
+                        // the check below is vacuously true. Belt and braces
+                        // with the equality assertion above -- that already
+                        // reds on an undriven instrument, since an unrecorded
+                        // one is not exported -- but this one states the local
+                        // requirement where the bounds are actually read,
+                        // rather than leaving it to hold at a distance.
+                        assert!(
+                            h.data_points().next().is_some(),
+                            "{name} must be recorded on above, or its bucket layout \
+                             cannot be read and the _seconds rule passes vacuously",
+                        );
+                        // Which histograms are durations is decided by the
+                        // bucket layout they were built with, not by whether
+                        // their name already says "duration". Keying on the
+                        // name would let `uc_timescaledb_insert_latency_ms`
+                        // through -- it announces nothing the guard looks for --
+                        // which is the same shape of hole as trusting a comment.
+                        // `uc_timescaledb_batch_rows` is the f64 histogram that
+                        // is correctly not in seconds, and it is BATCH_ROW_
+                        // BOUNDARIES that says so.
+                        let is_duration = h
+                            .data_points()
+                            .any(|dp| dp.bounds().eq(DURATION_BOUNDARIES_SECS.iter().copied()));
+                        assert!(
+                            !is_duration || name.ends_with("_seconds"),
+                            "{name} was built with the duration bucket layout and \
+                             must end in _seconds",
+                        );
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }

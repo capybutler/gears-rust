@@ -4105,6 +4105,11 @@ naming both entries.
 | drop "a retried batch counts once per attempt" | same |
 | a dotted instrument name (`uc_timescaledb.dedup.absorbed`) | `…obeys_the_naming_convention` |
 | `uc_timescaledb_query_duration_seconds` → `…_duration_secs` | same |
+| rename an instrument in `with_meter` only | same (set equality) |
+| `uc_timescaledb_dedup_absorbed_total` → drop `_total`, both sides | same (kind rule) |
+| `uc_timescaledb_insert_duration_seconds` → `…_insert_latency_ms`, both sides | same (bucket-layout rule; a name-based guard misses this) |
+| drop any single driver call | same (set equality) |
+| re-introduce a label spelled anything at all | `…separate_instruments…` (zero-attribute assert) |
 | `metadata jsonb` → `json` in the migration | `each_inserted_column_is_unnested_as_…` |
 
 **The description test asserts contiguous phrases, not loose substrings.** An
@@ -4116,11 +4121,39 @@ warning. That is the mutation row above.
 **`every_exported_instrument_obeys_the_naming_convention` is the mechanism for a
 claim the module doc had been making unbacked.** The doc states the two rules
 §3.11.5 binds this crate by; the bounded-label rule has the closed `as_label`
-enums, and the naming rule had nothing. The test drives every recording helper,
-flushes, and asserts over the **exported set** — `uc_timescaledb_` prefix,
-snake_case with no dots, `_seconds` on duration histograms — rather than against
-a hand-kept list of expected names, so a new instrument is covered the day it is
-added instead of on the day someone remembers to extend a list.
+enums, and the naming rule had nothing.
+
+It asserts **off each instrument's kind, over the exact exported set**:
+
+- `_total` on everything the SDK exports as a `Sum` — all **11** counters, where
+  the first version enforced it through five hardcoded names, which is the
+  hand-kept list its own rustdoc claimed to avoid.
+- `_seconds` on every histogram **built with `DURATION_BOUNDARIES_SECS`**, read
+  back off the exported bucket bounds. Not on every histogram whose *name*
+  contains "duration": that guard only inspects names that already announce
+  themselves, so `uc_timescaledb_insert_latency_ms` sails through it.
+  `uc_timescaledb_batch_rows` is the f64 histogram correctly not in seconds, and
+  `BATCH_ROW_BOUNDARIES` is what says so. The histogram arm also asserts it got
+  a data point, so the bounds check cannot pass vacuously.
+- The exported set **equals** `Metrics::declared_instrument_names()`, which
+  destructures `Self` with **no `..`** — so adding a field is a compile error
+  until it is listed. A floor (`>= 16`) was the first version and it was wrong
+  twice over: it cannot notice an instrument disappearing, and it hid an
+  untested belief that the two observable pool gauges are collected by their
+  callbacks on this path. **They are: the set is exactly 18.**
+
+**A measurement inside this task came out backwards and was caught by re-running
+it correctly — the mechanism is worth keeping.** Two mutations "survived",
+apparently showing that the driver block was decoration and that the SDK exports
+instruments it has built but never recorded. Both had been applied with
+`str.replace(old, new, 1)` on a literal that occurs in **two** test functions,
+so they mutated the *other* test and never touched the one under measurement. A
+mutation applied to the wrong site is a false survivor exactly as an mtime-stale
+rebuild is — and it argues, in the same direction, for deleting a working check.
+Re-run against the right site, every driver call is load-bearing: **an
+instrument the SDK has built but never recorded on is not exported at all**,
+counter, histogram and gauge alike. **Anchor a mutation to a unique site, or
+count the occurrences first.**
 
 **Left for Task 15, and routed into Task 15's own section rather than only
 recorded here.** Both increments sit on paths that need a live backend, so this

@@ -281,17 +281,19 @@ impl PgRecordStore {
         // an operator would most want to see, so counting only the attributed
         // ones would undercount exactly there.
         //
-        // The in-batch counterpart is in `resolve_batch`. The two arms of the
-        // `scope` label count different things and are not addable: `in_batch`
-        // increments once per refused **row**, `cross_call` once per refused
-        // **statement**, because the index aborts a multi-row `INSERT` whole.
+        // The in-batch counterpart is a *different instrument*,
+        // `uc_timescaledb_invalidation_rejected_rows_total` in `resolve_batch`,
+        // because the units differ: this one counts refused **statements** (the
+        // index aborts a multi-row `INSERT` whole), that one refused **rows**.
+        // They are two series rather than two values of one label precisely so
+        // that they cannot be summed — the separation is structural, not a
+        // warning someone has to read and obey.
         //
-        // `cross_call` therefore under-counts within itself, and not only
-        // against `in_batch`: one aborted batch withdrawing two *different*
-        // already-withdrawn targets is a single increment, because `plan_batch`
-        // pre-rejects same-target duplicates only and nothing splits the
-        // statement per row. Read it as "batches refused", never as
-        // "withdrawals refused".
+        // This one also under-counts against the withdrawals it refuses: one
+        // aborted batch withdrawing two *different* already-withdrawn targets
+        // is a single increment, because `plan_batch` pre-rejects same-target
+        // duplicates only and nothing splits the statement per row. Read it as
+        // "statements refused", never as "withdrawals refused".
         self.metrics.inc_invalidation_rejected_statement();
         match find_existing_invalidation(conn, slots).await {
             Ok(Some((id, invalidated_by))) => {
@@ -685,11 +687,11 @@ impl PgRecordStore {
             // than the row. See [`plan_batch`] — this check is not the
             // enforcement, only what keeps the outcome per-row.
             //
-            // Keeping it per-row is also why this counter's unit is the odd one
-            // out: `in_batch` increments once per refused **row** here, while
-            // `cross_call` increments once per refused **statement** in
-            // `map_insert_error`. The two arms of `scope` are not addable — see
-            // [`InvalidationRejection`].
+            // Keeping it per-row is also this counter's unit: one increment
+            // per refused **row** here, against one per refused **statement**
+            // in `map_insert_error`. That difference is why the two are
+            // separate instruments and not two values of one label — see
+            // `Metrics::inc_invalidation_rejected_row`.
             if let Some(&invalidated_by) = plan.duplicate_withdrawals.get(&i) {
                 self.metrics.inc_invalidation_rejected_row();
                 results.push(Err(duplicate_withdrawal_in_batch(record, invalidated_by)));
@@ -1493,9 +1495,10 @@ fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollec
 /// Log a retryable dedup-path transient at `warn` with the record's identifiers,
 /// then return the matching [`UsageCollectorPluginError::Transient`]. The
 /// degraded path is self-healing on retry but must still surface at `warn` so an
-/// operator can see it. This helper moves no counter itself; both callers
-/// increment one first where a metric applies (`inc_dedup_stale` on the
-/// retention race), so the path is logged and counted, not logged alone.
+/// operator can see it. This helper only logs and builds the error: any counter
+/// is the caller's, `inc_dedup_stale` on the retention-race sites and none on
+/// the defensive not-found arm, which is unreachable by construction. Stated as
+/// a kind rather than a count because the call sites move.
 fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
     tracing::warn!(
         tenant_id = %record.tenant_id,
@@ -2081,19 +2084,21 @@ impl RecordStore for PgRecordStore {
                 // self-healed deadlock victim can be told apart from a returned
                 // transient error, which moves this counter not at all (most
                 // move the backend-error counter instead; `map_insert_error`'s
-                // could-not-name-the-invalidation arm moves the
-                // invalidation-rejection counter, not this one).
+                // could-not-name-the-invalidation arm moves
+                // `uc_timescaledb_invalidation_rejected_statements_total`, not
+                // this one).
                 //
                 // That arm returns `Transient`, which `is_retryable_batch_error`
                 // admits, so a retention-race batch re-enters
                 // `map_insert_error` on each of up to `MAX_BATCH_ATTEMPTS`
-                // attempts and increments `cross_call` every time. Correct
-                // under that label's unit — three attempts are three refused
-                // statements — and `uc_timescaledb_batch_retries_total` moves
-                // beside it, so the two are readable together rather than one
-                // masking the other. Worth stating because it is new: before
-                // the increment was hoisted above that `match` it could not
-                // fire twice for one request.
+                // attempts and increments that instrument every time. Correct
+                // under its unit — three attempts are three refused statements
+                // — and this counter moves beside it, so the two are readable
+                // together rather than one masking the other. The caveat is on
+                // the instrument's own description too, since a Prometheus
+                // series carries no rustdoc. Worth stating because it is new:
+                // before the increment was hoisted above that `match` it could
+                // not fire twice for one request.
                 tracing::warn!(
                     attempt,
                     max_attempts = MAX_BATCH_ATTEMPTS,
