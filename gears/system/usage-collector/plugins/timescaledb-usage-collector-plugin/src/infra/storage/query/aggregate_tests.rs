@@ -202,13 +202,22 @@ const LEDGER_COLUMNS: &[&str] = &[
 /// scratch harness `#[path]`-includes this module.
 const MIGRATION_SQL: &str = include_str!("../../../../migrations/0001_init.sql");
 
-/// The ledger table's columns as declared, in declaration order. Reads the
-/// `CREATE TABLE` block and keeps the lines that are `<name> <sql type>`, which
-/// leaves out the comments, the table constraints and the generated-column
-/// continuation lines. The type token sheds a trailing comma, which is what a
-/// nullable column's declaration ends on.
+/// The ledger table's columns as declared, in declaration order.
+///
+/// It recognizes what a column is **not**, rather than allowlisting type names.
+/// The table-constraint keywords are closed by the SQL grammar and are upper
+/// case; type names are open-ended, and an allowlist of them fails in the worse
+/// direction — a column whose type is not on it vanishes from the parsed set,
+/// so a developer who forgets to add it to [`LEDGER_COLUMNS`] gets a green run
+/// and a blind alias guard, while one who remembers gets a red run telling a
+/// correct edit it is wrong. Here an unrecognized construct becomes an *extra*
+/// entry and reds the test instead, which is the loud failure.
+///
+/// A column line is indented exactly four spaces, names an all-lower-case
+/// identifier, and has a second token after it. That drops the `--` comments,
+/// the upper-case `PRIMARY KEY`/`CONSTRAINT` lines, and the more deeply
+/// indented constraint bodies and generated-column continuations.
 fn migration_ledger_columns() -> Vec<&'static str> {
-    const SQL_TYPES: &[&str] = &["uuid", "text", "numeric", "timestamptz", "bigint", "jsonb"];
     let start = MIGRATION_SQL
         .find("CREATE TABLE IF NOT EXISTS usage_records (")
         .expect("the ledger table is declared");
@@ -217,11 +226,17 @@ fn migration_ledger_columns() -> Vec<&'static str> {
     block[..end]
         .lines()
         .filter_map(|line| {
-            let mut parts = line.strip_prefix("    ")?.split_whitespace();
+            let decl = line.strip_prefix("    ")?;
+            if decl.starts_with(' ') {
+                return None;
+            }
+            let mut parts = decl.split_whitespace();
             let name = parts.next()?;
-            let sql_type = parts.next()?.trim_end_matches(',');
-            let is_column = SQL_TYPES.contains(&sql_type)
-                && name.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+            // A column declaration always has a type after the name.
+            parts.next()?;
+            let is_column = name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
             is_column.then_some(name)
         })
         .collect()
