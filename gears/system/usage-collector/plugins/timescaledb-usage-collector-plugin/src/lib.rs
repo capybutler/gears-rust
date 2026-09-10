@@ -4,7 +4,7 @@
 //!
 //! Implements [`usage_collector_sdk::UsageCollectorPluginV1`] on `PostgreSQL` +
 //! `TimescaleDB`. Layered DDD-light: [`gear`] performs the GTS registration
-//! handshake, [`domain`] holds the SPI adapter and store port traits, and
+//! handshake, [`domain`] holds the SPI adapter and the store port trait, and
 //! [`infra`] holds the `sqlx`-backed Postgres implementations.
 
 pub mod gear;

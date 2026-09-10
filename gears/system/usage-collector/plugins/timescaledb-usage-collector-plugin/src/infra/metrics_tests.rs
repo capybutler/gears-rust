@@ -1,4 +1,4 @@
-use super::{ErrorClass, InsertMode, Metrics, QueryKind, label};
+use super::{ErrorClass, InsertMode, InvalidationRejection, Metrics, QueryKind, label};
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -221,5 +221,60 @@ async fn recording_helpers_emit_expected_series() {
     assert_eq!(
         histogram_count(&exporter, "uc_timescaledb_insert_duration_seconds"),
         2,
+    );
+}
+
+/// The two at-most-one-invalidation counters emit under the names the
+/// inventory declares, and the rejection counter splits on the `scope` label
+/// rather than collapsing both refusal paths onto one series.
+///
+/// The split is the point: the in-batch pre-reject and the index's cross-call
+/// refusal are two different mechanisms with two different fixes, and a summed
+/// counter cannot tell an operator which one is firing. Asserting the total
+/// alone would stay green with both arms of `InvalidationRejection::as_label`
+/// returning the same string.
+#[tokio::test]
+async fn invalidation_counters_emit_under_their_declared_names() {
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+
+    metrics.inc_invalidation();
+    metrics.inc_invalidation();
+
+    metrics.inc_invalidation_rejection(InvalidationRejection::InBatch);
+    metrics.inc_invalidation_rejection(InvalidationRejection::InBatch);
+    metrics.inc_invalidation_rejection(InvalidationRejection::CrossCall);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_sum(&exporter, "uc_timescaledb_invalidations_total"),
+        2,
+        "an accepted invalidation entry increments the accepted counter",
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_timescaledb_invalidation_rejections_total"),
+        3,
+        "every refused withdrawal increments the rejection counter",
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_timescaledb_invalidation_rejections_total",
+            label::SCOPE,
+            label::SCOPE_IN_BATCH,
+        ),
+        2,
+        "the in-batch pre-reject carries scope=in_batch",
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_timescaledb_invalidation_rejections_total",
+            label::SCOPE,
+            label::SCOPE_CROSS_CALL,
+        ),
+        1,
+        "the index's cross-call refusal carries scope=cross_call",
     );
 }

@@ -36,7 +36,9 @@ use usage_collector_sdk::{
 };
 
 use crate::domain::ports::RecordStore;
-use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
+use crate::infra::metrics::{
+    ErrorClass, InsertMode, InvalidationRejection, Metrics, OpDurationGuard, QueryKind, TimedOp,
+};
 use crate::infra::storage::entity::UsageRecordRow;
 use crate::infra::storage::error::{
     DbErrorClass, acquire_error_clears_readiness, classify_db, db_code_and_constraint, map_sqlx_err,
@@ -179,8 +181,9 @@ static BATCH_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
 /// hypertable.
 ///
 /// Every operation acquires its connection through [`Self::timed_acquire`], so
-/// `pool.acquire.duration` is recorded per acquire and `tls.handshake.failure.count`
-/// is incremented when a fresh physical connection fails its TLS handshake (via
+/// `uc_timescaledb_pool_acquire_duration_seconds` is recorded per acquire and
+/// `uc_timescaledb_tls_handshake_failures_total` is incremented when a fresh
+/// physical connection fails its TLS handshake (via
 /// [`Self::record_backend_error`]).
 #[derive(Debug, Clone)]
 pub struct PgRecordStore {
@@ -258,6 +261,13 @@ impl PgRecordStore {
         }
         match find_existing_invalidation(conn, slots).await {
             Ok(Some((id, invalidated_by))) => {
+                // The one admission-time obligation the SPI puts on the store,
+                // refused across calls. Counted here and in-batch at
+                // `assemble_batch_results`, so the refusal rate is visible at
+                // all; without it the only trace of a refused withdrawal is the
+                // error returned to the caller.
+                self.metrics
+                    .inc_invalidation_rejection(InvalidationRejection::CrossCall);
                 UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }
             }
             // The index refused the write, so an accepted invalidation existed
@@ -271,7 +281,8 @@ impl PgRecordStore {
         }
     }
 
-    /// Acquire a pooled connection, recording `pool.acquire.duration`. Errors map
+    /// Acquire a pooled connection, recording
+    /// `uc_timescaledb_pool_acquire_duration_seconds`. Errors map
     /// through [`Self::record_backend_error`] (which also catches a TLS-handshake
     /// failure on a fresh physical connection). Every operation acquires through
     /// this path so the acquire-latency histogram is representative.
@@ -342,11 +353,12 @@ impl PgRecordStore {
     /// absorb-vs-conflict against the now-visible committed row.
     ///
     /// This carries the per-row counters (dedup absorbed / idempotency conflict
-    /// / compensation / backend error) so they are recorded exactly once per
-    /// row whether the caller is [`RecordStore::create`] (single) or
-    /// [`RecordStore::create_batch`] (per-row loop). The `insert.duration`
-    /// histogram is deliberately NOT recorded here — the public methods time
-    /// the whole call and tag it with the correct `mode`.
+    /// / invalidation accepted / invalidation refused / backend error) so they
+    /// are recorded exactly once per row whether the caller is
+    /// [`RecordStore::create`] (single) or [`RecordStore::create_batch`]
+    /// (per-row loop). The `uc_timescaledb_insert_duration_seconds` histogram is
+    /// deliberately NOT recorded here — the public methods time the whole call
+    /// and tag it with the correct `mode`.
     async fn create_inner(
         &self,
         record: UsageRecord,
@@ -431,7 +443,7 @@ impl PgRecordStore {
                 .await
                 .map_err(|e| self.record_backend_error(&e))?;
             if is_invalidation {
-                self.metrics.inc_compensation();
+                self.metrics.inc_invalidation();
             }
             return record_row_to_model(row);
         }
@@ -476,8 +488,9 @@ impl PgRecordStore {
     /// Resolve a dedup-key hit into absorb (stored row) vs `IdempotencyConflict`
     /// via [`canonical_equal`]. Called from the conflict branch of
     /// `create_inner` when an existing dedup slot's stored record is found.
-    /// Increments the matching per-row counter: `dedup.absorbed` on an
-    /// exact-equality absorb, `idempotency.conflict` on a canonical-field
+    /// Increments the matching per-row counter:
+    /// `uc_timescaledb_dedup_absorbed_total` on an exact-equality absorb,
+    /// `uc_timescaledb_idempotency_conflicts_total` on a canonical-field
     /// mismatch. A stored-metadata decode failure propagates as `Internal`
     /// rather than masquerading as a conflict.
     fn resolve_dedup_hit(
@@ -644,6 +657,8 @@ impl PgRecordStore {
             // than the row. See [`plan_batch`] — this check is not the
             // enforcement, only what keeps the outcome per-row.
             if let Some(&invalidated_by) = plan.duplicate_withdrawals.get(&i) {
+                self.metrics
+                    .inc_invalidation_rejection(InvalidationRejection::InBatch);
                 results.push(Err(duplicate_withdrawal_in_batch(record, invalidated_by)));
                 continue;
             }
@@ -653,7 +668,7 @@ impl PgRecordStore {
                 // the fresh insert.
                 Some(row) if plan.first_index.get(&key) == Some(&i) => {
                     if record.invalidation.is_some() {
-                        self.metrics.inc_compensation();
+                        self.metrics.inc_invalidation();
                     }
                     record_row_to_model(row.clone())
                 }
@@ -2182,7 +2197,8 @@ impl RecordStore for PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        // `_timer` records `query.duration` on drop (success and error alike).
+        // `_timer` records `uc_timescaledb_query_duration_seconds` on drop
+        // (success and error alike).
         build_list_page(rows, query, limit)
     }
 
@@ -2298,7 +2314,8 @@ impl RecordStore for PgRecordStore {
             .map(|row| aggregate_bucket(row, statement.dim_count))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // `_timer` records `query.duration` on drop (success and error alike).
+        // `_timer` records `uc_timescaledb_query_duration_seconds` on drop
+        // (success and error alike).
         Ok(AggregationResult { buckets })
     }
 }

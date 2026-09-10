@@ -1,8 +1,16 @@
 //! `OpenTelemetry` metric inventory for the `TimescaleDB` storage plugin.
 //!
-//! Realizes design ID `cpt-cf-uc-plugin-design-metric-inventory` (`DESIGN.md`
-//! §Observability): every backend-internal series the plugin owns under the
-//! `uc_timescaledb_` sub-namespace. Instrument names are the **full literal**
+//! Realizes design ID `cpt-cf-uc-plugin-design-metric-inventory`: every
+//! backend-internal series the plugin owns under the `uc_timescaledb_`
+//! sub-namespace. The gear's `DESIGN.md` §3.11.5 owns the request-path `uc_`
+//! inventory and delegates the rest — "plugins may expose backend-internal
+//! metrics under their own prefix; those series are owned by the plugin's
+//! deployment guide" — so **this module is the authority on what the plugin
+//! emits**, and the two rules §3.11.5 does bind it by are the naming
+//! convention below and the bounded-label rule further down. The plugin's own
+//! `docs/DESIGN.md` §4 table is not a second authority: it predates the
+//! slice-4 record model and still lists instruments this crate deleted with the
+//! usage-type catalog. Instrument names are the **full literal**
 //! Prometheus names (snake_case, `_total` on counters, `_seconds` on duration
 //! histograms) with **no** `.with_unit(...)` hint, so the rendered series name is
 //! identical whether the downstream collector runs with `add_metric_suffixes` on
@@ -70,6 +78,15 @@ pub mod label {
     pub const ERROR_CATEGORY_TRANSIENT: &str = "transient";
     /// `error_category` value: a non-retryable internal backend failure.
     pub const ERROR_CATEGORY_INTERNAL: &str = "internal";
+
+    /// Label key for the invalidation-rejection scope dimension.
+    pub const SCOPE: &str = "scope";
+    /// `scope` value: the withdrawal was refused against an earlier entry of
+    /// the same `create_batch` call.
+    pub const SCOPE_IN_BATCH: &str = "in_batch";
+    /// `scope` value: the withdrawal was refused against an entry already in
+    /// the ledger from an earlier call.
+    pub const SCOPE_CROSS_CALL: &str = "cross_call";
 }
 
 /// Insert-mode dimension behind the `mode` label of
@@ -135,6 +152,36 @@ impl ErrorClass {
     }
 }
 
+/// Which of the two at-most-one-invalidation rejection paths refused a
+/// withdrawal, behind the `scope` label of
+/// `uc_timescaledb_invalidation_rejections_total`.
+///
+/// The SPI names at-most-one invalidation as the store's single admission-time
+/// obligation, and the plugin refuses a second withdrawal along two paths that
+/// are asymmetric in every other respect: `plan_batch` pre-rejects a duplicate
+/// inside one `create_batch` call before the multi-row `INSERT` is built, while
+/// the partial unique index refuses one that arrives in a later call. Splitting
+/// the counter on that boundary is what makes the two legible apart; summing it
+/// gives the refusal rate an operator needs to see the obligation being
+/// exercised at all. A closed enum so the label set is enforced by the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationRejection {
+    /// Refused against an earlier entry of the same batch (`scope = "in_batch"`).
+    InBatch,
+    /// Refused against an entry already in the ledger (`scope = "cross_call"`).
+    CrossCall,
+}
+
+impl InvalidationRejection {
+    /// The bounded `scope` label value for this rejection path.
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::InBatch => label::SCOPE_IN_BATCH,
+            Self::CrossCall => label::SCOPE_CROSS_CALL,
+        }
+    }
+}
+
 /// The full `OpenTelemetry` metric inventory for the plugin.
 ///
 /// Built once via [`Metrics::new`] and shared through an `Arc<Metrics>`; the
@@ -165,8 +212,10 @@ pub struct Metrics {
     idempotency_conflict: Counter<u64>,
     /// `uc_timescaledb_migration_failures_total`.
     migration_failure: Counter<u64>,
-    /// `uc_timescaledb_compensations_total`.
-    compensation: Counter<u64>,
+    /// `uc_timescaledb_invalidations_total`.
+    invalidation: Counter<u64>,
+    /// `uc_timescaledb_invalidation_rejections_total` — labelled by `scope`.
+    invalidation_rejection: Counter<u64>,
     /// `uc_timescaledb_dedup_stale_total`.
     dedup_stale: Counter<u64>,
     /// `uc_timescaledb_batch_retries_total` — bounded in-process `create_batch`
@@ -249,9 +298,13 @@ impl Metrics {
             .u64_counter("uc_timescaledb_migration_failures_total")
             .with_description("Schema-migration failures at startup")
             .build();
-        let compensation = meter
-            .u64_counter("uc_timescaledb_compensations_total")
-            .with_description("Inserts carrying a corrects_id (compensating records)")
+        let invalidation = meter
+            .u64_counter("uc_timescaledb_invalidations_total")
+            .with_description("Accepted invalidation entries (append-only withdrawals)")
+            .build();
+        let invalidation_rejection = meter
+            .u64_counter("uc_timescaledb_invalidation_rejections_total")
+            .with_description("Withdrawals refused by the at-most-one rule, by scope")
             .build();
         let dedup_stale = meter
             .u64_counter("uc_timescaledb_dedup_stale_total")
@@ -305,7 +358,8 @@ impl Metrics {
             backend_error,
             idempotency_conflict,
             migration_failure,
-            compensation,
+            invalidation,
+            invalidation_rejection,
             dedup_stale,
             batch_retry,
             query_requests,
@@ -352,9 +406,17 @@ impl Metrics {
         self.idempotency_conflict.add(1, &[]);
     }
 
-    /// Increment the compensation (`corrects_id` insert) counter.
-    pub fn inc_compensation(&self) {
-        self.compensation.add(1, &[]);
+    /// Increment the accepted-invalidation counter (one per admitted entry
+    /// carrying an [`Invalidation`](usage_collector_sdk::Invalidation)).
+    pub fn inc_invalidation(&self) {
+        self.invalidation.add(1, &[]);
+    }
+
+    /// Increment the refused-withdrawal counter for the given
+    /// [`InvalidationRejection`] path.
+    pub fn inc_invalidation_rejection(&self, scope: InvalidationRejection) {
+        self.invalidation_rejection
+            .add(1, &[KeyValue::new(label::SCOPE, scope.as_label())]);
     }
 
     /// Increment the stale-dedup counter (dedup hit whose record had aged out).
