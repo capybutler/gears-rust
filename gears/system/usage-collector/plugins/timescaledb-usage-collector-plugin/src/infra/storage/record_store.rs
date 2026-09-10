@@ -1661,9 +1661,11 @@ impl RecordStore for PgRecordStore {
         // outright — a withdrawn pair MUST be returned as persisted, and a
         // plugin MUST NOT withhold a withdrawn entry from this path as a
         // kindness — because hiding either half destroys the audit trail the
-        // append-only model exists to keep, and there is no other surface that
-        // can read back what was withdrawn. A consumer that wants the netted
-        // view has what it needs: an invalidation names its target
+        // append-only model exists to keep. Nor is this path a special case:
+        // the ADR puts every ledger read path under the same obligation (raw
+        // query, point lookup and usage feed alike), and `list` on this trait
+        // carries no exclusion either. A consumer that wants the netted view
+        // has what it needs: an invalidation names its target
         // (`UsageRecord::invalidation`), so the fold happens on the reader's
         // side. Neither `invalidates IS NULL` nor an `entry_type` restriction
         // is a kindness here; both are data loss

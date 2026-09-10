@@ -3265,14 +3265,17 @@ BREAKING CHANGE: RecordStore::get takes the compiled scope."
 > * **One named mutation survives, and it is not a silent one.** Deleting
 >   `get`'s `for b in &ctx.binds { q = bind_one(q, b); }` loop is invisible to
 >   every unit test here — no unit test executes a statement. It is not a quiet
->   bypass: the SQL still *names* `$2…$N`, so Postgres rejects every scoped
->   lookup outright rather than answering an unscoped row. **Task 15 is where
->   it dies**, on the first `get` its rewritten suite makes under a scope.
-> * **Three `store.get(id)` call sites in `tests/` now need a second
->   argument** — `tests/id_uniqueness_integration_pg.rs:71,73`,
+>   bypass, and cannot become one: the `WHERE` text still carries the scope
+>   conjunct, so the result set cannot widen under any parameter semantics — a
+>   short parameter list is rejected outright, and even if a missing parameter
+>   were read as `NULL`, `tenant_id = NULL` is `NULL` and matches nothing.
+>   **Task 15 is where it dies**, on the first `get` its rewritten suite makes
+>   under a scope.
+> * **Five `store.get(id)` call sites, across three files in `tests/`, now
+>   need a second argument** — `tests/id_uniqueness_integration_pg.rs:71,73`,
 >   `tests/records_ingest_integration_pg.rs:176,500`,
 >   `tests/records_query_integration_pg.rs:699`. Left as they are: Task 15
->   rewrites all six of those files wholesale and no test binary links before
+>   rewrites all six `tests/` files wholesale and no test binary links before
 >   Task 13.
 > * **The scope's allowlist is the `$filter` allowlist, exactly.** `get`
 >   resolves identifiers through
