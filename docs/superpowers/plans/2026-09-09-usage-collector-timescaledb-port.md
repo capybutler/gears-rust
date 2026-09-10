@@ -1502,9 +1502,10 @@ green, every mutation in Step 8's two passes killed, none surviving."
 
 ---
 
-## Task 6: Fix `record_column` (DIVERGENCES entry 16) — DONE (`d162b94b2`)
+## Task 6: Fix `record_column` (DIVERGENCES entry 16)
 
-**Measured while executing, correcting the preamble below.** `record_column`
+**Done in `d162b94b2` + `1d23382b2` (code) and `33beda048` (this block).
+Measured while executing, correcting the preamble below.** `record_column`
 was still at `translate.rs:55` and still mapped exactly the nine identifiers
 named, and the published `$filter` eight at `usage-collector-v1.yaml:440` are
 as stated. Four other claims had drifted:
@@ -1546,12 +1547,17 @@ directions.
 **Verified against the file at the time of writing:** `record_column` is at
 `src/infra/storage/query/translate.rs:55` and maps nine identifiers — `id`,
 `created_at`, `tenant_id`, `resource_id`, `resource_type`, `subject_id`,
-`subject_type`, `corrects_id`, `status`. (Confirmed on execution.) Re-verify before editing; earlier
-tasks in this plan do not touch this function, but the file has moved before.
+`subject_type`, `corrects_id`, `status`. (Confirmed on execution.) Re-verify
+before editing; earlier tasks in this plan do not touch this function, but the
+file has moved before.
 
 **The published `$filter` field set is eight** (`usage-collector-v1.yaml:440`):
 `tenant_id`, `resource_id`, `resource_type`, `subject_id`, `subject_type`,
 `entry_type`, `origin`, `invalidates`. The allowlist covers five of them.
+(Eight here and eleven above count different things: the eight are the `$filter`
+names the YAML publishes, the eleven are the fields `UsageRecordQuery` declares,
+which additionally carry `id`, `window_start` and `window_end` — mapped, but
+reserved on `$filter`. Both numbers are correct.)
 
 **Files:**
 - Modify: `src/infra/storage/query/translate.rs`, `src/infra/storage/query/translate_tests.rs`
@@ -1564,8 +1570,9 @@ them.** Both assert a field list the SDK no longer has:
   The SDK's `UsageRecordQuery` (`usage-collector-sdk/src/models.rs:1734`)
   declares `id`, `window_start`, `window_end`, `tenant_id`, `resource_id`,
   `resource_type`, `subject_id`, `subject_type`, `invalidates`, `entry_type`,
-  `origin` — eleven, not the eight this bullet originally listed. Task 1 edited this block
-  (stripping its usage-type half) and left the stale list standing.
+  `origin` — eleven, not the eight this bullet originally listed. Task 1
+  edited this block (stripping its usage-type half) and left the stale list
+  standing.
 - **`record_column`'s own doc** — "only these nine identifiers", corrected by
   Step 3 below.
 
@@ -1706,6 +1713,36 @@ Expected: all three pass.
 map. Some tests will name `created_at` or `status`. Fix each, and give a
 **per-test verdict**: repointed to a live field, or deleted because its question
 no longer exists.
+
+- [x] **Step 5b: Two tests the code review added, and one it repaired**
+
+Not in the plan as written; recorded here because they are the reason Task 6's
+own defect cannot recur. All three were proven red against a named mutation.
+
+- `every_declared_filter_field_maps_to_its_own_column` iterates
+  `<UsageRecordFilterField as FilterField>::FIELDS` and asserts the identity.
+  `translate_filter` resolves a conjunct with `col(field.name())`, so this is
+  the real invariant; the published-eight list is hand-copied and
+  `KEYSET_SAFE_RECORD_FIELDS` covers seven names, so a **twelfth** SDK filter
+  field would slip past both and 500 exactly as `origin` did. Mutation: add a
+  twelfth field to `UsageRecordQuery` — red, and red alone.
+- `a_real_column_that_is_not_a_filter_field_does_not_resolve` probes real
+  `usage_records` columns that are not filter fields (`reason_code`,
+  `gts_type_id`, `value`, `idempotency_key`, `acceptance_sequence`,
+  `metadata`, `ingested_at`). The allowlist is documented as *the* security
+  boundary and its closedness had no test, while `render_order_by(&query.order,
+  record_column)` hands it an arbitrary caller-supplied `$orderby` string.
+  Mutation: add `"reason_code" => Some("reason_code")` — red, and red alone.
+- `keyset_predicate_rejects_mixed_directions` was passing for the wrong
+  reason: its second cursor key was `"x"` against `id` (`FieldKind::Uuid`), so
+  `cursor_key_to_bind` errored on the parse and the bare `is_err()` held even
+  with `keyset.rs`'s mixed-direction rule deleted outright. Both keys are now
+  parseable and the assertion names the message.
+
+`PUBLISHED_FILTER_FIELDS` stays hand-copied **on purpose**, and now says so: it
+is transcribed from the YAML, a different source from the SDK, so it is the one
+test here that can see the code and the published contract drift apart. The
+SDK-coupled tests structurally cannot.
 
 - [x] **Step 6: Prove the mutations**
 
@@ -2630,6 +2667,27 @@ BREAKING CHANGE: RecordStore::get takes the compiled scope."
 ---
 
 ## Task 11: `list_usage_records` — time range, order, cursor
+
+> **Added by Task 6's code review — `record_row_key` is the uncoupled half of
+> this task.** `record_store.rs:591` maps an order-field name to that row's
+> cursor-key value: the inverse of `record_column` on the pagination path, and
+> nothing couples the two. After Task 6 they disagree. `record_column` resolves
+> `window_start`, `window_end` and `origin`; `record_row_key` returns `None`
+> for all three, and all three are `$orderby`-admissible
+> (`KEYSET_SAFE_RECORD_FIELDS`). The `_ => None` arm becomes "order field has
+> no cursor key on the row" and **500s while minting `next_cursor`** — with no
+> compile error, and the canonical `(window_end, id)` order hits it. It has
+> zero tests today.
+>
+> It cannot be missed outright, because it still reads `row.created_at`,
+> `row.status` and `row.corrects_id`, which Task 4 deleted — but it can easily
+> be half-fixed, and Step 3 below points at `:1028` rather than `:591`.
+>
+> **Add a test iterating `usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS` and
+> asserting `record_row_key(&sample_row, field).is_some()` for each** — the
+> same SDK coupling shape Task 6 used, so the SDK growing an order key fails
+> here rather than at runtime. Name the mutation: dropping any one arm must
+> turn it red.
 
 **Files:**
 - Modify: `src/domain/ports.rs`, `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
