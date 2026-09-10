@@ -1,13 +1,14 @@
-//! `sqlx` row structs mirroring the `usage_records` hypertable (see
+//! `sqlx` row struct mirroring the `usage_records` hypertable (see
 //! `migrations/0001_init.sql`). The schema's other table,
 //! `usage_acceptance_sequence`, is a keyed counter and has no row struct
 //! here.
 //!
-//! These carry the raw storage-typed columns; [`super::mapper`] turns a row
-//! into the validated SDK model. Column types match the DDL: `uuid` →
-//! [`Uuid`], `text` → [`String`], `numeric` → [`Decimal`], `timestamptz` →
-//! [`OffsetDateTime`], `bigint` → `i64`, `jsonb` → [`serde_json::Value`], and
-//! a nullable `text` / `uuid` → `Option<…>`.
+//! It carries the raw storage-typed columns; [`super::mapper`] turns a row
+//! into the validated SDK model (and back where needed: the same module holds
+//! the model-to-SQL helpers the insert binds through). Column types match the
+//! DDL: `uuid` → [`Uuid`], `text` → [`String`], `numeric` → [`Decimal`],
+//! `timestamptz` → [`OffsetDateTime`], `bigint` → `i64`, `jsonb` →
+//! [`serde_json::Value`], and a nullable `text` / `uuid` → `Option<…>`.
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -22,7 +23,7 @@ use uuid::Uuid;
 /// still decodes correctly and one missing a column fails naming it.
 ///
 /// Two of the columns below have no counterpart on the SDK's `UsageRecord`,
-/// so the mapper decodes them and drops them: `ingested_at` is the server
+/// so nothing carries them past this struct: `ingested_at` is the server
 /// insert time, and `acceptance_sequence` is assigned by this plugin — the
 /// gear's DESIGN §3.7 (`gears/system/usage-collector/docs/DESIGN.md`) obliges
 /// the plugin to keep it strictly monotonic per `(tenant_id, gts_type_id)` —
@@ -50,15 +51,26 @@ pub struct UsageRecordRow {
     /// `window_start` — inclusive start of the covered period.
     pub window_start: OffsetDateTime,
     /// `window_end` — exclusive end of the covered period, and the hypertable
-    /// time dimension. Every selection predicate reads this.
+    /// time dimension. A read that carries a `time_range` selects on this
+    /// bound alone, `from <= window_end < to`
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`), and no selection
+    /// predicate reads `window_start`. `get_usage_record` carries no range
+    /// and looks up by `id` instead.
     pub window_end: OffsetDateTime,
     /// `resource_id` — resource attribution leaf.
     pub resource_id: String,
     /// `resource_type` — resource attribution leaf.
     pub resource_type: String,
-    /// `subject_id` — optional subject attribution leaf.
+    /// `subject_id` — optional subject attribution leaf. `NULL` means the
+    /// entry has no subject at all, which is `UsageRecord::subject_ref`
+    /// being `None`.
     pub subject_id: Option<String>,
-    /// `subject_type` — optional subject attribution leaf.
+    /// `subject_type` — the subject's type, optional *within* a subject.
+    /// `NULL` alongside a present `subject_id` is an untyped subject. The
+    /// reverse is unrepresentable: `SubjectRef` requires a `subject_id` and
+    /// makes only the type an `Option`, and the
+    /// `usage_records_subject_pairing` constraint refuses a stored type
+    /// without an id.
     pub subject_type: Option<String>,
     /// `idempotency_key` — caller-supplied dedup key.
     pub idempotency_key: String,
@@ -68,8 +80,9 @@ pub struct UsageRecordRow {
     /// `reason_code` — why the withdrawal was issued. Present exactly when
     /// `invalidates` is, by table constraint.
     pub reason_code: Option<String>,
-    /// `origin` — `'live'` / `'backfill'`; the ingestion path that admitted
-    /// this entry.
+    /// `origin` — the ingestion path that admitted this entry, stored in the
+    /// spelling [`RecordOrigin`](usage_collector_sdk::RecordOrigin) owns and
+    /// the DDL `CHECK` pins.
     pub origin: String,
     /// `acceptance_sequence` — plugin-assigned, strictly monotonic per
     /// `(tenant_id, gts_type_id)`. Not carried on the SDK model; see the
