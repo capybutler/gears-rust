@@ -5278,9 +5278,19 @@ a cached no-op.
 
 The 936 splits as `cf-gears-usage-collector` 551, `-sdk` 166,
 `noop-usage-collector-plugin` 5, `timescaledb-usage-collector-plugin` 214.
-**The obvious arithmetic is `716 + 214 = 930`, and the extra 6 are not the
-plugin's**: the three baseline packages have themselves grown from 716 to 722
-over Tasks 3-15. Nothing is skipped, so the bar holds.
+**The obvious arithmetic is `716 + 214 = 930`, and the extra 6 are the
+plugin's after all**: its `[dev-dependencies]` enables the sdk's `contract`
+feature (`plugins/timescaledb-usage-collector-plugin/Cargo.toml:81`), and cargo
+unifies features across a single invocation, so the sdk's own lib test binary
+gains its `contract` module and goes 160 -> 166 the moment the plugin joins the
+run. Measured with `nextest list`: the three baseline packages alone are still
+551 + 160 + 5 = **716**, exactly the baseline at this plan's line 128, and they
+list **zero** `contract::contract_tests::*` cases; add `-p ...-plugin` and the
+same six appear, all of them under `-sdk`. Nothing is skipped, so the bar holds.
+
+**A consequence for the bar itself: the `contract` row is not an independent
+measurement.** Its 166 is the same 160 + 6 the four-package run already
+contains, so the two rows share a suite rather than corroborating each other.
 
 `cargo +nightly fmt` changed no file.
 
