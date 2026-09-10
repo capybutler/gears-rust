@@ -1148,16 +1148,43 @@ fixture built by the code under test proves the round trip is self-consistent
 and nothing else; that is the "two layers tested against themselves" defect,
 and it has shipped here before.
 
-- [ ] **Step 2: Run the tests and watch them fail**
+- [ ] **Step 2: Measure first — the crate cannot link a test binary yet**
+
+An earlier draft of this step told you to run
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
 cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(mapper)' 2>&1 | tail -20
 ```
 
-Expected: compile errors naming `invalidation`, `invalidates` and
-`reason_code`. That is the correct failure at this point — the field does not
-exist yet.
+and expect "compile errors naming `invalidation`, `invalidates` and
+`reason_code`". **That expectation was wrong, and so was Step 7's.**
+`cargo nextest` has to build the *whole* crate to link a test binary, and
+Tasks 6-13 have not run. Measure it rather than assuming:
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+cargo check --all-targets 2>&1 | tail -60
+```
+
+At the Task 5 run this reported **41 errors in the lib and 71 in the lib
+test**, spread across `translate.rs`, `keyset.rs`, `aggregate.rs`,
+`record_store.rs`, `ports.rs`, `adapter.rs` and their sibling test files —
+every one of them owned by Tasks 6-13. **Do not fix them to force a green
+build**; that would make this commit unreviewable.
+
+So an in-crate red-then-green cycle is not available for this task. Two
+honest options, in order of preference:
+
+1. **Run the mapper module out of the crate.** `mapper.rs` and `entity.rs`
+   depend on nothing else in the crate, so a throwaway harness crate in the
+   session scratchpad can `#[path]`-include exactly those two files (plus
+   `mapper_tests.rs`, which `mapper.rs` pulls in itself) and run the tests for
+   real. Step 8 gives the recipe. This is what the Task 5 run did.
+2. **Defer, in writing.** If the harness is not viable, say so in this plan
+   and in the commit, and add the run to Task 13's steps — a deferred
+   verification that is not written down is a verification that does not
+   happen.
 
 - [ ] **Step 3: Delete the dead helpers**
 
@@ -1195,27 +1222,25 @@ If the constructor is spelled differently, follow the SDK, not this plan.
 ```rust
 /// Parse a stored `origin` string into [`RecordOrigin`].
 ///
-/// Matches the DDL `CHECK (origin IN ('live', 'backfill'))`.
+/// The accepted vocabulary is taken from [`RecordOrigin::as_str`] rather than
+/// restated here, so this reader and the writer that binds the column cannot
+/// disagree. The DDL `CHECK (origin IN ('live', 'backfill'))` pins the same
+/// two values on the storage side.
 ///
 /// # Errors
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] for any other value.
 pub fn parse_origin(raw: &str) -> Result<RecordOrigin, UsageCollectorPluginError> {
-    match raw {
-        "live" => Ok(RecordOrigin::Live),
-        "backfill" => Ok(RecordOrigin::Backfill),
-        other => Err(UsageCollectorPluginError::internal(format!(
-            "stored origin `{other}` is not 'live'/'backfill'"
-        ))),
-    }
-}
-
-/// SQL string form of a [`RecordOrigin`] (inverse of [`parse_origin`]).
-#[must_use]
-pub fn origin_to_sql(origin: RecordOrigin) -> &'static str {
-    match origin {
-        RecordOrigin::Live => "live",
-        RecordOrigin::Backfill => "backfill",
+    if raw == RecordOrigin::Live.as_str() {
+        Ok(RecordOrigin::Live)
+    } else if raw == RecordOrigin::Backfill.as_str() {
+        Ok(RecordOrigin::Backfill)
+    } else {
+        Err(UsageCollectorPluginError::internal(format!(
+            "stored origin `{raw}` is not `{}`/`{}`",
+            RecordOrigin::Live.as_str(),
+            RecordOrigin::Backfill.as_str()
+        )))
     }
 }
 
@@ -1251,12 +1276,26 @@ pub fn invalidation_from_row(
 }
 ```
 
+**There is deliberately no `origin_to_sql`.** An earlier draft of this task
+had one, which would have been a fourth spelling of `'live'`/`'backfill'`
+alongside `RecordOrigin::as_str` (`usage-collector-sdk/src/models.rs:786-796`,
+a `pub const fn` returning `&'static str`), the DDL `CHECK`, and the DDL's own
+`entry_type`-adjacent commentary. `RecordOrigin::as_str` **is** the SQL form
+and its doc already claims that ownership ("the wire spelling, shared by the
+REST projection, the `$filter` surface and the metric label"), so Task 9's
+insert binds `record.origin.as_str()` directly. The SDK offers no parsing
+direction (no `FromStr`, no `TryFrom<&str>`), which is why `parse_origin`
+still exists -- but it compares against `RecordOrigin::as_str` rather than
+against bare literals, so the two directions cannot drift.
+
 Verify `ReasonCode`'s constructor name and whether it exposes `as_str` before
-writing the test assertion in Step 1 against it:
+writing the test assertion in Step 1 against it. **It lives in `models.rs`,
+not `reason.rs`** -- `reason.rs` holds `ConflictReason` / `NotFoundReason` /
+`ValidationReason`, which are unrelated:
 
 ```bash
 grep -n 'impl ReasonCode' -A25 \
-  gears/system/usage-collector/usage-collector-sdk/src/reason.rs
+  gears/system/usage-collector/usage-collector-sdk/src/models.rs
 ```
 
 - [ ] **Step 5: Rewrite `record_row_to_model`**
@@ -1313,27 +1352,72 @@ length, and cites "the task skeleton". Rewrite for the types that exist.
 
 - [ ] **Step 7: Run the tests**
 
-```bash
-cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(mapper)' 2>&1 | tail -20
+An earlier draft expected "the mapper tests pass, other modules still fail to
+compile". **Those two are mutually exclusive** — `cargo nextest` links one test
+binary per crate, so it builds the whole crate or it builds nothing. Run them
+through the Step 8 harness instead, and read the crate-level run as Task 13
+Step 5's job.
+
+- [ ] **Step 8: Prove the new tests discriminate, in a harness outside the crate**
+
+`mapper.rs` and `entity.rs` depend on nothing else in the plugin crate, so both
+the green run and the falsification can happen in a throwaway crate that
+`#[path]`-includes exactly those two files. Build it in **your own session
+scratchpad** — the path is session-specific and printed in your environment, so
+read it there rather than copying a literal from this plan. A mutation script
+writing to a stale path from someone else's session is one of the documented
+ways a falsification lies to you: it edits nothing, the `Compiling` line still
+appears, and "mutation survived" then argues for deleting a working test.
+
+```
+$SCRATCH/mapper-harness/
+  Cargo.toml   # [workspace] (to detach it), path dep on usage-collector-sdk,
+               # plus serde_json / uuid / time / rust_decimal / sqlx at the
+               # versions the workspace pins. sqlx is needed only for
+               # entity.rs's `#[derive(sqlx::FromRow)]`.
+  src/lib.rs   # pub mod storage { #[path="<abs>/entity.rs"] pub mod entity;
+               #                   #[path="<abs>/mapper.rs"] pub mod mapper; }
 ```
 
-Expected: the mapper tests pass. Other modules still fail to compile; that is
-Tasks 6-13.
+`mapper.rs` pulls in `mapper_tests.rs` itself, and its `#[path]` resolves
+relative to `mapper.rs`'s own directory, so the real test file is picked up
+with no third entry. Point `CARGO_TARGET_DIR` at the scratchpad: a fresh dep
+graph in the workspace `target/` risks invalidating it, and `target/` reaching
+~110 GB is how this tree fills the disk. Cost measured at the Task 5 run: about
+90 seconds and 280 MB.
 
-- [ ] **Step 8: Prove the two new tests discriminate**
+To copy the workspace lint set for a clippy run, splice `[workspace.lints.*]`
+out of the root `Cargo.toml` into the harness manifest as `[lints.*]` and copy
+the root `clippy.toml` alongside it — the harness inherits neither otherwise,
+and without them a pedantic-deny finding is invisible.
 
-Copy the tree to the scratchpad first — **`git checkout` restores from HEAD and
-would discard uncommitted work, and there is uncommitted work in this tree.**
+**Mutate a copy, never the tree.** Copy `entity.rs`, `mapper.rs` and
+`mapper_tests.rs` into `$SCRATCH/mutate/`, keep a second untouched copy in
+`$SCRATCH/pristine/`, and point a second harness at `$SCRATCH/mutate/`. Then
+the working tree is never edited and no restore step can go wrong — which
+matters because `git checkout` restores from HEAD and there is uncommitted work
+here. Confirm the copy is faithful (`diff -r`) and green before mutating
+anything; then for each mutation assert the anchor matches **exactly once**,
+`touch` the file (`mv`/`cp` can preserve mtime and cargo skips the rebuild),
+confirm a `Compiling` line, grep the mutated line to confirm the edit landed,
+and confirm the *named* test goes red.
 
-```bash
-SNAP=/private/tmp/claude-501/-Users-binarycode-code-virtuozzo-gears-rust/347fc0db-cecd-4d4a-a9cb-c0475d8144d6/scratchpad/mapper-snap
-cp -a gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/mapper.rs "$SNAP"
-```
+Mutations run and killed at the Task 5 run:
 
-Apply each named mutation with an **absolute** path, `touch` the file (`mv`
-preserves mtime and cargo skips the rebuild), confirm a `Compiling` line
-appears, **grep the mutated line to confirm the edit actually landed**, and
-confirm the expected test goes red. Restore from `$SNAP`, never from git.
+| # | Mutation to `mapper.rs` | Test that must go red |
+|---|---|---|
+| 1 | `invalidation,` → `invalidation: None,` in the `UsageRecord` literal | `an_invalidation_row_maps_to_a_record_carrying_the_pair` |
+| 2 | `(Some(target), None)` arm returns `Ok(None)` | `a_row_naming_a_target_without_a_reason_is_an_invariant_break` |
+| 3 | `(None, Some(raw))` arm returns `Ok(None)` | `a_reason_without_a_target_is_an_invariant_break` |
+| 4 | `parse_origin`'s live branch yields `RecordOrigin::Backfill` | `parse_origin_round_trips_through_the_sdk_spelling`, `record_row_to_model_maps_a_valid_row_round_trip` |
+| 5 | the stored-`reason_code` failure is built with `transient` instead of `internal` | `an_unparseable_stored_reason_is_an_invariant_break` |
+| 6 | `parse_origin`'s else branch yields `Ok(RecordOrigin::Live)` | `parse_origin_rejects_unknown`, `record_row_unknown_origin_is_internal` |
+| 7 | `record_row_to_model` hardcodes `let origin = RecordOrigin::Live;` | `a_backfill_row_maps_to_the_backfill_origin`, `record_row_unknown_origin_is_internal` |
+
+A test whose mutation cannot be named does not go in. The Task 5 run wrote and
+then deleted a `meter_type_id_str_borrows_the_stored_spelling_back` test for
+exactly that reason: the body is `gts_type_id.as_ref()`, and there is no edit
+to it that both compiles and changes the result.
 
 - [ ] **Step 9: Commit**
 
@@ -1342,12 +1426,17 @@ git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/
 git commit -s -m "feat(timescaledb-plugin): map rows to the current record model
 
 Reassembles the invalidation pair from invalidates + reason_code, parses
-origin, and carries the covered period. Drops the status and usage-type-kind
-parsers, which have no model behind them.
+origin, and carries the covered period. Drops the status parsers, which have
+no model behind them, and renames the GTS helpers to the MeterTypeId that
+replaced UsageTypeGtsId.
 
 A half-populated invalidation pair is refused as an Internal: the table
 constrains the two columns together, so half a pair is a stored-invariant
-break rather than a shape the model can carry."
+break rather than a shape the model can carry.
+
+parse_origin compares against RecordOrigin::as_str instead of its own string
+literals, and there is no origin_to_sql beside it: the SDK accessor already
+is the SQL spelling, so the two directions cannot drift."
 ```
 
 ---
@@ -2692,6 +2781,14 @@ cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast 
 
 Report `N passed / M skipped` unfiltered. A count under an `-E` filter is a
 lower bound and is not the number to report.
+
+**This is the first in-crate run of the mapper tests.** Task 5 could not run
+them here — the crate had 41 lib errors and 71 lib-test errors at the time —
+so it ran them, and its seven-mutation falsification, in a scratchpad harness
+that `#[path]`-included `mapper.rs` and `entity.rs` alone (Task 5 Step 8).
+Confirm here that the 21 `mapper_tests` cases are present and green in the
+real crate; if any of them fails to compile in this context, the harness proof
+does not cover it and the gap is yours to close.
 
 - [ ] **Step 6: Commit**
 
