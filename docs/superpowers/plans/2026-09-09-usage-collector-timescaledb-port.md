@@ -1502,7 +1502,42 @@ green, every mutation in Step 8's two passes killed, none surviving."
 
 ---
 
-## Task 6: Fix `record_column` (DIVERGENCES entry 16)
+## Task 6: Fix `record_column` (DIVERGENCES entry 16) — DONE (`d162b94b2`)
+
+**Measured while executing, correcting the preamble below.** `record_column`
+was still at `translate.rs:55` and still mapped exactly the nine identifiers
+named, and the published `$filter` eight at `usage-collector-v1.yaml:440` are
+as stated. Four other claims had drifted:
+
+- The module doc's stale name list is at **`translate.rs:23-26`**, not 22-25.
+- **The SDK's `UsageRecordQuery` declares eleven filter fields, not eight** —
+  the preamble's list omits `invalidates`, `entry_type` and `origin`
+  (`usage-collector-sdk/src/models.rs`, struct at `:1734`). Those eleven are
+  exactly the eleven `record_column` now maps, so the module doc and the
+  allowlist agree by construction. Corrected inline below.
+- `translate_tests.rs` was **585** lines, not 569.
+- The old `record_column` doc said `gts_id`; the SPI parameter is
+  `gts_type_id` (`usage-collector-sdk/src/plugin_api.rs:164`, `:254`), which
+  Step 3's replacement text has right.
+
+A third stale line in the same module doc went with the two named: the
+``from_name("status")`` example, repointed to ``"entry_type"``.
+
+**Step 1's code block compiles as written.** `for field in
+PUBLISHED_FILTER_FIELDS` binds `field: &&str`, which deref-coerces to `&str`
+at the call; the same holds for `KEYSET_SAFE_RECORD_FIELDS` (also a `&[&str]`).
+No `.iter().copied()` was needed, and the block is left unchanged.
+
+**Verification route.** The Task 5 scratchpad harness extended to this file: a
+sibling `translate-harness` `#[path]`-includes `bind.rs`, `keyset.rs` and
+`translate.rs` and adds `toolkit-odata`, `bigdecimal` and `chrono` to the
+Task 5 dependency set. `cargo test` there: **35 passed / 0 failed** (32 before
+the three new tests, of which 9 were already red on HEAD). Clippy
+`--all-targets -- -D warnings` clean; `rustfmt --edition 2024 --check` clean.
+`cargo check --all-targets` inside the crate fell from 41 lib / 71 lib-test to
+**33 lib / 52 lib-test** errors, none in `query/translate`. **No verification
+is deferred to Task 13 by this task.**
+
 
 This is entry 16's own proposed resolution. The allowlist is the closed
 security boundary every `$filter` conjunct passes, and it is wrong in both
@@ -1511,7 +1546,7 @@ directions.
 **Verified against the file at the time of writing:** `record_column` is at
 `src/infra/storage/query/translate.rs:55` and maps nine identifiers — `id`,
 `created_at`, `tenant_id`, `resource_id`, `resource_type`, `subject_id`,
-`subject_type`, `corrects_id`, `status`. Re-verify before editing; earlier
+`subject_type`, `corrects_id`, `status`. (Confirmed on execution.) Re-verify before editing; earlier
 tasks in this plan do not touch this function, but the file has moved before.
 
 **The published `$filter` field set is eight** (`usage-collector-v1.yaml:440`):
@@ -1526,16 +1561,17 @@ them.** Both assert a field list the SDK no longer has:
 
 - **`translate.rs:22-25`** — the module doc claims `UsageRecordFilterField`'s
   names "are exactly `"id"`, `"created_at"`, … `"corrects_id"`, `"status"`".
-  The SDK's `UsageRecordQuery` (`usage-collector-sdk/src/models.rs`) declares
-  `id`, `window_start`, `window_end`, `tenant_id`, `resource_id`,
-  `resource_type`, `subject_id`, `subject_type`. Task 1 edited this block
+  The SDK's `UsageRecordQuery` (`usage-collector-sdk/src/models.rs:1734`)
+  declares `id`, `window_start`, `window_end`, `tenant_id`, `resource_id`,
+  `resource_type`, `subject_id`, `subject_type`, `invalidates`, `entry_type`,
+  `origin` — eleven, not the eight this bullet originally listed. Task 1 edited this block
   (stripping its usage-type half) and left the stale list standing.
 - **`record_column`'s own doc** — "only these nine identifiers", corrected by
   Step 3 below.
 
 Re-verify both line numbers before editing.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `src/infra/storage/query/translate_tests.rs`:
 
@@ -1599,7 +1635,7 @@ copy. That is deliberate: the SDK growing an eighth keyset field makes this
 test fail here, which is the coupling you want. A hand-copied list would go
 quietly stale — the failure mode this repository is named for.
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
@@ -1609,7 +1645,7 @@ cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast 
 Expected: tests 1 and 2 fail (`entry_type`, `origin`, `invalidates`,
 `window_start`, `window_end` all resolve to `None`); test 3 fails on all three.
 
-- [ ] **Step 3: Rewrite the allowlist**
+- [x] **Step 3: Rewrite the allowlist**
 
 ```rust
 /// Closed allowlist mapping a `usage_records` filter-field name to its column.
@@ -1656,7 +1692,7 @@ with the match below it is precisely the defect this plan's ground rules name.
 A count can also be spelled with no numeral at all, so grep for the members
 rather than for a number.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 ```bash
 cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(translate)' 2>&1 | tail -20
@@ -1664,21 +1700,21 @@ cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast 
 
 Expected: all three pass.
 
-- [ ] **Step 5: Sweep the rest of the file's tests**
+- [x] **Step 5: Sweep the rest of the file's tests**
 
-`translate_tests.rs` is 569 lines and was written against the nine-identifier
+`translate_tests.rs` is 585 lines and was written against the nine-identifier
 map. Some tests will name `created_at` or `status`. Fix each, and give a
 **per-test verdict**: repointed to a live field, or deleted because its question
 no longer exists.
 
-- [ ] **Step 6: Prove the mutations**
+- [x] **Step 6: Prove the mutations**
 
 Run each of the three named mutations from Step 1 under the discipline in
 Task 5 Step 8 (absolute paths, `cp` snapshot, `touch`, confirm `Compiling`,
 grep the mutated line). A count under a `-E` filter is a lower bound; use
 `--no-fail-fast` and no filter for any number you report.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/
