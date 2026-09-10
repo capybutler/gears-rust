@@ -2212,6 +2212,12 @@ impl RecordStore for PgRecordStore {
     ///   reason: it is `SELECT COUNT(*)`'s own answer, not a special case here
     ///   ([`usage_collector_sdk::AggregationBucket::value`]).
     ///
+    /// Both are held rather than asserted:
+    /// `the_ungrouped_fold_still_reaches_the_pool` drives an empty `group_by`
+    /// against a lazy pool at a dead DSN and requires the pool timeout, so the
+    /// ungrouped fold cannot answer without asking, and cannot acquire a
+    /// connection before it has a statement to run.
+    ///
     /// The dimension columns read positionally as `Option<String>` and the fold
     /// at index `k` as `Option<BigDecimal>` — arbitrary precision, so a wide
     /// `SUM` cannot overflow on decode.

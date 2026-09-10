@@ -3639,7 +3639,9 @@ nothing about the case", "that is an argument, not a ruling", "do not write the
 check first" — and Task 18 rewrites it. So §G is not a citation for the rule;
 the SDK's own `models.rs:1587-1592` and `contract/reference.rs:801` are, and a
 divergence pointer must read "resolved by Task 18". Task 12 corrected three
-sites that cited §G as the ruling, one of them propagated from Task 8.) `aggregate` today pushes
+sites that cited §G as the ruling, one of them propagated from Task 8.)
+
+`aggregate` today pushes
 `subject_id IS NOT NULL` / `subject_type IS NOT NULL` before rendering a subject
 dimension, and pushes nothing for `Metadata`, so a row missing the grouped key
 lands in a `NULL` bucket where `InMemoryReferencePlugin` drops it. **The spec
@@ -4131,9 +4133,12 @@ Four suites survive Task 1 and every one was written against the old model.
 which makes it the owner of one measurement nobody earlier could take** — see
 Step 1b.
 
-**And of three claims about `aggregate` that no unit test can reach**, handed
-over by Task 12 rather than left implied. None survives contact with a live
-backend, and all three survive every test in the crate today:
+**And of three claims about `aggregate` that only a live backend can settle**,
+handed over by Task 12 rather than left implied. Each needs a real query to
+decide it; a unit test reaches only the statement that leads there. Claims 2 and
+3 survive every unit test in the crate outright, and claim 1 partly — Task 12
+killed the short circuit at the placement it would actually be written, and item
+1 says which placement is left:
 
 1. **A bare aggregate returns exactly one row**, so an empty `group_by` yields
    the single empty-keyed bucket the SPI asks for. Task 12 pins the *statement*
