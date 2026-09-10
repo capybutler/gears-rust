@@ -4,67 +4,103 @@
 //! [`UsageCollectorPluginError::Internal`] — a row already in the database that
 //! cannot be reconstituted is a plugin invariant break, not a caller error.
 //!
-//! `UsageTypeGtsId` is the SDK newtype over `gts::GtsInstanceId`; it is built
-//! from a stored `&str` via [`gts_id_from_str`] (validating `UsageTypeGtsId::new`)
-//! and read back via [`gts_id_str`] (`AsRef<str>`). The constructor is fallible,
-//! so [`gts_id_from_str`] returns a `Result` (deviation from the infallible
-//! signature in the task skeleton — `UsageTypeGtsId::new` validates against the
-//! reserved GTS base).
+//! Most columns are already the model's type. Three need more than a move:
+//!
+//! - `gts_type_id` becomes a [`MeterTypeId`], whose constructor validates, so
+//!   the read direction ([`meter_type_id_from_str`]) returns a `Result` while
+//!   the bind direction ([`meter_type_id_str`]) is an infallible `AsRef<str>`
+//!   borrow.
+//! - `origin` becomes a [`RecordOrigin`]. There is deliberately no
+//!   `origin_to_sql` counterpart to [`parse_origin`]: [`RecordOrigin::as_str`]
+//!   already is the SQL form, and [`parse_origin`] compares against that same
+//!   accessor rather than against its own literals, so the two directions
+//!   cannot drift apart.
+//! - `invalidates` and `reason_code` are two nullable columns standing for one
+//!   `Option<Invalidation>` field; [`invalidation_from_row`] rejoins them.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
+use uuid::Uuid;
 
 use usage_collector_sdk::{
-    IdempotencyKey, MetadataKey, ResourceRef, SubjectRef, UsageCollectorPluginError, UsageRecord,
-    UsageRecordStatus, UsageTypeGtsId,
+    IdempotencyKey, Invalidation, MetadataKey, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef,
+    SubjectRef, UsageCollectorPluginError, UsageRecord,
 };
 
 use super::entity::UsageRecordRow;
 
-/// Borrow the raw GTS instance id string out of a [`UsageTypeGtsId`] (for
-/// binding).
+/// Borrow the raw GTS type id string out of a [`MeterTypeId`] (for binding).
 #[must_use]
-pub fn gts_id_str(gts_id: &UsageTypeGtsId) -> &str {
-    gts_id.as_ref()
+pub fn meter_type_id_str(gts_type_id: &MeterTypeId) -> &str {
+    gts_type_id.as_ref()
 }
 
-/// Reconstruct a validated [`UsageTypeGtsId`] from a stored string.
+/// Reconstruct a validated [`MeterTypeId`] from a stored string.
 ///
 /// # Errors
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] when the stored value is not
-/// a valid usage-type GTS id (a stored-data invariant break).
-pub fn gts_id_from_str(raw: &str) -> Result<UsageTypeGtsId, UsageCollectorPluginError> {
-    UsageTypeGtsId::new(raw).map_err(|e| {
-        UsageCollectorPluginError::internal(format!("stored gts_id `{raw}` invalid: {e}"))
+/// a valid meter type id (a stored-data invariant break).
+pub fn meter_type_id_from_str(raw: &str) -> Result<MeterTypeId, UsageCollectorPluginError> {
+    MeterTypeId::new(raw).map_err(|e| {
+        UsageCollectorPluginError::internal(format!("stored gts_type_id `{raw}` invalid: {e}"))
     })
 }
 
-/// Parse a stored `status` string into [`UsageRecordStatus`].
+/// Parse a stored `origin` string into [`RecordOrigin`].
 ///
-/// Mirrors the SDK serde wire shape (`#[serde(rename_all = "lowercase")]`),
-/// matching the DDL `CHECK (status IN ('active', 'inactive'))`.
+/// The accepted vocabulary is taken from [`RecordOrigin::as_str`] rather than
+/// restated here, so this reader and the writer that binds the column cannot
+/// disagree. The DDL `CHECK (origin IN ('live', 'backfill'))` pins the same
+/// two values on the storage side.
 ///
 /// # Errors
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] for any other value.
-pub fn parse_status(raw: &str) -> Result<UsageRecordStatus, UsageCollectorPluginError> {
-    match raw {
-        "active" => Ok(UsageRecordStatus::Active),
-        "inactive" => Ok(UsageRecordStatus::Inactive),
-        other => Err(UsageCollectorPluginError::internal(format!(
-            "stored status `{other}` is not 'active'/'inactive'"
-        ))),
+pub fn parse_origin(raw: &str) -> Result<RecordOrigin, UsageCollectorPluginError> {
+    if raw == RecordOrigin::Live.as_str() {
+        Ok(RecordOrigin::Live)
+    } else if raw == RecordOrigin::Backfill.as_str() {
+        Ok(RecordOrigin::Backfill)
+    } else {
+        Err(UsageCollectorPluginError::internal(format!(
+            "stored origin `{raw}` is not `{}`/`{}`",
+            RecordOrigin::Live.as_str(),
+            RecordOrigin::Backfill.as_str()
+        )))
     }
 }
 
-/// SQL string form of a [`UsageRecordStatus`] (inverse of [`parse_status`]).
-#[must_use]
-pub fn status_to_sql(status: UsageRecordStatus) -> &'static str {
-    match status {
-        UsageRecordStatus::Active => "active",
-        UsageRecordStatus::Inactive => "inactive",
+/// Reassemble the stored invalidation pair into an [`Invalidation`].
+///
+/// The `usage_records_invalidation_pairing` constraint holds the two columns
+/// both-present or both-absent, so a half-populated row is a stored-invariant
+/// break rather than a shape the model can carry: [`Invalidation`] groups the
+/// target and the reason precisely so that half is unrepresentable.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] when exactly one of the two
+/// is present, or when the stored reason fails [`ReasonCode`] validation.
+pub fn invalidation_from_row(
+    invalidates: Option<Uuid>,
+    reason_code: Option<String>,
+) -> Result<Option<Invalidation>, UsageCollectorPluginError> {
+    match (invalidates, reason_code) {
+        (None, None) => Ok(None),
+        (Some(target), Some(raw)) => {
+            let reason = ReasonCode::new(raw).map_err(|e| {
+                UsageCollectorPluginError::internal(format!("stored reason_code invalid: {e}"))
+            })?;
+            Ok(Some(Invalidation { target, reason }))
+        }
+        (Some(target), None) => Err(UsageCollectorPluginError::internal(format!(
+            "stored entry `{target}` names an invalidation target with no reason_code"
+        ))),
+        (None, Some(raw)) => Err(UsageCollectorPluginError::internal(format!(
+            "stored entry carries reason_code `{raw}` with no invalidation target"
+        ))),
     }
 }
 
@@ -121,13 +157,20 @@ pub fn metadata_map_to_jsonb(map: &BTreeMap<MetadataKey, String>) -> JsonValue {
 
 /// Map a [`UsageRecordRow`] into a validated [`UsageRecord`].
 ///
+/// Two of the row's columns are read and deliberately dropped, because the
+/// model has no field for either: `acceptance_sequence`, which this plugin
+/// assigns and orders reads by, and `ingested_at`, the server insert time.
+/// Neither travels back out through the SPI. This is not an oversight; see
+/// [`UsageRecordRow`]'s own doc for why they are decoded at all.
+///
 /// # Errors
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] when any stored component
-/// fails its SDK newtype validation (`gts_id`, `resource_ref`, `subject_ref`,
-/// `idempotency_key`, `status`, `metadata`).
+/// fails its SDK newtype validation (`gts_type_id`, `resource_ref`,
+/// `subject_ref`, `idempotency_key`, `metadata`, `origin`) or when the stored
+/// invalidation pair is half-populated (see [`invalidation_from_row`]).
 pub fn record_row_to_model(row: UsageRecordRow) -> Result<UsageRecord, UsageCollectorPluginError> {
-    let gts_id = gts_id_from_str(&row.gts_id)?;
+    let gts_type_id = meter_type_id_from_str(&row.gts_type_id)?;
 
     let resource_ref = ResourceRef::new(row.resource_id, row.resource_type).map_err(|e| {
         UsageCollectorPluginError::internal(format!("stored resource_ref invalid: {e}"))
@@ -145,20 +188,22 @@ pub fn record_row_to_model(row: UsageRecordRow) -> Result<UsageRecord, UsageColl
     })?;
 
     let metadata = metadata_jsonb_to_map(row.metadata)?;
-    let status = parse_status(&row.status)?;
+    let origin = parse_origin(&row.origin)?;
+    let invalidation = invalidation_from_row(row.invalidates, row.reason_code)?;
 
     Ok(UsageRecord {
         id: row.id,
-        gts_id,
+        gts_type_id,
         tenant_id: row.tenant_id,
         resource_ref,
         subject_ref,
         metadata,
         value: row.value,
         idempotency_key,
-        corrects_id: row.corrects_id,
-        status,
-        created_at: row.created_at,
+        origin,
+        invalidation,
+        window_start: row.window_start,
+        window_end: row.window_end,
     })
 }
 

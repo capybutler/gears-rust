@@ -5,29 +5,29 @@ use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use usage_collector_sdk::{
-    MetadataKey, UsageCollectorPluginError, UsageRecordStatus, UsageTypeGtsId,
-};
+use usage_collector_sdk::{MetadataKey, MeterTypeId, RecordOrigin, UsageCollectorPluginError};
 
 use super::super::entity::UsageRecordRow;
 use super::{
-    gts_id_from_str, metadata_jsonb_to_map, metadata_map_to_jsonb, parse_status,
-    record_row_to_model, status_to_sql,
+    invalidation_from_row, metadata_jsonb_to_map, metadata_map_to_jsonb, meter_type_id_from_str,
+    parse_origin, record_row_to_model,
 };
 
-// ── status round-trip ────────────────────────────────────────────────────────
+// ── origin round-trip ────────────────────────────────────────────────────────
 
 #[test]
-fn parse_status_round_trips_through_sql_form() {
-    for status in [UsageRecordStatus::Active, UsageRecordStatus::Inactive] {
-        let sql = status_to_sql(status);
-        assert_eq!(parse_status(sql).unwrap(), status);
+fn parse_origin_round_trips_through_the_sdk_spelling() {
+    for origin in [RecordOrigin::Live, RecordOrigin::Backfill] {
+        assert_eq!(parse_origin(origin.as_str()).unwrap(), origin);
     }
 }
 
 #[test]
-fn parse_status_rejects_unknown() {
-    assert!(parse_status("archived").is_err());
+fn parse_origin_rejects_unknown() {
+    assert!(matches!(
+        parse_origin("imported"),
+        Err(UsageCollectorPluginError::Internal(_))
+    ));
 }
 
 // ── metadata jsonb <-> map round-trip ────────────────────────────────────────
@@ -68,21 +68,46 @@ fn metadata_jsonb_non_string_value_is_rejected() {
     assert!(metadata_jsonb_to_map(JsonValue::Object(obj)).is_err());
 }
 
-// ── gts_id primitive ─────────────────────────────────────────────────────────
+// ── gts_type_id primitive ────────────────────────────────────────────────────
 
-/// A well-formed usage-type GTS instance id deriving from the reserved base
-/// (`gts.cf.core.uc.usage_record.v1~`).
-const VALID_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
+/// A well-formed meter type id: the reserved base
+/// (`gts.cf.core.uc.usage_record.v1~`) plus exactly one further derivation
+/// segment, `~`-terminated, which is what `MeterTypeId::new` validates.
+const VALID_METER_TYPE_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~";
 
 #[test]
-fn gts_id_from_str_accepts_valid_and_rejects_invalid_as_internal() {
-    assert!(gts_id_from_str(VALID_GTS_ID).is_ok());
+fn meter_type_id_from_str_accepts_valid_and_rejects_invalid_as_internal() {
+    assert!(meter_type_id_from_str(VALID_METER_TYPE_ID).is_ok());
     // A stored value that no longer validates is a plugin invariant break, not
     // a caller error — it MUST surface as `Internal`.
     assert!(matches!(
-        gts_id_from_str("not-a-valid-gts-id"),
+        meter_type_id_from_str("not-a-valid-meter-type-id"),
         Err(UsageCollectorPluginError::Internal(_))
     ));
+}
+
+// ── invalidation pair ────────────────────────────────────────────────────────
+
+#[test]
+fn a_reason_without_a_target_is_an_invariant_break() {
+    let err = invalidation_from_row(None, Some("duplicate_submission".to_owned()))
+        .expect_err("half a pair must not map");
+
+    assert!(
+        matches!(err, UsageCollectorPluginError::Internal(_)),
+        "a malformed stored row is a plugin invariant break, not a caller error; got {err:?}"
+    );
+}
+
+#[test]
+fn an_unparseable_stored_reason_is_an_invariant_break() {
+    // `ReasonCode::new` rejects the empty string. The column is plain `text`
+    // with no content check of its own -- only the pairing constraint -- so
+    // the store can hold one.
+    let err = invalidation_from_row(Some(Uuid::new_v4()), Some(String::new()))
+        .expect_err("an invalid reason must not map");
+
+    assert!(matches!(err, UsageCollectorPluginError::Internal(_)));
 }
 
 // ── record row -> model ──────────────────────────────────────────────────────
@@ -93,39 +118,56 @@ fn valid_metadata_json() -> JsonValue {
     JsonValue::Object(obj)
 }
 
-/// A fully valid `usage_records` row. Tests corrupt one field at a time and
-/// assert the mapper fails closed with `Internal`.
-fn valid_record_row() -> UsageRecordRow {
+/// A fully valid `usage_records` row, written out column by column from
+/// `migrations/0001_init.sql` rather than produced by any model-to-row
+/// direction of the mapper — a fixture the code under test builds would only
+/// prove the mapper agrees with itself.
+///
+/// It is an ordinary measurement: `invalidates` and `reason_code` are both
+/// `NULL`, which is one of the two shapes
+/// `usage_records_invalidation_pairing` admits. Tests corrupt one field at a
+/// time and assert the mapper fails closed with `Internal`.
+fn sample_row() -> UsageRecordRow {
     UsageRecordRow {
         id: Uuid::from_u128(1),
         tenant_id: Uuid::from_u128(2),
-        gts_id: VALID_GTS_ID.to_owned(),
+        gts_type_id: VALID_METER_TYPE_ID.to_owned(),
         value: Decimal::new(425, 1), // 42.5
-        created_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+        window_start: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+        window_end: OffsetDateTime::from_unix_timestamp(1_700_003_600).unwrap(),
         resource_id: "res-1".to_owned(),
         resource_type: "compute.vm".to_owned(),
         subject_id: Some("subj-1".to_owned()),
         subject_type: Some("user".to_owned()),
         idempotency_key: "idem-1".to_owned(),
-        corrects_id: None,
-        status: "active".to_owned(),
+        invalidates: None,
+        reason_code: None,
+        origin: "live".to_owned(),
+        acceptance_sequence: 7,
         metadata: valid_metadata_json(),
-        ingested_at: OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap(),
+        ingested_at: OffsetDateTime::from_unix_timestamp(1_700_003_700).unwrap(),
     }
 }
 
 #[test]
 fn record_row_to_model_maps_a_valid_row_round_trip() {
-    let row = valid_record_row();
+    let row = sample_row();
     let model = record_row_to_model(row).expect("a fully valid row maps");
 
     assert_eq!(model.id, Uuid::from_u128(1));
     assert_eq!(model.tenant_id, Uuid::from_u128(2));
-    assert_eq!(model.gts_id, UsageTypeGtsId::new(VALID_GTS_ID).unwrap());
+    assert_eq!(
+        model.gts_type_id,
+        MeterTypeId::new(VALID_METER_TYPE_ID).unwrap()
+    );
     assert_eq!(model.value, Decimal::new(425, 1));
     assert_eq!(
-        model.created_at,
+        model.window_start,
         OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+    );
+    assert_eq!(
+        model.window_end,
+        OffsetDateTime::from_unix_timestamp(1_700_003_600).unwrap()
     );
     assert_eq!(model.resource_ref.resource_id(), "res-1");
     assert_eq!(model.resource_ref.resource_type(), "compute.vm");
@@ -133,8 +175,8 @@ fn record_row_to_model_maps_a_valid_row_round_trip() {
     assert_eq!(subject.subject_id(), "subj-1");
     assert_eq!(subject.subject_type(), Some("user"));
     assert_eq!(model.idempotency_key.as_str(), "idem-1");
-    assert_eq!(model.corrects_id, None);
-    assert_eq!(model.status, UsageRecordStatus::Active);
+    assert_eq!(model.origin, RecordOrigin::Live);
+    assert!(model.invalidation.is_none());
     assert_eq!(
         model.metadata.get(&MetadataKey::new("region").unwrap()),
         Some(&"eu-west".to_owned())
@@ -142,18 +184,66 @@ fn record_row_to_model_maps_a_valid_row_round_trip() {
 }
 
 #[test]
+fn a_backfill_row_maps_to_the_backfill_origin() {
+    let row = UsageRecordRow {
+        origin: "backfill".to_owned(),
+        ..sample_row()
+    };
+    let model = record_row_to_model(row).expect("row must map");
+    assert_eq!(model.origin, RecordOrigin::Backfill);
+}
+
+#[test]
+fn an_invalidation_row_maps_to_a_record_carrying_the_pair() {
+    let target = Uuid::new_v4();
+    let row = UsageRecordRow {
+        invalidates: Some(target),
+        reason_code: Some("duplicate_submission".to_owned()),
+        ..sample_row()
+    };
+
+    let model = record_row_to_model(row).expect("row must map");
+
+    let invalidation = model
+        .invalidation
+        .expect("a row with invalidates must map to Some(Invalidation)");
+    assert_eq!(invalidation.target, target);
+    assert_eq!(invalidation.reason.as_str(), "duplicate_submission");
+}
+
+#[test]
+fn a_row_naming_a_target_without_a_reason_is_an_invariant_break() {
+    let row = UsageRecordRow {
+        invalidates: Some(Uuid::new_v4()),
+        reason_code: None,
+        ..sample_row()
+    };
+
+    let err = record_row_to_model(row).expect_err("half a pair must not map");
+
+    assert!(
+        matches!(err, UsageCollectorPluginError::Internal(_)),
+        "a malformed stored row is a plugin invariant break, not a caller error; got {err:?}"
+    );
+}
+
+#[test]
 fn record_row_absent_subject_maps_to_none() {
-    let mut row = valid_record_row();
-    row.subject_id = None;
-    row.subject_type = None;
+    let row = UsageRecordRow {
+        subject_id: None,
+        subject_type: None,
+        ..sample_row()
+    };
     let model = record_row_to_model(row).expect("a row without a subject maps");
     assert!(model.subject_ref.is_none());
 }
 
 #[test]
-fn record_row_invalid_gts_id_is_internal() {
-    let mut row = valid_record_row();
-    row.gts_id = "not-a-valid-gts-id".to_owned();
+fn record_row_invalid_gts_type_id_is_internal() {
+    let row = UsageRecordRow {
+        gts_type_id: "not-a-valid-meter-type-id".to_owned(),
+        ..sample_row()
+    };
     assert!(matches!(
         record_row_to_model(row),
         Err(UsageCollectorPluginError::Internal(_))
@@ -162,8 +252,11 @@ fn record_row_invalid_gts_id_is_internal() {
 
 #[test]
 fn record_row_invalid_resource_ref_is_internal() {
-    let mut row = valid_record_row();
-    row.resource_id = String::new(); // empty resource_id fails ResourceRef::new
+    let row = UsageRecordRow {
+        // empty resource_id fails ResourceRef::new
+        resource_id: String::new(),
+        ..sample_row()
+    };
     assert!(matches!(
         record_row_to_model(row),
         Err(UsageCollectorPluginError::Internal(_))
@@ -172,8 +265,11 @@ fn record_row_invalid_resource_ref_is_internal() {
 
 #[test]
 fn record_row_invalid_subject_ref_is_internal() {
-    let mut row = valid_record_row();
-    row.subject_id = Some(String::new()); // present-but-empty subject_id is rejected
+    let row = UsageRecordRow {
+        // present-but-empty subject_id is rejected
+        subject_id: Some(String::new()),
+        ..sample_row()
+    };
     assert!(matches!(
         record_row_to_model(row),
         Err(UsageCollectorPluginError::Internal(_))
@@ -182,8 +278,10 @@ fn record_row_invalid_subject_ref_is_internal() {
 
 #[test]
 fn record_row_invalid_idempotency_key_is_internal() {
-    let mut row = valid_record_row();
-    row.idempotency_key = String::new();
+    let row = UsageRecordRow {
+        idempotency_key: String::new(),
+        ..sample_row()
+    };
     assert!(matches!(
         record_row_to_model(row),
         Err(UsageCollectorPluginError::Internal(_))
@@ -192,8 +290,10 @@ fn record_row_invalid_idempotency_key_is_internal() {
 
 #[test]
 fn record_row_non_object_metadata_is_internal() {
-    let mut row = valid_record_row();
-    row.metadata = JsonValue::String("not-an-object".to_owned());
+    let row = UsageRecordRow {
+        metadata: JsonValue::String("not-an-object".to_owned()),
+        ..sample_row()
+    };
     assert!(matches!(
         record_row_to_model(row),
         Err(UsageCollectorPluginError::Internal(_))
@@ -201,9 +301,11 @@ fn record_row_non_object_metadata_is_internal() {
 }
 
 #[test]
-fn record_row_unknown_status_is_internal() {
-    let mut row = valid_record_row();
-    row.status = "archived".to_owned();
+fn record_row_unknown_origin_is_internal() {
+    let row = UsageRecordRow {
+        origin: "imported".to_owned(),
+        ..sample_row()
+    };
     assert!(matches!(
         record_row_to_model(row),
         Err(UsageCollectorPluginError::Internal(_))
