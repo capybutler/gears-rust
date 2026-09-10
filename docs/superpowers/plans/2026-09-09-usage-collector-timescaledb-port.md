@@ -4467,7 +4467,10 @@ six paths in this tree are not yours.
 
 **Files:**
 - Create: `tests/contract_conformance_pg.rs`
-- Modify: `Cargo.toml`
+- Modify: `Cargo.toml`, and — not foreseen when this was written —
+  `src/domain/adapter.rs` (`StorageAdapter` was `pub(crate)`, see Step 3) and
+  `tests/common/mod.rs` (it carried 6 of Task 15's 61 errors and
+  `mod common;` cannot skip them, see Step 3 and Task 15)
 
 ### Read this before relying on a green run
 
@@ -4492,19 +4495,30 @@ the same as being a conforming plugin. Specifically:
 `BLOCKED_CHECKS` and `ADDITIONAL_CHECKS` together.** `IMPLEMENTED_CHECKS` alone
 under-reports what `run_all` ran.
 
-- [ ] **Step 1: Add the dev-dependency**
+- [x] **Step 1: Add the dev-dependency** — DONE
 
-In `Cargo.toml` under `[dev-dependencies]`:
+**The alias is the key, not the package name.** What landed:
 
 ```toml
-cf-gears-usage-collector-sdk = { workspace = true, features = ["contract"] }
+usage-collector-sdk = { workspace = true, features = ["contract"] }
 ```
 
-The crate already depends on `usage-collector-sdk` under that workspace alias;
-confirm whether the alias or the package name is the right key here by matching
-how another crate in the workspace enables a feature on an aliased dependency.
+`contract.rs`'s own module header (and the snippet this step carried) writes
+`cf-gears-usage-collector-sdk`, which is the package name. Two things settle
+it against that: `[dependencies]` in this crate already names the package
+`usage-collector-sdk`, and the workspace table at `Cargo.toml:366` supplies
+the `package = "cf-gears-usage-collector-sdk"` rename — a second key for one
+package would be a second dependency under a second extern name. And it
+matches how the workspace already does this: `postgres-cluster-plugin` writes
+`cluster-sdk = { workspace = true, features = ["otel"] }`
+(`gears/system/cluster/plugins/postgres-cluster-plugin/Cargo.toml:46`) against
+`cluster-sdk = { package = "cf-gears-cluster-sdk", ... }` at `Cargo.toml:360`.
 
-- [ ] **Step 2: Write the test**
+The SDK header's `[dev-dependencies]` snippet is written for a consumer
+outside this workspace, so it is not wrong there — but it is not copyable
+here, and Task 18 may want to say so.
+
+- [x] **Step 2: Write the test** — DONE
 
 `tests/contract_conformance_pg.rs`:
 
@@ -4543,7 +4557,18 @@ Confirm the exported constant names and shapes against
 `usage-collector-sdk/src/contract.rs` before writing — `BLOCKED_CHECKS` carries
 each name with its blocker, so its element type may not be a bare `&str`.
 
-- [ ] **Step 3: `common::start_backend`**
+**DONE, with the assertion message widened.** `BLOCKED_CHECKS` is
+`&[(&str, &str)]`, so it renders as pairs. The shipped message reports all
+four constants rather than the two the snippet named, because
+`IMPLEMENTED_CHECKS` plus `BLOCKED_CHECKS` accounts for seven names and
+`run_all` ran **six** checks — the sixth being `ADDITIONAL_CHECKS`'
+`scope-is-a-filter-on-every-read-path`, which DESIGN obliges without
+tabulating. A reader of a failure message that named only the first two would
+under-report the run in exactly the way the module header warns against. The
+message reads `ran: [...] plus [...] / not run: [...] unwritten, [...]
+blocked`, and the mutation run below shows it rendering all four.
+
+- [x] **Step 3: `common::start_backend`** — DONE
 
 `tests/common/mod.rs` already starts a TimescaleDB container via
 `testcontainers` for the existing pg suites. Extend it with a helper returning
@@ -4555,13 +4580,43 @@ starts each run from whatever state the previous one left". A fresh container
 per run makes that moot; if the harness reuses one, read the fixtures' keying
 assumptions before relying on repeated runs.
 
-- [ ] **Step 4: Run it**
+**DONE. The harness starts a container per `bring_up` call**, so the
+keying question never arises: `start_backend` calls `bring_up`, and
+`TsHarness` owns the `ContainerAsync` — a run never meets a previous run's
+rows.
+
+**`bring_up`'s retention window turned out to be load-bearing here**, not
+incidental. `bring_up` passes `NO_DROP_RETENTION_SECS`; the suite offsets
+every fixture period from `FIXTURE_EPOCH` (`2020-01-01T00:00:00Z`,
+`contract/fixtures.rs`), which the production 365-day window puts years past
+the cutoff. Under the default the scheduled `policy_retention` job would drop
+the chunk mid-run and the checks would report a conforming backend as losing
+entries. Recorded in `start_backend`'s doc rather than left to `bring_up`'s.
+
+**One source change was required and it is not in this task's file list:
+`StorageAdapter` was `pub(crate)`.** `run_all` takes a
+`&dyn UsageCollectorPluginV1` and `StorageAdapter` is the crate's only
+implementation of it, so no `tests/*.rs` crate could name it. It and
+`StorageAdapter::new` are now `pub`, which is exactly the exemption
+`lib.rs:14-19` already writes down for `config`, `domain` and `infra`
+("Exposed `pub` only so the crate's integration tests ... can construct the
+stores, config, and metrics directly"); `domain` is `#[doc(hidden)]`, so
+`cargo doc --no-deps` stays at 7 warnings.
+
+**Task 15 inherits a partly-repaired `tests/common/mod.rs` — see the entry
+added to its section.**
+
+- [x] **Step 4: Run it** — DONE, **PASS**, first run, no backend change.
 
 ```bash
 cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
 cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres \
   --no-fail-fast -E 'test(the_timescale_backend_conforms)' 2>&1 | tail -40
 ```
+
+**Scope the run to `--test contract_conformance_pg`.** An unscoped
+`--features postgres` invocation builds all six integration targets and dies
+on the five Task 15 owns, before this one is ever linked.
 
 Needs a reachable Docker daemon. Expected: PASS.
 
@@ -4570,7 +4625,31 @@ fix the backend. If a violation looks like a defect in the suite rather than in
 the backend, stop and report it — that would be a twentieth DIVERGENCES entry,
 and this plan's Task 18 is where it lands.
 
-- [ ] **Step 5: Commit**
+**The run:**
+
+```
+Starting 1 test across 1 binary
+    PASS [   1.713s] cf-gears-timescaledb-usage-collector-plugin::contract_conformance_pg the_timescale_backend_conforms
+  Summary [   1.714s] 1 test run: 1 passed, 0 skipped
+```
+
+Nothing to route to DIVERGENCES: the suite found nothing.
+
+**A green run over an acceptance criterion is worth as little as an
+unfalsified one, so it was falsified.** The two range clauses in
+`push_meter_and_range_clauses` (`query.rs:71`, `:75` — one occurrence each,
+counted before mutating) were flipped from `r.window_end` to `r.window_start`
+and the test re-run with a `Compiling` line present. It went red with **8**
+violations, and the shape is the coupling this section warns about, observed
+rather than reasoned: 5 × `quantity-round-trip` ("accepted by
+`create_usage_record` but a `list_usage_records` range containing its
+`window_end` did not return it, so its quantity could not be compared at
+all") and 3 × `window-end-selection`, including both boundary cases. **Both
+red means the period rule, and the decimals are innocent** — now a measured
+claim. The mutation was reverted (`query.rs` is byte-identical to
+`5fc029a75`) and the suite re-run green with a `Compiling` line.
+
+- [x] **Step 5: Commit** — DONE
 
 ```bash
 git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/ \
@@ -4582,6 +4661,26 @@ written plus one DESIGN states without tabulating; the assertion message
 reports the blocked ones alongside the violations, because a green run over
 five checks must not read as a run over seven."
 ```
+
+**What the run covered, reported as the four constants require:**
+
+| constant | contents |
+| --- | --- |
+| `IMPLEMENTED_CHECKS` | `quantity-round-trip`, `window-end-selection`, `dedup-identity-over-window`, `invalidation-excluded-from-fold`, `at-most-one-invalidation` |
+| `ADDITIONAL_CHECKS` | `scope-is-a-filter-on-every-read-path` (run; DESIGN obliges it without tabulating) |
+| `UNWRITTEN_CHECKS` | empty |
+| `BLOCKED_CHECKS` | `feed-snapshot-and-replay` (no feed method on the SPI), `latest-tie-break` (no `acceptance_sequence` on `UsageRecord`) |
+
+Six checks ran, of DESIGN's seven names five are green, two never executed.
+Two further things a green run does **not** say, both still true after it:
+the suite touches none of the SPI's keyset obligations (order, `next_cursor`,
+cursor fingerprint), and it reaches the `Latest` fold at no site — `contract/checks/`
+dispatches `query_aggregated_usage_records` at exactly two places
+(`invalidation_excluded_from_fold.rs:292`,
+`scope_is_a_filter_on_every_read_path.rs:437`) and both pass
+`AggregationFold::Sum` with an empty `group_by`, so neither the other three
+folds nor any grouping dimension is touched. Task 15
+owns both gaps.
 
 ---
 
@@ -4621,7 +4720,26 @@ the statement, and a test pins it against the `GROUP BY` ordinals.
    exactly why only a real query demonstrates it.
 
 Task 12's `--all-targets` count of zero is a green **without** `--features
-postgres`; with it, these five files carry 61 errors that are yours.
+postgres`; with it, these files carry the errors that are yours.
+
+**Re-measured at Task 14**, after `tests/common/mod.rs` and
+`tests/contract_conformance_pg.rs` were made to compile. `cargo check -p
+cf-gears-timescaledb-usage-collector-plugin --features postgres --all-targets`
+now reports 91 error lines, 87 of them attributed to four files — the count
+rose against Task 12's 61 because the five targets no longer abort early on
+`common/mod.rs`, so each now reports its own errors in full rather than none:
+
+| file | errors |
+| --- | --- |
+| `records_query_integration_pg.rs` | 42 |
+| `records_ingest_integration_pg.rs` | 34 |
+| `id_uniqueness_integration_pg.rs` | 8 |
+| `cleanup_integration_pg.rs` | 3 |
+| `schema_integration_pg.rs` | **0 — it already compiles** |
+
+`schema_integration_pg.rs` compiling is not the same as its assertions being
+right; Step 2 still owns it, and a file that builds against the old schema's
+expectations is exactly the shape Step 2 exists to catch.
 
 **Three things Task 13 hands you, none of them a defect to fix:**
 
@@ -4687,14 +4805,43 @@ Produce that list in the task report. "Deleted the failing test" and "deleted
 the test whose question no longer exists" look identical in a diff, and only
 the second is legitimate.
 
-**Two items Task 1 handed forward and this task must close:**
+**What Task 14 already did to `tests/common/mod.rs`, and what it left.**
 
-- **`tests/common/mod.rs`'s `setup_with_type(_gts, _fields)` ignores both
-  parameters.** Task 1 kept the signature deliberately, to avoid churning 17
-  call sites this task rewrites anyway, and documented that it did. A helper
-  taking two ignored arguments is a trap for anyone who assumes it still
-  registers a type. **It must not survive this task** — either give it a
-  signature matching what it does, or delete it.
+Task 14's `tests/contract_conformance_pg.rs` does `mod common;`, so it could
+not compile until that file did — and each file in `tests/` is its own crate,
+so a broken `records_ingest_integration_pg.rs` does not block it. Task 14
+therefore repaired `common/mod.rs` alone, to the minimum, and the file is now
+**255 lines** (not the 346 in the list above, which was already stale at 318):
+
+- **Changed.** Dropped the `usage_collector_sdk::{IdempotencyKey, ResourceRef,
+  SubjectRef, UsageRecord, UsageTypeGtsId}` import and `time::OffsetDateTime`;
+  added `domain::adapter::StorageAdapter` and `domain::ports::RecordStore`.
+  Added `start_backend() -> (TsHarness, StorageAdapter)`. Repointed
+  `NO_DROP_RETENTION_SECS`' doc, which named `fixture_usage_record`'s
+  `created_at` — a field the model no longer has — at the `window_end` the
+  policy actually measures from.
+- **Deleted, not ported: `fixture_gts_id`, `fixture_usage_record`,
+  `fixture_usage_record_with_resource`, `fixture_usage_record_with_subject`**
+  (97 lines). They carried all six of the file's compile errors, every one in
+  a field the current `UsageRecord` does not have (`gts_id`, `corrects_id`,
+  `status`, `created_at`) or a type it no longer exports (`UsageTypeGtsId`,
+  `UsageRecordStatus`). Porting them means choosing a `window_start` /
+  `window_end` for every fixture and deciding whether the id stays
+  `Uuid::from_u128(seq)` now that it is a UUIDv5 over the 5-tuple — decisions
+  that belong to the suites in Steps 2-6, not to a file repaired so a
+  different test could link. **A ported-but-never-run fixture is the worse
+  inheritance**: it compiles, so it reads as validated.
+- **Left untouched, and stale.** `insert_raw_usage_record` compiles and will
+  fail at runtime: its `INSERT` names `created_at` and omits the period
+  columns, and its doc calls it the FK-referenced-delete test's child row
+  when Task 3's schema has no foreign key.
+
+**One item Task 1 handed forward, and one that has already closed itself:**
+
+- **`setup_with_type(_gts, _fields)` is already gone.** `grep -rn
+  setup_with_type gears/system/usage-collector/` returns nothing as of
+  `5fc029a75`; Task 1 removed it with the catalog. Nothing to close — do not
+  go looking for it.
 - **`pg_insert_with_unregistered_gts_id_is_usage_type_not_found` must be
   deleted, not repointed** (see Task 3 Step 2b). It passes for the wrong
   reason once the catalog table is gone.
