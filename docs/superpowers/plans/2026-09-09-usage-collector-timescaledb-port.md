@@ -2423,9 +2423,11 @@ by design — so the first blocker is fatal and the approach was abandoned.
   introduce. Both hold in fact: `cargo check --all-targets` emits no `E0277`
   (non-`Send` future) and no `E0407` anywhere in the run, and `E0050` only in
   `adapter.rs` — in a run that *did* emit `E0425`/`E0308` from inside this very
-  `impl` block (`record_store.rs:1609`, `:1752`, `:1783` — in `list` and
-  `aggregate`, against a block spanning `:1398-1819`), so method-body
+  `impl` block (`record_store.rs:1700`, `:1843`, `:1874` — in `list` and
+  `aggregate`, against a block spanning `:1469-1910`), so method-body
   type-checking demonstrably reached the block and was silent about these two.
+  (Re-measured after every edit that moved them; a line anchor written once and
+  carried forward is how the citation below went wrong in the first place.)
   One caveat: `ports.rs:6` carries an unresolved import, so "conformance
   checking ran" is strictly true only for methods whose signatures do not name
   the missing types — which `create` and `create_batch` do not, so the claim
@@ -2440,19 +2442,31 @@ by design — so the first blocker is fatal and the approach was abandoned.
   sentence added so the disclosure would not rest on bare assertion. The lesson
   is not "add evidence": it is that **added evidence needs the same
   verification as the claim it supports**. `extract_writehalf.py`'s own
-  docstring, which makes no evidence claim at all, was correct as written. Everything else in the extract is the
-  real file's bytes, and every deletion anchor is asserted unique, so a failed
-  anchor raises rather than silently emitting a different extract.
+  docstring, which makes no evidence claim at all, was correct as written.
+  Everything else in the extract is the real file's bytes, and every deletion
+  anchor is asserted unique, so a failed anchor raises rather than silently
+  emitting a different extract.
 - **What that does not cover.** Two of these are DB-free and *were* covered
   after this was first written; they are listed because the original framing —
   "anything needing a live backend" — quietly excluded them, and they are
   exactly where a silent corruption would live:
   - `InsertColumns::build`, the sixteen-way pivot the batch insert binds. A
-    swapped push (`resource_ids`/`resource_types`, `subject_ids`/`subject_types`,
-    the two bounds) corrupts every batched row and is invisible to every other
-    test. **Now covered** by
+    swapped push (`resource_ids`/`resource_types`,
+    `subject_ids`/`subject_types`, the two bounds) corrupts every batched row
+    and is invisible to every other test. **Now covered** by
     `insert_columns_pivots_each_record_into_the_column_it_is_bound_as`, with
     three swap mutations.
+  - The insert SQL's own column sequences, one layer below the pivot. The
+    column list, `SELECT` list and `UNNEST` alias list were four literal
+    spellings; a name transposed in one of them binds a `text[]` to the wrong
+    `text` column, which Postgres accepts silently. They are now one
+    `INSERT_COLUMNS` const with `single_insert_sql()` / `batch_insert_sql()`
+    built from it, and four tests read the sequences back out. The
+    column-to-array-type pairing is checked against a **hand transcription of
+    `migrations/0001_init.sql`**, not against the const the SQL is built from —
+    the first version of that test did the latter and a transposition mutation
+    survived it, since both sides moved together. The `.bind()` call order
+    remains genuinely Task 15's.
   - `claim_batch_sequences`'s pure half, now split out as `scope_runs` and
     `sequence_block`. An off-by-one there reuses or skips a sequence value that
     no constraint can object to. **Now covered**, with two mutations.
@@ -3047,6 +3061,23 @@ earlier call aborts the statement and returns an outer `AlreadyInvalidated`,
 not per-row outcomes. Fixing it needs per-row `SAVEPOINT`s, which is a larger
 change than this step scopes. Recorded for Task 18's DIVERGENCES entry.
 
+### Considered and not taken: folding the claim into the insert
+
+**Asked at code-quality review; the honest answer is that it was unconsidered
+at the time, so it is recorded here rather than defended.**
+
+`claim_acceptance_sequence` and the insert are two round trips inside the
+counter row's lock. A data-modifying CTE —
+`WITH seq AS (INSERT INTO usage_acceptance_sequence … RETURNING next_value)
+ INSERT INTO usage_records SELECT …, seq.next_value FROM …` — folds them into
+one, cutting the serialized window per scope by one round trip.
+
+It does **not** shorten the lock hold, which runs to commit either way, so it is
+a latency tweak and not a concurrency fix — and the two-statement shape is what
+lets one `claim_acceptance_sequence` serve both `count = 1` and a batch's
+per-scope blocks. **Routed to Task 15**, which has a live backend and can
+measure the saving instead of reasoning about it.
+
 - [x] **Step 8: Run, verify, commit** — DONE
 
 `cargo nextest` still cannot link a test binary for this crate: the read half
@@ -3087,6 +3118,19 @@ retry."
 ```
 
 ---
+
+> **Inherited from Task 9's review — three citations in the read half point at
+> files that do not exist.** `record_store.rs` cites `plugin-spi.md` at three
+> places in code Tasks 10-12 own: `:1681` and `:1718` (the `corrects_id`
+> partition rationale, §Method 3) and `:1776` (the aggregate cap, §Method 3).
+> **`git ls-files | grep -iE 'plugin-spi|domain-model'` is empty** — neither
+> file is in the tree, and the string "Plugin-specific outputs" appears nowhere
+> but in this one source file. The SPI is rustdoc on
+> `usage_collector_sdk::UsageCollectorPluginV1`. Task 9 removed the two in its
+> own paragraph (`canonical_equal`) rather than propagate them; **whichever of
+> Tasks 10-12 rewrites each of these three should re-point it at the rustdoc
+> that actually says the thing, or drop the reference** — do not carry it
+> across. All three sit in `aggregate`, so in practice this is Task 12's.
 
 ## Task 10: `get_usage_record` intersects the compiled scope
 
@@ -3580,6 +3624,40 @@ cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets
 ```
 
 Expected: exits 0. **This is the first time since slice 4.**
+
+- [ ] **Step 2b: Consider observing the at-most-one rejection (from Task 9's review)**
+
+**A consideration, not a required metric.** The SPI singles out at-most-one
+invalidation as the plugin's *one* admission-time obligation, and its two
+rejection paths are observed asymmetrically today: the in-batch pre-reject
+(`duplicate_withdrawal_in_batch`) logs a `warn` naming the target and the entry
+that already withdrew it; the cross-call one, which `map_insert_error` builds
+from the index violation, logs nothing. **Neither moves a metric.**
+
+That is thin for the outcome the SPI cares most about — an operator cannot see
+whether withdrawals are being refused at all. You own the metric inventory, so
+this is yours to weigh against DESIGN §3.11.5. Note that this plugin's own
+`docs/DESIGN.md` inventory is deliberately stale (DIVERGENCES 5 and 14), so a
+new counter here is a judgement call rather than something the doc obliges.
+
+- [ ] **Step 2c: Decide whether to split `record_store.rs` (from Task 9's review)**
+
+**A decision point, deliberately placed here.** `record_store.rs` is ~1,840
+lines, and roughly 400 of them — `plan_batch`, `scope_runs`, `sequence_block`,
+`InsertColumns`, the dedup helpers, `canonical_equal`, the `with_retry` family,
+the SQL builders — are pure and touch neither `PgRecordStore` nor `sqlx`.
+Moving them into `record_store/write_plan.rs` would give a real physical
+read/write split in place of the banner comment in `record_store_tests.rs`, and
+would let a future task `#[path]`-include a real file instead of regenerating
+an extract (see Task 9's Verification note for why that mattered).
+
+**Task 9 deliberately did not do it**: Tasks 10-12 were about to edit this file
+and the merge cost would have landed on them. This task closes the file and is
+where the crate first compiles, so it is the cheapest place to take it.
+
+One exception: **if Task 10's implementer finds the extractor painful, they may
+pull the split forward.** The benefit is largest before the read half is
+rewritten, not after.
 
 - [ ] **Step 3b: Re-run Task 9's deferred unit tests through `cargo nextest`**
 
