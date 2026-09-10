@@ -2422,12 +2422,14 @@ by design — so the first blocker is fatal and the approach was abandoned.
   trait — precisely the class of breakage a first-transaction change can
   introduce. Both hold in fact: `cargo check --all-targets` emits no `E0277`
   (non-`Send` future) and no `E0407` anywhere in the run, and `E0050` only in
-  `adapter.rs` — in a run that *did* emit `E0425`/`E0308` from inside this very
-  `impl` block (`record_store.rs:1700`, `:1843`, `:1874` — in `list` and
-  `aggregate`, against a block spanning `:1469-1910`), so method-body
-  type-checking demonstrably reached the block and was silent about these two.
-  (Re-measured after every edit that moved them; a line anchor written once and
-  carried forward is how the citation below went wrong in the first place.)
+  `adapter.rs` — in a run that *did* emit `E0425`/`E0308` from **inside the
+  bodies of `list` and `aggregate`**, which are methods of this very `impl`
+  block, so method-body type-checking demonstrably reached the block and was
+  silent about these two. (Those three errors sat at `record_store.rs:1712`,
+  `:1855` and `:1886` against a block spanning `:1477-1922` when this was last
+  measured, at `Task 9`'s final commit. The numbers are given for reproduction
+  and will drift; **the enclosing functions are the durable half of the
+  citation**, which is the lesson of how this sentence went wrong below.)
   One caveat: `ports.rs:6` carries an unresolved import, so "conformance
   checking ran" is strictly true only for methods whose signatures do not name
   the missing types — which `create` and `create_batch` do not, so the claim
@@ -3658,6 +3660,31 @@ where the crate first compiles, so it is the cheapest place to take it.
 One exception: **if Task 10's implementer finds the extractor painful, they may
 pull the split forward.** The benefit is largest before the read half is
 rewritten, not after.
+
+**The same decision covers where the DDL oracle lives.** Task 9's review found
+that its `DDL_COLUMN_ARRAY_TYPES` — a hand transcription of
+`migrations/0001_init.sql` — duplicates an instrument this crate already has:
+`aggregate_tests.rs:203-256` (Task 8's `migration_ledger_columns()`)
+`include_str!`s the same migration, parses it, and checks `LEDGER_COLUMNS`
+against it, recognizing what a column is *not* so an unrecognized construct
+reds the test rather than vanishing from it.
+
+The column sequence now has **six hand-kept spellings** with exactly derivable
+relationships: `LEDGER_COLUMNS` (18, parser-verified), `RECORD_COLUMNS` (17,
+`= LEDGER_COLUMNS − {entry_type}`), `INSERT_COLUMNS` (16,
+`= LEDGER_COLUMNS − {entry_type, ingested_at}`), `INSERT_COLUMN_ARRAY_TYPES`,
+`DDL_COLUMN_ARRAY_TYPES`, and `InsertColumns`' field order.
+`migration_ledger_columns()` already splits the type token off and discards it;
+extending it to yield `(name, type)` and deriving the oracle's name half from
+it would leave only the sixteen type strings and the one declared `metadata`
+divergence hand-written.
+
+**Not a Task 9 defect**, and not urgent: the silent-failure window needs a DDL
+change reflected in neither the oracle nor the code, which Task 15's live insert
+would reject outright. It belongs here because it is the same question as the
+file split — where shared test machinery lives — and because **the anchoring
+chain is now one independent oracle feeding everything else, which is precisely
+why the anchor's quality is the whole guarantee.**
 
 - [ ] **Step 3b: Re-run Task 9's deferred unit tests through `cargo nextest`**
 

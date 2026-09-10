@@ -14,10 +14,11 @@ use usage_collector_sdk::{UsageCollectorPluginError, UsageTypeGtsId};
 
 use super::{
     ConflictRead, DedupKey, INSERT_COLUMNS, INSERT_COLUMN_ARRAY_TYPES, InsertColumns,
-    MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, batch_insert_sql, batch_retry_backoff,
+    BATCH_INSERT_SQL, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, SINGLE_INSERT_SQL,
+    batch_retry_backoff,
     batch_retry_backoff_base, canonical_equal, dedup_key, invalidation_index_slots,
     is_retryable_batch_error, plan_batch, row_dedup_key, scope_runs, sequence_block,
-    single_insert_sql, with_retry,
+    with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -438,11 +439,17 @@ fn record_columns_is_the_insert_columns_plus_the_defaulted_ingested_at() {
         !names(RECORD_COLUMNS).contains(&"entry_type"),
         "entry_type is a generated column; nothing reads or writes it"
     );
+    assert_eq!(
+        names(INSERT_COLUMNS).last(),
+        Some(&"metadata"),
+        "the batch SELECT appends ::jsonb to the whole column list, so the cast \
+         lands on metadata only while metadata is last"
+    );
 }
 
 #[test]
 fn the_single_insert_binds_one_placeholder_per_inserted_column() {
-    let sql = single_insert_sql();
+    let sql = SINGLE_INSERT_SQL.as_str();
     let cols = sql
         .split_once("usage_records (")
         .and_then(|(_, rest)| rest.split_once(')'))
@@ -473,7 +480,7 @@ fn the_single_insert_binds_one_placeholder_per_inserted_column() {
 
 #[test]
 fn the_batch_insert_names_one_column_sequence_in_all_three_places() {
-    let sql = batch_insert_sql();
+    let sql = BATCH_INSERT_SQL.as_str();
     let expected = names(INSERT_COLUMNS);
 
     let cols = sql
@@ -522,6 +529,16 @@ fn the_batch_insert_names_one_column_sequence_in_all_three_places() {
             i + 1
         );
     }
+
+    // Asserted here as well as on the single insert, against the same literal.
+    // Both builders read `DEDUP_CONFLICT_TARGET` so they cannot differ today,
+    // but an arbiter hardcoded into this one alone would otherwise pass.
+    assert!(
+        sql.contains(
+            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end)"
+        ),
+        "the batch arbiter is the dedup 5-tuple too: {sql}"
+    );
 }
 
 // --- Batch planning ---

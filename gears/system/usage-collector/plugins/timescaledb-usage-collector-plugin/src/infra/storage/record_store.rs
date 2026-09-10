@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -84,7 +84,12 @@ const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, w
 /// `text[]` to the wrong `text` column, which Postgres accepts without
 /// complaint and which no row-level test can see. `metadata` is deliberately
 /// **last**, because the batch `SELECT` appends `::jsonb` to this string rather
-/// than restating it (see [`batch_insert_sql`]); a test pins that.
+/// than restating it (see [`BATCH_INSERT_SQL`]) — the cast binds to the final
+/// identifier only, which is what makes the `SELECT` list unable to be a
+/// transposition rather than merely tested not to be. A test asserts the
+/// position directly, because deriving it from an order assertion whose oracle
+/// happens to end in `metadata` would not survive a migration that declares a
+/// column after it.
 const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, window_end, \
      resource_id, resource_type, subject_id, subject_type, idempotency_key, invalidates, \
      reason_code, origin, acceptance_sequence, metadata";
@@ -128,15 +133,17 @@ fn placeholders(n: usize) -> String {
 /// The single-row `INSERT … ON CONFLICT (5-tuple) DO NOTHING RETURNING`.
 ///
 /// Built rather than inlined so a test can read the column list, the
-/// placeholder count and the conflict target back out of it.
-fn single_insert_sql() -> String {
+/// placeholder count and the conflict target back out of it — and built
+/// **once**, because every input to it is a constant and the alternative is
+/// sixteen `format!`s per write.
+static SINGLE_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "INSERT INTO usage_records ({INSERT_COLUMNS}) VALUES ({}) \
          ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
          RETURNING {RECORD_COLUMNS}",
         placeholders(INSERT_COLUMN_ARRAY_TYPES.len()),
     )
-}
+});
 
 /// The multi-row `INSERT … SELECT FROM UNNEST(…) ON CONFLICT (5-tuple) DO
 /// NOTHING RETURNING`.
@@ -146,7 +153,9 @@ fn single_insert_sql() -> String {
 /// the `SELECT` differs only by the trailing `::jsonb`, which works because
 /// `metadata` is the last column. `UNNEST`'s parameters are
 /// [`INSERT_COLUMN_ARRAY_TYPES`] in the same order, so `$n` is column `n`.
-fn batch_insert_sql() -> String {
+///
+/// Built once, for the same reason as [`SINGLE_INSERT_SQL`].
+static BATCH_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
     let unnest = INSERT_COLUMN_ARRAY_TYPES
         .iter()
         .enumerate()
@@ -159,7 +168,7 @@ fn batch_insert_sql() -> String {
          ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
          RETURNING {RECORD_COLUMNS}"
     )
-}
+});
 
 /// `sqlx`-backed implementation of [`RecordStore`] over the `usage_records`
 /// hypertable.
@@ -359,7 +368,6 @@ impl PgRecordStore {
         //    5-tuple already exists. `ingested_at` is left to its DEFAULT and
         //    `entry_type` is generated, which is why sixteen of the seventeen
         //    [`RECORD_COLUMNS`] are bound here.
-        let insert_sql = single_insert_sql();
         let subject_id = record
             .subject_ref
             .as_ref()
@@ -371,7 +379,7 @@ impl PgRecordStore {
         let (invalidates, reason_code) = invalidation_to_row(record.invalidation.as_ref());
         let is_invalidation = invalidates.is_some();
 
-        let attempted = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(insert_sql))
+        let attempted = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(SINGLE_INSERT_SQL.as_str()))
             .bind(record.id)
             .bind(record.tenant_id)
             .bind(record.gts_type_id.as_str())
@@ -504,7 +512,7 @@ impl PgRecordStore {
         }
         let cols = InsertColumns::build(reps, sequences);
 
-        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(batch_insert_sql()))
+        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(BATCH_INSERT_SQL.as_str()))
             .bind(&cols.ids)
             .bind(&cols.tenants)
             .bind(&cols.gts_type_ids)
@@ -1475,16 +1483,20 @@ impl RecordStore for PgRecordStore {
     /// `55P03` on a hot scope is an ordinary outcome here, not a rarity. It is
     /// still returned unretried, because a `Transient` lifts to
     /// `ServiceUnavailable` at the dispatch boundary and reaches the caller as
-    /// a 503 with a `Retry-After` slot: the client already holds the one record
-    /// and re-submitting it is cheap and exactly idempotent. Retrying in-process
-    /// would instead hold a pooled connection across the backoff — moving the
-    /// wait from the client, which has nothing else to do, onto the pool, which
-    /// is the resource the contention is already competing for.
+    /// a 503 with a `Retry-After` slot: the client already holds the one record,
+    /// and re-submitting it is cheap and exactly idempotent.
     ///
-    /// A batch is the opposite trade on both counts: re-submitting is expensive
-    /// for the caller, and its value is a vector of per-row outcomes that cannot
-    /// be partially returned, so absorbing a transient in-process is worth a
-    /// connection held for a few jittered milliseconds.
+    /// A batch is the opposite trade: re-submitting it is expensive for the
+    /// caller, and its value is a vector of per-row outcomes that cannot be
+    /// partially returned — so absorbing a transient in-process is worth the
+    /// jittered milliseconds, where here it would only duplicate a retry the
+    /// caller can make just as well.
+    ///
+    /// Note what is *not* part of this argument: a retry costs no pooled
+    /// connection. `conn` is a local of [`Self::create_inner`] and
+    /// `create_batch_inner`, so it is dropped and returned to the pool when
+    /// that `async fn` returns — before [`with_retry`] reaches `on_retry` or
+    /// its backoff sleep. Neither path holds a connection across a wait.
     // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-dedup:p2
     async fn create(&self, record: UsageRecord) -> Result<UsageRecord, UsageCollectorPluginError> {
         // Time the whole single-row call; the per-row counters live in
