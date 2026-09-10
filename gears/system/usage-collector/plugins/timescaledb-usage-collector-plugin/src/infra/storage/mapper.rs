@@ -4,7 +4,12 @@
 //! [`UsageCollectorPluginError::Internal`] — a row already in the database that
 //! cannot be reconstituted is a plugin invariant break, not a caller error.
 //!
-//! Most columns are already the model's type. Three need more than a move:
+//! `id`, `tenant_id`, `value` and the two period bounds move across unchanged.
+//! Every other column is validated on the way in: `resource_id` and
+//! `resource_type` through [`ResourceRef::new`], `subject_id` and
+//! `subject_type` through [`SubjectRef::new`], `idempotency_key` through
+//! [`IdempotencyKey::new`], `metadata` through [`metadata_jsonb_to_map`], and
+//! the rest through the helpers below, which take more explaining:
 //!
 //! - `gts_type_id` becomes a [`MeterTypeId`], whose constructor validates, so
 //!   the read direction ([`meter_type_id_from_str`]) returns a `Result` while

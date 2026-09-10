@@ -10,7 +10,7 @@ use usage_collector_sdk::{MetadataKey, MeterTypeId, RecordOrigin, UsageCollector
 use super::super::entity::UsageRecordRow;
 use super::{
     invalidation_from_row, metadata_jsonb_to_map, metadata_map_to_jsonb, meter_type_id_from_str,
-    parse_origin, record_row_to_model,
+    meter_type_id_str, parse_origin, record_row_to_model,
 };
 
 // ── origin round-trip ────────────────────────────────────────────────────────
@@ -84,6 +84,12 @@ fn meter_type_id_from_str_accepts_valid_and_rejects_invalid_as_internal() {
         meter_type_id_from_str("not-a-valid-meter-type-id"),
         Err(UsageCollectorPluginError::Internal(_))
     ));
+}
+
+#[test]
+fn meter_type_id_str_borrows_the_stored_spelling_back() {
+    let id = MeterTypeId::new(VALID_METER_TYPE_ID).unwrap();
+    assert_eq!(meter_type_id_str(&id), VALID_METER_TYPE_ID);
 }
 
 // ── invalidation pair ────────────────────────────────────────────────────────
