@@ -1,20 +1,25 @@
 #![cfg(feature = "postgres")]
-// Shared across test binaries: not every binary uses every fixture, and these
-// fixtures panic on invalid test input by design.
+// Shared across test binaries: `mod common;` compiles a private copy into each
+// one, so a helper another binary uses is `dead_code` in this one. These
+// helpers also panic on invalid test input by design.
+//
+// The allowance is earned by that sharing and by nothing else — `dead_code`
+// hides a helper with no callers at all just as well, which is how
+// `insert_raw_usage_record` kept an `INSERT` naming columns the table does not
+// have, and a doc citing a foreign key the schema does not have, until Task 14
+// deleted it. Before adding a helper here, check it has a caller somewhere;
+// the lint will not.
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 //! Shared `TimescaleDB` testcontainer harness. Requires Docker.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use rust_decimal::Decimal;
 use sqlx::PgPool;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig;
 use timescaledb_usage_collector_plugin::domain::adapter::StorageAdapter;
@@ -24,11 +29,6 @@ use timescaledb_usage_collector_plugin::infra::storage::pool::{
     MIGRATOR, apply_post_migration_setup, build_pool,
 };
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
-
-/// Monotonic seed so each raw record insert gets a distinct `id` and
-/// `idempotency_key` (the workspace `uuid` crate has no `v4` feature, so we
-/// mint deterministic-but-unique ids via [`Uuid::from_u128`]).
-static RAW_RECORD_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub struct TsHarness {
     pub pool: PgPool,
@@ -43,8 +43,8 @@ pub struct TsHarness {
 /// registration — i.e. while the test body is still running. The policy measures
 /// from `window_end` (the hypertable's partition column), so at the production
 /// default window (365 days) any fixture whose period ended more than a year ago
-/// is past the cutoff, and a handful of them share one 7-day chunk: that first
-/// scheduled run drops the chunk out from under the test. A stalled insert loop
+/// is past the cutoff, and they are spread over several 7-day chunks: that
+/// first scheduled run drops those chunks out from under the test. A stalled insert loop
 /// (parallel containers on a loaded CI box) then sees rows vanish mid-test: one
 /// aggregation bucket short, a `count` off by one, a cursor walk ending early.
 ///
@@ -195,9 +195,10 @@ pub fn record_store(pool: &PgPool) -> PgRecordStore {
 /// than the production default, and that is load-bearing here: the suite
 /// offsets every fixture period from its own `FIXTURE_EPOCH`
 /// (`2020-01-01T00:00:00Z`), which a 365-day window puts years past the
-/// cutoff — the scheduled `policy_retention` job would drop the chunk while
-/// the run is still writing to it, and the checks would report a conforming
-/// backend as losing entries.
+/// cutoff — the six checks sit at `FIXTURE_EPOCH` + 0/30/60/90/120/150 days,
+/// so that is six distinct 7-day chunks, and the scheduled `policy_retention`
+/// job would drop them while the run is still writing to them. The checks
+/// would then report a conforming backend as losing entries.
 ///
 /// The returned [`TsHarness`] owns the container: hold it for the length of
 /// the test, or the database goes away with it. The suite writes entries and
@@ -215,42 +216,4 @@ pub async fn start_backend() -> (TsHarness, StorageAdapter) {
         .expect("contract suite needs a migrated TimescaleDB container");
     let store: Arc<dyn RecordStore> = Arc::new(record_store(&harness.pool));
     (harness, StorageAdapter::new(store))
-}
-
-/// Insert a raw `usage_records` row referencing `gts_id`, bypassing the
-/// (not-yet-implemented) record store.
-///
-/// Used by the FK-referenced-delete test to create a child row. `status`,
-/// `metadata`, and `ingested_at` take their column defaults. The `id` and
-/// `idempotency_key` are minted from a process-wide counter so repeated calls
-/// do not collide on the primary key or the dedup unique constraint.
-///
-/// # Errors
-///
-/// Returns any `sqlx` error from the `INSERT`.
-pub async fn insert_raw_usage_record(
-    pool: &PgPool,
-    gts_id: &str,
-    tenant_id: Uuid,
-) -> anyhow::Result<()> {
-    let seq = RAW_RECORD_SEQ.fetch_add(1, Ordering::Relaxed);
-    let id = Uuid::from_u128(u128::from(seq));
-    let idempotency_key = format!("raw-idem-{seq}");
-
-    sqlx::query(
-        "INSERT INTO usage_records \
-         (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, idempotency_key) \
-         VALUES ($1, $2, $3, $4, now(), $5, $6, $7)",
-    )
-    .bind(id)
-    .bind(tenant_id)
-    .bind(gts_id)
-    .bind(Decimal::ONE)
-    .bind("res-1")
-    .bind("compute.vm")
-    .bind(&idempotency_key)
-    .execute(pool)
-    .await?;
-
-    Ok(())
 }

@@ -4678,8 +4678,9 @@ cursor fingerprint), and it reaches the `Latest` fold at no site — `contract/c
 dispatches `query_aggregated_usage_records` at exactly two places
 (`invalidation_excluded_from_fold.rs:292`,
 `scope_is_a_filter_on_every_read_path.rs:437`) and both pass
-`AggregationFold::Sum` with an empty `group_by`, so neither the other three
-folds nor any grouping dimension is touched. Task 15
+`AggregationFold::Sum` with an empty `group_by`. `AggregationFold` has five
+variants, so `Count`, `Max`, `Min` and `Latest` are all untouched, as is
+every grouping dimension. Task 15
 owns both gaps.
 
 ---
@@ -4827,7 +4828,9 @@ Task 14's `tests/contract_conformance_pg.rs` does `mod common;`, so it could
 not compile until that file did — and each file in `tests/` is its own crate,
 so a broken `records_ingest_integration_pg.rs` does not block it. Task 14
 therefore repaired `common/mod.rs` alone, to the minimum, and the file is now
-**256 lines** (not the 346 in the list above, which was already stale at 318):
+**219 lines** (not the 346 in the list above, which was already stale at 318).
+The per-file error counts below are unchanged by the second deletion, because
+the helper it removed had no callers:
 
 - **Changed.** Dropped the `usage_collector_sdk::{IdempotencyKey, ResourceRef,
   SubjectRef, UsageRecord, UsageTypeGtsId}` import and `time::OffsetDateTime`;
@@ -4847,10 +4850,51 @@ therefore repaired `common/mod.rs` alone, to the minimum, and the file is now
   that belong to the suites in Steps 2-6, not to a file repaired so a
   different test could link. **A ported-but-never-run fixture is the worse
   inheritance**: it compiles, so it reads as validated.
-- **Left untouched, and stale.** `insert_raw_usage_record` compiles and will
-  fail at runtime: its `INSERT` names `created_at` and omits the period
-  columns, and its doc calls it the FK-referenced-delete test's child row
-  when Task 3's schema has no foreign key.
+- **Also deleted: `insert_raw_usage_record` and `RAW_RECORD_SEQ`** (37 more
+  lines). **The fact that decides it is that it has no callers** — `grep -rn
+  "insert_raw_usage_record" tests/` finds only its own definition, across all
+  six files including the five that do not compile. It survived on
+  `#![allow(dead_code)]` alone. Every clause of it was false: the `INSERT`
+  named `gts_id` (the column is `gts_type_id`) and `created_at` (no such
+  column) and omitted `window_start`, `window_end`, `origin` and
+  `acceptance_sequence`, all `NOT NULL` with no default; its doc called
+  `PgRecordStore` "not-yet-implemented" 40 lines below where the file
+  constructs one, cited a FK-referenced-delete test when `grep REFERENCES
+  migrations/0001_init.sql` returns nothing, and said `status` takes its
+  column default when `status` is not a column. **Nothing here for Task 15 to
+  repair; it is already gone.**
+
+  The `dead_code` allowance stays, because it is separately earned:
+  `mod common;` compiles a private copy into each binary, so
+  `bring_up_real_retention` (called from `cleanup_integration_pg.rs:106`) and
+  `bring_up_with` (`:69`) really are dead in the contract binary. The header
+  comment now says that the allowance covers exactly that, and that it hides
+  a caller-less helper just as well — with this deletion as the worked
+  example.
+
+**Three things that must survive this task's rewrite, and one that saves a
+search:**
+
+1. **`start_backend`, `bring_up` and `NO_DROP_RETENTION_SECS` are the
+   acceptance test's harness — do not fold them into whatever the five
+   rewritten suites use.** After this task those five drive `PgRecordStore`
+   directly while `contract_conformance_pg.rs` drives it through
+   `StorageAdapter`, and that split is deliberate rather than duplication:
+   the port's contract obligation is at the SPI, the mechanics the five
+   suites assert are at the store. Unifying them either drops the SPI from
+   the acceptance path or drags the adapter into tests that mean to reach
+   past it. **If `start_backend` stops compiling, Task 14's acceptance
+   criterion has regressed** — re-run it before Step 7's unfiltered count.
+2. **The retention window is not cosmetic.** `bring_up` must keep passing
+   `NO_DROP_RETENTION_SECS`, for the reason its doc gives: the contract
+   fixtures sit at `FIXTURE_EPOCH` + 0/30/60/90/120/150 days, six distinct
+   7-day chunks, all past a 365-day cutoff.
+3. **The fixture-id decision has an ADR.** The derived id is a UUIDv5 over
+   the 5-tuple under
+   `cpt-cf-usage-collector-adr-record-identity-derivation`, which
+   `migrations/0001_init.sql:15-17` cites by name; Step 3's `id_uniqueness`
+   assertions are that ADR's, so read it rather than re-deriving the rule
+   from the schema.
 
 **One item Task 1 handed forward, and one that has already closed itself:**
 
@@ -5284,6 +5328,37 @@ to fix here.
    about `usage-query.md`: one current paragraph inside a wholesale-stale
    document is harder to notice than a uniformly stale one. **Register it; do
    not fix it line by line.**
+
+4. **Task 14's: the plugin's `README.md` is materially wrong and unowned —
+   and unlike entry 3, it is short enough to fix rather than register.**
+   The plan named Task 1 as README's only owner; Task 1 removed the catalog
+   sentence and left the rest. 52 lines, three of them wrong:
+
+   - `:32` calls `UNIQUE (tenant_id, gts_id, idempotency_key, created_at)`
+     the dedup authority and builds a whole paragraph on the "4-tuple" over
+     `created_at`, including a **Note** declaring an "intentional divergence
+     from the SPI's 3-tuple contract". The shipped constraint is
+     `usage_records_dedup_uniq UNIQUE (tenant_id, gts_type_id,
+     idempotency_key, window_start, window_end)`
+     (`migrations/0001_init.sql:73-74`) — the gear's DESIGN §3.7 5-tuple
+     verbatim, which is the opposite of a divergence. **This is the largest
+     surviving instance of the defect class in the crate**: a claim that
+     outlived its code and now describes a rule the schema inverted.
+   - `:34` documents a **Deactivation** bullet — `deactivate` flipping a
+     target and its depth-1 `corrects_id` compensations to `inactive`. Task 2
+     deleted that surface and `corrects_id` no longer exists in the SDK.
+   - `:38` says SPI "conformance is enforced at compile time" because the
+     adapter satisfies the trait. That is a claim about the *signature*.
+     Behavioural conformance is what `tests/contract_conformance_pg.rs` now
+     runs, and the README does not mention it — nor that a green run covers
+     six checks and not DESIGN's seven, which is exactly the reading the
+     suite's own module header exists to prevent.
+
+   Fix all three and say what the acceptance criterion actually is. The
+   contrast with entry 3 is the point: `docs/DESIGN.md` is 710 lines of
+   uniform staleness and gets registered, while a 52-line README with three
+   wrong lines gets corrected — a mostly-right document is where a wrong line
+   does its damage.
 
 - [ ] **Step 5: Update `DIVERGENCES.md`**
 
