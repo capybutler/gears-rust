@@ -10,7 +10,7 @@
 // not SecureConn/AccessScope.
 #![allow(unknown_lints, de0706_no_direct_sqlx)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,6 +73,93 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, window_end, \
      resource_id, resource_type, subject_id, subject_type, idempotency_key, invalidates, \
      reason_code, origin, acceptance_sequence, metadata, ingested_at";
+
+/// The columns every insert writes: [`RECORD_COLUMNS`] minus `ingested_at`,
+/// which the table defaults to `now()`. `entry_type` is generated and appears
+/// in neither.
+///
+/// **One spelling, used four times** — the single-row insert's column list, the
+/// batch insert's column list, its `SELECT` list and its `UNNEST` alias list.
+/// Written out four times instead, a name transposed in any one of them binds a
+/// `text[]` to the wrong `text` column, which Postgres accepts without
+/// complaint and which no row-level test can see. `metadata` is deliberately
+/// **last**, because the batch `SELECT` appends `::jsonb` to this string rather
+/// than restating it (see [`batch_insert_sql`]); a test pins that.
+const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, window_end, \
+     resource_id, resource_type, subject_id, subject_type, idempotency_key, invalidates, \
+     reason_code, origin, acceptance_sequence, metadata";
+
+/// Postgres array types for [`INSERT_COLUMNS`], **in the same order**, as the
+/// batch insert's `UNNEST` needs them. The length is what fixes the placeholder
+/// count for both inserts.
+const INSERT_COLUMN_ARRAY_TYPES: [&str; 16] = [
+    "uuid",
+    "uuid",
+    "text",
+    "numeric",
+    "timestamptz",
+    "timestamptz",
+    "text",
+    "text",
+    "text",
+    "text",
+    "text",
+    "uuid",
+    "text",
+    "text",
+    "bigint",
+    "text",
+];
+
+/// The dedup 5-tuple, as an `ON CONFLICT` arbiter. Both insert paths spend
+/// their one arbiter here, which is why `usage_records_one_invalidation_uniq`
+/// surfaces as a raw `23505` (see [`PgRecordStore::map_insert_error`]).
+const DEDUP_CONFLICT_TARGET: &str =
+    "tenant_id, gts_type_id, idempotency_key, window_start, window_end";
+
+/// `$1, $2, …, $n`.
+fn placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The single-row `INSERT … ON CONFLICT (5-tuple) DO NOTHING RETURNING`.
+///
+/// Built rather than inlined so a test can read the column list, the
+/// placeholder count and the conflict target back out of it.
+fn single_insert_sql() -> String {
+    format!(
+        "INSERT INTO usage_records ({INSERT_COLUMNS}) VALUES ({}) \
+         ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
+         RETURNING {RECORD_COLUMNS}",
+        placeholders(INSERT_COLUMN_ARRAY_TYPES.len()),
+    )
+}
+
+/// The multi-row `INSERT … SELECT FROM UNNEST(…) ON CONFLICT (5-tuple) DO
+/// NOTHING RETURNING`.
+///
+/// The column list, the `SELECT` list and the `UNNEST` alias list are all
+/// [`INSERT_COLUMNS`], so they cannot be transposed relative to one another —
+/// the `SELECT` differs only by the trailing `::jsonb`, which works because
+/// `metadata` is the last column. `UNNEST`'s parameters are
+/// [`INSERT_COLUMN_ARRAY_TYPES`] in the same order, so `$n` is column `n`.
+fn batch_insert_sql() -> String {
+    let unnest = INSERT_COLUMN_ARRAY_TYPES
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| format!("${}::{ty}[]", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO usage_records ({INSERT_COLUMNS}) \
+         SELECT {INSERT_COLUMNS}::jsonb FROM UNNEST({unnest}) AS t({INSERT_COLUMNS}) \
+         ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
+         RETURNING {RECORD_COLUMNS}"
+    )
+}
 
 /// `sqlx`-backed implementation of [`RecordStore`] over the `usage_records`
 /// hypertable.
@@ -272,16 +359,7 @@ impl PgRecordStore {
         //    5-tuple already exists. `ingested_at` is left to its DEFAULT and
         //    `entry_type` is generated, which is why sixteen of the seventeen
         //    [`RECORD_COLUMNS`] are bound here.
-        let insert_sql = format!(
-            "INSERT INTO usage_records \
-             (id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
-              resource_type, subject_id, subject_type, idempotency_key, invalidates, \
-              reason_code, origin, acceptance_sequence, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
-             ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end) \
-             DO NOTHING \
-             RETURNING {RECORD_COLUMNS}"
-        );
+        let insert_sql = single_insert_sql();
         let subject_id = record
             .subject_ref
             .as_ref()
@@ -426,26 +504,7 @@ impl PgRecordStore {
         }
         let cols = InsertColumns::build(reps, sequences);
 
-        let sql = format!(
-            "INSERT INTO usage_records \
-             (id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
-              resource_type, subject_id, subject_type, idempotency_key, invalidates, \
-              reason_code, origin, acceptance_sequence, metadata) \
-             SELECT id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
-              resource_type, subject_id, subject_type, idempotency_key, invalidates, \
-              reason_code, origin, acceptance_sequence, metadata::jsonb \
-             FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::numeric[], $5::timestamptz[], \
-              $6::timestamptz[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], \
-              $12::uuid[], $13::text[], $14::text[], $15::bigint[], $16::text[]) \
-              AS t(id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
-                   resource_type, subject_id, subject_type, idempotency_key, invalidates, \
-                   reason_code, origin, acceptance_sequence, metadata) \
-             ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end) \
-             DO NOTHING \
-             RETURNING {RECORD_COLUMNS}"
-        );
-
-        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
+        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(batch_insert_sql()))
             .bind(&cols.ids)
             .bind(&cols.tenants)
             .bind(&cols.gts_type_ids)
@@ -543,11 +602,16 @@ impl PgRecordStore {
 
     /// Resolve every input row in original order against its authoritative
     /// record, recording the per-row counters exactly as the single path does.
+    ///
+    /// `inserted` is the set of slots this batch won — it *is* the answer to
+    /// "did we win this key", so there is no separate `won` set to disagree
+    /// with it. An earlier shape passed both, which made two states
+    /// representable that the code cannot produce (a won key with no inserted
+    /// row) and so two `Internal` arms that only a hand-built map could reach.
     fn resolve_batch(
         &self,
         records: &[UsageRecord],
         plan: &BatchPlan<'_>,
-        won: &HashSet<DedupKey>,
         inserted: &HashMap<DedupKey, UsageRecordRow>,
         conflict: &HashMap<DedupKey, ConflictRead>,
     ) -> Vec<Result<UsageRecord, UsageCollectorPluginError>> {
@@ -563,31 +627,20 @@ impl PgRecordStore {
                 continue;
             }
             let key = dedup_key(record);
-            let is_winner = won.contains(&key) && plan.first_index.get(&key) == Some(&i);
-            let outcome = if is_winner {
-                match inserted.get(&key) {
-                    Some(row) => {
-                        if record.invalidation.is_some() {
-                            self.metrics.inc_compensation();
-                        }
-                        record_row_to_model(row.clone())
+            let outcome = match inserted.get(&key) {
+                // We won this slot and this input row is its first occurrence:
+                // the fresh insert.
+                Some(row) if plan.first_index.get(&key) == Some(&i) => {
+                    if record.invalidation.is_some() {
+                        self.metrics.inc_compensation();
                     }
-                    None => Err(dedup_invariant_break(
-                        record,
-                        "won dedup slot but no inserted record was returned \
-                         (concurrent-insert invariant break)",
-                    )),
+                    record_row_to_model(row.clone())
                 }
-            } else if won.contains(&key) {
-                match inserted.get(&key) {
-                    Some(row) => self.resolve_dedup_hit(row.clone(), record),
-                    None => Err(dedup_invariant_break(
-                        record,
-                        "intra-batch duplicate of a won key with no inserted record",
-                    )),
-                }
-            } else {
-                match conflict.get(&key) {
+                // We won the slot, but an earlier input row is its winner — so
+                // this is an in-batch duplicate, resolved against the row we
+                // just wrote exactly as the single path resolves a same-key hit.
+                Some(row) => self.resolve_dedup_hit(row.clone(), record),
+                None => match conflict.get(&key) {
                     Some(ConflictRead::Stored(row)) => {
                         // Clone the inner row directly; `*row.clone()` would
                         // round-trip through a throwaway `Box` allocation. The
@@ -609,7 +662,7 @@ impl PgRecordStore {
                         record,
                         "conflicting record not found during dedup resolution; retry",
                     )),
-                }
+                },
             };
             results.push(outcome);
         }
@@ -619,8 +672,8 @@ impl PgRecordStore {
     /// Orchestrate one batch inside **one transaction**: claim an
     /// acceptance-sequence block per scope → insert (dedup on the 5-tuple
     /// UNIQUE) → read conflicts for the not-won keys → commit → resolve per row
-    /// in input order. `won` is the set of keys the insert actually claimed
-    /// (its `RETURNING` rows).
+    /// in input order. The insert's `RETURNING` rows are themselves the set of
+    /// keys it claimed, so nothing else records that.
     ///
     /// The transaction is not decoration. `acceptance_sequence` is claimed here
     /// and inserted here, so the two must commit or roll back together; and the
@@ -664,12 +717,12 @@ impl PgRecordStore {
                 return Err(self.map_insert_error(&mut conn, &e, &slots).await);
             }
         };
-        let won: HashSet<DedupKey> = inserted.keys().cloned().collect();
+        // `inserted` is the won set; there is no second copy of it to drift.
         let not_won: Vec<&UsageRecord> = plan
             .reps
             .iter()
             .copied()
-            .filter(|r| !won.contains(&dedup_key(r)))
+            .filter(|r| !inserted.contains_key(&dedup_key(r)))
             .collect();
         let conflict = match self.read_conflict_records(&mut tx, &not_won).await {
             Ok(conflict) => conflict,
@@ -684,7 +737,7 @@ impl PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        Ok(self.resolve_batch(records, &plan, &won, &inserted, &conflict))
+        Ok(self.resolve_batch(records, &plan, &inserted, &conflict))
     }
 }
 
@@ -817,12 +870,24 @@ async fn rollback(tx: sqlx::Transaction<'_, Postgres>) {
 /// sequence expecting it.
 ///
 /// Runs inside the caller's transaction so the claim and the insert commit or
-/// roll back together. The row lock this takes serializes concurrent ingest for
-/// one scope, which is what strict per-scope monotonicity costs; scopes do not
-/// contend with each other. That lock is also why `55P03 lock_not_available`
-/// belongs in the transient set ([`crate::infra::storage::error`]): ingest now
-/// waits on a per-scope row on every write, so timing out on a hot scope is an
-/// ordinary contention outcome rather than a defect.
+/// roll back together, and the counter row's lock is therefore held to commit.
+///
+/// **That lock is not the price of monotonicity — it is the price of ordered
+/// visibility, and the distinction matters.** A plain Postgres `SEQUENCE` would
+/// give strict monotonicity lock-free, with gaps this doc already declares
+/// permitted. What it would *not* give is that claim order equals commit order:
+/// the next claimer blocks on this row until the holder commits, so within a
+/// scope a lower `acceptance_sequence` is always visible before a higher one.
+/// The Feed Gateway serves pages "ordered by `acceptance_sequence` within each
+/// `(tenant, gts_type)` scope" (`cpt-cf-usage-collector-fr-billing-usage-feed`,
+/// the gear's `docs/DESIGN.md` §1.2 driver table), so a consumer that has read
+/// past N must never afterwards see an N-1 commit. Swap this for a sequence and
+/// the feed breaks silently. Scopes do not contend with each other.
+///
+/// That lock is also why `55P03 lock_not_available` belongs in the transient set
+/// ([`crate::infra::storage::error`]): ingest now waits on a per-scope row on
+/// every write, so timing out on a hot scope is an ordinary contention outcome
+/// rather than a defect.
 async fn claim_acceptance_sequence(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     tenant_id: Uuid,
@@ -933,6 +998,11 @@ fn invalidation_index_slots(records: &[&UsageRecord]) -> Vec<(Uuid, Uuid, Offset
 /// Read back the accepted invalidation occupying one of `slots`, as
 /// `(withdrawn target, withdrawing entry id)`.
 ///
+/// A batch can carry several already-invalidated targets and every match is a
+/// genuine conflict, so this reports **one of possibly several**. The order is
+/// pinned to the stored entry's `id` so a given failure names the same target
+/// on every run rather than whichever row the planner reached first.
+///
 /// Diagnostic only — it runs after a write was already rejected, never before
 /// one; see [`PgRecordStore::map_insert_error`].
 ///
@@ -962,6 +1032,7 @@ async fn find_existing_invalidation(
            ON r.tenant_id = t.tenant_id \
           AND r.invalidates = t.target \
           AND r.window_end = t.window_end \
+         ORDER BY r.id \
          LIMIT 1",
     )
     .bind(&tenants)
@@ -1358,12 +1429,12 @@ enum ConflictRead {
 /// through `timestamptz` cannot compare unequal to the caller's on precision or
 /// offset alone.
 ///
-/// Comparing `id` here is explicitly sanctioned by the SPI contract:
-/// plugin-spi.md §"Plugin-specific outputs" (Create single record output) and
-/// domain-model.md §2.5 `IdempotencyKey` note that a plugin MAY defensively
-/// verify the deterministic `id` against the derived value — surfacing a
-/// corrupted stored row as `IdempotencyConflict` rather than a silent absorb —
-/// without changing the outcome for well-formed data.
+/// No external sanction is cited for comparing `id`, because there is none to
+/// cite: the SPI here is rustdoc ([`usage_collector_sdk::UsageCollectorPluginV1`]),
+/// and it says nothing either way about a plugin verifying the derived
+/// identity. The argument above stands on its own — the comparison cannot
+/// change the outcome for well-formed data, and it turns one shape of stored
+/// corruption into a loud `IdempotencyConflict` instead of a silent absorb.
 ///
 /// # Errors
 ///
@@ -1396,6 +1467,24 @@ fn canonical_equal(
 
 #[async_trait]
 impl RecordStore for PgRecordStore {
+    /// **This path deliberately does not retry, and the asymmetry with
+    /// [`Self::create_batch`] is a decision rather than an omission.**
+    ///
+    /// Task 9 made the wait structural — every single-row write now takes the
+    /// per-scope `usage_acceptance_sequence` row lock before it inserts — so a
+    /// `55P03` on a hot scope is an ordinary outcome here, not a rarity. It is
+    /// still returned unretried, because a `Transient` lifts to
+    /// `ServiceUnavailable` at the dispatch boundary and reaches the caller as
+    /// a 503 with a `Retry-After` slot: the client already holds the one record
+    /// and re-submitting it is cheap and exactly idempotent. Retrying in-process
+    /// would instead hold a pooled connection across the backoff — moving the
+    /// wait from the client, which has nothing else to do, onto the pool, which
+    /// is the resource the contention is already competing for.
+    ///
+    /// A batch is the opposite trade on both counts: re-submitting is expensive
+    /// for the caller, and its value is a vector of per-row outcomes that cannot
+    /// be partially returned, so absorbing a transient in-process is worth a
+    /// connection held for a few jittered milliseconds.
     // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-dedup:p2
     async fn create(&self, record: UsageRecord) -> Result<UsageRecord, UsageCollectorPluginError> {
         // Time the whole single-row call; the per-row counters live in
@@ -1451,7 +1540,9 @@ impl RecordStore for PgRecordStore {
             |attempt, err| {
                 // Make the retry observable: a distinct warn + counter so a
                 // self-healed deadlock victim can be told apart from a returned
-                // transient error (which only moves the backend-error counter).
+                // transient error, which moves this counter not at all (most
+                // move the backend-error counter instead; `map_insert_error`'s
+                // could-not-name-the-invalidation arm moves none).
                 tracing::warn!(
                     attempt,
                     max_attempts = MAX_BATCH_ATTEMPTS,

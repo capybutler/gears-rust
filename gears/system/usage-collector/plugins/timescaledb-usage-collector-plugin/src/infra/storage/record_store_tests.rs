@@ -2,7 +2,7 @@
 // (clippy.toml allows unwrap/expect in tests, not panic).
 #![allow(clippy::panic)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -13,9 +13,11 @@ use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use usage_collector_sdk::{UsageCollectorPluginError, UsageTypeGtsId};
 
 use super::{
-    ConflictRead, DedupKey, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, batch_retry_backoff,
+    ConflictRead, DedupKey, INSERT_COLUMNS, INSERT_COLUMN_ARRAY_TYPES, InsertColumns,
+    MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, batch_insert_sql, batch_retry_backoff,
     batch_retry_backoff_base, canonical_equal, dedup_key, invalidation_index_slots,
-    is_retryable_batch_error, plan_batch, row_dedup_key, scope_runs, sequence_block, with_retry,
+    is_retryable_batch_error, plan_batch, row_dedup_key, scope_runs, sequence_block,
+    single_insert_sql, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -349,6 +351,179 @@ fn canonical_equal_compares_both_halves_of_the_invalidation_pair() {
     );
 }
 
+// --- The insert SQL's column sequences ---
+//
+// `InsertColumns::build` is tested above; these test the layer under it. The
+// hazard is a name transposed between the column list, the `SELECT` list and
+// the `UNNEST` alias: two `text[]` columns exchanged that way bind the wrong
+// values, Postgres accepts it, and every row-level test still passes. Hoisting
+// all three onto one `INSERT_COLUMNS` makes the transposition unrepresentable;
+// these assertions are what keep it that way.
+//
+// The `.bind()` call sequence is one layer further down and still uncovered
+// here — it needs a live backend, and it is Task 15's.
+
+/// The comma-separated names of a SQL column list.
+fn names(list: &str) -> Vec<&str> {
+    list.split(',').map(str::trim).collect()
+}
+
+/// Every inserted column paired with the array element type the batch insert
+/// must `UNNEST` it as, **transcribed by hand from `migrations/0001_init.sql`**
+/// rather than derived from the code under test.
+///
+/// This literal is the whole point of the pairing test below. Checking the
+/// generated SQL against `INSERT_COLUMN_ARRAY_TYPES` proves only that the SQL
+/// was built from that array — transpose two entries and both sides move
+/// together, which is exactly how the first version of this test let such a
+/// mutation survive. A transposition has to be measured against something that
+/// does not move, and the migration is that thing.
+///
+/// One deliberate divergence from the DDL: `metadata` is `jsonb` in the table
+/// but travels as `text[]` and is cast `::jsonb` per row, because `jsonb[]`
+/// array encoding is the thing being sidestepped.
+const DDL_COLUMN_ARRAY_TYPES: [(&str, &str); 16] = [
+    ("id", "uuid"),
+    ("tenant_id", "uuid"),
+    ("gts_type_id", "text"),
+    ("value", "numeric"),
+    ("window_start", "timestamptz"),
+    ("window_end", "timestamptz"),
+    ("resource_id", "text"),
+    ("resource_type", "text"),
+    ("subject_id", "text"),
+    ("subject_type", "text"),
+    ("idempotency_key", "text"),
+    ("invalidates", "uuid"),
+    ("reason_code", "text"),
+    ("origin", "text"),
+    ("acceptance_sequence", "bigint"),
+    ("metadata", "text"),
+];
+
+#[test]
+fn each_inserted_column_is_unnested_as_the_type_the_migration_declares() {
+    let want_names: Vec<&str> = DDL_COLUMN_ARRAY_TYPES.iter().map(|(n, _)| *n).collect();
+    let want_types: Vec<&str> = DDL_COLUMN_ARRAY_TYPES.iter().map(|(_, t)| *t).collect();
+
+    assert_eq!(
+        names(INSERT_COLUMNS),
+        want_names,
+        "the inserted column sequence must be the migration's, in its order"
+    );
+    assert_eq!(
+        INSERT_COLUMN_ARRAY_TYPES.to_vec(),
+        want_types,
+        "each column's array type must be the one the migration declares for it \
+         (metadata excepted: jsonb in the table, carried as text and cast per row)"
+    );
+}
+
+#[test]
+fn record_columns_is_the_insert_columns_plus_the_defaulted_ingested_at() {
+    // The read list and the write list are one sequence with one difference:
+    // `ingested_at` defaults to `now()` and is never written. If they drift,
+    // `RETURNING {RECORD_COLUMNS}` decodes a row the insert did not write.
+    assert_eq!(
+        RECORD_COLUMNS,
+        format!("{INSERT_COLUMNS}, ingested_at"),
+        "the only column the insert omits is the one the table defaults"
+    );
+    assert_eq!(
+        names(INSERT_COLUMNS).len(),
+        INSERT_COLUMN_ARRAY_TYPES.len(),
+        "one array type per inserted column, in the same order"
+    );
+    assert!(
+        !names(RECORD_COLUMNS).contains(&"entry_type"),
+        "entry_type is a generated column; nothing reads or writes it"
+    );
+}
+
+#[test]
+fn the_single_insert_binds_one_placeholder_per_inserted_column() {
+    let sql = single_insert_sql();
+    let cols = sql
+        .split_once("usage_records (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .expect("the insert names its column list")
+        .0;
+    assert_eq!(names(cols), names(INSERT_COLUMNS));
+
+    let values = sql
+        .split_once("VALUES (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .expect("the insert has a VALUES list")
+        .0;
+    let want: Vec<String> = (1..=names(INSERT_COLUMNS).len())
+        .map(|i| format!("${i}"))
+        .collect();
+    assert_eq!(
+        names(values),
+        want,
+        "$n must be column n, numbered from 1 with no gap"
+    );
+    assert!(
+        sql.contains(
+            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end)"
+        ),
+        "the arbiter is the dedup 5-tuple: {sql}"
+    );
+}
+
+#[test]
+fn the_batch_insert_names_one_column_sequence_in_all_three_places() {
+    let sql = batch_insert_sql();
+    let expected = names(INSERT_COLUMNS);
+
+    let cols = sql
+        .split_once("usage_records (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .expect("the insert names its column list")
+        .0;
+    assert_eq!(names(cols), expected, "INSERT column list");
+
+    let select = sql
+        .split_once("SELECT ")
+        .and_then(|(_, rest)| rest.split_once(" FROM UNNEST("))
+        .expect("the insert has a SELECT list")
+        .0;
+    assert_eq!(
+        select,
+        format!("{INSERT_COLUMNS}::jsonb"),
+        "the SELECT list is the column list with the trailing metadata cast, \
+         which only works while `metadata` is last"
+    );
+
+    let alias = sql
+        .split_once("AS t(")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .expect("the UNNEST has an alias list")
+        .0;
+    assert_eq!(names(alias), expected, "UNNEST alias list");
+
+    let unnest = sql
+        .split_once(" FROM UNNEST(")
+        .and_then(|(_, rest)| rest.split_once(") AS t("))
+        .expect("the insert has an UNNEST parameter list")
+        .0;
+    let params = names(unnest);
+    assert_eq!(
+        params.len(),
+        expected.len(),
+        "one UNNEST array per column: {unnest}"
+    );
+    for (i, (param, ty)) in params.iter().zip(INSERT_COLUMN_ARRAY_TYPES).enumerate() {
+        assert_eq!(
+            *param,
+            format!("${}::{ty}[]", i + 1),
+            "UNNEST parameter {} must be column {}'s array type",
+            i + 1,
+            i + 1
+        );
+    }
+}
+
 // --- Batch planning ---
 
 #[test]
@@ -488,10 +663,13 @@ fn invalidation_index_slots_names_only_the_withdrawals() {
 
 #[test]
 fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
-    // Two records whose leaves are all distinguishable from one another, so a
-    // swapped push pair (`resource_ids`/`resource_types`,
-    // `subject_ids`/`subject_types`, the two bounds, the invalidation pair)
-    // cannot land on an equal value and pass.
+    // Two records whose leaves are all distinguishable from one another, so no
+    // swap of a same-typed adjacent pair can land on an equal value and pass.
+    // Three pairs are actually swappable without a type error —
+    // `resource_ids`/`resource_types`, `subject_ids`/`subject_types`, and the
+    // two bounds — and each is given differing values here. The invalidation
+    // pair is not among them: `Vec<Option<Uuid>>` and `Vec<Option<String>>`
+    // do not exchange.
     let tenant = uuid::Uuid::from_u128(0xD1);
     let target = uuid::Uuid::from_u128(0xD100);
     let mut plain = unit_record(tenant, "idem-a", 0xD101);
@@ -611,79 +789,18 @@ fn a_claimed_block_expands_to_the_values_below_its_returned_last() {
     );
 }
 
-// --- `resolve_batch` invariant-break / defensive arms (DB-free) ---
+// --- `resolve_batch` defensive arm (DB-free) ---
 //
-// `resolve_batch` is a pure function of its (`won`, `inserted`, `conflict`)
-// maps, so these arms are exercised over a lazy pool that is never touched. The
-// branches below fire only on a broken DB invariant (a won slot with no
-// inserted record) or a cleanup race (the dedup pointer vanished between claim
-// and read) — unreachable from the happy-path integration tests, hence easy to
-// break silently. Each is pinned here against a hand-built map.
-
-#[tokio::test]
-async fn resolve_batch_winner_with_no_inserted_record_is_internal() {
-    let store = lazy_store();
-    let tenant = uuid::Uuid::from_u128(0xB1);
-    let records = vec![unit_record(tenant, "win", 0x10)];
-    let plan = plan_batch(&records);
-    let key = dedup_key(&records[0]);
-
-    // We claimed (won) the slot, but the multi-row insert returned no row for it
-    // — a concurrent-insert invariant break, not a normal outcome.
-    let won = HashSet::from([key]);
-    let inserted: HashMap<DedupKey, UsageRecordRow> = HashMap::new();
-    let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
-
-    let results = store.resolve_batch(&records, &plan, &won, &inserted, &conflict);
-
-    assert_eq!(results.len(), 1, "one result per input row");
-    match results.into_iter().next().expect("one result") {
-        Err(UsageCollectorPluginError::Internal(msg)) => assert!(
-            msg.contains("no inserted record was returned"),
-            "unexpected message: {msg}"
-        ),
-        other => panic!("a won slot with no inserted record must be Internal, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn resolve_batch_intra_batch_dup_of_won_key_with_no_record_is_internal() {
-    let store = lazy_store();
-    let tenant = uuid::Uuid::from_u128(0xB2);
-    // Two rows share one dedup key: idx 0 is the winner, idx 1 the in-batch dup.
-    let records = vec![
-        unit_record(tenant, "dup", 0x20),
-        unit_record(tenant, "dup", 0x21),
-    ];
-    let plan = plan_batch(&records);
-    let key = dedup_key(&records[0]);
-
-    // Won the slot, but no inserted record came back for it.
-    let won = HashSet::from([key]);
-    let inserted: HashMap<DedupKey, UsageRecordRow> = HashMap::new();
-    let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
-
-    let results = store.resolve_batch(&records, &plan, &won, &inserted, &conflict);
-
-    assert_eq!(results.len(), 2, "one result per input row");
-    // idx 0 hits the winner-missing Internal arm...
-    assert!(
-        matches!(results[0], Err(UsageCollectorPluginError::Internal(_))),
-        "winner with no inserted record is Internal: {:?}",
-        results[0]
-    );
-    // ...idx 1 is the in-batch duplicate of that won key — the distinct second
-    // Internal arm, identified by its message.
-    match &results[1] {
-        Err(UsageCollectorPluginError::Internal(msg)) => assert!(
-            msg.contains("intra-batch duplicate"),
-            "unexpected message: {msg}"
-        ),
-        other => {
-            panic!("intra-batch dup of a won key with no record must be Internal, got {other:?}")
-        }
-    }
-}
+// One arm remains that no happy path reaches: a not-won key absent from the
+// conflict map. It is pinned here against a hand-built map.
+//
+// Two further `Internal` arms used to live here — "won the slot but no
+// inserted record" and "intra-batch duplicate of a won key with no inserted
+// record". Both were artefacts of passing `resolve_batch` a `won` set derived
+// from `inserted`, which made a state representable that the code could not
+// produce; their tests could only reach them through maps the code cannot
+// build. `resolve_batch` now matches on `inserted` directly, so neither state
+// nor arm nor test exists.
 
 #[tokio::test]
 async fn resolve_batch_missing_conflict_entry_falls_through_to_transient() {
@@ -695,11 +812,10 @@ async fn resolve_batch_missing_conflict_entry_falls_through_to_transient() {
     // Not won, and the conflict map has no entry for the key at all. The
     // defensive `None` fallthrough must still be a retryable Transient — never a
     // silent success and never a panic.
-    let won: HashSet<DedupKey> = HashSet::new();
     let inserted: HashMap<DedupKey, UsageRecordRow> = HashMap::new();
     let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
 
-    let results = store.resolve_batch(&records, &plan, &won, &inserted, &conflict);
+    let results = store.resolve_batch(&records, &plan, &inserted, &conflict);
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -707,6 +823,52 @@ async fn resolve_batch_missing_conflict_entry_falls_through_to_transient() {
         "a key absent from the conflict map must fall through to Transient: {:?}",
         results[0]
     );
+}
+
+#[tokio::test]
+async fn resolve_batch_conflicts_an_in_batch_duplicate_whose_canonical_fields_differ() {
+    // Two input rows share a dedup key but disagree on `value`. Only the first
+    // can win the slot; the second must resolve against what was written, which
+    // means `canonical_equal` and an `IdempotencyConflict` — not a second copy
+    // of the winner's row handed back as though it were this row's insert.
+    //
+    // This is what the `plan.first_index` guard buys. Without it every input row
+    // holding a won key looks like a fresh insert, and a same-key submission
+    // carrying different data absorbs silently.
+    let store = lazy_store();
+    let tenant = uuid::Uuid::from_u128(0xB6);
+    let mut second = unit_record(tenant, "k", 0xB602);
+    second.value = rust_decimal::Decimal::new(999, 0);
+    let records = vec![unit_record(tenant, "k", 0xB601), second];
+    assert_eq!(
+        dedup_key(&records[0]),
+        dedup_key(&records[1]),
+        "test setup: the two rows must share a dedup key"
+    );
+
+    let plan = plan_batch(&records);
+    let winner_row = row_matching(&records[0], serde_json::Value::Object(serde_json::Map::new()));
+    let inserted: HashMap<DedupKey, UsageRecordRow> =
+        HashMap::from([(dedup_key(&records[0]), winner_row)]);
+    let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
+
+    let results = store.resolve_batch(&records, &plan, &inserted, &conflict);
+
+    assert_eq!(results.len(), 2, "one result per input row, in input order");
+    assert!(
+        results[0].is_ok(),
+        "the first occurrence wins its slot: {:?}",
+        results[0]
+    );
+    match &results[1] {
+        Err(UsageCollectorPluginError::IdempotencyConflict { existing_id, .. }) => {
+            assert_eq!(
+                *existing_id, records[0].id,
+                "the conflict names the row already holding the slot"
+            );
+        }
+        other => panic!("an in-batch duplicate carrying different data must conflict, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -721,13 +883,12 @@ async fn resolve_batch_reports_a_pre_rejected_withdrawal_as_already_invalidated(
     let plan = plan_batch(&records);
 
     // Only the first withdrawal reaches the insert, and it wins its slot.
-    let winner_key = dedup_key(&records[0]);
     let winner_row = row_matching(&records[0], serde_json::Value::Object(serde_json::Map::new()));
-    let won = HashSet::from([winner_key.clone()]);
-    let inserted: HashMap<DedupKey, UsageRecordRow> = HashMap::from([(winner_key, winner_row)]);
+    let inserted: HashMap<DedupKey, UsageRecordRow> =
+        HashMap::from([(dedup_key(&records[0]), winner_row)]);
     let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
 
-    let results = store.resolve_batch(&records, &plan, &won, &inserted, &conflict);
+    let results = store.resolve_batch(&records, &plan, &inserted, &conflict);
 
     assert_eq!(results.len(), 2, "one result per input row, in input order");
     assert!(

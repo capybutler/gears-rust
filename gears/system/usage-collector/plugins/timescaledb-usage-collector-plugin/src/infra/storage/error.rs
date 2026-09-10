@@ -10,13 +10,13 @@ use usage_collector_sdk::UsageCollectorPluginError;
 /// Name of the dedup UNIQUE declared in `migrations/0001_init.sql`, over the
 /// 5-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
 /// window_end)`.
-pub const DEDUP_UNIQUE: &str = "usage_records_dedup_uniq";
+const DEDUP_UNIQUE: &str = "usage_records_dedup_uniq";
 
 /// Name of the partial unique index that enforces at-most-one accepted
 /// invalidation per target. It is the *atomic* enforcement the SPI requires,
 /// so unlike [`DEDUP_UNIQUE`] its violation reaches this classifier on a live
 /// path rather than defensively.
-pub const ONE_INVALIDATION_UNIQUE: &str = "usage_records_one_invalidation_uniq";
+const ONE_INVALIDATION_UNIQUE: &str = "usage_records_one_invalidation_uniq";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbErrorClass {
