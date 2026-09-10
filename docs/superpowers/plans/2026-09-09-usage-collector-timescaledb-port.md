@@ -4872,8 +4872,8 @@ the helper it removed had no callers:
   a caller-less helper just as well — with this deletion as the worked
   example.
 
-**Three things that must survive this task's rewrite, and one that saves a
-search:**
+**Three things that must survive this task's rewrite, one that saves a
+search, and one claim of Task 14's that expires with your Step 7:**
 
 1. **`start_backend`, `bring_up` and `NO_DROP_RETENTION_SECS` are the
    acceptance test's harness — do not fold them into whatever the five
@@ -4895,6 +4895,18 @@ search:**
    `migrations/0001_init.sql:15-17` cites by name; Step 3's `id_uniqueness`
    assertions are that ADR's, so read it rather than re-deriving the rule
    from the schema.
+4. **Delete a clause from `contract_conformance_pg.rs`'s module doc once the
+   five suites compile.** Its keyset-coverage bullet reads "…and, once Task
+   15 rewrites them, the other pg suites — which today do not compile, so
+   they cover nothing yet." Task 14 wrote that true and it goes false the
+   moment your Step 7 is green: **drop the "which today do not compile, so
+   they cover nothing yet" clause**, and the "once Task 15 rewrites them"
+   hedge with it. Nothing else collects this — the sentence lives in a file
+   this task does not otherwise touch, which is exactly how a claim outlives
+   its code. It is the only clause there with an expiry: the coverage bullet
+   is pinned to the SDK's constants and carries no counts, and the two
+   `record_store_tests` names beside it are citations that a rename breaks
+   visibly rather than claims that quietly go false.
 
 **One item Task 1 handed forward, and one that has already closed itself:**
 
