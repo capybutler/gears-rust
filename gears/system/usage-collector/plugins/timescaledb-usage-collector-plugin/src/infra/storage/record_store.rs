@@ -20,18 +20,19 @@ use bigdecimal::BigDecimal;
 use rand::RngExt as _;
 use rust_decimal::Decimal;
 use sqlx::pool::PoolConnection;
+use sqlx::postgres::PgRow;
 use sqlx::{Acquire as _, AssertSqlSafe, PgPool, Postgres, Row};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
-use toolkit_odata::filter::{FilterField, convert_expr_to_filter_node};
+use toolkit_odata::filter::FilterField;
 use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, SortDir, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationBucket, AggregationDimension, AggregationResult, AggregationSpec, MetadataFilter,
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, MetadataFilter,
     MeterTypeId, TimeRange, UsageCollectorPluginError, UsageRecord, UsageRecordFilterField,
-    UsageTypeGtsId, canonical_period_bound, is_keyset_safe_record_field,
+    canonical_period_bound, is_keyset_safe_record_field,
 };
 
 use crate::domain::ports::RecordStore;
@@ -44,14 +45,13 @@ use crate::infra::storage::mapper::{
     invalidation_to_row, metadata_jsonb_to_map, metadata_map_to_jsonb, record_row_to_model,
 };
 use crate::infra::storage::query::aggregate::{
-    agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
+    aggregate_limit_clause, dimension_select_expr, fold_select_expr, withdrawal_exclusion_clause,
 };
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
 };
 use crate::infra::storage::query::translate::{
-    SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_record_filter,
-    translate_scope,
+    SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_scope,
 };
 use crate::infra::storage::query::{
     effective_page_size, ledger_from_clause, push_metadata_filter_clauses,
@@ -1750,6 +1750,204 @@ fn canonical_equal(
         && stored_metadata == incoming.metadata)
 }
 
+/// The presence guard a grouped dimension needs so a row missing that
+/// dimension is dropped rather than folded into a `NULL` bucket.
+///
+/// Built from `select_expr` — the very string the `GROUP BY` ordinal points
+/// at — so it is by construction the exact negation of "the grouping
+/// expression yields `NULL`" and cannot drift from the expression it guards.
+/// For a metadata dimension that reads `r.metadata ->> $N IS NOT NULL`, whose
+/// bound key is the one [`dimension_select_expr`] already pushed; the key is
+/// therefore bound once, not twice.
+///
+/// `IS NOT NULL` over `->>` rather than the containment operator `?`: they
+/// disagree on a key present with JSON `null`, where `?` is true and `->>` is
+/// `NULL`, and it is `NULL` that decides the bucket. (Where containment really
+/// is wanted the unambiguous spelling is `jsonb_exists(r.metadata, $N)`; a bare
+/// `?` collides with the placeholder syntax of some drivers.)
+///
+/// `None` for the three columns the schema declares `NOT NULL` — a guard on
+/// them would be dead SQL. The match is exhaustive on purpose: a new
+/// [`AggregationDimension`] variant fails to compile here, next to the decision
+/// it needs.
+///
+/// **The consequence is deliberate: grouped buckets need not sum to the
+/// ungrouped total.** Dropping the row is the spec owner's decision
+/// (`DIVERGENCES.md` §G), matching the SDK's reference backend and its own
+/// dimension docs. It was already true of the two subject dimensions; guarding
+/// the metadata one makes it uniform rather than accidental.
+fn dimension_presence_guard(dim: &AggregationDimension, select_expr: &str) -> Option<String> {
+    match dim {
+        AggregationDimension::SubjectId
+        | AggregationDimension::SubjectType
+        | AggregationDimension::Metadata(_) => Some(format!("{select_expr} IS NOT NULL")),
+        AggregationDimension::TenantId
+        | AggregationDimension::ResourceId
+        | AggregationDimension::ResourceType => None,
+    }
+}
+
+/// Build the pushed-down aggregate statement and its binds, in placeholder
+/// order.
+///
+/// ```sql
+/// SELECT <dimension exprs…>, <fold expr>
+/// FROM usage_records r
+/// WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3
+///   AND <withdrawal exclusion>
+///   [AND <translated $filter>] [AND <metadata filters>] [AND <presence guards>]
+/// [GROUP BY 1, 2, …] [LIMIT MAX_AGGREGATION_BUCKETS + 1]
+/// ```
+///
+/// Every line but the last two comes from a shared builder rather than from a
+/// second transcription here: [`ledger_from_clause`] is the `FROM`,
+/// [`push_meter_and_range_clauses`] the meter and the covered-period range,
+/// [`withdrawal_exclusion_clause`] the two obligations a withdrawn pair places
+/// on every fold, and [`push_metadata_filter_clauses`] the side channel. The
+/// range predicate especially: read from one place, it cannot drift onto
+/// `window_start` in this path alone, which would fail `window-end-selection`
+/// and `quantity-round-trip` at once (`DIVERGENCES.md` §F).
+///
+/// The `$filter` goes through [`translate_scope`], which parenthesizes what it
+/// returns. What arrives is the caller's filter `And`-composed with the
+/// compiled PDP scope, **or the scope alone when the caller supplied none** —
+/// and a multi-constraint grant compiles to a disjunction, so a bare fragment
+/// pushed into a `join(" AND ")` would read as `(P AND A) OR B` and answer rows
+/// outside the grant. Nothing at this layer can tell how many constraints the
+/// PDP returned, so the parenthesized spelling is the only safe one.
+///
+/// **No slot of `query` beyond `filter` and `filter_hash`'s absence is read.**
+/// This path paginates nothing and mints no cursor, so `query.cursor`,
+/// `query.filter_hash` and `query.limit` reach neither the statement nor the
+/// binds — the SPI is explicit that an aggregate implementation must not read
+/// the fingerprint slot, and the gateway assigns this call none.
+///
+/// Identifiers all come from closed enum matches
+/// ([`fold_select_expr`], [`dimension_select_expr`], `record_column`); the only
+/// caller-derived values — a grouped metadata key, `$filter` operands, side
+/// channel keys and values — are bound (`$N`).
+///
+/// # Errors
+///
+/// Returns the translation error string when the composed filter names a field
+/// outside the allowlist, uses an unsupported operator, or carries a value that
+/// cannot be bound.
+fn build_aggregate_sql(
+    gts_type_id: &MeterTypeId,
+    time_range: TimeRange,
+    fold: AggregationFold,
+    query: &ODataQuery,
+    metadata_filter: &[MetadataFilter],
+    group_by: &[AggregationDimension],
+) -> Result<(String, Vec<SqlBind>), String> {
+    let mut ctx = SqlCtx::new(1);
+    let mut clauses: Vec<String> = Vec::new();
+
+    push_meter_and_range_clauses(gts_type_id, time_range, &mut ctx, &mut clauses);
+
+    // The one rule this path applies that the ledger paths do not: an
+    // invalidation entry contributes nothing, and neither does the record an
+    // accepted invalidation names. Unconditional, because both obligations hold
+    // under every fold.
+    clauses.push(withdrawal_exclusion_clause().to_owned());
+
+    if let Some(expr) = query.filter() {
+        clauses.push(translate_scope(expr, &mut ctx)?);
+    }
+
+    push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
+
+    // Dimension SELECT exprs in `GROUP BY` order, each binding its metadata key
+    // at most once, each contributing a presence guard when its column can be
+    // `NULL`.
+    let mut select_dims: Vec<String> = Vec::with_capacity(group_by.len());
+    for dim in group_by {
+        let expr = dimension_select_expr(dim, &mut ctx);
+        if let Some(guard) = dimension_presence_guard(dim, &expr) {
+            clauses.push(guard);
+        }
+        select_dims.push(expr);
+    }
+
+    // SELECT list = the dimension exprs, then the fold. With no dimensions the
+    // SELECT is the fold alone, which is what makes the no-grouping case one
+    // aggregate row rather than none.
+    let dim_count = select_dims.len();
+    let mut select_parts = select_dims;
+    select_parts.push(fold_select_expr(fold).to_owned());
+    let select_list = select_parts.join(", ");
+
+    // `GROUP BY` by ordinal (1..=k), so a bound metadata expr is written once
+    // and the second reference cannot renumber its placeholder. Omitted
+    // entirely with no dimensions: `GROUP BY` with an empty ordinal list is a
+    // syntax error, and grouping by nothing is what a bare aggregate already
+    // does.
+    let group_by_sql = if dim_count == 0 {
+        String::new()
+    } else {
+        let ordinals = (1..=dim_count)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" GROUP BY {ordinals}")
+    };
+
+    Ok((
+        format!(
+            "SELECT {select_list} FROM {} WHERE {}{group_by_sql}{}",
+            // Called, never spelled: with a literal here the shared constant
+            // would be decorative, and an alias change would red a test that
+            // then gets "fixed" by editing the literal back.
+            ledger_from_clause(),
+            clauses.join(" AND "),
+            aggregate_limit_clause(dim_count),
+        ),
+        ctx.binds,
+    ))
+}
+
+/// Read one aggregate result row into a bucket: `dim_count` dimension columns
+/// as the key, then the folded value.
+///
+/// Split out so the caller is a 1:1 `map` over the fetched rows. That is the
+/// shape the no-grouping case needs: with no `GROUP BY` the statement is a bare
+/// aggregate and `PostgreSQL` answers exactly one row, which becomes exactly one
+/// bucket with an empty key — the shape a conforming plugin owes, where an
+/// empty bucket list is not. A short circuit that answered `[]` for an empty
+/// fetch would need a branch this shape has nowhere to put.
+///
+/// A `NULL` dimension reads as the empty string. With the presence guards
+/// [`dimension_presence_guard`] emits, the nullable dimensions cannot produce
+/// one; the fallback stands for the columns that never can.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] when a column cannot be
+/// decoded at its expected type — `TEXT` for a dimension, `numeric` for the
+/// fold.
+fn aggregate_bucket(
+    row: &PgRow,
+    dim_count: usize,
+) -> Result<AggregationBucket, UsageCollectorPluginError> {
+    let mut key = Vec::with_capacity(dim_count);
+    for i in 0..dim_count {
+        let dim = row.try_get::<Option<String>, _>(i).map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "aggregate dimension column {i} read failed: {e}"
+            ))
+        })?;
+        key.push(dim.unwrap_or_default());
+    }
+    let value = row
+        .try_get::<Option<BigDecimal>, _>(dim_count)
+        .map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "aggregate value column {dim_count} read failed: {e}"
+            ))
+        })?;
+    Ok(AggregationBucket { key, value })
+}
+
 #[async_trait]
 impl RecordStore for PgRecordStore {
     /// **This path deliberately does not retry, and the asymmetry with
@@ -1986,45 +2184,55 @@ impl RecordStore for PgRecordStore {
         build_list_page(rows, query, limit)
     }
 
-    /// Pushed-down aggregation over `usage_records`, scoped to `gts_id` (bound
-    /// at `$1`) and to `status = 'active'`, with optional `$filter`, metadata
-    /// side-channel filters, and a `GROUP BY` over the spec's dimensions
-    /// (§3.6 aggregated query).
+    /// Pushed-down fold over one meter's entries in one covered-period range,
+    /// optionally grouped.
     ///
-    /// Builds `SELECT <dim exprs…>, <AGG> FROM usage_records WHERE gts_id = $1
-    /// AND status = 'active' [AND corrects_id IS NULL] [AND <filter>] [AND
-    /// <metadata>] [AND <subject-not-null guards>] [GROUP BY 1, 2, …]`. The
-    /// aggregate ([`agg_select_expr`]) and each dimension
-    /// ([`dimension_select_expr`]) come from closed enum allowlists; the only
-    /// caller-derived values (a grouped metadata key, `$filter` operands,
-    /// metadata side-channel values) are bound (`$N`). `status = 'active'` is
-    /// always applied. The `corrects_id IS NULL` partition is op-dependent
-    /// ([`corrects_id_partition_clause`]): `SUM` nets across all active rows —
-    /// compensations carry a signed `value` — so it omits the partition; every
-    /// other op (`COUNT`/`MIN`/`MAX`/`AVG`) restricts to `corrects_id IS NULL`
-    /// rows, since compensations adjust `SUM` and are not events (plugin-spi.md
-    /// §Method 3). With an empty `group_by` there is no `GROUP BY` clause, so
-    /// the query yields exactly one bucket with `key = []`.
+    /// The statement is [`build_aggregate_sql`]'s; the rules it encodes are
+    /// documented there. Two properties are this method's rather than the
+    /// builder's:
     ///
-    /// Each returned row maps to one [`AggregationBucket`]: the `k` dimension
-    /// columns read positionally as `Option<String>` (a `NULL` dimension
-    /// becomes the empty string — relevant only when a grouped metadata key is
-    /// absent on some active rows), and the aggregate at index `k` reads as
-    /// `Option<BigDecimal>` (arbitrary precision, carried through as-is;
-    /// `NULL` -> `None`).
+    /// - **The statement is built before a connection is acquired**, so a query
+    ///   that cannot be rendered never reaches the pool and never reads a row.
+    /// - **Each fetched row becomes exactly one bucket**
+    ///   ([`aggregate_bucket`]), so an empty `group_by` — a bare aggregate with
+    ///   no `GROUP BY`, which `PostgreSQL` answers with exactly one row — yields
+    ///   the single empty-keyed bucket the SPI asks for rather than an empty
+    ///   bucket list. `COUNT` over an empty selection is `Some(0)` for the same
+    ///   reason: it is `SELECT COUNT(*)`'s own answer, not a special case here
+    ///   ([`usage_collector_sdk::AggregationBucket::value`]).
+    ///
+    /// The dimension columns read positionally as `Option<String>` and the fold
+    /// at index `k` as `Option<BigDecimal>` — arbitrary precision, so a wide
+    /// `SUM` cannot overflow on decode.
+    ///
+    /// **`LATEST` materializes before it picks.** Its expression is
+    /// `(ARRAY_AGG(r.value ORDER BY …))[1]`, so `PostgreSQL` builds a group's
+    /// values into an array before taking the head. Peak state is **O(rows
+    /// scanned), not O(largest group)**: under a `HashAggregate` plan every
+    /// group's array is live at once, and only a sorted `GroupAggregate` gives
+    /// the weaker bound — the planner chooses.
+    /// [`aggregate_limit_clause`] offers no protection, because it bounds
+    /// groups and never the rows within one; the only row bound is the
+    /// `time_range`, which is a request parameter. A `LATEST` meter read over a
+    /// wide window is therefore a server-side allocation sized by caller input.
+    /// Recorded rather than reformulated: any alternative needs `EXPLAIN`
+    /// against a real planner rather than reasoning.
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorPluginError::Internal`] when the filter AST
-    /// references an unknown field or is otherwise invalid, the DB query fails,
-    /// or a result column cannot be read at its expected type.
+    /// Returns [`UsageCollectorPluginError::Internal`] when the composed filter
+    /// cannot be translated, the query fails, or a result column cannot be
+    /// decoded at its expected type; a pool-acquisition failure surfaces as
+    /// whatever `timed_acquire` classifies it as.
     // @cpt-flow:cpt-cf-uc-plugin-seq-query-aggregated:p2
     async fn aggregate(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        spec: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
         // Time the full aggregated-query call and count the request. The
         // drop-timer records the histogram on every return, not just success.
@@ -2033,79 +2241,19 @@ impl RecordStore for PgRecordStore {
             TimedOp::Query(QueryKind::Aggregated),
         );
         self.metrics.inc_query_request(QueryKind::Aggregated);
-        // `$1` is reserved for the `gts_id` scope bind; every translated bind
-        // therefore starts at `$2`.
-        let mut ctx = SqlCtx::new(2);
-        let mut clauses: Vec<String> =
-            vec!["gts_id = $1".to_owned(), "status = 'active'".to_owned()];
 
-        // `corrects_id` partition (plugin-spi.md §Method 3): `SUM` nets across
-        // all active rows (compensations carry a signed `value`); every other op
-        // operates over `corrects_id IS NULL` rows only, since compensations
-        // adjust `SUM` and are not events. Load-bearing for `COUNT`-on-counter.
-        if let Some(clause) = corrects_id_partition_clause(spec.op) {
-            clauses.push(clause.to_owned());
-        }
+        let (sql, binds) = build_aggregate_sql(
+            &gts_type_id,
+            time_range,
+            fold,
+            query,
+            metadata_filter,
+            group_by,
+        )
+        .map_err(UsageCollectorPluginError::internal)?;
 
-        // `$filter` (validated AST -> typed node -> parameterized fragment).
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment = translate_record_filter(&node, &mut ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Metadata side-channel (same expansion as `list`).
-        push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
-
-        // Build dimension SELECT exprs in GROUP-BY order, binding any metadata
-        // keys, and emit subject-not-null guards so subject-less rows are
-        // excluded from subject grouping (per the SDK dimension docs).
-        let mut select_dims: Vec<String> = Vec::with_capacity(spec.group_by.len());
-        for dim in &spec.group_by {
-            match dim {
-                AggregationDimension::SubjectId => {
-                    clauses.push("subject_id IS NOT NULL".to_owned());
-                }
-                AggregationDimension::SubjectType => {
-                    clauses.push("subject_type IS NOT NULL".to_owned());
-                }
-                _ => {}
-            }
-            select_dims.push(dimension_select_expr(dim, &mut ctx));
-        }
-
-        // SELECT list = dimension exprs ++ the aggregate. With no dimensions
-        // the SELECT is just the aggregate (single-bucket / no-grouping case).
-        let dim_count = select_dims.len();
-        let mut select_parts = select_dims;
-        select_parts.push(agg_select_expr(spec.op).to_owned());
-        let select_list = select_parts.join(", ");
-
-        // GROUP BY by ordinal (1..=k) so the bound metadata expr is not
-        // repeated; omitted entirely when there are no dimensions.
-        let group_by = if dim_count == 0 {
-            String::new()
-        } else {
-            let ordinals = (1..=dim_count)
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(" GROUP BY {ordinals}")
-        };
-
-        // Bound the distinct-group cardinality so a high-cardinality `group_by`
-        // cannot materialize an unbounded bucket set into memory; the gateway
-        // rejects an over-cap result (plugin-spi.md §Method 3).
-        let limit_clause = aggregate_limit_clause(dim_count);
-        let sql = format!(
-            "SELECT {select_list} FROM usage_records WHERE {}{group_by}{limit_clause}",
-            clauses.join(" AND "),
-        );
-
-        let mut q = sqlx::query(AssertSqlSafe(sql)).bind(gts_id_str(&gts_id));
-        for b in &ctx.binds {
+        let mut q = sqlx::query(AssertSqlSafe(sql));
+        for b in &binds {
             q = bind_one_query(q, b);
         }
         let mut conn = self.timed_acquire().await?;
@@ -2114,28 +2262,21 @@ impl RecordStore for PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        let mut buckets = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut key = Vec::with_capacity(dim_count);
-            for i in 0..dim_count {
-                let dim = row.try_get::<Option<String>, _>(i).map_err(|e| {
-                    UsageCollectorPluginError::internal(format!(
-                        "aggregate dimension column {i} read failed: {e}"
-                    ))
-                })?;
-                // A NULL dimension (e.g. a grouped metadata key absent on some
-                // active rows) becomes the empty string in the bucket key.
-                key.push(dim.unwrap_or_default());
-            }
-            let value = row
-                .try_get::<Option<BigDecimal>, _>(dim_count)
-                .map_err(|e| {
-                    UsageCollectorPluginError::internal(format!(
-                        "aggregate value column {dim_count} read failed: {e}"
-                    ))
-                })?;
-            buckets.push(AggregationBucket { key, value });
-        }
+        // One bucket per row, in the order `PostgreSQL` emitted them. The
+        // `map` is what keeps the no-grouping case honest: no branch on
+        // `group_by.is_empty()` exists to answer an empty bucket list with.
+        //
+        // `group_by.len()` is the same count the SELECT list was built from —
+        // [`build_aggregate_sql`] pushes exactly one dimension expression per
+        // element — but nothing here observes that: no unit test executes a
+        // statement, and `PgRow` cannot be built off a connection. Handing the
+        // decoder a different count, or restoring the short circuit above,
+        // survives every test in the crate. Task 15's integration tests are
+        // where both are caught.
+        let buckets = rows
+            .iter()
+            .map(|row| aggregate_bucket(row, group_by.len()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         // `_timer` records `query.duration` on drop (success and error alike).
         Ok(AggregationResult { buckets })

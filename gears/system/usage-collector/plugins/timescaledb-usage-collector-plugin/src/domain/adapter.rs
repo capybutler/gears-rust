@@ -6,8 +6,8 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, MetadataFilter, MeterTypeId, TimeRange,
-    UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, UsageTypeGtsId,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
+    TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 
 use crate::domain::ports::RecordStore;
@@ -53,13 +53,22 @@ impl UsageCollectorPluginV1 for StorageAdapter {
 
     async fn query_aggregated_usage_records(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        aggregation: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
         self.record
-            .aggregate(gts_id, query, metadata_filter, aggregation)
+            .aggregate(
+                gts_type_id,
+                time_range,
+                fold,
+                query,
+                metadata_filter,
+                group_by,
+            )
             .await
     }
 

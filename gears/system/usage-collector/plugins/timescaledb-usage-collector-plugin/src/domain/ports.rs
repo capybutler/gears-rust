@@ -3,8 +3,8 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, MetadataFilter, MeterTypeId, TimeRange,
-    UsageCollectorPluginError, UsageRecord, UsageTypeGtsId,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
+    TimeRange, UsageCollectorPluginError, UsageRecord,
 };
 
 /// Persistence + query operations on `usage_records`. Implemented by infra.
@@ -50,11 +50,28 @@ pub trait RecordStore: Send + Sync + 'static {
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;
+    /// Fold one meter's entries over one covered-period range, optionally
+    /// grouped.
+    ///
+    /// `fold` and `group_by` are typed parameters: a declaration never reaches
+    /// this port, so the store resolves no usage type and stays pure
+    /// persistence. `time_range` selects on the covered-period end under the
+    /// same `from <= window_end < to` obligation [`RecordStore::list`] carries.
+    ///
+    /// A withdrawn pair contributes nothing — both the invalidation entry and
+    /// the record it names — which is the one rule this path applies that the
+    /// ledger paths do not
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    ///
+    /// An empty `group_by` yields a **single** bucket carrying an empty key,
+    /// never an empty bucket list.
     async fn aggregate(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        spec: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError>;
 }

@@ -11,18 +11,23 @@ use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 use toolkit_odata::ast;
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
-use usage_collector_sdk::UsageCollectorPluginError;
+use usage_collector_sdk::{
+    AggregationDimension, AggregationFold, MetadataFilter, MetadataKey, UsageCollectorPluginError,
+};
 
 use super::{
     BATCH_INSERT_SQL, ConflictRead, DedupKey, INSERT_COLUMN_ARRAY_TYPES, INSERT_COLUMNS,
     InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, SINGLE_INSERT_SQL,
-    batch_retry_backoff, batch_retry_backoff_base, build_get_sql, build_list_page, build_list_sql,
-    canonical_equal, dedup_key, invalidation_index_slots, is_retryable_batch_error, plan_batch,
-    record_row_key, row_dedup_key, scope_runs, sequence_block, with_retry,
+    batch_retry_backoff, batch_retry_backoff_base, build_aggregate_sql, build_get_sql,
+    build_list_page, build_list_sql, canonical_equal, dedup_key, invalidation_index_slots,
+    is_retryable_batch_error, plan_batch, record_row_key, row_dedup_key, scope_runs,
+    sequence_block, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
 use crate::infra::storage::entity::UsageRecordRow;
+use crate::infra::storage::query::aggregate::{fold_select_expr, withdrawal_exclusion_clause};
+use crate::infra::storage::query::ledger_from_clause;
 use crate::infra::storage::query::translate::{SqlBind, record_column};
 
 /// A valid meter type id: the reserved base plus one derivation segment,
@@ -2144,4 +2149,541 @@ async fn a_page_that_cannot_be_built_never_reaches_the_pool() {
              connection; reaching the pool would answer Transient. got: {other:?}"
         ),
     }
+}
+
+// --- The fold: `build_aggregate_sql` (Task 12) ---
+
+/// The fold's own query slot: no order, no page size, no fingerprint. The fold
+/// paginates nothing, so [`list_query`]'s canonical order would be noise here.
+fn fold_query() -> ODataQuery {
+    ODataQuery::new()
+}
+
+/// The metadata key a grouped metadata dimension reads, distinct from the side
+/// channel's `region`, so a statement carrying both cannot pass by binding one
+/// key where the other belongs.
+const GROUPED_METADATA_KEY: &str = "tier";
+
+fn metadata_dimension(key: &str) -> AggregationDimension {
+    AggregationDimension::Metadata(MetadataKey::new(key).expect("a valid metadata key"))
+}
+
+/// Every dimension the SDK declares, in variant order — an exhaustiveness
+/// witness for a test that claims to cover "every dimension": adding a variant
+/// fails to compile in [`dimension_presence_guard`], and this array is what a
+/// reader checks the claim against.
+fn every_dimension() -> Vec<AggregationDimension> {
+    vec![
+        AggregationDimension::TenantId,
+        AggregationDimension::ResourceId,
+        AggregationDimension::ResourceType,
+        AggregationDimension::SubjectId,
+        AggregationDimension::SubjectType,
+        metadata_dimension(GROUPED_METADATA_KEY),
+    ]
+}
+
+/// Every fold the SDK declares, in variant order.
+fn every_fold() -> Vec<AggregationFold> {
+    vec![
+        AggregationFold::Sum,
+        AggregationFold::Count,
+        AggregationFold::Min,
+        AggregationFold::Max,
+        AggregationFold::Latest,
+    ]
+}
+
+/// One grouped statement carrying every moving part at once: the meter and
+/// range, the withdrawal exclusion, a two-conjunct compiled scope, a
+/// side-channel filter, and two grouped dimensions — one of them the metadata
+/// escape hatch, whose key is bound and whose presence guard reads the same
+/// placeholder.
+///
+/// Two tests read it, because the statement text and the bind vector are two
+/// halves of one oracle and the text is the weaker half: it reads identically
+/// no matter which value lands in which placeholder.
+fn full_fold_statement() -> (String, Vec<SqlBind>) {
+    let query = fold_query().with_filter(parse_scope(&format!(
+        "tenant_id eq {SCOPE_TENANT_A} and resource_type eq 'vm'"
+    )));
+    let group_by = vec![
+        AggregationDimension::SubjectType,
+        metadata_dimension(GROUPED_METADATA_KEY),
+    ];
+
+    build_aggregate_sql(
+        &list_meter(),
+        list_range(),
+        AggregationFold::Sum,
+        &query,
+        &[MetadataFilter::new("region", ["eu-west-1"]).expect("a valid side channel filter")],
+        &group_by,
+    )
+    .expect("a well-formed fold must render")
+}
+
+#[test]
+fn the_fold_assembles_one_statement_from_the_builders_both_read_paths_share() {
+    let (sql, _binds) = full_fold_statement();
+
+    // Transcribed by hand, from the shape the SPI describes rather than from
+    // anything a builder produces — including the `100001`, which is
+    // `MAX_AGGREGATION_BUCKETS + 1` written out. `aggregate_tests.rs` pins the
+    // clause against the constant; if this line derived the number from the
+    // same constant the two layers would only be agreeing with each other.
+    assert_eq!(
+        sql,
+        "SELECT r.subject_type, r.metadata ->> $8, SUM(r.value)::numeric \
+         FROM usage_records r \
+         WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
+         AND r.invalidates IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id) \
+         AND ((tenant_id = $4 AND resource_type = $5)) \
+         AND r.metadata ->> $6 IN ($7) \
+         AND r.subject_type IS NOT NULL \
+         AND r.metadata ->> $8 IS NOT NULL \
+         GROUP BY 1, 2 LIMIT 100001"
+    );
+}
+
+#[test]
+fn the_fold_binds_the_meter_and_both_range_bounds_ahead_of_everything() {
+    // The statement text is the weaker half of the oracle: it reads identically
+    // however the values are permuted across its placeholders. A wrong page is
+    // noticeable; a wrong total is a billing figure that looks fine.
+    //
+    // `query_tests.rs` pins what `push_meter_and_range_clauses` binds in
+    // isolation. What is this builder's is that it calls that builder first, so
+    // the three land at $1..=$3 with the caller's own values behind them.
+    let (_sql, binds) = full_fold_statement();
+
+    assert!(
+        matches!(&binds[0], SqlBind::Str(s) if s == VCPU_METER),
+        "$1 is the meter this fold reads; an empty string here would drop the \
+         scoping to one meter without changing a character of the SQL. got: {:?}",
+        binds[0]
+    );
+    assert!(
+        matches!(&binds[1], SqlBind::DateTime(t) if t.unix_timestamp() == RANGE_FROM_UNIX),
+        "$2 is the range's inclusive lower bound. got: {:?}",
+        binds[1]
+    );
+    assert!(
+        matches!(&binds[2], SqlBind::DateTime(t) if t.unix_timestamp() == RANGE_TO_UNIX),
+        "$3 is the range's exclusive upper bound; swapped with $2 the range \
+         inverts to `window_end >= to AND window_end < from` and the fold \
+         selects nothing, ever. got: {:?}",
+        binds[2]
+    );
+}
+
+#[test]
+fn the_fold_binds_its_callers_values_behind_the_range() {
+    // The other half of the bind oracle: the compiled scope's two operands, the
+    // side channel's key and value, and the grouped metadata key — each pinned
+    // by value in placeholder order, with the length assertion a completeness
+    // check on that set rather than the oracle itself. All five are `text` or
+    // `uuid` binds into a statement whose text cannot tell them apart.
+    let (_sql, binds) = full_fold_statement();
+
+    assert_eq!(
+        binds.len(),
+        8,
+        "the meter, both bounds, both scope operands, the side channel key and \
+         its one value, and the grouped metadata key. got: {binds:?}"
+    );
+    assert!(
+        matches!(&binds[3], SqlBind::Uuid(u) if u.to_string() == SCOPE_TENANT_A),
+        "$4 is the tenant the compiled scope pins. got: {:?}",
+        binds[3]
+    );
+    assert!(
+        matches!(&binds[4], SqlBind::Str(s) if s == "vm"),
+        "$5 is the resource type the compiled scope pins. got: {:?}",
+        binds[4]
+    );
+    assert!(
+        matches!(&binds[5], SqlBind::Str(s) if s == "region"),
+        "$6 is the side channel's key. got: {:?}",
+        binds[5]
+    );
+    assert!(
+        matches!(&binds[6], SqlBind::Str(s) if s == "eu-west-1"),
+        "$7 is the side channel's one value; bound where the key belongs, the \
+         fold reads a different facet of every row. got: {:?}",
+        binds[6]
+    );
+    assert!(
+        matches!(&binds[7], SqlBind::Str(s) if s == GROUPED_METADATA_KEY),
+        "$8 is the grouped metadata key, bound once and read twice: by the \
+         SELECT expression and by the presence guard. got: {:?}",
+        binds[7]
+    );
+}
+
+#[test]
+fn the_folds_from_clause_is_the_one_constant_both_read_paths_read() {
+    let (sql, _binds) = build_aggregate_sql(
+        &list_meter(),
+        list_range(),
+        AggregationFold::Sum,
+        &fold_query(),
+        &[],
+        &[],
+    )
+    .expect("a well-formed fold must render");
+
+    // Called, never spelled. Every fragment in the statement qualifies its
+    // columns with the alias this clause declares, and the withdrawal
+    // exclusion's `w.invalidates = r.id` is unresolvable without it — the
+    // statement this method built before Task 12 was `FROM usage_records`
+    // unaliased beside an already-alias-qualified metadata fragment, which
+    // `PostgreSQL` refuses outright.
+    assert!(
+        sql.contains(ledger_from_clause()),
+        "the fold's FROM must be the shared clause. got: {sql}"
+    );
+}
+
+#[test]
+fn no_fold_escapes_the_withdrawal_exclusion() {
+    // `aggregate_tests.rs` pins that the clause has no per-fold branch; this
+    // pins that the statement builder applies it at all, under each fold in
+    // turn. Deleting the one `clauses.push` reds all five arms of this loop.
+    for fold in every_fold() {
+        let (sql, _binds) =
+            build_aggregate_sql(&list_meter(), list_range(), fold, &fold_query(), &[], &[])
+                .expect("a well-formed fold must render");
+
+        assert!(
+            sql.contains(withdrawal_exclusion_clause()),
+            "an invalidation entry, and the record an accepted invalidation \
+             names, contribute nothing under {fold:?} as under every other \
+             fold. got: {sql}"
+        );
+        assert!(
+            sql.contains(fold_select_expr(fold)),
+            "the statement must fold with the fold it was asked for. got: {sql}"
+        );
+    }
+}
+
+#[test]
+fn the_fold_carries_no_status_predicate() {
+    // The retired time model's `status = 'active'` was applied unconditionally
+    // here and lost its only test in Task 2; the Task 3 schema has no such
+    // column, so the clause would now be an error rather than a narrowing.
+    //
+    // Task 10's trap — a "column X is absent" assertion matching the SELECT
+    // list instead of the WHERE clause — does not reach this statement, and
+    // that is a property of what builds an aggregate SELECT list rather than of
+    // this particular call: it is the grouped dimension expressions followed by
+    // the fold expression, never `RECORD_COLUMNS`. Neither those six
+    // expressions nor the five folds name `status`. So the whole statement is
+    // the right thing to grep, and grouping by every dimension at once is the
+    // widest text this builder can produce.
+    for fold in every_fold() {
+        let (sql, _binds) = build_aggregate_sql(
+            &list_meter(),
+            list_range(),
+            fold,
+            &fold_query(),
+            &[MetadataFilter::new("region", ["eu-west-1"]).expect("a valid filter")],
+            &every_dimension(),
+        )
+        .expect("a well-formed fold must render");
+
+        assert!(
+            !sql.contains("status"),
+            "`status` is not a column in the Task 3 schema. got: {sql}"
+        );
+    }
+}
+
+#[test]
+fn the_no_grouping_case_is_one_bare_aggregate_row() {
+    // The single empty-keyed bucket a conforming plugin owes for an empty
+    // `group_by` is `PostgreSQL`'s own answer to a bare aggregate — exactly one
+    // row, and `Some(0)` rather than `None` for `COUNT` over an empty
+    // selection. That only holds while the statement stays a bare aggregate.
+    //
+    // Two mutations this kills: emitting the `GROUP BY` unconditionally (with
+    // no dimensions the ordinal list is empty, which is a syntax error, and
+    // with a `1` bolted on it would group by the fold itself), and emitting the
+    // bucket `LIMIT` when there is no group cardinality to bound.
+    let (sql, binds) = build_aggregate_sql(
+        &list_meter(),
+        list_range(),
+        AggregationFold::Count,
+        &fold_query(),
+        &[],
+        &[],
+    )
+    .expect("an ungrouped fold must render");
+
+    assert!(
+        !sql.contains("GROUP BY"),
+        "grouping by nothing is what a bare aggregate already does. got: {sql}"
+    );
+    assert!(
+        !sql.contains("LIMIT"),
+        "there is one row and no group cardinality to bound. got: {sql}"
+    );
+    assert!(
+        sql.starts_with("SELECT COUNT(*)::numeric FROM "),
+        "the SELECT list is the fold alone. got: {sql}"
+    );
+    // The ungrouped statement binds the meter and the two bounds and nothing
+    // else, so a stray dimension bind would show up here as a fourth value.
+    assert_eq!(
+        binds.len(),
+        3,
+        "the meter and the two bounds. got: {binds:?}"
+    );
+    assert!(
+        matches!(&binds[0], SqlBind::Str(s) if s == VCPU_METER),
+        "$1 is the meter. got: {:?}",
+        binds[0]
+    );
+    assert!(
+        matches!(&binds[1], SqlBind::DateTime(t) if t.unix_timestamp() == RANGE_FROM_UNIX),
+        "$2 is the inclusive lower bound. got: {:?}",
+        binds[1]
+    );
+    assert!(
+        matches!(&binds[2], SqlBind::DateTime(t) if t.unix_timestamp() == RANGE_TO_UNIX),
+        "$3 is the exclusive upper bound. got: {:?}",
+        binds[2]
+    );
+}
+
+#[test]
+fn grouping_numbers_its_ordinals_from_one_and_bounds_the_bucket_count() {
+    // `GROUP BY` by ordinal so a bound metadata expression is written once:
+    // repeating the expression would push its key a second time and renumber
+    // every placeholder after it. Ordinals are 1-based — a 0-based list is a
+    // `PostgreSQL` error rather than a silently wrong grouping, but only for
+    // the first ordinal, so the three-dimension case is what pins the shape.
+    let (sql, binds) = build_aggregate_sql(
+        &list_meter(),
+        list_range(),
+        AggregationFold::Max,
+        &fold_query(),
+        &[],
+        &[
+            AggregationDimension::TenantId,
+            AggregationDimension::ResourceId,
+            metadata_dimension(GROUPED_METADATA_KEY),
+        ],
+    )
+    .expect("a grouped fold must render");
+
+    assert!(
+        sql.ends_with(" GROUP BY 1, 2, 3 LIMIT 100001"),
+        "three dimensions, then the cap plus one. got: {sql}"
+    );
+    assert!(
+        sql.starts_with("SELECT r.tenant_id::text, r.resource_id, r.metadata ->> $4, MAX(r.value)::numeric FROM "),
+        "the SELECT list is the dimensions in `group_by` order, then the fold. \
+         got: {sql}"
+    );
+    assert_eq!(
+        binds.len(),
+        4,
+        "the meter, both bounds, and the grouped metadata key once. got: {binds:?}"
+    );
+    assert!(
+        matches!(&binds[3], SqlBind::Str(s) if s == GROUPED_METADATA_KEY),
+        "$4 is the grouped metadata key. got: {:?}",
+        binds[3]
+    );
+}
+
+#[test]
+fn a_nullable_dimension_drops_the_rows_that_do_not_carry_it() {
+    // The absent-dimension rule, uniform across all three dimensions that can
+    // be `NULL`: drop the row rather than fold it into a `NULL` bucket
+    // (`DIVERGENCES.md` §G, matching the SDK's reference backend). Before Task
+    // 12 the two subject dimensions were guarded and the metadata one was not,
+    // so five of six dimensions obeyed the rule and the sixth did so by
+    // accident of the SDK's own docs.
+    //
+    // The guard is spelled against the grouping expression itself, so it is the
+    // exact negation of "this expression yields NULL". `?` would not be: for a
+    // key present with JSON `null` it is true while `->>` is `NULL`, and it is
+    // the `NULL` that decides the bucket.
+    // Each guard is transcribed by hand, placeholder included: with the meter
+    // and the two bounds bound first, a lone grouped metadata key is `$4`.
+    for (dim, guard) in [
+        (AggregationDimension::SubjectId, "r.subject_id IS NOT NULL"),
+        (
+            AggregationDimension::SubjectType,
+            "r.subject_type IS NOT NULL",
+        ),
+        (
+            metadata_dimension(GROUPED_METADATA_KEY),
+            "r.metadata ->> $4 IS NOT NULL",
+        ),
+    ] {
+        let (sql, _binds) = build_aggregate_sql(
+            &list_meter(),
+            list_range(),
+            AggregationFold::Sum,
+            &fold_query(),
+            &[],
+            std::slice::from_ref(&dim),
+        )
+        .expect("a grouped fold must render");
+
+        assert!(
+            sql.contains(guard),
+            "{dim:?} can be NULL, so a row missing it must be dropped rather \
+             than bucketed under NULL. got: {sql}"
+        );
+        // The other half, and the one that makes the guard unable to drift:
+        // strip ` IS NOT NULL` off the guard and what is left must be the
+        // grouping expression itself, the same bound placeholder and all.
+        let grouping_expr = guard
+            .strip_suffix(" IS NOT NULL")
+            .unwrap_or_else(|| panic!("the transcribed guard must end in the predicate"));
+        assert!(
+            sql.starts_with(&format!("SELECT {grouping_expr}, ")),
+            "the guard must negate the grouping expression it guards, not a \
+             second spelling of it. got: {sql}"
+        );
+        assert!(
+            !sql.contains(" ? "),
+            "the guard is `->> IS NOT NULL`, never the containment operator: \
+             they disagree on a key present with JSON null, and a bare `?` \
+             collides with placeholder syntax in some drivers. got: {sql}"
+        );
+    }
+}
+
+#[test]
+fn the_three_never_null_dimensions_get_no_dead_guard() {
+    // `tenant_id`, `resource_id` and `resource_type` are NOT NULL in the
+    // schema, so a presence guard on them is dead SQL that the planner still
+    // has to carry. The mutation this kills is the tempting uniform one: guard
+    // every dimension because three of them need it.
+    let (sql, _binds) = build_aggregate_sql(
+        &list_meter(),
+        list_range(),
+        AggregationFold::Sum,
+        &fold_query(),
+        &[],
+        &[
+            AggregationDimension::TenantId,
+            AggregationDimension::ResourceId,
+            AggregationDimension::ResourceType,
+        ],
+    )
+    .expect("a grouped fold must render");
+
+    assert!(
+        !sql.contains("IS NOT NULL"),
+        "none of these three columns can be NULL, so none needs a guard. \
+         got: {sql}"
+    );
+}
+
+#[test]
+fn the_folds_disjunctive_scope_survives_the_conjunction_with_the_range() {
+    // The shape a multi-constraint grant compiles to. Pushed into the
+    // `join(" AND ")` unparenthesized — which is what the inline
+    // `convert_expr_to_filter_node` + `translate_record_filter` pair this
+    // builder used to carry produced — `… AND A OR B` binds as
+    // `(… AND A) OR B` and folds every row matching the last disjunct,
+    // whatever meter or range was asked for. Nothing at this layer can tell
+    // how many constraints the PDP returned.
+    let query = fold_query().with_filter(parse_scope(&format!(
+        "(tenant_id eq {SCOPE_TENANT_A} and resource_type eq 'vm') or \
+         (tenant_id eq {SCOPE_TENANT_B} and resource_type eq 'vm')"
+    )));
+
+    let (sql, binds) = build_aggregate_sql(
+        &list_meter(),
+        list_range(),
+        AggregationFold::Sum,
+        &query,
+        &[],
+        &[],
+    )
+    .expect("a compiled scope must render");
+
+    // Transcribed by hand.
+    assert!(
+        sql.contains(
+            "AND (((tenant_id = $4 AND resource_type = $5) \
+             OR (tenant_id = $6 AND resource_type = $7)))"
+        ),
+        "the whole disjunction must sit inside the conjunction. got: {sql}"
+    );
+    assert_eq!(
+        binds.len(),
+        7,
+        "the meter, both bounds, four scope operands"
+    );
+    assert!(
+        matches!(&binds[3], SqlBind::Uuid(u) if u.to_string() == SCOPE_TENANT_A),
+        "$4 is the first admitted tenant. got: {:?}",
+        binds[3]
+    );
+    assert!(
+        matches!(&binds[5], SqlBind::Uuid(u) if u.to_string() == SCOPE_TENANT_B),
+        "$6 is the second admitted tenant; both grants must be bound, or the \
+         scope silently narrows to one. got: {:?}",
+        binds[5]
+    );
+}
+
+#[test]
+fn the_fold_reads_neither_the_cursor_nor_the_fingerprint_slot() {
+    // "An aggregate implementation MUST NOT read the slot": this call
+    // paginates nothing, mints no cursor, and the gateway assigns it no
+    // fingerprint. The realistic mutation is not a deliberate read — it is the
+    // cursor block copied across from `build_list_sql`, which resolves
+    // `query.filter_hash` through `require_filter_hash` and errors when it is
+    // absent, then pushes a keyset predicate. Under that copy the second and
+    // third statements below stop matching the first.
+    //
+    // What this pins is that neither slot reaches the statement or its binds. A
+    // read whose value is then discarded leaves no trace in either, and so is
+    // not observable from here.
+    let base = fold_query();
+    let with_cursor = fold_query().with_cursor(CursorV1 {
+        k: vec!["2023-11-14T23:13:20Z".to_owned()],
+        o: SortDir::Asc,
+        s: "+window_end".to_owned(),
+        f: None,
+        d: "fwd".to_owned(),
+    });
+    let with_fingerprint = fold_query().with_filter_hash(READ_FINGERPRINT.to_owned());
+
+    let render = |query: &ODataQuery| {
+        let (sql, binds) = build_aggregate_sql(
+            &list_meter(),
+            list_range(),
+            AggregationFold::Sum,
+            query,
+            &[],
+            &[AggregationDimension::TenantId],
+        )
+        .expect("a well-formed fold must render");
+        (sql, format!("{binds:?}"))
+    };
+
+    let expected = render(&base);
+    assert_eq!(
+        render(&with_cursor),
+        expected,
+        "a cursor in the slot must change neither the statement nor its binds"
+    );
+    assert_eq!(
+        render(&with_fingerprint),
+        expected,
+        "a fingerprint in the slot must change neither the statement nor its \
+         binds"
+    );
 }

@@ -89,7 +89,11 @@ pub fn push_meter_and_range_clauses(
 /// every other fragment: `aggregate` also emits a *presence guard* over the same
 /// column for a grouped metadata dimension, and one statement holding a
 /// qualified and an unqualified reference to one column is the drift the alias
-/// constant exists to stop.
+/// constant exists to stop. What holds this half of that to it is
+/// `every_fragment_qualifies_its_columns_with_the_alias_the_from_clause_declares`
+/// in `query/aggregate_tests.rs`, which drains this builder into the fragment
+/// list it walks and refuses a bare ledger column — the same test the two
+/// siblings above name.
 ///
 /// An empty value set matches nothing (the gateway rejects it, but be
 /// defensive): a `FALSE` clause is emitted so the result is empty rather than
@@ -142,9 +146,10 @@ pub const MAX_PAGE_SIZE: u64 = 1000;
 /// The **lower** bound of 1 is not cosmetic. A resolved page size of 0 would
 /// drive `LIMIT 0+1 = 1` then `truncate(0)` on the look-ahead read — leaving
 /// `rows.last()` `None` on a non-empty table and 500-ing the list path at that
-/// guard, before `encode_next_cursor` is reached. The REST surface cannot deliver a 0 (the toolkit
-/// `OData` extractor rejects a zero page size — in either the `$top` or the
-/// `limit` spelling — with `InvalidLimit` before the handler runs), but an
+/// guard, before `encode_next_cursor` is reached. The REST surface cannot
+/// deliver a 0 (the toolkit `OData` extractor rejects a zero page size — in
+/// either the `$top` or the `limit` spelling — with `InvalidLimit` before the
+/// handler runs), but an
 /// in-process SDK caller hands the plugin an `ODataQuery` directly and
 /// reaches neither that check nor the core gateway's
 /// `prepare_list_query`. Flooring to the smallest legal page (1)
