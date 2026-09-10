@@ -3078,19 +3078,22 @@ Grep the assembled SQL in a test rather than assuming.
 
 - [ ] **Step 2b: Three things Task 8 hands to this task**
 
-**1. `agg_select_expr` now returns `Option<&'static str>`, and `Latest` is the
-`None`.** It is not an aggregate function but an ordered pick, rendered by
-`latest_select_expr()`. The `None` means "rendered elsewhere", never
-"unsupported fold" — a caller that treats it as the latter serves no `LATEST`
-meter at all. This arrives as a compile error at `record_store.rs:1253`
-(`expected String, found Option<&str>`), so it cannot be missed, only
-mis-resolved. Branch:
+**1. `agg_select_expr` is now `fold_select_expr(fold) -> &'static str`, with
+five arms and no branch to take.** An earlier draft of this step prescribed
+`.map(str::to_owned).unwrap_or_else(…)` against an `Option` whose `None` was
+`Latest`. That `Option` modelled no absence: `(ARRAY_AGG(r.value ORDER BY …))[1]`
+composes in a grouped SELECT list exactly as `SUM(r.value)` does, and the only
+consumer joins the string into a SELECT list without inspecting it. It was
+deleted, along with the misreading hazard that a `None` meant "unsupported
+fold". Push `fold_select_expr(fold).to_owned()` and nothing else. The "ordered
+pick, not an aggregate function" observation survives as doc on the arm's
+constant, which is where it belongs.
 
-```rust
-let fold_expr = agg_select_expr(fold)
-    .map(str::to_owned)
-    .unwrap_or_else(|| latest_select_expr().to_owned());
-```
+**1b. Build the `FROM` from `aggregate_from_clause()`.** The `r` alias is no
+longer a convention two files honour separately — the module exports the clause
+(`"usage_records r"`), a test asserts it declares `r`, and every other fragment
+binds to it. Write `format!("SELECT {select_list} FROM {} WHERE …",
+aggregate_from_clause())` rather than spelling the table and alias again here.
 
 **2. The absent-dimension rule is settled: drop the row — and `Metadata` is the
 dimension that does not yet obey it.** `aggregate` today pushes
@@ -3099,25 +3102,38 @@ dimension, and pushes nothing for `Metadata`, so a row missing the grouped key
 lands in a `NULL` bucket where `InMemoryReferencePlugin` drops it. **The spec
 owner has decided in favour of dropping** (see Task 18), matching the reference
 backend and the SDK's own docs at `models.rs:1587-1592`. So emit a presence
-guard for the metadata dimension alongside the two subject ones —
-`r.metadata ? $N` against the same bound key, or an equivalent
-`r.metadata ->> $N IS NOT NULL` — so all six dimensions drop absent-dimension
-rows consistently rather than five doing so by accident. Note in a comment that
+guard for the metadata dimension alongside the two subject ones, spelled
+**`r.metadata ->> $N IS NOT NULL`** against the same bound key, so all six
+dimensions drop absent-dimension rows consistently rather than five doing so by
+accident. Use that spelling and not `?`: they are not equivalent — for a key
+present with JSON `null`, `?` is true while `->>` is `NULL` — and `->> IS NOT
+NULL` is by construction the exact negation of "the grouping expression yields
+NULL", so it cannot drift from the expression it guards. (If containment is ever
+what is wanted, the unambiguous spelling is `jsonb_exists(r.metadata, $N)`;
+bare `?` collides with the placeholder syntax of some drivers.) Note in a comment that
 the consequence is deliberate: **grouped buckets need not sum to the ungrouped
 total.** That is already true for subject today; this makes it uniform.
 
 The guard cannot live in `dimension_select_expr` — a `GROUP BY` ordinal carries
 no `WHERE` predicate — which is why it is yours and not Task 8's.
 
-**3. `LATEST` materializes each group; record it, do not fix it.**
-`latest_select_expr()` is `(ARRAY_AGG(r.value ORDER BY …))[1]`, so Postgres
-builds one array holding **every selected value in the group** before taking the
-head. `aggregate_limit_clause` bounds the number of distinct *groups*, not the
-rows per group, and the row scan is bounded only by the gateway's time window.
-`MIN`/`MAX` have no such cost. The expression is correct and was prescribed
-verbatim, but this module is otherwise fastidious about unbounded memory (the
-`LIMIT` exists for exactly that reason), so the asymmetry belongs in this task's
-write-up and, if it survives review, in `DIVERGENCES.md`.
+**3. `LATEST` materializes each group. Record it; do not try to fix it in SQL
+here.** The `Latest` arm is `(ARRAY_AGG(r.value ORDER BY …))[1]`, so Postgres
+builds an array of a group's values before taking the head.
+
+**Peak state is O(rows scanned), not O(largest group)** — say it that way,
+because the weaker phrasing understates it by orders of magnitude. Under a
+HashAggregate plan **every group's array is live simultaneously**; only a sorted
+GroupAggregate gives O(largest group), and the planner chooses. `aggregate_limit_clause`
+offers *zero* protection: it bounds the number of groups, never the rows within
+one. The only row bound is the gateway's time window, which is a request
+parameter — so a `LATEST` meter queried over a wide window is a server-side
+allocation sized by caller input. `MIN`/`MAX`/`SUM`/`COUNT` carry no such cost.
+
+Do not reformulate the SQL in this task: the crate does not compile, no Postgres
+is reachable in this slice, and any alternative needs `EXPLAIN` rather than
+reasoning. Carry the fact into the write-up; Task 15 measures it and Task 18
+publishes it.
 
 - [ ] **Step 3: Get the no-grouping case right**
 
@@ -3398,10 +3414,41 @@ Four suites survive Task 1 and every one was written against the old model.
 **Files:**
 - Rewrite: `tests/records_ingest_integration_pg.rs` (702), `tests/records_query_integration_pg.rs` (919), `tests/cleanup_integration_pg.rs` (239), `tests/id_uniqueness_integration_pg.rs` (93), `tests/schema_integration_pg.rs` (75), `tests/common/mod.rs` (346)
 
+**This task is also the first point in the slice where Postgres is reachable,
+which makes it the owner of one measurement nobody earlier could take** — see
+Step 1b.
+
 - [ ] **Step 1: Inventory what each suite asserts, before changing any of it**
 
 For each file, list the questions it asks. Then mark each: **still a live
 question** (repoint it), or **a question the model no longer has** (delete it).
+
+- [ ] **Step 1b: Measure what `LATEST` costs, and whether another formulation is cheaper**
+
+Task 8 shipped the `Latest` fold as `(ARRAY_AGG(r.value ORDER BY r.window_end
+DESC, r.acceptance_sequence DESC))[1]::numeric`, which materializes a group's
+values before picking one. Task 12 carried the fact; **this task can measure
+it**, because it has Docker and the crate compiles by now. Nobody earlier could:
+the alternative formulations differ by planner behaviour, and that needs
+`EXPLAIN (ANALYZE, BUFFERS)`, not reasoning.
+
+Two questions, in this order:
+
+1. **What is the peak actually?** Run a grouped `LATEST` over a wide window and
+   read the plan. A HashAggregate keeps every group's array live at once —
+   O(rows scanned); a sorted GroupAggregate keeps one — O(largest group). Which
+   the planner picks, and at what row count it switches, is the number Task 18
+   publishes.
+2. **Is there a formulation with the same semantics and a bounded peak?** The
+   candidates are a `DISTINCT ON` in a subquery joined back per group, and a
+   window function (`ROW_NUMBER() OVER (PARTITION BY … ORDER BY window_end DESC,
+   acceptance_sequence DESC)`) filtered to `= 1`. Both were rejected at Task 8 on
+   composition grounds — reasoning, unmeasured. If one is both correct and
+   cheaper, that is a change to `aggregate.rs` with a test, and it belongs here
+   rather than in a slice that could only guess.
+
+Report the numbers either way. A "measured, and the current form is fine" is a
+result Task 18 can publish; an unmeasured claim is not.
 Produce that list in the task report. "Deleted the failing test" and "deleted
 the test whose question no longer exists" look identical in a diff, and only
 the second is legitimate.
@@ -3817,8 +3864,8 @@ Changes owed:
   not as an open divergence. Task 8 Step 6 reframed the question and it went to
   the owner in that form; the answer matches `InMemoryReferencePlugin` and the
   published wire shape, where `AggregationBucket.key` types every item as a
-  non-nullable string with no null spelling available. Three things §G's
-  current text gets wrong or omits, all owed to it:
+  non-nullable string with no null spelling available. Two corrections to §G's
+  current text, and one thing to add to it:
   - **The live case was metadata, not subject.** §G is written about
     `GROUP BY subject_id`, but `record_store.rs`'s `aggregate` already pushes
     `subject_id IS NOT NULL` / `subject_type IS NOT NULL`, so the two backends
@@ -3832,16 +3879,27 @@ Changes owed:
     `AggregationDimension::SubjectId` and `SubjectType` at `models.rs:1587-1592`
     — "rows without a subject are excluded from the grouping". DESIGN is silent;
     the SDK was not, for four of the six dimensions.
-  - **State the consequence plainly: grouped buckets need not sum to the
-    ungrouped total.** That was already true for subject; the decision makes it
-    uniform rather than accidental, and a consumer reconciling a grouped
-    aggregate against an ungrouped one needs to know it is by design.
-- **Possibly a twentieth entry from Task 8:** `latest_select_expr`'s
-  `(ARRAY_AGG(…))[1]` materializes every value in a group before taking the
-  head, while `aggregate_limit_clause` bounds only the number of groups and the
-  row scan is bounded only by the gateway's time window. `MIN`/`MAX` carry no
-  such cost. Task 12 was asked to carry it in its write-up; decide here whether
-  it earns an entry.
+  - **§G already states the consequence** — "grouped buckets need not sum to
+    the ungrouped total", `DIVERGENCES.md:1435-1437` — so do not re-report it as
+    a gap. What is new is that it becomes **uniform rather than accidental**:
+    today it holds for subject because the caller guards those two dimensions,
+    not because anyone decided it should. Add that, and leave the consequence
+    sentence where it is.
+- **A twentieth entry is owed: `LATEST` has an unbounded server-side
+  allocation driven by caller input.** The `Latest` fold is
+  `(ARRAY_AGG(r.value ORDER BY …))[1]`, which materializes a group's values
+  before picking one. Peak state is **O(rows scanned)**, not O(largest group):
+  under a HashAggregate plan every group's array is live at once, and only a
+  sorted GroupAggregate gives the weaker bound — the planner chooses.
+  `aggregate_limit_clause` gives **zero** protection, because it bounds the
+  number of groups and never the rows within one; the only row bound is the
+  gateway's time window, a request parameter. `MIN`/`MAX`/`SUM`/`COUNT` carry no
+  such cost.
+
+  **This is a limit to publish, not a question to weigh.** DESIGN §3.10 asks
+  each plugin's deployment guide to state the bounds it can hold, and this is
+  one it cannot hold under a `LATEST` meter with a wide window. Write the entry
+  against the measurement Task 15 takes, not against this description.
 - **Any twentieth entry** this port turned up.
 
 - [ ] **Step 6: Full verification bar, one last time**
