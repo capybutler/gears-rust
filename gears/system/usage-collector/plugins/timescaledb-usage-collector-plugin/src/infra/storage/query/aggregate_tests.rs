@@ -3,16 +3,25 @@
 //! the one caller-derived value is bound rather than interpolated, and that
 //! every fragment qualifies its columns with the alias the `FROM` clause
 //! declares.
+//!
+//! The alias guard's subject is **the assembled statement**, not this module:
+//! it is fed the shared builders in [`super::super`] as well, because a
+//! statement holding one qualified and one unqualified reference to the same
+//! column is exactly the drift the shared `FROM` constant exists to stop, and
+//! splitting the guard by which file emitted a fragment would let that through.
 
 use usage_collector_sdk::{
-    AggregationDimension, AggregationFold, MAX_AGGREGATION_BUCKETS, MetadataKey,
+    AggregationDimension, AggregationFold, MAX_AGGREGATION_BUCKETS, MetadataFilter, MetadataKey,
+    MeterTypeId, TimeRange,
 };
 
 use super::super::bind::SqlBind;
 use super::super::translate::SqlCtx;
+use super::super::{
+    ledger_from_clause, push_metadata_filter_clauses, push_meter_and_range_clauses,
+};
 use super::{
-    aggregate_from_clause, aggregate_limit_clause, dimension_select_expr, fold_select_expr,
-    withdrawal_exclusion_clause,
+    aggregate_limit_clause, dimension_select_expr, fold_select_expr, withdrawal_exclusion_clause,
 };
 
 #[test]
@@ -256,7 +265,7 @@ fn ledger_columns_are_the_migrations_columns() {
 }
 
 /// The aliases `sql` may qualify a column with. `r`, the alias
-/// [`aggregate_from_clause`] declares, is always admissible. `w` is admissible
+/// [`ledger_from_clause`] declares, is always admissible. `w` is admissible
 /// only in a fragment that declares it, so a fragment borrowing the withdrawal
 /// subquery's alias without opening the subquery is an offender rather than a
 /// pass.
@@ -306,8 +315,9 @@ fn misqualified_columns(sql: &str) -> Vec<&'static str> {
     offenders
 }
 
-/// Every fragment this module emits that can name a column — which is all of
-/// them but [`aggregate_limit_clause`], whose output is a row count.
+/// Every fragment an assembled ledger statement is built from that can name a
+/// column — this module's, all but [`aggregate_limit_clause`] whose output is a
+/// row count, plus the builders both read paths share.
 ///
 /// The two `match` statements are exhaustiveness witnesses and nothing else:
 /// adding a variant to either enum fails to compile *here*, next to the array
@@ -317,9 +327,27 @@ fn misqualified_columns(sql: &str) -> Vec<&'static str> {
 fn all_fragments() -> Vec<String> {
     let mut ctx = SqlCtx::new(1);
     let mut fragments: Vec<String> = vec![
-        aggregate_from_clause().to_owned(),
+        ledger_from_clause().to_owned(),
         withdrawal_exclusion_clause().to_owned(),
     ];
+    // The shared builders push into a clause vector rather than returning one
+    // fragment, so drain them into the same list the per-fragment guard walks.
+    push_meter_and_range_clauses(
+        &MeterTypeId::new("gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~")
+            .expect("valid meter id"),
+        TimeRange::new(
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid ts"),
+            time::OffsetDateTime::from_unix_timestamp(1_700_003_600).expect("valid ts"),
+        )
+        .expect("a strictly ordered range"),
+        &mut ctx,
+        &mut fragments,
+    );
+    push_metadata_filter_clauses(
+        &[MetadataFilter::new("region", ["eu-west-1"]).expect("valid metadata filter")],
+        &mut ctx,
+        &mut fragments,
+    );
     for fold in [
         AggregationFold::Sum,
         AggregationFold::Count,
@@ -359,16 +387,16 @@ fn all_fragments() -> Vec<String> {
 
 #[test]
 fn every_fragment_qualifies_its_columns_with_the_alias_the_from_clause_declares() {
-    // The alias is one constant both sides read (`aggregate_from_clause`), but
-    // the fragments still hard-code `r` in their text, so the two can drift.
-    // This is the half of that coupling this file can pin: no fragment may name
-    // a bare column, and none may reach for an alias it did not open, so a
-    // fragment drifting off `r` is caught here rather than by a query failing
-    // against a live database.
+    // The alias is one constant every read path reads (`ledger_from_clause`),
+    // but the fragments still hard-code `r` in their text, so the two can
+    // drift. This is the half of that coupling a pure test can pin: no fragment
+    // may name a bare column, and none may reach for an alias it did not open,
+    // so a fragment drifting off `r` is caught here rather than by a query
+    // failing against a live database.
     assert!(
-        aggregate_from_clause().ends_with(" r"),
+        ledger_from_clause().ends_with(" r"),
         "the FROM clause must declare the `r` every other fragment binds to, got {}",
-        aggregate_from_clause()
+        ledger_from_clause()
     );
     for fragment in all_fragments() {
         assert!(

@@ -1254,8 +1254,9 @@ fn parse_scope(raw: &str) -> ast::Expr {
 /// For the point lookup that is the `WHERE` alone; for the keyset page it also
 /// carries the table alias, the `ORDER BY` and the `LIMIT`, which is what lets
 /// one hand-transcribed string pin that the keyset tuple and the `ORDER BY`
-/// read the same order.
-fn where_clause(sql: &str) -> String {
+/// read the same order. Named for what it returns rather than for the clause it
+/// started out returning.
+fn statement_tail(sql: &str) -> String {
     sql.split_once(" FROM usage_records ")
         .unwrap_or_else(|| panic!("a built statement must read `usage_records`. got: {sql}"))
         .1
@@ -1263,7 +1264,7 @@ fn where_clause(sql: &str) -> String {
 }
 
 #[test]
-fn the_point_lookup_renders_the_scope_as_its_whole_where_clause() {
+fn the_point_lookup_renders_the_scope_as_its_whole_statement_tail() {
     let scope = parse_scope(&format!("tenant_id eq {SCOPE_TENANT_A}"));
 
     let (sql, _binds) = build_get_sql(&scope).expect("a scope must render");
@@ -1290,7 +1291,7 @@ fn the_point_lookup_binds_the_scope_values_after_the_id() {
     // started at `$1` the tenant predicate would read the id bind and the
     // statement would carry one more parameter than it names.
     assert_eq!(
-        where_clause(&sql),
+        statement_tail(&sql),
         "WHERE id = $1 AND ((tenant_id = $2 AND resource_type = $3))",
         "the scope's binds follow the id, which occupies $1"
     );
@@ -1328,7 +1329,7 @@ fn the_point_lookups_disjunctive_scope_survives_the_conjunction_with_the_id() {
 
     // Transcribed by hand, not derived from anything the builder produces.
     assert_eq!(
-        where_clause(&sql),
+        statement_tail(&sql),
         "WHERE id = $1 AND (((tenant_id = $2 AND resource_type = $3) \
          OR (tenant_id = $4 AND resource_type = $5)))",
         "every disjunct of the scope has to survive the conjunction with the id"
@@ -1352,7 +1353,7 @@ fn the_point_lookup_carries_no_invalidation_predicate() {
     // can see, because none executes a statement. Task 15 covers that half,
     // against a stored pair.
     let (sql, _binds) = build_get_sql(&scope).expect("a scope must render");
-    let predicate = where_clause(&sql);
+    let predicate = statement_tail(&sql);
 
     assert!(
         !predicate.contains("invalidates"),
@@ -1381,7 +1382,7 @@ fn the_point_lookup_renders_a_membership_scope_over_several_tenants() {
     let (sql, binds) = build_get_sql(&scope).expect("a scope must render");
 
     assert_eq!(
-        where_clause(&sql),
+        statement_tail(&sql),
         "WHERE id = $1 AND (tenant_id IN ($2, $3))",
         "a membership scope narrows the lookup to the tenants it names"
     );
@@ -1564,13 +1565,22 @@ fn a_field_that_is_not_a_keyset_key_mints_no_boundary() {
 //
 // `build_list_sql` and `build_list_page` are the two pure halves of `list`;
 // what is left in `list` itself is the round trip between them. Everything
-// below is asserted on those two, without a database — which is the only way
-// the fingerprint obligation is testable at all, since it has no compiler
-// backstop and no visible effect until page two.
+// below is asserted on those two, without a database. That matters here
+// because the fingerprint obligation has no compiler backstop and no visible
+// effect until page two: a unit test is what makes the mint observable at the
+// moment it happens, rather than a page later. (The live walk in
+// `tests/records_query_integration_pg.rs` decodes a `next_cursor` too — it is
+// stale and Task 15's, and it is a page later and behind Docker.)
 
-/// The gateway's read fingerprint. Opaque to the plugin: it covers the
-/// caller's `$filter` together with all three typed parameters, and nothing
-/// here may interpret or recompute it.
+/// A stand-in for the gateway's read fingerprint. Opaque to the plugin: it
+/// covers the caller's `$filter` together with all three typed parameters, and
+/// nothing here may interpret or recompute it.
+///
+/// **Deliberately not the shape the gateway mints** — `read_fingerprint` emits
+/// sixteen bare hex characters, and this carries a prefix and is longer. That
+/// is the point: a fixture in the real shape would let an implementation start
+/// depending on that shape with no test noticing, and the SPI says the value is
+/// opaque and "its shape is the gateway's to change".
 const READ_FINGERPRINT: &str = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 
 /// `[2023-11-14T00:00:00Z, 2023-11-15T00:00:00Z)` — the day that contains
@@ -1633,7 +1643,7 @@ fn selection_reads_the_period_end_alone() {
 
     let (sql, binds) = build_list_sql(&list_meter(), list_range(), &query, &[], 25)
         .expect("the canonical first page must render");
-    let tail = where_clause(&sql);
+    let tail = statement_tail(&sql);
 
     assert!(
         tail.contains("r.window_end >= $2"),
@@ -1775,9 +1785,19 @@ fn the_minted_boundary_is_read_in_the_order_it_was_handed() {
         .expect("an id-led page must assemble");
 
     assert_eq!(
-        page.items.len(),
-        2,
-        "the look-ahead row is dropped, not served"
+        page.items
+            .iter()
+            .map(|r| r.id.to_string())
+            .collect::<Vec<_>>(),
+        vec![
+            "00000000-0000-0000-0000-000000000001".to_owned(),
+            "00000000-0000-0000-0000-000000000002".to_owned(),
+        ],
+        "the look-ahead row is dropped, and the page serves the rest in the \
+         order it read them, so the boundary below is the key of the last row \
+         the caller actually saw. Counting the items instead leaves the two \
+         unrelated: reverse them and every continuation re-serves or skips \
+         rows while the boundary assertion goes on passing"
     );
     let token = page
         .page_info
@@ -1844,7 +1864,7 @@ fn the_composed_filter_survives_the_conjunction_with_the_range() {
 
     // Transcribed by hand, not derived from anything the builder produces.
     assert_eq!(
-        where_clause(&sql),
+        statement_tail(&sql),
         "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
          AND (((tenant_id = $4 AND resource_type = $5) \
          OR (tenant_id = $6 AND resource_type = $7))) \
@@ -1914,7 +1934,7 @@ fn the_keyset_tuple_and_the_order_by_read_one_order() {
 
     // Transcribed by hand.
     assert_eq!(
-        where_clause(&sql),
+        statement_tail(&sql),
         "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
          AND (id, window_end) < ($4, $5) \
          ORDER BY id DESC, window_end DESC LIMIT 26",
@@ -1943,9 +1963,9 @@ fn the_metadata_side_channel_is_bound_after_the_range() {
         .expect("a metadata-filtered page must render");
 
     assert_eq!(
-        where_clause(&sql),
+        statement_tail(&sql),
         "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
-         AND metadata ->> $4 IN ($5, $6) \
+         AND r.metadata ->> $4 IN ($5, $6) \
          ORDER BY window_end ASC, id ASC LIMIT 26"
     );
     assert_eq!(
@@ -1968,7 +1988,7 @@ fn the_ledger_page_withholds_no_withdrawn_entry() {
 
     let (sql, _) = build_list_sql(&list_meter(), list_range(), &query, &[], 25)
         .expect("the canonical first page must render");
-    let tail = where_clause(&sql);
+    let tail = statement_tail(&sql);
 
     assert!(
         !tail.contains("invalidates"),

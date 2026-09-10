@@ -2155,6 +2155,13 @@ than a literal, which is what makes the constant load-bearing rather than
 decorative. Two tests in this file back it: every fragment must qualify its
 columns with an alias it opened, and the `FROM` clause must declare `r`.
 
+**Moved by Task 11**, which made `list` a second reader of the alias: the
+function is now `query::ledger_from_clause()`, since a list path reaching into
+an `aggregate` module for its `FROM` is the wrong shape. Same body, same
+contract, same two tests — the qualification guard stays in `aggregate_tests.rs`
+and is now fed the shared builders too, so it guards the assembled statement
+rather than one module's output.
+
 - [ ] **Step 3: Rewrite `agg_select_expr` for the new fold set**
 
 ```rust
@@ -3352,6 +3359,11 @@ plugin that drops it recompiles clean and paginates exactly once.
 
 - [x] **Step 2: Write the failing tests** — DONE
 
+**Shipped as assertions on `build_list_sql` / `build_list_page`** — the two
+pure halves `list` was split into. No separate `build_time_range_clause` or
+`mint_next_cursor` was introduced; the code block below names them, and they
+exist nowhere.
+
 ```rust
 #[test]
 fn selection_reads_the_period_end_alone() {
@@ -3553,6 +3565,18 @@ WHERE r.gts_type_id = $1
 The table **must** be aliased `r` — `withdrawal_exclusion_clause` binds to it.
 Grep the assembled SQL in a test rather than assuming.
 
+**Task 11 hoisted three of those lines into `query.rs`; consume them, do not
+transcribe them.** `ledger_from_clause()` is the `FROM` (it moved out of
+`aggregate.rs`, which is why `aggregate_from_clause` no longer exists),
+`push_meter_and_range_clauses(&gts_type_id, time_range, &mut ctx, &mut clauses)`
+is the meter-and-range predicate, and `push_metadata_filter_clauses` is the
+side channel — the last now emitting the **alias-qualified**
+`r.metadata ->> $N`, which is what Step 2b's presence guard needs to sit beside
+without one statement holding a qualified and an unqualified reference to one
+column. Reading the range predicate rather than transcribing it is the point:
+DIVERGENCES §F says getting it wrong fails `window-end-selection` **and**
+`quantity-round-trip` at once, and `list` already has the test that notices.
+
 - [ ] **Step 2b: Three things Task 8 hands to this task**
 
 **1. `agg_select_expr` is now `fold_select_expr(fold) -> &'static str`, with
@@ -3566,17 +3590,20 @@ fold". Push `fold_select_expr(fold).to_owned()` and nothing else. The "ordered
 pick, not an aggregate function" observation survives as doc on the arm's
 constant, which is where it belongs.
 
-**1b. Build the `FROM` from `aggregate_from_clause()`, and assert it in the
-test.** The `r` alias is no longer a convention two files honour separately —
-the module exports the clause (`"usage_records r"`), a test asserts it declares
-`r`, and every other fragment binds to it. Write
-`format!("SELECT {select_list} FROM {} WHERE …", aggregate_from_clause())`
-rather than spelling the table and alias again here.
+**1b. Build the `FROM` from `ledger_from_clause()`, and assert it in the
+test.** The `r` alias is no longer a convention several files honour separately
+— `query.rs` exports the clause (`"usage_records r"`), a test asserts it
+declares `r`, `list` already builds its `FROM` from it, and every fragment binds
+to it. Write
+`format!("SELECT {select_list} FROM {} WHERE …", ledger_from_clause())`
+rather than spelling the table and alias again here. (Task 11 moved this out of
+`aggregate.rs`: it serves both read paths now, so `list` reaching into an
+`aggregate` module for it would have been the wrong shape.)
 
 **The last link is yours, and it is one character of test.** Nothing forces this
 task to *call* the function: the fragments still spell `r` in their own text,
 and Task 8's tests can only pin that they agree with each other. So the
-assembled-SQL test must assert `sql.contains(aggregate_from_clause())` and
+assembled-SQL test must assert `sql.contains(ledger_from_clause())` and
 **not** a literal `"usage_records r"`. With the literal, the constant is
 decorative and a future alias change reds a test that then gets "fixed" by
 editing the literal; with the call, the two sides cannot drift without the test

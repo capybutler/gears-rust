@@ -3,10 +3,11 @@
 //!
 //! The fragments compose into `SELECT <dim exprs…>, <fold expr> FROM <from
 //! clause> WHERE <scope> AND <withdrawal exclusion> [AND …] [GROUP BY 1, 2, …]
-//! [LIMIT …]`. Only the scope predicates are the caller's:
+//! [LIMIT …]`. The `FROM` clause is not this module's: it is
+//! [`super::ledger_from_clause`], shared with the list path, and every fragment
+//! below qualifies its columns with the `r` alias that clause declares. Only
+//! the scope predicates are the caller's:
 //!
-//! - [`aggregate_from_clause`] — the ledger table and the `r` alias every other
-//!   fragment qualifies its columns with.
 //! - [`fold_select_expr`] — the folded column, one arm per fold.
 //! - [`withdrawal_exclusion_clause`] — the two obligations a withdrawn pair
 //!   places on every fold.
@@ -21,17 +22,6 @@ use usage_collector_sdk::{AggregationDimension, AggregationFold, MAX_AGGREGATION
 
 use super::bind::SqlBind;
 use super::translate::SqlCtx;
-
-/// The aggregate query's `FROM` clause: the ledger table and the alias every
-/// other fragment here binds to.
-///
-/// It exists so the alias is one constant both sides read rather than a
-/// convention two files independently honour — a caller spelling its own `FROM`
-/// can pick a different one with no compile error and invalid SQL at runtime.
-#[must_use]
-pub fn aggregate_from_clause() -> &'static str {
-    "usage_records r"
-}
 
 /// The [`AggregationFold::Latest`] arm of [`fold_select_expr`].
 ///
@@ -66,7 +56,7 @@ const LATEST_SELECT_EXPR: &str =
 ///
 /// The returned string is a `'static` constant from the closed enum match,
 /// never caller text. Each arm naming a column qualifies it with the alias
-/// [`aggregate_from_clause`] declares; `COUNT(*)` names none.
+/// [`super::ledger_from_clause`] declares; `COUNT(*)` names none.
 #[must_use]
 pub fn fold_select_expr(fold: AggregationFold) -> &'static str {
     match fold {
@@ -102,8 +92,8 @@ pub fn fold_select_expr(fold: AggregationFold) -> &'static str {
 ///
 /// # Precondition
 ///
-/// The outer query's `FROM` must be [`aggregate_from_clause`] — `r` is what both
-/// conjuncts bind against, and the subquery's own `w` is what keeps
+/// The outer query's `FROM` must be [`super::ledger_from_clause`] — `r` is what
+/// both conjuncts bind against, and the subquery's own `w` is what keeps
 /// `w.invalidates = r.id` unambiguous. The returned string is a `'static`
 /// constant, never caller text.
 #[must_use]

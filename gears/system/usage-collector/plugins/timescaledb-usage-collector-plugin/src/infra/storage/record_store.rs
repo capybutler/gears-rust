@@ -46,13 +46,16 @@ use crate::infra::storage::mapper::{
 use crate::infra::storage::query::aggregate::{
     agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
 };
-use crate::infra::storage::query::effective_page_size;
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
 };
 use crate::infra::storage::query::translate::{
     SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_record_filter,
     translate_scope,
+};
+use crate::infra::storage::query::{
+    effective_page_size, ledger_from_clause, push_metadata_filter_clauses,
+    push_meter_and_range_clauses,
 };
 
 /// Default page size when the caller omits `$top` (`query.limit`).
@@ -1062,38 +1065,6 @@ async fn find_existing_invalidation(
     .await
 }
 
-/// Append the metadata side-channel filters as parameterized `WHERE` clauses.
-///
-/// Shared by [`PgRecordStore::list`] and [`PgRecordStore::aggregate`] so both
-/// expand the side channel identically: AND across filters, OR within one
-/// filter's values (`metadata ->> $key IN ($v1, $v2, …)`). The key and every
-/// value are bound via `ctx` (`$N`); only the `metadata ->> $N` shape is
-/// interpolated, so this is injection-safe. An empty value set matches nothing
-/// (the gateway rejects it, but be defensive): a `FALSE` clause is emitted so
-/// the result is empty rather than unfiltered.
-fn push_metadata_filter_clauses(
-    metadata_filter: &[MetadataFilter],
-    ctx: &mut SqlCtx,
-    clauses: &mut Vec<String>,
-) {
-    for mf in metadata_filter {
-        if mf.values().is_empty() {
-            clauses.push("FALSE".to_owned());
-            continue;
-        }
-        let key_n = ctx.push(SqlBind::Str(mf.key().as_str().to_owned()));
-        let placeholders = mf
-            .values()
-            .iter()
-            .map(|v| format!("${}", ctx.push(SqlBind::Str(v.clone()))))
-            .collect::<Vec<_>>();
-        clauses.push(format!(
-            "metadata ->> ${key_n} IN ({})",
-            placeholders.join(", ")
-        ));
-    }
-}
-
 /// Extract a single order-field value from a row as its cursor-key string.
 ///
 /// Inverse of [`cursor_key_to_bind`](crate::infra::storage::query::keyset::cursor_key_to_bind):
@@ -1104,10 +1075,14 @@ fn push_metadata_filter_clauses(
 ///
 /// **The arms are [`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`], and that
 /// is the whole rule.** A key that is not on that list is one the SDK does not
-/// promise every entry carries, so it cannot seed a boundary at all — a `NULL`
-/// compares as `NULL` inside the row-value tuple and silently drops the row.
-/// `None` therefore means "this order field is not a keyset key on the row",
-/// which is a refusal to mint rather than a missing value.
+/// carry as an attribute of every entry *in its own right* — either it can be
+/// absent, or it is derived from an attribute that can be. For the first kind a
+/// `NULL` compares as `NULL` inside the row-value tuple and silently drops the
+/// row; for the second the SDK simply gives no guarantee to rest a keyset on.
+/// `entry_type` is the case that makes the distinction necessary: it is present
+/// on every entry, and still not keyset-safe. `None` here therefore means "this
+/// order field is not a keyset key on the row", which is a refusal to mint
+/// rather than a missing value.
 ///
 /// This is one half of a two-sided map: [`record_column`] resolves an order
 /// field to the column the `ORDER BY` and the keyset tuple are rendered from,
@@ -1188,10 +1163,12 @@ fn build_get_sql(scope: &ast::Expr) -> Result<(String, Vec<SqlBind>), String> {
 /// The `WHERE` is assembled in bind order: the meter at `$1`, the covered
 /// period's two bounds at `$2` and `$3`, then the caller's composed `$filter`,
 /// the metadata side channel, and the keyset continuation. Identifiers come
-/// from the [`record_column`] allowlist, the static [`RECORD_COLUMNS`], and
-/// this function's own literal column names — `r.gts_type_id`, `r.window_end`,
-/// and the side channel's `metadata ->>`. None of the three is caller input;
-/// every caller-derived value is bound.
+/// from the [`record_column`] allowlist, the static [`RECORD_COLUMNS`], and the
+/// literal column names the shared builders write — `r.gts_type_id` and
+/// `r.window_end` from [`push_meter_and_range_clauses`], `r.metadata ->>` from
+/// [`push_metadata_filter_clauses`]. None is caller input, and every
+/// caller-derived value is bound, save the clamped page size, which is a `u64`
+/// this function renders itself into the `LIMIT`.
 ///
 /// **Selection reads the covered-period end alone** — `from <= window_end <
 /// to`, per `cpt-cf-usage-collector-adr-window-end-selection` — and the
@@ -1232,20 +1209,12 @@ fn build_list_sql(
     limit: u64,
 ) -> Result<(String, Vec<SqlBind>), String> {
     let mut ctx = SqlCtx::new(1);
-    let mut clauses = vec![
-        format!(
-            "r.gts_type_id = ${}",
-            ctx.push(SqlBind::Str(gts_type_id.as_str().to_owned()))
-        ),
-        format!(
-            "r.window_end >= ${}",
-            ctx.push(SqlBind::DateTime(time_range.lower_inclusive()))
-        ),
-        format!(
-            "r.window_end < ${}",
-            ctx.push(SqlBind::DateTime(time_range.upper_exclusive()))
-        ),
-    ];
+    let mut clauses: Vec<String> = Vec::new();
+
+    // The meter scope and the covered-period range, from the one spelling both
+    // read paths share. Read rather than transcribed, so `aggregate` cannot
+    // drift from this on the ADR obligation both are held to.
+    push_meter_and_range_clauses(gts_type_id, time_range, &mut ctx, &mut clauses);
 
     // The composed `$filter`, through the seam every read path shares. What
     // arrives is the caller's filter `And`-composed with the compiled PDP
@@ -1305,11 +1274,17 @@ fn build_list_sql(
 
     Ok((
         format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records r WHERE {} ORDER BY {order_sql} \
-             LIMIT {}",
+            "SELECT {RECORD_COLUMNS} FROM {} WHERE {} ORDER BY {order_sql} LIMIT {}",
+            // Called, never spelled: with a literal here the shared constant
+            // would be decorative, and an alias change would red a test that
+            // then gets "fixed" by editing the literal back.
+            ledger_from_clause(),
             clauses.join(" AND "),
-            // The look-ahead: one row past the page, to tell "this is the last
-            // page" from "there is another" without a second query.
+            // The look-ahead: one row past the page, so the page can tell "this
+            // is the last page" from "there is another" without a second query.
+            // [`build_list_page`] consumes it, and its `rows.len() > page_size`
+            // is the other half of this convention — the `+ 1` here is what
+            // makes that `>` correct rather than `>=`.
             limit.saturating_add(1),
         ),
         ctx.binds,
@@ -1332,12 +1307,25 @@ fn build_list_sql(
 /// caller ordering by `id` gets its keys in that order rather than in a
 /// canonical one this function assumed.
 ///
+/// # Precondition
+///
+/// `limit >= 1`, and `rows` is the look-ahead read
+/// [`build_list_sql`] asked for — at most `limit + 1` rows. The two halves of
+/// that convention are the `+ 1` there and the `rows.len() > page_size` here:
+/// the `>` is correct precisely because the extra row was requested, and would
+/// have to be `>=` if it were not. [`effective_page_size`] is what floors the
+/// limit to 1; this signature does not, so a caller passing `0` truncates the
+/// whole page away and reaches the `Err` below.
+///
 /// # Errors
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] when `query.filter_hash` is
 /// absent (a gateway breach, not a case to paper over), when an order field is
 /// not a keyset key on the row, when the cursor cannot be encoded, or when a
-/// stored row cannot be mapped to the SDK model.
+/// stored row cannot be mapped to the SDK model — and, distinctly from all
+/// four, `"non-empty page lost its tail"` when the precondition above is
+/// broken, which is a bug in this crate rather than anything a caller of the
+/// SPI can provoke.
 fn build_list_page(
     mut rows: Vec<UsageRecordRow>,
     query: &ODataQuery,
@@ -1941,9 +1929,10 @@ impl RecordStore for PgRecordStore {
     ///
     /// The statement is [`build_list_sql`]'s and the page is
     /// [`build_list_page`]'s; what is left here is the round trip between
-    /// them. Both halves are pure, so both are tested without a database —
-    /// which is the only way the fingerprint obligation below is testable at
-    /// all.
+    /// them. Both halves are pure, so both are tested without a database. That
+    /// matters here because the fingerprint obligation below has no compiler
+    /// backstop and no visible effect until page two: a unit test is what makes
+    /// the mint observable at the moment it happens, rather than a page later.
     ///
     /// Selection reads the covered-period end alone, `from <= window_end <
     /// to`; entries are returned as persisted, withdrawn pairs included; and
