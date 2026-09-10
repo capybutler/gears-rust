@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use toolkit_macros::domain_model;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
@@ -43,8 +43,12 @@ impl UsageCollectorPluginV1 for StorageAdapter {
         self.record.create_batch(records).await
     }
 
-    async fn get_usage_record(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
-        self.record.get(id).await
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        self.record.get(id, scope).await
     }
 
     async fn query_aggregated_usage_records(

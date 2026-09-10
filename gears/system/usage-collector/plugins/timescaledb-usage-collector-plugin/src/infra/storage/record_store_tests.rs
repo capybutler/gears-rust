@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
+use toolkit_odata::ast;
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use usage_collector_sdk::{UsageCollectorPluginError, UsageTypeGtsId};
 
@@ -16,13 +17,14 @@ use super::{
     ConflictRead, DedupKey, INSERT_COLUMNS, INSERT_COLUMN_ARRAY_TYPES, InsertColumns,
     BATCH_INSERT_SQL, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS, SINGLE_INSERT_SQL,
     batch_retry_backoff,
-    batch_retry_backoff_base, canonical_equal, dedup_key, invalidation_index_slots,
-    is_retryable_batch_error, plan_batch, row_dedup_key, scope_runs, sequence_block,
-    with_retry,
+    batch_retry_backoff_base, build_get_sql, canonical_equal, dedup_key,
+    invalidation_index_slots, is_retryable_batch_error, plan_batch, row_dedup_key, scope_runs,
+    sequence_block, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
 use crate::infra::storage::entity::UsageRecordRow;
+use crate::infra::storage::query::translate::SqlBind;
 
 /// A valid meter type id: the reserved base plus one derivation segment,
 /// `~`-terminated, which is what `MeterTypeId::new` validates.
@@ -1207,11 +1209,191 @@ async fn acquire_failure_clears_ready_gauge() {
     );
 }
 
-// --- Read-half tests (Tasks 10-12) ------------------------------------------
+// --- Task 10: the point lookup intersects the compiled scope -----------------
+//
+// The SPI hands `get` the caller's compiled PDP scope and no caller `$filter`,
+// so the scope is the whole filter beyond the `id`. Slice 3 retired the
+// gateway's in-process per-record attribution check, which means nothing above
+// the SPI re-reads the row that comes back: everything below tests the only
+// remaining place "exists but not yours reads as NotFound" is kept.
+
+/// The tenant the scopes below admit.
+const SCOPE_TENANT_A: &str = "11111111-1111-1111-1111-111111111111";
+/// A second admitted tenant, so a scope can take the disjunctive shape
+/// `authz::scope_to_odata_filter` actually compiles.
+const SCOPE_TENANT_B: &str = "22222222-2222-2222-2222-222222222222";
+
+/// Compile a scope the way the gateway hands one over: an
+/// `toolkit_odata::ast::Expr`. `authz::scope_to_odata_filter` builds the same
+/// AST from PDP constraints; a filter string is just its readable spelling, and
+/// keeps these tests naming the predicate rather than assembling `Box<Expr>`
+/// towers.
+fn parse_scope(raw: &str) -> ast::Expr {
+    toolkit_odata::parse_filter_string(raw)
+        .unwrap_or_else(|e| panic!("the test's own scope must parse: {e}"))
+        .into_expr()
+}
+
+/// The `WHERE …` tail of a built statement, so an expectation can be written
+/// out by hand without restating [`RECORD_COLUMNS`] — which has its own,
+/// independent, oracle elsewhere.
+fn where_clause(sql: &str) -> String {
+    sql.split_once(" FROM usage_records ")
+        .unwrap_or_else(|| panic!("the point lookup must read `usage_records`. got: {sql}"))
+        .1
+        .to_owned()
+}
+
+#[test]
+fn the_point_lookup_renders_the_scope_as_its_whole_where_clause() {
+    let scope = parse_scope(&format!("tenant_id eq {SCOPE_TENANT_A}"));
+
+    let (sql, _ctx) = build_get_sql(&scope).expect("a scope must render");
+
+    assert!(
+        sql.contains("WHERE id = $1 AND ("),
+        "the point lookup carries no caller filter, so the compiled scope is \
+         the whole filter the row must satisfy; a lookup that selects on id \
+         alone is an existence oracle. got: {sql}"
+    );
+}
+
+#[test]
+fn the_point_lookup_binds_the_scope_values_after_the_id() {
+    // Two conjuncts of different value types, so a dropped or reordered bind
+    // shows up as a different variant rather than a different uuid.
+    let scope = parse_scope(&format!(
+        "tenant_id eq {SCOPE_TENANT_A} and resource_type eq 'vm'"
+    ));
+
+    let (sql, ctx) = build_get_sql(&scope).expect("a scope must render");
+
+    // The `id` owns `$1`, so the scope's own binds start at `$2`. If they
+    // started at `$1` the tenant predicate would read the id bind and the
+    // statement would carry one more parameter than it names.
+    assert_eq!(
+        where_clause(&sql),
+        "WHERE id = $1 AND ((tenant_id = $2 AND resource_type = $3))",
+        "the scope's binds follow the id, which occupies $1"
+    );
+    assert_eq!(
+        ctx.binds.len(),
+        2,
+        "both scope operands must be bound, in placeholder order. got: {:?}",
+        ctx.binds
+    );
+    assert!(
+        matches!(&ctx.binds[0], SqlBind::Uuid(u) if u.to_string() == SCOPE_TENANT_A),
+        "$2 is the tenant the scope pins. got: {:?}",
+        ctx.binds[0]
+    );
+    assert!(
+        matches!(&ctx.binds[1], SqlBind::Str(s) if s == "vm"),
+        "$3 is the resource type the scope pins. got: {:?}",
+        ctx.binds[1]
+    );
+}
+
+#[test]
+fn the_point_lookup_wraps_a_disjunctive_scope_in_its_own_parentheses() {
+    // The shape `authz::scope_to_odata_filter` compiles: a disjunction of
+    // tenant-pinned conjunctions. Conjoined without parentheses of its own,
+    // `id = $1 AND A OR B` binds as `(id = $1 AND A) OR B` and answers every
+    // row matching the last disjunct, whatever id was asked for.
+    let scope = parse_scope(&format!(
+        "(tenant_id eq {SCOPE_TENANT_A} and resource_type eq 'vm') or \
+         (tenant_id eq {SCOPE_TENANT_B} and resource_type eq 'vm')"
+    ));
+
+    let (sql, ctx) = build_get_sql(&scope).expect("a scope must render");
+
+    // Transcribed by hand, not derived from anything the builder produces.
+    assert_eq!(
+        where_clause(&sql),
+        "WHERE id = $1 AND (((tenant_id = $2 AND resource_type = $3) \
+         OR (tenant_id = $4 AND resource_type = $5)))",
+        "every disjunct of the scope has to survive the conjunction with the id"
+    );
+    assert_eq!(ctx.binds.len(), 4, "four operands, four binds");
+}
+
+#[test]
+fn the_point_lookup_carries_no_invalidation_predicate() {
+    // Step 4's obligation, as a test rather than only a comment. The fold
+    // excludes a withdrawn pair; this path is the ledger and MUST return one as
+    // persisted. The scope below names neither column, so anything matching in
+    // the predicate was added by the query builder. The select list is exempt
+    // and has to be: `invalidates` is one of the columns a withdrawn entry is
+    // read back *through*.
+    let scope = parse_scope(&format!("tenant_id eq {SCOPE_TENANT_A}"));
+
+    let (sql, _ctx) = build_get_sql(&scope).expect("a scope must render");
+    let predicate = where_clause(&sql);
+
+    assert!(
+        !predicate.contains("invalidates"),
+        "a withdrawn entry MUST be returned as persisted here; an `invalidates` \
+         predicate on the ledger path destroys the audit trail the append-only \
+         model exists to keep, and the exclusion belongs to the fold. \
+         got: {predicate}"
+    );
+    assert!(
+        !predicate.contains("entry_type"),
+        "restricting the point lookup to `entry_type = 'record'` withholds the \
+         invalidation half of a withdrawn pair, which is the same data loss by \
+         another spelling. got: {predicate}"
+    );
+}
+
+#[test]
+fn a_scope_naming_a_field_off_the_allowlist_is_refused() {
+    // `gts_type_id` is a typed SPI parameter, deliberately absent from the
+    // filterable schema and from `record_column`. A scope naming it must be an
+    // error: dropping the unrenderable conjunct would leave `WHERE id = $1`,
+    // turning a translation failure into an authorization bypass.
+    let scope = parse_scope("gts_type_id eq 'gts.cf.core.uc.usage_record.v1~'");
+
+    let Err(err) = build_get_sql(&scope) else {
+        panic!("a scope naming a field off the allowlist must not render");
+    };
+
+    assert!(
+        err.contains("gts_type_id"),
+        "the refusal names the field it refused. got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_scope_that_fails_to_translate_never_reaches_the_pool() {
+    // The half the pure test above cannot see: that `get` propagates the
+    // refusal instead of reading without it. The store's pool is lazy and
+    // points at nothing, so any path that got as far as acquiring a connection
+    // answers `Transient` (a pool timeout). An `Internal` naming the scope is
+    // therefore proof the lookup stopped before it read anything.
+    let store = lazy_store();
+    let scope = parse_scope("gts_type_id eq 'gts.cf.core.uc.usage_record.v1~'");
+
+    let Err(err) = store.get(uuid::Uuid::from_u128(1), &scope).await else {
+        panic!("an untranslatable scope must not yield a row");
+    };
+
+    match err {
+        UsageCollectorPluginError::Internal(message) => assert!(
+            message.contains("gts_type_id"),
+            "the refusal reaches the caller as-is. got: {message}"
+        ),
+        other => panic!(
+            "an untranslatable scope must stop the lookup before it acquires a \
+             connection; reaching the pool would answer Transient. got: {other:?}"
+        ),
+    }
+}
+
+// --- Read-half tests (Tasks 11-12) ------------------------------------------
 //
 // These still exercise the retired column model and the pre-port `list`
-// signature. They are the read half's to bring current; nothing below this
-// line is Task 9's.
+// signature. They are `list`'s and `aggregate`'s to bring current; nothing
+// below this line is Task 9's or Task 10's.
 
 #[tokio::test]
 async fn list_rejects_cursor_whose_sort_order_differs_from_query() {

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
@@ -15,7 +15,18 @@ pub trait RecordStore: Send + Sync + 'static {
         &self,
         records: Vec<UsageRecord>,
     ) -> Result<Vec<Result<UsageRecord, UsageCollectorPluginError>>, UsageCollectorPluginError>;
-    async fn get(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError>;
+    /// Read one entry by its `id`, intersected with the caller's compiled
+    /// PDP scope.
+    ///
+    /// `scope` is the *whole* filter the row must satisfy: this path carries
+    /// no caller-supplied `$filter` of its own. An entry outside it reads as
+    /// [`UsageCollectorPluginError::UsageRecordNotFound`], indistinguishable
+    /// from one that was never stored.
+    async fn get(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError>;
     async fn list(
         &self,
         gts_id: UsageTypeGtsId,

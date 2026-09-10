@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
 use toolkit_odata::filter::{FilterField, convert_expr_to_filter_node};
-use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, SortDir};
+use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, SortDir, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
@@ -1105,6 +1105,55 @@ fn record_row_key(row: &UsageRecordRow, field: &str) -> Option<String> {
     }
 }
 
+/// Build the point-lookup SQL and the binds that go with it: the asked-for
+/// `id` at `$1`, conjoined with the caller's compiled PDP scope.
+///
+/// **The scope is the whole filter beyond the `id`.** This path carries no
+/// caller-supplied `$filter`, and nothing above the SPI re-checks the row that
+/// comes back, so a lookup selecting on `id` alone would answer with any row
+/// whose `id` a caller can name — an existence oracle over every tenant's
+/// entries.
+///
+/// The scope reaches SQL by the one road a `$filter` takes.
+/// [`convert_expr_to_filter_node`] resolves every identifier against the SDK's
+/// filterable schema (`UsageRecordFilterField`), and
+/// [`translate_record_filter`] resolves it again against the closed
+/// [`record_column`] allowlist and binds every value as `$N`. There is no
+/// second translator here, so there is exactly one place an identifier can
+/// reach the SQL string, and it is the same place `list` and `aggregate` use.
+///
+/// Binds start at `$2` because the `id` occupies `$1`; [`PgRecordStore::get`]
+/// binds the `id` first, before this context's binds, for that reason.
+///
+/// The rendered fragment gets its own parentheses. Every fragment
+/// [`translate_record_filter`] can return today is already self-delimiting,
+/// but what `authz::scope_to_odata_filter` compiles is a *disjunction* of
+/// tenant-pinned conjunctions, and an unparenthesized `A OR B` conjoined after
+/// `id = $1` would bind as `(id = $1 AND A) OR B` — returning every row that
+/// matches `B`, whatever `id` was asked for. The parentheses cost nothing and
+/// take the question away from a future reader of the translator.
+///
+/// # Errors
+///
+/// Returns the message from whichever stage refused the scope: an identifier
+/// off the allowlist, an operator SQL cannot express, an empty `IN` list, or a
+/// value that cannot be bound. **The caller must propagate it.** A scope that
+/// fails to translate and is dropped instead leaves `WHERE id = $1` — a
+/// translation failure turned into an authorization bypass — so this returns
+/// `Err` rather than a partial fragment, and it is the only producer of this
+/// path's SQL.
+fn build_get_sql(scope: &ast::Expr) -> Result<(String, SqlCtx), String> {
+    // `$1` is the `id`; every scope bind therefore starts at `$2`.
+    let mut ctx = SqlCtx::new(2);
+    let node = convert_expr_to_filter_node::<UsageRecordFilterField>(scope)
+        .map_err(|e| format!("invalid scope: {e}"))?;
+    let fragment = translate_record_filter(&node, &mut ctx)?;
+    Ok((
+        format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1 AND ({fragment})"),
+        ctx,
+    ))
+}
+
 /// The dedup identity, mirroring the `usage_records_dedup_uniq` UNIQUE
 /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)` — the
 /// same five inputs the entry `id` is a `UUIDv5` projection of
@@ -1577,7 +1626,20 @@ impl RecordStore for PgRecordStore {
         result
     }
 
-    async fn get(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
+    /// Point lookup by `id`, intersected with the caller's compiled PDP scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorPluginError::UsageRecordNotFound`] when no row
+    /// satisfies both the `id` and the scope — the two cases are one answer, on
+    /// purpose — [`UsageCollectorPluginError::Internal`] when the scope cannot
+    /// be translated or a stored row cannot be mapped, and the mapped backend
+    /// error when the query itself fails.
+    async fn get(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
         // Lookup by the public `id`. This relies on a one-record-per-`id`
         // contract, which the hypertable schema cannot enforce on its own — a
         // `UNIQUE` there must include the `window_end` partition column, so only
@@ -1590,16 +1652,43 @@ impl RecordStore for PgRecordStore {
         // exactly this plugin's dedup identity — the same five inputs
         // `usage_records_dedup_uniq` is built over — so each stored row carries
         // a distinct `id` and `WHERE id = $1` matches at most one row.
-        let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1");
+        //
+        // **No `invalidates` predicate belongs in this query, and none ever
+        // will.** The asymmetry with the fold is deliberate, not an oversight
+        // waiting to be tidied up: `aggregate` excludes a withdrawn pair
+        // because a total that counts a withdrawn entry is a wrong total, and
+        // that is a derived view. This is the ledger itself. The SPI states it
+        // outright — a withdrawn pair MUST be returned as persisted, and a
+        // plugin MUST NOT withhold a withdrawn entry from this path as a
+        // kindness — because hiding either half destroys the audit trail the
+        // append-only model exists to keep, and there is no other surface that
+        // can read back what was withdrawn. A consumer that wants the netted
+        // view has what it needs: an invalidation names its target
+        // (`UsageRecord::invalidation`), so the fold happens on the reader's
+        // side. Neither `invalidates IS NULL` nor an `entry_type` restriction
+        // is a kindness here; both are data loss
+        // (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+        //
+        // The scope is translated before a connection is acquired, so a scope
+        // that cannot be rendered never reaches the pool and never reads a row.
+        let (sql, ctx) = build_get_sql(scope).map_err(UsageCollectorPluginError::internal)?;
+        let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).bind(id);
+        for b in &ctx.binds {
+            q = bind_one(q, b);
+        }
         let mut conn = self.timed_acquire().await?;
-        let row = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
-            .bind(id)
+        let row = q
             .fetch_optional(&mut *conn)
             .await
             .map_err(|err| self.record_backend_error(&err))?;
 
         match row {
             Some(row) => record_row_to_model(row),
+            // One arm for both "no such entry" and "exists, but outside your
+            // scope": the scope is part of the `WHERE`, so a withheld row is
+            // already indistinguishable from an absent one by the time we get
+            // here. Nothing may be logged, counted or timed that would tell
+            // them apart — that distinction *is* the existence oracle.
             None => Err(UsageCollectorPluginError::UsageRecordNotFound { id }),
         }
     }
