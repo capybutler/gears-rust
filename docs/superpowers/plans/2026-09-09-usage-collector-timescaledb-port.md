@@ -3121,21 +3121,6 @@ retry."
 
 ---
 
-> **Inherited from Task 9's review — three citations in the read half point at
-> files that do not exist.** `record_store.rs` cites `plugin-spi.md` at three
-> places in code Tasks 11-12 own: `:1873` and `:1910` (the `corrects_id`
-> partition rationale, §Method 3) and `:1968` (the aggregate cap, §Method 3).
-> (Line numbers refreshed after Task 10 inserted `build_get_sql`; all three are
-> still inside `aggregate` and still untouched.)
-> **`git ls-files | grep -iE 'plugin-spi|domain-model'` is empty** — neither
-> file is in the tree, and the string "Plugin-specific outputs" appears nowhere
-> but in this one source file. The SPI is rustdoc on
-> `usage_collector_sdk::UsageCollectorPluginV1`. Task 9 removed the two in its
-> own paragraph (`canonical_equal`) rather than propagate them; **whichever of
-> Tasks 10-12 rewrites each of these three should re-point it at the rustdoc
-> that actually says the thing, or drop the reference** — do not carry it
-> across. All three sit in `aggregate`, so in practice this is Task 12's.
-
 ## Task 10: `get_usage_record` intersects the compiled scope
 
 The SPI signature grew a parameter and it is not cosmetic. Slice 3 retired the
@@ -3212,7 +3197,8 @@ obligation to prevent, and it must make this red.
 
 - [x] **Step 3: Implement** — DONE
 
-`get` was at `:1638`, not `:982` (Task 9 moved the file substantially); it builds `SELECT {RECORD_COLUMNS} FROM usage_records WHERE
+`get` was at **`:1580`** at this task's base (`b37f1b470`), not `:982` — Task 9
+moved the file substantially. It built `SELECT {RECORD_COLUMNS} FROM usage_records WHERE
 id = $1`. It must now conjoin the translated scope. `translate.rs` already has
 the filter-AST-to-SQL machinery `list` uses; reuse it — a second translator is
 two implementations of one security boundary.
@@ -3260,6 +3246,24 @@ the exclusion belongs to the fold.
 BREAKING CHANGE: RecordStore::get takes the compiled scope."
 ```
 
+> **The compiled-scope seam lives in `translate.rs`, and Tasks 11-12 must call
+> it.** `translate_scope(scope: &ast::Expr, ctx: &mut SqlCtx) -> Result<String,
+> String>` is the one road from the `ast::Expr` a read path is handed to the
+> SQL it may conjoin: it owns both allowlist gates
+> (`convert_expr_to_filter_node::<UsageRecordFilterField>` then
+> `translate_record_filter` over `record_column`), the `invalid scope:` error
+> prefix, and — the part a caller cannot supply for itself — the **parentheses
+> that make the fragment safe to conjoin**. `AND` binds tighter than `OR`, and
+> `authz::scope_to_odata_filter` folds its constraints into a left-nested `or`
+> chain of tenant-pinned conjunctions (the `disjunction` loop in
+> `usage-collector/src/domain/authz.rs`), so a fragment pushed unparenthesized
+> into a `clauses.join(" AND ")` reads as `(leading AND A) OR B` — every row
+> matching the last disjunct. `list` and `aggregate` push their translated
+> `$filter` fragment exactly that way today — both `clauses.push(fragment)`
+> sites, named by symbol because these line numbers move every task — and get
+> none of the protection `get` has. **Replace those four-line blocks with `translate_scope`; do not
+> transcribe them a third and fourth time.**
+>
 > **What Task 10 leaves.**
 >
 > * **One named mutation survives, and it is not a silent one.** Deleting
@@ -3393,6 +3397,14 @@ Test 2's mutation is the important one. Name it out loud in the task report.
 
 - [ ] **Step 3: Implement**
 
+**Translate `query.filter` through `translate_scope`** (Task 10,
+`query/translate.rs`) rather than repeating the
+`convert_expr_to_filter_node` + `translate_record_filter` pair inline. It
+returns a parenthesized fragment, so pushing it into `clauses` is safe; the
+inline version here is not, and what arrives in `query.filter` is the
+gateway's composition of the compiled PDP scope with the caller's filter —
+a disjunction of tenant-pinned conjunctions at its outermost level.
+
 Rewrite `list` (`:1028`). The shape:
 
 ```sql
@@ -3457,6 +3469,20 @@ parameters."
 
 ## Task 12: `query_aggregated_usage_records`
 
+> **Inherited from Task 9's review, and now Task 12's — three citations in
+> `aggregate` point at files that do not exist.** `record_store.rs` cites
+> `plugin-spi.md` §Method 3 in three places, **anchored by symbol rather than
+> by line, because the line numbers have already gone stale twice**: in
+> `aggregate`'s rustdoc (the `corrects_id` partition rationale), in the
+> `corrects_id` partition comment inside the body, and at the aggregate cap
+> comment. **`git ls-files | grep -iE 'plugin-spi|domain-model'` is empty** —
+> neither file is in the tree, and the string "Plugin-specific outputs"
+> appears nowhere but in this one source file. The SPI is rustdoc on
+> `usage_collector_sdk::UsageCollectorPluginV1`. Task 9 removed two others in
+> its own paragraph (`canonical_equal`) rather than propagate them; **Task 12
+> rewrites all three of these, so re-point each at the rustdoc that actually
+> says the thing, or drop the reference** — do not carry it across.
+
 **Files:**
 - Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`
 
@@ -3496,6 +3522,11 @@ it from the mapper; the test files are Task 15's. Neither count is this task's
 to fix, but do not be surprised by the remainder.
 
 - [ ] **Step 2: Rewrite `aggregate`**
+
+**Translate `query.filter` through `translate_scope`** (Task 10,
+`query/translate.rs`), for the reason Task 11's Step 3 gives: the inline pair
+this file still carries pushes an unparenthesized fragment into a
+`clauses.join(" AND ")`, and the compiled scope's outermost node is an `Or`.
 
 At `:1204`. The shape:
 

@@ -42,7 +42,9 @@
 //!   `MetadataKey::new(impl Into<String>) -> Result<_, _>`;
 //!   `IdempotencyKey::new(impl Into<String>) -> Result<_, _>`.
 
-use toolkit_odata::filter::{FilterField, FilterNode, FilterOp};
+use toolkit_odata::ast;
+use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, convert_expr_to_filter_node};
+use usage_collector_sdk::UsageRecordFilterField;
 
 pub use super::bind::{SqlBind, bind_one, bind_one_query, odata_value_to_bind};
 pub use toolkit_odata::filter::ODataValue;
@@ -139,6 +141,53 @@ fn op_sql(op: FilterOp) -> Result<&'static str, String> {
         FilterOp::Le => Ok("<="),
         other => Err(format!("unsupported operator: {other:?}")),
     }
+}
+
+/// Translate a compiled PDP scope into a **self-delimiting** parameterized
+/// `WHERE` fragment, pushing each value onto `ctx` as a bind.
+///
+/// This is the whole road from the `ast::Expr` a read path is handed to the SQL
+/// it may conjoin, and every read path takes it: the point lookup with the
+/// scope alone, `list` and `aggregate` with the gateway's composition of that
+/// scope and the caller's `$filter` (the Query Gateway composes them "so the
+/// result can only narrow", so what arrives is one expression). Three
+/// transcriptions of these four lines would be three chances to get the
+/// security boundary wrong in different ways.
+///
+/// **Two gates, in this order.** [`convert_expr_to_filter_node`] resolves each
+/// identifier against [`UsageRecordFilterField`], the SDK's filterable schema —
+/// fixing the vocabulary a scope may name in one place — and
+/// [`translate_record_filter`] resolves it again against the closed
+/// [`record_column`] allowlist and binds every value as `$N`. No identifier
+/// reaches the SQL string from caller input either way.
+///
+/// **The result is parenthesized, and that is the point of the return being a
+/// fragment rather than a clause vector.** Callers conjoin it — the point
+/// lookup after `id = $1`, the collection paths inside a `clauses.join(" AND
+/// ")` — and `AND` binds tighter than `OR`, so an unparenthesized `A OR B`
+/// conjoined after another predicate `P` reads as `(P AND A) OR B`: every row
+/// matching `B`, whatever `P` said. What the host gear's
+/// `authz::scope_to_odata_filter` compiles is exactly that shape — a
+/// left-nested `or` chain of tenant-pinned conjunctions — so this is the
+/// realistic case, not a corner one. The recursive walker below already
+/// parenthesizes a `Composite`, and `composite_or_joins_children_with_or_inside_parens`
+/// pins that; the wrap here means a caller never has to know it, and never has
+/// to re-check it when the translator grows a node kind.
+///
+/// # Errors
+///
+/// Returns `invalid scope: …` when either gate refuses — an identifier off the
+/// schema or off the allowlist, an operator SQL cannot express, an empty `IN`
+/// list, or a value that cannot be bound. **A caller must propagate it.** A
+/// scope that fails to translate and is dropped instead leaves the read
+/// unscoped, which turns a translation failure into an authorization bypass;
+/// there is deliberately no "renders to nothing" success here to drop.
+pub fn translate_scope(scope: &ast::Expr, ctx: &mut SqlCtx) -> Result<String, String> {
+    let node = convert_expr_to_filter_node::<UsageRecordFilterField>(scope)
+        .map_err(|e| format!("invalid scope: {e}"))?;
+    let fragment =
+        translate_record_filter(&node, ctx).map_err(|e| format!("invalid scope: {e}"))?;
+    Ok(format!("({fragment})"))
 }
 
 /// Translate a `usage_records` filter node into a parameterized `WHERE`

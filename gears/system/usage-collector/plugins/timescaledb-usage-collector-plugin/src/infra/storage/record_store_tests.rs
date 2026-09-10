@@ -1248,7 +1248,7 @@ fn where_clause(sql: &str) -> String {
 fn the_point_lookup_renders_the_scope_as_its_whole_where_clause() {
     let scope = parse_scope(&format!("tenant_id eq {SCOPE_TENANT_A}"));
 
-    let (sql, _ctx) = build_get_sql(&scope).expect("a scope must render");
+    let (sql, _binds) = build_get_sql(&scope).expect("a scope must render");
 
     assert!(
         sql.contains("WHERE id = $1 AND ("),
@@ -1266,7 +1266,7 @@ fn the_point_lookup_binds_the_scope_values_after_the_id() {
         "tenant_id eq {SCOPE_TENANT_A} and resource_type eq 'vm'"
     ));
 
-    let (sql, ctx) = build_get_sql(&scope).expect("a scope must render");
+    let (sql, binds) = build_get_sql(&scope).expect("a scope must render");
 
     // The `id` owns `$1`, so the scope's own binds start at `$2`. If they
     // started at `$1` the tenant predicate would read the id bind and the
@@ -1277,20 +1277,19 @@ fn the_point_lookup_binds_the_scope_values_after_the_id() {
         "the scope's binds follow the id, which occupies $1"
     );
     assert_eq!(
-        ctx.binds.len(),
+        binds.len(),
         2,
-        "both scope operands must be bound, in placeholder order. got: {:?}",
-        ctx.binds
+        "both scope operands must be bound, in placeholder order. got: {binds:?}"
     );
     assert!(
-        matches!(&ctx.binds[0], SqlBind::Uuid(u) if u.to_string() == SCOPE_TENANT_A),
+        matches!(&binds[0], SqlBind::Uuid(u) if u.to_string() == SCOPE_TENANT_A),
         "$2 is the tenant the scope pins. got: {:?}",
-        ctx.binds[0]
+        binds[0]
     );
     assert!(
-        matches!(&ctx.binds[1], SqlBind::Str(s) if s == "vm"),
+        matches!(&binds[1], SqlBind::Str(s) if s == "vm"),
         "$3 is the resource type the scope pins. got: {:?}",
-        ctx.binds[1]
+        binds[1]
     );
 }
 
@@ -1305,7 +1304,7 @@ fn the_point_lookup_wraps_a_disjunctive_scope_in_its_own_parentheses() {
          (tenant_id eq {SCOPE_TENANT_B} and resource_type eq 'vm')"
     ));
 
-    let (sql, ctx) = build_get_sql(&scope).expect("a scope must render");
+    let (sql, binds) = build_get_sql(&scope).expect("a scope must render");
 
     // Transcribed by hand, not derived from anything the builder produces.
     assert_eq!(
@@ -1314,7 +1313,7 @@ fn the_point_lookup_wraps_a_disjunctive_scope_in_its_own_parentheses() {
          OR (tenant_id = $4 AND resource_type = $5)))",
         "every disjunct of the scope has to survive the conjunction with the id"
     );
-    assert_eq!(ctx.binds.len(), 4, "four operands, four binds");
+    assert_eq!(binds.len(), 4, "four operands, four binds");
 }
 
 #[test]
@@ -1327,7 +1326,12 @@ fn the_point_lookup_carries_no_invalidation_predicate() {
     // read back *through*.
     let scope = parse_scope(&format!("tenant_id eq {SCOPE_TENANT_A}"));
 
-    let (sql, _ctx) = build_get_sql(&scope).expect("a scope must render");
+    // This covers the SQL half only. The other way to withhold a withdrawn
+    // entry is to read the row and then drop it — `if row.invalidates.is_some()
+    // { return NotFound }` in `get`'s `Some(row)` arm — which no unit test here
+    // can see, because none executes a statement. Task 15 covers that half,
+    // against a stored pair.
+    let (sql, _binds) = build_get_sql(&scope).expect("a scope must render");
     let predicate = where_clause(&sql);
 
     assert!(
@@ -1343,6 +1347,23 @@ fn the_point_lookup_carries_no_invalidation_predicate() {
          invalidation half of a withdrawn pair, which is the same data loss by \
          another spelling. got: {predicate}"
     );
+}
+
+#[test]
+fn the_point_lookup_renders_a_membership_scope_over_several_tenants() {
+    // `scope_to_odata_filter` pins the owning tenant with `Eq` *or* `In`, so a
+    // multi-tenant grant reaches the plugin as a membership test. Every other
+    // test here only ever hands it `Eq`.
+    let scope = parse_scope(&format!("tenant_id in ({SCOPE_TENANT_A}, {SCOPE_TENANT_B})"));
+
+    let (sql, binds) = build_get_sql(&scope).expect("a scope must render");
+
+    assert_eq!(
+        where_clause(&sql),
+        "WHERE id = $1 AND (tenant_id IN ($2, $3))",
+        "a membership scope narrows the lookup to the tenants it names"
+    );
+    assert_eq!(binds.len(), 2, "one bind per named tenant");
 }
 
 #[test]

@@ -15,7 +15,7 @@ use super::super::bind::{SqlBind, odata_value_to_bind};
 use super::super::keyset::{
     cursor_key_to_bind, ensure_forward_cursor, keyset_predicate, render_order_by, uniform_dir,
 };
-use super::{ODataValue, SqlCtx, record_column, translate_record_filter};
+use super::{ODataValue, SqlCtx, record_column, translate_record_filter, translate_scope};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -828,4 +828,104 @@ fn decode_cursor_rejects_a_malformed_client_token() {
     assert!(super::super::keyset::decode_cursor("").is_err());
     // Valid base64url, but the decoded bytes are not a `CursorV1` JSON payload.
     assert!(super::super::keyset::decode_cursor("bm90LWpzb24").is_err());
+}
+
+// ── The compiled-scope seam ────────────────────────────────────────────────
+//
+// `translate_scope` is the one road from the `ast::Expr` a read path is handed
+// to the SQL it may conjoin. The point lookup takes it today; `list` and
+// `aggregate` are to take it as they are ported. Everything the callers are
+// entitled to assume is asserted here rather than at each of them.
+
+/// Parse a filter string into the AST a read path is handed. The gateway's
+/// `authz::scope_to_odata_filter` builds the same `ast::Expr` from PDP
+/// constraints; a string is its readable spelling.
+fn scope_expr(raw: &str) -> toolkit_odata::ast::Expr {
+    toolkit_odata::parse_filter_string(raw)
+        .unwrap_or_else(|e| panic!("the test's own scope must parse: {e}"))
+        .into_expr()
+}
+
+#[test]
+fn translate_scope_parenthesizes_a_bare_comparison() {
+    // The narrowest shape, and the one whose fragment is NOT self-delimiting
+    // on its own: `translate_record_filter` returns `tenant_id = $1` bare, so
+    // the parentheses here are this function's, not the walker's.
+    let mut ctx = SqlCtx::new(1);
+
+    let sql = translate_scope(&scope_expr("tenant_id eq 11111111-1111-1111-1111-111111111111"), &mut ctx)
+        .expect("a tenant-pinned scope must render");
+
+    assert_eq!(sql, "(tenant_id = $1)");
+    assert_eq!(ctx.binds.len(), 1);
+}
+
+#[test]
+fn translate_scope_survives_being_conjoined_after_another_predicate() {
+    // The property every caller relies on, stated the way a caller uses it.
+    // `AND` binds tighter than `OR`, so a disjunctive scope conjoined without
+    // its own parentheses reads as `(leading AND A) OR B` and answers every row
+    // matching the last disjunct. The expectation is transcribed by hand.
+    let mut ctx = SqlCtx::new(2);
+
+    let sql = translate_scope(
+        &scope_expr(
+            "tenant_id eq 11111111-1111-1111-1111-111111111111 or \
+             tenant_id eq 22222222-2222-2222-2222-222222222222",
+        ),
+        &mut ctx,
+    )
+    .expect("a disjunctive scope must render");
+
+    assert_eq!(
+        format!("gts_id = $1 AND {sql}"),
+        "gts_id = $1 AND ((tenant_id = $2 OR tenant_id = $3))",
+        "the whole scope has to sit inside the conjunction, not just its head"
+    );
+    assert_eq!(ctx.binds.len(), 2);
+}
+
+#[test]
+fn translate_scope_continues_the_callers_placeholder_numbering() {
+    // A caller seeds `ctx` past its own leading binds; the scope must take the
+    // next free slots rather than restart at `$1` and collide with them.
+    let mut ctx = SqlCtx::new(4);
+
+    let sql = translate_scope(
+        &scope_expr("resource_type eq 'vm' and resource_id eq 'i-1'"),
+        &mut ctx,
+    )
+    .expect("a conjunctive scope must render");
+
+    assert_eq!(sql, "((resource_type = $4 AND resource_id = $5))");
+}
+
+#[test]
+fn translate_scope_refuses_a_field_the_filterable_schema_does_not_carry() {
+    // First gate: `gts_type_id` is a typed SPI parameter, deliberately absent
+    // from `UsageRecordQuery`. A refusal, never a dropped conjunct — dropping
+    // one leaves the read unscoped.
+    let mut ctx = SqlCtx::new(1);
+
+    let err = translate_scope(&scope_expr("gts_type_id eq 'x'"), &mut ctx)
+        .expect_err("a field off the filterable schema must not render");
+
+    assert!(err.starts_with("invalid scope: "), "got: {err}");
+    assert!(err.contains("gts_type_id"), "the refusal names the field. got: {err}");
+    assert!(ctx.binds.is_empty(), "a refused scope binds nothing");
+}
+
+#[test]
+fn translate_scope_refuses_an_operator_the_second_gate_rejects() {
+    // Second gate. `contains` converts cleanly — `resource_id` is a string
+    // field, so the converter admits it — and dies at `op_sql`, which carries
+    // no `LIKE` family. Both refusal paths therefore carry the same prefix, so
+    // neither can be read as a caller's `$filter` error.
+    let mut ctx = SqlCtx::new(1);
+
+    let err = translate_scope(&scope_expr("contains(resource_id, 'abc')"), &mut ctx)
+        .expect_err("the scope vocabulary is exact-match only");
+
+    assert!(err.starts_with("invalid scope: "), "got: {err}");
+    assert!(err.contains("unsupported operator"), "got: {err}");
 }

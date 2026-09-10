@@ -52,6 +52,7 @@ use crate::infra::storage::query::keyset::{
 };
 use crate::infra::storage::query::translate::{
     SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_record_filter,
+    translate_scope,
 };
 
 /// Default page size when the caller omits `$top` (`query.limit`).
@@ -1114,43 +1115,31 @@ fn record_row_key(row: &UsageRecordRow, field: &str) -> Option<String> {
 /// whose `id` a caller can name — an existence oracle over every tenant's
 /// entries.
 ///
-/// The scope reaches SQL by the one road a `$filter` takes.
-/// [`convert_expr_to_filter_node`] resolves every identifier against the SDK's
-/// filterable schema (`UsageRecordFilterField`), and
-/// [`translate_record_filter`] resolves it again against the closed
-/// [`record_column`] allowlist and binds every value as `$N`. There is no
-/// second translator here, so there is exactly one place an identifier can
-/// reach the SQL string, and it is the same place `list` and `aggregate` use.
+/// The scope itself is translated by [`translate_scope`], which every read path
+/// shares: it owns both allowlist gates, the bind numbering, and the
+/// parentheses that let the fragment be conjoined safely. What is left here is
+/// statement assembly, and that is all this function should ever grow.
 ///
 /// Binds start at `$2` because the `id` occupies `$1`; [`PgRecordStore::get`]
-/// binds the `id` first, before this context's binds, for that reason.
-///
-/// The rendered fragment gets its own parentheses. Every fragment
-/// [`translate_record_filter`] can return today is already self-delimiting,
-/// but what `authz::scope_to_odata_filter` compiles is a *disjunction* of
-/// tenant-pinned conjunctions, and an unparenthesized `A OR B` conjoined after
-/// `id = $1` would bind as `(id = $1 AND A) OR B` — returning every row that
-/// matches `B`, whatever `id` was asked for. The parentheses cost nothing and
-/// take the question away from a future reader of the translator.
+/// binds the `id` first, before these, for that reason. The seeding matches
+/// [`PgRecordStore::list`] and [`PgRecordStore::aggregate`], which seed the same
+/// way behind their leading `gts_id` bind. Only the ordered bind values are
+/// returned, not the [`SqlCtx`]: the statement is finished, so there is nothing
+/// left for a caller to legitimately push.
 ///
 /// # Errors
 ///
-/// Returns the message from whichever stage refused the scope: an identifier
-/// off the allowlist, an operator SQL cannot express, an empty `IN` list, or a
-/// value that cannot be bound. **The caller must propagate it.** A scope that
-/// fails to translate and is dropped instead leaves `WHERE id = $1` — a
-/// translation failure turned into an authorization bypass — so this returns
-/// `Err` rather than a partial fragment, and it is the only producer of this
-/// path's SQL.
-fn build_get_sql(scope: &ast::Expr) -> Result<(String, SqlCtx), String> {
+/// Propagates [`translate_scope`]'s refusal unchanged. A scope that fails to
+/// translate and is dropped instead leaves `WHERE id = $1` — a translation
+/// failure turned into an authorization bypass — so this returns `Err` rather
+/// than a partial statement, and it is the only producer of this path's SQL.
+fn build_get_sql(scope: &ast::Expr) -> Result<(String, Vec<SqlBind>), String> {
     // `$1` is the `id`; every scope bind therefore starts at `$2`.
     let mut ctx = SqlCtx::new(2);
-    let node = convert_expr_to_filter_node::<UsageRecordFilterField>(scope)
-        .map_err(|e| format!("invalid scope: {e}"))?;
-    let fragment = translate_record_filter(&node, &mut ctx)?;
+    let fragment = translate_scope(scope, &mut ctx)?;
     Ok((
-        format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1 AND ({fragment})"),
-        ctx,
+        format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1 AND {fragment}"),
+        ctx.binds,
     ))
 }
 
@@ -1662,20 +1651,20 @@ impl RecordStore for PgRecordStore {
         // plugin MUST NOT withhold a withdrawn entry from this path as a
         // kindness — because hiding either half destroys the audit trail the
         // append-only model exists to keep. Nor is this path a special case:
-        // the ADR puts every ledger read path under the same obligation (raw
-        // query, point lookup and usage feed alike), and `list` on this trait
-        // carries no exclusion either. A consumer that wants the netted view
-        // has what it needs: an invalidation names its target
-        // (`UsageRecord::invalidation`), so the fold happens on the reader's
-        // side. Neither `invalidates IS NULL` nor an `entry_type` restriction
-        // is a kindness here; both are data loss
+        // the SPI puts `list_usage_records` under the same obligation in as
+        // many words — "a withdrawn pair MUST likewise be returned as
+        // persisted here" — and `list` below carries no exclusion either. A
+        // consumer that wants the netted view has what it needs: an
+        // invalidation names its target (`UsageRecord::invalidation`), so the
+        // fold happens on the reader's side. Neither `invalidates IS NULL` nor
+        // an `entry_type` restriction is a kindness here; both are data loss
         // (`cpt-cf-usage-collector-adr-append-only-invalidation`).
         //
         // The scope is translated before a connection is acquired, so a scope
         // that cannot be rendered never reaches the pool and never reads a row.
-        let (sql, ctx) = build_get_sql(scope).map_err(UsageCollectorPluginError::internal)?;
+        let (sql, binds) = build_get_sql(scope).map_err(UsageCollectorPluginError::internal)?;
         let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).bind(id);
-        for b in &ctx.binds {
+        for b in &binds {
             q = bind_one(q, b);
         }
         let mut conn = self.timed_acquire().await?;
