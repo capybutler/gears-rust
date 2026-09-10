@@ -2370,6 +2370,14 @@ by a write.
 >    whole multi-row `INSERT` and returns an outer `AlreadyInvalidated` rather
 >    than per-row outcomes. Recorded for Task 18 rather than papered over.
 
+> **Every `:NNN` line anchor in this task was stale**, not just Step 6b's
+> eight. They were written against a draft of `record_store.rs` that is not
+> what Task 9 inherited. Each has been corrected in place to the number in the
+> file **as Task 9 found it** (`7114a7b9b`), verified with `grep -n` on that
+> revision; a bare number that has since been superseded by a rewritten
+> paragraph was dropped rather than re-anchored. Anchors into `error.rs` and
+> `pool.rs` are likewise as-found.
+
 ### Verification: the harness does **not** reach `record_store.rs`
 
 **Measured, not assumed.** The Task 5-8 harness pattern — `#[path]`-include the
@@ -2403,13 +2411,43 @@ by design — so the first blocker is fatal and the approach was abandoned.
   editing; a mutation of the real file propagates into the extract, and the
   mutation driver greps the mutated line out of the *generated* file so a
   dropped mutation reads as a failed run rather than a survivor.
-- **What that does not cover:** anything needing a live backend —
-  `create_inner`, `create_batch_inner`, `claim_acceptance_sequence`'s block
-  arithmetic against a real counter row, `find_existing_invalidation`, and every
-  SQL string. Those are Task 15's pg suites and Task 14's contract run.
+- **Two substitutions in the extract change more than which text is present,
+  and the second is load-bearing.** (a) `toolkit::tokio::time::sleep` becomes
+  `tokio::time::sleep`, to keep the `toolkit` crate out of a scratch target
+  dir. (b) **`#[async_trait] impl RecordStore for PgRecordStore` becomes an
+  inherent `impl PgRecordStore`** — which drops the `async_trait` desugaring (a
+  boxed `Send` future) and drops conformance checking against the `RecordStore`
+  signatures. So the harness proves **neither** that `create` /
+  `create_batch`'s futures are `Send` **nor** that they still satisfy the
+  trait — precisely the class of breakage a first-transaction change can
+  introduce. Both hold in fact: `cargo check --all-targets` emits no `E0277`
+  (non-`Send` future), `E0050` or `E0407` at either method, in a run that *did*
+  emit `E0050` in `adapter.rs` and `E0609` inside this very `impl` block — so
+  the trait-conformance and body-checking passes ran and were silent about
+  these two. But that is cargo saying so, not the instrument this task's
+  confidence otherwise rests on. Everything else in the extract is the
+  real file's bytes, and every deletion anchor is asserted unique, so a failed
+  anchor raises rather than silently emitting a different extract.
+- **What that does not cover.** Two of these are DB-free and *were* covered
+  after this was first written; they are listed because the original framing —
+  "anything needing a live backend" — quietly excluded them, and they are
+  exactly where a silent corruption would live:
+  - `InsertColumns::build`, the sixteen-way pivot the batch insert binds. A
+    swapped push (`resource_ids`/`resource_types`, `subject_ids`/`subject_types`,
+    the two bounds) corrupts every batched row and is invisible to every other
+    test. **Now covered** by
+    `insert_columns_pivots_each_record_into_the_column_it_is_bound_as`, with
+    three swap mutations.
+  - `claim_batch_sequences`'s pure half, now split out as `scope_runs` and
+    `sequence_block`. An off-by-one there reuses or skips a sequence value that
+    no constraint can object to. **Now covered**, with two mutations.
+  - Genuinely DB-only, and Task 15's: `create_inner`, `create_batch_inner`,
+    `claim_acceptance_sequence` against a real counter row,
+    `find_existing_invalidation` (including its `tenant_id` predicate), and
+    every SQL string. Task 14's contract run covers the behaviour.
 - **Task 13 must re-run these tests through `cargo nextest` once the crate
   compiles**, since the extract is not what ships. That obligation is written
-  into Task 13's Step 3.
+  into **Task 13's Step 3b**.
 
 ### Obligation 1 — the dedup identity is the 5-tuple
 
@@ -2503,33 +2541,39 @@ fn the_dedup_key_is_the_five_tuple() {
     );
 }
 
-#[test]
-fn a_unique_violation_on_the_invalidation_index_reads_as_already_invalidated() {
-    let err = map_insert_error(
-        &pg_unique_violation("usage_records_one_invalidation_uniq"),
-        &sample_invalidation_record(),
-    );
-
-    assert!(
-        matches!(err, UsageCollectorPluginError::AlreadyInvalidated { .. }),
-        "the partial unique index is how at-most-one is enforced atomically; \
-         its violation is the caller-visible rejection, not an Internal. got {err:?}"
-    );
-}
+// ~~SUPERSEDED~~ — this call shape does not exist. `map_insert_error` is
+// `async` and takes a connection (naming the existing invalidation needs a
+// read, after the rollback), and the discrimination this tests moved to
+// `classify_db`. Kept struck-through to show what changed; do not write it.
+//
+// #[test]
+// fn a_unique_violation_on_the_invalidation_index_reads_as_already_invalidated() {
+//     let err = map_insert_error(
+//         &pg_unique_violation("usage_records_one_invalidation_uniq"),
+//         &sample_invalidation_record(),
+//     );
+//     assert!(matches!(err, UsageCollectorPluginError::AlreadyInvalidated { .. }));
+// }
 ```
 
 **The mutations:** drop `window_start` from `dedup_key` (test 1 red); route the
 `usage_records_one_invalidation_uniq` constraint name to `Internal` (test 2
 red).
 
-`pg_unique_violation` needs to build an `sqlx::Error::Database` carrying a
+~~`pg_unique_violation` needs to build an `sqlx::Error::Database` carrying a
 constraint name. Check how `error_tests.rs` already constructs one — the crate
 has this problem solved somewhere, and inventing a second way is worse than
-finding the first.
+finding the first.~~ **Superseded, and wrong on its facts.** No such helper was
+needed: `classify_db` takes `(code, constraint)` as plain values. And
+`error_tests.rs` does **not** construct an `sqlx::Error::Database` — the only
+place in this repo that does is
+`gears/system/cluster/plugins/postgres-cluster-plugin/src/pg_error.rs`
+(`FakeDbError`). Noted so the next task that needs one looks in the right
+file.
 
 - [x] **Step 2: Update `RECORD_COLUMNS`** — DONE
 
-At `:65`. It must match `UsageRecordRow`'s field order from Task 4 exactly —
+At `:63` (as found). It must match `UsageRecordRow`'s field order from Task 4 exactly —
 the row struct lists them (a readability convention, not a decode requirement).
 
 ```rust
@@ -2591,13 +2635,13 @@ go red.
 
 - [x] **Step 3: Rewrite the dedup helpers** — DONE
 
-`dedup_key`, `row_dedup_key` and `canonical_equal` (at `:627`, `:638`, `:884`)
+`dedup_key`, `row_dedup_key` and `canonical_equal` (at `:615`, `:626`, `:872` as found)
 all carry the 4-tuple. Bring each to the 5-tuple. `canonical_equal` compares a
 submitted record against a stored row to decide absorb-vs-conflict; it must now
 compare the covered-period pair, `origin`, and the invalidation pair too — an
 exact-equality retry means every caller-supplied field matches.
 
-`to_micros` (`:832`) normalized an `OffsetDateTime` for comparison by
+`to_micros` (`:820` as found) normalized an `OffsetDateTime` for comparison by
 delegating to `usage_collector_sdk::created_at_micros`. **That SDK function no
 longer exists**, so the helper was deleted rather than reimplemented: the SDK's
 canonical microsecond primitive is now `canonical_period_bound`, the same
@@ -2665,7 +2709,7 @@ obligation.
 
 - [x] **Step 5: Rewrite the insert** — DONE
 
-`create_inner` (`:197`) and `insert_records_on_conflict` (`:312`) carry the
+`create_inner` (`:184`) and `insert_records_on_conflict` (`:300`, both as found) carry the
 `ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING`
 dedup authority. The conflict target becomes the 5-tuple, matching the Task 3
 constraint.
@@ -2703,8 +2747,8 @@ usage_acceptance_seq  constraint() = Some("usage_acceptance_sequence_pkey")     
 
 **Three facts that change the implementation:**
 
-1. **Neither unique constraint reports its bare name.** `error.rs:38-39`'s
-   `Some("usage_records_dedup_uniq")` is **unreachable on a real hypertable**
+1. **Neither unique constraint reports its bare name.** `error.rs:41`'s
+   `Some("usage_records_dedup_uniq")` (as found) is **unreachable on a real hypertable**
    and always has been. It has been invisible because ingest uses
    `ON CONFLICT … DO NOTHING`, so that arm is defensive and no test could reach
    it. **Your new `AlreadyInvalidated` arm is on a live path** — written the
@@ -2838,7 +2882,7 @@ is yours to set. Step 1's test already calls it as
 `map_insert_error(&err, &sample_invalidation_record())` — a `&UsageRecord`, not
 the dropped `&UsageTypeGtsId` — so nothing is owed back.
 
-`map_insert_error` (`:128`) maps a unique violation to `IdempotencyConflict`.
+`map_insert_error` (`:124` as found) maps a unique violation to `IdempotencyConflict`.
 It must now discriminate on the constraint name:
 
 - `usage_records_dedup_uniq` -> the existing absorb-or-conflict path
@@ -2871,9 +2915,10 @@ call site, because it looks like the pre-read the SPI forbids and is not one.
 
 - [x] **Step 6b: Settle every transaction claim in this file, and the 55P03 gap** — DONE
 
-**Eight sites, not two.** An earlier draft named `:778` and `:940`; Task 2's
-code review found three more, and a re-count found a further one. Measured
-with `grep -n 'transaction' src/infra/storage/record_store.rs`:
+**Eight sites, not two.** An earlier draft named two of them (at line numbers
+that were already stale — see the table); Task 2's code review found three
+more, and a re-count found a further one. Measured with
+`grep -n 'transaction' src/infra/storage/record_store.rs`:
 
 **Every line number here was stale by ~13-14 lines.** Re-measured with
 `grep -n 'transaction' src/infra/storage/record_store.rs` at Task 9's start —
@@ -2896,23 +2941,26 @@ names *both* locks ingest waits on (the `usage_acceptance_sequence` row and the
 speculative dedup tuple), with a pointer to why `55P03` is classified
 transient.
 
-The split matters: `:717`, `:750` and `:942` read as true of *Postgres*, which
-wraps every statement in an implicit transaction, whereas `:778` and `:940` are
-false about *this crate*, which after Task 2 opens none. **Decide all eight
-deliberately** — do not fix the two obvious ones and leave six lookalikes, which
-is how this file got into its current state. Report a per-line verdict.
+~~The split matters: `:717`, `:750` and `:942` read as true of *Postgres*,
+which wraps every statement in an implicit transaction, whereas `:778` and
+`:940` are false about *this crate*, which after Task 2 opens none. Note the
+direction of travel: `:189` and `:536` are correct *now* and your work makes
+them wrong.~~ ~~**`pool.rs:70` is the sibling case and is also yours:** "the
+same dedup 4-tuple".~~
 
-Note the direction of travel: `:189` and `:536` are correct *now* and your work
-makes them wrong, so they need rewriting too even though they read fine today.
-
-**`pool.rs:70` is the sibling case and is also yours:** "the same dedup
-4-tuple", correct until this task moves identity to the 5-tuple.
+**Superseded by the table above**, which carries the real line numbers and the
+settled verdict for each of the eight, plus `pool.rs`. Struck rather than
+deleted so the framing that produced the verdicts is still readable — but the
+numbers in it are the stale ones, and `pool.rs` is done, so do not re-open
+either from here. The standing instruction that survives: **decide all eight
+deliberately** — do not fix the obvious ones and leave the lookalikes, which is
+how this file got into its current state.
 
 **The 55P03 decision, which no other task owns.** `is_transient_sqlstate`
-(`error.rs:18-24`) matches `08*`, `57P01`, `57P02`, `57P03`, `53300`, `40001`,
+(`error.rs:17-23` as found) matches `08*`, `57P01`, `57P02`, `57P03`, `53300`, `40001`,
 `40P01`. **`55P03 lock_not_available` is absent**, so a statement that hits
 `LOCK_TIMEOUT` falls to `Other` → `Internal` → non-retryable, and
-`is_retryable_batch_error` (`:757`) will not retry it.
+`is_retryable_batch_error` (`:745` as found) will not retry it.
 
 That is pre-existing, but Task 2 made it visible by electing the ingest
 `ON CONFLICT` path as `LOCK_TIMEOUT`'s worked example — so an inherently
@@ -2954,7 +3002,7 @@ statement rather than one row, which is wrong — the SPI wants exactly one
 accepted and the other rejected, with per-record outcomes aligned to input
 order.
 
-If that is what happens, the fix is `plan_batch` (`:693`) detecting a
+If that is what happens, the fix is `plan_batch` (`:681` as found) detecting a
 duplicate `invalidates` target within the batch and pre-rejecting all but the
 first, **in addition to** the index, which still covers the cross-call case.
 Document that the in-batch check is not the enforcement — the index is — so
