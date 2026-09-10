@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     gts_type_id         text        NOT NULL,
     value               numeric     NOT NULL,
     -- The covered period [window_start, window_end). The only emitter-supplied
-    -- time attribution. Every selection predicate reads the end alone
+    -- time attribution. The time-range predicate reads the end alone
     -- (cpt-cf-usage-collector-adr-window-end-selection), which is why the end
     -- is the hypertable partition column.
     window_start        timestamptz NOT NULL,
