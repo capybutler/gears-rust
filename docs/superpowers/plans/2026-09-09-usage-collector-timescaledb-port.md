@@ -1900,6 +1900,92 @@ minus `ingested_at` (defaulted) and `acceptance_sequence` (claimed per Step 4).
 
 Both must run inside a transaction that also holds the sequence claim.
 
+- [ ] **Step 5b: Constraint names arrive chunk-prefixed — exact match is dead**
+
+**Measured with a standalone sqlx 0.9.0 probe against a live
+`timescale/timescaledb:latest-pg16` running this crate's own
+`migrations/0001_init.sql`.** Not inferred, not read off a psql message —
+`db.constraint()` was printed directly:
+
+```
+DEDUP, chunk A        constraint() = Some("1_usage_records_dedup_uniq")
+DEDUP, chunk B        constraint() = Some("2_usage_records_dedup_uniq")
+2nd INVALIDATION, A   constraint() = Some("_hyper_1_1_chunk_usage_records_one_invalidation_uniq")
+2nd INVALIDATION, B   constraint() = Some("_hyper_1_2_chunk_usage_records_one_invalidation_uniq")
+CHECK window_ordered  constraint() = Some("usage_records_window_ordered")          <- BARE
+usage_acceptance_seq  constraint() = Some("usage_acceptance_sequence_pkey")        <- BARE
+```
+
+**Three facts that change the implementation:**
+
+1. **Neither unique constraint reports its bare name.** `error.rs:38-39`'s
+   `Some("usage_records_dedup_uniq")` is **unreachable on a real hypertable**
+   and always has been. It has been invisible because ingest uses
+   `ON CONFLICT … DO NOTHING`, so that arm is defensive and no test could reach
+   it. **Your new `AlreadyInvalidated` arm is on a live path** — written the
+   same way it would be dead on arrival, and the failure would look like a
+   logic bug rather than a string-matching one.
+
+2. **The two constraints prefix differently, for a structural reason.** A
+   constraint declared inside `CREATE TABLE` is cloned by TimescaleDB as
+   `<chunk_id>_<name>`; a standalone `CREATE UNIQUE INDEX` is cloned by
+   Postgres as `<chunk_relname>_<name>`. `usage_records_dedup_uniq` is the
+   former, `usage_records_one_invalidation_uniq` the latter. **A normalization
+   that strips one shape silently misses the other.**
+
+3. **`chunk_id` is a global sequence across every hypertable in the database**,
+   not a per-hypertable counter — a second hypertable's first chunk came back
+   as id `3`. The numeric part is unbounded and unknowable ahead of time, so no
+   fixed prefix can be hardcoded.
+
+**Use a boundary-anchored suffix match:**
+
+```rust
+/// True when `actual` names `name`, allowing for TimescaleDB's chunk-local
+/// spellings.
+///
+/// A hypertable clones each constraint onto every chunk under a generated
+/// name, and there are two shapes because there are two declaration sites:
+/// `<chunk_id>_<name>` for a constraint declared in `CREATE TABLE`, and
+/// `_hyper_<ht>_<chunk>_chunk_<name>` for a standalone `CREATE INDEX`. Both
+/// end in `_<name>`. Bare equality still holds for CHECK constraints, which
+/// are not renamed, and for non-hypertable tables.
+fn is_constraint(actual: &str, name: &str) -> bool {
+    actual == name || actual.strip_suffix(name).is_some_and(|p| p.ends_with('_'))
+}
+```
+
+The `_` anchor over a plain `ends_with` costs nothing and stops an unrelated
+name that merely ends in the same characters without a separator.
+
+**Suffix matching is safe for this schema, verified exhaustively.** Every
+constraint and index name in `0001_init.sql` was enumerated — including the
+implicit `usage_records_pkey`, `usage_records_origin_check`,
+`usage_acceptance_sequence_pkey` and TimescaleDB's own
+`usage_records_window_end_idx` — and no name is a suffix of any other. Note
+`usage_records_tenant_window_idx` is *not* a suffix of
+`usage_records_tenant_type_window_idx`.
+
+**One rule for future migrations, measured rather than assumed.** Postgres
+truncates identifiers at 63 bytes *from the tail* and the chunk prefix is
+prepended, so a long enough name loses its suffix entirely. Demonstrated with a
+69-character constraint whose chunk-local form kept no suffix at all.
+`usage_records_dedup_uniq` (24 chars) and `usage_records_one_invalidation_uniq`
+(35, chunk-local 52) both have ample headroom. **Keep constraint names under
+~45 characters.**
+
+**Add a regression test with the literal chunk-local strings** as unit inputs to
+`classify_db` — `"1_usage_records_dedup_uniq"` and
+`"_hyper_1_1_chunk_usage_records_one_invalidation_uniq"`. It needs no container
+and it pins the finding so a later refactor cannot quietly restore exact
+matching. **The mutation:** change `is_constraint` back to `actual == name`.
+
+**Do not reach for `ON CONFLICT` to sidestep string matching.** A statement
+admits one arbiter and the ingest insert already spends it on the dedup
+5-tuple, so the one-invalidation index still surfaces as a raw `23505`.
+Error-string discrimination is the route, which is why the match rule is
+load-bearing.
+
 - [ ] **Step 6: Translate the new constraint violation**
 
 **First, a stale doc this task inherits.** `map_insert_error`'s doc comment
