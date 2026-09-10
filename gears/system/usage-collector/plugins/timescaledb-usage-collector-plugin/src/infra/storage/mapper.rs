@@ -20,7 +20,10 @@
 //!   accessor rather than against its own literals, so the two directions
 //!   cannot drift apart.
 //! - `invalidates` and `reason_code` are two nullable columns standing for one
-//!   `Option<Invalidation>` field; [`invalidation_from_row`] rejoins them.
+//!   `Option<Invalidation>` field; [`invalidation_from_row`] rejoins them and
+//!   [`invalidation_to_row`] splits them again. This is the one pair with a
+//!   helper in both directions, because it is the one pair whose halves the
+//!   insert could otherwise bind independently.
 
 use std::collections::BTreeMap;
 
@@ -105,6 +108,23 @@ pub fn invalidation_from_row(
         (None, Some(raw)) => Err(UsageCollectorPluginError::internal(format!(
             "stored entry carries reason_code `{raw}` with no invalidation target"
         ))),
+    }
+}
+
+/// Split an [`Invalidation`] back into the two columns that store it.
+///
+/// The inverse of [`invalidation_from_row`], and the reason the insert cannot
+/// bind `invalidates` and `reason_code` separately: going through one function
+/// makes the half-populated pair unrepresentable on the way out, the same way
+/// [`Invalidation`] makes it unrepresentable on the way in. Without it the
+/// write direction would reintroduce exactly the split shape the read
+/// direction exists to refuse, with nothing catching it until Postgres rejects
+/// the row on `usage_records_invalidation_pairing` at runtime.
+#[must_use]
+pub fn invalidation_to_row(invalidation: Option<&Invalidation>) -> (Option<Uuid>, Option<&str>) {
+    match invalidation {
+        None => (None, None),
+        Some(Invalidation { target, reason }) => (Some(*target), Some(reason.as_str())),
     }
 }
 

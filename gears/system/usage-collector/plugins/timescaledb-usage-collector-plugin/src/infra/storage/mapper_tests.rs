@@ -9,8 +9,8 @@ use usage_collector_sdk::{MetadataKey, MeterTypeId, RecordOrigin, UsageCollector
 
 use super::super::entity::UsageRecordRow;
 use super::{
-    invalidation_from_row, metadata_jsonb_to_map, metadata_map_to_jsonb, meter_type_id_from_str,
-    parse_origin, record_row_to_model,
+    invalidation_from_row, invalidation_to_row, metadata_jsonb_to_map, metadata_map_to_jsonb,
+    meter_type_id_from_str, parse_origin, record_row_to_model,
 };
 
 /// Assert a mapper call failed as [`UsageCollectorPluginError::Internal`].
@@ -133,6 +133,31 @@ fn an_unparseable_stored_reason_is_an_invariant_break() {
     assert_internal(
         invalidation_from_row(Some(Uuid::new_v4()), Some(String::new())),
         "a complete pair whose reason_code fails ReasonCode validation",
+    );
+}
+
+#[test]
+fn invalidation_to_row_names_the_two_columns_it_writes() {
+    // Deliberately NOT a round trip against `invalidation_from_row`: feeding
+    // this function's output straight back into its inverse proves the pair is
+    // self-consistent and nothing else. The insert binds these two values into
+    // `invalidates` and `reason_code`, so the test names them.
+    let target = Uuid::from_u128(0x5115_0000_0000_0051);
+    let invalidation = usage_collector_sdk::Invalidation {
+        target,
+        reason: usage_collector_sdk::ReasonCode::new("duplicate_submission")
+            .expect("a valid reason code"),
+    };
+
+    assert_eq!(
+        invalidation_to_row(Some(&invalidation)),
+        (Some(target), Some("duplicate_submission")),
+        "a present withdrawal writes both columns: the target it names and the          reason it carries"
+    );
+    assert_eq!(
+        invalidation_to_row(None),
+        (None, None),
+        "an ordinary measurement writes neither column"
     );
 }
 

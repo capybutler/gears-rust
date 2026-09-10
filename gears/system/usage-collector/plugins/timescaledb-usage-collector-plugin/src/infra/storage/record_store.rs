@@ -19,9 +19,8 @@ use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use rand::RngExt as _;
 use rust_decimal::Decimal;
-use sqlx::AssertSqlSafe;
 use sqlx::pool::PoolConnection;
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{Acquire as _, AssertSqlSafe, PgPool, Postgres, Row};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
@@ -32,15 +31,17 @@ use uuid::Uuid;
 use usage_collector_sdk::{
     AggregationBucket, AggregationDimension, AggregationResult, AggregationSpec, MetadataFilter,
     UsageCollectorPluginError, UsageRecord, UsageRecordFilterField, UsageTypeGtsId,
-    is_keyset_safe_record_field,
+    canonical_period_bound, is_keyset_safe_record_field,
 };
 
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
 use crate::infra::storage::entity::UsageRecordRow;
-use crate::infra::storage::error::{acquire_error_clears_readiness, map_sqlx_err};
+use crate::infra::storage::error::{
+    DbErrorClass, acquire_error_clears_readiness, classify_db, db_code_and_constraint, map_sqlx_err,
+};
 use crate::infra::storage::mapper::{
-    gts_id_str, metadata_jsonb_to_map, metadata_map_to_jsonb, record_row_to_model,
+    invalidation_to_row, metadata_jsonb_to_map, metadata_map_to_jsonb, record_row_to_model,
 };
 use crate::infra::storage::query::aggregate::{
     agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
@@ -58,11 +59,20 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 
 /// Column list for every `usage_records` SELECT / RETURNING, in
 /// [`UsageRecordRow`] field order. A static const (never caller input), so
-/// `sqlx::query_as::<_, UsageRecordRow>` decodes positionally without risk of
-/// SQL injection.
-const RECORD_COLUMNS: &str = "id, tenant_id, gts_id, value, created_at, resource_id, \
-     resource_type, subject_id, subject_type, idempotency_key, corrects_id, status, metadata, \
-     ingested_at";
+/// there is no risk of SQL injection.
+///
+/// `sqlx`'s derived `FromRow` looks each column up by the struct's own field
+/// name, so the order here is a reading convenience — matching the struct and
+/// the DDL — rather than a decode requirement. **Omission is the hazard**: a
+/// missing column fails the decode with `no column found for name: <field>`.
+///
+/// The ledger's `entry_type` is deliberately absent. It is a stored generated
+/// column that exists so `$filter=entry_type eq 'invalidation'` resolves to a
+/// real column; nothing decodes it, because [`UsageRecordRow`] has no field
+/// for it (see that struct's doc).
+const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, window_end, \
+     resource_id, resource_type, subject_id, subject_type, idempotency_key, invalidates, \
+     reason_code, origin, acceptance_sequence, metadata, ingested_at";
 
 /// `sqlx`-backed implementation of [`RecordStore`] over the `usage_records`
 /// hypertable.
@@ -113,16 +123,51 @@ impl PgRecordStore {
         mapped
     }
 
-    /// Single-row insert error mapping, currently a plain deferral to
-    /// [`Self::record_backend_error`].
+    /// Translate an insert-path `sqlx` error into the caller-visible outcome.
     ///
-    /// The seam is kept rather than inlined because the insert path has more
-    /// than one constraint whose violation is caller-visible rather than
-    /// internal — `usage_records_dedup_uniq` and
-    /// `usage_records_one_invalidation_uniq` — and telling those apart by
-    /// constraint name belongs on the insert error path, not at the call site.
-    fn map_insert_error(&self, err: &sqlx::Error) -> UsageCollectorPluginError {
-        self.record_backend_error(err)
+    /// Two of the ledger's unique constraints answer the caller rather than
+    /// reporting a fault, and they reach this seam very differently. A
+    /// statement admits exactly one `ON CONFLICT` arbiter and the ingest insert
+    /// spends it on the dedup 5-tuple, so the dedup constraint's violation is
+    /// suppressed into a no-row result and never arrives here — that arm of
+    /// [`classify_db`] stays defensive. The at-most-one-invalidation index has
+    /// no arbiter left to claim, so its violation always arrives as a raw
+    /// `23505`, and this is the arm that turns it into
+    /// [`UsageCollectorPluginError::AlreadyInvalidated`].
+    ///
+    /// `targets` are the `(invalidation target, window_end)` pairs the failed
+    /// statement tried to write. They are used to name the invalidation already
+    /// in place — and **that lookup is a read taken after the write was already
+    /// rejected, so it is diagnostic and not a check.** The SPI's atomicity
+    /// obligation is discharged by the index, inside the transaction, before
+    /// this function is reached; this runs afterwards on a rolled-back
+    /// connection purely so the rejection can name an entry. It looks like the
+    /// pre-read the SPI forbids and is not one.
+    async fn map_insert_error(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        err: &sqlx::Error,
+        targets: &[(Uuid, OffsetDateTime)],
+    ) -> UsageCollectorPluginError {
+        let Some((code, constraint)) = db_code_and_constraint(err) else {
+            return self.record_backend_error(err);
+        };
+        if classify_db(&code, constraint.as_deref()) != DbErrorClass::AlreadyInvalidated {
+            return self.record_backend_error(err);
+        }
+        match find_existing_invalidation(conn, targets).await {
+            Ok(Some((id, invalidated_by))) => {
+                UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }
+            }
+            // The index refused the write, so an accepted invalidation existed
+            // at that instant. Finding none now means its chunk was dropped by
+            // retention in between — the same retention-boundary race the dedup
+            // path carries. Retryable, rather than a fabricated identifier.
+            Ok(None) => UsageCollectorPluginError::transient(
+                "the invalidation that refused this withdrawal could not be named; retry",
+            ),
+            Err(read_err) => self.record_backend_error(&read_err),
+        }
     }
 
     /// Acquire a pooled connection, recording `pool.acquire.duration`. Errors map
@@ -162,18 +207,38 @@ impl PgRecordStore {
     }
 
     /// Core single-row insert path: dedup on the `usage_records`
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` UNIQUE
-    /// (`usage_records_dedup_uniq`) via `INSERT … ON CONFLICT … DO NOTHING`, then
-    /// lost-the-race absorb-vs-conflict resolution.
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+    /// UNIQUE (`usage_records_dedup_uniq`) via `INSERT … ON CONFLICT … DO
+    /// NOTHING`, then lost-the-race absorb-vs-conflict resolution.
     ///
-    /// `ON CONFLICT DO NOTHING` is the serialization authority: a concurrent
-    /// same-key insert blocks on the in-progress speculative tuple until the
-    /// winner commits — bounded by the connection's `lock_timeout`
+    /// **One backend transaction, and it has to be one.** Two obligations meet
+    /// here. The entry's `acceptance_sequence` is claimed from
+    /// `usage_acceptance_sequence` (the gear's DESIGN §3.7), and where the
+    /// entry is an invalidation, `usage_records_one_invalidation_uniq` must
+    /// refuse a second withdrawal of one target *atomically with the entry it
+    /// admits* — the SPI says in as many words that a read followed by a write
+    /// will not do, and why a gateway-side pre-read cannot substitute. So the
+    /// claim and the insert commit or roll back together.
+    ///
+    /// **The at-most-one guarantee is conditional, and on the gateway.** The
+    /// index is over `(invalidates, window_end)`, because a hypertable UNIQUE
+    /// must contain the partition column. It catches two withdrawals of one
+    /// target only while they share that target's `window_end` — which a
+    /// faithful withdrawal does by construction, since it copies the covered
+    /// period of the entry it withdraws, and which the Ingestion Gateway
+    /// enforces upstream. A caller reaching this SPI directly with a mismatched
+    /// period is not bound by that, and would get two accepted invalidations.
+    /// Measured on a live container: same `window_end` → rejected; different
+    /// `window_end` → both accepted. No hypertable-compatible index can do
+    /// better, so this is recorded as a published-contract divergence rather
+    /// than papered over with an in-transaction pre-read.
+    ///
+    /// `ON CONFLICT DO NOTHING` remains the dedup serialization authority: a
+    /// concurrent same-key insert blocks on the in-progress speculative tuple
+    /// until the winner commits — bounded by the connection's `lock_timeout`
     /// ([`crate::infra::storage::pool`]), so the wait cannot pin the connection
     /// indefinitely — then its `DO NOTHING` returns no row and it resolves
-    /// absorb-vs-conflict against the now-visible committed row. The operation is
-    /// one `INSERT` plus at most one `SELECT` (both read-committed), so no
-    /// explicit transaction is needed.
+    /// absorb-vs-conflict against the now-visible committed row.
     ///
     /// This carries the per-row counters (dedup absorbed / idempotency conflict
     /// / compensation / backend error) so they are recorded exactly once per
@@ -186,17 +251,35 @@ impl PgRecordStore {
         record: UsageRecord,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         let mut conn = self.timed_acquire().await?;
+        let mut tx = conn.begin().await.map_err(|e| self.record_backend_error(&e))?;
 
-        // 1. Insert, deduplicated on the 4-tuple UNIQUE. `RETURNING` yields the
+        // 1. Claim this entry's acceptance_sequence inside the transaction that
+        //    will insert it, so the two commit or roll back together.
+        let acceptance_sequence =
+            match claim_acceptance_sequence(&mut tx, record.tenant_id, record.gts_type_id.as_str(), 1)
+                .await
+            {
+                Ok(seq) => seq,
+                Err(e) => {
+                    rollback(tx).await;
+                    return Err(self.record_backend_error(&e));
+                }
+            };
+
+        // 2. Insert, deduplicated on the 5-tuple UNIQUE. `RETURNING` yields the
         //    row only when we won the slot — `DO NOTHING` suppresses it on a
         //    conflict — so `Some` = fresh insert, `None` = a row with this
-        //    4-tuple already exists.
+        //    5-tuple already exists. `ingested_at` is left to its DEFAULT and
+        //    `entry_type` is generated, which is why sixteen of the seventeen
+        //    [`RECORD_COLUMNS`] are bound here.
         let insert_sql = format!(
             "INSERT INTO usage_records \
-             (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING \
+             (id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
+              resource_type, subject_id, subject_type, idempotency_key, invalidates, \
+              reason_code, origin, acceptance_sequence, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+             ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end) \
+             DO NOTHING \
              RETURNING {RECORD_COLUMNS}"
         );
         let subject_id = record
@@ -205,48 +288,75 @@ impl PgRecordStore {
             .map(usage_collector_sdk::SubjectRef::subject_id);
         let subject_type = record.subject_ref.as_ref().and_then(|s| s.subject_type());
         let metadata = metadata_map_to_jsonb(&record.metadata);
-        let is_compensation = record.corrects_id.is_some();
+        // One helper for both columns, so the half-populated pair the read
+        // direction refuses is unrepresentable on the way out too.
+        let (invalidates, reason_code) = invalidation_to_row(record.invalidation.as_ref());
+        let is_invalidation = invalidates.is_some();
 
-        let inserted = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(insert_sql))
+        let attempted = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(insert_sql))
             .bind(record.id)
             .bind(record.tenant_id)
-            .bind(gts_id_str(&record.gts_id))
+            .bind(record.gts_type_id.as_str())
             .bind(record.value)
-            .bind(record.created_at)
+            .bind(record.window_start)
+            .bind(record.window_end)
             .bind(record.resource_ref.resource_id())
             .bind(record.resource_ref.resource_type())
             .bind(subject_id)
             .bind(subject_type)
             .bind(record.idempotency_key.as_str())
-            .bind(record.corrects_id)
+            .bind(invalidates)
+            .bind(reason_code)
+            .bind(record.origin.as_str())
+            .bind(acceptance_sequence)
             .bind(metadata)
-            .fetch_optional(&mut *conn)
-            .await
-            // typed constraint mapping lands here; see map_insert_error
-            .map_err(|e| self.map_insert_error(&e))?;
+            .fetch_optional(&mut *tx)
+            .await;
+
+        let inserted = match attempted {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                // The failed statement aborted the transaction, so roll it back
+                // before the diagnostic read below: a further query on a failed
+                // transaction is refused with `25P02`, not answered.
+                rollback(tx).await;
+                let targets = invalidation_target_pairs(&[&record]);
+                return Err(self.map_insert_error(&mut conn, &e, &targets).await);
+            }
+        };
 
         if let Some(row) = inserted {
-            // 2a. Won the slot — fresh insert.
-            if is_compensation {
+            // 3a. Won the slot — fresh insert. Commit it together with the
+            //     sequence claim it was assigned.
+            tx.commit()
+                .await
+                .map_err(|e| self.record_backend_error(&e))?;
+            if is_invalidation {
                 self.metrics.inc_compensation();
             }
             return record_row_to_model(row);
         }
 
-        // 2b. Lost the slot — a row with this 4-tuple already exists. Read it and
-        //     resolve absorb-vs-conflict. The read mutates nothing.
+        // 3b. Lost the slot — a row with this 5-tuple already exists. Read it
+        //     and resolve absorb-vs-conflict. The read mutates nothing, and the
+        //     rollback that follows releases the sequence value claimed in
+        //     step 1, which is why an absorbed single-row retry leaves no gap
+        //     (a batch's block claim does; see [`claim_acceptance_sequence`]).
         let select_sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records \
-             WHERE tenant_id = $1 AND gts_id = $2 AND idempotency_key = $3 AND created_at = $4"
+             WHERE tenant_id = $1 AND gts_type_id = $2 AND idempotency_key = $3 \
+               AND window_start = $4 AND window_end = $5"
         );
         let stored = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(record.tenant_id)
-            .bind(gts_id_str(&record.gts_id))
+            .bind(record.gts_type_id.as_str())
             .bind(record.idempotency_key.as_str())
-            .bind(record.created_at)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
+            .bind(record.window_start)
+            .bind(record.window_end)
+            .fetch_optional(&mut *tx)
+            .await;
+        rollback(tx).await;
+        let stored = stored.map_err(|e| self.record_backend_error(&e))?;
 
         if let Some(row) = stored {
             self.resolve_dedup_hit(row, &record)
@@ -290,95 +400,70 @@ impl PgRecordStore {
     }
 
     /// Insert all distinct-key representatives in one multi-row
-    /// `INSERT … ON CONFLICT (4-tuple) DO NOTHING RETURNING`. The returned rows
+    /// `INSERT … ON CONFLICT (5-tuple) DO NOTHING RETURNING`. The returned rows
     /// are exactly the slots we won — `DO NOTHING` suppresses any row whose
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` already exists — so the
-    /// result maps each won [`DedupKey`] to its stored row. `reps` must be sorted
-    /// by [`DedupKey`] so concurrent batches insert in one global order
-    /// (deadlock-free). `metadata` is bound as `text[]` of JSON strings and cast
-    /// `::jsonb` per-row to sidestep `jsonb[]` array encoding.
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+    /// already exists — so the result maps each won [`DedupKey`] to its stored
+    /// row. `reps` must be sorted by [`DedupKey`] so concurrent batches insert
+    /// in one global order (deadlock-free), and `sequences` must be the
+    /// acceptance-sequence values claimed for them, in the same order.
+    ///
+    /// Errors come back as the raw `sqlx::Error` rather than mapped: the caller
+    /// holds the transaction that has to be rolled back before the mapping's
+    /// diagnostic read can run.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `sequences` is produced from `reps` by
+    /// [`claim_batch_sequences`], one value per representative.
     async fn insert_records_on_conflict(
-        &self,
-        conn: &mut sqlx::PgConnection,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
         reps: &[&UsageRecord],
-    ) -> Result<HashMap<DedupKey, UsageRecordRow>, UsageCollectorPluginError> {
+        sequences: &[i64],
+    ) -> Result<HashMap<DedupKey, UsageRecordRow>, sqlx::Error> {
         if reps.is_empty() {
             return Ok(HashMap::new());
         }
-
-        let ids: Vec<Uuid> = reps.iter().map(|r| r.id).collect();
-        let tenants: Vec<Uuid> = reps.iter().map(|r| r.tenant_id).collect();
-        let gtss: Vec<String> = reps
-            .iter()
-            .map(|r| gts_id_str(&r.gts_id).to_owned())
-            .collect();
-        let values: Vec<Decimal> = reps.iter().map(|r| r.value).collect();
-        let cats: Vec<OffsetDateTime> = reps.iter().map(|r| r.created_at).collect();
-        let resource_ids: Vec<String> = reps
-            .iter()
-            .map(|r| r.resource_ref.resource_id().to_owned())
-            .collect();
-        let resource_types: Vec<String> = reps
-            .iter()
-            .map(|r| r.resource_ref.resource_type().to_owned())
-            .collect();
-        let subject_ids: Vec<Option<String>> = reps
-            .iter()
-            .map(|r| {
-                r.subject_ref
-                    .as_ref()
-                    .map(|s| usage_collector_sdk::SubjectRef::subject_id(s).to_owned())
-            })
-            .collect();
-        let subject_types: Vec<Option<String>> = reps
-            .iter()
-            .map(|r| {
-                r.subject_ref
-                    .as_ref()
-                    .and_then(|s| s.subject_type())
-                    .map(str::to_owned)
-            })
-            .collect();
-        let idem_keys: Vec<String> = reps
-            .iter()
-            .map(|r| r.idempotency_key.as_str().to_owned())
-            .collect();
-        let corrects: Vec<Option<Uuid>> = reps.iter().map(|r| r.corrects_id).collect();
-        let metadata: Vec<String> = reps
-            .iter()
-            .map(|r| metadata_map_to_jsonb(&r.metadata).to_string())
-            .collect();
+        let cols = InsertColumns::build(reps, sequences);
 
         let sql = format!(
             "INSERT INTO usage_records \
-             (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             SELECT id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata::jsonb \
+             (id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
+              resource_type, subject_id, subject_type, idempotency_key, invalidates, \
+              reason_code, origin, acceptance_sequence, metadata) \
+             SELECT id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
+              resource_type, subject_id, subject_type, idempotency_key, invalidates, \
+              reason_code, origin, acceptance_sequence, metadata::jsonb \
              FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::numeric[], $5::timestamptz[], \
-              $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::uuid[], $12::text[]) \
-              AS t(id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-                   subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING \
+              $6::timestamptz[], $7::text[], $8::text[], $9::text[], $10::text[], $11::text[], \
+              $12::uuid[], $13::text[], $14::text[], $15::bigint[], $16::text[]) \
+              AS t(id, tenant_id, gts_type_id, value, window_start, window_end, resource_id, \
+                   resource_type, subject_id, subject_type, idempotency_key, invalidates, \
+                   reason_code, origin, acceptance_sequence, metadata) \
+             ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end) \
+             DO NOTHING \
              RETURNING {RECORD_COLUMNS}"
         );
 
         let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
-            .bind(&ids)
-            .bind(&tenants)
-            .bind(&gtss)
-            .bind(&values)
-            .bind(&cats)
-            .bind(&resource_ids)
-            .bind(&resource_types)
-            .bind(&subject_ids)
-            .bind(&subject_types)
-            .bind(&idem_keys)
-            .bind(&corrects)
-            .bind(&metadata)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
+            .bind(&cols.ids)
+            .bind(&cols.tenants)
+            .bind(&cols.gts_type_ids)
+            .bind(&cols.values)
+            .bind(&cols.window_starts)
+            .bind(&cols.window_ends)
+            .bind(&cols.resource_ids)
+            .bind(&cols.resource_types)
+            .bind(&cols.subject_ids)
+            .bind(&cols.subject_types)
+            .bind(&cols.idem_keys)
+            .bind(&cols.invalidates)
+            .bind(&cols.reason_codes)
+            .bind(&cols.origins)
+            .bind(&cols.sequences)
+            .bind(&cols.metadata)
+            .fetch_all(&mut **tx)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -386,14 +471,15 @@ impl PgRecordStore {
             .collect())
     }
 
-    /// For the not-won keys, read the existing `usage_records` row by its 4-tuple
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` — the batch analogue of
-    /// the single path's conflict branch. Maps each key to `Stored` (row found →
-    /// resolve absorb/conflict) or `Stale` (the conflicting row's chunk was
-    /// dropped by retention between the conflicting insert and this read).
+    /// For the not-won keys, read the existing `usage_records` row by its
+    /// 5-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
+    /// window_end)` — the batch analogue of the single path's conflict branch.
+    /// Maps each key to `Stored` (row found → resolve absorb/conflict) or
+    /// `Stale` (the conflicting row's chunk was dropped by retention between
+    /// the conflicting insert and this read).
     async fn read_conflict_records(
         &self,
-        conn: &mut sqlx::PgConnection,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
         not_won: &[&UsageRecord],
     ) -> Result<HashMap<DedupKey, ConflictRead>, UsageCollectorPluginError> {
         let mut out: HashMap<DedupKey, ConflictRead> = HashMap::new();
@@ -404,27 +490,30 @@ impl PgRecordStore {
         let tenants: Vec<Uuid> = not_won.iter().map(|r| r.tenant_id).collect();
         let gtss: Vec<String> = not_won
             .iter()
-            .map(|r| gts_id_str(&r.gts_id).to_owned())
+            .map(|r| r.gts_type_id.as_str().to_owned())
             .collect();
         let keys: Vec<String> = not_won
             .iter()
             .map(|r| r.idempotency_key.as_str().to_owned())
             .collect();
-        let cats: Vec<OffsetDateTime> = not_won.iter().map(|r| r.created_at).collect();
+        let starts: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_start).collect();
+        let ends: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_end).collect();
 
         let select_sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records \
-             WHERE (tenant_id, gts_id, idempotency_key, created_at) IN \
-               (SELECT t1, t2, t3, t4 \
-                FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[]) \
-                  AS t(t1, t2, t3, t4))"
+             WHERE (tenant_id, gts_type_id, idempotency_key, window_start, window_end) IN \
+               (SELECT t1, t2, t3, t4, t5 \
+                FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[], \
+                            $5::timestamptz[]) \
+                  AS t(t1, t2, t3, t4, t5))"
         );
         let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(&tenants)
             .bind(&gtss)
             .bind(&keys)
-            .bind(&cats)
-            .fetch_all(&mut *conn)
+            .bind(&starts)
+            .bind(&ends)
+            .fetch_all(&mut **tx)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
@@ -464,12 +553,21 @@ impl PgRecordStore {
     ) -> Vec<Result<UsageRecord, UsageCollectorPluginError>> {
         let mut results = Vec::with_capacity(records.len());
         for (i, record) in records.iter().enumerate() {
+            // Pre-rejected in-batch: an earlier row of this same batch already
+            // withdraws this target, and both rows would have gone into one
+            // multi-row INSERT where the index rejects the *statement* rather
+            // than the row. See [`plan_batch`] — this check is not the
+            // enforcement, only what keeps the outcome per-row.
+            if let Some(&invalidated_by) = plan.duplicate_withdrawals.get(&i) {
+                results.push(Err(duplicate_withdrawal_in_batch(record, invalidated_by)));
+                continue;
+            }
             let key = dedup_key(record);
             let is_winner = won.contains(&key) && plan.first_index.get(&key) == Some(&i);
             let outcome = if is_winner {
                 match inserted.get(&key) {
                     Some(row) => {
-                        if record.corrects_id.is_some() {
+                        if record.invalidation.is_some() {
                             self.metrics.inc_compensation();
                         }
                         record_row_to_model(row.clone())
@@ -518,11 +616,25 @@ impl PgRecordStore {
         results
     }
 
-    /// Orchestrate one batch on a single connection: insert (dedup on the
-    /// 4-tuple UNIQUE) → read conflicts for the not-won keys → resolve per row in
-    /// input order. The multi-row `INSERT … ON CONFLICT DO NOTHING` is itself
-    /// atomic, so no explicit transaction is required; `won` is the set of keys
-    /// the insert actually claimed (its `RETURNING` rows).
+    /// Orchestrate one batch inside **one transaction**: claim an
+    /// acceptance-sequence block per scope → insert (dedup on the 5-tuple
+    /// UNIQUE) → read conflicts for the not-won keys → commit → resolve per row
+    /// in input order. `won` is the set of keys the insert actually claimed
+    /// (its `RETURNING` rows).
+    ///
+    /// The transaction is not decoration. `acceptance_sequence` is claimed here
+    /// and inserted here, so the two must commit or roll back together; and the
+    /// at-most-one-invalidation index has to refuse a second withdrawal
+    /// atomically with the entry it admits, which the SPI is explicit about.
+    ///
+    /// **Two invalidations of one target that arrive together are handled
+    /// before the insert, not by it** — see [`plan_batch`]. What the index
+    /// still owns alone is the cross-call case, and there its violation aborts
+    /// the whole statement: a batch carrying a withdrawal of an
+    /// already-invalidated target fails as a whole with
+    /// [`UsageCollectorPluginError::AlreadyInvalidated`] rather than yielding
+    /// per-row outcomes. That residue is recorded as a divergence rather than
+    /// hidden.
     async fn create_batch_inner(
         &self,
         records: &[UsageRecord],
@@ -531,10 +643,27 @@ impl PgRecordStore {
         let plan = plan_batch(records);
 
         let mut conn = self.timed_acquire().await?;
+        let mut tx = conn.begin().await.map_err(|e| self.record_backend_error(&e))?;
 
-        let inserted = self
-            .insert_records_on_conflict(&mut conn, &plan.reps)
-            .await?;
+        let sequences = match claim_batch_sequences(&mut tx, &plan.reps).await {
+            Ok(sequences) => sequences,
+            Err(e) => {
+                rollback(tx).await;
+                return Err(self.record_backend_error(&e));
+            }
+        };
+
+        let inserted = match Self::insert_records_on_conflict(&mut tx, &plan.reps, &sequences).await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                // The failed statement aborted the transaction; roll it back so
+                // the mapping's diagnostic read has a usable connection.
+                rollback(tx).await;
+                let targets = invalidation_target_pairs(&plan.reps);
+                return Err(self.map_insert_error(&mut conn, &e, &targets).await);
+            }
+        };
         let won: HashSet<DedupKey> = inserted.keys().cloned().collect();
         let not_won: Vec<&UsageRecord> = plan
             .reps
@@ -542,10 +671,244 @@ impl PgRecordStore {
             .copied()
             .filter(|r| !won.contains(&dedup_key(r)))
             .collect();
-        let conflict = self.read_conflict_records(&mut conn, &not_won).await?;
+        let conflict = self.read_conflict_records(&mut tx, &not_won).await?;
+        tx.commit()
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
 
         Ok(self.resolve_batch(records, &plan, &won, &inserted, &conflict))
     }
+}
+
+/// The sixteen per-column vectors one multi-row insert binds.
+///
+/// `sqlx` binds arrays, not rows, so the batch insert `UNNEST`s these back into
+/// rows. Keeping them in one struct built by one function keeps the column
+/// list, the `UNNEST` list and the bind order readable side by side instead of
+/// spread across sixteen locals in the middle of the query.
+struct InsertColumns {
+    ids: Vec<Uuid>,
+    tenants: Vec<Uuid>,
+    gts_type_ids: Vec<String>,
+    values: Vec<Decimal>,
+    window_starts: Vec<OffsetDateTime>,
+    window_ends: Vec<OffsetDateTime>,
+    resource_ids: Vec<String>,
+    resource_types: Vec<String>,
+    subject_ids: Vec<Option<String>>,
+    subject_types: Vec<Option<String>>,
+    idem_keys: Vec<String>,
+    invalidates: Vec<Option<Uuid>>,
+    reason_codes: Vec<Option<String>>,
+    origins: Vec<String>,
+    sequences: Vec<i64>,
+    metadata: Vec<String>,
+}
+
+impl InsertColumns {
+    /// Pivot `reps` (plus the acceptance sequences claimed for them, in the
+    /// same order) into per-column vectors.
+    ///
+    /// `metadata` is carried as `text[]` of JSON strings and cast `::jsonb`
+    /// per-row in the query, to sidestep `jsonb[]` array encoding. The
+    /// invalidation pair goes through [`invalidation_to_row`] rather than being
+    /// read out of the record twice, so the two columns cannot drift apart.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `sequences` comes from [`claim_batch_sequences`] over
+    /// the same `reps`, so it is the same length. A shorter one would be a
+    /// caller invariant break, and panicking beats silently writing a wrong
+    /// acceptance sequence.
+    fn build(reps: &[&UsageRecord], sequences: &[i64]) -> Self {
+        assert_eq!(
+            reps.len(),
+            sequences.len(),
+            "one acceptance sequence must be claimed per batch representative"
+        );
+        let mut cols = Self {
+            ids: Vec::with_capacity(reps.len()),
+            tenants: Vec::with_capacity(reps.len()),
+            gts_type_ids: Vec::with_capacity(reps.len()),
+            values: Vec::with_capacity(reps.len()),
+            window_starts: Vec::with_capacity(reps.len()),
+            window_ends: Vec::with_capacity(reps.len()),
+            resource_ids: Vec::with_capacity(reps.len()),
+            resource_types: Vec::with_capacity(reps.len()),
+            subject_ids: Vec::with_capacity(reps.len()),
+            subject_types: Vec::with_capacity(reps.len()),
+            idem_keys: Vec::with_capacity(reps.len()),
+            invalidates: Vec::with_capacity(reps.len()),
+            reason_codes: Vec::with_capacity(reps.len()),
+            origins: Vec::with_capacity(reps.len()),
+            sequences: sequences.to_vec(),
+            metadata: Vec::with_capacity(reps.len()),
+        };
+        for r in reps {
+            let (invalidates, reason_code) = invalidation_to_row(r.invalidation.as_ref());
+            cols.ids.push(r.id);
+            cols.tenants.push(r.tenant_id);
+            cols.gts_type_ids.push(r.gts_type_id.as_str().to_owned());
+            cols.values.push(r.value);
+            cols.window_starts.push(r.window_start);
+            cols.window_ends.push(r.window_end);
+            cols.resource_ids
+                .push(r.resource_ref.resource_id().to_owned());
+            cols.resource_types
+                .push(r.resource_ref.resource_type().to_owned());
+            cols.subject_ids.push(
+                r.subject_ref
+                    .as_ref()
+                    .map(|sr| usage_collector_sdk::SubjectRef::subject_id(sr).to_owned()),
+            );
+            cols.subject_types.push(
+                r.subject_ref
+                    .as_ref()
+                    .and_then(|sr| sr.subject_type())
+                    .map(str::to_owned),
+            );
+            cols.idem_keys.push(r.idempotency_key.as_str().to_owned());
+            cols.invalidates.push(invalidates);
+            cols.reason_codes.push(reason_code.map(str::to_owned));
+            cols.origins.push(r.origin.as_str().to_owned());
+            cols.metadata
+                .push(metadata_map_to_jsonb(&r.metadata).to_string());
+        }
+        cols
+    }
+}
+
+/// Roll `tx` back now, logging a failure rather than propagating it.
+///
+/// Dropping a `Transaction` rolls it back too, but lazily — the `ROLLBACK` is
+/// queued and sent when the connection is next used. Every caller here rolls
+/// back precisely because it is about to use the connection again (for the
+/// diagnostic read that names an existing invalidation) or is about to return
+/// it to the pool after a failure, so "now" is the property that matters. A
+/// rollback that itself fails says the connection is gone; the pool discards
+/// it, and the caller's original error is the one worth returning.
+async fn rollback(tx: sqlx::Transaction<'_, Postgres>) {
+    if let Err(err) = tx.rollback().await {
+        tracing::warn!(
+            error = %err,
+            "rolling back a usage-record write transaction failed"
+        );
+    }
+}
+
+/// Claim a contiguous block of `count` `acceptance_sequence` values for
+/// `(tenant_id, gts_type_id)`, returning the block's **last** value — the block
+/// is `[returned - count + 1, returned]`.
+///
+/// Strictly monotonic per scope, which is the gear's DESIGN §3.7 obligation. It
+/// is **not** gapless and does not need to be: a batch claims one block per
+/// scope up front and then commits whatever the dedup `ON CONFLICT` let it win,
+/// so every value claimed for a slot it lost is spent without ever being
+/// stored. (A single-row insert that loses its slot rolls back instead, so that
+/// path leaves no gap.) Density is not the obligation and nothing reads the
+/// sequence expecting it.
+///
+/// Runs inside the caller's transaction so the claim and the insert commit or
+/// roll back together. The row lock this takes serializes concurrent ingest for
+/// one scope, which is what strict per-scope monotonicity costs; scopes do not
+/// contend with each other. That lock is also why `55P03 lock_not_available`
+/// belongs in the transient set ([`crate::infra::storage::error`]): ingest now
+/// waits on a per-scope row on every write, so timing out on a hot scope is an
+/// ordinary contention outcome rather than a defect.
+async fn claim_acceptance_sequence(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    gts_type_id: &str,
+    count: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO usage_acceptance_sequence (tenant_id, gts_type_id, next_value) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (tenant_id, gts_type_id) \
+         DO UPDATE SET next_value = usage_acceptance_sequence.next_value + $3 \
+         RETURNING next_value",
+    )
+    .bind(tenant_id)
+    .bind(gts_type_id)
+    .bind(count)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Claim one `acceptance_sequence` per representative, aligned to `reps` order.
+///
+/// `reps` are sorted by [`DedupKey`], whose first two components are exactly
+/// the sequence's scope, so same-scope representatives are contiguous and the
+/// scopes are visited in one global order — the same discipline that keeps the
+/// dedup tuple locks deadlock-free, applied to the counter rows.
+///
+/// One statement per scope rather than one per entry: the block claim advances
+/// the counter by `count` and returns the block's last value, so a batch of `n`
+/// entries in one scope costs one round trip and takes the counter's row lock
+/// once.
+async fn claim_batch_sequences(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    reps: &[&UsageRecord],
+) -> Result<Vec<i64>, sqlx::Error> {
+    let mut out: Vec<i64> = Vec::with_capacity(reps.len());
+    let mut start = 0usize;
+    while start < reps.len() {
+        let scope = (reps[start].tenant_id, reps[start].gts_type_id.as_str());
+        let mut end = start;
+        while end < reps.len() && (reps[end].tenant_id, reps[end].gts_type_id.as_str()) == scope {
+            end += 1;
+        }
+        // `end - start` is a slice length, so it fits an i64 on every target
+        // this builds for; saturating keeps the conversion total regardless.
+        let count = i64::try_from(end - start).unwrap_or(i64::MAX);
+        let last = claim_acceptance_sequence(tx, scope.0, scope.1, count).await?;
+        let first = last - count + 1;
+        for offset in 0..count {
+            out.push(first + offset);
+        }
+        start = end;
+    }
+    Ok(out)
+}
+
+/// The `(invalidation target, window_end)` pairs `records` would write into
+/// `usage_records_one_invalidation_uniq`.
+///
+/// Empty for ordinary measurements, which the partial index does not cover.
+/// The pair is the index's own key, so a lookup on it finds exactly the row
+/// that refused a write.
+fn invalidation_target_pairs(records: &[&UsageRecord]) -> Vec<(Uuid, OffsetDateTime)> {
+    records
+        .iter()
+        .filter_map(|r| r.invalidation.as_ref().map(|i| (i.target, r.window_end)))
+        .collect()
+}
+
+/// Read back the accepted invalidation occupying one of `targets`'
+/// `(invalidates, window_end)` slots, as `(withdrawn target, withdrawing entry
+/// id)`.
+///
+/// Diagnostic only — it runs after a write was already rejected, never before
+/// one; see [`PgRecordStore::map_insert_error`].
+async fn find_existing_invalidation(
+    conn: &mut sqlx::PgConnection,
+    targets: &[(Uuid, OffsetDateTime)],
+) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let ids: Vec<Uuid> = targets.iter().map(|(target, _)| *target).collect();
+    let ends: Vec<OffsetDateTime> = targets.iter().map(|(_, end)| *end).collect();
+    sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT t.target, r.id FROM usage_records AS r \
+         JOIN UNNEST($1::uuid[], $2::timestamptz[]) AS t(target, window_end) \
+           ON r.invalidates = t.target AND r.window_end = t.window_end \
+         LIMIT 1",
+    )
+    .bind(&ids)
+    .bind(&ends)
+    .fetch_optional(&mut *conn)
+    .await
 }
 
 /// Append the metadata side-channel filters as parameterized `WHERE` clauses.
@@ -604,31 +967,42 @@ fn record_row_key(row: &UsageRecordRow, field: &str) -> Option<String> {
 }
 
 /// The dedup identity, mirroring the `usage_records_dedup_uniq` UNIQUE
-/// `(tenant_id, gts_id, idempotency_key, created_at)`. The `created_at` component
-/// is the microsecond count (see [`to_micros`]) so an in-memory key built from a
-/// caller's `OffsetDateTime` matches the µs-truncated `created_at` Postgres
-/// returns via `RETURNING` (timestamptz stores microseconds; sub-µs nanos do not
-/// survive the round-trip).
-type DedupKey = (Uuid, String, String, i128);
+/// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)` — the
+/// same five inputs the entry `id` is a `UUIDv5` projection of
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so the two can
+/// never disagree about what one entry is.
+///
+/// The two covered-period bounds enter as
+/// [`canonical_period_bound`](usage_collector_sdk::canonical_period_bound)
+/// renders them, not as `OffsetDateTime`s. That is the SDK's own canonical
+/// microsecond form, shared with the identity derivation, and it is what makes
+/// an in-memory key built from a caller's value match the key built from what
+/// Postgres returned: `timestamptz` stores microseconds, so sub-µs nanos and a
+/// non-UTC offset do not survive the round trip, and the rendering flattens
+/// both. Using the SDK's function rather than a local truncation means a
+/// precision change in one crate cannot silently diverge them.
+type DedupKey = (Uuid, String, String, String, String);
 
 /// Build the [`DedupKey`] for an incoming record.
 fn dedup_key(record: &UsageRecord) -> DedupKey {
     (
         record.tenant_id,
-        gts_id_str(&record.gts_id).to_owned(),
+        record.gts_type_id.as_str().to_owned(),
         record.idempotency_key.as_str().to_owned(),
-        to_micros(record.created_at),
+        canonical_period_bound(record.window_start),
+        canonical_period_bound(record.window_end),
     )
 }
 
 /// Build the [`DedupKey`] for a stored row, so an `INSERT … RETURNING` result
-/// and an incoming record map to the same key (µs-normalized `created_at`).
+/// and an incoming record map to the same key (both bounds canonicalized).
 fn row_dedup_key(row: &UsageRecordRow) -> DedupKey {
     (
         row.tenant_id,
-        row.gts_id.clone(),
+        row.gts_type_id.clone(),
         row.idempotency_key.clone(),
-        to_micros(row.created_at),
+        canonical_period_bound(row.window_start),
+        canonical_period_bound(row.window_end),
     )
 }
 
@@ -641,7 +1015,7 @@ fn row_dedup_key(row: &UsageRecordRow) -> DedupKey {
 fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
     tracing::error!(
         tenant_id = %record.tenant_id,
-        gts_id = %gts_id_str(&record.gts_id),
+        gts_type_id = %record.gts_type_id.as_str(),
         idempotency_key = %record.idempotency_key.as_str(),
         "{msg}"
     );
@@ -655,7 +1029,7 @@ fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollec
 fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
     tracing::warn!(
         tenant_id = %record.tenant_id,
-        gts_id = %gts_id_str(&record.gts_id),
+        gts_type_id = %record.gts_type_id.as_str(),
         idempotency_key = %record.idempotency_key.as_str(),
         "{msg}"
     );
@@ -666,22 +1040,59 @@ fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPlu
 ///
 /// `reps` are the first-occurrence representative records, one per distinct
 /// dedup key, **sorted** by [`DedupKey`] so concurrent batches take the
-/// 4-tuple-UNIQUE conflict locks in one global order (deadlock-free).
+/// 5-tuple-UNIQUE conflict locks — and the per-scope acceptance-sequence row
+/// locks — in one global order (deadlock-free).
 /// `first_index` maps each key to the input index of its first occurrence — the
 /// only row that can win the slot; later same-key rows resolve against the
 /// winner's record, exactly as the single-row path resolves a same-key hit.
+/// `duplicate_withdrawals` names the input rows pre-rejected because an earlier
+/// row of the same batch already withdraws their target.
 struct BatchPlan<'a> {
     reps: Vec<&'a UsageRecord>,
     first_index: HashMap<DedupKey, usize>,
+    duplicate_withdrawals: HashMap<usize, Uuid>,
 }
 
-/// Collapse a batch to its distinct dedup keys (first occurrence wins),
-/// sorted for a stable lock order. Pure — no DB. `reps` borrow from `records`,
-/// which outlives the plan, so no record is cloned onto the plan.
+/// Collapse a batch to its distinct dedup keys (first occurrence wins), sorted
+/// for a stable lock order, and pre-reject a second in-batch withdrawal of one
+/// target. Pure — no DB. `reps` borrow from `records`, which outlives the plan,
+/// so no record is cloned onto the plan.
+///
+/// **The in-batch withdrawal check is not the at-most-one enforcement.** The
+/// enforcement is `usage_records_one_invalidation_uniq`, which is the only
+/// mechanism that can be atomic with the entry it admits and the only one that
+/// covers a second withdrawal arriving in a *different* call. This check exists
+/// because two withdrawals of one target inside a single batch would both land
+/// in one multi-row `INSERT`, where the index rejects the whole **statement**
+/// rather than the offending row — costing every other entry in the batch its
+/// outcome, when the SPI asks for exactly one accepted and the other rejected,
+/// per-record and in input order. Do not delete the index as redundant with
+/// this, and do not delete this as redundant with the index.
+///
+/// Within a batch the rule can be applied in its true form — at most one
+/// withdrawal per target, whatever period each carries — because the whole
+/// batch is in hand. The index can only approximate it, over
+/// `(invalidates, window_end)`; see [`PgRecordStore::create_inner`].
+///
+/// A repeat of the *same* withdrawal (same derived `id`, so all five dedup
+/// attributes match) is an idempotent retry, not a second withdrawal, and is
+/// left to the dedup path to absorb.
 fn plan_batch(records: &[UsageRecord]) -> BatchPlan<'_> {
     let mut first_index: HashMap<DedupKey, usize> = HashMap::new();
     let mut reps: Vec<(DedupKey, &UsageRecord)> = Vec::new();
+    let mut withdrawn: HashMap<Uuid, Uuid> = HashMap::new();
+    let mut duplicate_withdrawals: HashMap<usize, Uuid> = HashMap::new();
     for (i, record) in records.iter().enumerate() {
+        if let Some(invalidation) = record.invalidation.as_ref() {
+            if let Some(&first_id) = withdrawn.get(&invalidation.target) {
+                if first_id != record.id {
+                    duplicate_withdrawals.insert(i, first_id);
+                    continue;
+                }
+            } else {
+                withdrawn.insert(invalidation.target, record.id);
+            }
+        }
         let key = dedup_key(record);
         if let std::collections::hash_map::Entry::Vacant(slot) = first_index.entry(key.clone()) {
             slot.insert(i);
@@ -692,6 +1103,37 @@ fn plan_batch(records: &[UsageRecord]) -> BatchPlan<'_> {
     BatchPlan {
         reps: reps.into_iter().map(|(_, r)| r).collect(),
         first_index,
+        duplicate_withdrawals,
+    }
+}
+
+/// Build the [`UsageCollectorPluginError::AlreadyInvalidated`] for a batch row
+/// that an earlier row of the same batch already withdrew, logging it the way
+/// the other batch-path rejections are logged.
+///
+/// `invalidated_by` is the earlier row's entry id. A record reaching here
+/// always carries an invalidation — [`plan_batch`] only records rows that do —
+/// so the `None` arm is a plugin invariant break rather than a caller shape.
+fn duplicate_withdrawal_in_batch(
+    record: &UsageRecord,
+    invalidated_by: Uuid,
+) -> UsageCollectorPluginError {
+    let Some(invalidation) = record.invalidation.as_ref() else {
+        return dedup_invariant_break(
+            record,
+            "batch row pre-rejected as a duplicate withdrawal carries no invalidation",
+        );
+    };
+    tracing::warn!(
+        tenant_id = %record.tenant_id,
+        gts_type_id = %record.gts_type_id.as_str(),
+        target = %invalidation.target,
+        invalidated_by = %invalidated_by,
+        "rejecting a second withdrawal of one entry submitted in the same batch"
+    );
+    UsageCollectorPluginError::AlreadyInvalidated {
+        id: invalidation.target,
+        invalidated_by,
     }
 }
 
@@ -702,10 +1144,11 @@ const MAX_BATCH_ATTEMPTS: u32 = 3;
 
 /// Deterministic pre-jitter backoff base for the `attempt`-th retry (1-based).
 /// A short exponential — 5 ms, 10 ms, … — because a deadlock victim can retry
-/// almost immediately: the surviving transaction has already committed or
-/// aborted by the time Postgres aborts the victim, so the contended dedup locks
-/// are free. The shift is saturated so the schedule can never overflow
-/// regardless of how `MAX_BATCH_ATTEMPTS` grows.
+/// almost immediately: the transaction that survived the deadlock has already
+/// committed or aborted by the time Postgres aborts the victim, so the
+/// contended dedup and acceptance-sequence locks are free. The shift is
+/// saturated so the schedule can never overflow regardless of how
+/// `MAX_BATCH_ATTEMPTS` grows.
 fn batch_retry_backoff_base(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(6);
     Duration::from_millis(5u64 << shift)
@@ -735,13 +1178,17 @@ fn batch_retry_backoff(attempt: u32) -> Duration {
 /// Retry predicate for [`with_retry`] around `create_batch`: retry **only** an
 /// outer [`UsageCollectorPluginError::Transient`].
 ///
-/// The deadlock victim surfaces as an outer `Transient` (the whole transaction
-/// rolled back); serialization failures (`40001`) and connection blips collapse
-/// to the same bucket inside the storage helpers, and all are safe to re-run
-/// for this idempotent batch. `Internal`, `IdempotencyConflict`, and the typed
-/// domain errors are non-retryable and returned unchanged. Per-row `Transient`
-/// outcomes carried inside an `Ok(vec)` are deliberately not seen here — the
-/// batch as a whole succeeded, so the loop never inspects them.
+/// The deadlock victim surfaces as an outer `Transient` — `create_batch_inner`
+/// runs the whole batch in one transaction, and that transaction rolled back,
+/// so the attempt left nothing behind. Serialization failures (`40001`), lock
+/// timeouts (`55P03`, which ingest can now hit on the per-scope
+/// acceptance-sequence row) and connection blips collapse to the same bucket
+/// inside the storage helpers, and all are safe to re-run for this idempotent
+/// batch. `Internal`, `IdempotencyConflict`, `AlreadyInvalidated` and the other
+/// typed domain outcomes are non-retryable and returned unchanged — an
+/// already-withdrawn target does not become withdrawable by waiting. Per-row
+/// `Transient` outcomes carried inside an `Ok(vec)` are deliberately not seen
+/// here — the batch as a whole succeeded, so the loop never inspects them.
 fn is_retryable_batch_error(err: &UsageCollectorPluginError) -> bool {
     matches!(err, UsageCollectorPluginError::Transient { .. })
 }
@@ -760,12 +1207,14 @@ fn is_retryable_batch_error(err: &UsageCollectorPluginError) -> bool {
 /// told apart from a bubbled transient failure.
 ///
 /// Generic and DB-free so the retry mechanics are unit-tested without a
-/// transaction. `operation` is an `Fn` invoked fresh each attempt (it borrows
-/// the caller's input, so re-invocation is allocation-free), which is exactly
-/// the right unit of retry for `create_batch_inner`: every attempt acquires a
-/// fresh connection and opens a fresh transaction. There is zero happy-path
-/// cost — on success the loop runs the operation once and neither sleeps,
-/// allocates a backoff, nor calls `on_retry`.
+/// database at all. `operation` is an `Fn` invoked fresh each attempt (it
+/// borrows the caller's input, so re-invocation is allocation-free), which is
+/// exactly the right unit of retry for `create_batch_inner`: every attempt
+/// acquires a fresh connection and opens a fresh transaction on it, so a failed
+/// attempt leaves neither a claimed acceptance sequence nor a half-written
+/// batch behind. There is zero happy-path cost — on success the loop runs the
+/// operation once and neither sleeps, allocates a backoff, nor calls
+/// `on_retry`.
 async fn with_retry<T, E, Op, Fut>(
     max_attempts: u32,
     backoff: impl Fn(u32) -> Duration,
@@ -805,64 +1254,48 @@ enum ConflictRead {
     Stale,
 }
 
-/// `OffsetDateTime` at microsecond precision, as the unix-epoch microsecond
-/// count.
-///
-/// Postgres `timestamptz` stores microseconds; an incoming `OffsetDateTime`
-/// may carry sub-microsecond nanos that never survive the round-trip. Comparing
-/// the microsecond counts makes the canonical-equality check agree with what
-/// the DB actually persisted.
-///
-/// Delegates to the SDK's [`usage_collector_sdk::created_at_micros`] so this
-/// dedup-equality projection and the identity derivation in
-/// [`usage_collector_sdk::derive_usage_record_id`] share one canonical µs
-/// primitive — a precision change in one crate cannot silently diverge them.
-fn to_micros(dt: OffsetDateTime) -> i128 {
-    usage_collector_sdk::created_at_micros(dt)
-}
-
 /// Compare the caller-supplied canonical fields of a stored row against an
-/// incoming record (§3.6: absorb vs conflict).
+/// incoming record (DESIGN §3.6: absorb vs conflict).
 ///
-/// The canonical set compared here is `id`, `value`, `resource_ref`,
-/// `subject_ref`, `corrects_id`, and `metadata`. Excluded are the dedup-key
-/// fields (`tenant_id` / `gts_id` / `idempotency_key` / `created_at`) — the
-/// lookup key, already matched — and server-managed `status` / `ingested_at`.
-/// `metadata` is compared after decoding the stored `jsonb` back to the typed
-/// map.
+/// This runs only once the dedup 5-tuple has already matched, so it answers one
+/// question: does the rest of what the caller supplied match too? If it does,
+/// the submission is an exact retry and is absorbed; if it does not, one
+/// idempotency key is being used for two different entries and that is an
+/// `IdempotencyConflict`.
 ///
-/// NOTE — `created_at` is excluded because it is part of the dedup key (the
-/// `(tenant_id, gts_id, idempotency_key, created_at)` 4-tuple UNIQUE): this
-/// function only runs once that key has already matched, so the timestamps are
-/// equal by construction. A same-`idempotency_key` request carrying a
-/// *different* `created_at` is a distinct 4-tuple — a distinct record with a
-/// distinct `id` (ADR-0014 makes `created_at` part of the record identity), not
-/// a conflict; see DESIGN.md §2.2.
+/// The compared set is therefore *everything the caller supplies*: `id`, the
+/// covered period, `value`, `resource_ref`, `subject_ref`, `origin`, the
+/// invalidation pair, and `metadata`. Only the server-managed columns are
+/// excluded — `acceptance_sequence`, which this plugin assigns, and
+/// `ingested_at`, the insert time. `metadata` is compared after decoding the
+/// stored `jsonb` back to the typed map; the invalidation pair is compared
+/// through [`invalidation_to_row`], the same helper the insert binds through,
+/// so the write and the comparison cannot spell the pair differently.
 ///
-/// NOTE — the record `id` is compared here (stored `id` column vs the
-/// incoming record's `id`). Since `id` is a deterministic projection of the
-/// 4-tuple dedup key `(tenant_id, gts_id, idempotency_key, created_at)`
-/// (ADR-0014) and this function only runs once that full key has matched, the
-/// two ids are equal by construction, so this comparison is a defensive
-/// tautology rather than a fail-closed guard against a mismatched
-/// caller-supplied identity. It is kept so a future non-deterministic-id path
-/// (or a corrupted stored row) still surfaces as an `IdempotencyConflict`
-/// rather than a silent absorb.
+/// NOTE — the invalidation *target* is compared here even though it is
+/// deliberately excluded from the identity derivation. The SDK explains that
+/// the exclusion and this inclusion are one mechanism: excluded from the
+/// identity, reusing one idempotency key across an entry and its withdrawal
+/// collapses them onto a single dedup slot; included here, that collapse is
+/// loud (the pair compares unequal and conflicts) instead of silently absorbing
+/// the withdrawal as a duplicate of the entry it meant to withdraw.
+///
+/// NOTE — the record `id` and the two covered-period bounds are compared even
+/// though all three are determined by the dedup key that has already matched:
+/// `id` is a `UUIDv5` projection of it, and the bounds are two of its five
+/// components. Both comparisons are defensive tautologies rather than
+/// fail-closed guards on caller data, kept so a corrupted stored row surfaces
+/// as an `IdempotencyConflict` rather than a silent absorb. The bounds are
+/// compared through the same canonical rendering the key uses, so a stored
+/// value that round-tripped through `timestamptz` cannot compare unequal to the
+/// caller's on precision or offset alone.
 ///
 /// Comparing `id` here is explicitly sanctioned by the SPI contract:
 /// plugin-spi.md §"Plugin-specific outputs" (Create single record output) and
-/// domain-model.md §2.5 `IdempotencyKey` exclude only the server-managed
-/// `status` from the caller-canonical comparison, and both note that a plugin
-/// MAY defensively verify the deterministic `id` against the derived value —
-/// surfacing a corrupted stored row as `IdempotencyConflict` rather than a
-/// silent absorb — without changing the outcome for well-formed data. That is
-/// exactly the guard described above.
-///
-/// The one edge the tautology relies on: a pre-`id`-determinism row would break
-/// it — its stored `id` is the old *caller-supplied* `uuid`, not the derived
-/// value — surfacing an exact retry as a false `IdempotencyConflict`.
-/// Deployments are greenfield, so no such row exists; see migration
-/// `0002_rename_uuid_to_id.sql`.
+/// domain-model.md §2.5 `IdempotencyKey` note that a plugin MAY defensively
+/// verify the deterministic `id` against the derived value — surfacing a
+/// corrupted stored row as `IdempotencyConflict` rather than a silent absorb —
+/// without changing the outcome for well-formed data.
 ///
 /// # Errors
 ///
@@ -876,6 +1309,8 @@ fn canonical_equal(
     let stored_metadata = metadata_jsonb_to_map(row.metadata.clone())?;
     Ok(row.id == incoming.id
         && row.value == incoming.value
+        && canonical_period_bound(row.window_start) == canonical_period_bound(incoming.window_start)
+        && canonical_period_bound(row.window_end) == canonical_period_bound(incoming.window_end)
         && row.resource_id == incoming.resource_ref.resource_id()
         && row.resource_type == incoming.resource_ref.resource_type()
         && row.subject_id.as_deref()
@@ -885,7 +1320,9 @@ fn canonical_equal(
                 .map(usage_collector_sdk::SubjectRef::subject_id)
         && row.subject_type.as_deref()
             == incoming.subject_ref.as_ref().and_then(|s| s.subject_type())
-        && row.corrects_id == incoming.corrects_id
+        && row.origin == incoming.origin.as_str()
+        && (row.invalidates, row.reason_code.as_deref())
+            == invalidation_to_row(incoming.invalidation.as_ref())
         && stored_metadata == incoming.metadata)
 }
 
@@ -923,10 +1360,12 @@ impl RecordStore for PgRecordStore {
         //
         // Wrap the whole call in a bounded retry: on an outer `Transient` (the
         // classic ABBA deadlock victim aborted as `40P01`, a serialization
-        // failure `40001`, or a connection blip) re-run the operation up to
-        // `MAX_BATCH_ATTEMPTS` times. Each attempt acquires a fresh connection
-        // and opens a fresh transaction (`create_batch_inner` does both), so a
-        // rolled-back attempt leaves no state behind. Re-running is safe: the
+        // failure `40001`, a `55P03` lock timeout on a hot scope's
+        // acceptance-sequence row, or a connection blip) re-run the operation up
+        // to `MAX_BATCH_ATTEMPTS` times. Each attempt acquires a fresh
+        // connection and opens a fresh transaction on it (`create_batch_inner`
+        // does both), so a rolled-back attempt leaves no state behind — not even
+        // the acceptance-sequence block it had claimed. Re-running is safe: that
         // transaction is atomic and the dedup keys make it idempotent, so a
         // re-run either re-claims the same slots or absorbs/conflicts against
         // the now-committed survivor. `Ok(vec)` is never retried — per-row

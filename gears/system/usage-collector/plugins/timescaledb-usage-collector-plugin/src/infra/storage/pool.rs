@@ -66,10 +66,16 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 }
 
 /// Fixed upper bound on how long a request-path statement waits on a contended
-/// lock — e.g. an ingest `INSERT ... ON CONFLICT ... DO NOTHING` that meets a
-/// not-yet-committed duplicate of the same dedup 4-tuple and blocks until that
-/// transaction resolves. The wait then fails fast (`55P03 lock_not_available`)
-/// instead of blocking on — and pinning — a pooled connection.
+/// lock. Ingest waits on two: the `usage_acceptance_sequence` row for the
+/// entry's `(tenant_id, gts_type_id)` scope, which every write claims from, and
+/// the speculative tuple an `INSERT ... ON CONFLICT ... DO NOTHING` meets when
+/// a not-yet-committed duplicate of the same dedup 5-tuple is in flight. The
+/// wait then fails fast (`55P03 lock_not_available`) instead of blocking on —
+/// and pinning — a pooled connection.
+///
+/// `55P03` is classified transient ([`super::error`]) precisely because these
+/// are ordinary contention outcomes on a hot scope, so a timed-out batch is
+/// retried rather than returned as a non-retryable failure.
 const LOCK_TIMEOUT: &str = "5s";
 
 /// Session GUCs applied to every request-path pool connection at connect time:

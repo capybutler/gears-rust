@@ -163,3 +163,77 @@ fn internal_mapping_does_not_leak_raw_error_text() {
         other => panic!("expected Internal, got {other:?}"),
     }
 }
+
+// --- TimescaleDB chunk-local constraint spellings ---
+//
+// A hypertable clones each constraint onto every chunk under a generated name,
+// so the bare name a migration declares is not what a violation reports. These
+// inputs are the literal strings a live `timescale/timescaledb:latest-pg16`
+// returned from `db.constraint()` against this crate's own
+// `migrations/0001_init.sql`, so they pin the finding rather than a guess at
+// it.
+
+#[test]
+fn a_chunk_local_dedup_constraint_is_still_the_dedup_violation() {
+    // Declared inside `CREATE TABLE`, so TimescaleDB clones it as
+    // `<chunk_id>_<name>`. `chunk_id` is a global sequence across every
+    // hypertable in the database, so the prefix cannot be hardcoded.
+    assert_eq!(
+        classify_db("23505", Some("1_usage_records_dedup_uniq")),
+        DbErrorClass::DedupUniqueViolation,
+        "the chunk-local spelling is the only one a real hypertable reports, so \
+         exact-name matching would leave this arm dead"
+    );
+    assert_eq!(
+        classify_db("23505", Some("2_usage_records_dedup_uniq")),
+        DbErrorClass::DedupUniqueViolation,
+        "a second chunk carries a different numeric prefix"
+    );
+}
+
+#[test]
+fn a_chunk_local_one_invalidation_index_is_already_invalidated() {
+    // Declared as a standalone `CREATE UNIQUE INDEX`, so Postgres clones it
+    // onto the chunk as `_hyper_<ht>_<chunk>_chunk_<name>` — a different shape
+    // from the in-table constraint above. A normalization that strips one
+    // shape silently misses the other; a boundary-anchored suffix match takes
+    // both.
+    assert_eq!(
+        classify_db(
+            "23505",
+            Some("_hyper_1_1_chunk_usage_records_one_invalidation_uniq")
+        ),
+        DbErrorClass::AlreadyInvalidated,
+        "the at-most-one-invalidation index is the atomic enforcement, and this \
+         is the spelling its violation actually arrives under"
+    );
+    assert_eq!(
+        classify_db("23505", Some("usage_records_one_invalidation_uniq")),
+        DbErrorClass::AlreadyInvalidated,
+        "the bare name still matches, for a non-hypertable or a future rename"
+    );
+}
+
+#[test]
+fn a_name_that_merely_ends_in_a_constraint_name_is_not_that_constraint() {
+    // The suffix match is anchored on the `_` separator every chunk-local
+    // spelling ends its prefix with. Without that anchor an unrelated
+    // constraint whose name happens to end in the same characters would be
+    // misread as the dedup authority.
+    assert_eq!(
+        classify_db("23505", Some("tenantusage_records_dedup_uniq")),
+        DbErrorClass::Other,
+        "no `_` separator before the suffix, so this is a different constraint"
+    );
+}
+
+#[test]
+fn lock_not_available_is_transient_so_the_batch_retry_can_see_it() {
+    // Every request-path connection sets `lock_timeout` (pool.rs), and the
+    // ingest path now takes a per-scope row lock on `usage_acceptance_sequence`
+    // plus the dedup tuple lock, so a 5s wait that times out is an ordinary
+    // contention outcome rather than a defect. Classified `Other` it would map
+    // to a non-retryable `Internal` and `is_retryable_batch_error` would refuse
+    // to re-run an operation that is idempotent by construction.
+    assert_eq!(classify_db("55P03", None), DbErrorClass::Transient);
+}

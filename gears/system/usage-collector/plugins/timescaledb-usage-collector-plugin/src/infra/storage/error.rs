@@ -7,19 +7,79 @@
 
 use usage_collector_sdk::UsageCollectorPluginError;
 
+/// Name of the dedup UNIQUE declared in `migrations/0001_init.sql`, over the
+/// 5-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
+/// window_end)`.
+pub const DEDUP_UNIQUE: &str = "usage_records_dedup_uniq";
+
+/// Name of the partial unique index that enforces at-most-one accepted
+/// invalidation per target. It is the *atomic* enforcement the SPI requires,
+/// so unlike [`DEDUP_UNIQUE`] its violation reaches this classifier on a live
+/// path rather than defensively.
+pub const ONE_INVALIDATION_UNIQUE: &str = "usage_records_one_invalidation_uniq";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbErrorClass {
     DedupUniqueViolation,
+    /// A second accepted invalidation of one target, refused by
+    /// [`ONE_INVALIDATION_UNIQUE`].
+    AlreadyInvalidated,
     Transient,
     Other,
 }
 
+/// `55P03 lock_not_available` is in the transient set deliberately, and it is
+/// the one member that is not a connectivity or serialization fault.
+///
+/// Every request-path connection carries a fixed `lock_timeout`
+/// ([`crate::infra::storage::pool`]), so a statement that waits too long on a
+/// contended lock fails with `55P03` rather than pinning a pooled connection.
+/// The ingest path takes two such locks per entry — the `usage_acceptance_sequence`
+/// row for the entry's `(tenant_id, gts_type_id)` scope, and the speculative
+/// tuple an in-flight same-key insert holds — so losing that race is an
+/// ordinary contention outcome on a hot scope, self-healing on retry. Left in
+/// `Other` it maps to a non-retryable `Internal` and
+/// `is_retryable_batch_error` refuses to re-run a batch that is idempotent by
+/// construction.
+///
+/// The one coupling worth naming: `acquire_error_clears_readiness` routes a
+/// backend-reported `Database` error through this same predicate, so a
+/// transient SQLSTATE there clears the `ready` gauge. `55P03` cannot arrive on
+/// that path — `pool.acquire()` establishes a connection and applies its GUCs
+/// as startup parameters, running no lock-taking statement — so the gauge is
+/// unaffected.
 fn is_transient_sqlstate(code: &str) -> bool {
     code.starts_with("08")
         || matches!(
             code,
-            "57P01" | "57P02" | "57P03" | "53300" | "40001" | "40P01"
+            "57P01" | "57P02" | "57P03" | "53300" | "40001" | "40P01" | "55P03"
         )
+}
+
+/// True when `actual` names the constraint `name`, allowing for `TimescaleDB`'s
+/// chunk-local spellings.
+///
+/// A hypertable clones each constraint onto every chunk under a generated
+/// name, and there are two shapes because there are two declaration sites:
+/// `<chunk_id>_<name>` for a constraint declared in `CREATE TABLE`, and
+/// `_hyper_<ht>_<chunk>_chunk_<name>` for a standalone `CREATE UNIQUE INDEX`.
+/// Both end in `_<name>`, and `chunk_id` is a global sequence across every
+/// hypertable in the database, so no fixed prefix can be hardcoded. Bare
+/// equality still holds for CHECK constraints, which are not renamed, and for
+/// non-hypertable tables such as `usage_acceptance_sequence`.
+///
+/// The `_` anchor over a plain `ends_with` costs nothing and stops an
+/// unrelated name that merely ends in the same characters without a separator.
+///
+/// Suffix matching is safe for this schema because no name in
+/// `migrations/0001_init.sql` is a suffix of any other — note in particular
+/// that `usage_records_tenant_window_idx` is *not* a suffix of
+/// `usage_records_tenant_type_window_idx`. One rule follows for future
+/// migrations: Postgres truncates identifiers at 63 bytes measured from the
+/// tail and the chunk prefix is prepended, so a long enough name loses its
+/// suffix entirely. Keep constraint names under ~45 characters.
+fn is_constraint(actual: &str, name: &str) -> bool {
+    actual == name || actual.strip_suffix(name).is_some_and(|p| p.ends_with('_'))
 }
 
 /// 23503 `foreign_key_violation` has no arm: the schema declares no foreign
@@ -27,18 +87,26 @@ fn is_transient_sqlstate(code: &str) -> bool {
 #[must_use]
 pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
     match code {
-        // Match each unique constraint by name. Another unique constraint (the
-        // records PK `(id, window_end)`, or the at-most-one-invalidation index
-        // `usage_records_one_invalidation_uniq`) must fall through to `Other`
-        // rather than be silently misread as a dedup conflict.
+        // Match each unique constraint by name. Any other unique constraint —
+        // the records PK `(id, window_end)`, say — must fall through to
+        // `Other` rather than be silently misread as one of these two.
         //
-        // `usage_records_dedup_uniq` is the dedup authority, but the ingest path
-        // reaches it via `INSERT … ON CONFLICT … DO NOTHING`, which suppresses
-        // the 23505 — so this arm is defensive: it only fires if a dedup-unique
+        // [`DEDUP_UNIQUE`] is the dedup authority, but the ingest path reaches
+        // it via `INSERT … ON CONFLICT … DO NOTHING`, which suppresses the
+        // 23505 — so that arm is defensive: it only fires if a dedup-unique
         // violation ever surfaces as a raw error (e.g. a future write path that
         // bypasses `ON CONFLICT`), keeping it classified rather than `Other`.
+        //
+        // [`ONE_INVALIDATION_UNIQUE`] is the opposite: a statement admits one
+        // `ON CONFLICT` arbiter and the ingest insert spends it on the dedup
+        // 5-tuple, so this index always surfaces as a raw 23505 and its arm is
+        // on a live path.
+        //
+        // Both are matched through [`is_constraint`], not by equality: on a
+        // real hypertable neither reports its bare name.
         "23505" => match constraint {
-            Some("usage_records_dedup_uniq") => DbErrorClass::DedupUniqueViolation,
+            Some(c) if is_constraint(c, DEDUP_UNIQUE) => DbErrorClass::DedupUniqueViolation,
+            Some(c) if is_constraint(c, ONE_INVALIDATION_UNIQUE) => DbErrorClass::AlreadyInvalidated,
             _ => DbErrorClass::Other,
         },
         c if is_transient_sqlstate(c) => DbErrorClass::Transient,

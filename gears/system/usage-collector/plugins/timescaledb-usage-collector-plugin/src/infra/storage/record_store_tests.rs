@@ -14,14 +14,27 @@ use usage_collector_sdk::{UsageCollectorPluginError, UsageTypeGtsId};
 
 use super::{
     ConflictRead, DedupKey, MAX_BATCH_ATTEMPTS, PgRecordStore, batch_retry_backoff,
-    batch_retry_backoff_base, canonical_equal, dedup_key, is_retryable_batch_error, plan_batch,
-    with_retry,
+    batch_retry_backoff_base, canonical_equal, dedup_key, invalidation_target_pairs,
+    is_retryable_batch_error, plan_batch, row_dedup_key, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
 use crate::infra::storage::entity::UsageRecordRow;
 
-const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
+/// A valid meter type id: the reserved base plus one derivation segment,
+/// `~`-terminated, which is what `MeterTypeId::new` validates.
+const VCPU_METER: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~";
+
+/// The covered period every unit record below carries: one hour starting at
+/// `2023-11-14T22:13:20Z` (unix `1_700_000_000`).
+const WINDOW_START_UNIX: i64 = 1_700_000_000;
+const WINDOW_END_UNIX: i64 = 1_700_003_600;
+
+/// The canonical rendering of those two bounds, spelled out rather than
+/// computed, so a test that pins the dedup key names the bytes instead of
+/// re-deriving them with the function under test.
+const WINDOW_START_CANONICAL: &str = "2023-11-14T22:13:20.000000Z";
+const WINDOW_END_CANONICAL: &str = "2023-11-14T23:13:20.000000Z";
 
 /// A store over a lazy pool: no connection is opened, so the pre-DB validation
 /// paths under test return before any query is issued. The tiny acquire timeout
@@ -38,103 +51,11 @@ fn lazy_store() -> PgRecordStore {
     )
 }
 
-#[tokio::test]
-async fn list_rejects_cursor_whose_sort_order_differs_from_query() {
-    let store = lazy_store();
-    let gts_id = UsageTypeGtsId::new(VCPU_GTS).expect("valid gts id");
-
-    // The live query sorts (created_at asc, id asc); the cursor was minted
-    // under a different order (id first). The keys are individually valid, so
-    // without the guard the request binds old key strings against new columns —
-    // silently wrong pagination. The filter hash agrees (both unset), so only
-    // the sort-order guard can reject this.
-    let query = ODataQuery::new()
-        .with_order(ODataOrderBy(vec![
-            OrderKey {
-                field: "created_at".to_owned(),
-                dir: SortDir::Asc,
-            },
-            OrderKey {
-                field: "id".to_owned(),
-                dir: SortDir::Asc,
-            },
-        ]))
-        .with_cursor(CursorV1 {
-            k: vec![
-                "2024-01-01T00:00:00Z".to_owned(),
-                "00000000-0000-0000-0000-000000000001".to_owned(),
-            ],
-            o: SortDir::Asc,
-            s: "+id,+created_at".to_owned(),
-            f: None,
-            d: "fwd".to_owned(),
-        });
-
-    let err = store
-        .list(gts_id, &query, &[])
-        .await
-        .expect_err("a cursor minted under a different order must be rejected");
-
-    match err {
-        UsageCollectorPluginError::Internal(msg) => {
-            assert!(
-                msg.contains("sort order"),
-                "unexpected error message: {msg}"
-            );
-        }
-        other => panic!("expected an Internal sort-order mismatch, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn list_rejects_backward_cursor() {
-    let store = lazy_store();
-    let gts_id = UsageTypeGtsId::new(VCPU_GTS).expect("valid gts id");
-
-    // A backward cursor whose filter hash and sort order both agree with the
-    // query, so only the direction guard can reject it. Without the guard the
-    // request would page FORWARD (the keyset operator is derived from the sort
-    // direction, not `d`) and silently return the wrong page.
-    let query = ODataQuery::new()
-        .with_order(ODataOrderBy(vec![
-            OrderKey {
-                field: "created_at".to_owned(),
-                dir: SortDir::Asc,
-            },
-            OrderKey {
-                field: "id".to_owned(),
-                dir: SortDir::Asc,
-            },
-        ]))
-        .with_cursor(CursorV1 {
-            k: vec![
-                "2024-01-01T00:00:00Z".to_owned(),
-                "00000000-0000-0000-0000-000000000001".to_owned(),
-            ],
-            o: SortDir::Asc,
-            s: "+created_at,+id".to_owned(),
-            f: None,
-            d: "bwd".to_owned(),
-        });
-
-    let err = store
-        .list(gts_id, &query, &[])
-        .await
-        .expect_err("a backward cursor must be rejected before any DB access");
-
-    match err {
-        UsageCollectorPluginError::Internal(msg) => {
-            assert!(msg.contains("direction"), "unexpected error message: {msg}");
-        }
-        other => panic!("expected an Internal direction error, got {other:?}"),
-    }
-}
-
 /// Minimal in-memory `UsageRecord` for pure (no-DB) unit tests.
 fn unit_record(tenant: uuid::Uuid, idem: &str, seq: u128) -> usage_collector_sdk::UsageRecord {
     usage_collector_sdk::UsageRecord {
         id: uuid::Uuid::from_u128(seq),
-        gts_id: usage_collector_sdk::UsageTypeGtsId::new(VCPU_GTS).expect("valid gts id"),
+        gts_type_id: usage_collector_sdk::MeterTypeId::new(VCPU_METER).expect("valid meter id"),
         tenant_id: tenant,
         resource_ref: usage_collector_sdk::ResourceRef::new("res-1", "compute.vm")
             .expect("valid resource_ref"),
@@ -142,57 +63,140 @@ fn unit_record(tenant: uuid::Uuid, idem: &str, seq: u128) -> usage_collector_sdk
         metadata: std::collections::BTreeMap::new(),
         value: rust_decimal::Decimal::new(1, 0),
         idempotency_key: usage_collector_sdk::IdempotencyKey::new(idem).expect("valid idem key"),
-        corrects_id: None,
-        status: usage_collector_sdk::UsageRecordStatus::Active,
-        created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid ts"),
+        origin: usage_collector_sdk::RecordOrigin::Live,
+        invalidation: None,
+        window_start: time::OffsetDateTime::from_unix_timestamp(WINDOW_START_UNIX)
+            .expect("valid ts"),
+        window_end: time::OffsetDateTime::from_unix_timestamp(WINDOW_END_UNIX).expect("valid ts"),
     }
 }
 
+/// A withdrawal of `target`: the same shape as [`unit_record`] plus the
+/// invalidation pair. A faithful withdrawal copies its target's covered period,
+/// and every one built here does.
+fn withdrawal(
+    tenant: uuid::Uuid,
+    idem: &str,
+    seq: u128,
+    target: uuid::Uuid,
+) -> usage_collector_sdk::UsageRecord {
+    usage_collector_sdk::UsageRecord {
+        invalidation: Some(usage_collector_sdk::Invalidation {
+            target,
+            reason: usage_collector_sdk::ReasonCode::new("duplicate_submission")
+                .expect("valid reason code"),
+        }),
+        ..unit_record(tenant, idem, seq)
+    }
+}
+
+// --- The dedup identity (the 5-tuple) ---
+
 #[test]
-fn plan_batch_collapses_and_sorts_distinct_keys() {
-    let tenant = uuid::Uuid::from_u128(1);
-    let mk = |idem: &str, seq: u128| unit_record(tenant, idem, seq);
-    let records = vec![
-        mk("kb", 10), // idx 0
-        mk("ka", 11), // idx 1
-        mk("kb", 12), // idx 2 — duplicate of idx 0's key
-        mk("kc", 13), // idx 3
-    ];
+fn the_dedup_key_is_the_five_tuple() {
+    let tenant = uuid::Uuid::from_u128(2);
+    let base = unit_record(tenant, "same", 100);
 
-    let plan = plan_batch(&records);
+    // The five components, named rather than re-derived: two entries differing
+    // in any one of them are distinct entries, not retries of each other.
+    let mut other_tenant = unit_record(uuid::Uuid::from_u128(3), "same", 100);
+    other_tenant.window_start = base.window_start;
+    assert_ne!(dedup_key(&base), dedup_key(&other_tenant), "tenant_id");
 
-    let idems: Vec<&str> = plan
-        .reps
-        .iter()
-        .map(|r| r.idempotency_key.as_str())
-        .collect();
-    assert_eq!(idems, vec!["ka", "kb", "kc"], "distinct, sorted by key");
+    let mut other_meter = unit_record(tenant, "same", 100);
+    other_meter.gts_type_id = usage_collector_sdk::MeterTypeId::new(
+        "gts.cf.core.uc.usage_record.v1~cf.storage._.gb_hours.v1~",
+    )
+    .expect("valid meter id");
+    assert_ne!(dedup_key(&base), dedup_key(&other_meter), "gts_type_id");
 
-    assert_eq!(
-        plan.first_index[&dedup_key(&records[1])],
-        1,
-        "ka first at idx 1"
-    );
-    assert_eq!(
-        plan.first_index[&dedup_key(&records[0])],
-        0,
-        "kb first at idx 0"
-    );
-    assert_eq!(
-        plan.first_index[&dedup_key(&records[3])],
-        3,
-        "kc first at idx 3"
+    assert_ne!(
+        dedup_key(&base),
+        dedup_key(&unit_record(tenant, "different", 100)),
+        "idempotency_key"
     );
 
-    let kb_rep = plan
-        .reps
-        .iter()
-        .find(|r| r.idempotency_key.as_str() == "kb")
-        .expect("kb rep present");
+    let mut shifted_start = unit_record(tenant, "same", 100);
+    shifted_start.window_start = base.window_start - time::Duration::hours(1);
+    assert_ne!(
+        dedup_key(&base),
+        dedup_key(&shifted_start),
+        "window_start is one of the five dedup-identity inputs, so two entries \
+         differing only in it are distinct entries, not a retry"
+    );
+
+    let mut shifted_end = unit_record(tenant, "same", 100);
+    shifted_end.window_end = base.window_end + time::Duration::hours(1);
+    assert_ne!(
+        dedup_key(&base),
+        dedup_key(&shifted_end),
+        "window_end is the fifth dedup-identity input"
+    );
+
+    // ...and nothing else is in the key. `value` is a compared canonical field,
+    // not an identity component.
+    let mut other_value = unit_record(tenant, "same", 100);
+    other_value.value = rust_decimal::Decimal::new(999, 0);
     assert_eq!(
-        kb_rep.id,
-        uuid::Uuid::from_u128(10),
-        "kb rep is the first occurrence"
+        dedup_key(&base),
+        dedup_key(&other_value),
+        "value is not part of the dedup key"
+    );
+}
+
+#[test]
+fn the_dedup_key_names_the_canonical_microsecond_bounds() {
+    // The bounds enter the key as the SDK's canonical rendering, the same form
+    // the entry `id` is derived over. Spelled out here rather than computed
+    // with the function under test.
+    let tenant = uuid::Uuid::from_u128(0x2A);
+    assert_eq!(
+        dedup_key(&unit_record(tenant, "k", 42)),
+        (
+            tenant,
+            VCPU_METER.to_owned(),
+            "k".to_owned(),
+            WINDOW_START_CANONICAL.to_owned(),
+            WINDOW_END_CANONICAL.to_owned(),
+        )
+    );
+}
+
+#[test]
+fn a_sub_microsecond_bound_keys_the_same_as_what_postgres_stores() {
+    // `timestamptz` stores microseconds, so a caller's sub-µs nanos never
+    // survive the round trip. If the key carried the raw `OffsetDateTime`, an
+    // `INSERT … RETURNING` row would key differently from the record that
+    // produced it and the batch path would lose track of its own winners.
+    let tenant = uuid::Uuid::from_u128(0x2B);
+    let mut sub_micro = unit_record(tenant, "k", 43);
+    sub_micro.window_start = time::OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(WINDOW_START_UNIX) * 1_000_000_000 + 750,
+    )
+    .expect("valid ts");
+
+    assert_eq!(
+        dedup_key(&sub_micro),
+        dedup_key(&unit_record(tenant, "k", 43)),
+        "sub-microsecond nanos are below the precision the ledger stores, so \
+         they cannot make two submissions distinct entries"
+    );
+}
+
+#[test]
+fn a_stored_row_keys_the_same_as_the_record_it_holds() {
+    // The batch path maps `INSERT … RETURNING` rows back to the records that
+    // produced them through these two functions, so a disagreement between
+    // them silently turns every winner into an invariant break.
+    let tenant = uuid::Uuid::from_u128(0x2C);
+    let record = unit_record(tenant, "k", 44);
+    let row = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
+
+    assert_eq!(row_dedup_key(&row), dedup_key(&record));
+    assert_eq!(
+        row_dedup_key(&row).3,
+        WINDOW_START_CANONICAL,
+        "and it is the canonical form on the row side too"
     );
 }
 
@@ -203,21 +207,28 @@ fn row_matching(
     record: &usage_collector_sdk::UsageRecord,
     metadata: serde_json::Value,
 ) -> UsageRecordRow {
+    let (invalidates, reason_code) = match record.invalidation.as_ref() {
+        Some(i) => (Some(i.target), Some(i.reason.as_str().to_owned())),
+        None => (None, None),
+    };
     UsageRecordRow {
         id: record.id,
         tenant_id: record.tenant_id,
-        gts_id: VCPU_GTS.to_owned(),
+        gts_type_id: record.gts_type_id.as_str().to_owned(),
         value: record.value,
-        created_at: record.created_at,
+        window_start: record.window_start,
+        window_end: record.window_end,
         resource_id: record.resource_ref.resource_id().to_owned(),
         resource_type: record.resource_ref.resource_type().to_owned(),
         subject_id: None,
         subject_type: None,
         idempotency_key: record.idempotency_key.as_str().to_owned(),
-        corrects_id: record.corrects_id,
-        status: "active".to_owned(),
+        invalidates,
+        reason_code,
+        origin: record.origin.as_str().to_owned(),
+        acceptance_sequence: 1,
         metadata,
-        ingested_at: record.created_at,
+        ingested_at: record.window_end,
     }
 }
 
@@ -226,8 +237,9 @@ fn canonical_equal_surfaces_corrupt_stored_metadata_as_internal() {
     let tenant = uuid::Uuid::from_u128(7);
     let record = unit_record(tenant, "k", 700);
     // Stored metadata that cannot decode back to the typed map (a JSON string,
-    // not an object). Every other canonical field matches, so the old `.ok()`
-    // swallow turned this stored-data corruption into a silent `IdempotencyConflict`.
+    // not an object). Every other canonical field matches, so a swallowed
+    // decode error would turn stored-data corruption into a silent
+    // `IdempotencyConflict`.
     let row = row_matching(&record, serde_json::Value::String("corrupt".to_owned()));
 
     let err = canonical_equal(&row, &record)
@@ -270,11 +282,10 @@ fn canonical_equal_reports_a_field_mismatch_as_not_equal() {
 fn canonical_equal_treats_id_as_canonical() {
     // The record `id` is part of the canonical set: a same-key request whose
     // other canonical fields all match but whose stored `id` differs is a
-    // fail-closed `IdempotencyConflict`, not a silent absorb. Since the SDK made
-    // `id` a deterministic projection of the dedup key, a real dedup hit always
-    // carries a matching id — so this is now a defensive guard against a
-    // corrupted stored row (a non-deterministic id) rather than a mismatched
-    // caller-supplied one; see `canonical_equal`'s doc.
+    // fail-closed `IdempotencyConflict`, not a silent absorb. Since `id` is a
+    // deterministic projection of the dedup key, a real dedup hit always
+    // carries a matching id — so this is a defensive guard against a corrupted
+    // stored row rather than a mismatched caller-supplied one.
     let tenant = uuid::Uuid::from_u128(10);
     let record = unit_record(tenant, "k", 1000);
     let mut row = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
@@ -288,48 +299,182 @@ fn canonical_equal_treats_id_as_canonical() {
 }
 
 #[test]
-fn canonical_equal_ignores_created_at() {
-    // Approach A: `created_at` joins the dedup key (the 4-tuple
-    // `(tenant, gts, idem, created_at)` UNIQUE), so `canonical_equal` — which
-    // only runs once that key has already matched — no longer compares it. A row
-    // whose `created_at` differs but whose every other canonical field matches
-    // must still compare equal (absorb), never conflict on the timestamp.
+fn canonical_equal_compares_origin() {
+    // `origin` is server-assigned by the gateway from the route the entry
+    // arrived on, but it is still supplied to this plugin per entry and is not
+    // in the dedup key — so one idempotency key standing for a live entry and
+    // a backfilled one is a conflict, not an absorb.
     let tenant = uuid::Uuid::from_u128(11);
     let record = unit_record(tenant, "k", 1100);
     let mut row = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
-    row.created_at = record.created_at + time::Duration::seconds(5);
+    row.origin = usage_collector_sdk::RecordOrigin::Backfill.as_str().to_owned();
 
     assert!(
-        canonical_equal(&row, &record).expect("valid metadata decodes"),
-        "created_at is part of the dedup key now, not a compared canonical field"
+        !canonical_equal(&row, &record).expect("valid metadata decodes"),
+        "a differing origin must conflict rather than absorb"
     );
 }
 
 #[test]
-fn dedup_key_includes_created_at_but_not_value() {
-    // Approach A: the dedup identity is the 4-tuple
-    // `(tenant, gts, idem, created_at)` enforced on the hypertable's own UNIQUE,
-    // so two records sharing a key but carrying different event times are
-    // distinct slots (silent duplicate), not a conflict. `value` remains outside
-    // the key (it is a compared canonical field).
-    let tenant = uuid::Uuid::from_u128(2);
-    let a = unit_record(tenant, "same", 100);
+fn canonical_equal_compares_both_halves_of_the_invalidation_pair() {
+    // The invalidation target is deliberately excluded from the identity
+    // derivation, which is exactly why it has to be compared here: reusing one
+    // idempotency key across an entry and its withdrawal collapses them onto a
+    // single dedup slot, and only this comparison makes that collapse loud
+    // instead of absorbing the withdrawal as a duplicate of its own target.
+    let tenant = uuid::Uuid::from_u128(12);
+    let target = uuid::Uuid::from_u128(0x1200);
+    let record = withdrawal(tenant, "k", 1200, target);
 
-    let mut diff_time = unit_record(tenant, "same", 200);
-    diff_time.created_at = a.created_at + time::Duration::seconds(5);
-    assert_ne!(
-        dedup_key(&a),
-        dedup_key(&diff_time),
-        "created_at is part of the dedup identity (the 4-tuple)"
+    let mut plain = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
+    plain.invalidates = None;
+    plain.reason_code = None;
+    assert!(
+        !canonical_equal(&plain, &record).expect("valid metadata decodes"),
+        "an ordinary measurement stored under this key is not this withdrawal"
     );
 
-    let mut diff_value = unit_record(tenant, "same", 300);
-    diff_value.value = rust_decimal::Decimal::new(999, 0);
+    let mut other_target = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
+    other_target.invalidates = Some(uuid::Uuid::from_u128(0x1201));
+    assert!(
+        !canonical_equal(&other_target, &record).expect("valid metadata decodes"),
+        "a withdrawal of a different entry is a different entry"
+    );
+
+    let mut other_reason = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
+    other_reason.reason_code = Some("late_correction".to_owned());
+    assert!(
+        !canonical_equal(&other_reason, &record).expect("valid metadata decodes"),
+        "the reason is caller-supplied and compared, so a differing one conflicts"
+    );
+}
+
+// --- Batch planning ---
+
+#[test]
+fn plan_batch_collapses_and_sorts_distinct_keys() {
+    let tenant = uuid::Uuid::from_u128(1);
+    let mk = |idem: &str, seq: u128| unit_record(tenant, idem, seq);
+    let records = vec![
+        mk("kb", 10), // idx 0
+        mk("ka", 11), // idx 1
+        mk("kb", 12), // idx 2 — duplicate of idx 0's key
+        mk("kc", 13), // idx 3
+    ];
+
+    let plan = plan_batch(&records);
+
+    let idems: Vec<&str> = plan
+        .reps
+        .iter()
+        .map(|r| r.idempotency_key.as_str())
+        .collect();
+    assert_eq!(idems, vec!["ka", "kb", "kc"], "distinct, sorted by key");
+
     assert_eq!(
-        dedup_key(&a),
-        dedup_key(&diff_value),
-        "value is not part of the dedup key"
+        plan.first_index[&dedup_key(&records[1])],
+        1,
+        "ka first at idx 1"
     );
+    assert_eq!(
+        plan.first_index[&dedup_key(&records[0])],
+        0,
+        "kb first at idx 0"
+    );
+    assert_eq!(
+        plan.first_index[&dedup_key(&records[3])],
+        3,
+        "kc first at idx 3"
+    );
+    assert!(
+        plan.duplicate_withdrawals.is_empty(),
+        "a batch of ordinary measurements pre-rejects nothing"
+    );
+
+    let kb_rep = plan
+        .reps
+        .iter()
+        .find(|r| r.idempotency_key.as_str() == "kb")
+        .expect("kb rep present");
+    assert_eq!(
+        kb_rep.id,
+        uuid::Uuid::from_u128(10),
+        "kb rep is the first occurrence"
+    );
+}
+
+#[test]
+fn plan_batch_pre_rejects_a_second_withdrawal_of_one_target() {
+    // Both withdrawals would otherwise go into one multi-row INSERT, where the
+    // at-most-one index rejects the whole *statement* — taking the unrelated
+    // entry at idx 1 down with it. The SPI wants exactly one accepted, the
+    // other rejected, and every other row's outcome intact.
+    let tenant = uuid::Uuid::from_u128(0xC1);
+    let target = uuid::Uuid::from_u128(0xC100);
+    let records = vec![
+        withdrawal(tenant, "w1", 0xC101, target), // idx 0 — wins
+        unit_record(tenant, "plain", 0xC102),     // idx 1 — unrelated
+        withdrawal(tenant, "w2", 0xC103, target), // idx 2 — pre-rejected
+    ];
+
+    let plan = plan_batch(&records);
+
+    assert_eq!(
+        plan.duplicate_withdrawals.get(&2),
+        Some(&uuid::Uuid::from_u128(0xC101)),
+        "the second withdrawal of one target is pre-rejected, naming the first"
+    );
+    assert!(
+        !plan.duplicate_withdrawals.contains_key(&0),
+        "the first withdrawal is admitted"
+    );
+    let rep_ids: Vec<uuid::Uuid> = plan.reps.iter().map(|r| r.id).collect();
+    assert!(
+        !rep_ids.contains(&uuid::Uuid::from_u128(0xC103)),
+        "a pre-rejected row never reaches the insert"
+    );
+    assert!(
+        rep_ids.contains(&uuid::Uuid::from_u128(0xC102)),
+        "the unrelated entry keeps its slot in the insert"
+    );
+}
+
+#[test]
+fn plan_batch_leaves_an_identical_repeat_withdrawal_to_the_dedup_path() {
+    // Two rows carrying the *same* withdrawal — same derived id, so all five
+    // dedup attributes match — are an at-least-once redelivery, not a second
+    // withdrawal. Rejecting the repeat would turn an idempotent retry into a
+    // hard error.
+    let tenant = uuid::Uuid::from_u128(0xC2);
+    let target = uuid::Uuid::from_u128(0xC200);
+    let records = vec![
+        withdrawal(tenant, "w", 0xC201, target),
+        withdrawal(tenant, "w", 0xC201, target),
+    ];
+
+    let plan = plan_batch(&records);
+
+    assert!(
+        plan.duplicate_withdrawals.is_empty(),
+        "a repeat of one withdrawal is absorbed by dedup, not pre-rejected"
+    );
+    assert_eq!(plan.reps.len(), 1, "and it collapses to a single slot");
+}
+
+#[test]
+fn invalidation_target_pairs_names_only_the_withdrawals() {
+    let tenant = uuid::Uuid::from_u128(0xC3);
+    let target = uuid::Uuid::from_u128(0xC300);
+    let plain = unit_record(tenant, "plain", 0xC301);
+    let with = withdrawal(tenant, "w", 0xC302, target);
+
+    assert_eq!(
+        invalidation_target_pairs(&[&plain, &with]),
+        vec![(target, with.window_end)],
+        "the partial index covers `invalidates IS NOT NULL` only, so an ordinary \
+         measurement contributes no slot to look up"
+    );
+    assert!(invalidation_target_pairs(&[&plain]).is_empty());
 }
 
 // --- `resolve_batch` invariant-break / defensive arms (DB-free) ---
@@ -428,6 +573,45 @@ async fn resolve_batch_missing_conflict_entry_falls_through_to_transient() {
         "a key absent from the conflict map must fall through to Transient: {:?}",
         results[0]
     );
+}
+
+#[tokio::test]
+async fn resolve_batch_reports_a_pre_rejected_withdrawal_as_already_invalidated() {
+    let store = lazy_store();
+    let tenant = uuid::Uuid::from_u128(0xB5);
+    let target = uuid::Uuid::from_u128(0xB500);
+    let records = vec![
+        withdrawal(tenant, "w1", 0xB501, target),
+        withdrawal(tenant, "w2", 0xB502, target),
+    ];
+    let plan = plan_batch(&records);
+
+    // Only the first withdrawal reaches the insert, and it wins its slot.
+    let winner_key = dedup_key(&records[0]);
+    let winner_row = row_matching(&records[0], serde_json::Value::Object(serde_json::Map::new()));
+    let won = HashSet::from([winner_key.clone()]);
+    let inserted: HashMap<DedupKey, UsageRecordRow> = HashMap::from([(winner_key, winner_row)]);
+    let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
+
+    let results = store.resolve_batch(&records, &plan, &won, &inserted, &conflict);
+
+    assert_eq!(results.len(), 2, "one result per input row, in input order");
+    assert!(
+        results[0].is_ok(),
+        "the first withdrawal is accepted: {:?}",
+        results[0]
+    );
+    match &results[1] {
+        Err(UsageCollectorPluginError::AlreadyInvalidated { id, invalidated_by }) => {
+            assert_eq!(*id, target, "the rejection names the target it tried to withdraw");
+            assert_eq!(
+                *invalidated_by,
+                uuid::Uuid::from_u128(0xB501),
+                "and the entry that already withdrew it"
+            );
+        }
+        other => panic!("a second in-batch withdrawal must be AlreadyInvalidated, got {other:?}"),
+    }
 }
 
 // --- Bounded-retry combinator (`with_retry`) — DB-free mechanics ---
@@ -709,4 +893,102 @@ async fn acquire_failure_clears_ready_gauge() {
         Some(0),
         "a pool-acquire failure must clear the readiness gauge to 0"
     );
+}
+
+// --- Read-half tests (Tasks 10-12) ------------------------------------------
+//
+// These still exercise the retired column model and the pre-port `list`
+// signature. They are the read half's to bring current; nothing below this
+// line is Task 9's.
+
+#[tokio::test]
+async fn list_rejects_cursor_whose_sort_order_differs_from_query() {
+    let store = lazy_store();
+    let gts_id = UsageTypeGtsId::new(VCPU_METER).expect("valid gts id");
+
+    // The live query sorts (created_at asc, id asc); the cursor was minted
+    // under a different order (id first). The keys are individually valid, so
+    // without the guard the request binds old key strings against new columns —
+    // silently wrong pagination. The filter hash agrees (both unset), so only
+    // the sort-order guard can reject this.
+    let query = ODataQuery::new()
+        .with_order(ODataOrderBy(vec![
+            OrderKey {
+                field: "created_at".to_owned(),
+                dir: SortDir::Asc,
+            },
+            OrderKey {
+                field: "id".to_owned(),
+                dir: SortDir::Asc,
+            },
+        ]))
+        .with_cursor(CursorV1 {
+            k: vec![
+                "2024-01-01T00:00:00Z".to_owned(),
+                "00000000-0000-0000-0000-000000000001".to_owned(),
+            ],
+            o: SortDir::Asc,
+            s: "+id,+created_at".to_owned(),
+            f: None,
+            d: "fwd".to_owned(),
+        });
+
+    let err = store
+        .list(gts_id, &query, &[])
+        .await
+        .expect_err("a cursor minted under a different order must be rejected");
+
+    match err {
+        UsageCollectorPluginError::Internal(msg) => {
+            assert!(
+                msg.contains("sort order"),
+                "unexpected error message: {msg}"
+            );
+        }
+        other => panic!("expected an Internal sort-order mismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn list_rejects_backward_cursor() {
+    let store = lazy_store();
+    let gts_id = UsageTypeGtsId::new(VCPU_METER).expect("valid gts id");
+
+    // A backward cursor whose filter hash and sort order both agree with the
+    // query, so only the direction guard can reject it. Without the guard the
+    // request would page FORWARD (the keyset operator is derived from the sort
+    // direction, not `d`) and silently return the wrong page.
+    let query = ODataQuery::new()
+        .with_order(ODataOrderBy(vec![
+            OrderKey {
+                field: "created_at".to_owned(),
+                dir: SortDir::Asc,
+            },
+            OrderKey {
+                field: "id".to_owned(),
+                dir: SortDir::Asc,
+            },
+        ]))
+        .with_cursor(CursorV1 {
+            k: vec![
+                "2024-01-01T00:00:00Z".to_owned(),
+                "00000000-0000-0000-0000-000000000001".to_owned(),
+            ],
+            o: SortDir::Asc,
+            s: "+created_at,+id".to_owned(),
+            f: None,
+            d: "bwd".to_owned(),
+        });
+
+    let err = store
+        .list(gts_id, &query, &[])
+        .await
+        .expect_err("a backward cursor must be rejected before any DB access");
+
+    match err {
+        UsageCollectorPluginError::Internal(msg) => {
+            assert!(msg.contains("direction"), "unexpected error message: {msg}");
+        }
+        other => panic!("expected an Internal direction error, got {other:?}"),
+    }
 }
