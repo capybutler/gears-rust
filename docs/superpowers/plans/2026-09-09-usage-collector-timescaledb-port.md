@@ -44,6 +44,16 @@ optional and they are not restated per task.
   `SLICE7.md`.
 - **`grep -c` returning 0 exits non-zero** and will silently truncate a `&&`
   chain.
+- **`timeout` does not exist in this shell.** `timeout 30 docker info` fails
+  with "command not found", so `timeout … && echo up || echo down` reports
+  *down* regardless of the daemon's actual state. This produced a wrong
+  conclusion in this session — Docker was reported unavailable twice while it
+  was running. **Run the command bare, and when a probe reports "unavailable",
+  check the probe before believing it.** The general form of this trap: a
+  wrapper that fails for its own reasons is indistinguishable, through `&&`/`||`,
+  from the thing it wraps failing.
+- **Docker is available** (server 28.3.3), so Tasks 3, 14, 15 and 17 can be
+  verified for real. Clean up containers you start, including on failure.
 - **Never post-filter `grep -rn` on digit patterns** — it matches grep's own
   line numbers and drops every hit on a line >= 10.
 - **A claim outliving the code is the characteristic defect here.** A retracted
