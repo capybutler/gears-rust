@@ -115,6 +115,22 @@ fn the_invalidation_target_scope_translates_for_a_conforming_backend() {
 /// cannot draw. [`HappyPathPlugin::last_get_scope`] renders; this reads
 /// [`HappyPathPlugin::last_get_scope_expr`] and puts the real converter
 /// behind the answer.
+///
+/// **It reads the LAST capture, so it only speaks for the whole test when
+/// there was one dispatch.** Both current callers sit immediately after an
+/// assertion pinning `get_usage_record_calls()` to exactly 1, which is what
+/// makes "the last scope" mean "the only scope". A test over several distinct
+/// targets must pin the count too, or this passes on one scope and says
+/// nothing about the others.
+///
+/// **If a third call site ever appears, reconsider the layer.** Putting the
+/// converter inside [`crate::domain::test_support::TargetLookupDouble`]'s
+/// lookup, at capture time, would refuse an untranslatable scope from every
+/// call site including ones not yet written, and the per-site cost would stop
+/// compounding. It is deliberately not done at two: a double that enforces is
+/// no longer a double that records, some test may one day want to observe a
+/// deliberately bad scope, and with two compile-time-known call sites naming
+/// them is more informative than a blanket refusal that names none.
 fn assert_translatable_scope(plugin: &HappyPathPlugin, call_site: &str) {
     let scope = plugin
         .last_get_scope_expr()

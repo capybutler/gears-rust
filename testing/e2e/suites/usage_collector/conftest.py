@@ -155,7 +155,11 @@ def _require_dedicated_binary():
         _refuse("E2E_BINARY not set — run these tests via: make e2e-usage-collector")
     # `require_docker` rather than `skip_without_docker`: the shared helper
     # skips unconditionally, and the choice between skipping and failing is
-    # this suite's to make. The shared helper keeps its other callers.
+    # this suite's to make. That leaves the helper with no callers at all -
+    # this was its last one - and it is kept rather than deleted because
+    # changing shared harness code to suit one suite is the larger move. Its
+    # own docstring records that it is uncalled, so nobody has to grep to find
+    # out.
     try:
         require_docker()
     except DockerUnavailable as exc:

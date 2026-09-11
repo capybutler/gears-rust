@@ -5404,9 +5404,18 @@ skip takes the plugin's only end-to-end exercise with it.
 
 Done as `UC_E2E_REQUIRE_DOCKER: "1"` on the step plus a `_refuse()` helper in
 the suite's conftest that fails when the variable is set and skips otherwise.
-Proven both ways: with the variable set and `E2E_BINARY` unset the run is **11
-errors**; with neither set it is **11 skipped**. The Rust lane needs nothing -
-`make test-usage-collector-pg` has no skip path.
+
+**What was actually exercised, which is narrower than "proven both ways":**
+both outcomes of the variable, on ONE of the two refusal sites. With the
+variable set and `E2E_BINARY` unset the run is **11 errors**; with neither set
+it is **11 skipped**. The Docker branch was exercised in neither mode, so the
+combination a real CI outage would take - variable set, binary present, daemon
+down - is the untested one. Both branches funnel through the same `_refuse()`,
+so the residual risk is the branch's own `try`/`except` and not the
+skip-versus-fail decision, but that is a reason to state the extent rather
+than to round it up.
+
+The Rust lane needs nothing - `make test-usage-collector-pg` has no skip path.
 
 The **generic** version of this - a minimum-collected-count assertion in
 `run_e2e.py`, which would cover mini-chat's identical `E2E_BINARY` skip and
