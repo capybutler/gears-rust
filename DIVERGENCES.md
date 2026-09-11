@@ -1,12 +1,20 @@
 # Spec divergences in the usage-collector
 
-Nineteen places where `usage-collector-v1.yaml`, `DESIGN.md`,
-`DECOMPOSITION.md` or a file under `docs/features/` describes behaviour the
-code does not have — or, in entry 17's case, fails to describe behaviour the
-code does have. The direction varies; the disagreement is the subject.
+**Twenty-five** places where `usage-collector-v1.yaml`, `DESIGN.md`,
+`DECOMPOSITION.md`, a file under `docs/features/` or a plugin's own documents
+describe behaviour the code does not have — or, in entries 17 and 25's case,
+fail to describe behaviour the code does have. The direction varies; the
+disagreement is the subject.
 
-They were left unedited on purpose. Correcting a governing document is the
-spec owner's call, not the implementer's.
+**Every count in this preamble is a `grep`, and a reader should re-run it rather
+than trust the numeral** — each one here has gone stale at least once. Entries:
+`grep -c '^## [0-9]'`. Load-bearing markers: `grep -c '^\*\*Load-bearing'`.
+
+The *governing* documents were left unedited on purpose. Correcting one is the
+spec owner's call, not the implementer's. Two documents that govern nothing were
+corrected rather than registered — the plugin's `README.md` (entry 23 says why)
+and one SDK rustdoc paragraph naming a fold the enum no longer has — and both
+are named where they belong rather than left for a reader to notice.
 
 **Entries 1-5** came out of slice 3, the time-model slice
 (`usage-collector/implementation-change`, 23 commits ending `74e3d4429`).
@@ -18,17 +26,25 @@ corrections its own review found landed after that).
 (the thirteen implementation tasks ending `a94d542cf`).
 **Entries 17-19** came out of slice 6, the errors-and-contract-gate slice (the
 eleven implementation tasks from `9f64cf22f` to `540dfbba0`, this sweep aside).
+**Entries 20-25** came out of slice 7, the TimescaleDB plugin port (the
+eighteen tasks ending at this sweep). Six of them were handed to the sweep by
+the tasks that found them, which is why they arrive together rather than one per
+task.
 
-Slice 6 also **closed** two things recorded here rather than only adding to
-them, and both are struck in place rather than deleted. Entry 9(a) is struck:
-`UsageCollectorError::NotFound` now carries a typed `NotFoundReason`, so the
-metric label it blocked is emitted. Section D is struck: the reason table now
-pins every wire spelling to its own identifier. Neither entry is *wholly*
-closed, and each says at its strike what is left and where the remainder lives.
+Slices 6 and 7 also **closed** things recorded here rather than only adding to
+them, and each is struck in place rather than deleted. Slice 6 struck entry
+9(a) — `UsageCollectorError::NotFound` now carries a typed `NotFoundReason`, so
+the metric label it blocked is emitted — and section D, where the reason table
+now pins every wire spelling to its own identifier. Slice 7 struck **entry 16**
+(the plugin's filter allowlist, resolved in code as its own proposed resolution
+described), **§A** (`api.json` regenerated and committed) and **§G**
+(`group-by-absent-dimension`, resolved by owner decision and implemented as a
+presence guard). Not all are *wholly* closed, and each says at its strike what is
+left and where the remainder lives.
 
-In **twelve of the nineteen the code is the correct side** and the document is
-imprecise or stale. Seven are not that shape, and saying so matters more than a
-tidy summary:
+In **fourteen of the twenty-five the code is the correct side** and the document
+is imprecise or stale. Eleven are not that shape, and saying so matters more
+than a tidy summary:
 
 - **Entry 8** — the three documents agree with each other and the code
   implements none of it. Slice 6 built the plugin half — the published 28-digit
@@ -45,19 +61,34 @@ tidy summary:
 - **Entry 15** — DESIGN gives `$filter` and `group_by` one field set and the
   SDK gives `group_by` five of the eight. The narrower surface is unbuilt
   scope, not a document defect.
-- **Entry 16** — the TimescaleDB plugin's filter allowlist names three columns
-  the model no longer has and is missing five the gear needs. The plugin is the
-  deficient side, and it is outside both this slice's edit surface and the
-  workspace: it has not compiled since slice 4.
+- **Entry 16** — the TimescaleDB plugin's filter allowlist named three columns
+  the model no longer had and was missing five the gear needed. The plugin was
+  the deficient side. **Resolved by slice 7**, which is the port that entry
+  asked for, and struck in place.
 - **Entry 18** — the document is right and the code is deliberately one variant
   short. `UsageCollectorPluginError` ships five of DESIGN §3.3's six, and the
   sixth signals a replay refusal on a feed the SPI does not declare. Landing it
   with the feed was a spec-owner decision, not an oversight.
 - **Entry 19** — two of DESIGN §3.3's seven contract checks cannot be written at
   all. Neither side is wrong about behaviour; the SPI and the record model are
-  missing the method and the field a check would have to read.
+  missing the method and the field a check would have to read. Slice 7 made it
+  concrete rather than conditional: two conforming backends now answer a
+  `LATEST` tie differently, on the rule the blocked check would have pinned.
+- **Entry 20** — no document is wrong. The `LATEST` fold has a bound nobody
+  stated, driven by an input the caller chooses, and DESIGN §3.10 asks for
+  exactly that statement.
+- **Entries 21 and 22** — the SPI is right and the store cannot fully hold it.
+  A hypertable `UNIQUE` must contain the partition column, so at-most-one
+  invalidation is conditional on the gateway; and a cross-call collision aborts
+  a `create_batch` whole where the SPI asks for per-row outcomes.
+- **Entry 25** — nothing is stale. A registration step that no document names
+  and no artifact performs stands between a fresh deployment and its first
+  successful ingest.
 
-**Fourteen** are load-bearing rather than cosmetic, and each is marked below.
+**Twenty** are load-bearing rather than cosmetic, and each is marked below. The
+numeral in this sentence read "Fourteen" through two slices in which the true
+count was fifteen — the entry-8 split added one and nobody re-measured — which
+is why the preamble now names the `grep` beside every count.
 The sharpest is still entry 10, and slice 6 widened it: a client generated from
 the published contract cannot submit a single record and cannot make an
 aggregate request either — two independent `400`s on each of those two
@@ -707,6 +738,14 @@ untouched: it still spells `value`, and it will go red on the `quantity`
 rename. `accepted_at` and `acceptance_sequence` are still absent from both
 emitted key sets.
 
+`acceptance_sequence` now exists, and not where this entry needs it: the
+TimescaleDB plugin assigns it in its own `usage_records` table, strictly
+monotonic per `(tenant_id, gts_type_id)`, which discharges DESIGN §3.7's
+*storage* obligation and nothing else — the SDK's `UsageRecord` still carries
+no such field and the published response shape still cannot emit one, so this
+entry is open in exactly the terms it was written in. `accepted_at` has not
+moved at all.
+
 **Load-bearing**, more decisively than any other entry here: no generated
 client works at all, on either write path — ingestion or aggregate.
 
@@ -926,6 +965,34 @@ is genuinely absent from the yaml.
 retired `created_at` window model entry 5 covers, so it is two sites in one
 file.
 
+**Two sites is what this entry said, and the file is stale wholesale.** The
+register is the index a reader trusts for what is stale, so naming `:127` and
+`:139` and stopping implied the rest of the file was sound. Measured on the
+branch (`gears/system/usage-collector/docs/features/usage-query.md`, **951
+lines**):
+
+- The retired `(created_at, id)` keyset order appears on **14** lines — `:147
+  :215 :232 :331 :333 :347 :349 :356 :453 :763 :786 :877 :932 :939`. The
+  canonical order is `(window_end, id)`.
+- `created_at` appears on **18** lines / **35** occurrences in this file, and on
+  **62** lines / **93** occurrences across
+  `gears/system/usage-collector/docs/`.
+- The whole read-path description is pre-port. The mandatory time window is
+  described as a `$filter` conjunct — `timestamp ge X and timestamp lt Y` on
+  **16** lines, a third spelling matching neither the model's
+  `window_start` / `window_end` nor the wire — and the gear now takes it as the
+  mandatory typed `from` / `to` query parameters instead, so the rejection the
+  file documents on **18** lines (`MISSING_TIME_WINDOW`) is not the one a caller
+  gets. Beside it: `last_keyset` (**15** lines), `page_after` (**14**),
+  `validate_cursor_against` (**17**), and a `status` filter field (**12**) that
+  the append-only model deleted.
+
+**Do not fix the file, and do not fix it line by line** — one current paragraph
+inside a wholesale-stale document is harder to notice than a uniformly stale
+one, which is the same rule entry 23 applies to the plugin's `docs/DESIGN.md`.
+This paragraph exists so the register stops implying the file has two stale
+paragraphs.
+
 **Load-bearing for the same reason the rest of this entry is**, and slightly
 worse: §1.6 exists precisely so a reader who distrusts the surrounding sections
 has one place to trust, and it is the section that is wrong. Its sibling
@@ -973,7 +1040,23 @@ stops advertising three dimensions it does not have.
 
 ---
 
-## 16. The TimescaleDB plugin's filter allowlist cannot serve the published `$filter` field set
+## 16. ~~The TimescaleDB plugin's filter allowlist cannot serve the published `$filter` field set~~
+
+**Resolved in code by the TimescaleDB port, and kept rather than deleted.**
+`record_column` is the model that exists: the three dead columns are gone,
+`window_start`, `window_end`, `invalidates` and `origin` are mapped, and
+`entry_type` is the stored generated column over `invalidates` — the proposed
+resolution at the foot of this entry, implemented as written. The plugin is a
+workspace member again, `RECORD_COLUMNS` and `UsageRecordRow` name the current
+columns, and the DESIGN §3.3 contract suite runs against a live container.
+`$filter=origin eq 'backfill'` is served rather than answered with a `500`.
+
+**What the resolution did not close is entry 19, which this entry sends a porter
+to read.** A green suite covers six checks and two of DESIGN's seven remain
+blocked; `latest-tie-break` is the one that matters to a backend author, and see
+entry 19 for how this backend and the reference one now differ on it. The
+original entry follows unchanged as the record of what was wrong.
+
 
 `gears/system/usage-collector/docs/usage-collector-v1.yaml:440`, the `$filter`
 parameter, names eight fixed fields: `tenant_id`, `resource_id`,
@@ -1198,6 +1281,16 @@ deterministic, it is **not** the declared rule, and no check asserts either way.
 So the suite silently ships one substituted semantic, on the exact rule the
 blocked check would have pinned.
 
+**A second backend has landed since, and it sharpens the entry rather than
+resolving it.** The TimescaleDB plugin assigns `acceptance_sequence` in its own
+table, so its `LATEST` fold orders on `(window_end DESC, acceptance_sequence
+DESC)` — **DESIGN's declared tie-break exactly**. The reference backend cannot:
+the field is absent from `UsageRecord`, so it substitutes the greatest `id`. Two
+conforming backends now give **different answers** on a `window_end` tie over
+the same ledger, and the check that would have caught it is the blocked one. The
+substitution was disclosed before there was a second backend to disagree with;
+now there is.
+
 **Load-bearing**, in the same conditional way entries 11 and 16 are: the
 consequence lands on whoever ports a backend, not on a running system. "Run this
 suite" is the acceptance criterion for a port, so a green run that covers five
@@ -1217,6 +1310,354 @@ the blocker named per check.
 
 ---
 
+## 20. `LATEST` has an unbounded server-side allocation driven by caller input
+
+The TimescaleDB plugin's `Latest` fold is
+`(ARRAY_AGG(r.value ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]`
+(`plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/aggregate.rs`,
+`LATEST_SELECT_EXPR`), which materializes a group's values before picking one.
+`aggregate_limit_clause` in the same module gives **zero** protection against
+it: that clause bounds the number of *groups* (`LIMIT MAX_AGGREGATION_BUCKETS +
+1`) and never the rows within one. The only bound on rows in a group is the
+gateway-enforced `from` / `to` covered-period window — **a request parameter**.
+`MIN` / `MAX` / `SUM` / `COUNT` carry no such cost.
+
+**This is a limit to publish, not a question to weigh.** Gear DESIGN §3.10
+requires each plugin crate's deployment guide to publish that plugin's actual
+profile — "**Every guide MUST state:**", followed by six items. A memory bound
+is **not** one of the six; they are consistency, freshness, retention and
+throughput statements. So this belongs to that guide by kind and not by the
+enumeration, which matters only in that nobody can be held to it today: the
+plugin publishes no such guide, and the document that claims the role is the one
+entry 23 registers as stale wholesale.
+
+**Measured, on `timescale/timescaledb:2.29.2-pg18` (`PostgreSQL` 18.6).** At the
+image's *tuned* settings, not `PostgreSQL`'s compiled defaults: the image runs
+`001_timescaledb_tune.sh` at initdb, so a fresh container reported
+`work_mem = 7837kB` and `shared_buffers = 1959MB` on the measuring host, and no
+`SET` was issued. **Read the deltas below, not the absolutes.** Every RSS figure
+is from one host and one fixture table, and peak RSS counts the shared buffers a
+backend has touched — so against that 1 959 MB `shared_buffers` the absolutes
+run an order of magnitude above what an independent replication saw (76.8 /
+84.5 / 84.2 / 110.3 MB for the same four queries). **The differences reproduced
+exactly, and the differences are the claim.**
+
+1. **The planner never chooses a `HashAggregate` here.** An aggregate carrying
+   its own `ORDER BY` takes the grouped node off the hash path entirely. With
+   `enable_sort` *and* `enable_incremental_sort` off the plan is still
+   `Sort → GroupAggregate` with the `Sort` reported `Disabled: true` — and a
+   disabled node is chosen only when no alternative path exists, while
+   `HashAggregate` was never disabled. The same statement with the inner
+   `ORDER BY` dropped plans as a `HashAggregate` immediately; adding one ordered
+   aggregate beside a plain `MAX` takes that query off the hash path too;
+   `COUNT(DISTINCT …)` behaves identically; and with an index supplying the
+   order and every scan method disabled the node is *still* `GroupAggregate`. It
+   is a property of ordered and distinct aggregation generally, not of this
+   expression, this data or this row count.
+2. **So the peak is O(largest group), and it is real.** Exactly one array is
+   live at a time. On the worst case for it — 1 000 000 rows in one group,
+   parallelism off — peak backend RSS ran **+34 MB over `MAX(r.value)`** on the
+   same rows (1 022.7 MB against 988.6 MB here; +33.5 MB in the independent
+   replication), i.e. **≈34 bytes per row in the largest group**, reproducible
+   to ±0.2 MB across runs. The array does not spill.
+3. **The `Sort` beneath does scan-sized work, and is not this fold's cost.** It
+   materializes the whole selection but is `work_mem`-bounded and spills rather
+   than growing: `external merge`, ~10 MB in each of four workers under the
+   image's default parallelism at 1 000 000 rows, and 41 MB as a single sort
+   with `max_parallel_workers_per_gather = 0` (33 MB in the independent
+   replication — fixture-dependent absolute, same shape). Every candidate
+   formulation needs the same sort.
+
+**Both alternatives were measured and both stay out.** On that single-group
+worst case `DISTINCT ON` and `ROW_NUMBER() OVER (PARTITION BY …) = 1` both
+peaked **~25 MB below** the shipped form (997.6 MB and 997.4 MB here; 25.8 MB
+and 26.1 MB below in the independent replication), O(1) per group, with
+execution times inside the run-to-run noise of the parallel plan (86-111 ms at
+100 000 rows, 257-293 ms at 1 000 000, all three formulations). Neither is a
+`SELECT`-list expression that composes beside `SUM`, and — the decisive fact —
+**neither can express the ungrouped fold**: `DISTINCT ON ()` is a syntax error,
+and `PARTITION BY` nothing, like the `ORDER BY … LIMIT 1` rewrite, answers
+**zero** rows over an empty selection where the SPI owes exactly one
+empty-keyed bucket. So `aggregate.rs` is unchanged and this entry publishes a
+limit rather than a fix.
+
+**Load-bearing.** An operator sizing a deployment from DESIGN §3.10 gets no
+bound for this fold from any document, and the input that drives it — the
+covered-period window — is chosen by the caller, not the operator. The same
+correction is on `RecordStore::aggregate`'s rustdoc and on `LATEST_SELECT_EXPR`'s
+and both ship; what did not exist until this entry is the register a reviewer
+reads.
+
+**A superseded claim, recorded because it was nearly published.** The
+pre-measurement form of this entry said the peak was "O(rows scanned), not
+O(largest group): under a `HashAggregate` plan every group's array is live at
+once, and only a sorted `GroupAggregate` gives the weaker bound, the planner
+chooses." Fact 1 above falsifies it. It is written down here so a reader who
+met the earlier phrasing elsewhere can see it was retracted on a measurement
+rather than quietly reworded.
+
+**Proposed resolution:** none in the code. State the bound wherever the plugin's
+§3.10 deployment guide eventually lives — today the only candidate is the
+plugin's `docs/DESIGN.md`, whose traceability row at `:89` claims the
+consistency-profile role for its §4, and entry 23 is why that file cannot carry
+anything a reader would trust.
+
+---
+
+## 21. The at-most-one-invalidation guarantee is conditional on the Ingestion Gateway
+
+The SPI says **the store** MUST reject a second withdrawal of one target, and
+MUST make that check atomic with the entry it admits — in as many words, and
+with the reason a gateway-side pre-read cannot substitute.
+
+**What the store can enforce.** The mechanism is the partial unique index
+`usage_records_one_invalidation_uniq` over `(invalidates, window_end)`
+(`plugins/timescaledb-usage-collector-plugin/migrations/0001_init.sql`), claimed
+and inserted inside the one transaction that also claims `acceptance_sequence`,
+so the atomicity half is met.
+
+**Why it cannot key on `invalidates` alone.** A hypertable's `PRIMARY KEY` and
+every `UNIQUE` must contain the partition column. `window_end` is the partition
+column, so **no hypertable-compatible index can key on `invalidates` alone** —
+this is a property of the storage engine, not a choice in this schema.
+
+**What that costs, measured on a live container.** Two withdrawals of one target
+sharing the target's `window_end` are rejected. Two carrying **different**
+`window_end` are **both accepted**. Conformance therefore rests on every
+withdrawal being a faithful copy of its target's covered period — which the
+Ingestion Gateway enforces upstream, and which the migration's own comment
+states as though it were unconditional ("an invalidation is a faithful copy of
+the entry it withdraws, so it shares that entry's covered period"). **A caller
+reaching this SPI directly is not bound by it.** The residual guarantee lives at
+the gateway; the entry exists so that nobody reads the index as the whole of it.
+
+**A green contract run is not evidence the general case is covered.** Task 14's
+`at-most-one-invalidation` check passes either way, because its fixture builds
+every withdrawal from its target's own `window_start` / `window_end`
+(`usage-collector-sdk/src/contract/checks/at_most_one_invalidation.rs`,
+`at_most_one_fixtures`) — the shape the gateway admits, and the shape the index
+catches. The check is right to use it; it just does not reach the case this
+entry records.
+
+**Load-bearing.** The SPI's obligation is on the store, and a second backend
+author reading the SPI would implement it as written and conclude this one does
+too. A direct SPI caller — another gear, a migration tool, a test harness — can
+land two accepted withdrawals of one entry today, and the fold excludes a
+withdrawn entry once regardless, so the ledger carries a contradiction nothing
+reports.
+
+**Proposed resolution:** a spec decision, not a code fix. Either the SPI's
+obligation narrows to "the store MUST reject a second withdrawal *carrying the
+target's covered period*", which is what a hypertable-backed store can hold and
+what the gateway already guarantees, or the obligation stands and the SPI
+declares that a conforming store may require a non-partitioned uniqueness
+domain. Recorded at the call site in
+`plugins/timescaledb-usage-collector-plugin/src/infra/storage/record_store.rs`
+(`create_inner`'s rustdoc) as well as here.
+
+---
+
+## 22. A cross-call invalidation collision fails a `create_batch` whole
+
+The SPI asks `create_batch` for **per-record outcomes aligned to input order**.
+Two withdrawals of one target get that treatment only when they arrive
+together.
+
+- **Same call** — `plan_batch`
+  (`plugins/timescaledb-usage-collector-plugin/src/infra/storage/record_store.rs`)
+  pre-rejects all but the first, per row, and the other rows still commit. This
+  is the SPI's shape.
+- **A later call** — the collision is caught by
+  `usage_records_one_invalidation_uniq`, which aborts the whole multi-row
+  `INSERT`. The batch returns an outer
+  `UsageCollectorPluginError::AlreadyInvalidated` instead of a per-row result
+  vector, so every well-formed record travelling beside the offending one is
+  refused with it.
+
+**It was scoped out, not missed.** Fixing it needs a per-row `SAVEPOINT` pass —
+each row's insert wrapped so its rollback does not take the statement with it —
+which changes the batch's transaction shape and its cost, and belongs in a slice
+that can measure the result. Recorded at `create_batch_inner`'s rustdoc as well
+as here.
+
+**Load-bearing.** A caller batching a day's emissions gets the whole batch
+refused because one record withdraws something already withdrawn, and the outer
+error names the one entry rather than the batch, so a naive retry of the whole
+batch fails identically. The SPI's per-record contract is what a client author
+builds retry logic against.
+
+**Proposed resolution:** a plugin slice for the `SAVEPOINT` pass. Until then the
+honest statement is the one the code makes at the call site: in-batch is per-row,
+cross-call is whole-batch.
+
+---
+
+## 23. The plugin's own `docs/DESIGN.md` is stale wholesale, and no entry owned it
+
+`gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/DESIGN.md`
+is **710 lines** describing the superseded model throughout: `gts_id` on 37 of
+them, `catalog` on 30, `created_at` on 29, `usage_type` on 25, `corrects_id` on
+10, `deactivate` on 7. Its §4 Observability table still lists
+`uc_timescaledb_deactivate_duration_seconds` (`:630`),
+`uc_timescaledb_usage_type_referenced_total` (`:652`) and
+`uc_timescaledb_usage_type_catalog_size` (`:672`) — three instruments this crate
+deleted — and describes `uc_timescaledb_compensations_total` as `corrects_id`-driven
+(`:676`).
+
+**The point of this entry is the ownership gap, not the staleness.** Entry 5
+owns `gears/system/usage-collector/docs/DECOMPOSITION.md`; entry 14 declares
+itself the entry that owns `docs/features/`. **Neither reaches the plugin's
+directory**, and nothing else here did either, so this file was stale *and*
+unregistered — the worse of the two states, because an unregistered document
+has no reader who knows to distrust it.
+
+**It is the nominal owner of three things it can no longer describe.** The gear
+delegates, and this file is what claims the delegation — nothing else in the
+tree does:
+
+- Gear DESIGN §3.7: "Concrete table shapes are plugin-internal … each plugin's
+  own DESIGN document owns them."
+- Gear DESIGN §3.11.5: "Plugins may expose backend-internal metrics under their
+  own prefix. Those series are owned by the plugin's deployment guide." This
+  file's traceability row at `:90` claims exactly that role —
+  `cpt-cf-uc-plugin-nfr-operational-visibility` → "OTel `uc_timescaledb_*`
+  metric inventory (§4 Observability)".
+- Gear DESIGN §3.10: "Each plugin crate's deployment guide MUST publish that
+  plugin's actual consistency profile." The row at `:89` claims that one too —
+  `cpt-cf-uc-plugin-nfr-consistency-profile` → "Single-node read-after-write
+  ceiling; per-topology profile (§4, ADR-0011)".
+
+Both claimed roles point at the same §4, and §4 is part of what is stale. The
+register has to say that the file cannot currently be read as the owner of any
+of the three. Entry 20's bound is a fourth thing with nowhere to go for the same
+reason.
+
+**Registered rather than fixed, on entry 14's own rule.** One current paragraph
+inside a wholesale-stale document is harder to notice than a uniformly stale
+one, so the §4 table was deliberately left alone rather than patched in place.
+
+**The contrast that makes the rule legible.** The same slice *corrected* the
+plugin's `README.md` — 52 lines with three wrong ones, including a **Note** that
+declared an "intentional divergence from the SPI's 3-tuple contract" where the
+shipped `usage_records_dedup_uniq` is the gear's DESIGN §3.7 5-tuple verbatim,
+the opposite of a divergence. A mostly-right document is where a wrong line does
+its damage, and is worth the edit; a uniformly stale one is worth a marker.
+
+**Load-bearing.** An implementer or reviewer working the plugin's §4 table
+builds three instruments that no longer have anything to measure and mis-keys a
+fourth, and the file presents itself — via `:90` and via gear DESIGN §3.11.5 —
+as the authority for exactly that.
+
+**Proposed resolution:** a documentation slice rewriting the file against the
+shipped model, not an editorial pass. Until it lands, the file needs a banner at
+its head saying it describes the pre-port model; that banner is the smallest
+change that does not create the mixed-staleness problem, and it is a spec
+owner's to write. See entry 24 for the traceability ignore that is coupled to
+this decision.
+
+---
+
+## 24. The `.cf-studio` ignore block's trigger has fired, and its stated reason is now half false
+
+`.cf-studio/config/artifacts.toml:84-91` ignores the plugin's `docs/*`, `src/*`
+and `tests/*` from traceability validation. Its reason:
+
+> Ignore the TimescaleDB usage-collector storage plugin — its specs **and code**
+> still describe the superseded model … pending the plugin's own update to
+> aggregation folds and invalidation once the rewrite tracked in PRD section 13
+> lands. Docs and code are ignored together: ignoring the specs alone would
+> orphan the plugin's code traceability markers.
+
+**That rewrite is this port.** The code half of the reason is therefore false:
+`src/` and `tests/` were rewritten to the aggregation-fold and invalidation
+model the block was waiting for. The ignore now suppresses validation of markers
+that **are** current — `@cpt-flow:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1`
+at `src/gear.rs:34`, for one.
+
+**The decision, taken jointly with entry 23: the ignore stands as written.** The
+block's final clause is its own answer. Narrowing it to `docs/*` would validate
+the code's markers against specs that are still stale — which is entry 23,
+unchanged, because that file was registered rather than rewritten. The ignore is
+internally coherent for exactly as long as `docs/DESIGN.md` is stale, and not one
+commit longer: **when entry 23 is resolved, narrow this block to `docs/*` in the
+same change, or drop it.**
+
+**Not load-bearing**, and marked so deliberately. Nothing is wrong today; a true
+half and a false half currently reach the same correct outcome. What fails is
+the *next* reader, who finds a reason that no longer describes the tree and
+cannot tell whether the block is still wanted.
+
+**This entry is routed here because it is otherwise ownerless.** Before it,
+`grep -c 'artifacts.toml\|cf-studio'` over this port's plan returned **0** —
+nothing anywhere would have brought a reader back to the file.
+
+**Proposed resolution:** on its own, correct the reason text to say that the code
+is current and the ignore now stands on the specs alone — the patterns unchanged.
+The file is the studio tooling's, not this branch's, so the wording is proposed
+and not applied:
+
+> Ignore the TimescaleDB usage-collector storage plugin — its `docs/` still
+> describe the superseded model (`DIVERGENCES.md` entry 23), while `src/` and
+> `tests/` were brought to the current model by the PRD section 13 rewrite.
+> Code is ignored with the docs rather than on its own merits: validating the
+> plugin's code traceability markers against stale specs would fail them.
+> Narrow to `docs/*` when entry 23 is resolved.
+
+---
+
+## 25. Nothing seeds `gts.cf.core.uc.usage_record.v1~`, so a fresh deployment meters nothing
+
+A meter is a **derived GTS type** of `gts.cf.core.uc.usage_record.v1~`, and the
+gear resolves it through `types-registry`. The abstract base itself is registered
+by nothing:
+
+- usage-collector declares no `#[gts_type_schema]` for it. Its only link-time
+  type schema is the storage-plugin spec
+  (`usage-collector-sdk/src/gts.rs`).
+- No shipped config carries it in `gears.types-registry.config.entities` —
+  checked by grepping every `*.yaml` / `*.yml` / `*.json` in the tree for the id,
+  which finds it only in the gear's own `docs/schemas/` and
+  `docs/usage-collector-v1.yaml`.
+
+`types-registry` refuses a child whose parent is unknown, so until the base is
+registered **every ingest is a 404 "GTS type … is not declared"** and no meter
+can be declared either. The E2E suite works around it by posting
+`docs/schemas/usage_record.v1.schema.json` itself before every meter
+(`testing/e2e/suites/usage_collector/conftest.py`), which is a test fixture
+standing in for a deployment step.
+
+**The comparison that makes this a decision rather than a bug report.**
+`config/quickstart.yaml:366-376` seeds the AM platform-root tenant type
+(`gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~`) exactly this way, under
+`gears.types-registry.config.entities`. So the platform has a shipped idiom for
+seeding an abstract root, and usage-collector does not use it.
+
+**Load-bearing.** Out of the box the gear's whole ingest surface returns 404.
+Anyone deploying it has to discover the obligation from a 404, and the document
+that would have told them does not exist.
+
+**What is recorded, since this one needs a decision and not only a description.**
+Three options, and the register's job is to say the choice has not been made:
+
+1. **Link time** — a `#[gts_type_schema]` on the gear for the base. Makes the
+   base present wherever the gear is linked, with no operator step; also makes
+   the gear the owner of a type its own `docs/schemas/` already publishes, which
+   is where the schema would have to come from.
+2. **`config/quickstart.yaml`** — the AM platform-root idiom above. Smallest
+   change, and consistent with a shipped precedent; seeds only deployments that
+   start from that config, so it fixes the demo path and not the general one.
+3. **An operator obligation** — documented in the gear's deployment guidance and
+   left to the deployer. Honest if the base is expected to be versioned
+   independently of the gear binary; today it is documented nowhere, which is the
+   state this entry is about.
+
+**Proposed resolution:** option 1 or 2 is a spec-owner call; option 3 is only
+tenable once it is written down. What must not stand is the current fourth
+state — no seeding, no documentation, and a test fixture quietly covering for
+both.
+
+---
+
 ## Not divergences — seven things this branch owes someone else
 
 None is a spec-owner decision, so none is numbered above. **A** and **B** were
@@ -1225,7 +1666,46 @@ them; **C** and **D** by slice 5's; **F** and **G** by slice 6's. All reach
 someone outside this branch. **D is struck** — slice 6 closed it — and stands
 struck rather than deleted, for the same reason the struck sub-items above do.
 
-### A. `docs/api/api.json` is stale, and it will fail CI
+### ~~A. `docs/api/api.json` is stale, and it will fail CI~~
+
+**Discharged by the TimescaleDB port's last task: `make openapi` ran and the
+result is committed.** The three claims below were re-verified immediately
+before the regeneration and all three held — `git diff --stat main --
+docs/api/api.json` empty, `QueryAggregatedUsageRecordsRequest` present **twice**,
+`AggregationRequest` **zero** times.
+
+**The regeneration was larger than this section's inventory, and that is worth
+recording here rather than leaving the next reader to rediscover it.** §A
+predicted the removals and the rename, which is what a staleness note is for; it
+did not predict the *additions* the same commits require, because it was written
+from the side of what the document still says. Measured over the whole document,
+the delta is confined to the usage-collector gear — no other gear's path or
+schema moved — and is exactly:
+
+- **Paths:** `+ /records/backfill`; `- /records/{id}/deactivate`,
+  `- /usage-types`, `- /usage-types/{gts_id}`.
+- **Schemas removed:** `QueryAggregatedUsageRecordsRequest` (renamed),
+  `CreateUsageTypeRequest`, `UsageTypeDto`, `Page_UsageTypeDto` (the two deleted
+  routes' bodies), and **`AggregationOpDto`** — the one §A gave no reason to
+  expect, and it goes because the fold is resolved from the queried type's
+  declaration, so no request names an operator.
+- **Schemas added:** `AggregationRequest` (the rename's target) and
+  **`TimeRangeDto`**, the mandatory covered-period range that request carries.
+- **DTO fields removed:** exactly the four §A names — `status`, `corrects_id`,
+  `created_at`, `gts_id` — and nothing else.
+- **DTO fields added:** `gts_type_id`, `window_start`, `window_end`,
+  `invalidates`, `reason_code` on both record shapes, plus `entry_type` and
+  `origin` on `UsageRecordDto`.
+- **Query parameters:** `gts_id` → `gts_type_id` on `GET /records` and
+  `POST /records/aggregate`; `from` and `to` added to `GET /records` as
+  mandatory, which is the time window leaving `$filter` (see entry 14).
+
+No `$ref` is left dangling. The breaking-change label is still owed — see the
+foot of this section — and now rests on fourteen `!` commits rather than the
+eleven the port's plan predicted.
+
+The original text follows unchanged.
+
 
 The generated aggregate contract still advertises
 `POST /usage-collector/v1/records/{id}/deactivate`, both `/usage-types` routes,
@@ -1424,7 +1904,46 @@ diagnose it one request early (`report_unbound_next_cursor`,
 suite is worth the most.** Recorded, not built: it is a new check plus reference
 support for minting cursors, which is a slice, not a sweep.
 
-### G. `group-by-absent-dimension` is a spec question before it is a check
+### ~~G. `group-by-absent-dimension` is a spec question before it is a check~~
+
+**Resolved by owner decision: drop the row.** It went to the owner in the form
+the port's aggregation task reframed it, and the answer matches both
+`InMemoryReferencePlugin` and the published wire shape, where
+`AggregationBucket.key` types every item as a non-nullable string with no null
+spelling available. `dimension_presence_guard`
+(`plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/aggregate.rs`)
+implements it: a grouped dimension that can yield `NULL` gets an `IS NOT NULL`
+built from the very expression the `GROUP BY` ordinal points at.
+
+Three things about the section below, now that it is settled.
+
+**The live case was metadata, not subject.** §G is written about
+`GROUP BY subject_id`, and the two backends agreed on subject all along — the
+plugin's aggregate already pushed `subject_id IS NOT NULL` and
+`subject_type IS NOT NULL`. It pushed nothing for a metadata dimension, and
+`InMemoryReferencePlugin`'s `bucket_key` reads a grouped metadata key as
+`row.metadata.get(key).cloned()` (`contract/reference.rs`), so an absent key
+yields `None` and the row joins no bucket. **The metadata dimension is the one
+place the two actually differed**, and the presence guard closes it.
+
+**"DESIGN says nothing about the case" understates what was already written.**
+DESIGN is silent; the SDK was not. `AggregationDimension::SubjectId` and
+`SubjectType` document the drop answer in as many words — "rows without a
+subject are excluded from the grouping" (`usage-collector-sdk/src/models.rs`).
+Of the six dimensions, three can be absent at all — `SubjectId`, `SubjectType`
+and `Metadata`; the other three read `NOT NULL` columns and the case cannot
+arise — so the SDK had already answered two of the three, and the unanswered one
+was the one that mattered.
+
+**The consequence is already stated below and is not re-reported as a gap.**
+"Grouped buckets need not sum to the ungrouped total" stands where it is. What
+is new is that it becomes **uniform rather than accidental**: it held for
+subject because the caller happened to guard those two dimensions, not because
+anyone had decided it should, and now it holds for every dimension because
+someone did.
+
+The original text follows unchanged.
+
 
 A second candidate check, and this one cannot be written until someone decides
 what the right answer is.
@@ -1459,6 +1978,36 @@ checkable, the slice-4 line entries 6-11, and the slice-5 line entries 12-16;
 overwriting any of them would strand those entries. Every line names the commit
 it was taken at, and a line that names none is not evidence — see the last
 paragraph of this section.
+
+**Slice 7 (the TimescaleDB plugin port), verified at `f884b9c64` on
+`usage-collector/implementation-change`, 2026-09-11:** **937 passed, 0 skipped**
+across the **four** usage-collector packages — the plugin is a workspace member
+again, which is what moves the figure from slice 6's three-package 716; plus
+**166 passed, 0 skipped** for `cargo nextest run -p cf-gears-usage-collector-sdk
+--features contract`. `cargo check --workspace --all-targets` and `cargo clippy
+--workspace --all-targets --all-features` clean, `cargo +nightly fmt` a no-op;
+`cargo doc --no-deps` clean on `cf-gears-usage-collector-sdk` and the same **35**
+pre-existing warnings on `cf-gears-usage-collector`, neither count grown.
+Separately, the DESIGN §3.3 contract suite runs green against a live
+`timescale/timescaledb` container via
+`cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features
+postgres`, which is the port's acceptance criterion and is not in the figures
+above.
+
+**The plugin is no longer identical to `main`, and every earlier line here says
+it is.** `git diff --stat main --
+gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/` is 40
+files, +10 736 / -4 288. Entries 1-19 predate that, so where one of them quotes
+the plugin it is quoting the pre-port file; entry 16's strike is the marker for
+the one that did so substantively.
+
+Entries 20-25, the strikes on 16 / §A / §G, and the additions to 10, 14 and 19
+were verified against the branch at that commit. The sweep commits that add them
+change `DIVERGENCES.md`, the plugin's `README.md`, one rustdoc paragraph in
+`usage-collector-sdk/src/models.rs`, and the generated `docs/api/api.json` — no
+behaviour and no test. Slice 7 touched no file under
+`gears/system/usage-collector/docs/`, so the quotations in 1-19 stand as earlier
+slices left them.
 
 **Slice 6 (errors and the contract gate), verified at `540dfbba0` on
 `usage-collector/implementation-change`, 2026-09-09:** **716 passed, 0
