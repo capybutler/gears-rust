@@ -125,6 +125,14 @@ jobs:
       # `timescaledb-usage-collector` entry in this suite's own e2e.yaml
       # `features:` list is what turns it on.
       - name: Run usage-collector E2E tests (TimescaleDB container)
+        # Fail if the suite cannot run instead of letting it skip itself into a
+        # green step that asserted nothing — the same reason ci.yml sets
+        # RG_PG_REQUIRE_DOCKER. The suite gates on E2E_BINARY and on a reachable
+        # Docker daemon and skips on either; with this set, both refusals are
+        # failures. It buys more here than it does there: this is the only job
+        # that exercises the storage plugin end to end.
+        env:
+          UC_E2E_REQUIRE_DOCKER: "1"
         run: make e2e-usage-collector
 
       - name: Upload E2E logs

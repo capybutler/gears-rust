@@ -28,7 +28,7 @@ use usage_collector_sdk::{
 
 use super::*;
 use crate::domain::ports::declarations::DeclarationSource;
-use crate::domain::test_support::{MockPlugin, UnreachableResolver, enforcer_for};
+use crate::domain::test_support::{HappyPathPlugin, MockPlugin, UnreachableResolver, enforcer_for};
 
 /// Dummy enforcer for tests that never reach the PDP path
 /// (binding / plugin-host tests). An unreachable PDP transport never matters
@@ -37,22 +37,22 @@ fn dummy_enforcer() -> PolicyEnforcer {
     enforcer_for(Arc::new(UnreachableResolver))
 }
 
-/// The system-internal invalidation-target read must hand the plugin a scope
-/// a conforming backend can actually render.
+/// The scope [`target_pinned_read_filter`] builds must be one a conforming
+/// backend can render, and must pin the row it claims to pin.
 ///
 /// This is a regression test with a field report behind it. The scope used to
 /// be a bare `true` literal, which reads as "no narrowing" and is refused in
 /// a boolean position by BOTH `convert_expr_to_filter_node`
 /// (`FilterError::BareLiteral`) and the SDK's own reference implementation
 /// (`contract/reference.rs`). Every invalidation submitted to the `TimescaleDB`
-/// backend therefore came back `500 Internal("invalid read predicate")`. No
-/// unit test caught it because the in-crate plugin doubles never translate a
-/// scope, and no contract check caught it because the SPI's checks supply
-/// their own filters rather than observing this one.
+/// backend therefore came back `500 Internal("invalid read predicate")`.
 ///
-/// So the assertion is the translation itself, not the shape: a future filter
-/// that renders differently but still translates is fine, and one that
-/// happens to look plausible but cannot be served is not.
+/// **This test alone would not have caught that**, and saying so is the point:
+/// it calls the helper directly and never observes what the two call sites
+/// pass, so reverting either of them would leave it green. The assertions that
+/// watch the call sites are
+/// [`assert_translatable_scope`]'s, one per path — see its doc for why both
+/// are needed and what each one covers.
 #[test]
 fn the_invalidation_target_scope_translates_for_a_conforming_backend() {
     let target = Uuid::from_u128(0xF11E);
@@ -61,15 +61,27 @@ fn the_invalidation_target_scope_translates_for_a_conforming_backend() {
     let node = toolkit_odata::filter::convert_expr_to_filter_node::<UsageRecordFilterField>(&scope)
         .expect("the invalidation-target scope must be translatable by any conforming plugin");
 
-    // And it must pin the row already named by the `id` argument, so the
-    // "narrows nothing" claim in the helper's own doc is checked rather than
-    // asserted: a scope that translated but selected a different row would
-    // turn a legitimate withdrawal into a spurious target-not-found.
-    let rendered = format!("{node:?}");
-    assert!(
-        rendered.contains(&target.to_string()),
-        "the scope must pin the target id, got {rendered}"
-    );
+    // Destructured rather than substring-matched on a `Debug` rendering: the
+    // claim is `id eq <target>` and nothing else, and a rendering match would
+    // also accept, say, `tenant_id eq <target>`. `field.name()` rather than a
+    // variant pattern, because the enum is macro-derived and its variant
+    // spelling is not the published contract - the field name is.
+    // `ODataValue` implements no `PartialEq`, so the value arm is a `matches!`
+    // guard rather than an equality assertion.
+    match node {
+        toolkit_odata::filter::FilterNode::Binary { field, op, value } => {
+            assert_eq!(
+                toolkit_odata::filter::FilterField::name(&field),
+                usage_collector_sdk::RECORD_ID_FIELD
+            );
+            assert_eq!(op, toolkit_odata::filter::FilterOp::Eq);
+            assert!(
+                matches!(value, ast::Value::Uuid(id) if id == target),
+                "the scope must compare `id` against the target uuid, got {value:?}"
+            );
+        }
+        other => panic!("the scope must be one `id eq <uuid>` comparison, got {other:?}"),
+    }
 
     // The negative half, and it is what keeps the positive one from going
     // quiet: the shape this replaced has to still be refused. If the
@@ -83,6 +95,38 @@ fn the_invalidation_target_scope_translates_for_a_conforming_backend() {
         .is_err(),
         "a bare literal in a boolean position is what made this fix necessary"
     );
+}
+
+/// Assert that the scope the service last handed `get_usage_record` is one a
+/// conforming backend can translate.
+///
+/// **Called once per call site, and both calls are load-bearing.** The two
+/// invalidation-target pre-reads are separate expressions in separate
+/// functions - `resolve_invalidation_targets` for the batch path,
+/// `Service::create_usage_record_inner` for the single-record one - so one
+/// assertion covers one of them and says nothing about the other. The E2E
+/// suite cannot close the gap either: the gear publishes no single-record
+/// POST, so `create_usage_record` is reachable only through the in-process
+/// `ClientHub` path (`local_client.rs`) and no HTTP test can drive it.
+///
+/// The question is deliberately "does it translate", not "what shape is it":
+/// a future scope that renders differently but a backend can still serve is
+/// fine, and that is exactly the distinction a `Debug`-string assertion
+/// cannot draw. [`HappyPathPlugin::last_get_scope`] renders; this reads
+/// [`HappyPathPlugin::last_get_scope_expr`] and puts the real converter
+/// behind the answer.
+fn assert_translatable_scope(plugin: &HappyPathPlugin, call_site: &str) {
+    let scope = plugin
+        .last_get_scope_expr()
+        .expect("the target pre-read must have dispatched to the plugin");
+
+    toolkit_odata::filter::convert_expr_to_filter_node::<UsageRecordFilterField>(&scope)
+        .unwrap_or_else(|err| {
+            panic!(
+                "the scope `{call_site}` hands `get_usage_record` must be translatable \
+                 by a conforming backend; `{scope:?}` was refused as {err:?}"
+            )
+        });
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -992,6 +1036,7 @@ mod invalidation_target_batch_tests {
     };
     use uuid::Uuid;
 
+    use super::assert_translatable_scope;
     use crate::domain::Service;
     use crate::domain::test_support::{
         HappyPathPlugin, ServiceFixture, authenticated_ctx, counter_sum_with_label,
@@ -1092,6 +1137,8 @@ mod invalidation_target_batch_tests {
              get_usage_record SPI dispatch; observed {} calls",
             plugin.get_usage_record_calls(),
         );
+
+        assert_translatable_scope(&plugin, "resolve_invalidation_targets");
     }
 
     /// Three distinct targets MUST produce three `get_usage_record`
@@ -2150,6 +2197,7 @@ mod create_usage_record_path_tests {
     };
     use uuid::Uuid;
 
+    use super::assert_translatable_scope;
     use crate::domain::Service;
     use crate::domain::test_support::{
         DenyAllResolver, HappyPathPlugin, ServiceFixture, authenticated_ctx, enforcer_for,
@@ -2336,6 +2384,8 @@ mod create_usage_record_path_tests {
             1,
             "an invalidation MUST resolve its target exactly once",
         );
+
+        assert_translatable_scope(&plugin, "Service::create_usage_record_inner");
     }
 
     /// `invalidates` names a uuid the plugin does not hold ⇒ `NotFound`

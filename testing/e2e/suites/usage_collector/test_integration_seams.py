@@ -263,7 +263,17 @@ async def test_backfill_admits_a_period_the_live_path_refuses(api, make_meter):
             await client.post("/records/backfill", json={"records": [payload]})
         )
 
-    assert rejected_records(live)[0]["status"] == 400, live.text
+    # The reason code, not just the class — the standard this file sets on the
+    # invalidation test above. Any of a dozen validation faults is a 400, so a
+    # status-only assertion would stay green if the past bound stopped firing
+    # and something else rejected the payload instead.
+    refusal = rejected_records(live)[0]
+    assert refusal["status"] == 400, refusal
+    violations = refusal["context"]["field_violations"]
+    assert [(v["field"], v["reason"]) for v in violations] == [
+        ("window_end", "PAST_WINDOW")
+    ], refusal
+
     assert imported[0]["origin"] == "backfill"
     # The period is carried verbatim, not clamped to the live route's bound:
     # the route exists for exactly the periods that bound refuses.

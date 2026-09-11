@@ -5392,6 +5392,27 @@ usage-collector suite "is not run here at all during the type-plane rewrite —
 see testing/e2e/suites/usage_collector/e2e.yaml". Leaving that comment beside a
 restored step is exactly the "claim outliving the code" defect.
 
+**The e2e step also needs a "may not skip itself" gate**, and the repo has
+already settled the argument: `ci.yml` sets `RG_PG_REQUIRE_DOCKER: "1"` with
+the comment *"Fail if Docker is unreachable instead of letting the suite skip
+itself into a green step that asserted nothing."* The usage-collector suite has
+two such skips - `E2E_BINARY` unset and Docker unreachable, both in
+`conftest.py`'s autouse session fixture - and either yields **11 skipped and a
+green step**. That buys more here than it does for resource-group: this step is
+the only job in CI that compiles the storage plugin into a server, so a silent
+skip takes the plugin's only end-to-end exercise with it.
+
+Done as `UC_E2E_REQUIRE_DOCKER: "1"` on the step plus a `_refuse()` helper in
+the suite's conftest that fails when the variable is set and skips otherwise.
+Proven both ways: with the variable set and `E2E_BINARY` unset the run is **11
+errors**; with neither set it is **11 skipped**. The Rust lane needs nothing -
+`make test-usage-collector-pg` has no skip path.
+
+The **generic** version of this - a minimum-collected-count assertion in
+`run_e2e.py`, which would cover mini-chat's identical `E2E_BINARY` skip and
+every future self-managed suite - is repo-wide harness work belonging to
+neither Task 17 nor Task 18, and is raised in the PR description instead.
+
 - [x] **Step 3a: Rewrite the `e2e.yaml` header**
 
 It currently opens:
@@ -5455,16 +5476,25 @@ nothing else could, and one decision it forced.
    which asserts the *translation* and keeps the old shape's refusal as its
    negative half, so it cannot go quiet.
 
-   **A spy for it already existed and had no assertion behind it.**
-   `test_support.rs`'s `RecordingPlugin::last_get_scope()` - whose own doc
-   says it proves the point lookup "actually handed the plugin a compiled PDP
-   scope" - has exactly one caller, `service_tests.rs:1951`, on the DESIGN
-   section 3.3 path. The invalidation pre-read went through the same spy and
-   nothing ever looked at what it captured. Everything else is blind by
-   construction: the other in-crate doubles take `_scope` or record it as a
-   `Debug` string without translating it, and the contract check builds its
-   own `scope_under_test()`. So this is not "only an E2E could have caught
-   it" - it is one unwritten assertion on a mechanism already in the tree.
+   **A spy for it already existed and had no assertion behind it, and that
+   gap is now closed rather than recorded.** `HappyPathPlugin::last_get_scope()`
+   - whose own doc says it proves the point lookup "actually handed the plugin
+   a compiled PDP scope" - had exactly one caller, on the DESIGN section 3.3
+   path. The invalidation pre-read dispatched through the same spy and nothing
+   looked at what it captured. It could not have, usefully: the spy stored a
+   `Debug` rendering, which can only be substring-matched, and "does the string
+   mention X" is not the question. The double now keeps the `ast::Expr`
+   (`last_get_scope_expr()`), and `assert_translatable_scope` puts the real
+   converter behind the answer at **both** call sites - one assertion per path,
+   because they are separate expressions in separate functions and one says
+   nothing about the other. Proven by reverting each call site in turn: each
+   revert reds its own assertion and leaves the other green, while the
+   direct-call test stays green through both. That last part is why the
+   direct-call test was not enough on its own.
+
+   The single-record path is the one the E2E suite structurally cannot reach:
+   the gear publishes no single-record POST, so `create_usage_record` is
+   reachable only through the in-process `ClientHub` path (`local_client.rs`).
 
 2. **The at-most-one-invalidation refusal is top-level, not per-record.** The
    partial unique index on `(invalidates, window_end)` refuses the whole
@@ -5711,18 +5741,6 @@ to fix here.
    for exactly this reason. Record whether the base is meant to be seeded at
    link time, shipped in `config/quickstart.yaml` the way the AM platform-root
    tenant type is, or left as an operator obligation.
-
-7. **Task 17's: the scope spy that existed and was never asserted on.** The
-   `unrestricted_read_filter` defect (Task 17 Step 4, item 1) reached a live
-   deployment through a path that already had the instrument to catch it:
-   `RecordingPlugin::last_get_scope()` (`domain/test_support.rs:1462`) has one
-   caller, `service_tests.rs:1951`, on the DESIGN section 3.3 point-lookup
-   path. The invalidation-target pre-read dispatches through the same spy.
-   This is not a `DIVERGENCES.md` row — it is a note for whoever writes the
-   next SPI-touching slice: **when a scope crosses the SPI, assert that it
-   translates, not that the call returned `Ok`.** The in-crate doubles record
-   scopes as `Debug` strings without translating them, so "the spy captured
-   something" is not evidence a backend can serve it.
 
 - [ ] **Step 5: Update `DIVERGENCES.md`**
 

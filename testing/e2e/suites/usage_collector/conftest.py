@@ -22,7 +22,7 @@ import httpx
 import pytest
 
 from lib.orchestrator import GearTestEnv
-from lib.sidecars import TimescaleDbSidecar, skip_without_docker
+from lib.sidecars import DockerUnavailable, TimescaleDbSidecar, require_docker
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -121,14 +121,45 @@ def _rfc3339(moment: datetime) -> str:
 
 # ── Environment gate ──────────────────────────────────────────────────────
 
+# Set by the CI step to forbid the two skips below, mirroring
+# `RG_PG_REQUIRE_DOCKER` in ci.yml: "Fail if Docker is unreachable instead of
+# letting the suite skip itself into a green step that asserted nothing."
+#
+# It matters more here than it does there. This suite's step is the only job in
+# CI that compiles the TimescaleDB storage plugin into a server, so a silent
+# skip is not one lane going quiet - it is the plugin's only end-to-end
+# exercise going quiet, in the same green tick.
+#
+# Off by default, because a developer without Docker should still get a skip
+# rather than a failure from a `make e2e-local` sweep. Only the step that owns
+# the guarantee sets it.
+REQUIRE_DOCKER_ENV = "UC_E2E_REQUIRE_DOCKER"
+
+
+def _refuse(reason: str) -> None:
+    """Fail if the caller demanded this suite run; skip otherwise.
+
+    Not a swap of two callables with one argument list: `pytest.skip` takes
+    `allow_module_level` and `pytest.fail` takes `pytrace`, and passing the
+    wrong one is a `TypeError` inside a session fixture - which pytest reports
+    as an error, not as the refusal it was meant to be.
+    """
+    if os.environ.get(REQUIRE_DOCKER_ENV):
+        pytest.fail(reason, pytrace=False)
+    pytest.skip(reason, allow_module_level=True)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _require_dedicated_binary():
     if not os.environ.get("E2E_BINARY"):
-        pytest.skip(
-            "E2E_BINARY not set — run these tests via: make e2e-usage-collector",
-            allow_module_level=True,
-        )
-    skip_without_docker()
+        _refuse("E2E_BINARY not set — run these tests via: make e2e-usage-collector")
+    # `require_docker` rather than `skip_without_docker`: the shared helper
+    # skips unconditionally, and the choice between skipping and failing is
+    # this suite's to make. The shared helper keeps its other callers.
+    try:
+        require_docker()
+    except DockerUnavailable as exc:
+        _refuse(f"Docker required for this suite: {exc}")
 
 
 def pytest_collection_modifyitems(items):
@@ -376,21 +407,29 @@ def rejected_records(response: httpx.Response) -> list[dict]:
         f"expected 207, got {response.status_code}: {response.text}"
     )
     results = response.json()["results"]
-    accepted = [r for r in results if r["outcome"] != "rejected"]
-    assert not accepted, f"records unexpectedly accepted: {accepted}"
+    # `!= "rejected"`, not `== "accepted"`: two wire tags exist today, and the
+    # fail-closed spelling is the one that would also catch a third.
+    unrejected = [r for r in results if r["outcome"] != "rejected"]
+    assert not unrejected, f"records not rejected: {unrejected}"
     return [r["error"] for r in results]
 
 
 def accepted_records(response: httpx.Response) -> list[dict]:
     """Assert every per-record outcome is `accepted`, return the record bodies.
 
-    POST /records is a BATCH endpoint: it answers 200 when all records were
-    accepted or deduplicated and 207 when any was rejected, with the real
-    outcome per record. Asserting only on the status code would pass while
-    every record was rejected.
+    POST /records is a BATCH endpoint: it answers 200 when every entry was
+    admitted and 207 when any was rejected, with the real outcome per record.
+    Asserting only on the status code would pass while every record was
+    rejected.
+
+    `CreateUsageRecordResultDto` has exactly two tags, `accepted` and
+    `rejected`. A deduplicated resubmission is an `accepted` carrying the
+    already-persisted row - it is not a third outcome, and nothing on the wire
+    distinguishes it from a first submission.
     """
     assert response.status_code == 200, f"expected 200, got {response.status_code}: {response.text}"
     results = response.json()["results"]
-    rejected = [r for r in results if r["outcome"] != "accepted"]
-    assert not rejected, f"records rejected: {rejected}"
+    # Same fail-closed spelling as `rejected_records`, and the same reason.
+    unaccepted = [r for r in results if r["outcome"] != "accepted"]
+    assert not unaccepted, f"records not accepted: {unaccepted}"
     return [r["record"] for r in results]

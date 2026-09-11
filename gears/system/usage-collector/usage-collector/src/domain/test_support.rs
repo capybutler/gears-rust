@@ -1229,7 +1229,15 @@ pub struct TargetLookupDouble {
     transient: Mutex<Option<ProgrammedTransient>>,
     transient_by_id: Mutex<std::collections::BTreeMap<Uuid, ProgrammedTransient>>,
     inputs: Mutex<Vec<Uuid>>,
-    last_scope: Mutex<Option<String>>,
+    /// The most-recent `scope`, kept as the AST rather than as a rendering
+    /// of it. A `Debug` string can only be substring-matched, which is how
+    /// a scope that no backend could translate
+    /// (`Expr::Value(Bool(true))` - see `service::target_pinned_read_filter`)
+    /// passed through this spy unnoticed. Holding the `Expr` lets a test
+    /// hand it to `convert_expr_to_filter_node` and ask the question that
+    /// matters. [`Self::last_scope`] still renders it for callers that only
+    /// want the string.
+    last_scope: Mutex<Option<ast::Expr>>,
 }
 
 impl TargetLookupDouble {
@@ -1271,6 +1279,19 @@ impl TargetLookupDouble {
     /// first call.
     #[must_use]
     pub fn last_scope(&self) -> Option<String> {
+        self.last_scope
+            .lock()
+            .expect("mutex")
+            .as_ref()
+            .map(|scope| format!("{scope:?}"))
+    }
+
+    /// The most-recent `scope` itself, or `None` before the first call.
+    ///
+    /// For the assertion [`Self::last_scope`] cannot support: whether a
+    /// conforming backend could translate what the service handed the SPI.
+    #[must_use]
+    pub fn last_scope_expr(&self) -> Option<ast::Expr> {
         self.last_scope.lock().expect("mutex").clone()
     }
 
@@ -1287,7 +1308,7 @@ impl TargetLookupDouble {
         scope: &ast::Expr,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         self.inputs.lock().expect("mutex").push(id);
-        *self.last_scope.lock().expect("mutex") = Some(format!("{scope:?}"));
+        *self.last_scope.lock().expect("mutex") = Some(scope.clone());
         if let Some((detail, retry_after_seconds)) = self.transient.lock().expect("mutex").clone() {
             return Err(UsageCollectorPluginError::transient_with_retry(
                 detail,
@@ -1461,6 +1482,20 @@ impl HappyPathPlugin {
     #[must_use]
     pub fn last_get_scope(&self) -> Option<String> {
         self.target_lookup.last_scope()
+    }
+    /// The `scope` filter passed to the most-recent `get_usage_record`
+    /// call, as the AST rather than a rendering of it, or `None` if it was
+    /// never invoked.
+    ///
+    /// Use this, not [`Self::last_get_scope`], whenever the question is
+    /// whether a real backend could serve the scope: a `Debug` string
+    /// answers only "does it mention X", which is what let
+    /// `Expr::Value(Bool(true))` — untranslatable by every conforming
+    /// plugin, and by the SDK's own reference implementation — reach a live
+    /// deployment on the invalidation-target pre-read.
+    #[must_use]
+    pub fn last_get_scope_expr(&self) -> Option<ast::Expr> {
+        self.target_lookup.last_scope_expr()
     }
     pub fn set_list_usage_records_response(&self, page: ODataPage<UsageRecord>) {
         *self.list_usage_records_response.lock().expect("mutex") = Some(page);
