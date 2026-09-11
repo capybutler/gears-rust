@@ -1000,6 +1000,21 @@ worse: §1.6 exists precisely so a reader who distrusts the surrounding sections
 has one place to trust, and it is the section that is wrong. Its sibling
 instance in `DECOMPOSITION.md:573` is in entry 5.
 
+**Proposed resolution, for `usage-query.md` specifically.** The
+`**Proposed wording:**` above disposes of the three
+`uc_ingestion_duration_seconds` sites this entry was originally about, and it
+does not reach the file the paragraph above measures. That one needs the same
+disposition entry 23 gets for the plugin's `docs/DESIGN.md`, because it is the
+same judgment: **a documentation slice rewriting the file against the shipped
+model, not an editorial pass, and explicitly not a line-by-line fix.** Until it
+lands, the file needs a banner at its head saying it describes the pre-port
+read path. Both are a spec owner's to write.
+
+The two are the same finding in two directories, and disposing of them
+differently would be the register contradicting itself. Entry 5 is a third
+instance for `DECOMPOSITION.md` and pre-dates this slice; it is registered as
+out of scope alongside this entry rather than re-opened here.
+
 ---
 
 ## 15. `AggregationDimension` carries five of the eight fixed dimensions DESIGN gives `group_by`
@@ -1554,8 +1569,14 @@ as the authority for exactly that.
 shipped model, not an editorial pass. Until it lands, the file needs a banner at
 its head saying it describes the pre-port model; that banner is the smallest
 change that does not create the mixed-staleness problem, and it is a spec
-owner's to write. See entry 24 for the traceability ignore that is coupled to
-this decision.
+owner's to write.
+
+**Two entries are coupled to this one and neither can be closed without it.**
+See entry 24 for the traceability ignore, which narrows to `docs/*` in the same
+change that resolves this entry — and **entry 20**, whose `LATEST` memory bound
+has no document to live in until this file is one a reader can trust: whoever
+rewrites it is the landing site for that bound, and gear DESIGN §3.10 is where
+the obligation to carry it comes from.
 
 ---
 
