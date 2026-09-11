@@ -75,8 +75,10 @@ than a tidy summary:
   concrete rather than conditional: two conforming backends now answer a
   `LATEST` tie differently, on the rule the blocked check would have pinned.
 - **Entry 20** — no document is wrong. The `LATEST` fold has a bound nobody
-  stated, driven by an input the caller chooses, and DESIGN §3.10 asks for
-  exactly that statement.
+  stated, driven by an input the caller chooses. It belongs to the plugin's
+  §3.10 deployment guide by kind and **not** by that section's enumeration,
+  which lists six mandatory statements and no memory bound — and the plugin
+  publishes no such guide anyway.
 - **Entries 21 and 22** — the SPI is right and the store cannot fully hold it.
   A hypertable `UNIQUE` must contain the partition column, so at-most-one
   invalidation is conditional on the gateway; and a cross-call collision aborts
@@ -1663,8 +1665,9 @@ both.
 None is a spec-owner decision, so none is numbered above. **A** and **B** were
 found by slice 4's final review, after eight per-task review rounds had missed
 them; **C** and **D** by slice 5's; **F** and **G** by slice 6's. All reach
-someone outside this branch. **D is struck** — slice 6 closed it — and stands
-struck rather than deleted, for the same reason the struck sub-items above do.
+someone outside this branch. **Three are struck** — **D** by slice 6, and **A**
+and **G** by slice 7 — and each stands struck rather than deleted, for the same
+reason the struck sub-items above do. **B**, **C**, **E** and **F** are open.
 
 ### ~~A. `docs/api/api.json` is stale, and it will fail CI~~
 
@@ -1701,8 +1704,22 @@ schema moved — and is exactly:
   mandatory, which is the time window leaving `$filter` (see entry 14).
 
 No `$ref` is left dangling. The breaking-change label is still owed — see the
-foot of this section — and now rests on fourteen `!` commits rather than the
-eleven the port's plan predicted.
+foot of this section — and now rests on fourteen `!` commits from slices 6-7
+(`9f64cf22f..HEAD`) rather than the eleven the port's plan predicted. **The PR
+goes against `main`, which is a wider set: thirty.**
+
+```
+git log --oneline $(git merge-base main HEAD)..HEAD | grep '!'
+```
+
+`git merge-base main HEAD` is `42e285e9a`; the plan's `9f64cf22f` base covers
+slices 6-7 only. **The commits that earned the label are mostly in the other
+sixteen** — the four that removed the very routes and fields this regeneration
+deletes are `d027e2089` (remove the usage-type catalog), `547915dc1` (delete the
+deactivation surface), `b3a3811fe` (carry the read-path time range as a typed
+parameter) and `c8a51ea73` (carry the covered period and derive identity over
+it), and not one of them is among the fourteen. Run the command rather than
+reading a numeral out of this paragraph.
 
 The original text follows unchanged.
 

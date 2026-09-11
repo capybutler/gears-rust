@@ -5575,9 +5575,56 @@ CI regains a Docker dependency for the usage-collector lanes."
 Last, because `api.json` is a generated artifact that conflicts noisily.
 
 **Files:**
-- Modify: `docs/api/api.json`, `DIVERGENCES.md`
+- Modify: `docs/api/api.json`, `DIVERGENCES.md`,
+  `gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/README.md`,
+  `gears/system/usage-collector/usage-collector-sdk/src/models.rs`
+  (the last two are Step 4b's entry-4 fix and the `AVG` rustdoc this task was
+  routed; the plan's original file list named only the first two)
 
-- [ ] **Step 1: Re-verify §A before acting on it**
+> **FLIGHT CORRECTION (Task 18, as shipped).** Four claims below were falsified
+> by measurement while the task ran. Each is corrected in place at its step;
+> collected here so a reader does not have to find them. **Every one is a count
+> or a scope claim** — the defect class this task's own output exists to
+> register, arriving in the instructions for registering it.
+>
+> 1. **Step 4's "Slice 6 contributed three" is four, the plan's total of eleven
+>    is fourteen, and the number the PR actually rests on is thirty.**
+>    `9f64cf22f..HEAD` carries 14: slice 6 contributed four
+>    (`b353c27fc`, `8b30a288d`, `7691b8222`, `7cce8db2e`) and this plan ten —
+>    the predicted Tasks 1, 2, 3, 8, 9, 10, 11, 12 plus Task 13's two metric
+>    renames (`3a37fad36`, `74514f02e`), which are real operator-visible breaks
+>    the plan did not anticipate. **But the label goes on a PR against `main`**,
+>    and `git merge-base main HEAD` is `42e285e9a`, not `9f64cf22f` — that range
+>    carries **30**. The four that removed the very routes and fields the
+>    regeneration deletes (`d027e2089`, `547915dc1`, `b3a3811fe`, `c8a51ea73`)
+>    are in the other sixteen and in none of the plan's counts. Recorded with
+>    its reproducing command in `DIVERGENCES.md` §A, because a numeral in a plan
+>    is exactly what went stale here.
+> 2. **Step 5's §G bullet says "for four of the six dimensions"; it is two of
+>    three.** Measured against `bucket_key` and `dimension_presence_guard`:
+>    three of the six dimensions can be absent at all — `SubjectId`,
+>    `SubjectType`, `Metadata` — and the other three read `NOT NULL` columns, so
+>    the case cannot arise for them. The SDK documented the drop answer for two
+>    of those three, and the undocumented one, `Metadata`, is the one place the
+>    two backends actually differed.
+> 3. **Step 5's LATEST bullet says "DESIGN §3.10 asks each plugin's deployment
+>    guide to state the bounds it can hold"; §3.10's enumeration contains no
+>    memory bound.** It requires a deployment guide per plugin crate and lists
+>    six mandatory statements, all consistency, freshness, retention and
+>    throughput. The bound belongs to that guide **by kind and not by the
+>    enumeration** — and the plugin publishes no such guide at all, which is
+>    entry 23's subject. Entry 20 makes the kind claim; the scope claim would
+>    have been the defect the entry is about.
+> 4. **Step 3's "stop and report it" was read as protecting *accounting*, not
+>    literal prediction, and the task did not stop.** The regeneration contains
+>    items §A does not predict — `AggregationOpDto`'s removal, `TimeRangeDto`,
+>    every added DTO field, and the `from` / `to` parameters — and every one
+>    traces to a commit on this branch. They are enumerated in §A's discharge
+>    rather than left for the next reader. Stopping would have left `api.json`
+>    byte-identical to `main` with the contract workflow red, which is the debt
+>    this task exists to clear.
+
+- [x] **Step 1: Re-verify §A before acting on it**
 
 DIVERGENCES §A records what the regeneration will contain, and slice 6
 corrected it once already.
@@ -5591,7 +5638,7 @@ usage-type routes, renames a published component — check out.
 Re-run those three commands before trusting these numbers; Tasks 1-17 have
 landed since.
 
-- [ ] **Step 2: Regenerate**
+- [x] **Step 2: Regenerate**
 
 ```bash
 cd /Users/binarycode/code/virtuozzo/gears-rust
@@ -5599,14 +5646,14 @@ make openapi
 git diff --stat docs/api/api.json
 ```
 
-- [ ] **Step 3: Read the diff against §A**
+- [x] **Step 3: Read the diff against §A**
 
 Confirm it adds `/records/backfill`, removes the two usage-type routes, and
 renames `QueryAggregatedUsageRecordsRequest` to `AggregationRequest`. **If the
 diff contains anything §A does not predict, stop and report it** rather than
 committing a generated file whose contents you have not accounted for.
 
-- [ ] **Step 4: Settle the `breaking-api-acknowledged` label**
+- [x] **Step 4: Settle the `breaking-api-acknowledged` label**
 
 The slice-6 breaking changes plus this slice's. Enumerate:
 
@@ -5614,14 +5661,24 @@ The slice-6 breaking changes plus this slice's. Enumerate:
 git log --oneline 9f64cf22f..HEAD | grep '!'
 ```
 
-Slice 6 contributed three. This plan adds a `!` to Tasks 1, 2, 3, 8, 9, 10, 11
-and 12. Every one is a real wire or SPI break, so the label is owed.
+~~Slice 6 contributed three. This plan adds a `!` to Tasks 1, 2, 3, 8, 9, 10, 11
+and 12.~~ **Both numbers are wrong, and the base commit is the wrong one — see
+flight correction 1.** Slice 6 contributed **four**; this plan **ten** (the eight
+predicted plus Task 13's two metric renames); `9f64cf22f..HEAD` totals
+**fourteen**; and the PR goes against `main`, whose merge-base `42e285e9a`
+yields **thirty**. Enumerate with the merge-base, never with `9f64cf22f`:
+
+```bash
+git log --oneline $(git merge-base main HEAD)..HEAD | grep '!'
+```
+
+Every one is a real wire or SPI break, so the label is owed.
 
 The label goes on the PR, which does not exist yet — the gateway work and this
 port merge together. **Report the enumerated list so whoever opens the PR
 applies the label**; do not open the PR as part of this task unless asked.
 
-- [ ] **Step 4b: The DIVERGENCES entries earlier tasks owe you**
+- [x] **Step 4b: The DIVERGENCES entries earlier tasks owe you**
 
 **Do not read the count out of this heading or out of the list below** — tasks
 keep adding to it, and a numeral here goes stale the way every other count in
@@ -5751,7 +5808,7 @@ to fix here.
    link time, shipped in `config/quickstart.yaml` the way the AM platform-root
    tenant type is, or left as an operator obligation.
 
-- [ ] **Step 5: Update `DIVERGENCES.md`**
+- [x] **Step 5: Update `DIVERGENCES.md`**
 
 Measured at slice start: **19 numbered entries** (`grep -c '^## [0-9]'`) and
 **15 load-bearing** markers (`grep -c '^\*\*Load-bearing'`). **Note the
@@ -5811,7 +5868,11 @@ Changes owed:
     written.** The SDK documents the drop answer on
     `AggregationDimension::SubjectId` and `SubjectType` at `models.rs:1587-1592`
     — "rows without a subject are excluded from the grouping". DESIGN is silent;
-    the SDK was not, for four of the six dimensions.
+    the SDK was not. ~~for four of the six dimensions~~ **Two of three — see
+    flight correction 2.** Three of the six dimensions can be absent at all
+    (`SubjectId`, `SubjectType`, `Metadata`); the other three read `NOT NULL`
+    columns. The SDK answered two of those three, and the unanswered one is the
+    one that mattered.
   - **§G already states the consequence** — "grouped buckets need not sum to
     the ungrouped total", `DIVERGENCES.md:1435-1437` — so do not re-report it as
     a gap. What is new is that it becomes **uniform rather than accidental**:
@@ -5887,9 +5948,13 @@ Changes owed:
   `aggregate.rs` is unchanged, and the entry publishes a limit rather than a
   fix.
 
-  **This is a limit to publish, not a question to weigh.** DESIGN §3.10 asks
-  each plugin's deployment guide to state the bounds it can hold, and this is
-  one it cannot hold under a `LATEST` meter whose largest group is wide.
+  **This is a limit to publish, not a question to weigh.** ~~DESIGN §3.10 asks
+  each plugin's deployment guide to state the bounds it can hold~~ — **a scope
+  claim; see flight correction 3.** §3.10 requires a deployment guide per plugin
+  crate and enumerates six mandatory statements, none of them a memory bound.
+  The bound belongs to that guide by **kind**, not by the enumeration, and the
+  plugin publishes no such guide at all. Write the kind claim; the scope claim
+  is the defect this entry is about.
 
   **The entry's content is the three numbered facts above plus
   `aggregate_limit_clause`'s zero protection and the time window being caller
@@ -5913,7 +5978,7 @@ Changes owed:
   so it was routed here rather than fixed in Task 15's commits.
 - **Any further entry** this port turned up, beyond the `LATEST` one above.
 
-- [ ] **Step 6: Full verification bar, one last time**
+- [x] **Step 6: Full verification bar, one last time**
 
 ```bash
 cargo check --workspace --all-targets
@@ -5928,7 +5993,7 @@ cargo doc --no-deps -p cf-gears-usage-collector-sdk -p cf-gears-usage-collector
 
 0 skipped. Doc warnings 35 / 0, neither grown.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add docs/api/api.json DIVERGENCES.md
@@ -5944,6 +6009,31 @@ acceptance_sequence now exists in the plugin's own table, which is DESIGN
 published response shape, so the LATEST fold still has nothing to read and
 latest-tie-break stays blocked."
 ```
+
+**Shipped as four commits, not one.** The plan's `git add` names two files, but
+Step 4b also required fixing the plugin's `README.md` (entry 4) and the `AVG`
+rustdoc in `usage-collector-sdk/src/models.rs`, which are different scopes from
+a generated artifact and from the register:
+
+| Commit | Scope |
+| --- | --- |
+| `a0661a9a8` | `docs(usage-collector)`: regenerate `api.json`, with the whole delta accounted for |
+| `f77b1a0e5` | `docs(timescaledb-plugin)`: the README's stale claims |
+| `2a698584f` | `docs(usage-collector-sdk)`: drop `AVG` from `AggregationBucket::value` |
+| `308f3b319` | `docs(usage-collector)`: `DIVERGENCES.md` — entries 20-25 and the amendments |
+
+A fifth carries this plan update and the review fixes. **The README needed a
+fourth line, not the three Step 4b named:** `:52` sends a reader to
+`docs/DESIGN.md` for "the full architecture, sequences, schema, and constraint
+catalog" — the file entry 23 registers as stale wholesale, schema included, and
+which `migrations/0001_init.sql:5-6` already calls out by name. Leaving it would
+have been the exact defect the entry-3/entry-4 contrast exists to teach.
+
+**Bar at the end, unmoved:** `cargo check --workspace --all-targets` clean;
+four-package nextest **937 / 0 skipped**; contract **166 / 0**; clippy
+`--workspace --all-targets --all-features` **0 warnings**; `cargo +nightly fmt`
+a no-op; `cargo doc` **35** on the host gear and **0** on the SDK, read off the
+`generated N warnings` summary line and not by counting `^warning:`.
 
 ---
 

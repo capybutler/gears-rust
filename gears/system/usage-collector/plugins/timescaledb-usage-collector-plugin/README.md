@@ -49,4 +49,4 @@ Without the feature, only the unit tests run (no Docker needed).
 
 ## Design
 
-See [`DESIGN.md`](docs/DESIGN.md) for the full architecture, sequences, schema, and constraint catalog.
+See [`DESIGN.md`](docs/DESIGN.md) for the full architecture, sequences, schema, and constraint catalog — but see `DIVERGENCES.md` entry 23 first: it still describes the pre-port model throughout, its schema included. `migrations/0001_init.sql` is the authority for the shipped schema, and it says so at its head.
