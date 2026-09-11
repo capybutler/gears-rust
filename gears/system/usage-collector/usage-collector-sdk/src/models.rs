@@ -1621,12 +1621,9 @@ pub struct AggregationBucket {
     pub key: Vec<String>,
     /// Aggregation result for the bucket, carried as an arbitrary-precision
     /// [`bigdecimal::BigDecimal`] so `SUM`, `MIN`, `MAX`, and `COUNT` are exact
-    /// at any magnitude. Postgres `NUMERIC` is unbounded, and a wide `SUM`
-    /// (or large-magnitude `AVG`) can exceed
-    /// [`rust_decimal::Decimal`]'s ~7.9×10²⁸ ceiling — which previously
-    /// surfaced as an `Internal` (HTTP 500) on decode. `AVG` is now exact in
-    /// magnitude but may still carry a backend/plugin-chosen rounding scale on
-    /// non-terminating quotients (arbitrary precision is still finite). `None`
+    /// at any magnitude. Postgres `NUMERIC` is unbounded, and a wide `SUM` can
+    /// exceed [`rust_decimal::Decimal`]'s ~7.9×10²⁸ ceiling — which previously
+    /// surfaced as an `Internal` (HTTP 500) on decode. `None`
     /// when no rows matched the bucket (e.g. `MIN` over an empty set).
     /// `COUNT` is the one exception and answers `Some(0)`: counting an
     /// empty selection is zero rather than absent, the same split
