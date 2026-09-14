@@ -72,7 +72,7 @@ Decided in review:
 ## 4. Verified behaviour (TimescaleDB 2.29.2-pg18)
 
 A throwaway probe verified every behaviour this design depends on. The
-references below (P1…P17) are used through the rest of the spec.
+references below (P1…P21) are used through the rest of the spec.
 
 | # | Behaviour | Result |
 | --- | --- | --- |
@@ -92,6 +92,9 @@ references below (P1…P17) are used through the rest of the spec.
 | P15 | A refresh after 500 k invalidating rows | 212 ms |
 | P9 | `refresh_continuous_aggregate` inside a transaction block | Refused. Policies avoid the need. |
 | P11a | `refresh_continuous_aggregate(…, force => true)` | Exists. Not used by this design. |
+| P19 | The watermark before a refresh, after a refresh over no rows, and after a refresh with rows | `4714-11-24 BC`, unchanged, then the end of the newest materialised bucket (not the refresh window's end) |
+| P20 | `timescaledb_information.jobs` for a refresh policy | `hypertable_name` is the **view** (`usage_rollup_1h`), not the materialisation hypertable. `timescaledb_information.continuous_aggregates` names the materialisation hypertable. |
+| P21 | A new policy's first run; re-adding a policy with the same offsets; `alter_job(…, scheduled => false)` | Runs within seconds of creation; refused ("already exists"); pauses the job |
 
 **One property shapes the defaults.** A refresh recomputes every group in an
 invalidated time range, not only the groups written. So the refresh must never
@@ -149,8 +152,11 @@ them already enforced:
 ### 5.3 Refresh
 
 `apply_post_migration_setup` applies two policies, under the init advisory lock
-it already holds. On every startup it first removes the aggregate's existing
-policies, so a configuration change replaces them rather than adding to them.
+it already holds. On every startup it first deletes the aggregate's existing
+policies (`delete_job` over `timescaledb_information.jobs` rows whose
+`hypertable_name` is the view, P20), so a configuration change replaces them.
+TimescaleDB refuses a second policy with the same offsets (P21), so the delete
+is required, not tidy.
 
 | Policy | `start_offset` | `end_offset` | `schedule_interval` | Covers |
 | --- | --- | --- | --- | --- |
@@ -301,10 +307,9 @@ TimescaleDB does not enforce this (P6), so the sweep does.
 2. **The sweep resolves the materialisation hypertable** once per sweep:
 
    ```sql
-   SELECT format('%I.%I', h.schema_name, h.table_name)
-   FROM _timescaledb_catalog.continuous_agg ca
-   JOIN _timescaledb_catalog.hypertable h ON h.id = ca.mat_hypertable_id
-   WHERE ca.user_view_schema = current_schema() AND ca.user_view_name = 'usage_rollup_1h'
+   SELECT format('%I.%I', materialization_hypertable_schema, materialization_hypertable_name)
+   FROM timescaledb_information.continuous_aggregates
+   WHERE view_schema = current_schema() AND view_name = 'usage_rollup_1h'
    ```
 
    If that fails or returns no row, the sweep drops nothing. The failure is
@@ -375,18 +380,24 @@ New instruments in `src/infra/metrics.rs`, also listed in
 | --- | --- | --- |
 | `uc_timescaledb_aggregate_path_total` | counter | `path` = `rollup` \| `scan`; `reason` = `none` \| `fold` \| `metadata_filter` \| `group_by` \| `filter_field` \| `sub_hour_range` |
 | `uc_timescaledb_rollup_rows_deleted_total` | counter | — |
-| `uc_timescaledb_rollup_watermark_lag_seconds` | gauge | — |
+| `uc_timescaledb_rollup_refresh_age_seconds` | gauge | `policy` = `live` \| `history` |
 | `uc_timescaledb_rollup_refresh_job_failing` | gauge, 0 or 1 | `policy` = `live` \| `history` |
 
 - **`path` and `reason`.** `path="rollup"` always carries `reason="none"`.
 - **How the gauges are fed.** A monitor tick samples both gauges every 60 seconds
-  inside the plugin's existing background task. It reads the aggregate's
-  watermark (`_timescaledb_functions.cagg_watermark`) and the last run status of
-  both policies (`timescaledb_information.job_stats`). The sweep keeps its own
-  timer. A failed sample is logged and leaves the gauges unchanged.
-- **Alerting.** A watermark lag above `rollup_materialization_lag` +
-  `rollup_refresh_interval` means the live policy is not keeping its published
-  bound.
+  inside the plugin's existing background task. It reads each policy's
+  `last_successful_finish` and `last_run_status` from
+  `timescaledb_information.job_stats`. The sweep keeps its own timer. A failed
+  sample is logged and leaves the gauges unchanged. The age gauge is not set
+  for a policy that has never succeeded.
+- **Why not the watermark.** The aggregate's watermark is the end of the newest
+  *materialised bucket*, not of the refreshed window, and it stays at the
+  minimum timestamp until data exists (P19). A watermark lag therefore alarms on
+  an empty or quiet deployment. The time since a policy last succeeded measures
+  the refresh itself.
+- **Alerting.** A live-policy refresh age above twice
+  `rollup_refresh_interval_secs`, or a failing gauge at 1, means the published
+  bound is not being kept.
 
 ## 9. Documentation
 
@@ -440,9 +451,15 @@ New instruments in `src/infra/metrics.rs`, also listed in
 
 **Harness**
 
-- Test configuration sets both refresh schedules to `MAX_INTERVAL_SECS`, so
-  background workers cannot race assertions. Tests refresh through a helper that
-  calls `refresh_continuous_aggregate` explicitly.
+- After setup, the harness waits for both policies' first run (they run on
+  creation, P21) and then deletes them, so background workers cannot race
+  assertions. Tests refresh through a helper that calls
+  `refresh_continuous_aggregate` explicitly. A test about the policies
+  themselves re-applies setup.
+- Routing is asserted by behaviour rather than by metric: after a refresh, a
+  late write below the watermark is invisible on the rollup path until the next
+  refresh, and visible at once on a query that falls back (an `origin` filter).
+  The path counter's emission is covered by a unit test.
 
 **Schema**
 
@@ -471,8 +488,9 @@ New instruments in `src/infra/metrics.rs`, also listed in
 
 **Routing**
 
-- `uc_timescaledb_aggregate_path_total` counts `rollup` for an eligible query,
-  and `scan` with `reason="filter_field"` for an `origin` filter.
+- After a refresh, a late write below the watermark does not change an eligible
+  query's result until the next refresh, and does change the same query with an
+  `origin` filter at once, because that query falls back to the scan.
 
 **Freshness**
 
@@ -527,7 +545,7 @@ New instruments in `src/infra/metrics.rs`, also listed in
 | Risk | Mitigation |
 | --- | --- |
 | The internal catalog, `cagg_watermark` or `drop_chunk` change on an upgrade | The §10.2 pin tests fail. Each query is isolated in one function. |
-| Refresh runtime grows with the rows written into old periods | The history policy runs hourly. `uc_timescaledb_rollup_refresh_job_failing` and the watermark lag surface a job that falls behind. |
+| Refresh runtime grows with the rows written into old periods | The history policy runs hourly. `uc_timescaledb_rollup_refresh_job_failing` and `uc_timescaledb_rollup_refresh_age_seconds` surface a job that falls behind. |
 | A deployment's live past tolerance exceeds `rollup_live_window_secs` | Correctness holds. Those writes appear on the history schedule, and the README says to size the window to the tolerance. |
 | The at-most-one-invalidation guarantee is violated | The rollup would skew along with the scan. `DIVERGENCES.md` entry 21 records the dependency. |
-| Background workers are disabled on a deployment | If they never ran, the watermark never advances and every query answers correctly through the real-time half, only slowly. If they stop after running, writes below the watermark stay stale indefinitely. The README states that background workers are required, and the watermark lag gauge and `uc_timescaledb_rollup_refresh_job_failing` show both cases. |
+| Background workers are disabled on a deployment | If they never ran, the watermark never advances and every query answers correctly through the real-time half, only slowly. If they stop after running, writes below the watermark stay stale indefinitely. The README states that background workers are required, and `uc_timescaledb_rollup_refresh_age_seconds` and `uc_timescaledb_rollup_refresh_job_failing` show both cases. |
