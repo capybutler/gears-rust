@@ -3362,6 +3362,7 @@ dependencies = [
  "cf-gears-toolkit",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-utils",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "cf-gears-usage-collector-sdk",
