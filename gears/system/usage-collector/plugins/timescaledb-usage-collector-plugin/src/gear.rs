@@ -37,7 +37,7 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
         cfg.validate()
             .map_err(|e| anyhow::anyhow!("invalid timescaledb plugin config: {e}"))?;
 
-        // Connect, migrate, and install the config-driven retention policy.
+        // Connect, migrate, and apply the configured partitioning.
         // Race the startup-I/O sequence against the gear's cancellation token so
         // a shutdown mid-startup aborts promptly instead of blocking on each
         // call's own timeout. `Metrics::new` and the migration-failure counter
@@ -60,7 +60,8 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
                     metrics.inc_migration_failure();
                     return Err::<_, anyhow::Error>(e.into());
                 }
-                apply_post_migration_setup(&pool, cfg.retention_period_secs).await?;
+                apply_post_migration_setup(&pool, cfg.chunk_time_interval_secs, cfg.type_key_slice_width)
+                    .await?;
                 Ok((pool, metrics))
             } => res?,
         };

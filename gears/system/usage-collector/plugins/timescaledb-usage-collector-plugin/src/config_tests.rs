@@ -9,7 +9,9 @@ fn config_defaults_are_applied() {
     assert_eq!(cfg.pool_size_max, 16);
     assert_eq!(cfg.connection_timeout_secs, 10);
     assert_eq!(cfg.statement_timeout_secs, 30);
-    assert_eq!(cfg.retention_period_secs, 365 * 86_400);
+    assert_eq!(cfg.chunk_time_interval_secs, 604_800);
+    assert_eq!(cfg.type_key_slice_width, 1);
+    assert_eq!(cfg.retention_sweep_interval_secs, 3_600);
     assert!(cfg.database_url.expose().is_empty());
 }
 
@@ -29,8 +31,8 @@ fn validate_rejects_min_gt_max_pool() {
 #[test]
 fn validate_rejects_pool_max_of_one() {
     // A max of 1 self-deadlocks startup: post-migration setup holds the single
-    // connection under an advisory lock while the retention policy tries to
-    // acquire a second, so the pool must allow at least 2.
+    // connection under an advisory lock while the partitioning statements run
+    // on a second, so the pool must allow at least 2.
     let json = r#"{ "database_url": "postgres://x", "pool_size_min": 1, "pool_size_max": 1 }"#;
     let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
     assert!(
@@ -70,40 +72,64 @@ fn validate_accepts_nonzero_statement_timeout() {
 }
 
 #[test]
-fn validate_rejects_zero_retention() {
-    let json = r#"{ "database_url": "postgres://x", "retention_period_secs": 0 }"#;
+fn validate_rejects_zero_chunk_time_interval() {
+    let json = r#"{ "database_url": "postgres://x", "chunk_time_interval_secs": 0 }"#;
     let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
     assert!(
         cfg.validate().is_err(),
-        "a zero retention window would drop every chunk immediately"
+        "a zero-width chunk cannot hold a row"
     );
 }
 
 #[test]
-fn validate_rejects_excessive_retention() {
-    // A retention so large that `make_interval(secs => ...)` overflows at the
-    // DB would otherwise fail *after* migrations run, as a confusing
-    // post-migration init error. Catch it as a clean config error upfront.
+fn validate_rejects_a_chunk_time_interval_beyond_the_interval_bound() {
     let json = format!(
-        r#"{{ "database_url": "postgres://x", "retention_period_secs": {} }}"#,
+        r#"{{ "database_url": "postgres://x", "chunk_time_interval_secs": {} }}"#,
         u64::MAX
     );
     let cfg: TimescaleDbPluginConfig = serde_json::from_str(&json).unwrap();
     assert!(
         cfg.validate().is_err(),
-        "an absurd retention window must be rejected before it reaches make_interval"
+        "an interval make_interval cannot hold must fail before it reaches the database"
     );
 }
 
 #[test]
-fn validate_accepts_large_but_sane_retention() {
-    // 10 years is well within make_interval's range and a plausible operator
-    // choice; it must not trip the upper bound.
-    let ten_years = 10u64 * 365 * 86_400;
-    let json =
-        format!(r#"{{ "database_url": "postgres://x", "retention_period_secs": {ten_years} }}"#);
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(&json).unwrap();
-    assert!(cfg.validate().is_ok());
+fn validate_rejects_zero_type_key_slice_width() {
+    let json = r#"{ "database_url": "postgres://x", "type_key_slice_width": 0 }"#;
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "a slice must hold at least one type key"
+    );
+}
+
+#[test]
+fn validate_rejects_a_type_key_slice_width_wider_than_the_key_type() {
+    let json = r#"{ "database_url": "postgres://x", "type_key_slice_width": 2147483648 }"#;
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "type_key is an int; a wider slice is meaningless"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_retention_sweep_interval() {
+    let json = r#"{ "database_url": "postgres://x", "retention_sweep_interval_secs": 0 }"#;
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "a zero interval would sweep in a hot loop"
+    );
+}
+
+#[test]
+fn config_rejects_the_retired_table_wide_retention_key() {
+    // Retention is per type now, read from types-registry. A config still
+    // carrying the table-wide window must fail loudly rather than be ignored.
+    let json = r#"{ "database_url": "postgres://x", "retention_period_secs": 31536000 }"#;
+    assert!(serde_json::from_str::<TimescaleDbPluginConfig>(json).is_err());
 }
 
 #[test]

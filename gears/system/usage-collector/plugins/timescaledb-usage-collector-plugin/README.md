@@ -10,9 +10,12 @@ Config maps to `TimescaleDbPluginConfig` (`src/config.rs`). Durations are whole 
 | --- | --- | --- |
 | `database_url` | _(required)_ | Postgres DSN; TLS required (use `sslmode=require`). |
 | `pool_size_min` | `2` | Connection-pool lower bound. |
-| `pool_size_max` | `16` | Connection-pool upper bound. |
+| `pool_size_max` | `16` | Connection-pool upper bound (at least 2). |
 | `connection_timeout_secs` | `10` | Connection acquire timeout (seconds). |
-| `retention_period_secs` | `31536000` (365d) | `usage_records` retention window; chunks wholly older are dropped. |
+| `statement_timeout_secs` | `30` | Per-statement timeout on every request-path connection (seconds). |
+| `chunk_time_interval_secs` | `604800` (7d) | Time width of new ledger chunks; applies to chunks created afterwards. |
+| `type_key_slice_width` | `1` | How many type keys share one chunk slice; applies to chunks created afterwards. See [Retention](#retention). |
+| `retention_sweep_interval_secs` | `3600` (1h) | Seconds between retention sweeps. |
 | `vendor` | `cyberfabric` | Vendor name for GTS instance registration. |
 | `priority` | `10` | Plugin priority (lower = higher precedence). |
 
@@ -22,7 +25,10 @@ database_url = "postgres://user:pass@host:5432/usage?sslmode=require"
 pool_size_min = 2
 pool_size_max = 16
 connection_timeout_secs = 10
-retention_period_secs = 31536000
+statement_timeout_secs = 30
+chunk_time_interval_secs = 604800
+type_key_slice_width = 1
+retention_sweep_interval_secs = 3600
 vendor = "cyberfabric"
 priority = 10
 ```
@@ -30,7 +36,7 @@ priority = 10
 ## Storage semantics
 
 - **Deduplication** — the `usage_records` hypertable's own `UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end)` (`usage_records_dedup_uniq`, `migrations/0001_init.sql`) is the dedup authority, enforced via `INSERT … ON CONFLICT … DO NOTHING RETURNING`. A returned row is a fresh insert; on conflict the existing row is read and resolved as a silent absorb (canonical-equal) or an `IdempotencyConflict`. `ON CONFLICT DO NOTHING` serializes concurrent same-key inserts (the loser blocks on the in-progress tuple until the winner commits). The dedup index rides the hypertable's chunk lifecycle — no separate dedup table, no cleanup job. **Note:** the dedup identity is the gear's DESIGN §3.7 5-tuple verbatim, not a divergence from it — one stable per-meter `idempotency_key` therefore covers many covered periods, and a replay of that key over a *different* `(window_start, window_end)` is a distinct entry by design rather than an `IdempotencyConflict`.
-- **Retention** — a declarative TimescaleDB retention policy is registered at init from `retention_period_secs`; TimescaleDB drops chunks wholly older than the window. No application-side deletion path.
+- **Retention** — per GTS type, applied by the plugin's retention sweep; see [Retention](#retention).
 - **Invalidation** — there is no mutation path. A withdrawal is an ordinary appended entry carrying `invalidates` (the entry it withdraws) and `reason_code`; the withdrawn entry is never rewritten. At most one accepted withdrawal per target is enforced by the partial unique index `usage_records_one_invalidation_uniq` over `(invalidates, window_end)` — see `DIVERGENCES.md` entry 21 for why that guarantee is conditional on the Ingestion Gateway and entry 22 for how a cross-call collision fails a `create_batch`.
 
 ## SPI conformance

@@ -81,8 +81,17 @@ pub struct TimescaleDbPluginConfig {
     /// Postgres treats `statement_timeout = 0` as *disabled*, which would
     /// reintroduce the unbounded-query footgun.
     pub statement_timeout_secs: u64,
-    /// `usage_records` retention window in seconds; chunks wholly older are dropped.
-    pub retention_period_secs: u64,
+    /// Time width of a new ledger chunk, in seconds. Applied at startup to
+    /// chunks created afterwards; existing chunks keep their range.
+    pub chunk_time_interval_secs: u64,
+    /// How many consecutive type keys share one slice of the ledger's second
+    /// partitioning dimension. `1` gives every type its own chunks, so each is
+    /// dropped exactly at its own retention; `N` lets up to `N` types share a
+    /// chunk, which is then held to the longest retention among them. Applied at
+    /// startup to chunks created afterwards.
+    pub type_key_slice_width: u32,
+    /// Seconds between two retention sweeps.
+    pub retention_sweep_interval_secs: u64,
     /// Vendor name for GTS instance registration.
     pub vendor: String,
     /// Plugin priority (lower = higher priority).
@@ -97,43 +106,46 @@ impl Default for TimescaleDbPluginConfig {
             pool_size_max: 16,
             connection_timeout_secs: 10,
             statement_timeout_secs: 30,
-            retention_period_secs: 365 * 86_400, // 365 days
+            chunk_time_interval_secs: 7 * 86_400,
+            type_key_slice_width: 1,
+            retention_sweep_interval_secs: 3_600,
             vendor: "cyberfabric".to_owned(),
             priority: 10,
         }
     }
 }
 
-/// Upper bound on `retention_period_secs` (100 years in seconds).
+/// Upper bound on every interval setting (100 years in seconds).
 ///
-/// Postgres `make_interval(secs => ...)` — used to register the retention
-/// policy and the dedup-cleanup job (see `pool::apply_retention_policy`) —
-/// overflows well below `u64::MAX`. A pathological retention would otherwise
-/// surface as a confusing failure *after* migrations have already run. 100
-/// years is far beyond any realistic usage-data retention while staying safely
-/// inside `make_interval`'s range.
-const MAX_RETENTION_SECS: u64 = 100 * 365 * 86_400;
+/// Postgres `make_interval(secs => ...)`, which applies the chunk interval,
+/// overflows well below `u64::MAX`. A pathological value would otherwise surface
+/// as a confusing failure *after* migrations have already run.
+const MAX_INTERVAL_SECS: u64 = 100 * 365 * 86_400;
+
+/// Upper bound on `type_key_slice_width`: `type_key` is an `int`.
+const MAX_TYPE_KEY_SLICE_WIDTH: u32 = 2_147_483_647;
 
 impl TimescaleDbPluginConfig {
     /// Validate invariants not expressible in the type.
     ///
     /// # Errors
     /// Returns an error string for an empty DSN, a pool `max` below 2 or
-    /// `min > max`, a zero acquire timeout, a zero statement timeout, or a
-    /// retention window outside `(0, MAX_RETENTION_SECS]`.
+    /// `min > max`, a zero acquire timeout, a zero statement timeout, an interval
+    /// outside `(0, MAX_INTERVAL_SECS]`, or a slice width outside
+    /// `[1, MAX_TYPE_KEY_SLICE_WIDTH]`.
     pub fn validate(&self) -> Result<(), String> {
         if self.database_url.expose().trim().is_empty() {
             return Err("database_url must not be empty".to_owned());
         }
         // `max` must be >= 2, not just != 0: `apply_post_migration_setup` holds
         // one connection under a session advisory lock for the whole critical
-        // section while `apply_retention_policy` acquires a *second* on the same
+        // section while `apply_partitioning` runs on a *second* on the same
         // pool. A `max` of 1 therefore self-deadlocks startup (`PoolTimedOut`).
         if self.pool_size_max < 2 || self.pool_size_min > self.pool_size_max {
             return Err(format!(
                 "invalid pool bounds: min={} max={} (max must be >= 2: \
-                 post-migration setup holds one connection while the retention \
-                 policy acquires a second — a max of 1 self-deadlocks startup)",
+                 post-migration setup holds one connection while the partitioning \
+                 statements run on a second — a max of 1 self-deadlocks startup)",
                 self.pool_size_min, self.pool_size_max
             ));
         }
@@ -151,13 +163,21 @@ impl TimescaleDbPluginConfig {
                     .to_owned(),
             );
         }
-        if self.retention_period_secs == 0 {
-            return Err("retention_period_secs must be > 0".to_owned());
-        }
-        if self.retention_period_secs > MAX_RETENTION_SECS {
+        if self.chunk_time_interval_secs == 0 || self.chunk_time_interval_secs > MAX_INTERVAL_SECS {
             return Err(format!(
-                "retention_period_secs must be <= {MAX_RETENTION_SECS} (100 years); \
-                 a larger window overflows the backend interval type"
+                "chunk_time_interval_secs must be in (0, {MAX_INTERVAL_SECS}] (100 years)"
+            ));
+        }
+        if self.type_key_slice_width == 0 || self.type_key_slice_width > MAX_TYPE_KEY_SLICE_WIDTH {
+            return Err(format!(
+                "type_key_slice_width must be in [1, {MAX_TYPE_KEY_SLICE_WIDTH}]"
+            ));
+        }
+        if self.retention_sweep_interval_secs == 0
+            || self.retention_sweep_interval_secs > MAX_INTERVAL_SECS
+        {
+            return Err(format!(
+                "retention_sweep_interval_secs must be in (0, {MAX_INTERVAL_SECS}] (100 years)"
             ));
         }
         Ok(())

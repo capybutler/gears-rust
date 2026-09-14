@@ -63,8 +63,11 @@ async fn the_ledger_partitions_on_window_end_then_type_key() {
     );
 }
 
+/// Retention is per type and applied by the plugin's sweep, so no table-wide
+/// `TimescaleDB` retention policy may be registered: one would drop every type
+/// at a single horizon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_retention_policy_is_registered_against_the_ledger() {
+async fn no_table_wide_retention_policy_is_registered() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
@@ -76,10 +79,7 @@ async fn a_retention_policy_is_registered_against_the_ledger() {
     .fetch_one(&h.pool)
     .await
     .expect("jobs query");
-    assert_eq!(
-        jobs, 1,
-        "exactly one retention policy must be registered against usage_records"
-    );
+    assert_eq!(jobs, 0, "no table-wide retention policy may be registered");
 }
 
 /// The dedup obligation is the ledger's own UNIQUE, over the 5-tuple verbatim.
