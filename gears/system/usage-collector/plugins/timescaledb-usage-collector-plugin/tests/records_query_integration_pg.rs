@@ -937,17 +937,22 @@ async fn a_withdrawn_pair_is_returned_by_the_ledger_and_folded_by_nothing() {
     }
 }
 
-/// An orphan invalidation — one whose target has been purged by retention —
-/// still contributes nothing.
+/// An orphan invalidation — one whose target row is gone — still contributes
+/// nothing to the **scan** path.
 ///
-/// Retention is plugin-owned, so a conforming deployment really can hold a
-/// withdrawal whose target's chunk is gone. That orphan is the echoed quantity
-/// with nothing left to pair it against, which is why the exclusion is two
-/// obligations rather than one conditional: the `invalidates IS NULL` conjunct
-/// stands on its own and is not an optimization of the `NOT EXISTS` one.
+/// In this plugin an orphan is unreachable through any SPI or retention path:
+/// an invalidation copies its target's `window_end` and type, so it shares its
+/// target's chunk and the retention sweep drops the pair together, and the
+/// gateway admits an invalidation only for an existing target. The raw `DELETE`
+/// below manufactures one anyway, because the scan's `invalidates IS NULL`
+/// conjunct is a standing obligation, not an optimization of the `NOT EXISTS`
+/// one. The rollup path (`usage_rollup_1h`) nets a pair by signed addition and
+/// relies on that unreachability (spec §5.2, invariant 4), so this test pins the
+/// scan explicitly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_orphan_invalidation_contributes_nothing() {
     let (h, store) = setup().await;
+    let scan = common::record_store(&h.pool).without_rollup();
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x200C);
 
@@ -981,7 +986,7 @@ async fn an_orphan_invalidation_contributes_nothing() {
         .rows_affected();
     assert_eq!(purged, 1, "the target was purged");
 
-    let result = store
+    let result = scan
         .aggregate(
             meter,
             wide_range(),

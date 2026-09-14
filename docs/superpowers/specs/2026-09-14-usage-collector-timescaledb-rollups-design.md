@@ -145,7 +145,11 @@ them already enforced:
 3. **The target existed.** The gateway accepts an invalidation only for an
    existing record.
 4. **The pair is purged together.** The two entries share `window_end` and
-   `type_key`, so they share a chunk, and the sweep drops them together.
+   `type_key`, so they share a chunk, and the sweep drops them together. An
+   orphan invalidation — one whose target is gone while it remains — is
+   therefore unreachable through the SPI or retention; only out-of-band
+   deletion can create one, and the rollup path would then subtract its
+   quantity where the scan counts nothing.
 
 `COUNT` nets the same way, with `+1` and `−1`.
 
