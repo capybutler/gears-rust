@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::time::Duration;
 use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
@@ -74,4 +75,32 @@ pub trait RecordStore: Send + Sync + 'static {
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError>;
+}
+
+/// Why a type's declared retention could not be resolved.
+///
+/// Every variant keeps data: the retention sweep never drops a chunk without a
+/// definite retention for each type it may hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionError {
+    /// The registry client is missing, or the call failed with anything other
+    /// than a definite not-found.
+    Unavailable(String),
+    /// The registry holds no such type.
+    NotFound,
+    /// The type declares no `retention` trait.
+    MissingTrait,
+    /// `retention` is not a string, not a fixed-length ISO 8601 duration, or
+    /// zero.
+    InvalidTrait(String),
+}
+
+/// Reads the declared retention of a GTS type.
+///
+/// Retention is the one declaration attribute this plugin reads, because it is
+/// the component that applies it (the gear's `DESIGN.md` §3.3). It is mutable,
+/// so an implementation must not cache it across sweeps.
+#[async_trait]
+pub trait RetentionSource: Send + Sync + 'static {
+    async fn retention(&self, gts_type_id: &str) -> Result<Duration, RetentionError>;
 }

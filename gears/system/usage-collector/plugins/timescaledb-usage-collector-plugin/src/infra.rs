@@ -4,4 +4,6 @@
 #[doc(hidden)]
 pub mod metrics;
 #[doc(hidden)]
+pub mod registry_retention;
+#[doc(hidden)]
 pub mod storage;

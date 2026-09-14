@@ -33,6 +33,9 @@ tokio-util = { workspace = true }
 
 async-trait = { workspace = true }
 
+# ISO 8601 duration parsing for the declared `retention` trait.
+toolkit-utils = { workspace = true }
+
 sqlx = { workspace = true, features = [
   "postgres",
   "uuid",
@@ -85,3 +88,5 @@ test-containers = { workspace = true }
 # In-memory metric reader for the metrics-recording unit tests; the `testing`
 # feature gates `InMemoryMetricExporter`.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# `MockTypesRegistryClient` for the retention-source unit tests.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
