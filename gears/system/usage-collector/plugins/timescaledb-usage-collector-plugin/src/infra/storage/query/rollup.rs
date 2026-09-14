@@ -9,9 +9,12 @@
 
 use time::OffsetDateTime;
 use toolkit_odata::ast;
-use usage_collector_sdk::{AggregationDimension, AggregationFold, MetadataFilter, TimeRange};
+use usage_collector_sdk::{
+    AggregationDimension, AggregationFold, MetadataFilter, MeterTypeId, TimeRange,
+};
 
-use super::translate::filter_fields;
+use super::translate::{SqlBind, SqlCtx, filter_fields, translate_scope};
+use super::{aggregate::aggregate_limit_clause, ledger_from_clause};
 
 /// One rollup bucket, in nanoseconds. `time_bucket(INTERVAL '1 hour', …)`
 /// aligns buckets to Unix-epoch UTC hours, and so does this.
@@ -133,6 +136,142 @@ pub fn rollup_eligible(
         }
     }
     hour_split(range).ok_or(FallbackReason::SubHourRange)
+}
+
+/// The signed quantity of one ledger entry, as the rollup view sums it.
+const SIGNED_VALUE: &str = "CASE WHEN r.invalidates IS NULL THEN r.value ELSE -r.value END";
+/// The signed count of one ledger entry, as the rollup view sums it.
+const SIGNED_COUNT: &str = "CASE WHEN r.invalidates IS NULL THEN 1 ELSE -1 END";
+
+/// The meter and its partition-key subquery, both reading the meter's bind at
+/// `$meter`. Both halves of the statement start with these, so chunk exclusion
+/// applies to the view's materialised half and to the ledger edges alike.
+fn meter_scope(meter: usize) -> Vec<String> {
+    vec![
+        format!("r.gts_type_id = ${meter}"),
+        format!(
+            "r.type_key = (SELECT k.type_key FROM usage_type_key k WHERE k.gts_type_id = ${meter})"
+        ),
+    ]
+}
+
+/// A rendered rollup aggregate: the statement, its binds in placeholder order,
+/// and how many leading key columns each result row carries.
+#[derive(Debug)]
+pub struct RollupStatement {
+    pub sql: String,
+    pub binds: Vec<SqlBind>,
+    pub dim_count: usize,
+}
+
+/// Render the aggregate for an eligible query: whole hours from
+/// `usage_rollup_1h`, partial edge hours from the ledger, summed in one
+/// statement.
+///
+/// The result shape matches the scan's exactly (spec §6.4). A grouped query
+/// drops a group whose count nets to zero, because the scan never forms a group
+/// from withdrawn entries alone. An ungrouped `SUM` is `NULL` over a selection
+/// whose count nets to zero, and an ungrouped `COUNT` is `0`. Both tests read
+/// the count, never the sum, so a genuine zero or negative total still returns.
+///
+/// Precondition: [`rollup_eligible`] returned `Ok(split)` for these inputs. The
+/// filter is rendered once per half with its own placeholders. Its bare column
+/// names are valid against both `FROM` clauses, since each half reads one
+/// relation.
+///
+/// # Errors
+///
+/// Returns an error string for a fold other than `Sum` or `Count`, or when the
+/// filter cannot be translated.
+pub fn build_rollup_aggregate_sql(
+    gts_type_id: &MeterTypeId,
+    split: HourSplit,
+    fold: AggregationFold,
+    filter: Option<&ast::Expr>,
+    group_by: &[AggregationDimension],
+) -> Result<RollupStatement, String> {
+    let grouped = !group_by.is_empty();
+    let fold_expr = match (fold, grouped) {
+        (AggregationFold::Sum, false) => {
+            "(CASE WHEN COALESCE(SUM(c), 0) = 0 THEN NULL ELSE SUM(s) END)::numeric"
+        }
+        (AggregationFold::Count, false) => "COALESCE(SUM(c), 0)::numeric",
+        (AggregationFold::Sum, true) => "SUM(s)::numeric",
+        (AggregationFold::Count, true) => "SUM(c)::numeric",
+        (other, _) => return Err(format!("the rollup does not serve the {other} fold")),
+    };
+    let dim = if grouped {
+        "r.tenant_id::text AS d, "
+    } else {
+        ""
+    };
+
+    let mut ctx = SqlCtx::new(1);
+    let meter = ctx.push(SqlBind::Str(gts_type_id.as_str().to_owned()));
+
+    let mut rollup_where = meter_scope(meter);
+    rollup_where.push(format!(
+        "r.bucket >= ${}",
+        ctx.push(SqlBind::DateTime(split.whole_from))
+    ));
+    rollup_where.push(format!(
+        "r.bucket < ${}",
+        ctx.push(SqlBind::DateTime(split.whole_to))
+    ));
+    if let Some(expr) = filter {
+        rollup_where.push(translate_scope(expr, &mut ctx)?);
+    }
+    let mut parts = vec![format!(
+        "SELECT {dim}r.sum_value AS s, r.count_value AS c FROM usage_rollup_1h r WHERE {}",
+        rollup_where.join(" AND ")
+    )];
+
+    let mut edges = Vec::new();
+    if split.has_lower_edge() {
+        let a = ctx.push(SqlBind::DateTime(split.from));
+        let b = ctx.push(SqlBind::DateTime(split.whole_from));
+        edges.push(format!("(r.window_end >= ${a} AND r.window_end < ${b})"));
+    }
+    if split.has_upper_edge() {
+        let a = ctx.push(SqlBind::DateTime(split.whole_to));
+        let b = ctx.push(SqlBind::DateTime(split.to));
+        edges.push(format!("(r.window_end >= ${a} AND r.window_end < ${b})"));
+    }
+    if !edges.is_empty() {
+        let mut edge_where = meter_scope(meter);
+        edge_where.push(format!("({})", edges.join(" OR ")));
+        if let Some(expr) = filter {
+            edge_where.push(translate_scope(expr, &mut ctx)?);
+        }
+        let group = if grouped { " GROUP BY 1" } else { "" };
+        parts.push(format!(
+            "SELECT {dim}SUM({SIGNED_VALUE})::numeric AS s, SUM({SIGNED_COUNT})::bigint AS c \
+             FROM {} WHERE {}{group}",
+            ledger_from_clause(),
+            edge_where.join(" AND ")
+        ));
+    }
+
+    let dim_count = usize::from(grouped);
+    let (outer_dim, tail) = if grouped {
+        (
+            "d, ",
+            format!(
+                " GROUP BY 1 HAVING SUM(c) <> 0{}",
+                aggregate_limit_clause(dim_count)
+            ),
+        )
+    } else {
+        ("", String::new())
+    };
+    Ok(RollupStatement {
+        sql: format!(
+            "WITH parts AS ({}) SELECT {outer_dim}{fold_expr} FROM parts{tail}",
+            parts.join(" UNION ALL ")
+        ),
+        binds: ctx.binds,
+        dim_count,
+    })
 }
 
 #[cfg(test)]
