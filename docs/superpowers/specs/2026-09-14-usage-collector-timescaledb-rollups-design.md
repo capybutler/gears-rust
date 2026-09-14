@@ -284,6 +284,13 @@ genuine measurements sum to zero, or to a negative value, is still returned.
 `SUM(c) <> 0` is exactly "at least one non-withdrawn record", because §5.2
 makes every group's `c` the number of records minus their invalidations.
 
+**Numeric scale.** The rollup path's value is **numerically** equal to the
+scan's — neither path's SQL changes for this. Its decimal *scale* may differ
+where a withdrawn pair of wider scale shares a bucket with a genuine
+measurement: `1.500 − 1.500 + 2` renders `2.000` on the rollup path (`numeric`
+addition keeps the widest scale of its operands), where the scan, which never
+adds the withdrawn pair together, renders `2`.
+
 ### 6.5 Code shape
 
 | Unit | Location | Responsibility |
@@ -386,22 +393,27 @@ New instruments in `src/infra/metrics.rs`, also listed in
 | `uc_timescaledb_rollup_rows_deleted_total` | counter | — |
 | `uc_timescaledb_rollup_refresh_age_seconds` | gauge | `policy` = `live` \| `history` |
 | `uc_timescaledb_rollup_refresh_job_failing` | gauge, 0 or 1 | `policy` = `live` \| `history` |
+| `uc_timescaledb_rollup_refresh_policies` | gauge, u64 | — |
 
 - **`path` and `reason`.** `path="rollup"` always carries `reason="none"`.
-- **How the gauges are fed.** A monitor tick samples both gauges every 60 seconds
-  inside the plugin's existing background task. It reads each policy's
+- **How the gauges are fed.** A monitor tick samples every 60 seconds inside
+  the plugin's existing background task. It reads each policy's
   `last_successful_finish` and `last_run_status` from
-  `timescaledb_information.job_stats`. The sweep keeps its own timer. A failed
-  sample is logged and leaves the gauges unchanged. The age gauge is not set
-  for a policy that has never succeeded.
+  `timescaledb_information.job_stats`, and sets
+  `uc_timescaledb_rollup_refresh_policies` to the number of policies the sample
+  found, on every successful sample including zero. The sweep keeps its own
+  timer. A failed sample is logged and leaves every gauge unchanged. The age
+  gauge is not set for a policy that has never succeeded.
 - **Why not the watermark.** The aggregate's watermark is the end of the newest
   *materialised bucket*, not of the refreshed window, and it stays at the
   minimum timestamp until data exists (P19). A watermark lag therefore alarms on
   an empty or quiet deployment. The time since a policy last succeeded measures
   the refresh itself.
-- **Alerting.** A live-policy refresh age above twice
-  `rollup_refresh_interval_secs`, or a failing gauge at 1, means the published
-  bound is not being kept.
+- **Alerting.** Alert when `uc_timescaledb_rollup_refresh_policies` is below 2,
+  when a policy's refresh-age series is absent for longer than twice its
+  interval (a policy that has never succeeded publishes no age — for example
+  with background workers disabled), when the live age exceeds twice
+  `rollup_refresh_interval_secs`, or when either failing gauge is 1.
 
 ## 9. Documentation
 
@@ -551,5 +563,5 @@ New instruments in `src/infra/metrics.rs`, also listed in
 | The internal catalog, `cagg_watermark` or `drop_chunk` change on an upgrade | The §10.2 pin tests fail. Each query is isolated in one function. |
 | Refresh runtime grows with the rows written into old periods | The history policy runs hourly. `uc_timescaledb_rollup_refresh_job_failing` and `uc_timescaledb_rollup_refresh_age_seconds` surface a job that falls behind. |
 | A deployment's live past tolerance exceeds `rollup_live_window_secs` | Correctness holds. Those writes appear on the history schedule, and the README says to size the window to the tolerance. |
-| The at-most-one-invalidation guarantee is violated | The rollup would skew along with the scan. `DIVERGENCES.md` entry 21 records the dependency. |
-| Background workers are disabled on a deployment | If they never ran, the watermark never advances and every query answers correctly through the real-time half, only slowly. If they stop after running, writes below the watermark stay stale indefinitely. The README states that background workers are required, and `uc_timescaledb_rollup_refresh_age_seconds` and `uc_timescaledb_rollup_refresh_job_failing` show both cases. |
+| The at-most-one-invalidation guarantee is violated | The skew is rollup-only: a second invalidation's `-value`/`-1` can land in another bucket or another meter's rollup, and a rollup-served `COUNT` can go negative. The scan is unaffected. `DIVERGENCES.md` entry 21 records the dependency. |
+| Background workers are disabled on a deployment | If they never ran, the watermark never advances and every query answers correctly through the real-time half, only slowly. If they stop after running, writes below the watermark stay stale indefinitely. The README states that background workers are required. `uc_timescaledb_rollup_refresh_policies` and an absent refresh-age series (a policy that has never succeeded publishes no age) show the first case; `uc_timescaledb_rollup_refresh_age_seconds` and `uc_timescaledb_rollup_refresh_job_failing` show the second. |

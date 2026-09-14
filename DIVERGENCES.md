@@ -1492,10 +1492,17 @@ domain. Recorded at the call site in
 **The rollup path depends on the same guarantee.** The TimescaleDB plugin's
 hourly rollup (`usage_rollup_1h`, `migrations/0002_usage_rollup.sql`) nets a
 withdrawn pair by adding `-value` for the invalidation rather than excluding
-the pair. That is exact only while a record carries at most one invalidation: a
-second one accepted past this gap would subtract the quantity twice. The scan
-path miscounts such a pair too, so a violation now skews two reads rather than
-one, not a new class of error.
+the pair. That is exact only while a record carries at most one invalidation.
+The index above admits a second withdrawal only when its `window_end` or
+`type_key` differs from its target's, so a second invalidation's `-value`/`-1`
+lands in a **different bucket** than the target's pair — possibly outside the
+queried range, or, for a cross-type withdrawal, in **another meter's rollup**
+entirely. The scan is correct in that case: its `NOT EXISTS` subquery excludes
+a withdrawn entry once, whatever the number of invalidations accepted against
+it, so it still counts the pair correctly. This is therefore a **new,
+rollup-only symptom**, not a second instance of the scan's own miscounting: a
+rollup-served `COUNT` can go negative, and a rollup-served `SUM` can diverge
+from the scan's answer for the bucket(s) the stray invalidation lands in.
 
 ---
 
