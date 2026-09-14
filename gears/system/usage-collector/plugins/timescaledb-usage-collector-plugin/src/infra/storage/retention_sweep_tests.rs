@@ -8,6 +8,7 @@ fn the_catalog_query_collapses_each_chunk_before_converting_its_time() {
     assert!(LIST_CHUNKS_SQL.contains("FILTER (WHERE d.column_name = 'type_key')"));
     assert!(LIST_CHUNKS_SQL.ends_with("GROUP BY ch.relid"));
     assert!(LIST_CHUNKS_SQL.contains("WHERE h.table_name = 'usage_records'"));
+    assert!(LIST_CHUNKS_SQL.contains("AND h.schema_name = current_schema()"));
 }
 
 #[test]

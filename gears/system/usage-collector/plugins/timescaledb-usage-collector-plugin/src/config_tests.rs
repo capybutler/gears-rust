@@ -125,6 +125,19 @@ fn validate_rejects_zero_retention_sweep_interval() {
 }
 
 #[test]
+fn validate_rejects_a_retention_sweep_interval_beyond_the_interval_bound() {
+    let json = format!(
+        r#"{{ "database_url": "postgres://x", "retention_sweep_interval_secs": {} }}"#,
+        u64::MAX
+    );
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(&json).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "an interval make_interval cannot hold must fail before it reaches the database"
+    );
+}
+
+#[test]
 fn config_rejects_the_retired_table_wide_retention_key() {
     // Retention is per type now, read from types-registry. A config still
     // carrying the table-wide window must fail loudly rather than be ignored.

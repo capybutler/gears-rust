@@ -44,7 +44,7 @@ pub const LIST_CHUNKS_SQL: &str = "SELECT ch.relid::text AS chunk, \
      JOIN _timescaledb_catalog.hypertable h ON h.id = ch.hypertable_id \
      JOIN _timescaledb_catalog.dimension_slice ds ON ds.chunk_id = ch.id \
      JOIN _timescaledb_catalog.dimension d ON d.id = ds.dimension_id \
-     WHERE h.table_name = 'usage_records' \
+     WHERE h.table_name = 'usage_records' AND h.schema_name = current_schema() \
      GROUP BY ch.relid";
 
 /// Drops one chunk by its schema-qualified name. `DROP TABLE <chunk>` is an
@@ -82,7 +82,10 @@ type ChunkRow = (String, Option<OffsetDateTime>, Option<i64>, Option<i64>);
 
 /// Every chunk of the ledger. A chunk missing either range — which a
 /// two-dimension hypertable does not produce — is logged and left out, and so
-/// is never dropped.
+/// is never dropped. So is a chunk whose `type_key` range is empty or
+/// inverted (`key_start >= key_end`): [`BTreeMap::range`] panics on such a
+/// range, and a two-dimension hypertable does not produce one either, so this
+/// is defense in depth rather than an observed shape.
 ///
 /// # Errors
 ///
@@ -92,21 +95,29 @@ pub async fn list_chunks(pool: &PgPool) -> Result<Vec<ChunkSlice>, sqlx::Error> 
     Ok(rows
         .into_iter()
         .filter_map(|(chunk, time_end, key_start, key_end)| {
-            if let (Some(time_end), Some(key_start), Some(key_end)) = (time_end, key_start, key_end)
-            {
-                Some(ChunkSlice {
-                    chunk,
-                    time_end,
-                    key_start,
-                    key_end,
-                })
-            } else {
+            let (Some(time_end), Some(key_start), Some(key_end)) = (time_end, key_start, key_end)
+            else {
                 tracing::warn!(
                     chunk = %chunk,
                     "a ledger chunk lacks a window_end or type_key range; it is kept"
                 );
-                None
+                return None;
+            };
+            if key_start >= key_end {
+                tracing::warn!(
+                    chunk = %chunk,
+                    key_start,
+                    key_end,
+                    "a ledger chunk's type_key range is empty or inverted; it is kept"
+                );
+                return None;
             }
+            Some(ChunkSlice {
+                chunk,
+                time_end,
+                key_start,
+                key_end,
+            })
         })
         .collect())
 }

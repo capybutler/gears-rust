@@ -205,8 +205,9 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
             .map_err(|e| anyhow::anyhow!("sweep_handle lock: {e}"))?
             .take();
         if let Some(handle) = handle {
+            let mut handle = handle;
             toolkit::tokio::select! {
-                result = handle => {
+                result = &mut handle => {
                     if let Err(e) = result
                         && !e.is_cancelled()
                     {
@@ -214,6 +215,11 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
                     }
                 }
                 () = deadline.cancelled() => {
+                    // Safe to abort mid-sweep: the sweep lock lives on a
+                    // detached connection (`sweep_under_lock`) that closes,
+                    // and so releases the lock, on drop regardless of how the
+                    // task ends.
+                    handle.abort();
                     tracing::info!("retention sweep stop cut short by the framework deadline");
                 }
             }
