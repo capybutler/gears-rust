@@ -15,6 +15,7 @@
 pub mod aggregate;
 pub mod bind;
 pub mod keyset;
+pub mod rollup;
 pub mod translate;
 
 use usage_collector_sdk::{MetadataFilter, MeterTypeId, TimeRange};

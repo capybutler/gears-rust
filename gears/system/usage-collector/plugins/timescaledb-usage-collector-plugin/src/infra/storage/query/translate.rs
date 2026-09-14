@@ -44,6 +44,8 @@
 //!   `MetadataKey::new(impl Into<String>) -> Result<_, _>`;
 //!   `IdempotencyKey::new(impl Into<String>) -> Result<_, _>`.
 
+use std::collections::BTreeSet;
+
 use toolkit_odata::ast;
 use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, convert_expr_to_filter_node};
 use usage_collector_sdk::UsageRecordFilterField;
@@ -201,6 +203,40 @@ pub fn translate_scope(scope: &ast::Expr, ctx: &mut SqlCtx) -> Result<String, St
     let fragment =
         translate_record_filter(&node, ctx).map_err(|e| format!("invalid read predicate: {e}"))?;
     Ok(format!("({fragment})"))
+}
+
+/// Every filter-field name `expr` references, resolved through the same
+/// schema gate [`translate_scope`] applies first.
+///
+/// The aggregate path uses it to decide whether a query's predicate can be
+/// applied to rollup rows, which it can only when every name is a rollup grain
+/// column. It is the whole of that decision's view of the filter, so it walks
+/// every node kind, including under `not`.
+///
+/// # Errors
+///
+/// Returns `invalid read predicate: …` when an identifier is off the schema,
+/// the same refusal [`translate_scope`] would give.
+pub fn filter_fields(expr: &ast::Expr) -> Result<BTreeSet<&'static str>, String> {
+    let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
+        .map_err(|e| format!("invalid read predicate: {e}"))?;
+    let mut names = BTreeSet::new();
+    collect_filter_fields(&node, &mut names);
+    Ok(names)
+}
+
+fn collect_filter_fields<F: FilterField>(node: &FilterNode<F>, out: &mut BTreeSet<&'static str>) {
+    match node {
+        FilterNode::Binary { field, .. } | FilterNode::InList { field, .. } => {
+            out.insert(field.name());
+        }
+        FilterNode::Composite { children, .. } => {
+            for child in children {
+                collect_filter_fields(child, out);
+            }
+        }
+        FilterNode::Not(inner) => collect_filter_fields(inner, out),
+    }
 }
 
 /// Translate a `usage_records` filter node into a parameterized `WHERE`

@@ -15,7 +15,9 @@ use super::super::bind::{SqlBind, odata_value_to_bind};
 use super::super::keyset::{
     cursor_key_to_bind, ensure_forward_cursor, keyset_predicate, render_order_by, uniform_dir,
 };
-use super::{ODataValue, SqlCtx, record_column, translate_record_filter, translate_scope};
+use super::{
+    ODataValue, SqlCtx, filter_fields, record_column, translate_record_filter, translate_scope,
+};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -935,4 +937,44 @@ fn translate_scope_refuses_an_operator_the_second_gate_rejects() {
 
     assert!(err.starts_with("invalid read predicate: "), "got: {err}");
     assert!(err.contains("unsupported operator"), "got: {err}");
+}
+
+// ── filter_fields ──────────────────────────────────────────────────────────
+
+fn parsed(raw: &str) -> toolkit_odata::ast::Expr {
+    toolkit_odata::parse_filter_string(raw)
+        .unwrap_or_else(|e| panic!("the test's own filter must parse: {e}"))
+        .into_expr()
+}
+
+#[test]
+fn filter_fields_names_every_field_a_nested_filter_touches() {
+    let expr = parsed(
+        "tenant_id eq 11111111-1111-1111-1111-111111111111 \
+         or (origin eq 'live' and not (resource_id eq 'r1'))",
+    );
+    let fields = filter_fields(&expr).expect("a schema filter resolves");
+    assert_eq!(
+        fields.into_iter().collect::<Vec<_>>(),
+        ["origin", "resource_id", "tenant_id"]
+    );
+}
+
+#[test]
+fn filter_fields_reads_the_field_of_an_in_list() {
+    let expr = parsed(
+        "tenant_id in (11111111-1111-1111-1111-111111111111, 22222222-2222-2222-2222-222222222222)",
+    );
+    assert_eq!(
+        filter_fields(&expr)
+            .expect("resolves")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["tenant_id"]
+    );
+}
+
+#[test]
+fn filter_fields_refuses_a_field_off_the_schema() {
+    assert!(filter_fields(&parsed("gts_type_id eq 'x'")).is_err());
 }
