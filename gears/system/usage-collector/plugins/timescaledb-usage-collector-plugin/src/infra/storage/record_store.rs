@@ -2416,7 +2416,9 @@ impl RecordStore for PgRecordStore {
     /// statement shape for one fold, with its own empty-selection special case.
     ///
     /// An eligible `SUM` or `COUNT` is served from `usage_rollup_1h` (see
-    /// `query::rollup`); the result is identical to the scan's.
+    /// `query::rollup`); the result is numerically identical to the scan's, up
+    /// to the rollup's refresh watermark (spec §8.1) and given spec §5.2's
+    /// invariants.
     ///
     /// # Errors
     ///
@@ -2458,10 +2460,10 @@ impl RecordStore for PgRecordStore {
         };
         let statement = match routed {
             Some(Ok(split)) => {
-                self.metrics.record_aggregate_path(None);
                 let st =
                     build_rollup_aggregate_sql(&gts_type_id, split, fold, query.filter(), group_by)
                         .map_err(UsageCollectorPluginError::internal)?;
+                self.metrics.record_aggregate_path(None);
                 AggregateStatement {
                     sql: st.sql,
                     binds: st.binds,
