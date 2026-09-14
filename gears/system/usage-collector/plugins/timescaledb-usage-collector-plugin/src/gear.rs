@@ -1,10 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use toolkit::Gear;
 use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
+use toolkit::contracts::RunnableCapability;
 use toolkit::gts::PluginV1;
+use toolkit::tokio::task::JoinHandle;
 use tracing::info;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use usage_collector_sdk::{UsageCollectorPluginSpecV1, UsageCollectorPluginV1};
@@ -13,21 +17,36 @@ use crate::config::TimescaleDbPluginConfig;
 use crate::domain::adapter::StorageAdapter;
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
+use crate::infra::registry_retention::TypesRegistryRetentionSource;
 use crate::infra::storage::pool::{MIGRATOR, apply_post_migration_setup, build_pool};
 use crate::infra::storage::record_store::PgRecordStore;
+use crate::infra::storage::retention_sweep::PgRetentionSweeper;
 
 /// `TimescaleDB` Usage Collector storage backend plugin module.
 ///
 /// Conforms to the storage Plugin SPI: connects + migrates a `TimescaleDB`
 /// database, performs the full GTS registration handshake, then registers
 /// the scoped `StorageAdapter` client so the plugin host resolves it on
-/// first dispatch.
+/// first dispatch. It also runs the per-type retention sweep as its
+/// background task (`RunnableCapability`).
 #[toolkit::gear(
     name = "timescaledb-usage-collector-plugin",
-    deps = [types_registry]
+    deps = [types_registry],
+    capabilities = [stateful]
 )]
 #[derive(Default)]
-pub struct TimescaleDbUsageCollectorPlugin;
+pub struct TimescaleDbUsageCollectorPlugin {
+    /// Built by `init`, run by `start`.
+    sweep: OnceLock<SweepWiring>,
+    sweep_cancel: Mutex<Option<CancellationToken>>,
+    sweep_handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// What `start` needs from `init` to run the retention sweep.
+struct SweepWiring {
+    sweeper: Arc<PgRetentionSweeper>,
+    interval: Duration,
+}
 
 #[async_trait]
 impl Gear for TimescaleDbUsageCollectorPlugin {
@@ -97,6 +116,22 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
             ready_metrics.set_ready(false);
         });
 
+        // The retention sweep reads each type's declared retention from
+        // types-registry itself — the one declaration attribute this plugin
+        // reads, because it is the component that applies it.
+        let retention = Arc::new(TypesRegistryRetentionSource::new(ctx.client_hub()));
+        let sweeper = Arc::new(PgRetentionSweeper::new(
+            pool.clone(),
+            retention,
+            Arc::clone(&metrics),
+        ));
+        self.sweep
+            .set(SweepWiring {
+                sweeper,
+                interval: Duration::from_secs(cfg.retention_sweep_interval_secs),
+            })
+            .map_err(|_| anyhow::anyhow!("timescaledb plugin init ran twice"))?;
+
         // Wire the storage stack: the record store behind the adapter. It takes
         // the one metric inventory built above via `Arc<Metrics>`.
         let record: Arc<dyn RecordStore> = Arc::new(PgRecordStore::new(
@@ -121,6 +156,96 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
             "Registered TimescaleDB usage-collector plugin instance"
         );
         Ok(())
+    }
+}
+
+#[async_trait]
+impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
+    async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let wiring = self.sweep.get().ok_or_else(|| {
+            anyhow::anyhow!("retention sweep not initialized - init() must run before start()")
+        })?;
+        let sweeper = Arc::clone(&wiring.sweeper);
+        let interval = wiring.interval;
+        let token = cancel.child_token();
+        {
+            let mut guard = self
+                .sweep_cancel
+                .lock()
+                .map_err(|e| anyhow::anyhow!("sweep_cancel lock: {e}"))?;
+            if guard.is_some() {
+                anyhow::bail!("retention sweep already started");
+            }
+            *guard = Some(token.clone());
+        }
+        let handle = toolkit::tokio::spawn(run_sweeps(sweeper, interval, token));
+        *self
+            .sweep_handle
+            .lock()
+            .map_err(|e| anyhow::anyhow!("sweep_handle lock: {e}"))? = Some(handle);
+        info!(
+            interval_secs = interval.as_secs(),
+            "retention sweep started"
+        );
+        Ok(())
+    }
+
+    async fn stop(&self, deadline: CancellationToken) -> anyhow::Result<()> {
+        if let Some(token) = self
+            .sweep_cancel
+            .lock()
+            .map_err(|e| anyhow::anyhow!("sweep_cancel lock: {e}"))?
+            .take()
+        {
+            token.cancel();
+        }
+        let handle = self
+            .sweep_handle
+            .lock()
+            .map_err(|e| anyhow::anyhow!("sweep_handle lock: {e}"))?
+            .take();
+        if let Some(handle) = handle {
+            toolkit::tokio::select! {
+                result = handle => {
+                    if let Err(e) = result
+                        && !e.is_cancelled()
+                    {
+                        tracing::warn!(error = ?e, "retention sweep task failed");
+                    }
+                }
+                () = deadline.cancelled() => {
+                    tracing::info!("retention sweep stop cut short by the framework deadline");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sweep now, then once per `interval`, until `cancel` fires.
+///
+/// Cancellation is observed between sweeps only. A sweep holds the sweep lock
+/// and may be part-way through a chunk drop; letting it finish is cheaper than
+/// reasoning about where it stopped, and its lock connection closes either way.
+async fn run_sweeps(
+    sweeper: Arc<PgRetentionSweeper>,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
+    loop {
+        sweep_and_log(&sweeper).await;
+        toolkit::tokio::select! {
+            () = cancel.cancelled() => break,
+            () = toolkit::tokio::time::sleep(interval) => {}
+        }
+    }
+}
+
+/// Run one sweep and log its outcome, whatever that is.
+async fn sweep_and_log(sweeper: &PgRetentionSweeper) {
+    match sweeper.sweep_once().await {
+        Ok(report) => tracing::debug!(?report, "retention sweep finished"),
+        Err(e) => tracing::warn!(error = %e, "retention sweep failed; retrying next interval"),
     }
 }
 
