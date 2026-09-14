@@ -2901,3 +2901,15 @@ fn the_fold_reads_neither_the_cursor_nor_the_fingerprint_slot() {
          binds"
     );
 }
+
+// `#[tokio::test]`, not `#[test]`: `lazy_store()`'s `connect_lazy` spawns the
+// pool's background maintenance task, which needs a Tokio context — every
+// other `lazy_store()` caller in this file is async for the same reason.
+#[tokio::test]
+async fn a_store_serves_from_the_rollup_unless_switched_off() {
+    assert!(
+        lazy_store().rollup_enabled,
+        "the rollup path is on by default"
+    );
+    assert!(!lazy_store().without_rollup().rollup_enabled);
+}

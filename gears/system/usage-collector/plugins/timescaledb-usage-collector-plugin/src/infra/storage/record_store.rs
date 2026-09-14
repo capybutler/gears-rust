@@ -63,6 +63,7 @@ use crate::infra::storage::query::aggregate::{
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
 };
+use crate::infra::storage::query::rollup::{build_rollup_aggregate_sql, rollup_eligible};
 use crate::infra::storage::query::translate::{
     SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_scope,
 };
@@ -204,6 +205,10 @@ pub struct PgRecordStore {
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
     type_keys: Arc<TypeKeyCache>,
+    /// Whether `aggregate` may serve an eligible query from `usage_rollup_1h`.
+    /// Always `true` outside tests; [`Self::without_rollup`] turns it off so
+    /// the integration suite can compare both reads over one database.
+    rollup_enabled: bool,
 }
 
 impl PgRecordStore {
@@ -218,7 +223,17 @@ impl PgRecordStore {
             metrics,
             cancel,
             type_keys: Arc::new(TypeKeyCache::default()),
+            rollup_enabled: true,
         }
+    }
+
+    /// The same store with the rollup read switched off, so every aggregate
+    /// takes the exact scan. Test-only: the equivalence suite compares the two.
+    #[cfg(any(test, feature = "postgres"))]
+    #[must_use]
+    pub fn without_rollup(mut self) -> Self {
+        self.rollup_enabled = false;
+        self
     }
 
     /// Map a `sqlx` error via [`map_sqlx_err`] and, as a side effect, increment
@@ -2400,6 +2415,9 @@ impl RecordStore for PgRecordStore {
     /// owes exactly one empty-keyed bucket. Adopting either means a second
     /// statement shape for one fold, with its own empty-selection special case.
     ///
+    /// An eligible `SUM` or `COUNT` is served from `usage_rollup_1h` (see
+    /// `query::rollup`); the result is identical to the scan's.
+    ///
     /// # Errors
     ///
     /// Returns [`UsageCollectorPluginError::Internal`] when the composed filter
@@ -2424,15 +2442,47 @@ impl RecordStore for PgRecordStore {
         );
         self.metrics.inc_query_request(QueryKind::Aggregated);
 
-        let statement = build_aggregate_sql(
-            &gts_type_id,
-            time_range,
-            fold,
-            query,
-            metadata_filter,
-            group_by,
-        )
-        .map_err(UsageCollectorPluginError::internal)?;
+        // The rollup answers an eligible SUM/COUNT exactly (spec §6); every
+        // other query takes the scan it always has. The eligibility test reads
+        // the same composed filter the scan would translate.
+        let routed = if self.rollup_enabled {
+            Some(rollup_eligible(
+                fold,
+                query.filter(),
+                metadata_filter,
+                group_by,
+                time_range,
+            ))
+        } else {
+            None
+        };
+        let statement = match routed {
+            Some(Ok(split)) => {
+                self.metrics.record_aggregate_path(None);
+                let st =
+                    build_rollup_aggregate_sql(&gts_type_id, split, fold, query.filter(), group_by)
+                        .map_err(UsageCollectorPluginError::internal)?;
+                AggregateStatement {
+                    sql: st.sql,
+                    binds: st.binds,
+                    dim_count: st.dim_count,
+                }
+            }
+            other => {
+                if let Some(Err(reason)) = other {
+                    self.metrics.record_aggregate_path(Some(reason));
+                }
+                build_aggregate_sql(
+                    &gts_type_id,
+                    time_range,
+                    fold,
+                    query,
+                    metadata_filter,
+                    group_by,
+                )
+                .map_err(UsageCollectorPluginError::internal)?
+            }
+        };
 
         let mut q = sqlx::query(AssertSqlSafe(statement.sql));
         for b in &statement.binds {

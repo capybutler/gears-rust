@@ -60,6 +60,7 @@ use opentelemetry::{InstrumentationScope, KeyValue, global};
 use sqlx::PgPool;
 
 use crate::domain::retention::KeepReason;
+use crate::infra::storage::query::rollup::FallbackReason;
 
 /// `OpenTelemetry` instrumentation scope (meter name) for every plugin series.
 const SCOPE_NAME: &str = "uc.timescaledb";
@@ -118,6 +119,17 @@ pub mod label {
 
     /// Label key for the kept-unresolved reason dimension.
     pub const KEEP_REASON: &str = "reason";
+
+    /// Label key for which read served an aggregate.
+    pub const AGGREGATE_PATH: &str = "path";
+    /// `path` value: whole hours from the rollup plus ledger edges.
+    pub const AGGREGATE_PATH_ROLLUP: &str = "rollup";
+    /// `path` value: the exact ledger scan.
+    pub const AGGREGATE_PATH_SCAN: &str = "scan";
+    /// Label key for why an aggregate took the scan.
+    pub const FALLBACK_REASON: &str = "reason";
+    /// `reason` value on `path="rollup"`.
+    pub const FALLBACK_REASON_NONE: &str = "none";
 }
 
 /// Insert-mode dimension behind the `mode` label of
@@ -262,6 +274,8 @@ pub struct Metrics {
     retention_chunks_kept_unresolved: Counter<u64>,
     /// `uc_timescaledb_retention_drop_failures_total`.
     retention_drop_failures: Counter<u64>,
+    /// `uc_timescaledb_aggregate_path_total` — labelled by `path` and `reason`.
+    aggregate_path: Counter<u64>,
 
     // --- Synchronous gauges (set imperatively) ---
     /// `uc_timescaledb_ready` — plugin-local backend health (0/1).
@@ -410,6 +424,13 @@ impl Metrics {
             .u64_gauge("uc_timescaledb_chunks")
             .with_description("Ledger chunks remaining after the last completed retention sweep")
             .build();
+        let aggregate_path = meter
+            .u64_counter("uc_timescaledb_aggregate_path_total")
+            .with_description(
+                "Aggregate queries by the read that served them: path=rollup (whole hours \
+                 from usage_rollup_1h plus ledger edges) or path=scan, with the reason it fell back",
+            )
+            .build();
 
         let ready = meter
             .u64_gauge("uc_timescaledb_ready")
@@ -458,6 +479,7 @@ impl Metrics {
             retention_chunks_dropped,
             retention_chunks_kept_unresolved,
             retention_drop_failures,
+            aggregate_path,
             ready,
             chunks,
             _pool_active: pool_active,
@@ -603,6 +625,22 @@ impl Metrics {
         self.retention_drop_failures.add(1, &[]);
     }
 
+    /// Count one aggregate by the read that served it: `None` for the rollup,
+    /// `Some(reason)` for the scan.
+    pub fn record_aggregate_path(&self, fallback: Option<FallbackReason>) {
+        let (path, reason) = match fallback {
+            None => (label::AGGREGATE_PATH_ROLLUP, label::FALLBACK_REASON_NONE),
+            Some(r) => (label::AGGREGATE_PATH_SCAN, r.as_label()),
+        };
+        self.aggregate_path.add(
+            1,
+            &[
+                KeyValue::new(label::AGGREGATE_PATH, path),
+                KeyValue::new(label::FALLBACK_REASON, reason),
+            ],
+        );
+    }
+
     // --- Synchronous gauge setters ---
 
     /// Set the plugin-local readiness gauge (1 when `ready`, else 0).
@@ -665,6 +703,7 @@ impl Metrics {
             retention_chunks_dropped: _,
             retention_chunks_kept_unresolved: _,
             retention_drop_failures: _,
+            aggregate_path: _,
             ready: _,
             chunks: _,
             _pool_active: _,
@@ -695,6 +734,7 @@ impl Metrics {
             "uc_timescaledb_retention_chunks_kept_unresolved_total",
             "uc_timescaledb_retention_drop_failures_total",
             "uc_timescaledb_chunks",
+            "uc_timescaledb_aggregate_path_total",
         ]
     }
 }

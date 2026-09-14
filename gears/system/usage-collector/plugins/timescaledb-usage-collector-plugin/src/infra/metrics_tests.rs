@@ -2,6 +2,7 @@ use super::{
     DURATION_BOUNDARIES_SECS, ErrorClass, InsertMode, Metrics, QueryKind, SweepOutcome, label,
 };
 use crate::domain::retention::KeepReason;
+use crate::infra::storage::query::rollup::FallbackReason;
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -466,6 +467,7 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
     metrics.inc_retention_chunk_kept_unresolved(KeepReason::Unavailable);
     metrics.inc_retention_drop_failure();
     metrics.set_chunks(1);
+    metrics.record_aggregate_path(None);
 
     provider.force_flush().unwrap();
 
@@ -543,4 +545,48 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn the_aggregate_path_counter_splits_by_path_and_reason() {
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+
+    metrics.record_aggregate_path(None);
+    metrics.record_aggregate_path(None);
+    metrics.record_aggregate_path(Some(FallbackReason::FilterField));
+    provider.force_flush().unwrap();
+
+    let name = "uc_timescaledb_aggregate_path_total";
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            name,
+            label::AGGREGATE_PATH,
+            label::AGGREGATE_PATH_ROLLUP
+        ),
+        2
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            name,
+            label::AGGREGATE_PATH,
+            label::AGGREGATE_PATH_SCAN
+        ),
+        1
+    );
+    assert_eq!(
+        counter_sum_with_label(&exporter, name, label::FALLBACK_REASON, "filter_field"),
+        1
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            name,
+            label::FALLBACK_REASON,
+            label::FALLBACK_REASON_NONE
+        ),
+        2
+    );
 }
