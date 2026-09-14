@@ -184,3 +184,79 @@ fn debug_does_not_leak_database_url_password() {
         "Debug of the config must not leak the DSN password; got: {dump}"
     );
 }
+
+#[test]
+fn rollup_defaults_are_applied() {
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(cfg.rollup_materialization_lag_secs, 7_200);
+    assert_eq!(cfg.rollup_live_window_secs, 259_200);
+    assert_eq!(cfg.rollup_refresh_interval_secs, 120);
+    assert_eq!(cfg.rollup_history_refresh_interval_secs, 3_600);
+}
+
+/// Parse `{ "database_url": "postgres://x", <extra> }` and validate it.
+fn validate_with(extra: &str) -> Result<(), String> {
+    let json = format!(r#"{{ "database_url": "postgres://x", {extra} }}"#);
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(&json).unwrap();
+    cfg.validate()
+}
+
+#[test]
+fn validate_rejects_a_chunk_interval_that_is_not_whole_hours() {
+    // Every hourly rollup bucket must lie inside one ledger chunk, or the
+    // retention cut cannot delete a bucket without under-counting a neighbour.
+    assert!(validate_with(r#""chunk_time_interval_secs": 5400"#).is_err());
+    assert!(validate_with(r#""chunk_time_interval_secs": 7200"#).is_ok());
+}
+
+#[test]
+fn validate_rejects_a_materialization_lag_that_is_not_whole_hours_or_under_one_hour() {
+    assert!(validate_with(r#""rollup_materialization_lag_secs": 5400"#).is_err());
+    assert!(validate_with(r#""rollup_materialization_lag_secs": 0"#).is_err());
+    assert!(validate_with(r#""rollup_materialization_lag_secs": 3600"#).is_ok());
+}
+
+#[test]
+fn validate_rejects_a_materialization_lag_not_below_the_live_window() {
+    assert!(
+        validate_with(
+            r#""rollup_materialization_lag_secs": 259200, "rollup_live_window_secs": 259200"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn validate_rejects_a_live_window_that_is_not_whole_hours_or_beyond_the_bound() {
+    assert!(
+        validate_with(
+            r#""rollup_live_window_secs": 262800, "rollup_materialization_lag_secs": 3600"#
+        )
+        .is_ok()
+    );
+    assert!(validate_with(r#""rollup_live_window_secs": 260000"#).is_err());
+    assert!(
+        validate_with(&format!(
+            r#""rollup_live_window_secs": {}"#,
+            u64::MAX - (u64::MAX % 3600)
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn validate_rejects_zero_or_unbounded_rollup_refresh_intervals() {
+    for key in [
+        "rollup_refresh_interval_secs",
+        "rollup_history_refresh_interval_secs",
+    ] {
+        assert!(
+            validate_with(&format!(r#""{key}": 0"#)).is_err(),
+            "{key} = 0"
+        );
+        assert!(
+            validate_with(&format!(r#""{key}": {}"#, u64::MAX)).is_err(),
+            "{key} = MAX"
+        );
+    }
+}

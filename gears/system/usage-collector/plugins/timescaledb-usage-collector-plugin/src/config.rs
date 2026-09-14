@@ -92,6 +92,19 @@ pub struct TimescaleDbPluginConfig {
     pub type_key_slice_width: u32,
     /// Seconds between two retention sweeps.
     pub retention_sweep_interval_secs: u64,
+    /// Seconds before now that the rollup's newest materialised bucket ends.
+    /// Newer buckets are answered from the ledger by real-time aggregation, so
+    /// a refresh never recomputes the hours ingestion is still writing. A
+    /// multiple of 3600, at least 3600, and below `rollup_live_window_secs`.
+    pub rollup_materialization_lag_secs: u64,
+    /// How far back the frequent (live) refresh policy reaches, in seconds.
+    /// Writes older than this are picked up by the history policy instead. A
+    /// multiple of 3600.
+    pub rollup_live_window_secs: u64,
+    /// Seconds between runs of the live refresh policy.
+    pub rollup_refresh_interval_secs: u64,
+    /// Seconds between runs of the history refresh policy.
+    pub rollup_history_refresh_interval_secs: u64,
     /// Vendor name for GTS instance registration.
     pub vendor: String,
     /// Plugin priority (lower = higher priority).
@@ -109,6 +122,10 @@ impl Default for TimescaleDbPluginConfig {
             chunk_time_interval_secs: 7 * 86_400,
             type_key_slice_width: 1,
             retention_sweep_interval_secs: 3_600,
+            rollup_materialization_lag_secs: 7_200,
+            rollup_live_window_secs: 259_200,
+            rollup_refresh_interval_secs: 120,
+            rollup_history_refresh_interval_secs: 3_600,
             vendor: "cyberfabric".to_owned(),
             priority: 10,
         }
@@ -122,6 +139,10 @@ impl Default for TimescaleDbPluginConfig {
 /// as a confusing failure *after* migrations have already run.
 const MAX_INTERVAL_SECS: u64 = 100 * 365 * 86_400;
 
+/// One rollup bucket, in seconds. Every interval a bucket must nest inside is a
+/// multiple of it.
+pub const HOUR_SECS: u64 = 3_600;
+
 /// Upper bound on `type_key_slice_width`: `type_key` is an `int`.
 const MAX_TYPE_KEY_SLICE_WIDTH: u32 = 2_147_483_647;
 
@@ -131,8 +152,8 @@ impl TimescaleDbPluginConfig {
     /// # Errors
     /// Returns an error string for an empty DSN, a pool `max` below 2 or
     /// `min > max`, a zero acquire timeout, a zero statement timeout, an interval
-    /// outside `(0, MAX_INTERVAL_SECS]`, or a slice width outside
-    /// `[1, MAX_TYPE_KEY_SLICE_WIDTH]`.
+    /// outside `(0, MAX_INTERVAL_SECS]`, a slice width outside
+    /// `[1, MAX_TYPE_KEY_SLICE_WIDTH]`, an hour-aligned setting that is not a multiple of 3600, a materialization lag under one hour or not below the live window, or a rollup interval outside `(0, MAX_INTERVAL_SECS]`.
     pub fn validate(&self) -> Result<(), String> {
         if self.database_url.expose().trim().is_empty() {
             return Err("database_url must not be empty".to_owned());
@@ -163,9 +184,13 @@ impl TimescaleDbPluginConfig {
                     .to_owned(),
             );
         }
-        if self.chunk_time_interval_secs == 0 || self.chunk_time_interval_secs > MAX_INTERVAL_SECS {
+        if self.chunk_time_interval_secs == 0
+            || self.chunk_time_interval_secs > MAX_INTERVAL_SECS
+            || !self.chunk_time_interval_secs.is_multiple_of(HOUR_SECS)
+        {
             return Err(format!(
-                "chunk_time_interval_secs must be in (0, {MAX_INTERVAL_SECS}] (100 years)"
+                "chunk_time_interval_secs must be a multiple of {HOUR_SECS} in (0, {MAX_INTERVAL_SECS}] \
+                 (every hourly rollup bucket must lie inside one chunk)"
             ));
         }
         if self.type_key_slice_width == 0 || self.type_key_slice_width > MAX_TYPE_KEY_SLICE_WIDTH {
@@ -179,6 +204,41 @@ impl TimescaleDbPluginConfig {
             return Err(format!(
                 "retention_sweep_interval_secs must be in (0, {MAX_INTERVAL_SECS}] (100 years)"
             ));
+        }
+        if self.rollup_live_window_secs == 0
+            || self.rollup_live_window_secs > MAX_INTERVAL_SECS
+            || !self.rollup_live_window_secs.is_multiple_of(HOUR_SECS)
+        {
+            return Err(format!(
+                "rollup_live_window_secs must be a multiple of {HOUR_SECS} in (0, {MAX_INTERVAL_SECS}]"
+            ));
+        }
+        if self.rollup_materialization_lag_secs < HOUR_SECS
+            || !self
+                .rollup_materialization_lag_secs
+                .is_multiple_of(HOUR_SECS)
+            || self.rollup_materialization_lag_secs >= self.rollup_live_window_secs
+        {
+            return Err(format!(
+                "rollup_materialization_lag_secs must be a multiple of {HOUR_SECS}, at least \
+                 {HOUR_SECS}, and below rollup_live_window_secs"
+            ));
+        }
+        for (key, value) in [
+            (
+                "rollup_refresh_interval_secs",
+                self.rollup_refresh_interval_secs,
+            ),
+            (
+                "rollup_history_refresh_interval_secs",
+                self.rollup_history_refresh_interval_secs,
+            ),
+        ] {
+            if value == 0 || value > MAX_INTERVAL_SECS {
+                return Err(format!(
+                    "{key} must be in (0, {MAX_INTERVAL_SECS}] (100 years)"
+                ));
+            }
         }
         Ok(())
     }

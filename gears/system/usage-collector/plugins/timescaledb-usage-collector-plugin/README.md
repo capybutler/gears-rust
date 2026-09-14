@@ -13,9 +13,13 @@ Config maps to `TimescaleDbPluginConfig` (`src/config.rs`). Durations are whole 
 | `pool_size_max` | `16` | Connection-pool upper bound (at least 2). The retention sweep holds one extra detached connection while it runs; budget Postgres `max_connections` for `pool_size_max + 1` per replica. |
 | `connection_timeout_secs` | `10` | Connection acquire timeout (seconds). |
 | `statement_timeout_secs` | `30` | Per-statement timeout on every request-path connection (seconds). |
-| `chunk_time_interval_secs` | `604800` (7d) | Time width of new ledger chunks; applies to chunks created afterwards. |
+| `chunk_time_interval_secs` | `604800` (7d) | Time width of new ledger chunks; a multiple of 3600; applies to chunks created afterwards. |
 | `type_key_slice_width` | `1` | How many type keys share one chunk slice; applies to chunks created afterwards. See [Retention](#retention). |
 | `retention_sweep_interval_secs` | `3600` (1h) | Seconds between retention sweeps. |
+| `rollup_materialization_lag_secs` | `7200` (2h) | Buckets newer than this are answered from the ledger rather than materialised. Multiple of 3600, at least 3600, below `rollup_live_window_secs`. See [Aggregate path](#aggregate-path). |
+| `rollup_live_window_secs` | `259200` (3d) | Reach of the frequent refresh policy. Size it to the gateway's live past tolerance (48h by default). Multiple of 3600. |
+| `rollup_refresh_interval_secs` | `120` | Seconds between live refresh-policy runs. |
+| `rollup_history_refresh_interval_secs` | `3600` (1h) | Seconds between history refresh-policy runs (backfill, old invalidations). |
 | `vendor` | `cyberfabric` | Vendor name for GTS instance registration. |
 | `priority` | `10` | Plugin priority (lower = higher precedence). |
 
@@ -29,6 +33,10 @@ statement_timeout_secs = 30
 chunk_time_interval_secs = 604800
 type_key_slice_width = 1
 retention_sweep_interval_secs = 3600
+rollup_materialization_lag_secs = 7200
+rollup_live_window_secs = 259200
+rollup_refresh_interval_secs = 120
+rollup_history_refresh_interval_secs = 3600
 vendor = "cyberfabric"
 priority = 10
 ```
