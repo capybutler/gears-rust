@@ -155,7 +155,7 @@ fn placeholders(n: usize) -> String {
 /// Built rather than inlined so a test can read the column list, the
 /// placeholder count and the conflict target back out of it — and built
 /// **once**, because every input to it is a constant and the alternative is
-/// sixteen `format!`s per write.
+/// seventeen `format!`s per write.
 static SINGLE_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "INSERT INTO usage_records ({INSERT_COLUMNS}) VALUES ({}) \
@@ -857,7 +857,7 @@ impl PgRecordStore {
 /// `sqlx` binds arrays, not rows, so the batch insert `UNNEST`s these back into
 /// rows. Keeping them in one struct built by one function keeps the column
 /// list, the `UNNEST` list and the bind order readable side by side instead of
-/// spread across sixteen locals in the middle of the query.
+/// spread across seventeen locals in the middle of the query.
 struct InsertColumns {
     ids: Vec<Uuid>,
     tenants: Vec<Uuid>,

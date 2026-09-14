@@ -56,11 +56,10 @@ fn a_day_count_parses_to_whole_days() {
 }
 
 #[test]
-#[allow(clippy::duration_suboptimal_units)]
 fn hours_are_a_fixed_length_and_are_accepted() {
     assert_eq!(
         retention_from_traits(&json!({ "retention": "PT36H" })),
-        Ok(Duration::from_secs(36 * 3600))
+        Ok(Duration::from_hours(36))
     );
 }
 

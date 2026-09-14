@@ -106,8 +106,8 @@ pub fn fold_select_expr(fold: AggregationFold) -> &'static str {
 ///
 /// The subquery also pins `w.type_key = r.type_key`. An invalidation has its
 /// target's type and so its key, so this excludes nothing the `id` match would
-/// keep; what it buys is chunk exclusion inside the subquery, which otherwise
-/// probes the invalidation index in every type's chunks.
+/// keep; it restricts the subquery to the outer row's type, which lets the
+/// planner skip other types' chunks where it can.
 ///
 /// # Precondition
 ///

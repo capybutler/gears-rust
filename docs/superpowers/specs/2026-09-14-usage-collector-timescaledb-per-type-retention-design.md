@@ -370,6 +370,13 @@ retries.
   → `Transient` handling in `record_store.rs`.
 - **Several replicas.** The advisory lock admits one sweeper at a time. Drops
   are idempotent across sweeps.
+- **A new type keyed into an already-expired shared chunk.** Needs
+  `type_key_slice_width` above 1 plus a backfill with longer retention. A type
+  can receive its `type_key` after a sweep has already loaded
+  `usage_type_key` and judged the shared slice's chunk expired; a write that
+  lands in that chunk before the drop is lost when the sweep drops the chunk
+  without having considered the new type's retention. Narrow: closing it needs
+  a lock-then-recheck around the drop; revisit with rollups.
 
 ## 9. Out of scope
 
@@ -528,3 +535,4 @@ type, not only its `window_end`.
 | `_timescaledb_functions.drop_chunk` is an internal function | The same pin coverage applies. `DROP TABLE <chunk>` is an equivalent fallback, also verified on 2.29.2. |
 | Chunk count grows with the number of types | Slice width and chunk interval can be tuned without a migration. The gauge and the documented ceiling cover the rest. |
 | A registry outage stops all drops | Storage grows, but nothing is lost. The unresolved counter surfaces it. |
+| By-id lookups (invalidation ingest) scan every chunk, and can queue behind a chunk drop's lock | Documented ceiling; follow-up: gateway passes the target's `gts_type_id` and `window_end` so the plugin can prune (SPI change). |

@@ -42,13 +42,15 @@ async fn the_ledger_partitions_on_window_end_then_type_key() {
         .await
         .expect("timescaledb container (Docker required)");
 
-    // One dimension, and it is `window_end`. Asserting the *column* rather than
-    // only "is a hypertable" is the whole point: the read contract selects on
-    // the covered period's end alone
+    // Two dimensions, in order: `window_end` first, `type_key` second.
+    // Asserting the *columns and their order* rather than only "is a
+    // hypertable" is the whole point. `window_end` leads because the read
+    // contract selects on the covered period's end alone
     // (`cpt-cf-usage-collector-adr-window-end-selection`), and partitioning on
     // `window_start` instead would leave every range read scanning chunks it
-    // cannot need while every constraint carrying the partition column silently
-    // changed meaning.
+    // cannot need while every constraint carrying the partition column
+    // silently changed meaning. `type_key` follows so a chunk can be dropped
+    // by the retention of the types it holds.
     let dims: Vec<(String, i64)> = sqlx::query_as(
         "SELECT column_name, dimension_number FROM timescaledb_information.dimensions \
          WHERE hypertable_name = 'usage_records' ORDER BY dimension_number",
