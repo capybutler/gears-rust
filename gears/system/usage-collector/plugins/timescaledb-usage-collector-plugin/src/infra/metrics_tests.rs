@@ -475,6 +475,7 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
         failing: false,
         secs_since_success: Some(1.0),
     });
+    metrics.set_rollup_refresh_policies(2);
 
     provider.force_flush().unwrap();
 
@@ -595,6 +596,36 @@ async fn the_aggregate_path_counter_splits_by_path_and_reason() {
             label::FALLBACK_REASON_NONE
         ),
         2
+    );
+}
+
+/// The refresh-policies gauge holds the last value it was set to, including
+/// zero: a monitor sample that finds no policies must still overwrite a
+/// stale reading from an earlier, non-empty sample rather than leave it in
+/// place. Two independent providers, one per value, because
+/// `get_finished_metrics` accumulates across every flush of one exporter and
+/// `gauge_last_u64` reads the first batch it finds — a second flush on the
+/// same exporter would not exercise "last value" at all.
+#[tokio::test]
+async fn the_refresh_policies_gauge_reports_its_last_value_including_zero() {
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+    metrics.set_rollup_refresh_policies(2);
+    provider.force_flush().unwrap();
+    assert_eq!(
+        gauge_last_u64(&exporter, "uc_timescaledb_rollup_refresh_policies"),
+        Some(2)
+    );
+
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+    metrics.set_rollup_refresh_policies(5);
+    metrics.set_rollup_refresh_policies(0);
+    provider.force_flush().unwrap();
+    assert_eq!(
+        gauge_last_u64(&exporter, "uc_timescaledb_rollup_refresh_policies"),
+        Some(0),
+        "the most recent set_rollup_refresh_policies call wins, including zero"
     );
 }
 

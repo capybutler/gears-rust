@@ -205,6 +205,8 @@ impl RollupMonitor {
         for status in &statuses {
             self.metrics.set_rollup_refresh_status(status);
         }
+        self.metrics
+            .set_rollup_refresh_policies(u64::try_from(statuses.len()).unwrap_or(u64::MAX));
         Ok(statuses.len())
     }
 }

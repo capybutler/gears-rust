@@ -293,6 +293,9 @@ pub struct Metrics {
     rollup_refresh_age: Gauge<f64>,
     /// `uc_timescaledb_rollup_refresh_job_failing` — labelled by `policy`.
     rollup_refresh_job_failing: Gauge<u64>,
+    /// `uc_timescaledb_rollup_refresh_policies` — the number of rollup refresh
+    /// policies the last monitor sample found.
+    rollup_refresh_policies: Gauge<u64>,
 
     // --- Observable gauges (callback-read; handles kept to stay registered) ---
     /// `uc_timescaledb_pool_connections_active`.
@@ -463,6 +466,12 @@ impl Metrics {
             .u64_gauge("uc_timescaledb_rollup_refresh_job_failing")
             .with_description("1 when a rollup refresh policy's last run failed, by policy")
             .build();
+        let rollup_refresh_policies = meter
+            .u64_gauge("uc_timescaledb_rollup_refresh_policies")
+            .with_description(
+                "Rollup refresh policies the last monitor sample found; alert below 2",
+            )
+            .build();
 
         // Each observable gauge owns its own callback closure: 0.31 has no
         // batch-observe API, so the two pool gauges cannot share one callback.
@@ -512,6 +521,7 @@ impl Metrics {
             chunks,
             rollup_refresh_age,
             rollup_refresh_job_failing,
+            rollup_refresh_policies,
             _pool_active: pool_active,
             _pool_idle: pool_idle,
         }
@@ -702,6 +712,12 @@ impl Metrics {
         }
     }
 
+    /// Set the number of rollup refresh policies the last monitor sample
+    /// found, including zero.
+    pub fn set_rollup_refresh_policies(&self, n: u64) {
+        self.rollup_refresh_policies.record(n, &[]);
+    }
+
     /// Every instrument name this inventory declares.
     ///
     /// The destructure below has **no `..`**, on purpose — but be exact about
@@ -758,6 +774,7 @@ impl Metrics {
             chunks: _,
             rollup_refresh_age: _,
             rollup_refresh_job_failing: _,
+            rollup_refresh_policies: _,
             _pool_active: _,
             _pool_idle: _,
         } = self;
@@ -790,6 +807,7 @@ impl Metrics {
             "uc_timescaledb_rollup_rows_deleted_total",
             "uc_timescaledb_rollup_refresh_age_seconds",
             "uc_timescaledb_rollup_refresh_job_failing",
+            "uc_timescaledb_rollup_refresh_policies",
         ]
     }
 }
