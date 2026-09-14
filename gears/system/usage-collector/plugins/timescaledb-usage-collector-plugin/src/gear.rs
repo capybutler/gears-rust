@@ -9,6 +9,7 @@ use toolkit::context::GearCtx;
 use toolkit::contracts::RunnableCapability;
 use toolkit::gts::PluginV1;
 use toolkit::tokio::task::JoinHandle;
+use toolkit::tokio::time::MissedTickBehavior;
 use tracing::info;
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use usage_collector_sdk::{UsageCollectorPluginSpecV1, UsageCollectorPluginV1};
@@ -21,6 +22,7 @@ use crate::infra::registry_retention::TypesRegistryRetentionSource;
 use crate::infra::storage::pool::{MIGRATOR, apply_post_migration_setup, build_pool};
 use crate::infra::storage::record_store::PgRecordStore;
 use crate::infra::storage::retention_sweep::PgRetentionSweeper;
+use crate::infra::storage::rollup_maintenance::RollupMonitor;
 
 /// `TimescaleDB` Usage Collector storage backend plugin module.
 ///
@@ -42,10 +44,12 @@ pub struct TimescaleDbUsageCollectorPlugin {
     sweep_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// What `start` needs from `init` to run the retention sweep.
+/// What `start` needs from `init` to run the retention sweep and the rollup
+/// refresh-policy monitor.
 struct SweepWiring {
     sweeper: Arc<PgRetentionSweeper>,
     interval: Duration,
+    monitor: Arc<RollupMonitor>,
 }
 
 #[async_trait]
@@ -124,10 +128,12 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
             retention,
             Arc::clone(&metrics),
         ));
+        let monitor = Arc::new(RollupMonitor::new(pool.clone(), Arc::clone(&metrics)));
         self.sweep
             .set(SweepWiring {
                 sweeper,
                 interval: Duration::from_secs(cfg.retention_sweep_interval_secs),
+                monitor,
             })
             .map_err(|_| anyhow::anyhow!("timescaledb plugin init ran twice"))?;
 
@@ -166,6 +172,7 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
         })?;
         let sweeper = Arc::clone(&wiring.sweeper);
         let interval = wiring.interval;
+        let monitor = Arc::clone(&wiring.monitor);
         let token = cancel.child_token();
         {
             let mut guard = self
@@ -177,14 +184,14 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
             }
             *guard = Some(token.clone());
         }
-        let handle = toolkit::tokio::spawn(run_sweeps(sweeper, interval, token));
+        let handle = toolkit::tokio::spawn(run_background(sweeper, interval, monitor, token));
         *self
             .sweep_handle
             .lock()
             .map_err(|e| anyhow::anyhow!("sweep_handle lock: {e}"))? = Some(handle);
         info!(
             interval_secs = interval.as_secs(),
-            "retention sweep started"
+            "retention sweep and rollup monitor started"
         );
         Ok(())
     }
@@ -227,21 +234,31 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
     }
 }
 
-/// Sweep now, then once per `interval`, until `cancel` fires.
+/// How often refresh-policy health is sampled.
+const ROLLUP_MONITOR_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Sweep and sample now, then each on its own interval, until `cancel` fires.
 ///
-/// Cancellation is observed between sweeps only. A sweep holds the sweep lock
-/// and may be part-way through a chunk drop; letting it finish is cheaper than
-/// reasoning about where it stopped, and its lock connection closes either way.
-async fn run_sweeps(
+/// Cancellation is observed between operations only. A sweep holds the sweep
+/// lock and may be part-way through a chunk drop; letting it finish is cheaper
+/// than reasoning about where it stopped, and its lock connection closes either
+/// way.
+async fn run_background(
     sweeper: Arc<PgRetentionSweeper>,
-    interval: Duration,
+    sweep_interval: Duration,
+    monitor: Arc<RollupMonitor>,
     cancel: CancellationToken,
 ) {
+    let mut sweep_tick = toolkit::tokio::time::interval(sweep_interval);
+    sweep_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut monitor_tick = toolkit::tokio::time::interval(ROLLUP_MONITOR_INTERVAL);
+    monitor_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        sweep_and_log(&sweeper).await;
         toolkit::tokio::select! {
+            biased;
             () = cancel.cancelled() => break,
-            () = toolkit::tokio::time::sleep(interval) => {}
+            _ = sweep_tick.tick() => sweep_and_log(&sweeper).await,
+            _ = monitor_tick.tick() => sample_and_log(&monitor).await,
         }
     }
 }
@@ -251,6 +268,16 @@ async fn sweep_and_log(sweeper: &PgRetentionSweeper) {
     match sweeper.sweep_once().await {
         Ok(report) => tracing::debug!(?report, "retention sweep finished"),
         Err(e) => tracing::warn!(error = %e, "retention sweep failed; retrying next interval"),
+    }
+}
+
+/// Sample refresh-policy health once and log a failure.
+async fn sample_and_log(monitor: &RollupMonitor) {
+    match monitor.sample_once().await {
+        Ok(n) => tracing::debug!(policies = n, "rollup refresh health sampled"),
+        Err(e) => {
+            tracing::warn!(error = %e, "sampling rollup refresh health failed; retrying next interval");
+        }
     }
 }
 

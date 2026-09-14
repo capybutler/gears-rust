@@ -3,6 +3,7 @@ use super::{
 };
 use crate::domain::retention::KeepReason;
 use crate::infra::storage::query::rollup::FallbackReason;
+use crate::infra::storage::rollup_maintenance::{RefreshJobStatus, RefreshPolicy};
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -469,6 +470,11 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
     metrics.set_chunks(1);
     metrics.record_aggregate_path(None);
     metrics.add_rollup_rows_deleted(3);
+    metrics.set_rollup_refresh_status(&RefreshJobStatus {
+        policy: RefreshPolicy::History,
+        failing: false,
+        secs_since_success: Some(1.0),
+    });
 
     provider.force_flush().unwrap();
 
@@ -589,5 +595,24 @@ async fn the_aggregate_path_counter_splits_by_path_and_reason() {
             label::FALLBACK_REASON_NONE
         ),
         2
+    );
+}
+
+#[tokio::test]
+async fn refresh_status_sets_both_gauges_under_the_policy_label() {
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+    metrics.set_rollup_refresh_status(&RefreshJobStatus {
+        policy: RefreshPolicy::Live,
+        failing: true,
+        secs_since_success: Some(90.0),
+    });
+    provider.force_flush().unwrap();
+    assert_eq!(
+        gauge_last_u64(&exporter, "uc_timescaledb_rollup_refresh_job_failing"),
+        Some(1)
+    );
+    assert!(
+        exported_names(&exporter).contains(&"uc_timescaledb_rollup_refresh_age_seconds".to_owned())
     );
 }

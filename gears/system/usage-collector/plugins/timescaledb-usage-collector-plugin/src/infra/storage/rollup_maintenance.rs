@@ -6,9 +6,12 @@
 // `record_store.rs`).
 #![allow(unknown_lints, de0706_no_direct_sqlx)]
 
+use std::sync::Arc;
+
 use sqlx::PgPool;
 
 use crate::config::TimescaleDbPluginConfig;
+use crate::infra::metrics::Metrics;
 
 /// The rollup view `migrations/0002_usage_rollup.sql` creates.
 pub const ROLLUP_VIEW: &str = "usage_rollup_1h";
@@ -103,6 +106,107 @@ pub fn delete_rollup_rows_sql(table: &str) -> String {
         "DELETE FROM {table} WHERE type_key >= $1::bigint AND type_key < $2::bigint \
          AND bucket >= $3 AND bucket + INTERVAL '1 hour' <= $4"
     )
+}
+
+/// Each rollup refresh policy with its last run status and the seconds since
+/// its last success. `last_successful_finish` is `-infinity` before the first
+/// success, which makes the age `+infinity`.
+pub const REFRESH_JOB_STATUS_SQL: &str = "SELECT (j.config->>'start_offset') IS NULL AS is_history, \
+     js.last_run_status::text, \
+     EXTRACT(EPOCH FROM (now() - js.last_successful_finish))::double precision AS age_secs \
+     FROM timescaledb_information.jobs j \
+     LEFT JOIN timescaledb_information.job_stats js ON js.job_id = j.job_id \
+     WHERE j.proc_name = 'policy_refresh_continuous_aggregate' \
+     AND j.hypertable_schema = current_schema() AND j.hypertable_name = 'usage_rollup_1h'";
+
+/// Which of the two refresh policies a job is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshPolicy {
+    /// The frequent policy over the live window.
+    Live,
+    /// The policy over everything older than the live window.
+    History,
+}
+
+impl RefreshPolicy {
+    /// The bounded `policy` label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::History => "history",
+        }
+    }
+}
+
+/// One refresh policy's health.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshJobStatus {
+    pub policy: RefreshPolicy,
+    /// The last run failed.
+    pub failing: bool,
+    /// Seconds since the last success; `None` if it has never succeeded.
+    pub secs_since_success: Option<f64>,
+}
+
+/// Interpret one row of [`REFRESH_JOB_STATUS_SQL`].
+#[must_use]
+pub fn job_status_from_row(
+    is_history: bool,
+    last_run_status: Option<&str>,
+    age_secs: Option<f64>,
+) -> RefreshJobStatus {
+    RefreshJobStatus {
+        policy: if is_history {
+            RefreshPolicy::History
+        } else {
+            RefreshPolicy::Live
+        },
+        failing: last_run_status == Some("Failure"),
+        secs_since_success: age_secs.filter(|a| a.is_finite()).map(|a| a.max(0.0)),
+    }
+}
+
+/// Every refresh policy of the rollup, as currently recorded.
+///
+/// # Errors
+/// Returns `sqlx::Error` if the query fails.
+#[allow(clippy::type_complexity)]
+pub async fn refresh_job_statuses(pool: &PgPool) -> Result<Vec<RefreshJobStatus>, sqlx::Error> {
+    let rows: Vec<(bool, Option<String>, Option<f64>)> = sqlx::query_as(REFRESH_JOB_STATUS_SQL)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(is_history, status, age)| job_status_from_row(is_history, status.as_deref(), age))
+        .collect())
+}
+
+/// Publishes refresh-policy health on the plugin's metric inventory.
+pub struct RollupMonitor {
+    pool: PgPool,
+    metrics: Arc<Metrics>,
+}
+
+impl RollupMonitor {
+    #[must_use]
+    pub fn new(pool: PgPool, metrics: Arc<Metrics>) -> Self {
+        Self { pool, metrics }
+    }
+
+    /// Read every policy's status and set its gauges. Returns how many
+    /// policies were sampled.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the status query fails; the gauges then keep
+    /// their last values.
+    pub async fn sample_once(&self) -> Result<usize, sqlx::Error> {
+        let statuses = refresh_job_statuses(&self.pool).await?;
+        for status in &statuses {
+            self.metrics.set_rollup_refresh_status(status);
+        }
+        Ok(statuses.len())
+    }
 }
 
 #[cfg(test)]

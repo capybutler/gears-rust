@@ -20,7 +20,9 @@ use usage_collector_sdk::{
 };
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
+use timescaledb_usage_collector_plugin::infra::storage::pool::apply_post_migration_setup;
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
+use timescaledb_usage_collector_plugin::infra::storage::rollup_maintenance::refresh_job_statuses;
 
 const TENANT_A: Uuid = Uuid::from_u128(0xA0);
 const TENANT_B: Uuid = Uuid::from_u128(0xB0);
@@ -333,5 +335,33 @@ async fn a_recent_write_is_visible_on_the_rollup_path_without_a_refresh() {
     assert_eq!(
         got.buckets[0].value.as_ref().map(BigDecimal::normalized),
         Some(BigDecimal::from(42).normalized())
+    );
+}
+
+/// Re-applied policies run on creation, and the status query reads both back
+/// with a success age once they have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_refresh_policies_report_a_success_age_after_their_first_run() {
+    let s = stores().await;
+    apply_post_migration_setup(&s.h.pool, &s.h.cfg)
+        .await
+        .expect("re-apply policies");
+
+    let mut statuses = Vec::new();
+    for _ in 0..60 {
+        statuses = refresh_job_statuses(&s.h.pool).await.expect("status query");
+        if statuses.len() == 2 && statuses.iter().all(|st| st.secs_since_success.is_some()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let mut policies: Vec<_> = statuses.iter().map(|st| st.policy.as_label()).collect();
+    policies.sort_unstable();
+    assert_eq!(policies, ["history", "live"], "{statuses:?}");
+    assert!(
+        statuses
+            .iter()
+            .all(|st| !st.failing && st.secs_since_success.is_some()),
+        "{statuses:?}"
     );
 }

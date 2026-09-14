@@ -61,6 +61,7 @@ use sqlx::PgPool;
 
 use crate::domain::retention::KeepReason;
 use crate::infra::storage::query::rollup::FallbackReason;
+use crate::infra::storage::rollup_maintenance::RefreshJobStatus;
 
 /// `OpenTelemetry` instrumentation scope (meter name) for every plugin series.
 const SCOPE_NAME: &str = "uc.timescaledb";
@@ -130,6 +131,9 @@ pub mod label {
     pub const FALLBACK_REASON: &str = "reason";
     /// `reason` value on `path="rollup"`.
     pub const FALLBACK_REASON_NONE: &str = "none";
+
+    /// Label key for which rollup refresh policy a series describes.
+    pub const REFRESH_POLICY: &str = "policy";
 }
 
 /// Insert-mode dimension behind the `mode` label of
@@ -285,6 +289,10 @@ pub struct Metrics {
     /// `uc_timescaledb_chunks` — ledger chunks remaining after the last
     /// completed retention sweep.
     chunks: Gauge<u64>,
+    /// `uc_timescaledb_rollup_refresh_age_seconds` — labelled by `policy`.
+    rollup_refresh_age: Gauge<f64>,
+    /// `uc_timescaledb_rollup_refresh_job_failing` — labelled by `policy`.
+    rollup_refresh_job_failing: Gauge<u64>,
 
     // --- Observable gauges (callback-read; handles kept to stay registered) ---
     /// `uc_timescaledb_pool_connections_active`.
@@ -444,6 +452,17 @@ impl Metrics {
             .u64_gauge("uc_timescaledb_ready")
             .with_description("Plugin-local backend readiness (1 = pool + migration ok)")
             .build();
+        let rollup_refresh_age = meter
+            .f64_gauge("uc_timescaledb_rollup_refresh_age_seconds")
+            .with_description(
+                "Seconds since each rollup refresh policy last succeeded, by policy; unset \
+                 until its first success",
+            )
+            .build();
+        let rollup_refresh_job_failing = meter
+            .u64_gauge("uc_timescaledb_rollup_refresh_job_failing")
+            .with_description("1 when a rollup refresh policy's last run failed, by policy")
+            .build();
 
         // Each observable gauge owns its own callback closure: 0.31 has no
         // batch-observe API, so the two pool gauges cannot share one callback.
@@ -491,6 +510,8 @@ impl Metrics {
             rollup_rows_deleted,
             ready,
             chunks,
+            rollup_refresh_age,
+            rollup_refresh_job_failing,
             _pool_active: pool_active,
             _pool_idle: pool_idle,
         }
@@ -667,6 +688,20 @@ impl Metrics {
         self.chunks.record(n, &[]);
     }
 
+    /// Set one refresh policy's gauges. The age is left unset for a policy
+    /// that has never succeeded.
+    pub fn set_rollup_refresh_status(&self, status: &RefreshJobStatus) {
+        let attrs = [KeyValue::new(
+            label::REFRESH_POLICY,
+            status.policy.as_label(),
+        )];
+        self.rollup_refresh_job_failing
+            .record(u64::from(status.failing), &attrs);
+        if let Some(age) = status.secs_since_success {
+            self.rollup_refresh_age.record(age, &attrs);
+        }
+    }
+
     /// Every instrument name this inventory declares.
     ///
     /// The destructure below has **no `..`**, on purpose — but be exact about
@@ -721,6 +756,8 @@ impl Metrics {
             rollup_rows_deleted: _,
             ready: _,
             chunks: _,
+            rollup_refresh_age: _,
+            rollup_refresh_job_failing: _,
             _pool_active: _,
             _pool_idle: _,
         } = self;
@@ -751,6 +788,8 @@ impl Metrics {
             "uc_timescaledb_chunks",
             "uc_timescaledb_aggregate_path_total",
             "uc_timescaledb_rollup_rows_deleted_total",
+            "uc_timescaledb_rollup_refresh_age_seconds",
+            "uc_timescaledb_rollup_refresh_job_failing",
         ]
     }
 }
