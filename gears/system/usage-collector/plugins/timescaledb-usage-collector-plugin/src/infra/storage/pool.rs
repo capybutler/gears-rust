@@ -13,6 +13,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgConnection, PgPool};
 
 use crate::config::TimescaleDbPluginConfig;
+use crate::infra::storage::rollup_maintenance::apply_rollup_policies;
 
 /// Embedded schema migrations (`migrations/` at crate root).
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -161,8 +162,9 @@ async fn acquire_init_lock(lock_conn: &mut PgConnection) -> Result<(), sqlx::Err
     Ok(())
 }
 
-/// Run the post-migration partitioning setup under a database advisory lock so
-/// concurrently-initializing replicas serialize here.
+/// Run the post-migration partitioning and rollup-policy setup under a
+/// database advisory lock so concurrently-initializing replicas serialize
+/// here.
 ///
 /// A session-level `pg_advisory_lock` held on a dedicated connection for the
 /// whole section lets only one replica apply at a time; the rest block until it
@@ -184,13 +186,16 @@ async fn acquire_init_lock(lock_conn: &mut PgConnection) -> Result<(), sqlx::Err
 /// fails.
 pub async fn apply_post_migration_setup(
     pool: &PgPool,
-    chunk_time_interval_secs: u64,
-    type_key_slice_width: u32,
+    cfg: &TimescaleDbPluginConfig,
 ) -> Result<(), sqlx::Error> {
     let mut lock_conn = pool.acquire().await?;
     acquire_init_lock(&mut lock_conn).await?;
 
-    let result = apply_partitioning(pool, chunk_time_interval_secs, type_key_slice_width).await;
+    let result = async {
+        apply_partitioning(pool, cfg.chunk_time_interval_secs, cfg.type_key_slice_width).await?;
+        apply_rollup_policies(pool, cfg).await
+    }
+    .await;
 
     // Release on every path (including the error path) so a failing replica
     // never wedges the others. If the unlock itself fails the session is likely

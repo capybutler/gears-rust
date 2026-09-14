@@ -43,6 +43,7 @@ use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordSt
 
 pub struct TsHarness {
     pub pool: PgPool,
+    pub cfg: TimescaleDbPluginConfig,
     _container: ContainerAsync<GenericImage>,
 }
 
@@ -310,16 +311,50 @@ pub async fn bring_up_with(
         .ok_or_else(|| anyhow::anyhow!("container bring-up loop ended without a container"))?;
 
     MIGRATOR.run(&pool).await?;
-    apply_post_migration_setup(
-        &pool,
-        cfg.chunk_time_interval_secs,
-        cfg.type_key_slice_width,
-    )
-    .await?;
+    apply_post_migration_setup(&pool, &cfg).await?;
+    settle_and_remove_rollup_policies(&pool).await?;
     Ok(TsHarness {
         pool,
+        cfg,
         _container: container,
     })
+}
+
+/// Wait for the two refresh policies' first run, which `TimescaleDB` starts
+/// within seconds of creating them, then delete them. A background refresh
+/// racing a test would make "stale until refreshed" assertions flaky; tests
+/// refresh explicitly through [`refresh_rollup`] instead. A test about the
+/// policies re-applies setup.
+async fn settle_and_remove_rollup_policies(pool: &PgPool) -> anyhow::Result<()> {
+    for _ in 0..60 {
+        let ran: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM timescaledb_information.jobs j \
+             JOIN timescaledb_information.job_stats js ON js.job_id = j.job_id \
+             WHERE j.proc_name = 'policy_refresh_continuous_aggregate' AND js.total_runs >= 1",
+        )
+        .fetch_one(pool)
+        .await?;
+        if ran >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    sqlx::query(
+        "SELECT delete_job(job_id) FROM timescaledb_information.jobs \
+         WHERE proc_name = 'policy_refresh_continuous_aggregate'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Materialise every invalidated range of the rollup now. Autocommit only:
+/// `refresh_continuous_aggregate` refuses a transaction block.
+pub async fn refresh_rollup(pool: &PgPool) {
+    sqlx::query("CALL refresh_continuous_aggregate('usage_rollup_1h', NULL, NULL)")
+        .execute(pool)
+        .await
+        .expect("refresh the rollup");
 }
 
 /// Build a fresh metric inventory over `pool`.

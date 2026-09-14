@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::storage::migration_probe;
+use timescaledb_usage_collector_plugin::infra::storage::pool::apply_post_migration_setup;
 use timescaledb_usage_collector_plugin::infra::storage::retention_sweep;
 
 /// The DDL spellings `format_type` renders differently, written out rather
@@ -395,4 +396,86 @@ async fn the_chunk_catalog_query_reads_one_row_per_chunk_with_both_ranges() {
             "the time range end bounds every window_end in the chunk: {chunk:?}"
         );
     }
+}
+
+/// The rollup is a real-time continuous aggregate over the grain the read path
+/// and the retention cut both rely on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_rollup_is_a_real_time_continuous_aggregate_over_the_grain() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    let materialized_only: bool = sqlx::query_scalar(
+        "SELECT materialized_only FROM timescaledb_information.continuous_aggregates \
+         WHERE view_schema = current_schema() AND view_name = 'usage_rollup_1h'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .expect("usage_rollup_1h must be a continuous aggregate");
+    assert!(!materialized_only, "real-time aggregation must be on");
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT attname::text FROM pg_attribute \
+         WHERE attrelid = 'usage_rollup_1h'::regclass AND attnum > 0 AND NOT attisdropped \
+         ORDER BY attnum",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .expect("view columns");
+    assert_eq!(
+        columns,
+        [
+            "bucket",
+            "tenant_id",
+            "gts_type_id",
+            "type_key",
+            "sum_value",
+            "count_value"
+        ]
+    );
+}
+
+/// Setup registers exactly the two configured policies, and re-running it
+/// replaces them rather than adding more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_registers_exactly_the_two_configured_refresh_policies() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let cfg = timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig {
+        rollup_materialization_lag_secs: 10_800,
+        rollup_live_window_secs: 172_800,
+        rollup_refresh_interval_secs: 300,
+        rollup_history_refresh_interval_secs: 7_200,
+        ..h.cfg.clone()
+    };
+    apply_post_migration_setup(&h.pool, &cfg)
+        .await
+        .expect("setup once");
+    apply_post_migration_setup(&h.pool, &cfg)
+        .await
+        .expect("setup twice");
+
+    // (start offset secs or NULL, end offset secs, schedule secs), live first.
+    let policies: Vec<(Option<f64>, f64, f64)> = sqlx::query_as(
+        "SELECT EXTRACT(EPOCH FROM (config->>'start_offset')::interval)::float8, \
+                EXTRACT(EPOCH FROM (config->>'end_offset')::interval)::float8, \
+                EXTRACT(EPOCH FROM schedule_interval)::float8 \
+         FROM timescaledb_information.jobs \
+         WHERE proc_name = 'policy_refresh_continuous_aggregate' \
+           AND hypertable_schema = current_schema() AND hypertable_name = 'usage_rollup_1h' \
+         ORDER BY (config->>'start_offset') IS NULL, job_id",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .expect("policy rows");
+    assert_eq!(
+        policies,
+        vec![
+            (Some(172_800.0), 10_800.0, 300.0),
+            (None, 172_800.0, 7_200.0),
+        ],
+        "one live policy and one history policy, replaced on re-run"
+    );
 }

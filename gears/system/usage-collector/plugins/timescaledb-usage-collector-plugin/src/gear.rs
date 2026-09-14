@@ -79,8 +79,7 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
                     metrics.inc_migration_failure();
                     return Err::<_, anyhow::Error>(e.into());
                 }
-                apply_post_migration_setup(&pool, cfg.chunk_time_interval_secs, cfg.type_key_slice_width)
-                    .await?;
+                apply_post_migration_setup(&pool, &cfg).await?;
                 Ok((pool, metrics))
             } => res?,
         };

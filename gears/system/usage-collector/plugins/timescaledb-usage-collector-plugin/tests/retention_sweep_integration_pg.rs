@@ -206,7 +206,11 @@ async fn a_shared_slice_is_held_to_its_longest_retention() {
         .expect("timescaledb container (Docker required)");
     // Before any write, so the first chunks are created at width 4: keys 1 and
     // 2 share the slice [0, 4).
-    apply_post_migration_setup(&h.pool, 604_800, 4)
+    let widened = timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig {
+        type_key_slice_width: 4,
+        ..h.cfg.clone()
+    };
+    apply_post_migration_setup(&h.pool, &widened)
         .await
         .expect("widen the type-key slice");
     let store = common::record_store(&h.pool);

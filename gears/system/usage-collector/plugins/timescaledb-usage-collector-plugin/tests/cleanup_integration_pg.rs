@@ -22,8 +22,9 @@ async fn pg_concurrent_post_migration_setup_is_serialized() {
     let mut tasks = Vec::new();
     for _ in 0..8u32 {
         let pool = h.pool.clone();
+        let cfg = h.cfg.clone();
         tasks.push(tokio::spawn(async move {
-            apply_post_migration_setup(&pool, 604_800, 1).await
+            apply_post_migration_setup(&pool, &cfg).await
         }));
     }
     for t in tasks {
