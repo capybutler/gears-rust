@@ -976,8 +976,8 @@ async fn an_orphan_invalidation_contributes_nothing() {
         .await
         .expect("create the standing entry");
 
-    // Purge the target the way retention would: the row goes, the withdrawal
-    // that named it stays.
+    // Manufacture an orphan out of band: the row goes, the withdrawal that
+    // named it stays.
     let purged = sqlx::query("DELETE FROM usage_records WHERE id = $1")
         .bind(target.id)
         .execute(&h.pool)

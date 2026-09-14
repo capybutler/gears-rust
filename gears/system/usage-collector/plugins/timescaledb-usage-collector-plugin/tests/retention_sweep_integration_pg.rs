@@ -26,8 +26,9 @@ use timescaledb_usage_collector_plugin::domain::ports::{
 use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
 use timescaledb_usage_collector_plugin::infra::storage::pool::apply_post_migration_setup;
 use timescaledb_usage_collector_plugin::infra::storage::retention_sweep::{
-    PgRetentionSweeper, SWEEP_ADVISORY_LOCK_KEY,
+    PgRetentionSweeper, SWEEP_ADVISORY_LOCK_KEY, list_chunks,
 };
+use timescaledb_usage_collector_plugin::infra::storage::rollup_maintenance::materialization_table;
 
 const DAY: u64 = 86_400;
 
@@ -213,6 +214,11 @@ async fn a_shared_slice_is_held_to_its_longest_retention() {
     apply_post_migration_setup(&h.pool, &widened)
         .await
         .expect("widen the type-key slice");
+    // apply_post_migration_setup re-creates the refresh policies; remove them
+    // again so a background refresh cannot race this test's own sweeps.
+    common::settle_and_remove_rollup_policies(&h.pool)
+        .await
+        .expect("settle and remove the re-created policies");
     let store = common::record_store(&h.pool);
     let tenant = Uuid::from_u128(0x5E04);
     let stub = Arc::new(StubRetention::default());
@@ -334,6 +340,19 @@ async fn a_sweep_skips_while_another_session_holds_the_lock() {
     assert!(!ran.skipped_locked && ran.dropped == 1, "{ran:?}");
 }
 
+/// Whether `usage_rollup_1h` holds a row for `meter` at exactly `bucket`.
+async fn bucket_exists(pool: &sqlx::PgPool, meter: &str, bucket: OffsetDateTime) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_rollup_1h WHERE gts_type_id = $1 AND bucket = $2",
+    )
+    .bind(meter)
+    .bind(bucket)
+    .fetch_one(pool)
+    .await
+    .expect("count rollup bucket");
+    n > 0
+}
+
 async fn rollup_rows(pool: &sqlx::PgPool, meter: &str) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM usage_rollup_1h WHERE gts_type_id = $1")
         .bind(meter)
@@ -400,6 +419,11 @@ async fn a_shared_slice_drop_cuts_every_type_in_its_key_range() {
     apply_post_migration_setup(&h.pool, &widened)
         .await
         .expect("widen");
+    // apply_post_migration_setup re-creates the refresh policies; remove them
+    // again so a background refresh cannot race this test's own sweep.
+    common::settle_and_remove_rollup_policies(&h.pool)
+        .await
+        .expect("settle and remove the re-created policies");
     let store = common::record_store(&h.pool);
     let tenant = Uuid::from_u128(0x5E11);
     let stub = Arc::new(StubRetention::default());
@@ -493,5 +517,167 @@ async fn a_late_write_into_a_dropped_range_is_the_only_thing_the_next_refresh_ro
         total,
         Some(Decimal::from(3)),
         "only the surviving late row is rolled up"
+    );
+}
+
+/// The rollup cut is bounded to the dropped chunk's own bucket range: an
+/// expired chunk's rollup row is deleted, and the very next hour's row, which
+/// belongs to a chunk that has not expired, survives untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollup_drop_cuts_only_the_dropped_chunks_bucket_range() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h.pool);
+    let tenant = Uuid::from_u128(0x5E20);
+    let stub = Arc::new(StubRetention::default());
+
+    // Discover the boundary between two adjacent chunks under the default
+    // 7-day chunk_time_interval_secs, without assuming how TimescaleDB
+    // anchors it: write a throw-away entry far in the past, read its chunk's
+    // [time_start, time_end) back from the catalog via list_chunks, and take
+    // time_end as the boundary. The row is then removed out of band so it
+    // does not add a second rollup bucket to the expired chunk below.
+    let probe = aged(common::VCPU_METER, tenant, "probe", 100);
+    let probe_id = probe.id;
+    let probe_end = probe.window_end;
+    store.create(probe).await.expect("create probe");
+    let probe_chunk = list_chunks(&h.pool)
+        .await
+        .expect("list chunks")
+        .into_iter()
+        .find(|c| c.time_start <= probe_end && probe_end < c.time_end)
+        .expect("the probe landed in a chunk");
+    let boundary = probe_chunk.time_end;
+    sqlx::query("DELETE FROM usage_records WHERE id = $1")
+        .bind(probe_id)
+        .execute(&h.pool)
+        .await
+        .expect("remove the probe");
+
+    // Two adjacent chunks at the discovered boundary: the expired chunk gets
+    // an entry in its LAST hour (window_end in [boundary - 1h, boundary)),
+    // the fresh chunk directly after it gets an entry in its FIRST hour
+    // (window_end in [boundary, boundary + 1h)). chunk_time_interval_secs is
+    // validated as a multiple of 3600 precisely so every hourly bucket lies
+    // inside exactly one chunk (spec §5.4); that makes `boundary` itself
+    // hour-aligned, so each entry's time_bucket('1 hour', window_end) bucket
+    // lands wholly inside its own chunk.
+    let expired_end = boundary - Duration::minutes(30);
+    let fresh_end = boundary + Duration::minutes(30);
+    let expired = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "expired",
+        Decimal::ONE,
+        expired_end - Duration::hours(1),
+        expired_end,
+    );
+    let fresh = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "fresh",
+        Decimal::ONE,
+        fresh_end - Duration::hours(1),
+        fresh_end,
+    );
+    store.create(expired).await.expect("create expired entry");
+    store.create(fresh).await.expect("create fresh entry");
+
+    // Retention arithmetic. `drop_decision` drops a chunk when
+    // `chunk.time_end + retention < now`. The expired chunk's time_end is
+    // `boundary`; the fresh chunk's is `boundary + 7 days` (the default
+    // chunk width). Anchoring the retention off `now - boundary`, rather
+    // than off a fixed day count, makes the arithmetic hold regardless of
+    // exactly where inside the 7-day window the 100-day-old probe landed:
+    //   expired: boundary + retention < now        =>  retention < now - boundary
+    //   fresh:   boundary + 7d + retention >= now   =>  retention >= now - boundary - 7d
+    // retention = (now - boundary) - 1 day satisfies both: a full day of
+    // margin on the expired side, and (7 days - 1 day) = 6 days of margin on
+    // the fresh side.
+    let now = OffsetDateTime::now_utc();
+    let secs_since_boundary = (now - boundary).whole_seconds();
+    assert!(
+        secs_since_boundary > i64::try_from(DAY).expect("DAY fits i64"),
+        "the discovered boundary must be more than a day in the past: {secs_since_boundary}s"
+    );
+    let retention_secs = u64::try_from(secs_since_boundary).expect("positive, checked above") - DAY;
+    stub.set(
+        common::VCPU_METER,
+        Ok(StdDuration::from_secs(retention_secs)),
+    );
+
+    common::refresh_rollup(&h.pool).await;
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!(
+        (report.dropped, report.rollup_rows_deleted),
+        (1, 1),
+        "{report:?}"
+    );
+
+    let expired_bucket = boundary - Duration::hours(1);
+    let fresh_bucket = boundary;
+    assert!(
+        !bucket_exists(&h.pool, common::VCPU_METER, expired_bucket).await,
+        "the expired chunk's rollup bucket is cut with its chunk"
+    );
+    assert!(
+        bucket_exists(&h.pool, common::VCPU_METER, fresh_bucket).await,
+        "the fresh chunk's rollup bucket survives untouched"
+    );
+}
+
+/// A failed rollup-row delete rolls back the whole drop: the chunk stays, the
+/// ledger entry stays, and the failure is counted rather than the sweep
+/// silently dropping a chunk whose rollup rows it could not also delete.
+///
+/// Mechanism: a `BEFORE DELETE` trigger on the materialisation hypertable
+/// (`rollup_maintenance::materialization_table`) that always raises. Tried
+/// against a live `timescale/timescaledb:2.29.2-pg18` container before this
+/// test was written: `TimescaleDB` accepts an ordinary trigger on that table
+/// without complaint (it is a plain heap table under
+/// `_timescaledb_internal`, owned by the same role the test pool connects
+/// as), so the `REVOKE DELETE` fallback the brief allows for was not needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rollup_row_delete_rolls_back_the_chunk_drop() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h.pool);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E21), "rollback", 100);
+    let id = entry.id;
+    store.create(entry).await.expect("create fixture");
+    common::refresh_rollup(&h.pool).await;
+
+    let table = materialization_table(&h.pool)
+        .await
+        .expect("materialisation table query")
+        .expect("the rollup has a materialisation table");
+    sqlx::query(
+        "CREATE FUNCTION uc_test_raise_on_rollup_delete() RETURNS trigger AS \
+         $$ BEGIN RAISE EXCEPTION 'delete refused for rollback test'; END; $$ \
+         LANGUAGE plpgsql",
+    )
+    .execute(&h.pool)
+    .await
+    .expect("create the raising trigger function");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER uc_test_refuse_delete BEFORE DELETE ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION uc_test_raise_on_rollup_delete()"
+    )))
+    .execute(&h.pool)
+    .await
+    .expect("install the raising trigger");
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!((report.drop_failures, report.dropped), (1, 0), "{report:?}");
+    assert!(
+        stored(&h.pool, id).await,
+        "the chunk drop rolled back along with the failed rollup-row delete"
     );
 }

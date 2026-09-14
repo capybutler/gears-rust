@@ -323,9 +323,11 @@ pub async fn bring_up_with(
 /// Wait for the two refresh policies' first run, which `TimescaleDB` starts
 /// within seconds of creating them, then delete them. A background refresh
 /// racing a test would make "stale until refreshed" assertions flaky; tests
-/// refresh explicitly through [`refresh_rollup`] instead. A test about the
-/// policies re-applies setup.
-async fn settle_and_remove_rollup_policies(pool: &PgPool) -> anyhow::Result<()> {
+/// refresh explicitly through [`refresh_rollup`] instead. A test that
+/// re-applies setup (which re-creates the policies) must call this again
+/// afterwards, once it is done asserting on the policies, so they cannot race
+/// the sweep.
+pub async fn settle_and_remove_rollup_policies(pool: &PgPool) -> anyhow::Result<()> {
     for _ in 0..60 {
         let ran: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM timescaledb_information.jobs j \

@@ -482,6 +482,12 @@ async fn setup_registers_exactly_the_two_configured_refresh_policies() {
         ],
         "one live policy and one history policy, replaced on re-run"
     );
+
+    // The assertion above is done with the policies; remove them so a
+    // background refresh cannot race a later test's sweep.
+    common::settle_and_remove_rollup_policies(&h.pool)
+        .await
+        .expect("settle and remove the re-created policies");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

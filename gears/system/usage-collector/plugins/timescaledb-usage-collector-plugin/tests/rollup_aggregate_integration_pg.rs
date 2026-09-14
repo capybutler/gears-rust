@@ -8,6 +8,8 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
 use time::{Duration, OffsetDateTime};
@@ -20,9 +22,12 @@ use usage_collector_sdk::{
 };
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
+use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
 use timescaledb_usage_collector_plugin::infra::storage::pool::apply_post_migration_setup;
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
-use timescaledb_usage_collector_plugin::infra::storage::rollup_maintenance::refresh_job_statuses;
+use timescaledb_usage_collector_plugin::infra::storage::rollup_maintenance::{
+    RollupMonitor, refresh_job_statuses,
+};
 
 const TENANT_A: Uuid = Uuid::from_u128(0xA0);
 const TENANT_B: Uuid = Uuid::from_u128(0xB0);
@@ -183,6 +188,18 @@ async fn the_rollup_path_equals_the_scan_before_and_after_a_refresh() {
     let s = stores().await;
     seed(&s.rollup).await;
     assert_paths_agree(&s, "before refresh (real-time half only)").await;
+
+    // A bounded refresh moves the watermark only across [h0(), h0() + 12h),
+    // leaving the rest of the fixture on the real-time half. Autocommit only:
+    // `refresh_continuous_aggregate` refuses a transaction block.
+    sqlx::query("CALL refresh_continuous_aggregate('usage_rollup_1h', $1, $2)")
+        .bind(h0())
+        .bind(h0() + Duration::hours(12))
+        .execute(&s.h.pool)
+        .await
+        .expect("bounded refresh");
+    assert_paths_agree(&s, "after a bounded refresh (watermark mid-fixture)").await;
+
     common::refresh_rollup(&s.h.pool).await;
     assert_paths_agree(&s, "after refresh").await;
 }
@@ -364,4 +381,16 @@ async fn both_refresh_policies_report_a_success_age_after_their_first_run() {
             .all(|st| !st.failing && st.secs_since_success.is_some()),
         "{statuses:?}"
     );
+}
+
+/// Bring-up settles and deletes the two refresh policies (see
+/// `common::settle_and_remove_rollup_policies`), so a monitor sample taken
+/// right after bring-up must find zero policies rather than erroring or
+/// reporting a stale count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_monitor_sample_after_bring_up_finds_no_policies() {
+    let s = stores().await;
+    let metrics = Arc::new(Metrics::new(s.h.pool.clone()));
+    let monitor = RollupMonitor::new(s.h.pool.clone(), metrics);
+    assert_eq!(monitor.sample_once().await.expect("sample"), 0);
 }
