@@ -108,9 +108,16 @@ fn the_range_predicate_reads_the_period_end_alone() {
         clauses,
         vec![
             "r.gts_type_id = $1".to_owned(),
+            "r.type_key = (SELECT k.type_key FROM usage_type_key k WHERE k.gts_type_id = $1)"
+                .to_owned(),
             "r.window_end >= $2".to_owned(),
             "r.window_end < $3".to_owned(),
         ]
+    );
+    assert_eq!(
+        ctx.binds.len(),
+        3,
+        "the key subquery reuses the meter's bind rather than binding it twice"
     );
     assert!(
         !clauses.iter().any(|c| c.contains("window_start")),

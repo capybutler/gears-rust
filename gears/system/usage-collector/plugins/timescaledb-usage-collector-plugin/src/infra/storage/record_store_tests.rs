@@ -1888,7 +1888,9 @@ fn the_composed_filter_survives_the_conjunction_with_the_range() {
     // Transcribed by hand, not derived from anything the builder produces.
     assert_eq!(
         statement_tail(&sql),
-        "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
+        "r WHERE r.gts_type_id = $1 \
+         AND r.type_key = (SELECT k.type_key FROM usage_type_key k WHERE k.gts_type_id = $1) \
+         AND r.window_end >= $2 AND r.window_end < $3 \
          AND (((tenant_id = $4 AND resource_type = $5) \
          OR (tenant_id = $6 AND resource_type = $7))) \
          ORDER BY window_end ASC, id ASC LIMIT 26",
@@ -1958,7 +1960,9 @@ fn the_keyset_tuple_and_the_order_by_read_one_order() {
     // Transcribed by hand.
     assert_eq!(
         statement_tail(&sql),
-        "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
+        "r WHERE r.gts_type_id = $1 \
+         AND r.type_key = (SELECT k.type_key FROM usage_type_key k WHERE k.gts_type_id = $1) \
+         AND r.window_end >= $2 AND r.window_end < $3 \
          AND (id, window_end) < ($4, $5) \
          ORDER BY id DESC, window_end DESC LIMIT 26",
         "the tuple's columns, its operator and the ORDER BY all read one order"
@@ -1987,7 +1991,9 @@ fn the_metadata_side_channel_is_bound_after_the_range() {
 
     assert_eq!(
         statement_tail(&sql),
-        "r WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
+        "r WHERE r.gts_type_id = $1 \
+         AND r.type_key = (SELECT k.type_key FROM usage_type_key k WHERE k.gts_type_id = $1) \
+         AND r.window_end >= $2 AND r.window_end < $3 \
          AND r.metadata ->> $4 IN ($5, $6) \
          ORDER BY window_end ASC, id ASC LIMIT 26"
     );
@@ -2283,9 +2289,11 @@ fn the_fold_assembles_one_statement_from_the_builders_both_read_paths_share() {
         sql,
         "SELECT r.subject_type, r.metadata ->> $8, SUM(r.value)::numeric \
          FROM usage_records r \
-         WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3 \
+         WHERE r.gts_type_id = $1 \
+         AND r.type_key = (SELECT k.type_key FROM usage_type_key k WHERE k.gts_type_id = $1) \
+         AND r.window_end >= $2 AND r.window_end < $3 \
          AND r.invalidates IS NULL \
-         AND NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id) \
+         AND NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id AND w.type_key = r.type_key) \
          AND ((tenant_id = $4 AND resource_type = $5)) \
          AND r.metadata ->> $6 IN ($7) \
          AND r.subject_type IS NOT NULL \

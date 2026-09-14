@@ -53,19 +53,27 @@ pub fn ledger_from_clause() -> &'static str {
 /// needs its own test to notice drift; read from here, both paths inherit the
 /// one that exists.
 ///
-/// Binds the meter and the two bounds onto `ctx` in that order, and pushes the
-/// three clause strings onto `clauses`. `time_range` is a typed SPI parameter
-/// and is never a `$filter` conjunct — the gateway refuses a predicate naming
-/// either bound — so nothing caller-supplied reaches this.
+/// Binds the meter and the two bounds onto `ctx` in that order, and pushes
+/// four clause strings onto `clauses`. The partition-key subquery reuses the
+/// meter's bind. `time_range` is a typed SPI parameter and is never a
+/// `$filter` conjunct — the gateway refuses a predicate naming either bound —
+/// so nothing caller-supplied reaches this.
 pub fn push_meter_and_range_clauses(
     gts_type_id: &MeterTypeId,
     time_range: TimeRange,
     ctx: &mut SqlCtx,
     clauses: &mut Vec<String>,
 ) {
+    let meter = ctx.push(SqlBind::Str(gts_type_id.as_str().to_owned()));
+    clauses.push(format!("r.gts_type_id = ${meter}"));
+    // The same meter as its partition key, which is what excludes every other
+    // type's chunks: a predicate on `gts_type_id` alone excludes none. The
+    // subquery runs once as an InitPlan and the chunks it rules out are skipped
+    // at runtime. A type that was never written has no key, so it yields NULL,
+    // matches no row and excludes every chunk — the ordinary empty result, with
+    // no sentinel and no lookup ahead of the statement.
     clauses.push(format!(
-        "r.gts_type_id = ${}",
-        ctx.push(SqlBind::Str(gts_type_id.as_str().to_owned()))
+        "r.type_key = (SELECT k.type_key FROM usage_type_key k WHERE k.gts_type_id = ${meter})"
     ));
     clauses.push(format!(
         "r.window_end >= ${}",

@@ -95,8 +95,9 @@ fn a_record_an_accepted_invalidation_names_is_excluded_under_every_fold() {
     // measurement the withdrawal was meant to remove, because an invalidation
     // echoes the quantity it withdraws rather than negating it.
     assert!(
-        withdrawal_exclusion_clause()
-            .contains("NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id)"),
+        withdrawal_exclusion_clause().contains(
+            "NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id AND w.type_key = r.type_key)"
+        ),
         "the entry an accepted invalidation names must contribute nothing either, got {}",
         withdrawal_exclusion_clause()
     );
@@ -112,7 +113,8 @@ fn no_fold_gets_its_own_withdrawal_rule() {
     assert_eq!(
         withdrawal_exclusion_clause(),
         "r.invalidates IS NULL \
-         AND NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id)"
+         AND NOT EXISTS (SELECT 1 FROM usage_records w \
+         WHERE w.invalidates = r.id AND w.type_key = r.type_key)"
     );
 }
 
@@ -237,15 +239,19 @@ fn ledger_columns_are_the_migrations_columns() {
 }
 
 /// The aliases `sql` may qualify a column with. `r`, the alias
-/// [`ledger_from_clause`] declares, is always admissible. `w` is admissible
-/// only in a fragment that declares it, so a fragment borrowing the withdrawal
-/// subquery's alias without opening the subquery is an offender rather than a
-/// pass.
+/// [`ledger_from_clause`] declares, is always admissible. `w` and `k` are
+/// admissible only in a fragment that opens them — the withdrawal subquery's
+/// second ledger and the type-key lookup's `usage_type_key` — so a fragment
+/// borrowing either without opening it is an offender rather than a pass.
 fn aliases_for(sql: &str) -> &'static [u8] {
-    if sql.contains("FROM usage_records w") {
-        b"rw"
-    } else {
-        b"r"
+    match (
+        sql.contains("FROM usage_records w"),
+        sql.contains("FROM usage_type_key k"),
+    ) {
+        (true, true) => b"rwk",
+        (true, false) => b"rw",
+        (false, true) => b"rk",
+        (false, false) => b"r",
     }
 }
 

@@ -104,6 +104,11 @@ pub fn fold_select_expr(fold: AggregationFold) -> &'static str {
 /// target and keep the invalidation that withdrew it; that orphan is the echoed
 /// quantity with nothing left to pair it against.
 ///
+/// The subquery also pins `w.type_key = r.type_key`. An invalidation has its
+/// target's type and so its key, so this excludes nothing the `id` match would
+/// keep; what it buys is chunk exclusion inside the subquery, which otherwise
+/// probes the invalidation index in every type's chunks.
+///
 /// # Precondition
 ///
 /// The outer query's `FROM` must be [`super::ledger_from_clause`] — `r` is what
@@ -113,7 +118,8 @@ pub fn fold_select_expr(fold: AggregationFold) -> &'static str {
 #[must_use]
 pub fn withdrawal_exclusion_clause() -> &'static str {
     "r.invalidates IS NULL \
-     AND NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id)"
+     AND NOT EXISTS (SELECT 1 FROM usage_records w \
+     WHERE w.invalidates = r.id AND w.type_key = r.type_key)"
 }
 
 /// SQL TEXT-returning expression for a group [`AggregationDimension`].

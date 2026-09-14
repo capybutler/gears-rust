@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
+use sqlx::AssertSqlSafe;
 use time::Duration;
 use uuid::Uuid;
 
@@ -34,6 +35,10 @@ use usage_collector_sdk::{
 };
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
+use timescaledb_usage_collector_plugin::infra::storage::query::translate::SqlCtx;
+use timescaledb_usage_collector_plugin::infra::storage::query::{
+    ledger_from_clause, push_meter_and_range_clauses,
+};
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
 
 /// The fingerprint the gateway computes for the query a page is read under. The
@@ -1345,5 +1350,64 @@ async fn the_fold_honours_the_filter_and_the_metadata_side_channel() {
         only_bucket_value(&result).map(|v| v.normalized()),
         Some(BigDecimal::from(4).normalized()),
         "the side channel narrows inside the filter"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-type chunk pruning
+// ---------------------------------------------------------------------------
+
+/// Two types in one time range sit in two chunks. A read of one type must
+/// execute only its own chunk. `gts_type_id` alone excludes nothing, so this
+/// fails if the partition-key clause is missing or stops excluding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_type_read_executes_only_that_types_chunk() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h.pool);
+    let tenant = Uuid::from_u128(0x9A0E);
+    let vcpu = common::meter(common::VCPU_METER);
+    let gb = common::meter(common::GB_METER);
+    store
+        .create(common::entry(&vcpu, tenant, "vcpu", Decimal::ONE))
+        .await
+        .expect("create vcpu");
+    store
+        .create(common::entry(&gb, tenant, "gb", Decimal::ONE))
+        .await
+        .expect("create gb");
+
+    let range = TimeRange::new(
+        common::fixture_window_start(),
+        common::fixture_window_end() + Duration::seconds(1),
+    )
+    .expect("a strictly ordered range");
+    let mut ctx = SqlCtx::new(1);
+    let mut clauses: Vec<String> = Vec::new();
+    push_meter_and_range_clauses(&vcpu, range, &mut ctx, &mut clauses);
+    let sql = format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*) FROM {} WHERE {}",
+        ledger_from_clause(),
+        clauses.join(" AND "),
+    );
+
+    let plan: Vec<String> = sqlx::query_scalar(AssertSqlSafe(sql))
+        .bind(vcpu.as_str())
+        .bind(range.lower_inclusive())
+        .bind(range.upper_exclusive())
+        .fetch_all(&h.pool)
+        .await
+        .expect("explain the single-type read");
+
+    let executed = plan
+        .iter()
+        .filter(|line| line.contains("_hyper_") && !line.contains("never executed"))
+        .count();
+    assert_eq!(
+        executed,
+        1,
+        "only the queried type's chunk may execute:\n{}",
+        plan.join("\n")
     );
 }

@@ -1890,7 +1890,7 @@ struct AggregateStatement {
 /// ```sql
 /// SELECT <dimension exprs…>, <fold expr>
 /// FROM usage_records r
-/// WHERE r.gts_type_id = $1 AND r.window_end >= $2 AND r.window_end < $3
+/// WHERE r.gts_type_id = $1 AND r.type_key = (…) AND r.window_end >= $2 AND r.window_end < $3
 ///   AND <withdrawal exclusion>
 ///   [AND <translated $filter>] [AND <metadata filters>] [AND <presence guards>]
 /// [GROUP BY 1, 2, …] [LIMIT MAX_AGGREGATION_BUCKETS + 1]
