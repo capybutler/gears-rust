@@ -468,6 +468,7 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
     metrics.inc_retention_drop_failure();
     metrics.set_chunks(1);
     metrics.record_aggregate_path(None);
+    metrics.add_rollup_rows_deleted(3);
 
     provider.force_flush().unwrap();
 

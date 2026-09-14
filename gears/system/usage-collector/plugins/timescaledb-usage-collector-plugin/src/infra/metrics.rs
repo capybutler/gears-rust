@@ -276,6 +276,8 @@ pub struct Metrics {
     retention_drop_failures: Counter<u64>,
     /// `uc_timescaledb_aggregate_path_total` — labelled by `path` and `reason`.
     aggregate_path: Counter<u64>,
+    /// `uc_timescaledb_rollup_rows_deleted_total`.
+    rollup_rows_deleted: Counter<u64>,
 
     // --- Synchronous gauges (set imperatively) ---
     /// `uc_timescaledb_ready` — plugin-local backend health (0/1).
@@ -431,6 +433,12 @@ impl Metrics {
                  from usage_rollup_1h plus ledger edges) or path=scan, with the reason it fell back",
             )
             .build();
+        let rollup_rows_deleted = meter
+            .u64_counter("uc_timescaledb_rollup_rows_deleted_total")
+            .with_description(
+                "Rollup rows deleted with the ledger chunks the retention sweep dropped",
+            )
+            .build();
 
         let ready = meter
             .u64_gauge("uc_timescaledb_ready")
@@ -480,6 +488,7 @@ impl Metrics {
             retention_chunks_kept_unresolved,
             retention_drop_failures,
             aggregate_path,
+            rollup_rows_deleted,
             ready,
             chunks,
             _pool_active: pool_active,
@@ -641,6 +650,11 @@ impl Metrics {
         );
     }
 
+    /// Add `n` to the deleted-rollup-rows counter.
+    pub fn add_rollup_rows_deleted(&self, n: u64) {
+        self.rollup_rows_deleted.add(n, &[]);
+    }
+
     // --- Synchronous gauge setters ---
 
     /// Set the plugin-local readiness gauge (1 when `ready`, else 0).
@@ -704,6 +718,7 @@ impl Metrics {
             retention_chunks_kept_unresolved: _,
             retention_drop_failures: _,
             aggregate_path: _,
+            rollup_rows_deleted: _,
             ready: _,
             chunks: _,
             _pool_active: _,
@@ -735,6 +750,7 @@ impl Metrics {
             "uc_timescaledb_retention_drop_failures_total",
             "uc_timescaledb_chunks",
             "uc_timescaledb_aggregate_path_total",
+            "uc_timescaledb_rollup_rows_deleted_total",
         ]
     }
 }

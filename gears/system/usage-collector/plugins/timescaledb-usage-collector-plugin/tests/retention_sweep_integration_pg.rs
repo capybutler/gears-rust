@@ -333,3 +333,165 @@ async fn a_sweep_skips_while_another_session_holds_the_lock() {
     let ran = sweeper.sweep_once().await.expect("sweep after release");
     assert!(!ran.skipped_locked && ran.dropped == 1, "{ran:?}");
 }
+
+async fn rollup_rows(pool: &sqlx::PgPool, meter: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM usage_rollup_1h WHERE gts_type_id = $1")
+        .bind(meter)
+        .fetch_one(pool)
+        .await
+        .expect("count rollup rows")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drop_takes_its_types_rollup_rows_and_leaves_the_others() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h.pool);
+    let tenant = Uuid::from_u128(0x5E10);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    stub.set(common::GB_METER, days(400));
+    store
+        .create(aged(common::VCPU_METER, tenant, "vcpu", 100))
+        .await
+        .expect("vcpu");
+    store
+        .create(aged(common::GB_METER, tenant, "gb", 100))
+        .await
+        .expect("gb");
+    common::refresh_rollup(&h.pool).await;
+    assert_eq!(
+        (
+            rollup_rows(&h.pool, common::VCPU_METER).await,
+            rollup_rows(&h.pool, common::GB_METER).await
+        ),
+        (1, 1)
+    );
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!(
+        (report.dropped, report.rollup_rows_deleted),
+        (1, 1),
+        "{report:?}"
+    );
+    assert_eq!(
+        rollup_rows(&h.pool, common::VCPU_METER).await,
+        0,
+        "the expired type's rollup rows go with its chunk"
+    );
+    assert_eq!(
+        rollup_rows(&h.pool, common::GB_METER).await,
+        1,
+        "the other type's rollup rows stay"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shared_slice_drop_cuts_every_type_in_its_key_range() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let widened = timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig {
+        type_key_slice_width: 4,
+        ..h.cfg.clone()
+    };
+    apply_post_migration_setup(&h.pool, &widened)
+        .await
+        .expect("widen");
+    let store = common::record_store(&h.pool);
+    let tenant = Uuid::from_u128(0x5E11);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    stub.set(common::GB_METER, days(30));
+    store
+        .create(aged(common::VCPU_METER, tenant, "vcpu", 100))
+        .await
+        .expect("vcpu");
+    store
+        .create(aged(common::GB_METER, tenant, "gb", 100))
+        .await
+        .expect("gb");
+    common::refresh_rollup(&h.pool).await;
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!(
+        (report.dropped, report.rollup_rows_deleted),
+        (1, 2),
+        "{report:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_rollup_nothing_is_dropped() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h.pool);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E12), "kept", 100);
+    let id = entry.id;
+    store.create(entry).await.expect("create");
+    sqlx::query("DROP MATERIALIZED VIEW usage_rollup_1h")
+        .execute(&h.pool)
+        .await
+        .expect("drop the rollup");
+
+    assert!(sweeper(&h.pool, &stub).sweep_once().await.is_err());
+    assert!(
+        stored(&h.pool, id).await,
+        "no rollup to cut, so no chunk is dropped"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_write_into_a_dropped_range_is_the_only_thing_the_next_refresh_rolls_up() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h.pool);
+    let tenant = Uuid::from_u128(0x5E13);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    let first = aged(common::VCPU_METER, tenant, "first", 100);
+    let (start, end) = (first.window_start, first.window_end);
+    store.create(first).await.expect("first");
+    common::refresh_rollup(&h.pool).await;
+    assert_eq!(
+        sweeper(&h.pool, &stub)
+            .sweep_once()
+            .await
+            .expect("sweep")
+            .dropped,
+        1
+    );
+
+    let late = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "late",
+        Decimal::from(3),
+        start,
+        end,
+    );
+    store
+        .create(late)
+        .await
+        .expect("late write recreates the chunk");
+    common::refresh_rollup(&h.pool).await;
+
+    let total: Option<rust_decimal::Decimal> =
+        sqlx::query_scalar("SELECT sum(sum_value) FROM usage_rollup_1h WHERE gts_type_id = $1")
+            .bind(common::VCPU_METER)
+            .fetch_one(&h.pool)
+            .await
+            .expect("rollup total");
+    assert_eq!(
+        total,
+        Some(Decimal::from(3)),
+        "only the surviving late row is rolled up"
+    );
+}

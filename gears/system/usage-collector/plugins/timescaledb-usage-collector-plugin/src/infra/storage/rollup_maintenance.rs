@@ -70,6 +70,41 @@ pub async fn apply_rollup_policies(
     Ok(())
 }
 
+/// The rollup's materialisation hypertable, schema-qualified and quoted with
+/// `%I` by the database, from the public information view rather than the
+/// internal catalog.
+pub const MATERIALIZATION_TABLE_SQL: &str = "SELECT format('%I.%I', materialization_hypertable_schema, materialization_hypertable_name) \
+     FROM timescaledb_information.continuous_aggregates \
+     WHERE view_schema = current_schema() AND view_name = 'usage_rollup_1h'";
+
+/// The materialisation hypertable, or `None` when the rollup does not exist.
+///
+/// # Errors
+/// Returns `sqlx::Error` if the query fails.
+pub async fn materialization_table(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(MATERIALIZATION_TABLE_SQL)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Deletes the rollup rows a dropped ledger chunk fed: `$1`/`$2` the chunk's
+/// `type_key` range, `$3`/`$4` its `window_end` range.
+///
+/// Only buckets **wholly** inside the chunk are cut. With the hour-multiple
+/// chunk interval every bucket is; a straddling bucket from a chunk created
+/// under an earlier interval is kept while its neighbour still holds rows, so
+/// the rollup can over-retain one bucket and never under-count.
+///
+/// `table` must come from [`materialization_table`], which quotes it; it is
+/// never caller input.
+#[must_use]
+pub fn delete_rollup_rows_sql(table: &str) -> String {
+    format!(
+        "DELETE FROM {table} WHERE type_key >= $1::bigint AND type_key < $2::bigint \
+         AND bucket >= $3 AND bucket + INTERVAL '1 hour' <= $4"
+    )
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "rollup_maintenance_tests.rs"]

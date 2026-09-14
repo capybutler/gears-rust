@@ -25,3 +25,11 @@ fn the_sweep_lock_is_not_the_init_lock() {
     // sweep and a replica's startup setup block each other.
     assert_ne!(SWEEP_ADVISORY_LOCK_KEY, 0x7563_7462);
 }
+
+#[test]
+fn the_catalog_query_reads_the_time_range_start_too() {
+    assert!(LIST_CHUNKS_SQL.contains(
+        "_timescaledb_functions.to_timestamp(\
+         max(ds.range_start) FILTER (WHERE d.column_name = 'window_end')) AS time_start"
+    ));
+}

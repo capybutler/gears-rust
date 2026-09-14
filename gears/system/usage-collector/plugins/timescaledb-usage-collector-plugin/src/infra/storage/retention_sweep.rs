@@ -16,19 +16,20 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sqlx::{Connection as _, PgPool};
+use sqlx::{AssertSqlSafe, Connection as _, PgPool};
 use time::OffsetDateTime;
 
 use crate::domain::ports::{RetentionError, RetentionSource};
 use crate::domain::retention::{Decision, drop_decision};
 use crate::infra::metrics::{Metrics, SweepOutcome};
+use crate::infra::storage::rollup_maintenance::{delete_rollup_rows_sql, materialization_table};
 
 /// Advisory-lock key admitting one sweeper at a time across replicas.
 /// Arbitrary but stable, and distinct from the init lock's key.
 /// (`0x7563_7473` == ASCII `"ucts"`.)
 pub const SWEEP_ADVISORY_LOCK_KEY: i64 = 0x7563_7473;
 
-/// Every chunk of `usage_records` with its time range end and type-key range.
+/// Every chunk of `usage_records` with its time range and type-key range.
 ///
 /// Reads internal catalog tables, whose shape changed between `TimescaleDB`
 /// 2.17 and 2.29; `tests/schema_integration_pg.rs` pins it against the image
@@ -36,6 +37,8 @@ pub const SWEEP_ADVISORY_LOCK_KEY: i64 = 0x7563_7473;
 /// time conversion, so no planner order can apply the conversion to the key
 /// dimension's range.
 pub const LIST_CHUNKS_SQL: &str = "SELECT ch.relid::text AS chunk, \
+     _timescaledb_functions.to_timestamp(\
+     max(ds.range_start) FILTER (WHERE d.column_name = 'window_end')) AS time_start, \
      _timescaledb_functions.to_timestamp(\
      max(ds.range_end) FILTER (WHERE d.column_name = 'window_end')) AS time_end, \
      max(ds.range_start) FILTER (WHERE d.column_name = 'type_key') AS key_start, \
@@ -56,6 +59,8 @@ pub const DROP_CHUNK_SQL: &str = "SELECT _timescaledb_functions.drop_chunk($1::r
 pub struct ChunkSlice {
     /// Schema-qualified chunk table, e.g. `_timescaledb_internal._hyper_1_1_chunk`.
     pub chunk: String,
+    /// Inclusive start of the chunk's `window_end` range.
+    pub time_start: OffsetDateTime,
     /// Exclusive end of the chunk's `window_end` range.
     pub time_end: OffsetDateTime,
     /// Inclusive start of the chunk's `type_key` range.
@@ -73,12 +78,19 @@ pub struct SweepReport {
     pub dropped: usize,
     pub kept_unresolved: usize,
     pub drop_failures: usize,
+    pub rollup_rows_deleted: u64,
 }
 
 /// One raw row of [`LIST_CHUNKS_SQL`], before the range-presence check that
 /// turns it into a [`ChunkSlice`]. Named so its type stays under the
 /// workspace's `type-complexity-threshold` at the call site.
-type ChunkRow = (String, Option<OffsetDateTime>, Option<i64>, Option<i64>);
+type ChunkRow = (
+    String,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
+    Option<i64>,
+    Option<i64>,
+);
 
 /// Every chunk of the ledger. A chunk missing either range — which a
 /// two-dimension hypertable does not produce — is logged and left out, and so
@@ -94,8 +106,9 @@ pub async fn list_chunks(pool: &PgPool) -> Result<Vec<ChunkSlice>, sqlx::Error> 
     let rows: Vec<ChunkRow> = sqlx::query_as(LIST_CHUNKS_SQL).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(chunk, time_end, key_start, key_end)| {
-            let (Some(time_end), Some(key_start), Some(key_end)) = (time_end, key_start, key_end)
+        .filter_map(|(chunk, time_start, time_end, key_start, key_end)| {
+            let (Some(time_start), Some(time_end), Some(key_start), Some(key_end)) =
+                (time_start, time_end, key_start, key_end)
             else {
                 tracing::warn!(
                     chunk = %chunk,
@@ -114,6 +127,7 @@ pub async fn list_chunks(pool: &PgPool) -> Result<Vec<ChunkSlice>, sqlx::Error> 
             }
             Some(ChunkSlice {
                 chunk,
+                time_start,
                 time_end,
                 key_start,
                 key_end,
@@ -144,8 +158,10 @@ impl PgRetentionSweeper {
     /// # Errors
     ///
     /// Returns the `sqlx` error that ended the sweep: acquiring the lock
-    /// connection, taking the lock, listing chunks or loading type keys. A
-    /// failed drop does not end the sweep; it is counted in the report.
+    /// connection, taking the lock, listing chunks, loading type keys, or
+    /// resolving the rollup's materialisation table (a missing rollup ends the
+    /// sweep before any drop). A failed drop does not end the sweep; it is
+    /// counted in the report.
     pub async fn sweep_once(&self) -> Result<SweepReport, sqlx::Error> {
         let started = Instant::now();
         let result = self.sweep_under_lock().await;
@@ -192,6 +208,14 @@ impl PgRetentionSweeper {
     /// types in its key range.
     async fn sweep(&self, now: OffsetDateTime) -> Result<SweepReport, sqlx::Error> {
         let chunks = list_chunks(&self.pool).await?;
+        // A ledger drop must take its rollup rows with it, so without the
+        // rollup's table nothing is dropped this sweep.
+        let Some(rollup_table) = materialization_table(&self.pool).await? else {
+            tracing::warn!(
+                "the rollup's materialisation table is missing; this sweep drops nothing"
+            );
+            return Err(sqlx::Error::RowNotFound);
+        };
         let type_keys: BTreeMap<i64, String> =
             sqlx::query_as::<_, (i32, String)>("SELECT type_key, gts_type_id FROM usage_type_key")
                 .fetch_all(&self.pool)
@@ -213,7 +237,8 @@ impl PgRetentionSweeper {
                 .resolve_chunk_retentions(chunk, &type_keys, &mut resolved)
                 .await;
             let decision = drop_decision(chunk.time_end, &retentions, now);
-            self.apply_decision(chunk, decision, &mut report).await;
+            self.apply_decision(chunk, decision, &rollup_table, &mut report)
+                .await;
         }
 
         let remaining = chunks.len().saturating_sub(report.dropped);
@@ -254,10 +279,11 @@ impl PgRetentionSweeper {
         &self,
         chunk: &ChunkSlice,
         decision: Decision,
+        rollup_table: &str,
         report: &mut SweepReport,
     ) {
         match decision {
-            Decision::Drop => self.drop_chunk(chunk, report).await,
+            Decision::Drop => self.drop_chunk(chunk, rollup_table, report).await,
             Decision::Keep(reason) if reason.is_unresolved() => {
                 report.kept_unresolved += 1;
                 self.metrics.inc_retention_chunk_kept_unresolved(reason);
@@ -271,16 +297,15 @@ impl PgRetentionSweeper {
         }
     }
 
-    /// Drop one expired chunk, counting the outcome either way.
-    async fn drop_chunk(&self, chunk: &ChunkSlice, report: &mut SweepReport) {
-        match sqlx::query(DROP_CHUNK_SQL)
-            .bind(&chunk.chunk)
-            .execute(&self.pool)
-            .await
-        {
-            Ok(_) => {
+    /// Drop one expired chunk and its rollup rows, counting the outcome either
+    /// way.
+    async fn drop_chunk(&self, chunk: &ChunkSlice, rollup_table: &str, report: &mut SweepReport) {
+        match self.drop_chunk_and_rollup_rows(chunk, rollup_table).await {
+            Ok(deleted) => {
                 report.dropped += 1;
+                report.rollup_rows_deleted += deleted;
                 self.metrics.inc_retention_chunk_dropped();
+                self.metrics.add_rollup_rows_deleted(deleted);
             }
             Err(e) => {
                 report.drop_failures += 1;
@@ -288,10 +313,35 @@ impl PgRetentionSweeper {
                 tracing::warn!(
                     chunk = %chunk.chunk,
                     error = %e,
-                    "dropping an expired ledger chunk failed; the next sweep retries it"
+                    "dropping an expired ledger chunk and its rollup rows failed; the next sweep retries it"
                 );
             }
         }
+    }
+
+    /// The chunk drop and the rollup cut, atomically: a rollup row never
+    /// outlives the ledger rows it was computed from, and a failed cut keeps
+    /// the chunk. Returns the rollup rows deleted.
+    async fn drop_chunk_and_rollup_rows(
+        &self,
+        chunk: &ChunkSlice,
+        rollup_table: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(DROP_CHUNK_SQL)
+            .bind(&chunk.chunk)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query(AssertSqlSafe(delete_rollup_rows_sql(rollup_table)))
+            .bind(chunk.key_start)
+            .bind(chunk.key_end)
+            .bind(chunk.time_start)
+            .bind(chunk.time_end)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(deleted)
     }
 }
 

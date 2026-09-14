@@ -395,6 +395,10 @@ async fn the_chunk_catalog_query_reads_one_row_per_chunk_with_both_ranges() {
             chunk.time_end > common::fixture_window_end(),
             "the time range end bounds every window_end in the chunk: {chunk:?}"
         );
+        assert!(
+            chunk.time_start < chunk.time_end && chunk.time_start <= common::fixture_window_end(),
+            "the time range start bounds every window_end from below: {chunk:?}"
+        );
     }
 }
 
@@ -477,5 +481,33 @@ async fn setup_registers_exactly_the_two_configured_refresh_policies() {
             (None, 172_800.0, 7_200.0),
         ],
         "one live policy and one history policy, replaced on re-run"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_rollups_materialisation_table_resolves_to_a_hypertable() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let table = timescaledb_usage_collector_plugin::infra::storage::rollup_maintenance::materialization_table(&h.pool)
+        .await
+        .expect("lookup runs")
+        .expect("the rollup exists");
+    // `timescaledb_information.hypertables` excludes a continuous aggregate's
+    // materialisation hypertable (its view definition filters
+    // `ca.mat_hypertable_id IS NULL`, verified on 2.29.2), so the internal
+    // catalog `retention_sweep.rs` already reads elsewhere is what actually
+    // confirms this table is registered as a hypertable.
+    let is_hypertable: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM _timescaledb_catalog.hypertable \
+         WHERE format('%I.%I', schema_name, table_name) = $1)",
+    )
+    .bind(&table)
+    .fetch_one(&h.pool)
+    .await
+    .expect("hypertable lookup");
+    assert!(
+        is_hypertable,
+        "{table} must be the rollup's materialisation hypertable"
     );
 }
