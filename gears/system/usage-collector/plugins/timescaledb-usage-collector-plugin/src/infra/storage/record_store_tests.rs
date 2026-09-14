@@ -225,6 +225,7 @@ fn row_matching(
         id: record.id,
         tenant_id: record.tenant_id,
         gts_type_id: record.gts_type_id.as_str().to_owned(),
+        type_key: 1,
         value: record.value,
         window_start: record.window_start,
         window_end: record.window_end,
@@ -491,7 +492,7 @@ fn the_single_insert_binds_one_placeholder_per_inserted_column() {
     );
     assert!(
         sql.contains(
-            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end)"
+            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key)"
         ),
         "the arbiter is the dedup 5-tuple: {sql}"
     );
@@ -554,7 +555,7 @@ fn the_batch_insert_names_one_column_sequence_in_all_three_places() {
     // but an arbiter hardcoded into this one alone would otherwise pass.
     assert!(
         sql.contains(
-            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end)"
+            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key)"
         ),
         "the batch arbiter is the dedup 5-tuple too: {sql}"
     );
@@ -721,13 +722,18 @@ fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
     );
     let with = withdrawal(tenant, "idem-b", 0xD102, target);
 
-    let cols = InsertColumns::build(&[&plain, &with], &[7, 8]);
+    let cols = InsertColumns::build(&[&plain, &with], &[7, 8], &[3, 4]);
 
     assert_eq!(cols.ids, vec![plain.id, with.id]);
     assert_eq!(cols.tenants, vec![tenant, tenant]);
     assert_eq!(
         cols.gts_type_ids,
         vec![VCPU_METER.to_owned(), VCPU_METER.to_owned()]
+    );
+    assert_eq!(
+        cols.type_keys,
+        vec![3, 4],
+        "each representative's partition key, in order"
     );
     assert_eq!(cols.values, vec![plain.value, with.value]);
     assert_eq!(
@@ -1472,6 +1478,7 @@ fn keyed_row() -> UsageRecordRow {
         id: uuid::Uuid::from_u128(0xA1),
         tenant_id: uuid::Uuid::from_u128(0xB2),
         gts_type_id: VCPU_METER.to_owned(),
+        type_key: 1,
         value: rust_decimal::Decimal::new(7, 0),
         window_start: time::OffsetDateTime::from_unix_timestamp(WINDOW_START_UNIX)
             .expect("valid ts"),

@@ -192,6 +192,7 @@ const LEDGER_COLUMNS: &[&str] = &[
     "id",
     "tenant_id",
     "gts_type_id",
+    "type_key",
     "value",
     "window_start",
     "window_end",

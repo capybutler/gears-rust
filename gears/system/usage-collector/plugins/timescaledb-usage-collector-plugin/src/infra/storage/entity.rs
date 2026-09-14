@@ -6,9 +6,9 @@
 //! It carries the raw storage-typed columns; [`super::mapper`] turns a row
 //! into the validated SDK model (and back where needed: the same module holds
 //! the model-to-SQL helpers the insert binds through). Column types match the
-//! DDL: `uuid` → [`Uuid`], `text` → [`String`], `numeric` → [`Decimal`],
-//! `timestamptz` → [`OffsetDateTime`], `bigint` → `i64`, `jsonb` →
-//! [`serde_json::Value`], and a nullable `text` / `uuid` → `Option<…>`.
+//! DDL: `uuid` → [`Uuid`], `text` → [`String`], `int` → `i32`, `numeric` →
+//! [`Decimal`], `timestamptz` → [`OffsetDateTime`], `bigint` → `i64`, `jsonb`
+//! → [`serde_json::Value`], and a nullable `text` / `uuid` → `Option<…>`.
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -46,6 +46,9 @@ pub struct UsageRecordRow {
     pub tenant_id: Uuid,
     /// `gts_type_id` — the meter this entry was submitted against.
     pub gts_type_id: String,
+    /// `type_key` — the plugin-internal partitioning key of `gts_type_id`
+    /// (`usage_type_key`). Not carried on the SDK model; see the struct doc.
+    pub type_key: i32,
     /// `value` — signed `numeric` quantity.
     pub value: Decimal,
     /// `window_start` — inclusive start of the covered period.

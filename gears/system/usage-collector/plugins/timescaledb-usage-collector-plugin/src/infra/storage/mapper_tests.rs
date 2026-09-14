@@ -183,6 +183,7 @@ fn sample_row() -> UsageRecordRow {
         id: Uuid::from_u128(1),
         tenant_id: Uuid::from_u128(2),
         gts_type_id: VALID_METER_TYPE_ID.to_owned(),
+        type_key: 1,
         value: Decimal::new(425, 1), // 42.5
         window_start: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
         window_end: OffsetDateTime::from_unix_timestamp(1_700_003_600).unwrap(),

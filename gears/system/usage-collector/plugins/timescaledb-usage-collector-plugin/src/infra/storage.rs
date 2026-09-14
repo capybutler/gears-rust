@@ -11,3 +11,4 @@ pub mod migration_probe;
 pub mod pool;
 pub mod query;
 pub mod record_store;
+pub mod type_key;

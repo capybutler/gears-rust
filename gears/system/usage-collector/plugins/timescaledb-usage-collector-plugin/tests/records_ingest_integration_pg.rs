@@ -615,48 +615,50 @@ async fn two_withdrawals_of_one_target_in_one_scope_admit_exactly_one() {
     assert_eq!(withdrawals, 1, "and the ledger holds one, not two");
 }
 
-/// Two withdrawals of one target from **different `(tenant_id, gts_type_id)`
-/// scopes**, concurrently: exactly one is accepted, and the index is the only
-/// thing that can have decided it.
+/// Two withdrawals of one target from **different tenants, same meter**,
+/// concurrently: exactly one is accepted, and the index is the only thing that
+/// can have decided it.
 ///
 /// **This is the test the atomicity obligation is for.** The SPI says the
 /// refusal must be atomic with the entry it admits — a read followed by a write
 /// will not do — and the test above cannot demonstrate that, because the
 /// per-scope acceptance-sequence row serialises two same-scope writers before
-/// either reaches the index. Crossing scopes removes that serialisation: the
+/// either reaches the index. Crossing tenants removes that serialisation: the
 /// two transactions claim different counter rows, proceed concurrently, and
 /// meet for the first time at `usage_records_one_invalidation_uniq`, which is
-/// **not** scope-partitioned — it is over `(invalidates, window_end)` alone.
-/// A pre-read implementation fails here, and passes the test above.
+/// **not** scope-partitioned — it is over `(invalidates, window_end, type_key)`
+/// alone. A pre-read implementation fails here, and passes the test above.
 ///
-/// **The shape is deliberately one the Ingestion Gateway would never emit.** A
-/// withdrawal naming a target in another tenant's scope is not a request any
-/// caller should be able to make, and the gateway is what stops it. This test
-/// reaches the SPI directly precisely because the store's own obligation is to
-/// the index rather than to the gateway's shape rules: the store must not admit
-/// two withdrawals of one entry whatever route they arrive by, and this is the
-/// only route on which both can be in flight at once.
+/// **Same meter is load-bearing, not incidental.** A faithful withdrawal
+/// shares its target's `gts_type_id` and so its `type_key`
+/// (`PgRecordStore::create_inner`'s "at-most-one guarantee is conditional"),
+/// which the hypertable's own unique-index rule now requires of every row in
+/// this index. A withdrawal naming a target of a *different* type is outside
+/// what the index can catch — the same published-contract divergence already
+/// recorded for a mismatched `window_end` — so this test stays on the type the
+/// guarantee still covers and crosses only the tenant, which the Ingestion
+/// Gateway also forbids upstream: the store's obligation is to the index
+/// rather than to the gateway's shape rules, and this is the route on which
+/// both writers can be in flight at once despite that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_withdrawals_of_one_target_from_different_scopes_race_on_the_index_alone() {
+async fn two_withdrawals_of_one_target_from_different_tenants_race_on_the_index_alone() {
     let (h, store) = setup().await;
     let vcpu = common::meter(common::VCPU_METER);
-    let gb = common::meter(common::GB_METER);
     let owner = Uuid::from_u128(0x1_A713);
     let other = Uuid::from_u128(0x1_A714);
 
     let target = common::entry(&vcpu, owner, "idem-target", Decimal::new(10, 0));
     let target = store.create(target).await.expect("create the target");
 
-    // Two withdrawals of that one entry, in two scopes that share neither the
-    // tenant nor the meter — so neither the counter row nor anything else
-    // serialises them. Both copy the target's `window_end`, which is what puts
-    // them in the same index slot.
+    // Two withdrawals of that one entry, in two scopes that share the meter
+    // (and so the type_key) but not the tenant — so neither the counter row
+    // nor anything else serialises them. Both copy the target's `window_end`
+    // and `gts_type_id`, which is what puts them in the same index slot.
     let mut a = common::withdrawal_of(&target, "idem-race-a");
     a.tenant_id = owner;
     let a = common::rederive(a);
     let mut b = common::withdrawal_of(&target, "idem-race-b");
     b.tenant_id = other;
-    b.gts_type_id = gb.clone();
     let b = common::rederive(b);
     assert_ne!(
         (a.tenant_id, a.gts_type_id.as_str()),

@@ -18,6 +18,13 @@ CREATE TABLE IF NOT EXISTS usage_records (
     id                  uuid        NOT NULL,
     tenant_id           uuid        NOT NULL,
     gts_type_id         text        NOT NULL,
+    -- The plugin-internal integer key of `gts_type_id`, assigned once per type
+    -- from `usage_type_key` below. It is the hypertable's second partitioning
+    -- dimension, so a chunk holds a slice of types and the retention sweep can
+    -- drop it by the retention of the types in it. It is not a declared
+    -- attribute (cpt-cf-usage-collector-adr-declaration-rehydration statement
+    -- 6): it names the type, and a type's key never changes.
+    type_key            int         NOT NULL,
     value               numeric     NOT NULL,
     -- The covered period [window_start, window_end). The only emitter-supplied
     -- time attribution. The time-range predicate reads the end alone
@@ -60,18 +67,21 @@ CREATE TABLE IF NOT EXISTS usage_records (
     metadata            jsonb       NOT NULL DEFAULT '{}'::jsonb,
     ingested_at         timestamptz NOT NULL DEFAULT now(),
 
-    -- A hypertable's PRIMARY KEY and every UNIQUE must contain the partition
-    -- column, so both carry `window_end`.
+    -- A hypertable's PRIMARY KEY and every UNIQUE must contain every partition
+    -- column, so both carry `window_end` and `type_key`. `type_key` is a
+    -- function of `gts_type_id`, so adding it separates no two rows either key
+    -- would otherwise join.
     --
     -- This is the same key as the dedup UNIQUE below, since `id` is a UUIDv5
     -- over that same 5-tuple. It is kept as defense in depth: while the
     -- derivation is correct the two are redundant, and a defect in it cannot
     -- then produce two rows for one identity.
-    PRIMARY KEY (id, window_end),
+    PRIMARY KEY (id, window_end, type_key),
 
-    -- The gear's DESIGN §3.7 dedup obligation, over the 5-tuple verbatim.
+    -- The gear's DESIGN §3.7 dedup obligation, over the 5-tuple verbatim, plus
+    -- the partition key the hypertable requires (see the PRIMARY KEY above).
     CONSTRAINT usage_records_dedup_uniq
-        UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end),
+        UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key),
 
     -- A point event is window_start == window_end; a period is strictly
     -- ordered. Nothing admits window_end < window_start.
@@ -95,7 +105,11 @@ CREATE TABLE IF NOT EXISTS usage_records (
         CHECK (subject_type IS NULL OR subject_id IS NOT NULL)
 );
 
-SELECT create_hypertable('usage_records', 'window_end', if_not_exists => TRUE);
+-- Partitioned on the covered-period end, then on the per-type key. The key's
+-- slice width and the time interval are configuration, applied at startup to
+-- chunks created afterwards (`pool::apply_post_migration_setup`).
+SELECT create_hypertable('usage_records', by_range('window_end'), if_not_exists => TRUE);
+SELECT add_dimension('usage_records', by_range('type_key', 1), if_not_exists => TRUE);
 
 -- At most one accepted invalidation per entry, enforced by the database rather
 -- than by a read-then-write in the store.
@@ -104,14 +118,15 @@ SELECT create_hypertable('usage_records', 'window_end', if_not_exists => TRUE);
 -- an invalidation is a faithful copy of the entry it withdraws, so it shares
 -- that entry's covered period and therefore its `window_end`. Two invalidations
 -- of one target necessarily collide on (invalidates, window_end), so including
--- the partition column costs nothing and satisfies the constraint rule.
+-- the partition columns costs nothing — an invalidation also shares its
+-- target's type, and so its `type_key`.
 --
 -- It also answers the fold's second withdrawal-exclusion obligation — "is this
 -- entry named by an accepted invalidation?" — since `invalidates` leads it
 -- under exactly that partial predicate. A separate index on (invalidates)
 -- would be wholly subsumed by this one; there deliberately is not one.
 CREATE UNIQUE INDEX IF NOT EXISTS usage_records_one_invalidation_uniq
-    ON usage_records (invalidates, window_end)
+    ON usage_records (invalidates, window_end, type_key)
     WHERE invalidates IS NOT NULL;
 
 -- Per-scope acceptance-sequence counters.
@@ -126,6 +141,18 @@ CREATE TABLE IF NOT EXISTS usage_acceptance_sequence (
     gts_type_id text   NOT NULL,
     next_value  bigint NOT NULL,
     PRIMARY KEY (tenant_id, gts_type_id)
+);
+
+-- Per-type partitioning keys.
+--
+-- One row per GTS type this plugin has written, mapping the type to a small
+-- integer the hypertable can partition on (`by_range` refuses a text column).
+-- It stores no declared attribute and nothing references it; it is not a type
+-- catalog. A key is assigned by the first write of its type and never changes,
+-- which is what lets it sit inside the ledger's unique constraints.
+CREATE TABLE IF NOT EXISTS usage_type_key (
+    gts_type_id text NOT NULL PRIMARY KEY,
+    type_key    int  GENERATED ALWAYS AS IDENTITY UNIQUE
 );
 
 -- Read paths select on the period end within a (tenant, meter) scope. The

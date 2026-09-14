@@ -70,6 +70,7 @@ use crate::infra::storage::query::{
     effective_page_size, ledger_from_clause, push_metadata_filter_clauses,
     push_meter_and_range_clauses,
 };
+use crate::infra::storage::type_key::TypeKeyCache;
 
 /// Default page size when the caller omits `$top` (`query.limit`).
 const DEFAULT_PAGE_SIZE: u64 = 100;
@@ -87,9 +88,9 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 /// column that exists so `$filter=entry_type eq 'invalidation'` resolves to a
 /// real column; nothing decodes it, because [`UsageRecordRow`] has no field
 /// for it (see that struct's doc).
-const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, window_end, \
-     resource_id, resource_type, subject_id, subject_type, idempotency_key, invalidates, \
-     reason_code, origin, acceptance_sequence, metadata, ingested_at";
+const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, value, window_start, \
+     window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
+     invalidates, reason_code, origin, acceptance_sequence, metadata, ingested_at";
 
 /// The columns every insert writes: [`RECORD_COLUMNS`] minus `ingested_at`,
 /// which the table defaults to `now()`. `entry_type` is generated and appears
@@ -107,17 +108,18 @@ const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, w
 /// position directly, because deriving it from an order assertion whose oracle
 /// happens to end in `metadata` would not survive a migration that declares a
 /// column after it.
-const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, window_end, \
-     resource_id, resource_type, subject_id, subject_type, idempotency_key, invalidates, \
-     reason_code, origin, acceptance_sequence, metadata";
+const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, value, window_start, \
+     window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
+     invalidates, reason_code, origin, acceptance_sequence, metadata";
 
 /// Postgres array types for [`INSERT_COLUMNS`], **in the same order**, as the
 /// batch insert's `UNNEST` needs them. The length is what fixes the placeholder
 /// count for both inserts.
-const INSERT_COLUMN_ARRAY_TYPES: [&str; 16] = [
+const INSERT_COLUMN_ARRAY_TYPES: [&str; 17] = [
     "uuid",
     "uuid",
     "text",
+    "int",
     "numeric",
     "timestamptz",
     "timestamptz",
@@ -133,11 +135,12 @@ const INSERT_COLUMN_ARRAY_TYPES: [&str; 16] = [
     "text",
 ];
 
-/// The dedup 5-tuple, as an `ON CONFLICT` arbiter. Both insert paths spend
-/// their one arbiter here, which is why `usage_records_one_invalidation_uniq`
-/// surfaces as a raw `23505` (see [`PgRecordStore::map_insert_error`]).
+/// The dedup 5-tuple plus the partition key the hypertable requires in every
+/// UNIQUE, as an `ON CONFLICT` arbiter. Both insert paths spend their one
+/// arbiter here, which is why `usage_records_one_invalidation_uniq` surfaces
+/// as a raw `23505` (see [`PgRecordStore::map_insert_error`]).
 const DEDUP_CONFLICT_TARGET: &str =
-    "tenant_id, gts_type_id, idempotency_key, window_start, window_end";
+    "tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key";
 
 /// `$1, $2, …, $n`.
 fn placeholders(n: usize) -> String {
@@ -200,6 +203,7 @@ pub struct PgRecordStore {
     pool: PgPool,
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
+    type_keys: Arc<TypeKeyCache>,
 }
 
 impl PgRecordStore {
@@ -213,6 +217,7 @@ impl PgRecordStore {
             pool,
             metrics,
             cancel,
+            type_keys: Arc::new(TypeKeyCache::default()),
         }
     }
 
@@ -363,17 +368,19 @@ impl PgRecordStore {
     /// claim and the insert commit or roll back together.
     ///
     /// **The at-most-one guarantee is conditional, and on the gateway.** The
-    /// index is over `(invalidates, window_end)`, because a hypertable UNIQUE
-    /// must contain the partition column. It catches two withdrawals of one
-    /// target only while they share that target's `window_end` — which a
-    /// faithful withdrawal does by construction, since it copies the covered
-    /// period of the entry it withdraws, and which the Ingestion Gateway
-    /// enforces upstream. A caller reaching this SPI directly with a mismatched
-    /// period is not bound by that, and would get two accepted invalidations.
-    /// Measured on a live container: same `window_end` → rejected; different
-    /// `window_end` → both accepted. No hypertable-compatible index can do
-    /// better, so this is recorded as a published-contract divergence rather
-    /// than papered over with an in-transaction pre-read.
+    /// index is over `(invalidates, window_end, type_key)`, because a
+    /// hypertable UNIQUE must contain every partition column. It catches two
+    /// withdrawals of one target only while they share that target's
+    /// `window_end` *and* `type_key` — which a faithful withdrawal does by
+    /// construction, since it copies the covered period and the type of the
+    /// entry it withdraws, and which the Ingestion Gateway enforces upstream. A
+    /// caller reaching this SPI directly with a mismatched period or a
+    /// mismatched type is not bound by that, and would get two accepted
+    /// invalidations. Measured on a live container: same `window_end` and
+    /// `type_key` → rejected; either one different → both accepted. No
+    /// hypertable-compatible index can do better, so this is recorded as a
+    /// published-contract divergence rather than papered over with an
+    /// in-transaction pre-read.
     ///
     /// `ON CONFLICT DO NOTHING` remains the dedup serialization authority: a
     /// concurrent same-key insert blocks on the in-progress speculative tuple
@@ -394,6 +401,15 @@ impl PgRecordStore {
         record: UsageRecord,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         let mut conn = self.timed_acquire().await?;
+
+        // The type's partition key, resolved in autocommit before the write
+        // transaction opens (see `TypeKeyCache::resolve`).
+        let type_key = self
+            .type_keys
+            .resolve(&mut conn, record.gts_type_id.as_str())
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
+
         let mut tx = conn
             .begin()
             .await
@@ -420,7 +436,7 @@ impl PgRecordStore {
         //    row only when we won the slot — `DO NOTHING` suppresses it on a
         //    conflict — so `Some` = fresh insert, `None` = a row with this
         //    5-tuple already exists. `ingested_at` is left to its DEFAULT and
-        //    `entry_type` is generated, which is why sixteen of the seventeen
+        //    `entry_type` is generated, which is why seventeen of the eighteen
         //    [`RECORD_COLUMNS`] are bound here.
         let subject_id = record
             .subject_ref
@@ -438,6 +454,7 @@ impl PgRecordStore {
                 .bind(record.id)
                 .bind(record.tenant_id)
                 .bind(record.gts_type_id.as_str())
+                .bind(type_key)
                 .bind(record.value)
                 .bind(record.window_start)
                 .bind(record.window_end)
@@ -549,6 +566,8 @@ impl PgRecordStore {
     /// row. `reps` must be sorted by [`DedupKey`] so concurrent batches insert
     /// in one global order (deadlock-free), and `sequences` must be the
     /// acceptance-sequence values claimed for them, in the same order.
+    /// `type_keys` must be the partition keys resolved for `reps`, in the same
+    /// order.
     ///
     /// Errors come back as the raw `sqlx::Error` rather than mapped: the caller
     /// holds the transaction that has to be rolled back before the mapping's
@@ -562,16 +581,18 @@ impl PgRecordStore {
         tx: &mut sqlx::Transaction<'_, Postgres>,
         reps: &[&UsageRecord],
         sequences: &[i64],
+        type_keys: &[i32],
     ) -> Result<HashMap<DedupKey, UsageRecordRow>, sqlx::Error> {
         if reps.is_empty() {
             return Ok(HashMap::new());
         }
-        let cols = InsertColumns::build(reps, sequences);
+        let cols = InsertColumns::build(reps, sequences, type_keys);
 
         let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(BATCH_INSERT_SQL.as_str()))
             .bind(&cols.ids)
             .bind(&cols.tenants)
             .bind(&cols.gts_type_ids)
+            .bind(&cols.type_keys)
             .bind(&cols.values)
             .bind(&cols.window_starts)
             .bind(&cols.window_ends)
@@ -767,6 +788,20 @@ impl PgRecordStore {
         let plan = plan_batch(records);
 
         let mut conn = self.timed_acquire().await?;
+
+        // One partition key per representative, aligned to `plan.reps`, resolved
+        // in autocommit before the write transaction opens. A type already seen
+        // costs no round trip.
+        let mut type_keys: Vec<i32> = Vec::with_capacity(plan.reps.len());
+        for rep in &plan.reps {
+            let key = self
+                .type_keys
+                .resolve(&mut conn, rep.gts_type_id.as_str())
+                .await
+                .map_err(|e| self.record_backend_error(&e))?;
+            type_keys.push(key);
+        }
+
         let mut tx = conn
             .begin()
             .await
@@ -780,17 +815,19 @@ impl PgRecordStore {
             }
         };
 
-        let inserted = match Self::insert_records_on_conflict(&mut tx, &plan.reps, &sequences).await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                // The failed statement aborted the transaction; roll it back so
-                // the mapping's diagnostic read has a usable connection.
-                rollback(tx).await;
-                let slots = invalidation_index_slots(&plan.reps);
-                return Err(self.map_insert_error(&mut conn, &e, &slots).await);
-            }
-        };
+        let inserted =
+            match Self::insert_records_on_conflict(&mut tx, &plan.reps, &sequences, &type_keys)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    // The failed statement aborted the transaction; roll it back so
+                    // the mapping's diagnostic read has a usable connection.
+                    rollback(tx).await;
+                    let slots = invalidation_index_slots(&plan.reps);
+                    return Err(self.map_insert_error(&mut conn, &e, &slots).await);
+                }
+            };
         // `inserted` is the won set; there is no second copy of it to drift.
         let not_won: Vec<&UsageRecord> = plan
             .reps
@@ -815,7 +852,7 @@ impl PgRecordStore {
     }
 }
 
-/// The sixteen per-column vectors one multi-row insert binds.
+/// The seventeen per-column vectors one multi-row insert binds.
 ///
 /// `sqlx` binds arrays, not rows, so the batch insert `UNNEST`s these back into
 /// rows. Keeping them in one struct built by one function keeps the column
@@ -825,6 +862,7 @@ struct InsertColumns {
     ids: Vec<Uuid>,
     tenants: Vec<Uuid>,
     gts_type_ids: Vec<String>,
+    type_keys: Vec<i32>,
     values: Vec<Decimal>,
     window_starts: Vec<OffsetDateTime>,
     window_ends: Vec<OffsetDateTime>,
@@ -852,19 +890,26 @@ impl InsertColumns {
     /// # Panics
     ///
     /// Never in practice: `sequences` comes from [`claim_batch_sequences`] over
-    /// the same `reps`, so it is the same length. A shorter one would be a
-    /// caller invariant break, and panicking beats silently writing a wrong
-    /// acceptance sequence.
-    fn build(reps: &[&UsageRecord], sequences: &[i64]) -> Self {
+    /// the same `reps`, so it is the same length; `type_keys` comes from a
+    /// resolve loop over the same `reps` too. A shorter one would be a caller
+    /// invariant break, and panicking beats silently writing a wrong
+    /// acceptance sequence or a wrong partition key.
+    fn build(reps: &[&UsageRecord], sequences: &[i64], type_keys: &[i32]) -> Self {
         assert_eq!(
             reps.len(),
             sequences.len(),
             "one acceptance sequence must be claimed per batch representative"
         );
+        assert_eq!(
+            reps.len(),
+            type_keys.len(),
+            "one partition key must be resolved per batch representative"
+        );
         let mut cols = Self {
             ids: Vec::with_capacity(reps.len()),
             tenants: Vec::with_capacity(reps.len()),
             gts_type_ids: Vec::with_capacity(reps.len()),
+            type_keys: type_keys.to_vec(),
             values: Vec::with_capacity(reps.len()),
             window_starts: Vec::with_capacity(reps.len()),
             window_ends: Vec::with_capacity(reps.len()),

@@ -26,12 +26,13 @@ use timescaledb_usage_collector_plugin::infra::storage::migration_probe;
 fn canonical_type(ddl_spelling: &str) -> &str {
     match ddl_spelling {
         "timestamptz" => "timestamp with time zone",
+        "int" => "integer",
         other => other,
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_ledger_is_a_hypertable_partitioned_on_window_end() {
+async fn the_ledger_partitions_on_window_end_then_type_key() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
@@ -53,8 +54,12 @@ async fn the_ledger_is_a_hypertable_partitioned_on_window_end() {
 
     assert_eq!(
         dims,
-        vec![("window_end".to_owned(), 1_i64)],
-        "usage_records must be a hypertable with exactly one time dimension, on window_end"
+        vec![
+            ("window_end".to_owned(), 1_i64),
+            ("type_key".to_owned(), 2_i64),
+        ],
+        "usage_records must partition on window_end first and on the per-type key second: \
+         the key is what lets a chunk be dropped by the retention of the types in it"
     );
 }
 
@@ -97,10 +102,11 @@ async fn the_dedup_unique_spans_the_five_tuple() {
     .expect("usage_records_dedup_uniq must exist");
 
     assert_eq!(
-        def, "UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end)",
+        def, "UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key)",
         "the dedup UNIQUE must span the 5-tuple dedup identity, in that order - the same \
          five inputs the entry id is a UUIDv5 projection of \
-         (cpt-cf-usage-collector-adr-record-identity-derivation)"
+         (cpt-cf-usage-collector-adr-record-identity-derivation) - plus the partition key, \
+         which a type determines and so separates no two rows the 5-tuple joins"
     );
 }
 
@@ -132,8 +138,8 @@ async fn the_at_most_one_invalidation_index_is_partial_and_unique() {
         "the at-most-one-invalidation index must be UNIQUE, or it enforces nothing: {def}"
     );
     assert!(
-        def.contains("btree (invalidates, window_end)"),
-        "the index must lead with `invalidates` and carry the partition column: {def}"
+        def.contains("btree (invalidates, window_end, type_key)"),
+        "the index must lead with `invalidates` and carry both partition columns: {def}"
     );
     assert!(
         def.contains("WHERE (invalidates IS NOT NULL)"),
@@ -288,5 +294,33 @@ async fn the_live_columns_are_the_migrations_columns_in_order() {
             && self_written.iter().any(|c| c == "ingested_at"),
         "entry_type must be generated and ingested_at defaulted in the live table, which is \
          why insertable_columns() drops exactly those two: {self_written:?}"
+    );
+}
+
+/// The per-type key table: one row per type, keyed by the type, with a
+/// database-assigned integer that nothing else may write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_type_key_maps_each_type_to_a_generated_integer() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT attname::text, format_type(atttypid, atttypmod), attidentity::text \
+         FROM pg_attribute \
+         WHERE attrelid = 'usage_type_key'::regclass AND attnum > 0 AND NOT attisdropped \
+         ORDER BY attnum",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .expect("usage_type_key must exist");
+
+    assert_eq!(
+        columns,
+        vec![
+            ("gts_type_id".to_owned(), "text".to_owned(), String::new()),
+            ("type_key".to_owned(), "integer".to_owned(), "a".to_owned()),
+        ],
+        "usage_type_key is (gts_type_id text, type_key int GENERATED ALWAYS AS IDENTITY)"
     );
 }
