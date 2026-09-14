@@ -1489,6 +1489,14 @@ domain. Recorded at the call site in
 `plugins/timescaledb-usage-collector-plugin/src/infra/storage/record_store.rs`
 (`create_inner`'s rustdoc) as well as here.
 
+**The rollup path depends on the same guarantee.** The TimescaleDB plugin's
+hourly rollup (`usage_rollup_1h`, `migrations/0002_usage_rollup.sql`) nets a
+withdrawn pair by adding `-value` for the invalidation rather than excluding
+the pair. That is exact only while a record carries at most one invalidation: a
+second one accepted past this gap would subtract the quantity twice. The scan
+path miscounts such a pair too, so a violation now skews two reads rather than
+one, not a new class of error.
+
 ---
 
 ## 22. A cross-call invalidation collision fails a `create_batch` whole
