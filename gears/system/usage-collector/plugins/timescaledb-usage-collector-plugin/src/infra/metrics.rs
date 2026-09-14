@@ -59,6 +59,8 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, ObservableGauge};
 use opentelemetry::{InstrumentationScope, KeyValue, global};
 use sqlx::PgPool;
 
+use crate::domain::retention::KeepReason;
+
 /// `OpenTelemetry` instrumentation scope (meter name) for every plugin series.
 const SCOPE_NAME: &str = "uc.timescaledb";
 
@@ -104,6 +106,18 @@ pub mod label {
     pub const ERROR_CATEGORY_TRANSIENT: &str = "transient";
     /// `error_category` value: a non-retryable internal backend failure.
     pub const ERROR_CATEGORY_INTERNAL: &str = "internal";
+
+    /// Label key for the retention-sweep outcome dimension.
+    pub const SWEEP_OUTCOME: &str = "outcome";
+    /// `outcome` value: the sweep held the lock and walked every chunk.
+    pub const SWEEP_OUTCOME_COMPLETED: &str = "completed";
+    /// `outcome` value: another replica held the sweep lock.
+    pub const SWEEP_OUTCOME_SKIPPED_LOCKED: &str = "skipped_locked";
+    /// `outcome` value: a catalog or connection error ended the sweep.
+    pub const SWEEP_OUTCOME_FAILED: &str = "failed";
+
+    /// Label key for the kept-unresolved reason dimension.
+    pub const KEEP_REASON: &str = "reason";
 }
 
 /// Insert-mode dimension behind the `mode` label of
@@ -169,6 +183,27 @@ impl ErrorClass {
     }
 }
 
+/// How one retention sweep ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepOutcome {
+    /// The sweep held the lock and walked every chunk.
+    Completed,
+    /// Another replica held the sweep lock; nothing was read.
+    SkippedLocked,
+    /// A catalog or connection error ended the sweep.
+    Failed,
+}
+
+impl SweepOutcome {
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Completed => label::SWEEP_OUTCOME_COMPLETED,
+            Self::SkippedLocked => label::SWEEP_OUTCOME_SKIPPED_LOCKED,
+            Self::Failed => label::SWEEP_OUTCOME_FAILED,
+        }
+    }
+}
+
 /// The full `OpenTelemetry` metric inventory for the plugin.
 ///
 /// Built once via [`Metrics::new`] and shared through an `Arc<Metrics>`; the
@@ -189,6 +224,8 @@ pub struct Metrics {
     pool_acquire_duration: Histogram<f64>,
     /// `uc_timescaledb_batch_rows` — row-count distribution per batch write.
     batch_rows: Histogram<f64>,
+    /// `uc_timescaledb_retention_sweep_duration_seconds`.
+    retention_sweep_duration: Histogram<f64>,
 
     // --- Counters ---
     /// `uc_timescaledb_dedup_absorbed_total`.
@@ -216,10 +253,22 @@ pub struct Metrics {
     query_requests: Counter<u64>,
     /// `uc_timescaledb_tls_handshake_failures_total`.
     tls_handshake_failure: Counter<u64>,
+    /// `uc_timescaledb_retention_sweeps_total` — labelled by `outcome`.
+    retention_sweeps: Counter<u64>,
+    /// `uc_timescaledb_retention_chunks_dropped_total`.
+    retention_chunks_dropped: Counter<u64>,
+    /// `uc_timescaledb_retention_chunks_kept_unresolved_total` — labelled by
+    /// `reason`.
+    retention_chunks_kept_unresolved: Counter<u64>,
+    /// `uc_timescaledb_retention_drop_failures_total`.
+    retention_drop_failures: Counter<u64>,
 
     // --- Synchronous gauges (set imperatively) ---
     /// `uc_timescaledb_ready` — plugin-local backend health (0/1).
     ready: Gauge<u64>,
+    /// `uc_timescaledb_chunks` — ledger chunks remaining after the last
+    /// completed retention sweep.
+    chunks: Gauge<u64>,
 
     // --- Observable gauges (callback-read; handles kept to stay registered) ---
     /// `uc_timescaledb_pool_connections_active`.
@@ -326,6 +375,42 @@ impl Metrics {
             .with_description("TLS handshake failures against the backend DSN")
             .build();
 
+        let retention_sweep_duration = meter
+            .f64_histogram("uc_timescaledb_retention_sweep_duration_seconds")
+            .with_description("Duration of one retention sweep, whatever its outcome")
+            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
+            .build();
+        let retention_sweeps = meter
+            .u64_counter("uc_timescaledb_retention_sweeps_total")
+            .with_description(
+                "Retention sweeps, by outcome: completed, skipped_locked (another replica \
+                 held the sweep lock) or failed",
+            )
+            .build();
+        let retention_chunks_dropped = meter
+            .u64_counter("uc_timescaledb_retention_chunks_dropped_total")
+            .with_description(
+                "Ledger chunks dropped because every type in them had passed its declared \
+                 retention",
+            )
+            .build();
+        let retention_chunks_kept_unresolved = meter
+            .u64_counter("uc_timescaledb_retention_chunks_kept_unresolved_total")
+            .with_description(
+                "Ledger chunks kept because a type in them had no resolvable retention, by \
+                 reason; counted once per chunk per sweep, so a persistent cause grows by \
+                 the chunk count every sweep",
+            )
+            .build();
+        let retention_drop_failures = meter
+            .u64_counter("uc_timescaledb_retention_drop_failures_total")
+            .with_description("Expired ledger chunks whose drop failed; retried next sweep")
+            .build();
+        let chunks = meter
+            .u64_gauge("uc_timescaledb_chunks")
+            .with_description("Ledger chunks remaining after the last completed retention sweep")
+            .build();
+
         let ready = meter
             .u64_gauge("uc_timescaledb_ready")
             .with_description("Plugin-local backend readiness (1 = pool + migration ok)")
@@ -357,6 +442,7 @@ impl Metrics {
             query_duration,
             pool_acquire_duration,
             batch_rows,
+            retention_sweep_duration,
             dedup_absorbed,
             backend_error,
             idempotency_conflict,
@@ -368,7 +454,12 @@ impl Metrics {
             batch_retry,
             query_requests,
             tls_handshake_failure,
+            retention_sweeps,
+            retention_chunks_dropped,
+            retention_chunks_kept_unresolved,
+            retention_drop_failures,
             ready,
+            chunks,
             _pool_active: pool_active,
             _pool_idle: pool_idle,
         }
@@ -487,11 +578,41 @@ impl Metrics {
             .add(1, &[KeyValue::new(label::QUERY_KIND, kind.as_label())]);
     }
 
+    /// Record one retention sweep: its duration, and its outcome.
+    pub fn record_retention_sweep(&self, outcome: SweepOutcome, secs: f64) {
+        self.retention_sweep_duration.record(secs, &[]);
+        self.retention_sweeps.add(
+            1,
+            &[KeyValue::new(label::SWEEP_OUTCOME, outcome.as_label())],
+        );
+    }
+
+    /// Increment the dropped-chunk counter.
+    pub fn inc_retention_chunk_dropped(&self) {
+        self.retention_chunks_dropped.add(1, &[]);
+    }
+
+    /// Increment the kept-unresolved counter under `reason`.
+    pub fn inc_retention_chunk_kept_unresolved(&self, reason: KeepReason) {
+        self.retention_chunks_kept_unresolved
+            .add(1, &[KeyValue::new(label::KEEP_REASON, reason.as_label())]);
+    }
+
+    /// Increment the failed-drop counter.
+    pub fn inc_retention_drop_failure(&self) {
+        self.retention_drop_failures.add(1, &[]);
+    }
+
     // --- Synchronous gauge setters ---
 
     /// Set the plugin-local readiness gauge (1 when `ready`, else 0).
     pub fn set_ready(&self, ready: bool) {
         self.ready.record(u64::from(ready), &[]);
+    }
+
+    /// Set the chunk-count gauge.
+    pub fn set_chunks(&self, n: u64) {
+        self.chunks.record(n, &[]);
     }
 
     /// Every instrument name this inventory declares.
@@ -528,6 +649,7 @@ impl Metrics {
             query_duration: _,
             pool_acquire_duration: _,
             batch_rows: _,
+            retention_sweep_duration: _,
             dedup_absorbed: _,
             backend_error: _,
             idempotency_conflict: _,
@@ -539,7 +661,12 @@ impl Metrics {
             batch_retry: _,
             query_requests: _,
             tls_handshake_failure: _,
+            retention_sweeps: _,
+            retention_chunks_dropped: _,
+            retention_chunks_kept_unresolved: _,
+            retention_drop_failures: _,
             ready: _,
+            chunks: _,
             _pool_active: _,
             _pool_idle: _,
         } = self;
@@ -562,6 +689,12 @@ impl Metrics {
             "uc_timescaledb_ready",
             "uc_timescaledb_pool_connections_active",
             "uc_timescaledb_pool_connections_idle",
+            "uc_timescaledb_retention_sweep_duration_seconds",
+            "uc_timescaledb_retention_sweeps_total",
+            "uc_timescaledb_retention_chunks_dropped_total",
+            "uc_timescaledb_retention_chunks_kept_unresolved_total",
+            "uc_timescaledb_retention_drop_failures_total",
+            "uc_timescaledb_chunks",
         ]
     }
 }

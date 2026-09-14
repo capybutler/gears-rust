@@ -1,4 +1,7 @@
-use super::{DURATION_BOUNDARIES_SECS, ErrorClass, InsertMode, Metrics, QueryKind, label};
+use super::{
+    DURATION_BOUNDARIES_SECS, ErrorClass, InsertMode, Metrics, QueryKind, SweepOutcome, label,
+};
+use crate::domain::retention::KeepReason;
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -420,7 +423,7 @@ async fn each_rejection_counters_description_carries_its_own_unit() {
 /// merely reach some floor. A floor cannot notice an instrument disappearing,
 /// and it hid an untested belief: that the two observable pool gauges are
 /// collected by their callbacks on this path. Equality tests that belief
-/// instead of assuming it — it holds, at 18.
+/// instead of assuming it — it holds, at 24.
 ///
 /// Two mechanisms catch different halves of a new instrument, and neither is
 /// quite a guarantee on its own: `declared_instrument_names`' destructure has
@@ -458,6 +461,11 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
     metrics.inc_invalidation_rejected_row();
     metrics.inc_invalidation_rejected_statement();
     metrics.set_ready(true);
+    metrics.record_retention_sweep(SweepOutcome::Completed, 0.001);
+    metrics.inc_retention_chunk_dropped();
+    metrics.inc_retention_chunk_kept_unresolved(KeepReason::Unavailable);
+    metrics.inc_retention_drop_failure();
+    metrics.set_chunks(1);
 
     provider.force_flush().unwrap();
 

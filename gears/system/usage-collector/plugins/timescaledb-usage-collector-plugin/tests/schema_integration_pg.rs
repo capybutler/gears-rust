@@ -13,7 +13,12 @@ mod common;
 
 use std::collections::BTreeSet;
 
+use rust_decimal::Decimal;
+use uuid::Uuid;
+
+use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::storage::migration_probe;
+use timescaledb_usage_collector_plugin::infra::storage::retention_sweep;
 
 /// The DDL spellings `format_type` renders differently, written out rather
 /// than derived.
@@ -323,4 +328,69 @@ async fn usage_type_key_maps_each_type_to_a_generated_integer() {
         ],
         "usage_type_key is (gts_type_id text, type_key int GENERATED ALWAYS AS IDENTITY)"
     );
+}
+
+/// The retention sweep reads chunk ranges out of `TimescaleDB`'s internal
+/// catalog, whose shape changed between 2.17 and 2.29. This is the pin that
+/// fails when an image upgrade reshapes it again: one row per chunk, each with
+/// a time range end and a width-1 key range naming a mapped type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chunk_catalog_query_reads_one_row_per_chunk_with_both_ranges() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h.pool);
+    let tenant = Uuid::from_u128(0xCA7A);
+    store
+        .create(common::entry(
+            &common::meter(common::VCPU_METER),
+            tenant,
+            "vcpu",
+            Decimal::ONE,
+        ))
+        .await
+        .expect("create vcpu");
+    store
+        .create(common::entry(
+            &common::meter(common::GB_METER),
+            tenant,
+            "gb",
+            Decimal::ONE,
+        ))
+        .await
+        .expect("create gb");
+
+    let chunks = retention_sweep::list_chunks(&h.pool)
+        .await
+        .expect("the catalog query must run against this TimescaleDB image");
+    let shown: i64 = sqlx::query_scalar("SELECT count(*) FROM show_chunks('usage_records')")
+        .fetch_one(&h.pool)
+        .await
+        .expect("show_chunks");
+    assert_eq!(shown, 2, "two types in one time range are two chunks");
+    assert_eq!(
+        i64::try_from(chunks.len()).unwrap(),
+        shown,
+        "one catalog row per chunk: {chunks:?}"
+    );
+
+    let keys: Vec<i32> = sqlx::query_scalar("SELECT type_key FROM usage_type_key")
+        .fetch_all(&h.pool)
+        .await
+        .expect("mapped keys");
+    for chunk in &chunks {
+        assert_eq!(
+            chunk.key_end - chunk.key_start,
+            1,
+            "slice width 1: {chunk:?}"
+        );
+        assert!(
+            keys.iter().any(|k| i64::from(*k) == chunk.key_start),
+            "each chunk's key range names a mapped type: {chunk:?} vs {keys:?}"
+        );
+        assert!(
+            chunk.time_end > common::fixture_window_end(),
+            "the time range end bounds every window_end in the chunk: {chunk:?}"
+        );
+    }
 }
