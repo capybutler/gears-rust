@@ -1428,25 +1428,42 @@ MUST make that check atomic with the entry it admits — in as many words, and
 with the reason a gateway-side pre-read cannot substitute.
 
 **What the store can enforce.** The mechanism is the partial unique index
-`usage_records_one_invalidation_uniq` over `(invalidates, window_end)`
+`usage_records_one_invalidation_uniq` over `(invalidates, window_end, type_key)`
 (`plugins/timescaledb-usage-collector-plugin/migrations/0001_init.sql`), claimed
 and inserted inside the one transaction that also claims `acceptance_sequence`,
 so the atomicity half is met.
 
 **Why it cannot key on `invalidates` alone.** A hypertable's `PRIMARY KEY` and
-every `UNIQUE` must contain the partition column. `window_end` is the partition
-column, so **no hypertable-compatible index can key on `invalidates` alone** —
-this is a property of the storage engine, not a choice in this schema.
+every `UNIQUE` must contain every partition column. `window_end` and `type_key`
+are both partition columns — `5d9a56e75` added `type_key` as the second, a
+`by_range` space dimension alongside the original `window_end` range dimension
+— so **no hypertable-compatible index can key on `invalidates` alone** — this is
+a property of the storage engine, not a choice in this schema.
 
 **What that costs, measured on a live container.** Two withdrawals of one target
-sharing the target's `window_end` are rejected. Two carrying **different**
-`window_end` are **both accepted**. Conformance therefore rests on every
-withdrawal being a faithful copy of its target's covered period — which the
-Ingestion Gateway enforces upstream, and which the migration's own comment
-states as though it were unconditional ("an invalidation is a faithful copy of
-the entry it withdraws, so it shares that entry's covered period"). **A caller
-reaching this SPI directly is not bound by it.** The residual guarantee lives at
-the gateway; the entry exists so that nobody reads the index as the whole of it.
+sharing the target's `window_end` **and** its `type_key` are rejected. Two
+carrying a different `window_end`, a different `type_key`, or both, are **both
+accepted**. Conformance therefore rests on every withdrawal being a faithful copy
+of its target's covered period and type — which the Ingestion Gateway enforces
+upstream (`faithful_copy_mismatch` in
+`usage-collector/src/domain/invalidation.rs` compares `gts_type_id` as well as
+the window), and which the migration's own comment states as though it were
+unconditional ("an invalidation is a faithful copy of the entry it withdraws, so
+it shares that entry's covered period"). **A caller reaching this SPI directly
+is not bound by it.** The residual guarantee lives at the gateway; the entry
+exists so that nobody reads the index as the whole of it.
+
+**A second consequence, added by `da6232aec`.** The aggregate fold's
+withdrawal-exclusion subquery (`withdrawal_exclusion_clause` in
+`plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/aggregate.rs`)
+now correlates `w.type_key = r.type_key` alongside `w.invalidates = r.id`. For a
+faithful-copy withdrawal that correlation changes nothing — it shares its
+target's type by construction — but a cross-type withdrawal that reaches the SPI
+directly, bypassing the gateway, no longer excludes its target from a fold
+either. The direct-caller gap this entry already records now has a second
+symptom alongside the double-accept: an unfaithful withdrawal of a different
+type is both accepted by the index and ignored by the fold, so the target it
+named keeps contributing to aggregates as though nothing withdrew it.
 
 **A green contract run is not evidence the general case is covered.** Task 14's
 `at-most-one-invalidation` check passes either way, because its fixture builds

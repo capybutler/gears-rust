@@ -515,8 +515,10 @@ statement that `DESIGN.md` §3.10 item 5 requires, and it states:
 The README configuration table and the storage-semantics bullets are updated to
 match §4 and §7.1.
 
-No governing document changes, and no `DIVERGENCES.md` entry is needed, because
-the design implements `DESIGN.md` as written.
+No governing document changes. `DIVERGENCES.md` entry 21 is updated, though,
+because `type_key` narrows the invalidation index's at-most-one guarantee and
+the aggregate fold's withdrawal exclusion to withdrawals that share a target's
+type, not only its `window_end`.
 
 ## 14. Risks
 
