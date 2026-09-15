@@ -79,16 +79,24 @@ paths:
       description: |
         Submit ledger entries up to the per-request cap. The cap is operator
         configuration, 100 by default. An empty or over-cap submission is
-        rejected whole with `400` on `records`. Every entry carries an
-        `idempotency_key` and is deduplicated on
-        `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
+        rejected whole with `400` on `records`. Every entry is deduplicated
+        on `(tenant_id, gts_type_id, idempotency_key, window_start,
+        window_end)`. A measurement carries the caller's `idempotency_key`;
+        an invalidation carries none, and the server derives it as `inv:`
+        followed by the `invalidates` identifier.
 
         The presence of `invalidates` is the sole discriminator between an
         ordinary measurement and an invalidation; an entry is never
         identified as a correction by the value or sign of its quantity. An
         invalidation entry is a faithful copy of the record it withdraws,
-        carrying additionally its own idempotency key, the target reference,
-        and a reason code.
+        carrying additionally the target reference and a reason code. Every
+        invalidation of one record derives one dedup identity, so a second
+        one under the same reason code is absorbed as a retry, and one under
+        a different reason code is rejected with `ALREADY_INVALIDATED`. An
+        invalidation whose target has not yet converged under the storage
+        plugin's dedup level is rejected with `TARGET_NOT_CONVERGED`, which
+        is retryable and clears within the plugin's convergence bound plus
+        its query-path lag bound.
 
         **The live path bounds the covered period on both sides, for every
         entry it admits.** An entry whose period ends further into the
@@ -158,7 +166,6 @@ paths:
                       quantity: "42"
                       window_start: "2026-05-29T12:00:00Z"
                       window_end: "2026-05-29T13:00:00Z"
-                      idempotency_key: ik-invalidate-0001
                       resource_ref:
                         resource_id: rsc_compute_vm_001
                         resource_type: compute.vm
@@ -716,30 +723,54 @@ components:
       minLength: 1
       maxLength: 256
       pattern: '^[^\x00-\x1F\x7F]+$'
+      not:
+        pattern: '^inv:'
       description: |
-        Caller-supplied dedup key. The dedup identity is the 5-tuple
-        `(tenant_id, gts_type_id, idempotency_key, window_start,
-        window_end)`, so submissions differing in period are distinct
-        entries rather than duplicates and an emitter does not encode the
-        period into the key.
+        Caller-supplied dedup key on a measurement. The dedup identity is
+        the 5-tuple `(tenant_id, gts_type_id, idempotency_key,
+        window_start, window_end)`, so submissions differing in period are
+        distinct entries rather than duplicates and an emitter does not
+        encode the period into the key.
 
         **The key carries what the identity does not.** `resource_ref` and
         `subject_ref` are compared on a collision but are not part of the
         identity, so one key shared across two resources in one period is a
         conflict, not a duplicate. Two entries covering one period need two
-        keys, an invalidation needs a key distinct from its target's, and a
-        retry must repeat its key exactly.
+        keys, and a retry must repeat its key exactly. An invalidation
+        carries no caller key: the server derives it, as `StoredIdempotencyKey`
+        describes.
 
         An exact-equality retry on that identity is absorbed and the stored
         entry is returned. Any differing caller-supplied field — including a
-        metadata-only difference — is rejected as a conflict.
+        metadata-only difference — is rejected as a conflict when it is
+        answered after the identity has converged, and so is the later of
+        two such entries in one request. A race answered before the
+        identity converges resolves by the store's commit order at the active plugin's
+        declared dedup level;
+        at every level one identity yields at most one entry on every
+        read.
 
         **Control characters are excluded.** The entry identifier
         derivation concatenates this value with the other dedup-identity
         inputs under a `0x1F` separator, so a key carrying a control
-        character would break the derivation's injectivity. The charset is
-        otherwise unconstrained, and the length is bounded at 1 to 256
-        characters. No token shape is enforced.
+        character would break the derivation's injectivity. **The `inv:`
+        prefix is reserved** for derived invalidation keys, so the two key
+        spaces never meet. The charset is otherwise unconstrained, and the
+        length is bounded at 1 to 256 characters. No token shape is
+        enforced.
+
+    StoredIdempotencyKey:
+      type: string
+      minLength: 1
+      maxLength: 256
+      pattern: '^[^\x00-\x1F\x7F]+$'
+      description: |
+        The dedup key an accepted entry carries on read. On a measurement it
+        is the caller's `IdempotencyKey`. On an invalidation it is
+        server-derived: `inv:` followed by the `invalidates` identifier in
+        lowercase hyphenated form. Every invalidation of one record
+        therefore shares one dedup identity, which is what keeps a record
+        withdrawn at most once.
 
     GtsTypeId:
       type: string
@@ -884,8 +915,9 @@ components:
             Stable across exact-equality retries and reproducible offline by
             the emitter, so a correction reference can be computed before
             submission. `invalidates` is deliberately excluded from the
-            derivation — and so is the `entry_type` derived from it — so one
-            key cannot stand for both a measurement and its withdrawal. The
+            derivation, and so is the `entry_type` derived from it; an
+            invalidation's key is itself derived from its target, so every
+            invalidation of one record derives one identifier. The
             namespace constant is recorded in the identity ADR.
         tenant_id:
           type: string
@@ -905,7 +937,7 @@ components:
         window_end:
           $ref: "#/components/schemas/Timestamp"
         idempotency_key:
-          $ref: "#/components/schemas/IdempotencyKey"
+          $ref: "#/components/schemas/StoredIdempotencyKey"
         accepted_at:
           allOf:
             - $ref: "#/components/schemas/Timestamp"
@@ -922,8 +954,9 @@ components:
           description: |
             The entry this one withdraws. Present exactly when
             `reason_code` is; its presence is what makes this entry an
-            invalidation. The target MUST exist, MUST itself be a `record`,
-            and MUST NOT already be invalidated.
+            invalidation. The target MUST exist and MUST itself be a
+            `record`. It is withdrawn at most once, because every
+            invalidation of it derives one dedup identity.
         reason_code:
           $ref: "#/components/schemas/ReasonCode"
         metadata:
@@ -939,22 +972,38 @@ components:
         - quantity
         - window_start
         - window_end
-        - idempotency_key
-      dependentRequired:
-        invalidates: [reason_code]
-        reason_code: [invalidates]
+      oneOf:
+        - title: record
+          description: A measurement. Carries the caller's key and neither `invalidates` nor `reason_code`.
+          required:
+            - idempotency_key
+          properties:
+            invalidates: false
+            reason_code: false
+        - title: invalidation
+          description: A withdrawal. Carries `invalidates` and `reason_code`, and no key.
+          required:
+            - invalidates
+            - reason_code
+          properties:
+            idempotency_key: false
       description: |
         Ingestion projection of `UsageRecord`: the same shape minus the three
-        server-owned fields — `id`, `accepted_at`, and `origin` — and
-        minus the derived `entry_type`. A stray value for
-        any of them is rejected as an unknown field.
+        server-owned fields — `id`, `accepted_at`, and `origin` — minus the
+        derived `entry_type`, and, on an invalidation, minus
+        `idempotency_key`, which the server derives. A stray value for
+        any of the server-owned or derived fields is rejected as an unknown
+        field; an `idempotency_key` on an invalidation fails the
+        `invalidation` branch below and is reported as a validation error.
 
         The same schema carries both entry types, distinguished by
         `invalidates` alone: supplying it makes the submission an
         invalidation, omitting it makes it an ordinary record. There is no
         caller-supplied discriminator, so a marker cannot disagree with the
         payload it marks. `invalidates` and `reason_code` are
-        both-or-neither, enforced by `dependentRequired`.
+        both-or-neither, and `idempotency_key` is required on a record and
+        forbidden on an invalidation, whose key the server derives from
+        `invalidates`; the two `oneOf` branches enforce both rules.
 
         For an invalidation the server additionally enforces that every
         caller-supplied field equals the target's — tenant, type, resource,
@@ -1027,11 +1076,17 @@ components:
         lifted out of the array.
 
         There is no `duplicate` outcome on the wire. An exact-equality
-        retry is absorbed by the dedup unique `(tenant_id, gts_type_id,
+        retry is absorbed on the dedup identity `(tenant_id, gts_type_id,
         idempotency_key, window_start, window_end)` and reported as
         `accepted` carrying the already-persisted record. A same-key
-        submission whose canonical fields differ is `rejected` with
-        `IDEMPOTENCY_CONFLICT`.
+        submission whose canonical fields differ from a converged entry, or
+        from an earlier entry in the same request, is `rejected` with
+        `IDEMPOTENCY_CONFLICT`, or with `ALREADY_INVALIDATED` where it is a
+        second invalidation of one record under a different reason code.
+        Under a plugin declaring the `eventual` dedup level, submissions
+        under one identity racing before convergence can each be
+        `accepted`, carrying their own `accepted_at`; the store keeps the
+        first in its commit order, which later reads return.
 
     AcceptedUsageRecord:
       type: object
@@ -1055,8 +1110,13 @@ components:
       required: [outcome, index, error]
       description: |
         The record failed validation, PDP authorization, the emission
-        semantics matrix, or a same-key canonical-field mismatch
-        (`IDEMPOTENCY_CONFLICT`). `error` is the same canonical envelope a
+        semantics matrix, a same-key canonical-field mismatch
+        (`IDEMPOTENCY_CONFLICT`), a second invalidation of an
+        already-withdrawn record (`ALREADY_INVALIDATED`, whose `context`
+        names the target, `invalidated_by`, and the stored `reason_code`),
+        or an invalidation of a target not yet converged
+        (`TARGET_NOT_CONVERGED`, with `context.retryable = true`). `error`
+        is the same canonical envelope a
         single-record failure would have surfaced, folded into the batch.
       properties:
         outcome:
@@ -1281,7 +1341,9 @@ components:
         `accepted_count` and `quantity_summary` cover exactly the entries
         the requested range selects (`from <= window_end < to`), the same
         rule every read path applies. The two watermarks are current as
-        of the response and are not bounded by the range.
+        of the response and are not bounded by the range. Every figure
+        reflects one entry per dedup identity, so a write the storage
+        plugin discards on convergence contributes to none of them.
       properties:
         scope:
           type: object

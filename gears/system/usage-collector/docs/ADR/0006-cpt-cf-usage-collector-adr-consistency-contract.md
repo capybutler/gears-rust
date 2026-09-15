@@ -38,13 +38,14 @@ queryability lag between the ingestion acknowledgement and a later query.
 Acknowledgement latency and queryability are two different mechanisms with two
 different bounds, so one combined freshness figure describes neither.
 
-The gear holds two intra-plugin invariants, and neither one bounds that lag. The
-dedup identity of an accepted entry stays visible to later ingestion attempts, for as
-long as the referenced GTS type's retention keeps that entry. The
-at-most-one-invalidation check commits atomically with the entry it admits, in
-one backend transaction, because only the store can make that check atomic.
-Neither invariant says anything about visibility to a later raw or aggregated
-read.
+The gear holds one intra-plugin invariant, and it does not bound that lag. The
+dedup identity of an accepted entry stays visible to later ingestion attempts,
+for as long as the referenced GTS type's retention keeps that entry, and the
+plugin declares how that identity behaves under concurrent writes
+(`cpt-cf-usage-collector-adr-mandatory-idempotency`). At most one invalidation
+per entry is a consequence of that identity rather than a second invariant
+(`cpt-cf-usage-collector-adr-append-only-invalidation`). The invariant says
+nothing about visibility to a later raw or aggregated read.
 
 Near-real-time consumers — admission control, post-emit summary, and
 immediate-readback dashboards — poll inside the query-latency NFR. Polling is
@@ -116,6 +117,13 @@ does not change in v1, and each plugin's deployment guide carries its profile in
 prose. The method can be added additively under
 `cpt-cf-usage-collector-adr-contract-stability` once a real consumer needs to
 switch behaviour on it.
+
+The published profile also carries the plugin's dedup level, `linearizable` or
+`eventual`, which `cpt-cf-usage-collector-adr-mandatory-idempotency` defines.
+The same split applies: the floor every plugin meets is stated once, and a
+consumer that relies on the stronger level couples itself to that plugin. The
+level and its convergence bound are the first candidates for the deferred typed
+profile, because they are what a gateway or a consumer would act on at runtime.
 
 ### Feed snapshot guarantee
 
@@ -255,11 +263,11 @@ The query path reflects a same-caller acknowledgement immediately.
 - `cpt-cf-usage-collector-nfr-workload-isolation` is allocated to isolated
   backend pools, which is the structural source of the queryability lag this
   floor names.
-- `cpt-cf-usage-collector-adr-mandatory-idempotency` and
-  `cpt-cf-usage-collector-adr-append-only-invalidation` own the two
-  plugin-transaction invariants. Both hold inside one store transaction and
-  neither is a cross-path guarantee against the query path. This decision is
-  additive and re-litigates neither.
+- `cpt-cf-usage-collector-adr-mandatory-idempotency` owns the intra-plugin
+  dedup invariant and its two levels, and
+  `cpt-cf-usage-collector-adr-append-only-invalidation` derives at most one
+  invalidation per entry from it. Neither is a cross-path guarantee against the
+  query path. This decision is additive and re-litigates neither.
 - Type resolution reaches `types-registry` through the Type Resolver's cache and
   never reaches a plugin. This decision does not change that.
 - The usage feed is deliberately pull-based rather than a push channel, so a
@@ -285,12 +293,12 @@ decisions, or design elements:
 - `cpt-cf-usage-collector-adr-registry-owned-typing` — GTS type declarations sit
   outside the floor. The Type Resolver's cache carries their propagation.
 - `cpt-cf-usage-collector-adr-mandatory-idempotency` — the floor cites
-  dedup-identity visibility as part of the acknowledgement guarantee. That
-  visibility lasts as long as retention keeps the entry, and the idempotency
-  contract itself is unchanged.
-- `cpt-cf-usage-collector-adr-append-only-invalidation` —
-  at-most-one-invalidation atomicity stays a plugin-transaction invariant. The
-  floor names it as such and states that it is not a cross-path guarantee.
+  dedup-identity visibility as part of the acknowledgement guarantee, and the
+  published profile carries the declared dedup level. That visibility lasts as
+  long as retention keeps the entry, and this decision re-decides neither.
+- `cpt-cf-usage-collector-adr-append-only-invalidation` — at most one
+  invalidation per entry follows from the dedup identity, so it carries the
+  same declared level and is not a cross-path guarantee.
 - `cpt-cf-usage-collector-adr-contract-stability` — the absence of a
   profile-advertisement method in v1 is reversible additively inside the Plugin
   SPI major-version contract.

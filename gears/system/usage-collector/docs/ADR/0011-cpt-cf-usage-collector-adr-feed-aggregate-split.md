@@ -116,13 +116,14 @@ assigned, because backends differ in what they can assign cheaply. One store
 has a native counter per table. Another has no sequence at all, and would need
 a coordination round-trip per write to emulate a counter per scope. Two
 guarantees bind every plugin. **Completeness**: a page carries only settled
-entries, before which nothing more can become visible. A cursor
-therefore never passes a position that is not final, and once it has passed one,
-no entry becomes visible at or before it, however many writers accept
-concurrently and in whatever order their writes commit. A page that reaches the
-settled head of the feed returns its cursor at that head, so a cursor's age
-reflects how far its consumer has read. **Correction order**: an invalidation
-follows its target.
+entries — entries that have converged under the plugin's dedup level
+(`cpt-cf-usage-collector-adr-mandatory-idempotency`) and before which nothing
+more can become visible. A cursor therefore never passes a position that is not
+final, and once it has passed one, no entry becomes visible at or before it,
+however many writers accept concurrently and in whatever order their writes
+commit. A page that reaches the settled head of the feed returns its cursor at
+that head, so a cursor's age reflects how far its consumer has read.
+**Correction order**: an invalidation follows its target.
 
 A paginated scan observes a snapshot, and the append-only ledger purchases that
 property. No accepted entry is ever rewritten. A correction arrives as a later

@@ -15,7 +15,7 @@ Updated:  2026-09-15 by Virtuozzo International GmbH
 - [Decision Drivers](#decision-drivers)
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
-  - [Five rules at the gateway, one at the store](#five-rules-at-the-gateway-one-at-the-store)
+  - [Five rules at the gateway, one in the dedup identity](#five-rules-at-the-gateway-one-in-the-dedup-identity)
   - [Fold exclusion over both entries of the pair](#fold-exclusion-over-both-entries-of-the-pair)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
@@ -102,26 +102,28 @@ entry it has already accepted. A correction is expressed by appending an
 **invalidation entry** that refers to exactly one accepted entry. It travels the
 same ingestion path that carries a measurement, so no dedicated correction
 endpoint, SDK method, or storage-plugin call exists. The platform PDP authorizes
-it on the caller's identity exactly as it authorizes a measurement, and it
-carries the mandatory idempotency key
+it on the caller's identity exactly as it authorizes a measurement, and it rides
+the same idempotency contract under a key the gear derives from its target
 (`cpt-cf-usage-collector-adr-mandatory-idempotency`).
 
 The entry is a **faithful copy** of its target. Every caller-supplied field equals
 the target's: tenant, GTS type, resource, subject, covered period, quantity, and
 metadata. The departures from that copy are closed, and are exactly three. The
-entry carries its own idempotency key distinct from the target's, the reference
-to the target, and a reason code. The reference is what makes the entry an
+caller supplies two of them: the reference to the target and a reason code. The
+third is the idempotency key, which the caller does not supply, because the gear
+derives it from the reference. The reference is what makes the entry an
 invalidation, so no separate marker exists to disagree with it.
 
-The entry also gets three server-side fields in its own right rather than by copy
-(`cpt-cf-usage-collector-fr-record-invalidation`). They are the fields any
+The entry also gets four server-side fields in its own right rather than by copy
+(`cpt-cf-usage-collector-fr-record-invalidation`). Three are the fields any
 accepted entry gets: an identifier, an acceptance instant, and an origin marker.
-The gear derives the identifier and stamps the instant and the marker. The marker
-names the path the entry arrived on. Being accepted in its own right gives the
+The fourth is its idempotency key. The gear derives the key and the identifier,
+and stamps the instant and the marker. The marker names the path the entry
+arrived on. Being accepted in its own right gives the
 invalidation its own position on the feed, which the feed's correction order
 places after its target.
 
-### Five rules at the gateway, one at the store
+### Five rules at the gateway, one in the dedup identity
 
 The Ingestion Gateway enforces five of the six invalidation rules before it
 dispatches the entry to the store.
@@ -130,8 +132,12 @@ dispatches the entry to the store.
   reference is what identifies it as an invalidation. It is never recognised by
   the value or the sign of its quantity. The reference and the reason code are
   both-or-neither.
-- **Valid reference.** The reference resolves to an existing entry. A reference
-  that resolves to nothing is rejected with an actionable error.
+- **Valid reference.** The reference resolves to an existing entry whose dedup
+  identity has converged under the active plugin's dedup level
+  (`cpt-cf-usage-collector-adr-mandatory-idempotency`); a target has converged
+  when its identity has. A reference that
+  resolves to nothing is rejected with an actionable error. A target that has not
+  yet converged is rejected with a retryable one.
 - **No invalidation of an invalidation.** The target is itself a measurement. An
   invalidation entry never refers to another invalidation entry.
 - **Faithful copy.** Every copied field matches the target's. The presence of a
@@ -146,18 +152,56 @@ arrived on, exactly as a measurement's own period is
 (`cpt-cf-usage-collector-adr-backfill-isolation`). Withdrawal therefore reaches
 back exactly as far as emission does on the same route, and no further.
 
-The sixth rule belongs to the store rather than to the gateway.
+The sixth rule is not a check any component runs. It follows from the key.
 
-- **At most one per entry.** At most one invalidation exists per entry, and a
-  second one is rejected. An exact-equality resubmission under the same
-  idempotency key is absorbed as a duplicate rather than treated as a second
-  invalidation.
+- **At most one per entry.** At most one invalidation exists per entry. A
+  second one under the same reason code is absorbed as a retry of the first,
+  and one under a different reason code is rejected as an already-invalidated
+  target.
 
-Only the store can make that check atomic with the entry it admits, in a single
-backend transaction. A gateway-side pre-read cannot exclude a concurrent second
-submission, so at-most-one is the plugin's one invalidation obligation. Reference
-validity is plugin-observable too, because a point lookup that misses raises a
-not-found error. The gateway is therefore not its sole enforcer.
+The gear derives an invalidation's idempotency key from its target, as `inv:`
+followed by the target's identifier. The entry copies its target's tenant, type,
+and covered period, so every invalidation of one entry has one dedup identity
+and one derived identifier. The faithful copy fixes every other compared field
+to the target's, which leaves the reason code as the only field two withdrawals
+of one entry can differ in. The same-key outcomes of
+`cpt-cf-usage-collector-adr-mandatory-idempotency` then decide the pair: an
+exact-equality retry, or a conflict that the gateway reports as an
+already-invalidated target, since the caller chose no key to conflict on.
+
+The rule therefore carries the guarantee level the active plugin declares for
+the dedup identity. Under `linearizable`, of two racing withdrawals of one entry
+with different reason codes exactly one is accepted. Under `eventual`, both can
+be acknowledged, and the store keeps the one first in its commit order. The
+entry is withdrawn either way, and only the retained reason code depends on the
+race.
+
+The target must have converged for the same reason. Under `eventual` a lookup
+before convergence can return a write the store later discards. A faithful copy
+checked against that write, and a PDP decision taken on its attribution, would
+then describe an entry that no longer exists.
+
+The lookup is bounded in both directions. It never reports an acknowledged,
+retained target as missing: a plugin that serves it from a lagging read pool answers
+not-converged until it has ruled such an entry out. It never answers
+not-converged indefinitely either: within the plugin's convergence bound plus
+its published query-path lag bound it returns the target or not-found, reading
+an authoritative source where its pool cannot decide. A withdrawal sent straight
+after its target's acknowledgement is therefore retried rather than refused, and
+one naming an identifier that never existed is refused rather than retried
+forever.
+
+The lookup applies the caller's scope before any of this. An entry outside that
+scope is treated exactly as an identifier with no entry, so a not-converged
+answer reveals nothing about an entry the caller cannot read.
+
+The alternative is a store-side check made atomic with the admitted entry in
+one backend transaction. It prescribes a mechanism rather than an outcome, so a
+backend with no multi-statement transaction, such as a columnar store, cannot
+conform to it by construction. It also puts a second rule on the plugin where
+the dedup identity already serves. Reference validity stays plugin-observable,
+because a point lookup that misses raises a not-found error, so the gateway is
+not its sole enforcer.
 
 ### Fold exclusion over both entries of the pair
 
@@ -226,18 +270,36 @@ entries as persisted, the invalidation naming its target.
 - An emitter holds or recomputes the target's caller-supplied fields to build the
   copy. The derived identifier is reproducible offline
   (`cpt-cf-usage-collector-adr-record-identity-derivation`), so naming the target
-  costs no read-back.
+  costs no read-back. The invalidation's own identifier is reproducible the same
+  way, since its key is a function of the target.
+- **An invalidation carries no caller key.** The gear derives it and rejects a
+  submission that supplies one. An emitter therefore stores no key before
+  sending a withdrawal, and a retried withdrawal lands on the same derived
+  identity.
+- **At most one invalidation per entry holds at the active plugin's dedup
+  level.** A plugin declaring `eventual` can acknowledge two concurrent
+  withdrawals of one entry that differ in reason code, and keeps one of them.
 
 ### Confirmation
 
 - A contract test asserting that a faithful-copy mismatch is rejected with an
   error naming the field that differs, covering the subject
   presence-against-absence case.
-- A store contract test asserting that the at-most-one-invalidation check commits
-  atomically with the entry it admits, and rejects a concurrent second
-  invalidation.
-- A test asserting that an exact-equality resubmission under the same idempotency
-  key is absorbed as a duplicate rather than treated as a second invalidation.
+- A test asserting that a second invalidation of one entry is absorbed under the
+  same reason code, and rejected as an already-invalidated target under a
+  different one.
+- A test asserting that an invalidation supplying its own idempotency key is
+  rejected before dispatch.
+- A plugin contract test driving two concurrent invalidations of one entry with
+  different reason codes. Under `linearizable` it asserts one acceptance and one
+  conflict, and under `eventual` one surviving invalidation, the first in commit
+  order.
+- A test asserting that an invalidation whose target has not yet converged is
+  rejected with a retryable error, and accepted once the target has converged.
+- A test asserting that an invalidation naming an identifier that never existed
+  is refused as not found within the plugin's convergence bound plus its
+  query-path lag bound, and that an out-of-scope target draws the same answers
+  as an absent one.
 - A test asserting that an invalidation whose target predates the live past
   tolerance is rejected on the live path with an error naming the backfill
   route, and accepted on that route carrying `origin = backfill`.
@@ -259,6 +321,9 @@ from that copy in exactly three closed ways.
   what a quantity means.
 - Good, because it reuses the ingestion path, the PDP boundary, the idempotency
   contract, and the ingestion quotas.
+- Good, because a key derived from the target makes at most one withdrawal per
+  entry a property of the dedup identity, so the plugin carries no invalidation
+  rule of its own.
 - Good, because the copied period makes the entry's own identifier derivable, and
   keeps both entries of the pair inside any range that selects either.
 - Good, because the copied metadata keeps the withdrawal inside the same grouped
@@ -415,8 +480,9 @@ question, and this decision does not settle it.
 
 ### Related decisions
 
-- `cpt-cf-usage-collector-adr-mandatory-idempotency` — states the dedup identity
-  and the canonical-equality set that absorb a resubmitted invalidation.
+- `cpt-cf-usage-collector-adr-mandatory-idempotency` — states the dedup identity,
+  its guarantee levels, the derived invalidation key, and the canonical-equality
+  set that decide a second invalidation of one entry.
 - `cpt-cf-usage-collector-adr-record-identity-derivation` — derives the identifier
   that a reference resolves against.
 - `cpt-cf-usage-collector-adr-backfill-isolation` — owns the per-path period
@@ -433,10 +499,11 @@ This decision directly addresses the following requirements or design elements:
 
 - `cpt-cf-usage-collector-fr-record-invalidation` — the requirement this decision
   realizes.
-- `cpt-cf-usage-collector-fr-invalidation-reason-code` — the fourth departure from
-  the faithful copy.
-- `cpt-cf-usage-collector-fr-idempotency` — the entry carries its own key and rides
-  the same dedup contract.
+- `cpt-cf-usage-collector-fr-invalidation-reason-code` — one of the three
+  departures from the faithful copy.
+- `cpt-cf-usage-collector-fr-idempotency` — the entry rides the same dedup
+  contract under a key derived from its target, which is what bounds withdrawal
+  to one per entry.
 - `cpt-cf-usage-collector-fr-record-identity` — the reference resolves against the
   derived identifier.
 - `cpt-cf-usage-collector-fr-ingestion` — the path the entry travels, shared with
@@ -454,7 +521,8 @@ This decision directly addresses the following requirements or design elements:
 - `cpt-cf-usage-collector-component-ingestion-gateway` — the component that owns
   five of the six rules.
 - `cpt-cf-usage-collector-interface-plugin` — the SPI obligation to exclude both
-  entries and to recompute, plus the atomic at-most-one check.
+  entries and to recompute. At most one invalidation reaches the plugin only as
+  the dedup identity it already enforces.
 - `cpt-cf-usage-collector-seq-invalidate-record` — the sequence realizing the
   withdrawal.
 - `cpt-cf-usage-collector-usecase-invalidate-record` and

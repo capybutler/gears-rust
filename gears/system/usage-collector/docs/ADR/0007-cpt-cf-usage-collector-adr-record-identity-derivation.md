@@ -5,7 +5,7 @@ decision-makers: usage-collector spec owners
 ---
 
 Created:  2026-07-07 by Virtuozzo International GmbH
-Updated:  2026-09-10 by Virtuozzo International GmbH
+Updated:  2026-09-15 by Virtuozzo International GmbH
 
 # Deterministic entry identity derived from the dedup identity over a covered period
 
@@ -119,8 +119,12 @@ bounds are equal. The derivation needs no separate case for it.
 An invalidation entry derives its identifier by the same function over the same
 five inputs. That derivation is well defined, because an invalidation entry
 copies the covered period of its target
-(`cpt-cf-usage-collector-adr-append-only-invalidation`). Its identifier differs
-from its target's for one reason only: the two carry different idempotency keys.
+(`cpt-cf-usage-collector-adr-append-only-invalidation`). Its idempotency key is
+not caller-supplied: the gear derives it as `inv:` followed by the target's
+identifier (`cpt-cf-usage-collector-adr-mandatory-idempotency`). Its identifier
+therefore differs from its target's for one reason only, the key, and it is a
+function of the target alone. Every invalidation of one entry derives the same
+identifier.
 
 ### The canonical pre-image
 
@@ -164,27 +168,22 @@ requirements, next to the control-character rule above.
 
 ### Entry type is excluded
 
-Entry type is deliberately not an input to the derivation. Admitting it lets one
-idempotency key stand for both a measurement and its withdrawal. An emitter
-defect that reused a key then produces both entries silently, instead of
-surfacing a conflict.
+Entry type is deliberately not an input to the derivation. The key already keeps
+the two kinds apart: a measurement key cannot begin with the reserved `inv:`
+prefix, and an invalidation key always does. A measurement and an invalidation
+therefore never share a dedup identity, and admitting entry type would add a
+second separator where one suffices.
 
-An invalidation submitted under its target's own key therefore collides on all
-five inputs. The gear rejects it as a same-key content mismatch, and the caller
-observes a conflict. This decision makes that outcome authoritative for the case,
-because it needs no rule beyond the derivation and canonical equality.
-`cpt-cf-usage-collector-adr-append-only-invalidation` separately states key
-distinctness as a wire-level rule. A gateway pre-check on that rule is a
-redundant guard, and it must not report a different error for a collision on all
-five inputs.
+The key is also what gives every invalidation of one entry a single identifier.
+Two withdrawals of the same target derive the same key, so they collide on all
+five inputs and resolve by the same-key outcomes of
+`cpt-cf-usage-collector-adr-mandatory-idempotency`. That collision is what
+`cpt-cf-usage-collector-adr-append-only-invalidation` relies on for at most one
+invalidation per entry.
 
-The complement of this exclusion lives in
-`cpt-cf-usage-collector-adr-mandatory-idempotency`: the invalidation target is
-part of the canonical-equality comparison set. Entry type itself is not
-compared. The gear derives it from the target, so it cannot differ unless the
-target differs. That asymmetry is the whole mechanism. The derivation collapses
-a key reused across the pair onto one identifier, and the comparison then
-converts the collision into a loud rejection.
+The invalidation target stays part of the canonical-equality comparison set,
+and entry type is not compared. The gear derives entry type from the target, so
+it cannot differ unless the target differs.
 
 ### Consequences
 
@@ -210,6 +209,10 @@ converts the collision into a loud rejection.
 - The canonical form is frozen with the namespace constant. A change to the
   fraction width, the UUID case or the text encoding re-maps every identifier
   the gear has issued.
+- The derived invalidation key is frozen the same way. Changing its prefix or
+  the spelling of the target identifier in it re-maps every invalidation
+  identifier, and lets a new withdrawal of an already-withdrawn entry derive a
+  second identity.
 - The microsecond ceiling binds the storage contract too. A plugin that
   persists a covered period at a coarser precision returns entries whose
   identifiers no emitter can reproduce.
@@ -225,10 +228,12 @@ converts the collision into a loud rejection.
 - A test asserting that a point event and a zero-length interval derive the same
   identifier.
 - A test asserting that an invalidation entry and its target differ in their
-  identifiers only through the idempotency key.
-- A test asserting that an invalidation submitted under its target's own
-  idempotency key is rejected as a same-key content mismatch. It must not be
-  accepted as a second entry.
+  identifiers only through the idempotency key, and that two invalidations of
+  one target derive one identifier.
+- Golden vectors for the derived invalidation key, pinning `inv:` and the
+  lowercase hyphenated target identifier.
+- A test asserting that a measurement key beginning with `inv:` is rejected
+  before the derivation runs.
 - A test asserting that a submission carrying the `0x1F` byte in the idempotency
   key or the GTS type reference is rejected before the derivation runs.
 - Golden vectors that pair equivalent input formats and assert one identifier.
