@@ -1,5 +1,5 @@
 Created:  2026-02-25 by Virtuozzo International GmbH
-Updated:  2026-09-10 by Virtuozzo International GmbH
+Updated:  2026-09-15 by Virtuozzo International GmbH
 
 # Usage Collector — DESIGN
 
@@ -64,7 +64,7 @@ collector.
 | `cpt-cf-usage-collector-fr-ingestion` | REST, SDK, and backfill entry points funnel into one Ingestion Gateway. The gateway authenticates upstream and authorizes at the PDP before dispatch. |
 | `cpt-cf-usage-collector-fr-idempotency` | Idempotency key mandatory on every entry. The dedup identity is the 5-tuple `(tenant, gts_type, key, window_start, window_end)`. Exact-equality retries are absorbed, divergent same-key writes surface as a fail-closed conflict. The horizon is the type's retention policy, measured from the covered period. |
 | `cpt-cf-usage-collector-fr-record-identity` | `id` is a deterministic UUIDv5 over the same 5-tuple, so it is stable, server-derived, and reproducible offline by the emitter before submission. `entry_type` is deliberately excluded from the derivation. |
-| `cpt-cf-usage-collector-fr-usage-windows` | The covered period `[window_start, window_end)` is the only emitter-supplied time attribution. `accepted_at` and `acceptance_sequence` are server-assigned. The gear stamps `accepted_at`, and the storage plugin assigns `acceptance_sequence` strictly monotonic per `(tenant_id, gts_type_id)`. Query selection reads the period end — `from <= window_end < to` — on every path, so no entry needs a shape-dependent case. |
+| `cpt-cf-usage-collector-fr-usage-windows` | The covered period `[window_start, window_end)` is the only emitter-supplied time attribution. The gear stamps `accepted_at`, and no caller can set it. Query selection reads the period end — `from <= window_end < to` — on every path, so no entry needs a shape-dependent case. |
 | `cpt-cf-usage-collector-fr-live-future-time-bound` | The live path bounds the covered period on both sides. It rejects a period that ends further into the future than a tolerance, 5 minutes by default. It also rejects one that ends further into the past than a second tolerance, 48 hours by default and configurable. Anything older must use the dedicated backfill route, which the rejection names. Both bounds govern every entry the path admits, an invalidation included, over the period it copies. The backfill path carries its own window. All of these are configuration, enforced in the Ingestion Gateway before dispatch. |
 | `cpt-cf-usage-collector-fr-record-quantity` | A finite signed decimal carried as `rust_decimal::Decimal`, wire-encoded as a JSON string, persisted in an exact decimal type. The published range and precision are declared in the OpenAPI contract. The SPI obliges every plugin to round-trip both halves without loss. |
 | `cpt-cf-usage-collector-fr-quantity-semantics` | The relation between quantity and period is carried by the declared fold and resolved per read. The gear never integrates, differentiates, interpolates, re-windows, or synthesizes samples. |
@@ -84,12 +84,12 @@ collector.
 | `cpt-cf-usage-collector-fr-pluggable-storage` | A dedicated Plugin SPI covers persistence, query, and feed reads. The active backend is resolved lazily via Plugin Host and `types-registry`. `[usage_collector].vendor` selects the plugin identity at `Gear::init`. |
 | `cpt-cf-usage-collector-fr-query-aggregation` | The Query Gateway enforces the mandatory single-type and time-range filters, runs PDP authorization, and pushes the declared fold and grouping to the plugin. Withdrawn pairs are excluded from the selected set. |
 | `cpt-cf-usage-collector-fr-query-raw` | Raw query reuses the same authorization and constraint-application pattern and returns cursor-paginated pages. Withdrawn pairs are returned **as persisted**, the invalidation naming its target. |
-| `cpt-cf-usage-collector-fr-billing-usage-feed` | A dedicated Feed Gateway serves per-subscription, cursor-paginated, snapshot-consistent pages ordered by `acceptance_sequence` within each `(tenant, gts_type)` scope, each carrying a watermark. |
+| `cpt-cf-usage-collector-fr-billing-usage-feed` | A dedicated Feed Gateway serves per-subscription, cursor-paginated, snapshot-consistent pages in a deterministic order the storage plugin realises, each carrying a cursor behind which the subscription is complete. |
 | `cpt-cf-usage-collector-fr-billing-fields-on-read` | Every read path returns the identifier, type reference, covered period, acceptance instant, declared metadata, signed quantity, entry type, the withdrawn-record reference with its reason code, and origin marker — unstripped. |
 | `cpt-cf-usage-collector-fr-billing-retention-floor` | Retention is declared per type, and the plugin reads it from `types-registry` itself. No gear surface carries it. The floor — backfill window plus one replay horizon — is a plugin-readiness condition surfaced at review, not a gear-side sweep. |
 | `cpt-cf-usage-collector-fr-backfill` | A dedicated import path, workload-isolated from live ingestion, applying identical validation and stamping `origin = backfill`. The configured window is a hard bound and no surface reaches past it. It takes **Usage Records** and invalidation entries alike, on REST and on the SDK trait. |
 | `cpt-cf-usage-collector-fr-rate-limiting` | Configurable per-caller and per-(caller, tenant) ingestion quotas across all ingestion paths, rejecting over-quota submissions with an actionable throttle error carrying retry guidance. |
-| `cpt-cf-usage-collector-fr-reconciliation-metadata` | Per-scope counters and three watermarks — acceptance instant, covered-period end, acceptance sequence — exposed on REST at the (tenant, GTS type) granularity. The gear evaluates none of them. |
+| `cpt-cf-usage-collector-fr-reconciliation-metadata` | Per-scope counters and two watermarks — acceptance instant and covered-period end — exposed on REST at the (tenant, GTS type) granularity. The gear evaluates none of them. |
 | `cpt-cf-usage-collector-fr-reconciliation-caller-scopes` | Deferred beyond v1: the tenant plane carries no calling-gear identity, so no counter can be grouped by caller. See [§4](#4-additional-context). |
 | `cpt-cf-usage-collector-fr-data-classification` | Opaque identifiers, operational telemetry, and caller-supplied metadata are the three classes. The gear interprets none of them and hosts no PII resolution. |
 
@@ -145,7 +145,7 @@ flowchart TB
         IngestPath["Ingestion Path<br/>(identity, idempotency, invalidation rules, quotas)"]
         Backfill["Backfill Path<br/>(isolated, origin-marked)"]
         QueryPath["Query Path<br/>(declared fold, raw, constraint application)"]
-        FeedPath["Feed Path<br/>(subscription, cursor, watermark)"]
+        FeedPath["Feed Path<br/>(subscription, cursor, completeness)"]
     end
     subgraph Domain["Domain"]
         Resolver["Type Resolver<br/>(cache over types-registry declarations)"]
@@ -202,7 +202,7 @@ directions.
 
 This is what keeps the feed's snapshot guarantee intact. A status flip on a
 delivered row would be a mutation a paginated scan could observe. An appended
-entry arriving at its own acceptance position cannot be.
+entry arriving at its own feed position cannot be.
 
 **ADRs**: `cpt-cf-usage-collector-adr-append-only-invalidation`
 
@@ -339,8 +339,11 @@ therefore migrate on independent schedules.
 
 The gateway owns, issues, decodes, and validates every opaque continuation token
 (`toolkit_odata::CursorV1`), on both the raw-query and feed paths. Plugins never
-mint, encode, or interpret a wire cursor — they receive a structured tuple and
-return rows plus a last keyset. This keeps cursor versioning, signing posture,
+mint, encode, or interpret a wire cursor. On the raw path a plugin receives a
+structured keyset tuple. On the feed path it receives back the opaque position
+it issued earlier, which the gateway carries inside its tokens without reading
+it. On both paths it returns rows plus the position to
+continue from. This keeps cursor versioning, signing posture,
 and validation at one platform-owned location.
 
 **ADRs**: `cpt-cf-usage-collector-adr-feed-aggregate-split`
@@ -512,7 +515,7 @@ a vendor-specific dependency requires a Plugin SPI major-version revision.
 
 | Entity | Description |
 | --- | --- |
-| `UsageRecord` | One accepted entry on the append-only ledger. It carries the attribution tuple, the covered period, a signed quantity, the dedup key, the acceptance instant and sequence, the origin, and optional metadata. An invalidation entry adds the target reference and a reason code. No operation rewrites an accepted entry. |
+| `UsageRecord` | One accepted entry on the append-only ledger. It carries the attribution tuple, the covered period, a signed quantity, the dedup key, the acceptance instant, the origin, and optional metadata. An invalidation entry adds the target reference and a reason code. No operation rewrites an accepted entry. |
 | `CreateUsageRecord` | The identity-free ingestion shape that both entry types share. It is the only input shape on every ingestion path, live and backfill. It carries no `entry_type`: `invalidates` alone decides the kind. |
 | `EntryType` | Closed discriminator, `record` or `invalidation`. Derived from the presence of `invalidates`. Never submitted, and never read from the value or sign of a quantity. |
 | `RecordOrigin` | Closed marker, `live` or `backfill`. The Ingestion Gateway stamps it from the path the entry arrived on. It applies to invalidation entries too. |
@@ -523,23 +526,22 @@ a vendor-specific dependency requires a Plugin SPI major-version revision.
 | `RecordMetadata` | Closed-shape key/value map. The GTS type declares the admissible keys. Values are strings in v1. The size cap is per deployment. |
 | `SecurityContext` | `toolkit_security::SecurityContext`, the platform-authenticated caller context. Declared in `libs/toolkit-security`, which is the only normative statement of its shape. Input to authorization only. |
 | `UsageRecordFilterField` | The admissible `$filter` and `group_by` field set: `tenant_id`, `resource_id`, `resource_type`, `subject_id`, `subject_type`, `entry_type`, `origin`, and `invalidates`, plus the queried type's declared metadata keys. Resolved per request. |
-| `Keyset` | The typed last-row sort tuple behind an opaque cursor. Raw reads use `(window_end, id)`, which a caller `$orderby` prefixes rather than replaces. Feed reads use `(acceptance_sequence, id)`. |
+| `Keyset` | The typed last-row sort tuple behind an opaque cursor. Raw reads use `(window_end, id)`, which a caller `$orderby` prefixes rather than replaces. Feed reads carry a `FeedPosition` instead. |
+| `FeedPosition` | A point in the feed's order. The storage plugin issues it, and decides whether one point covers a whole subscription or it keeps finer partitions of its own. It is opaque to the gateway and never appears on the wire. Its **age** is the acceptance instant it marks, which is what the retention-floor refusal reads. How a plugin assigns it — a store counter, a time-derived value, or anything else its backend offers — is plugin-internal, provided the feed-order invariant below holds. |
 | `AggregationResult` | Grouped buckets. Each carries the dimension values in `group_by` order and the folded quantity as `bigdecimal::BigDecimal` — unbounded, and deliberately not the per-entry `rust_decimal::Decimal`, because a fold is not bounded by the per-entry ceiling. `null` where no entry matched. Neither the fold nor the queried type rides the result: both are inputs to the call. |
-| `FeedSubscription` | The set of GTS types one consumer reads. It bounds that consumer's pages, cursor, and watermark. |
-| `FeedPage` | Entries in acceptance order, an opaque cursor, and an opaque watermark token carrying the completed position in every subscribed scope. |
-| `FeedWatermarkBound` | The typed per-scope positions behind a watermark token, as `Keyset` is the typed tuple behind a cursor. The SPI only ever sees it decoded. |
-| `ReconciliationMetadata` | Per-scope accepted counts, a fold-appropriate quantity summary, and three watermarks: acceptance instant, covered-period end, and sequence. |
+| `FeedSubscription` | The set of GTS types one consumer reads. It bounds that consumer's pages and cursor. |
+| `FeedPage` | Settled entries in feed order and an opaque cursor holding a `FeedPosition`. Everything before the cursor is delivered and final. |
+| `ReconciliationMetadata` | Per-scope accepted counts, a fold-appropriate quantity summary, and two watermarks: acceptance instant and covered-period end. |
 | `ReconciliationScope` | The reporting granularity. v1 admits `(tenant, gts_type)` only. The two caller scopes are reserved — see [§4](#4-additional-context). |
 | *(GTS type declaration)* | **Not an entity of this gear**, and given no shape here. A meter *is* a derived GTS type of `gts.cf.core.uc.usage_record.v1~`, whose trait schema is the only normative statement of what a declaration carries. The gear resolves a declaration. It never owns, mints, or stores one. |
 
 **Field ownership.** Who sets each field is load-bearing: a caller cannot forge
-identity, arrival order, or the entry kind.
+identity, acceptance instant, or the entry kind.
 
 | Group | Fields | Set by |
 | --- | --- | --- |
 | Caller-supplied | `tenant_id`, `resource_ref`, `subject_ref`, `gts_type_id`, `quantity`, `window_start`, `window_end`, `idempotency_key`, `invalidates`, `reason_code`, `metadata` | the emitter, on `CreateUsageRecord` |
 | Server-assigned | `id`, `accepted_at`, `origin` | the Ingestion Gateway, at the single choke point |
-| Server-assigned | `acceptance_sequence` | the storage plugin, at persist |
 | Derived on read | `entry_type` | computed from the entry's own `invalidates`, never stored as a flag |
 
 **Relationships**:
@@ -552,7 +554,7 @@ identity, arrival order, or the entry kind.
   path carries a reverse one.
 - `UsageRecord` → `ResourceRef` / `SubjectRef` / `RecordMetadata`: the
   attribution composites and the per-type extension surface.
-- `FeedSubscription` → `FeedPage`: bounds which entries, cursor, and watermark
+- `FeedSubscription` → `FeedPage`: bounds which entries and cursor
   one consumer receives.
 
 #### Value Objects and Invariants
@@ -585,8 +587,8 @@ on `nominal_sampling_interval`.
 | Additivity | A consumer reading entries directly sums quantities only where the declared fold is `SUM`, and MUST leave out every withdrawn pair. Under any other fold the quantities are observations and summing them is invalid. | consumer contract |
 | `COUNT` quantity | Under `COUNT` the quantity means nothing: one record is one event. An emitter sends `1`. Ingestion does not enforce this, because it never consults the fold. | consumer contract |
 | `COUNT` exclusion | `COUNT` counts the records in range that no accepted invalidation withdraws. It counts no invalidation entry and no withdrawn record, so a withdrawn pair counts none. | Query Gateway + every plugin (§3.3 contract test) |
-| `LATEST` tie-break | Greatest `window_end`, then greatest `acceptance_sequence`. It terminates because the sequence is monotonic inside the group's scope. `MAX` and `MIN` need no such rule. | plugin (§3.3 contract test) |
-| Acceptance-sequence monotonicity | Strictly monotonic per `(tenant_id, gts_type_id)`. No cross-tenant or cross-type total order is claimed. This is what makes feed order deterministic and `LATEST` tie-breaking terminate. | plugin, at persist |
+| `LATEST` tie-break | Greatest `window_end`, then greatest `accepted_at`, then greatest `id` in byte order. `id` is unique, so the order is total. The gear assigns all three keys, and each compares across tenants and types, so the order also holds over a group spanning tenants — which is what a request produces when it neither narrows to one tenant nor groups by tenant. `MAX` and `MIN` need no such rule. | plugin (§3.3 contract test) |
+| Feed order | The feed serves one deterministic order over a subscription, realised by the plugin through `FeedPosition`. No other ordering is claimed — in particular not acceptance-instant order. Two properties bind it. **Completeness**: a page carries only settled entries — entries before which nothing more can become visible — so no entry becomes visible behind a returned cursor, however many writers accept concurrently and in whatever order their writes commit. A page that reaches the settled head of the feed returns its cursor at that head rather than at its last entry, so a cursor's age reflects how far its consumer has read, not when an entry last arrived. **Correction order**: an invalidation follows its target. | plugin (§3.3 contract test) |
 | Declaration immutability | The fold, the canonical unit, and the metadata surface are immutable for the life of a GTS type. A meter that must change one is a new type. A persisted quantity carries neither unit nor fold of its own, so an edit in place would silently restate every entry already accepted. | `types-registry` |
 | Fail-closed resolution | An entry whose `gts_type_id` resolves nowhere is rejected and not persisted. The gear never substitutes a default for a declared attribute, and never relaxes validation to protect ingestion availability. Steady-state resolution is served from a local cache, so a registry outage degrades new-type introduction rather than ingestion. A declaration the registry has lost is restored from the mirror table (§3.7), where a row exists and the registry returns a definite not-found answer. | Type Resolver |
 | Closed metadata shape | An undeclared key is rejected before persistence. There is no free-form remainder and no open-extras escape hatch. Admissibility is recomputed per request, so a freshly declared property is usable on the next request. | Ingestion Gateway + Query Gateway |
@@ -796,24 +798,25 @@ A charging consumer's inbound path must be replay-safe under concurrent ingest �
 a consumer outage beyond its buffer, a region loss, a bounded re-rating. Without
 snapshot-consistent cursors a scan is silently incomplete or silently
 duplicated. The feed is a distinct component from the Query Gateway for two reasons. It
-orders by arrival rather than by covered period. Its snapshot and watermark
+serves its own feed order rather than covered-period order. Its snapshot and completeness
 obligations also have no analogue on the query paths.
 
 ##### Responsibility scope
 
 - Accepts a subscription declaring the GTS types a consumer reads, and excludes
-  everything else from the pages, the cursor, and the watermark.
-- Serves cursor-paginated pages ordered by `acceptance_sequence` within each
-  `(tenant, gts_type)` scope. Interleaving of scopes within a page is
-  implementation-defined but deterministic: the same cursor yields the same
-  continuation, extended only by entries accepted since. A replay that resends a
-  recorded watermark is identical, entry for entry.
-- Returns an opaque watermark token with every page, carrying the completed
-  position in every subscribed scope. A consumer resends it to bound a replay,
-  and the gateway applies the boundary per scope.
-- Refuses a cursor older than the retention floor with an actionable error,
-  rather than serving a silently truncated range.
-- Serves corrections as ordinary entries at their own acceptance position. No
+  everything else from the pages and the cursor.
+- Serves cursor-paginated pages in the deterministic order the active plugin
+  realises: the same cursor yields the same continuation, extended only by
+  entries accepted since. A replay bounded by a
+  cursor recorded later is identical, entry for entry.
+- Returns a next cursor with every page of a live read, including a page with
+  fewer entries than requested, and none once a bounded replay reaches `until`.
+  The feed reads forward only, so it returns no previous cursor. The cursor
+  proves completeness: everything before it is delivered
+  and final, because a page carries only settled entries.
+- Surfaces the plugin's refusal of a cursor older than the retention floor as
+  an actionable error, rather than serving a silently truncated range.
+- Serves corrections as ordinary entries at their own feed position. No
   feed entry represents a change to an already-delivered entry.
 
 ##### Responsibility boundaries
@@ -992,17 +995,18 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError>;
 
-    /// Replay-safe feed page over `(acceptance_sequence, id)`.
+    /// Replay-safe feed page, in the feed's deterministic order.
     ///
     /// Snapshot-consistent, unlike the query paths (§3.10). A consumer that
     /// must not miss entries reads this and not `list_usage_records`. A
-    /// cursor older than the retention floor is refused.
+    /// cursor older than the retention floor is refused. `until`, a cursor
+    /// recorded later, bounds a replay to exactly the pages read before.
     async fn read_usage_feed(
         &self,
         ctx: &SecurityContext,
         subscription: &FeedSubscription,
         cursor: Option<&CursorV1>,
-        watermark: Option<&FeedWatermarkBound>,
+        until: Option<&CursorV1>,
         limit: Option<u64>,
     ) -> Result<FeedPage, UsageCollectorError>;
 }
@@ -1071,11 +1075,16 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;
 
-    /// Snapshot-consistent feed page over `(acceptance_sequence, id)`.
+    /// Snapshot-consistent feed page, in the feed's deterministic order.
+    ///
+    /// `page_after` carries back a position this plugin issued, and
+    /// `until` a later one bounding a replay. Only the
+    /// plugin assigns or reads them. A page carries only settled entries.
     async fn read_feed_page(
         &self,
         subscription: &[MeterTypeId],
-        page_after: Option<FeedKeyset>,
+        page_after: Option<FeedPosition>,
+        until: Option<FeedPosition>,
         limit: u64,
     ) -> Result<FeedPage, UsageCollectorPluginError>;
 
@@ -1092,7 +1101,7 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
 
 **Plugin obligations.** These sit on top of the §3.1 invariants a plugin
 enforces (period-end selection, quantity fidelity, dedup identity, at most one
-invalidation, sequence monotonicity, `LATEST` tie-break, recomputation):
+invalidation, feed order, `LATEST` tie-break, recomputation):
 
 - **Do not re-validate.** The gateway enforces PDP attribution, type
   resolution, declaration validation, metadata shape, quantity range, period
@@ -1126,8 +1135,9 @@ invalidation, sequence monotonicity, `LATEST` tie-break, recomputation):
 | `at-most-one-invalidation` | A second withdrawal of one record is rejected. Under two concurrent submissions exactly one succeeds. |
 | `dedup-identity-over-window` | Both period bounds are part of the identity, so a same-key submission over a different period is a distinct entry. |
 | `quantity-round-trip` | The full published range round-trips digit for digit, negative half included. |
-| `feed-snapshot-and-replay` | A paginated scan observes no entry appearing, disappearing, or changing, except append-only arrivals the watermark demarcates. Replay from one cursor yields the same entries in the same order, extended only by entries accepted since. Resending a recorded watermark, the replay is identical — including where the subscription's scopes sit at different positions and one has never been written. |
-| `latest-tie-break` | Greatest `window_end`, then greatest `acceptance_sequence`. |
+| `feed-snapshot-and-replay` | A paginated scan observes no entry appearing, disappearing, or changing, except append-only arrivals ahead of the cursor. Replay from one cursor yields the same entries in the same order, extended only by entries accepted since. Bounded by a cursor recorded later, the replay is identical — including over a subscription spanning many tenants, some never written. |
+| `feed-completeness` | Under concurrent ingestion of measurements and invalidation entries through several gateway replicas, no page carries an entry that is not yet settled, no entry becomes visible behind a returned cursor, a page reaching the head returns its cursor at the head so a consumer that keeps reading is never refused however long its subscription stays quiet, and every invalidation follows its target. |
+| `latest-tie-break` | Greatest `window_end`, then greatest `accepted_at`, then greatest `id` in byte order. Two entries sharing a period resolve to the later-accepted one, and an aggregate that spans tenants resolves ties by the same order. |
 
 #### REST API — `cpt-cf-usage-collector-interface-rest-api`
 
@@ -1182,23 +1192,28 @@ its covered period alone, and an invalidation copies the period it withdraws.
 
 Per `cpt-cf-usage-collector-principle-cursor-gateway-ownership`, the gateway
 owns `toolkit_odata::CursorV1` on both paginated paths. The SPI never sees the
-wire token. The two paths anchor on different keysets. Raw query uses
-`(window_end, id)`, and the feed uses `(acceptance_sequence, id)`. One orders
-the ledger by the column selection reads, the other by arrival. Each tuple is
-unique within its scope, so successive page boundaries neither skip nor repeat
-rows within a stable filter scope. The cursor binds the order and a hash of the
+wire token. The two paths anchor differently. Raw query uses the keyset
+`(window_end, id)`, ordering the ledger by the column selection reads. That
+tuple is unique within its scope, so successive page boundaries neither skip
+nor repeat rows within a stable filter scope. The feed anchors on
+the `FeedPosition` the plugin issued. The gateway carries it inside the token
+and never reads it, and the feed-order invariant (§3.1) gives the same no-skip,
+no-repeat property. The cursor binds the order and a hash of the
 filter it was minted under, so that stability is enforced and not trusted. A
 malformed token, a changed filter, or an order supplied alongside a cursor is
 rejected as `InvalidArgument` with a `cursor` field violation —
 `INVALID_CURSOR`, `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`, and, in process only
 where a caller can set both at once, `ORDER_MISMATCH`.
 
-The feed's watermark token is owned the same way. It carries one acceptance
-position per subscribed scope, which no single sequence number can hold, so the
-gateway mints and decodes it and that set never becomes wire contract. The SPI
-receives a decoded `FeedWatermarkBound`, as it receives a decoded `Keyset`. A
-malformed or foreign token is rejected as `InvalidArgument` with a `watermark`
-field violation — `INVALID_WATERMARK`, `SUBSCRIPTION_MISMATCH`.
+A feed cursor carries the plugin's `FeedPosition` and binds the subscription as
+a raw cursor binds its filter. The position never becomes wire contract. The
+SPI receives it decoded as `FeedPosition` and is the only component that
+interprets it, including its age for the retention-floor refusal. No second token exists: a feed cursor already proves that everything
+before it is delivered and final, because a page carries only settled entries.
+The optional `until` bound is a cursor too, validated on the same terms and
+rejected with an `until` field violation. It is not part of the scope a feed
+cursor binds: adding `until` to a request that resends a cursor, or dropping
+it, is not a `FILTER_MISMATCH`.
 
 #### Error Contract
 
@@ -1242,7 +1257,7 @@ boundary in `usage-collector/src/domain/service.rs`:
 | `IdempotencyConflict { idempotency_key, existing_id }` | `Conflict(IdempotencyConflict)` |
 | `AlreadyInvalidated { id, invalidated_by }` | `Conflict(AlreadyInvalidated)` |
 | `UsageRecordNotFound { id }` | `NotFound` |
-| `CursorBeyondRetention { oldest_available }` | `InvalidArgument(CursorBeyondRetention)` |
+| `CursorBeyondRetention` | `InvalidArgument(CursorBeyondRetention)` |
 
 Six variants, deliberately. Type resolution, faithful-copy and reason-code
 checks, metadata shape and size, quantity range, cursor decoding, and
@@ -1332,7 +1347,7 @@ binding).
 | --- | --- |
 | Direction | Provided (read-only). **Pull-only by design** — no push/subscribe surface. |
 | Driver | REST plus in-process SDK. Wire contract: §3.3 plus `usage-collector-v1.yaml`. |
-| Data | Raw reads, aggregated reads, point lookups, and feed pages with cursor and watermark. Business logic must not run inside the Usage Collector. |
+| Data | Raw reads, aggregated reads, point lookups, and feed pages with their cursor. Business logic must not run inside the Usage Collector. |
 | Availability | `nfr-query-latency` plus `nfr-availability`. Feed freshness and replay throughput are plugin-readiness gates. PDP fail-closed. Readers must not invent usage state when UC is unreachable. |
 | Compatibility | From 1.0 onward, at most one prior major of REST and SDK supported concurrently. |
 
@@ -1381,7 +1396,7 @@ sequenceDiagram
     IG->>IG: derive id = UUIDv5(tenant, gts_type, key, window_start, window_end)
     IG->>IG: stamp accepted_at, origin=live
     IG->>PH: create_usage_record(s)
-    PH->>P: persist (assigns acceptance_sequence)
+    PH->>P: persist
     P-->>PH: persisted | absorbed retry | IdempotencyConflict
     PH-->>IG: outcome
     IG-->>GW: per-entry acknowledgement
@@ -1502,19 +1517,19 @@ sequenceDiagram
     participant PH as Plugin Host
     participant P as Storage Plugin
 
-    C->>FG: GET /feed (subscription: gts_type_ids[], cursor?)
+    C->>FG: GET /feed (subscription: gts_type_ids[], cursor?, until?)
     FG->>PDP: access_scope_with(ctx, read scope per subscribed type)
     PDP-->>FG: permit + constraints | deny
-    FG->>FG: decode cursor, reject if older than the retention floor
-    FG->>PH: read_feed_page(subscription, page_after, limit)
-    PH->>P: snapshot scan over (acceptance_sequence, id) per scope
-    P-->>PH: entries + last keyset + watermark
+    FG->>FG: decode and validate cursor and until
+    FG->>PH: read_feed_page(subscription, page_after, until, limit)
+    PH->>P: snapshot scan in feed order, settled entries only
+    P-->>PH: entries + next position | CursorBeyondRetention
     PH-->>FG: page
-    FG->>FG: mint next_cursor
-    FG-->>C: FeedPage { entries, next_cursor, watermark }
+    FG->>FG: mint next_cursor (none once until is reached)
+    FG-->>C: FeedPage { entries, page_info }
 ```
 
-Corrections arrive as ordinary entries at their own acceptance position. An accepted invalidation removes no entry from the feed. A replay from a
+Corrections arrive as ordinary entries at their own feed position, after the entry they withdraw. An accepted invalidation removes no entry from the feed. A replay from a
 cursor within the retention floor therefore observes the same entries the
 original scan observed.
 
@@ -1568,8 +1583,8 @@ plugin's own DESIGN document owns them. These shapes cover column types,
 primary keys, indexes, partitioning, retention, materialised views, and
 acceleration structures. Two obligations bind them from here. The dedup identity must be enforced as a
 uniqueness constraint over the 5-tuple, and preserved for the retention
-horizon. The plugin assigns `acceptance_sequence` and must keep it strictly
-monotonic per `(tenant_id, gts_type_id)`.
+horizon. The plugin realises the feed's order in whatever way its
+backend allows, and must meet the feed-order invariant of §3.1.
 
 ### 3.8 Deployment Topology
 
@@ -1677,7 +1692,7 @@ attempts for as long as the referenced type's retention policy keeps it. The ded
   with no upper bound** relative to a same-tenant ingestion ack. The window is
   driven by the active plugin's replication topology, not by Usage Collector.
   **No monotonic-reads guarantee at the floor.** The floor is per
-  `(tenant_id, gts_type_id)`. No cross-tenant or cross-type ordering is claimed.
+  `(tenant_id, gts_type_id)`. The floor claims no ordering of entries.
 - **Type declarations are outside this floor.** They are resolved from `types-registry` through the Type Resolver cache. Their
 propagation delay is therefore a property of that resolution path rather than
 of the storage plugin.
@@ -1697,14 +1712,14 @@ of the storage plugin.
   configured past tolerance while backfill accepts its whole window. An entry may
   therefore be inserted at a position a forward `(window_end, id)` cursor has
   already passed. This is orthogonal to replica lag — it occurs even on a
-  fully-converged single node. **A consumer that must not miss entries reads the feed.** The feed orders by
-  `acceptance_sequence` and therefore has no such hole. Such a consumer can
+  fully-converged single node. **A consumer that must not miss entries reads the feed.** The feed's
+  completeness rule closes that hole. Such a consumer can
   also re-aggregate over a closed window.
 
 **The feed is the exception, and deliberately so.** Unlike the query paths, the feed guarantees a **consistent snapshot**. A
 paginated scan does not observe entries appearing, disappearing, or changing
-mid-scan. The one exception is append-only arrivals, which the watermark
-returned with each page demarcates. The append-only ledger purchases that guarantee. No entry is ever mutated, and
+mid-scan. The one exception is append-only arrivals, which always land ahead of
+the cursor, because a page carries only settled entries. The append-only ledger purchases that guarantee. No entry is ever mutated, and
 a correction arrives as a later entry rather than a change to a delivered one.
 A scan therefore has nothing to observe changing. Feed *freshness* remains a
 plugin-readiness gate (`nfr-billing-feed-freshness`). Feed *consistency* is a
@@ -1720,16 +1735,19 @@ bound can then opt in by coupling to it. Every guide MUST state:
 2. **acceptance → feed visibility, p95.** A deployment whose plugin publishes
    no qualifying ceiling here MUST NOT feed a charging consumer
    (`nfr-billing-feed-freshness`, ≤ 5 minutes p95)
-3. **acceptance → aggregate visibility**, where the aggregate is materialised,
+3. **how it realises the feed's order**: how it assigns positions,
+   and how it keeps every page to settled entries under concurrent writers and
+   out-of-order commits
+4. **acceptance → aggregate visibility**, where the aggregate is materialised,
    **and separately how an accepted invalidation reaches it**. Withdrawal
    obliges recomputation, so a single number for both overstates one of them
    (`nfr-aggregate-freshness`)
-4. whether monotonic reads per `(tenant_id, gts_type_id)` hold by default, and
+5. whether monotonic reads per `(tenant_id, gts_type_id)` hold by default, and
    which knobs preserve them
-5. the retention it enforces per GTS type. The floor is the backfill window
+6. the retention it enforces per GTS type. The floor is the backfill window
    plus one replay horizon, and the retention must meet it for every type a
    charging consumer reads
-6. the sustained bulk read rate it can serve the feed at, against
+7. the sustained bulk read rate it can serve the feed at, against
    `nfr-replay-throughput`, and the procedure for deploying outside the
    documented posture.
 
@@ -1799,7 +1817,7 @@ label vocabularies are part of the architectural contract.
 | `uc_ingestion_requests_total` | `outcome` (`accepted`, `partial`, `rejected`), `error_category` (`none`, `missing_security_context`, `authz`, `unresolved_type`, `validation`, `metadata_size`, `quota`, `plugin_error`) | ingestion-gateway | Every submission request completes. `error_category` carries the request-wide reason and is `none` for `accepted`/`partial`. |
 | `uc_ingestion_records_total` | `outcome` (`accepted`, `duplicate`, `rejected`), `entry_type` (`record`, `invalidation`), `origin` (`live`, `backfill`), `error_category` (`none`, `authz`, `unresolved_type`, `validation`, `idempotency_conflict`, `invalidation_rule`, `plugin_error`) | ingestion-gateway | One increment per entry. **This carries the throughput NFR** — the profile is stated in entries, not requests — plus the correction and backfill shares. A period-bound rejection is `validation` for either `entry_type`, since the bound belongs to the path; `invalidation_rule` covers the copy, reference and at-most-one rules alone. |
 | `uc_query_requests_total` | `query_kind` (`aggregated`, `raw`, `point`), `outcome` (`success`, `denied`, `error`), `error_category` (`none`, `missing_security_context`, `authz`, `unresolved_type`, `cursor_decode`, `undeclared_field`, `missing_time_range`, `query_budget`, `plugin_error`) | query-gateway | Every query attempt completes. |
-| `uc_feed_requests_total` | `outcome` (`success`, `denied`, `error`), `error_category` (`none`, `authz`, `cursor_decode`, `cursor_beyond_retention`, `watermark_decode`, `plugin_error`) | feed-gateway | Every feed page request completes. `cursor_beyond_retention` is the replay-refusal signal. |
+| `uc_feed_requests_total` | `outcome` (`success`, `denied`, `error`), `error_category` (`none`, `authz`, `cursor_decode`, `cursor_beyond_retention`, `plugin_error`) | feed-gateway | Every feed page request completes. `cursor_beyond_retention` is the replay-refusal signal. |
 | `uc_type_resolution_total` | `result` (`cache_hit`, `cache_miss`, `restored`, `unresolved`, `registry_error`) | type-resolver | Every declaration resolution. The `cache_hit` share is the signal that the ingestion budget assumption holds. A sustained `restored` rate means `types-registry` is losing declarations. |
 | `uc_declaration_mirror_write_failures_total` | — | type-resolver | A declaration resolved but not mirrored. Each one is a type that a later registry restart will not restore. Ingestion is unaffected. |
 | `uc_pdp_failures_total` | `operation` (`ingest`, `backfill`, `query_raw`, `query_aggregated`, `get_record`, `read_feed`, `reconciliation`), `cause` (`unreachable`, `timeout`) | any component performing PDP enforcement | PDP call fails or times out. Denials are not failures. `cause="timeout"` is reserved until a host-side PDP deadline exists. |

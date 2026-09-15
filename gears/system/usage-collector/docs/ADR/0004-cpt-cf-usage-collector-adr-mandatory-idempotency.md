@@ -4,7 +4,7 @@ date: 2026-05-24
 ---
 
 Created:  2026-05-22 by Virtuozzo International GmbH
-Updated:  2026-09-10 by Virtuozzo International GmbH
+Updated:  2026-09-14 by Virtuozzo International GmbH
 
 # Mandatory idempotency key on every ingestion entry
 
@@ -104,7 +104,7 @@ the stored entry: quantity, resource, subject, metadata, invalidation target, an
 reason code. The plugin absorbs the submission and returns the stored entry, and
 the gear acknowledges it as accepted. No surface carries a separate duplicate
 outcome. A caller that must tell a replay from a first write reads the returned
-acceptance instant and acceptance sequence, which are the first entry's.
+acceptance instant, which is the first entry's.
 
 It is a canonical-field mismatch when any of those fields differs, a
 metadata-only difference included. The plugin reports a conflict that carries the

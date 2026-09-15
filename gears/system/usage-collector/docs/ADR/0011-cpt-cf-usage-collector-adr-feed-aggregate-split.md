@@ -5,7 +5,7 @@ decision-makers: usage-collector spec owners
 ---
 
 Created:  2026-09-09 by Virtuozzo International GmbH
-Updated:  2026-09-09 by Virtuozzo International GmbH
+Updated:  2026-09-15 by Virtuozzo International GmbH
 
 # Charging reads the entry stream, and aggregates are a derived view
 
@@ -41,7 +41,8 @@ therefore hands off, and the question is where that hand-off happens.
 
 Three read surfaces are candidates. The raw query path serves entries as
 persisted. The aggregate path applies the declared fold over a requested range.
-The feed serves entries in acceptance order under a subscription.
+The feed serves entries under a subscription, in an order independent of the
+covered period.
 
 The question is architectural rather than a routing detail, because the answer
 fixes what each surface must guarantee. A surface that feeds a charge owes
@@ -61,7 +62,8 @@ neither staleness it cannot detect nor a number it cannot reproduce.
   their identifiers, covered periods, correction linkage and reason codes. A
   total names nothing.
 - Staleness must be detectable — a charging consumer has to prove it has seen a
-  closed period, which needs a watermark and per-scope reconciliation metadata.
+  closed period, which needs a cursor that proves completeness and per-scope
+  reconciliation metadata.
 - `cpt-cf-usage-collector-fr-billing-usage-feed` — requires a deterministic,
   replay-safe pull path over entries. This decision states which consumer that
   path exists for.
@@ -80,7 +82,7 @@ neither staleness it cannot detect nor a number it cannot reproduce.
 ## Considered Options
 
 - A dedicated pull feed for entries, with aggregates as a derived view — the feed
-  carries entries under a subscription in acceptance order. The aggregate path
+  carries entries under a subscription in feed order. The aggregate path
   becomes a derived read path with its own freshness gate.
 - Aggregates only, with the per-entry read paths removed — the gear serves one
   number per meter, period and grouping. The feed, the raw query path and point
@@ -97,46 +99,62 @@ view". A charging consumer reads the feed and derives its charges from entries.
 
 The feed carries the obligations that follow from that role. It is pull-based
 over the Downstream Usage Reader Contract. A consumer declares the set of GTS
-types it rates, and the Feed Gateway excludes everything else from the pages, the
-cursor and the watermark. Pages are ordered by an acceptance sequence that is
-strictly monotonic per tenant and type, and no cross-tenant or cross-type total
-order is claimed. The gateway owns the cursor encoding, and a plugin never mints,
-encodes or interprets one. Every page carries a watermark: an opaque token
-holding the completed acceptance position in every subscribed scope, minted and
-decoded by the gateway on the same terms as the cursor. A single sequence number
-cannot serve — it is monotonic only within a scope, and a subscription spans
-every tenant, so one number for all of them would sit at the least advanced, and
-at zero behind any scope never written. The token also keeps that set off the
-wire, free to change and leaking no other tenant's volume.
+types it rates, and the Feed Gateway excludes everything else from the pages and the
+cursor. Pages come in a deterministic order the storage plugin chooses. Beyond
+determinism the decision promises only that an invalidation follows its target.
+In particular it promises no acceptance-instant order, and a consumer detects
+late arrival from the acceptance instant instead. The gateway owns the cursor
+encoding, and a plugin never mints, encodes or interprets one. The opaque cursor
+keeps the plugin's position off the wire, free to change and leaking no other
+tenant's volume.
 
-The storage plugin assigns the acceptance sequence, because only an atomic
-operation against the store guarantees monotonicity. The assignment therefore
-belongs where the entry lands. This decision's ordering guarantee depends on the
-sequence being assigned at acceptance, not on which component assigns it.
+The storage plugin owns the feed's order and how it is realised. A position is
+plugin-issued and opaque: the gateway carries it inside the cursor without
+reading it, and no position value appears on the wire. The
+decision fixes what the order guarantees rather than how positions are
+assigned, because backends differ in what they can assign cheaply. One store
+has a native counter per table. Another has no sequence at all, and would need
+a coordination round-trip per write to emulate a counter per scope. Two
+guarantees bind every plugin. **Completeness**: a page carries only settled
+entries, before which nothing more can become visible. A cursor
+therefore never passes a position that is not final, and once it has passed one,
+no entry becomes visible at or before it, however many writers accept
+concurrently and in whatever order their writes commit. A page that reaches the
+settled head of the feed returns its cursor at that head, so a cursor's age
+reflects how far its consumer has read. **Correction order**: an invalidation
+follows its target.
 
 A paginated scan observes a snapshot, and the append-only ledger purchases that
 property. No accepted entry is ever rewritten. A correction arrives as a later
-invalidation entry at its own acceptance position, so a scan has nothing to
-observe changing. Append-only arrivals are the one carve-out, and the watermark
-returned with each page demarcates them.
+invalidation entry at its own feed position, so a scan has nothing to
+observe changing. Append-only arrivals are the one carve-out, and they always
+land ahead of the cursor.
 
 The snapshot is therefore prefix-stable rather than frozen. A replay from a
 cursor returns every entry the original scan returned, in the same order and at
 the same position, extended only by entries accepted since. A consumer that
-resends a watermark it recorded reads an identical page. That watermark, not
-the cursor, is the snapshot boundary.
+bounds the replay with a cursor it recorded later reads exactly the pages it
+read before.
+
+No second token exists beside the cursor. Because a page carries only settled
+entries, a cursor already proves that everything before it is delivered and
+final. A separate completeness token would restate that. A design needs one
+only when its cursor can run ahead of what is final, and a cursor that runs
+ahead of what is final is exactly the hole completeness closes: an entry still
+being written lands behind it, and the consumer never receives it.
 
 Three zones govern a rewound cursor
-(`cpt-cf-usage-collector-fr-billing-retention-floor`). A cursor no older than the
+(`cpt-cf-usage-collector-fr-billing-retention-floor`). A cursor's age is the
+acceptance instant of the point it marks, and nothing else. A cursor no older than the
 operational replay horizon is served, and that is the guarantee a charging
 consumer codes against. Between that horizon and the retention floor, service is
 plugin-dependent and a consumer relies on none of it. A cursor older than the
 retention floor is refused with an actionable error. The Feed Gateway never
-serves a silently truncated range.
+serves a silently truncated range past the retention floor.
 
-The feed delivers both entries of a withdrawn pair, each at its own acceptance
-position. The two can land in different pages, because an invalidation is
-accepted after its target. Excluding the pair is therefore the consumer's step,
+The feed delivers both entries of a withdrawn pair, each at its own feed
+position. The two can land in different pages, because an invalidation follows
+its target in feed order and can arrive any time after it. Excluding the pair is therefore the consumer's step,
 taken when it folds, and the feed never excludes it. A consumer never treats a
 target as final because the page carrying it held no invalidation.
 
@@ -174,9 +192,9 @@ can therefore be inserted at a position a forward event-time cursor has already
 passed. The consumer never receives that entry and cannot detect the omission.
 
 The hole exists on a fully converged single node. It is therefore not a
-replica-lag problem, and no plugin consistency ceiling closes it. The feed orders
-by acceptance sequence, which is assigned at acceptance, so a newly accepted
-entry always lands ahead of a forward cursor. The raw path stays an audit,
+replica-lag problem, and no plugin consistency ceiling closes it. The feed's
+completeness guarantee means a newly accepted entry never becomes visible behind
+a cursor already returned. The raw path stays an audit,
 debugging and dispute-resolution surface (`cpt-cf-usage-collector-fr-query-raw`).
 
 ### Consequences
@@ -189,10 +207,10 @@ debugging and dispute-resolution surface (`cpt-cf-usage-collector-fr-query-raw`)
   backlog age to recovery time. At the launch objective that is five times the
   subscribed arrival rate, and a consumer never pays for traffic it does not
   read.
-- Reconciliation metadata and watermarks exist so a consumer can prove it has
-  seen a closed period. Per-scope counts, the acceptance-instant watermark, the
-  covered-period-end watermark and the acceptance-sequence watermark carry that
-  proof. The gear evaluates none of them and raises no stall signal.
+- Reconciliation metadata and its watermarks exist so a consumer can prove it
+  has seen a closed period. Per-scope counts, the acceptance-instant watermark
+  and the covered-period-end watermark carry that proof, beside the feed cursor
+  the consumer holds. The gear evaluates none of them and raises no stall signal.
 - The retention floor is what makes replay meaningful. It sums the backfill
   window and the operational replay horizon, so every accepted entry keeps one
   full horizon from the moment it becomes readable. A cursor past the floor is
@@ -203,8 +221,8 @@ debugging and dispute-resolution surface (`cpt-cf-usage-collector-fr-query-raw`)
 - The aggregate path being derived is what makes pre-aggregation legitimate. A
   charging path served from a materialised rollup is not legitimate, because a
   consumer cannot reproduce the charge from named entries.
-- The Feed Gateway stays a component distinct from the Query Gateway. It orders
-  by arrival rather than by covered period, and its snapshot and watermark
+- The Feed Gateway stays a component distinct from the Query Gateway. It serves
+  its own feed order rather than covered-period order, and its snapshot and completeness
   obligations have no analogue on the query paths.
 - Retaining entries keeps a recovery path open that an aggregates-only surface
   closes. A meter whose fold was bound wrongly can be re-read and reprocessed
@@ -216,12 +234,15 @@ debugging and dispute-resolution surface (`cpt-cf-usage-collector-fr-query-raw`)
 - Feed contract tests covering prefix stability and replay determinism. The same
   cursor yields the same continuation, extended only by entries accepted since,
   and a replay from a cursor inside the operational replay horizon observes the
-  entries the original scan observed, in the same order. A replay that resends a
-  recorded watermark is identical, entry for entry.
-- A multi-scope watermark test. A subscription whose scopes sit at different
-  positions, one never written, replays identically from a recorded watermark.
-- An acceptance-sequence monotonicity test per tenant and type, run under
-  concurrent ingestion of measurements and invalidation entries.
+  entries the original scan observed, in the same order. A replay bounded by a
+  cursor recorded later is identical, entry for entry.
+- A multi-tenant cursor test. A subscription spanning many tenants, some never
+  written, replays identically between two recorded cursors, and a consumer that
+  keeps reading is never refused however long its subscription stays quiet.
+- A completeness test, run under concurrent ingestion of
+  measurements and invalidation entries through several gateway replicas. No
+  page carries an entry that is not yet settled, no entry becomes visible behind
+  a returned cursor, and every invalidation follows its target.
 - A replay-refusal test. A cursor older than the retention floor returns an
   actionable error rather than a short page.
 - A recovery test against a subscription at the NFR envelope. A 24-hour backlog
@@ -235,15 +256,25 @@ debugging and dispute-resolution surface (`cpt-cf-usage-collector-fr-query-raw`)
 
 ### A dedicated pull feed for entries, with aggregates as a derived view
 
-The feed carries entries under a subscription in acceptance order. The aggregate
+The feed carries entries under a subscription in feed order. The aggregate
 path serves the declared fold to consumers that never compute a charge.
 
 - Good, because a charge stays reproducible. A consumer recomputes a period from
   named entries and obtains the number it charged.
 - Good, because a dispute resolves against identified entries, with covered
   periods, correction linkage and reason codes intact.
-- Good, because acceptance-sequence ordering has no late-arrival hole. A sequence
-  assigned at acceptance always lands ahead of a forward cursor.
+- Good, because a feed order with completeness has no late-arrival hole. A
+  newly accepted entry never lands behind a cursor already returned.
+- Good, because one token carries both the resume point and the completeness
+  proof, so a consumer cannot hold the two out of step.
+- Neutral, because the feed shows an entry only once it is settled, so feed lag
+  includes each plugin's settling time. That time falls inside the published
+  feed-freshness ceiling.
+- Good, because the ordering guarantee is stated as an outcome, so every backend
+  can meet it in its own way. None is forced to emulate a counter per scope.
+- Neutral, because completeness is a property each plugin must demonstrate
+  rather than one a counter implies. Each plugin's deployment guide states how
+  it holds.
 - Good, because it frees the aggregate path to be materialised. Close-query cost
   then scales with buckets served rather than with entries ingested.
 - Good, because subscription scoping keeps the replay obligation proportionate to
@@ -261,7 +292,7 @@ The gear serves one number per meter, period and grouping. The feed, the raw
 query path and point lookup all go away.
 
 - Good, because it is the smallest surface the gear can publish. One read shape,
-  with no cursor, no watermark and no snapshot obligation.
+  with no cursor and no snapshot obligation.
 - Good, because it makes the expensive scan unnecessary. Nothing has to stream
   tens of billions of entries out of the store.
 - Good, because it matches how a dashboard actually consumes usage. A chart asks
@@ -385,8 +416,8 @@ This decision directly addresses the following requirements or design elements:
   realizes, and the surface a charging consumer reads.
 - `cpt-cf-usage-collector-fr-billing-fields-on-read` — what every feed page
   carries, unstripped and with each invalidation naming the entry it withdraws.
-- `cpt-cf-usage-collector-fr-reconciliation-metadata` — the watermark and
-  metadata a consumer reconciles against to prove it has seen a closed period.
+- `cpt-cf-usage-collector-fr-reconciliation-metadata` — the metadata and
+  watermarks a consumer reconciles against to prove it has seen a closed period.
 - `cpt-cf-usage-collector-fr-billing-retention-floor` — the floor that bounds
   replay, and past which a cursor is refused.
 - `cpt-cf-usage-collector-nfr-query-freshness` — the floor that publishes no
@@ -412,7 +443,7 @@ This decision directly addresses the following requirements or design elements:
 - `cpt-cf-usage-collector-principle-canonical-page` — the page envelope the feed
   shares with every list path.
 - `cpt-cf-usage-collector-component-feed-gateway` — the component that owns
-  subscription, ordering, the watermark and cursor refusal.
+  the subscription and the cursor, and surfaces the plugin's refusal of a cursor.
 - `cpt-cf-usage-collector-contract-downstream-usage-reader` and
   `cpt-cf-usage-collector-actor-usage-consumer` — the contract and the actor this
   surface serves.

@@ -5,7 +5,7 @@ decision-makers: usage-collector spec owners
 ---
 
 Created:  2026-09-09 by Virtuozzo International GmbH
-Updated:  2026-09-09 by Virtuozzo International GmbH
+Updated:  2026-09-15 by Virtuozzo International GmbH
 
 # Entries are selected by the end of their covered period
 
@@ -81,8 +81,8 @@ no case for a point event, because a point event has
 `window_start == window_end`.
 
 The rule holds on every path that takes a time range: the aggregate path, the raw
-query path, and every SPI method. The usage feed is unaffected, because it selects
-and orders by acceptance sequence rather than by covered period.
+query path, and every SPI method. The usage feed is unaffected, because it neither
+selects nor orders by covered period.
 
 Raw pagination orders by `(window_end, id)`, so the range filter and the page
 order read one column.
@@ -198,8 +198,8 @@ property that made an exact rollup impossible.
   to every backend.
 - `cpt-cf-usage-collector-adr-record-identity-derivation` — the identity that
   keeps both period bounds, whether or not selection reads them.
-- `cpt-cf-usage-collector-adr-feed-aggregate-split` — the feed, which orders by
-  arrival and is not touched by this rule.
+- `cpt-cf-usage-collector-adr-feed-aggregate-split` — the feed, which does not
+  order by covered period and is not touched by this rule.
 
 ## Traceability
 

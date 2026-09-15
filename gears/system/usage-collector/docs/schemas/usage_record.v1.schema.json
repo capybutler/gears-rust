@@ -17,7 +17,6 @@
     "window_end",
     "idempotency_key",
     "accepted_at",
-    "acceptance_sequence",
     "origin"
   ],
   "oneOf": [
@@ -130,11 +129,6 @@
       "description": "Server-assigned instant of acceptance. Not settable or overridable by the emitter - an emitter-supplied value would let a skewed emitter hide its own lateness. Late arrival is evaluated as `accepted_at` against `window_end`.",
       "type": "string",
       "format": "date-time"
-    },
-    "acceptance_sequence": {
-      "description": "Server-assigned position, strictly monotonic per `(tenant_id, gts_type_id)`. Orders the usage feed and breaks `LATEST` ties. No cross-tenant or cross-type total order is claimed.",
-      "type": "integer",
-      "minimum": 0
     },
     "origin": {
       "description": "Which ingestion path admitted the entry. Server-assigned from the path itself, never caller-supplied, and returned on every read path.",

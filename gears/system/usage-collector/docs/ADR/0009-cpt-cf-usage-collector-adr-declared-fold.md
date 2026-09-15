@@ -5,7 +5,7 @@ decision-makers: usage-collector spec owners
 ---
 
 Created:  2026-09-09 by Virtuozzo International GmbH
-Updated:  2026-09-09 by Virtuozzo International GmbH
+Updated:  2026-09-15 by Virtuozzo International GmbH
 
 # The aggregation fold is declared on the type, not chosen per query
 
@@ -63,9 +63,10 @@ pre-computed representation must also know what to accumulate at declaration tim
   persisted entry its meaning are immutable, and the fold is one of them.
 - `cpt-cf-usage-collector-fr-record-quantity` — the ingestion contract carries no
   per-meter case, and the sign of a quantity is never constrained.
-- `cpt-cf-usage-collector-fr-billing-usage-feed` — the acceptance sequence is
-  strictly monotonic per tenant and type, which a selecting fold needs for a
-  total tie-break.
+- `cpt-cf-usage-collector-fr-usage-windows` and
+  `cpt-cf-usage-collector-fr-record-identity` — the acceptance instant and the
+  identifier are gear-assigned, so a selecting fold can break a tie on values
+  every store holds alike.
 - One declaration rather than two — additivity and the fold must not be separate
   declared facts that can disagree.
 
@@ -111,7 +112,7 @@ The closed set is as follows.
 | `COUNT`  | not read — the fold counts entries, and a withdrawn pair counts none |
 | `MAX`    | one observation, and the fold reports the largest in range           |
 | `MIN`    | one observation, and the fold reports the smallest in range          |
-| `LATEST` | one observation, and the fold reports the one with the greatest covered-period end in range, ties broken by the greatest acceptance sequence |
+| `LATEST` | one observation, and the fold reports the one with the greatest covered-period end in range, ties broken by the latest acceptance instant, then the greatest identifier in byte order |
 
 **The quantity under `COUNT`.** A `COUNT` meter's entries still carry a quantity,
 because the entry shape is uniform across every type. The quantity means nothing
@@ -133,12 +134,19 @@ selects an entry rather than reducing values. An undefined tie therefore lets tw
 consumers read the same range and obtain different quantities.
 
 The order is total for that reason: the greatest covered-period end, then the
-greatest acceptance sequence. No two entries of one meter share an acceptance
-sequence, because that sequence is strictly monotonic per tenant and type
-(`cpt-cf-usage-collector-fr-billing-usage-feed`). An aggregation group always sits
-inside one such scope, so the second key always resolves the tie. `MAX` and `MIN`
-need no such rule, because a tie there returns the same value whichever entry
-supplied it.
+latest acceptance instant, then the greatest identifier in byte order. The identifier is
+unique, so the last key always resolves the tie. The gear assigns all three
+keys, and each compares across tenants and types. The order therefore stays
+total when a group spans tenants, which it does whenever a request neither
+narrows to one tenant nor groups by tenant. `MAX` and `MIN` need no such rule,
+because a tie there returns the same value whichever entry supplied it.
+
+The tie-break reads no feed position. A position is plugin-owned and promises
+only the feed's order, so a tie broken on it could resolve differently on
+different backends. The acceptance instant carries the intended meaning — the
+later-accepted observation wins — and every backend evaluates it identically.
+Clock skew across gateway replicas makes that approximate, but the order stays
+deterministic, which is all the fold needs.
 
 ### Additivity is normative
 
@@ -179,7 +187,8 @@ calls the aggregate path still resolves the declaration.
 - A contract test per fold, asserting the aggregate result that the declaration
   selects.
 - A `LATEST` tie-breaking test that pins the total order over the covered-period
-  end and the acceptance sequence.
+  end, the acceptance instant and the identifier, including over a group that
+  spans tenants.
 - A test asserting that the aggregate request carries no operation parameter.
 - A test asserting that ingestion accepts an entry without consulting the
   declared fold.
@@ -204,8 +213,8 @@ meter applies it, and no caller can select another.
   accumulate a rollup at the declared granularity and re-aggregate to any
   coarser group, provided each bucket keeps the state its fold needs: a sum
   under `SUM`, a count under `COUNT`, the extreme value under `MAX` and `MIN`,
-  and the selected quantity with its covered-period end and acceptance sequence
-  under `LATEST`. A bucket that keeps quantities alone answers a coarser query
+  and the selected quantity with its covered-period end, acceptance instant and
+  identifier under `LATEST`. A bucket that keeps quantities alone answers a coarser query
   wrongly under `COUNT` and `LATEST`.
 - Good, because the ingestion path stays fold-blind. Every emitter uses one retry
   pattern and one validation contract across all the types it emits.
@@ -316,8 +325,9 @@ This decision directly addresses the following requirements or design elements:
 - `cpt-cf-usage-collector-fr-usage-type-resolution` — the resolution that delivers
   the declared fold to every read, and that rejects an unresolvable type before
   dispatch.
-- `cpt-cf-usage-collector-fr-billing-usage-feed` — the acceptance sequence that
-  makes the `LATEST` tie-break total.
+- `cpt-cf-usage-collector-fr-usage-windows` and
+  `cpt-cf-usage-collector-fr-record-identity` — the gear-assigned acceptance
+  instant and identifier that make the `LATEST` tie-break total.
 - `cpt-cf-usage-collector-principle-declared-fold` — the design principle that
   this decision codifies.
 - `cpt-cf-usage-collector-principle-aggregate-asymmetry` — the read-side asymmetry

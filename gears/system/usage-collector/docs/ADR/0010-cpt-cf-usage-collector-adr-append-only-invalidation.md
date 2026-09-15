@@ -5,7 +5,7 @@ decision-makers: usage-collector spec owners
 ---
 
 Created:  2026-05-22 by Virtuozzo International GmbH
-Updated:  2026-09-09 by Virtuozzo International GmbH
+Updated:  2026-09-15 by Virtuozzo International GmbH
 
 # Invalidation as the single correction primitive on an append-only ledger
 
@@ -113,13 +113,13 @@ entry carries its own idempotency key distinct from the target's, the reference
 to the target, and a reason code. The reference is what makes the entry an
 invalidation, so no separate marker exists to disagree with it.
 
-The entry also gets four server-side fields in its own right rather than by copy
+The entry also gets three server-side fields in its own right rather than by copy
 (`cpt-cf-usage-collector-fr-record-invalidation`). They are the fields any
-accepted entry gets: an identifier, an acceptance instant, an acceptance-sequence
-position, and an origin marker. The gear derives the identifier and stamps the
-instant and the marker, and the storage plugin assigns the sequence. The marker
-names the path the entry arrived on, and the sequence gives the invalidation its
-own acceptance position on the feed.
+accepted entry gets: an identifier, an acceptance instant, and an origin marker.
+The gear derives the identifier and stamps the instant and the marker. The marker
+names the path the entry arrived on. Being accepted in its own right gives the
+invalidation its own position on the feed, which the feed's correction order
+places after its target.
 
 ### Five rules at the gateway, one at the store
 
@@ -170,8 +170,8 @@ Both entries carry the same covered period, so no requested covered-period range
 selects one of the pair without the other. Aggregation and raw query both select
 by that range, so no placement of the invalidation changes a result.
 
-The usage feed is the contrary case. It orders by acceptance sequence, and an
-invalidation lands at its own acceptance position. That position can fall on a
+The usage feed is the contrary case. It serves its own feed order, and an
+invalidation lands at its own position, after its target. That position can fall on a
 later page than its target, so a feed page can carry a target without its
 invalidation. A feed consumer tolerates that ordering, and never treats a target
 as final merely because the page carrying it held no invalidation.

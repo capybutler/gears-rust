@@ -4,7 +4,7 @@ date: 2026-05-31
 ---
 
 Created:  2026-05-22 by Virtuozzo International GmbH
-Updated:  2026-09-09 by Virtuozzo International GmbH
+Updated:  2026-09-15 by Virtuozzo International GmbH
 
 # Consistency contract for usage-collector read/write paths
 
@@ -109,8 +109,7 @@ The floor covers usage entries reached through the Plugin SPI. GTS type
 declarations sit outside it. The gear does not store them, and their propagation
 is a property of the Type Resolver's cache rather than of any plugin read path
 (`cpt-cf-usage-collector-adr-registry-owned-typing`). The floor is per tenant
-and GTS type, and the gear publishes no cross-tenant and no cross-type ordering
-claim.
+and GTS type, and it claims no ordering of entries.
 
 A typed profile-advertisement method on the SPI is deferred. The SPI surface
 does not change in v1, and each plugin's deployment guide carries its profile in
@@ -126,8 +125,9 @@ append-only ledger purchases that property
 (`cpt-cf-usage-collector-principle-append-only-ledger`).
 
 Append-only arrivals are the one carve-out. A later page can carry entries
-accepted after the scan began, and the watermark returned with each page
-demarcates them.
+accepted after the scan began, and they always land ahead of the cursor: a page
+carries only settled entries, so none can appear behind a position a cursor has
+passed.
 
 This is a gear-level property, distinct from feed freshness
 (`cpt-cf-usage-collector-nfr-billing-feed-freshness`), which stays a per-plugin

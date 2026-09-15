@@ -330,23 +330,30 @@ paths:
         Deterministic, replay-safe, pull-based read path for charging
         consumers.
 
-        Ordering is monotonic `acceptance_sequence`, scoped per
-        `(tenant_id, gts_type_id)`; no cross-tenant or cross-type total
-        order is claimed. Interleaving of scopes within a page is
-        implementation-defined but deterministic — the same cursor yields
+        Entries come in a deterministic order chosen by the storage plugin.
+        The only ordering promised beyond determinism is that an
+        invalidation follows the entry it withdraws; no position value is
+        exposed. A page carries only settled entries, so everything before
+        a returned cursor is delivered and final, and no entry becomes
+        visible behind it. On a live read every page returns a
+        `page_info.next_cursor`, even one with fewer entries than `limit`;
+        it is `null` only once a replay reaches `until`, and `prev_cursor`
+        is always `null`, since the feed reads forward only. The same
+        cursor yields
         the same continuation, extended only by entries accepted since. A
-        replay that resends a previously recorded `watermark` is identical,
+        replay bounded by `until`, a cursor recorded later, is identical,
         entry for entry.
 
         A paginated scan does not observe entries appearing, disappearing,
-        or changing mid-scan, except append-only arrivals demarcated by the
-        `watermark` returned with each page. Corrections arrive as ordinary
-        entries at their own acceptance position; an accepted invalidation
+        or changing mid-scan, except append-only arrivals, which land ahead
+        of the cursor. Corrections arrive as ordinary
+        entries at their own feed position; an accepted invalidation
         removes neither entry from the feed.
 
-        A cursor older than the retention floor is refused with `400`
-        (`context.reason = CURSOR_BEYOND_RETENTION`) rather than served as a
-        silently truncated range.
+        A cursor older than the retention floor is refused with `400` and a
+        `cursor` field violation (`context.field_violations[0].field =
+        cursor`, `.reason = CURSOR_BEYOND_RETENTION`) rather than served as
+        a silently truncated range.
       parameters:
         - name: gts_type_id
           in: query
@@ -354,12 +361,12 @@ paths:
           description: |
             Subscription: the GTS types this consumer reads. Repeat the
             parameter for each type. The feed excludes everything else —
-            from the entries, the cursor, and the watermark.
+            from the entries and the cursor.
 
-            The list is bounded because the subscription is: it spans every
-            tenant of each named type, and the watermark carries one
-            position per `(tenant_id, gts_type_id)` scope. A consumer of
-            more than 100 types reads them over several subscriptions.
+            The list is bounded because a subscription spans every tenant
+            of each named type, so its size sets the cost of every page. A
+            consumer of more than 100 types reads them over several
+            subscriptions.
           schema:
             type: array
             minItems: 1
@@ -368,10 +375,10 @@ paths:
               $ref: "#/components/schemas/GtsTypeId"
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
-        - $ref: "#/components/parameters/Watermark"
+        - $ref: "#/components/parameters/Until"
       responses:
         "200":
-          description: A page of feed entries with cursor and watermark.
+          description: A page of feed entries with its cursor.
           content:
             application/json:
               schema:
@@ -547,20 +554,21 @@ components:
         Continue a page by resending the same query, cursor apart.
       schema:
         type: string
-    Watermark:
-      name: watermark
+    Until:
+      name: until
       in: query
       required: false
       description: |
-        A `watermark.token` this operation returned earlier. It bounds the
-        page at that position in each subscribed scope, so a replay from the
-        same cursor is identical entry for entry. Omit it to read the live
-        feed.
+        A feed cursor this operation returned earlier, used as an upper
+        bound. Reading stops at its position, so a
+        replay from an earlier cursor up to it is identical entry for
+        entry. The page that reaches it carries a `null`
+        `next_cursor`. Omit it to read the live feed.
 
-        It binds the subscription it was minted under. A malformed or
-        foreign token is rejected `400` with a `watermark` field violation
-        (`INVALID_WATERMARK`, `SUBSCRIPTION_MISMATCH`). One older than the
-        retention floor is refused as a cursor is.
+        It is validated as `cursor` is and must be minted under the same
+        subscription; a violation is rejected `400` with an `until` field
+        violation. One older than the retention floor is refused as a
+        cursor is.
       schema:
         type: string
 
@@ -639,12 +647,11 @@ components:
         `resource_ref`, as on `$filter` and `AggregationDimension`.
 
         Fail-closed: a field added to `UsageRecord` is not an order key
-        until this enum names it. The five required fields it excludes each
+        until this enum names it. The four required fields it excludes each
         fail one of those three tests — `resource_ref` is an object,
         `quantity` is a decimal carried as a string (so `"9"` sorts after
-        `"42.5"`), `idempotency_key` is opaque, `gts_type_id` is reserved
-        and holds one value per request, and `acceptance_sequence` is
-        monotonic only per `(tenant_id, gts_type_id)`. Optional fields are
+        `"42.5"`), `idempotency_key` is opaque, and `gts_type_id` is
+        reserved and holds one value per request. Optional fields are
         excluded by the nullable-keyset rule.
 
     Timestamp:
@@ -832,7 +839,6 @@ components:
         - window_end
         - idempotency_key
         - accepted_at
-        - acceptance_sequence
         - origin
       oneOf:
         - title: record
@@ -906,15 +912,6 @@ components:
             overridable by the emitter** — an emitter-supplied one would let
             a skewed emitter hide its own lateness. Late arrival is
             evaluated as `accepted_at` against `window_end`.
-        acceptance_sequence:
-          type: integer
-          format: int64
-          minimum: 0
-          description: |
-            Gear-assigned position, monotonic per
-            `(tenant_id, gts_type_id)`. Orders the usage feed and breaks
-            `LATEST` ties. No cross-tenant or cross-type total order is
-            claimed.
         origin:
           $ref: "#/components/schemas/RecordOrigin"
         invalidates:
@@ -945,9 +942,9 @@ components:
         invalidates: [reason_code]
         reason_code: [invalidates]
       description: |
-        Ingestion projection of `UsageRecord`: the same shape minus the four
-        server-owned fields — `id`, `accepted_at`, `acceptance_sequence`,
-        and `origin` — and minus the derived `entry_type`. A stray value for
+        Ingestion projection of `UsageRecord`: the same shape minus the three
+        server-owned fields — `id`, `accepted_at`, and `origin` — and
+        minus the derived `entry_type`. A stray value for
         any of them is rejected as an unknown field.
 
         The same schema carries both entry types, distinguished by
@@ -1097,49 +1094,26 @@ components:
     FeedPage:
       type: object
       additionalProperties: false
-      required: [entries, watermark, page_info]
+      required: [entries, page_info]
       description: |
-        A page of the usage feed, keyset-stable over
-        `(acceptance_sequence, id)` within each subscribed
-        `(tenant_id, gts_type_id)` scope.
+        A page of the usage feed, in the feed's deterministic order.
+
+        The page carries only settled entries, so everything before its
+        next cursor is delivered and final. It uses the shared `PageInfo`.
+        On a live read `next_cursor` is never `null`, even on a page with
+        fewer entries than `limit`: the feed has no end, and a later
+        request with that cursor returns only entries settled since.
+        `next_cursor` is `null` only on the page that reaches `until`, and
+        `prev_cursor` is always `null`. There is no separate completeness
+        token: the cursor is the proof.
       properties:
         entries:
           type: array
           maxItems: 1000
           items:
             $ref: "#/components/schemas/UsageRecord"
-        watermark:
-          $ref: "#/components/schemas/FeedWatermark"
         page_info:
           $ref: "#/components/schemas/PageInfo"
-
-    FeedWatermark:
-      type: object
-      additionalProperties: false
-      required: [token, accepted_at]
-      description: |
-        The acceptance position through which this page is complete, in
-        **every** subscribed `(tenant_id, gts_type_id)` scope.
-
-        There is one position per scope, and a subscription names GTS types
-        but not tenants, so it spans every tenant. A single
-        `acceptance_sequence` cannot carry that set — it is monotonic only
-        within a scope. The token carries it.
-      properties:
-        token:
-          type: string
-          description: |
-            Opaque replay boundary. Callers MUST NOT parse or modify it —
-            record it and resend it as the `watermark` parameter. The
-            gateway owns the encoding as it owns the cursor's
-            (`cpt-cf-usage-collector-principle-cursor-gateway-ownership`).
-        accepted_at:
-          allOf:
-            - $ref: "#/components/schemas/Timestamp"
-          description: |
-            How fresh the boundary is, for lag observation only. It carries
-            no replay semantics — the boundary is `token`. Per-scope figures
-            are served by `get_reconciliation_metadata`.
 
     MetadataFilter:
       type: object
@@ -1295,7 +1269,6 @@ components:
         - quantity_summary
         - accepted_at_watermark
         - window_end_watermark
-        - sequence_watermark
       description: |
         Per-scope ingestion metadata. Counts report ingestion activity
         rather than aggregating the meter, so they are reported for every
@@ -1303,7 +1276,7 @@ components:
 
         `accepted_count` and `quantity_summary` cover exactly the entries
         the requested range selects (`from <= window_end < to`), the same
-        rule every read path applies. The three watermarks are current as
+        rule every read path applies. The two watermarks are current as
         of the response and are not bounded by the range.
       properties:
         scope:
@@ -1354,10 +1327,6 @@ components:
           $ref: "#/components/schemas/Timestamp"
         window_end_watermark:
           $ref: "#/components/schemas/Timestamp"
-        sequence_watermark:
-          type: integer
-          format: int64
-          minimum: 0
 
     ReconciliationMetadataList:
       type: object
@@ -1383,10 +1352,14 @@ components:
       properties:
         next_cursor:
           type: [string, "null"]
-          description: Opaque cursor for the next page. `null` on the last page.
+          description: |
+            Opaque cursor for the next page. `null` on the last page, unless
+            the page schema states otherwise (`FeedPage` does).
         prev_cursor:
           type: [string, "null"]
-          description: Opaque cursor for the previous page. `null` on the first page.
+          description: |
+            Opaque cursor for the previous page. `null` on the first page,
+            unless the page schema states otherwise (`FeedPage` does).
         limit:
           type: integer
           format: int64
