@@ -512,7 +512,7 @@ a vendor-specific dependency requires a Plugin SPI major-version revision.
 | `UsageRecord` | One accepted entry on the append-only ledger. It carries the attribution tuple, the covered period, a signed quantity, the dedup key, the acceptance instant, the origin, and optional metadata. An invalidation entry adds the target reference and a reason code. No operation rewrites an accepted entry. |
 | `CreateUsageRecord` | The identity-free ingestion shape that both entry types share. It is the only input shape on every ingestion path, live and backfill. It carries no `entry_type`: `invalidates` alone decides the kind. |
 | `EntryType` | Closed discriminator, `record` or `invalidation`. Derived from the presence of `invalidates`. Never submitted, and never read from the value or sign of a quantity. |
-| `RecordOrigin` | Closed marker, `live` or `backfill`. The Ingestion Gateway stamps it from the path the entry arrived on. It applies to invalidation entries too. |
+| `RecordOrigin` | Closed marker, `live` or `backfill`. The Ingestion Gateway stamps it from the path the entry arrived on. It applies to invalidation entries too. An absorbed retry keeps the stored origin, whichever path it arrived on. |
 | `ResourceRef` | Caller-supplied `(resource_id, resource_type)`. Both leaves are mandatory on every entry. The gear validates presence and shape only. Ownership is a PDP decision. |
 | `SubjectRef` | Caller-supplied `(subject_id, optional subject_type)`. Absent for system-level consumption. `subject_type` cannot appear without `subject_id`. |
 | `AggregationFold` | Closed set — `SUM`, `COUNT`, `MAX`, `MIN`, `LATEST`. Declared per GTS type, immutable, and read on the aggregate path only. `SUM` is the only fold that yields a chargeable period quantity. |

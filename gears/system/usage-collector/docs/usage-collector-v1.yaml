@@ -259,7 +259,7 @@ paths:
       description: |
         Identical validation and request shape to `POST /records`, differing
         only in four respects: the workload is isolated from live ingestion
-        so it cannot breach live-path SLOs, every accepted entry is stamped
+        so it cannot breach live-path SLOs, every persisted entry is stamped
         `origin: backfill`, the live path's past bound on the covered period
         (default 48 hours) does not apply because this route exists for
         exactly the periods that bound rejects, and the configured
@@ -272,7 +272,7 @@ paths:
 
         The route takes measurements and invalidation entries alike, mixed
         in one batch, under the same per-entry rules `POST /records`
-        applies. Every accepted entry carries `origin: backfill`, the
+        applies. Every persisted entry carries `origin: backfill`, the
         invalidation included, so a correction of closed history reads as
         history. The in-process SDK trait carries the same operation as
         `backfill_usage_records`.
