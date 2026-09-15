@@ -1075,9 +1075,11 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// Snapshot-consistent feed page in feed order (§3.1).
     ///
     /// `page_after` and `until` carry back positions this plugin issued.
+    /// `scope` is the compiled PDP scope. An entry outside it is absent.
     async fn read_feed_page(
         &self,
         subscription: &[MeterTypeId],
+        scope: &ast::Expr,
         page_after: Option<FeedPosition>,
         until: Option<FeedPosition>,
         limit: u64,
@@ -1212,7 +1214,9 @@ rejected as `InvalidArgument` with a `cursor` field violation —
 `INVALID_CURSOR`, `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`, and, in process only
 where a caller can set both at once, `ORDER_MISMATCH`.
 
-A feed cursor binds the subscription as a raw cursor binds its filter. The
+A feed cursor binds the subscription as a raw cursor binds its filter. Its
+guarantees hold for an unchanged compiled scope: entries a widened scope admits
+behind the cursor are not delivered. The
 optional `until` bound is a cursor too, validated on the same terms and
 rejected with an `until` field violation. It is not part of the bound scope:
 adding or dropping `until` alongside a resent cursor is not a
@@ -1527,7 +1531,7 @@ sequenceDiagram
     FG->>PDP: access_scope_with(ctx, read scope per subscribed type)
     PDP-->>FG: permit + constraints | deny
     FG->>FG: decode and validate cursor and until
-    FG->>PH: read_feed_page(subscription, page_after, until, limit)
+    FG->>PH: read_feed_page(subscription, scope, page_after, until, limit)
     PH->>P: snapshot scan in feed order, settled entries only
     P-->>PH: entries + next position | CursorBeyondRetention
     PH-->>FG: page

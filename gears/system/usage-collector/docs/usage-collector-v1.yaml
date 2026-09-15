@@ -326,9 +326,9 @@ paths:
             from the entries and the cursor.
 
             The list is bounded because a subscription spans every tenant
-            of each named type, so its size sets the cost of every page. A
-            consumer of more than 100 types reads them over several
-            subscriptions.
+            the caller may read, for each named type, so its size sets the
+            cost of every page. A consumer of more than 100 types reads them
+            over several subscriptions.
           schema:
             type: array
             minItems: 1
