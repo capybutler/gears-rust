@@ -61,9 +61,10 @@ neither staleness it cannot detect nor a number it cannot reproduce.
 - A charge must be attributable — a dispute resolves against named entries with
   their identifiers, covered periods, correction linkage and reason codes. A
   total names nothing.
-- Staleness must be detectable — a charging consumer has to prove it has seen a
-  closed period, which needs a cursor that proves completeness, and to spot a
-  stalled emitter, which needs per-scope reconciliation metadata.
+- Staleness must be detectable — a charging consumer has to prove it has seen
+  everything accepted up to a point, which needs a cursor that proves
+  completeness, and to spot a stalled emitter, which needs per-scope
+  reconciliation metadata.
 - `cpt-cf-usage-collector-fr-billing-usage-feed` — requires a deterministic,
   replay-safe pull path over entries. This decision states which consumer that
   path exists for.
@@ -129,7 +130,10 @@ A paginated scan observes a snapshot, and the append-only ledger purchases that
 property. No accepted entry is ever rewritten. A correction arrives as a later
 invalidation entry at its own feed position, so a scan has nothing to
 observe changing. Append-only arrivals are the one carve-out, and they always
-land ahead of the cursor.
+land ahead of the cursor. That includes a late entry or a withdrawal for a
+covered period the consumer has already read, so a cursor proves what the feed
+has delivered, never that a covered period will not change. The consumer
+handles such an arrival as an adjustment to that period.
 
 The snapshot is therefore prefix-stable rather than frozen. A replay from a
 cursor returns every entry the original scan returned, in the same order and at
@@ -212,8 +216,8 @@ debugging and dispute-resolution surface (`cpt-cf-usage-collector-fr-query-raw`)
   read.
 - Reconciliation metadata and its watermarks let a consumer compare totals and
   spot a stalled emitter. They prove nothing about completeness: they are not
-  tied to a feed cursor, and the cursor alone is that proof. The gear evaluates
-  none of them and raises no stall signal.
+  tied to a feed cursor, and only the cursor proves what the feed has
+  delivered. The gear evaluates none of them and raises no stall signal.
 - The retention floor is what makes replay meaningful. It sums the backfill
   window and the operational replay horizon, so every accepted entry keeps one
   full horizon from the moment it becomes readable. A cursor past the floor is
