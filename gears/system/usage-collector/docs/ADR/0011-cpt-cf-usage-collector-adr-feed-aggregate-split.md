@@ -62,8 +62,8 @@ neither staleness it cannot detect nor a number it cannot reproduce.
   their identifiers, covered periods, correction linkage and reason codes. A
   total names nothing.
 - Staleness must be detectable — a charging consumer has to prove it has seen a
-  closed period, which needs a cursor that proves completeness and per-scope
-  reconciliation metadata.
+  closed period, which needs a cursor that proves completeness, and to spot a
+  stalled emitter, which needs per-scope reconciliation metadata.
 - `cpt-cf-usage-collector-fr-billing-usage-feed` — requires a deterministic,
   replay-safe pull path over entries. This decision states which consumer that
   path exists for.
@@ -210,10 +210,10 @@ debugging and dispute-resolution surface (`cpt-cf-usage-collector-fr-query-raw`)
   backlog age to recovery time. At the launch objective that is five times the
   subscribed arrival rate, and a consumer never pays for traffic it does not
   read.
-- Reconciliation metadata and its watermarks exist so a consumer can prove it
-  has seen a closed period. Per-scope counts, the acceptance-instant watermark
-  and the covered-period-end watermark carry that proof, beside the feed cursor
-  the consumer holds. The gear evaluates none of them and raises no stall signal.
+- Reconciliation metadata and its watermarks let a consumer compare totals and
+  spot a stalled emitter. They prove nothing about completeness: they are not
+  tied to a feed cursor, and the cursor alone is that proof. The gear evaluates
+  none of them and raises no stall signal.
 - The retention floor is what makes replay meaningful. It sums the backfill
   window and the operational replay horizon, so every accepted entry keeps one
   full horizon from the moment it becomes readable. A cursor past the floor is
@@ -420,7 +420,7 @@ This decision directly addresses the following requirements or design elements:
 - `cpt-cf-usage-collector-fr-billing-fields-on-read` — what every feed page
   carries, unstripped and with each invalidation naming the entry it withdraws.
 - `cpt-cf-usage-collector-fr-reconciliation-metadata` — the metadata and
-  watermarks a consumer reconciles against to prove it has seen a closed period.
+  watermarks a consumer compares totals against and uses to spot a stalled emitter.
 - `cpt-cf-usage-collector-fr-billing-retention-floor` — the floor that bounds
   replay, and past which a cursor is refused.
 - `cpt-cf-usage-collector-nfr-query-freshness` — the floor that publishes no
