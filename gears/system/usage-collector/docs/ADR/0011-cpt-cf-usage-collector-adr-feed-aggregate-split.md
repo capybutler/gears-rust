@@ -146,12 +146,14 @@ being written lands behind it, and the consumer never receives it.
 
 Three zones govern a rewound cursor
 (`cpt-cf-usage-collector-fr-billing-retention-floor`). A cursor's age is the
-acceptance instant of the point it marks, and nothing else. A cursor no older than the
+acceptance instant of the oldest entry after it, so it holds whatever order the
+plugin chooses. A cursor with nothing after it is current. A cursor no older than the
 operational replay horizon is served, and that is the guarantee a charging
 consumer codes against. Between that horizon and the retention floor, service is
 plugin-dependent and a consumer relies on none of it. A cursor older than the
-retention floor is refused with an actionable error. The Feed Gateway never
-serves a silently truncated range past the retention floor.
+retention floor is refused with an actionable error, and so is a cursor after
+which retention has already removed an entry. The Feed Gateway never serves a
+silently truncated range.
 
 The feed delivers both entries of a withdrawn pair, each at its own feed
 position. The two can land in different pages, because an invalidation follows
