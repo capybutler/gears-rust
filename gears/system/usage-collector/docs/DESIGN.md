@@ -644,6 +644,10 @@ plugin.
 
 ##### Responsibility scope
 
+- Enforces the per-request entry cap. The cap is operator configuration,
+  100 by default, and bounds what one caller sends, not what one backend write
+  holds. An empty or over-cap submission is rejected whole, before any entry
+  is validated.
 - Validates the structural attribution tuple (tenant, resource, optional
   subject, `gts_type_id`).
 - Requires an idempotency key on every entry and derives `id` as the
@@ -1118,8 +1122,15 @@ invalidation, feed order, `LATEST` tie-break, recomputation):
 - **Offset/limit scans are forbidden** on both paginated paths.
 - **Trace context is ambient.** Continue the Plugin Host's span over the
   backend dispatch.
-- **Latency sub-allocations** (§3.11.2): 75 ms p95 of the 200 ms ingestion
-  budget, 425 ms p95 of the 500 ms aggregated-query budget. For batched
+- **Acknowledge only what is durable.** A plugin may buffer ingestion calls
+  and coalesce them into larger backend writes. It returns from a persist call
+  only after every entry it reports accepted is durable, so a buffer holds only
+  unacknowledged entries. A crash loses no acknowledged entry, and the caller's
+  retry lands on the dedup identity.
+- **Latency planning values** (§3.11.2): 75 ms p95 of the 200 ms ingestion
+  budget, 425 ms p95 of the 500 ms aggregated-query budget. These are defaults,
+  not conformance bounds. A plugin may spend more where the end-to-end NFR
+  still holds, and publishes its measured persist and aggregate p95. For batched
   ingestion, raw paging, feed reads, and reconciliation, reserve at least
   25 ms of the end-to-end envelope for gateway, PDP, and core overhead.
 - **`AggregationBucket.key` encoding**: `tenant_id` as `Uuid::to_string()`
@@ -1687,7 +1698,9 @@ paths. The decision is recorded in
 - **Ingestion ack** — after an ingestion call returns the persisted entry, that
 entry is durable. Its dedup identity stays visible to subsequent ingestion
 attempts for as long as the referenced type's retention policy keeps it. The dedup
-  window is therefore **per-meter and bounded**, not unbounded.
+  window is therefore **per-meter and bounded**, not unbounded. A plugin that
+  buffers writes still acknowledges only after durability, so buffering adds
+  latency and never weakens this floor.
 - **Read paths (raw, aggregate, point lookup, feed)** — **eventually consistent
   with no upper bound** relative to a same-tenant ingestion ack. The window is
   driven by the active plugin's replication topology, not by Usage Collector.
@@ -1749,7 +1762,10 @@ bound can then opt in by coupling to it. Every guide MUST state:
    charging consumer reads
 7. the sustained bulk read rate it can serve the feed at, against
    `nfr-replay-throughput`, and the procedure for deploying outside the
-   documented posture.
+   documented posture
+8. **its ingestion batching**: whether it coalesces concurrent persist calls,
+   its target batch size and longest wait, and the measured persist and
+   aggregate p95 that result.
 
 A consumer depending on a tighter bound than the gear floor couples itself to
 one plugin's ceiling. That coupling MUST be recorded in the consumer's own
@@ -1767,7 +1783,9 @@ grouping dimension execute in the plugin's native acceleration structures. The
 gear never iterates rows. **Declaration caching**: steady-state type resolution
 is an in-memory lookup, so ingestion does not pay a registry round-trip.
 **Batch ingestion**: a first-class SPI method so each plugin drives its native
-bulk-write path.
+bulk-write path. The size of a backend write is the plugin's choice and is
+independent of the per-request cap. A plugin whose backend prefers large
+writes may coalesce concurrent calls.
 
 #### 3.11.2 Latency Budgets (PERF-DESIGN-003)
 
@@ -1778,14 +1796,17 @@ Canonical NFR p95 budgets:
 | Ingestion | `cpt-cf-usage-collector-nfr-ingestion-latency` | 200 ms |
 | Aggregated query (30-day single-tenant) | `cpt-cf-usage-collector-nfr-query-latency` | 500 ms |
 
-SPI sub-allocations: **75 ms** of the ingestion budget and **425 ms** of the
-aggregated-query budget. Per-component PDP enforcement dominates ingestion
+Default SPI planning values: **75 ms** of the ingestion budget and **425 ms**
+of the aggregated-query budget. The totals above are the conformance bounds,
+and these values are not. A plugin may spend more of a budget where its
+end-to-end p95 still meets the NFR, as a columnar plugin does when it waits to
+coalesce writes. Per-component PDP enforcement dominates ingestion
 latency. Aggregation pushdown dominates query latency. Type resolution adds no
 round-trip in the steady state — a cache miss is a cold-path cost, not a budget
 line. DESIGN carves no sub-allocation for batched ingestion, raw paging, or feed
 reads. For those, plugins **SHOULD** reserve ≥ 25 ms of the end-to-end envelope for
-gateway, PDP, and core overhead. Plugins must publish their own SPI-internal
-budgets in their deployment guide.
+gateway, PDP, and core overhead. Plugins must publish their measured
+SPI-internal p95 in their deployment guide.
 
 #### 3.11.3 Resource Efficiency (PERF-DESIGN-004)
 
@@ -1834,7 +1855,7 @@ label vocabularies are part of the architectural contract.
 | `uc_plugin_call_duration_seconds` | seconds | `operation` (SPI method name) | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0 | plugin-host |
 | `uc_pdp_duration_seconds` | seconds | `operation` (same nine-value set) | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 | any PDP-enforcing component |
 | `uc_type_resolution_duration_seconds` | seconds | `result` (`cache_hit`, `cache_miss`) | 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5 | type-resolver |
-| `uc_ingestion_batch_size` | entries/request | — | 1, 2, 5, 10, 20, 50, 100 | ingestion-gateway |
+| `uc_ingestion_batch_size` | entries/request | — | 1, 2, 5, 10, 20, 50, 100, then the configured cap where it exceeds 100 | ingestion-gateway |
 | `uc_record_metadata_bytes` | bytes | — | 256, 512, 1024, 2048, 4096, 8192 | ingestion-gateway |
 | `uc_query_result_rows` | rows/response | `query_kind` (`aggregated`, `raw`) | 1, 10, 50, 100, 500, 1000, 10000, 100000 | query-gateway |
 | `uc_feed_page_entries` | entries/page | — | 1, 10, 50, 100, 500, 1000, 5000 | feed-gateway |
