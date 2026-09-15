@@ -62,7 +62,7 @@ collector.
 | Requirement | Design Response |
 | --- | --- |
 | `cpt-cf-usage-collector-fr-ingestion` | REST, SDK, and backfill entry points funnel into one Ingestion Gateway. The gateway authenticates upstream and authorizes at the PDP before dispatch. |
-| `cpt-cf-usage-collector-fr-idempotency` | Every entry has an idempotency key: caller-supplied on a record, derived by the Ingestion Gateway from the target on an invalidation. The dedup identity is the 5-tuple `(tenant, gts_type, key, window_start, window_end)`. Exact-equality retries are absorbed, divergent same-key writes against a converged entry surface as a fail-closed conflict, and a race resolves by the store's own commit order, the first write surviving, at a plugin-declared level: `linearizable` rejects the later divergent write, and `eventual` may acknowledge it and then discard it. The horizon is the type's retention policy, measured from the covered period. |
+| `cpt-cf-usage-collector-fr-idempotency` | Every entry has an idempotency key: caller-supplied on a record, derived by the Ingestion Gateway from the target on an invalidation. The dedup identity is the 5-tuple `(tenant, gts_type, key, window_start, window_end)`. Exact-equality retries are absorbed, divergent writes against a converged entry are a fail-closed conflict, and races resolve at a plugin-declared dedup level. The horizon is the type's retention policy, measured from the covered period. |
 | `cpt-cf-usage-collector-fr-record-identity` | `id` is a deterministic UUIDv5 over the same 5-tuple, so it is stable, server-derived, and reproducible offline by the emitter before submission. `entry_type` is deliberately excluded from the derivation. |
 | `cpt-cf-usage-collector-fr-usage-windows` | The covered period `[window_start, window_end)` is the only emitter-supplied time attribution. The gear stamps `accepted_at`, and no caller can set it. Query selection reads the period end — `from <= window_end < to` — on every path, so no entry needs a shape-dependent case. |
 | `cpt-cf-usage-collector-fr-live-future-time-bound` | The live path bounds the covered period on both sides. It rejects a period that ends further into the future than a tolerance, 5 minutes by default. It also rejects one that ends further into the past than a second tolerance, 48 hours by default and configurable. Anything older must use the dedicated backfill route, which the rejection names. Both bounds govern every entry the path admits, an invalidation included, over the period it copies. The backfill path carries its own window. All of these are configuration, enforced in the Ingestion Gateway before dispatch. |
@@ -72,7 +72,7 @@ collector.
 | `cpt-cf-usage-collector-fr-metering-unit-binding` | The unit is a declaration property resolved through the type reference. Ingestion rejects an entry whose type binds no unit. Never carried per entry. |
 | `cpt-cf-usage-collector-fr-canonical-units` | The canonical list is published in the OpenAPI contract. No path converts, scales, or rounds a quantity. |
 | `cpt-cf-usage-collector-fr-record-metadata` | Closed-shape validation against the declaration's schema at the gateway, with a configurable size cap. Declared properties are exactly the groupable and filterable dimensions, computed per request. |
-| `cpt-cf-usage-collector-fr-record-invalidation` | Invalidation rides the ordinary ingestion path as a faithful copy of its target with three closed departures. The Ingestion Gateway enforces the copy, the reference, and no-invalidation-of-invalidation before persistence, and derives the entry's idempotency key from its target. At most one per record follows from that key: every invalidation of one record shares one dedup identity. The copied period is bounded by the path, not by the entry kind. |
+| `cpt-cf-usage-collector-fr-record-invalidation` | Invalidation rides the ordinary ingestion path as a faithful copy of its target with three closed departures. The Ingestion Gateway enforces the copy, the reference, and no-invalidation-of-invalidation before persistence. At most one per record follows from the key the gateway derives from the target. The copied period is bounded by the path, not by the entry kind. |
 | `cpt-cf-usage-collector-fr-invalidation-reason-code` | A non-empty reason code is mandatory on an invalidation and forbidden on an ordinary record. Returned on every read path exposing the correction. |
 | `cpt-cf-usage-collector-fr-usage-type-declaration` | No Usage Collector surface carries a type operation, read or write. Declaration is a `types-registry` operation. |
 | `cpt-cf-usage-collector-fr-usage-type-resolution` | A dedicated Type Resolver component resolves declarations from `types-registry` through a local cache, fail-closed, on both write and read paths. Cached declarations stay usable during a registry outage. A declaration the registry has lost is restored from the mirror table of [§3.7](#37-database-schemas--tables), where a row exists and the registry returns a definite not-found answer. |
@@ -117,7 +117,7 @@ collector.
 | `cpt-cf-usage-collector-adr-pdp-centric-authorization` | Every operation is authorized at the platform PDP. The gear keeps no access table and no decision cache. | Current. |
 | `cpt-cf-usage-collector-adr-pluggable-storage` | Persistence and query are reached only through the Plugin SPI. The operator selects the backend, and the host binds it lazily. | Current. |
 | `cpt-cf-usage-collector-adr-caller-supplied-attribution` | Attribution is caller-supplied and PDP-authorized. The gear never derives tenant, resource, or subject from the caller's identity. | Current. |
-| `cpt-cf-usage-collector-adr-mandatory-idempotency` | Every entry carries an idempotency key, caller-supplied on a record and derived from the target on an invalidation. The gear absorbs an exact-equality retry and rejects any divergent canonical field fail-closed. Races resolve by the store's commit order, and each plugin declares whether the later divergent write is rejected or acknowledged and discarded. | Current. |
+| `cpt-cf-usage-collector-adr-mandatory-idempotency` | Every entry carries an idempotency key, caller-supplied on a record and derived from the target on an invalidation. The gear absorbs an exact-equality retry and rejects any divergent canonical field fail-closed. Races resolve at a plugin-declared dedup level. | Current. |
 | `cpt-cf-usage-collector-adr-contract-stability` | REST, SDK, and Plugin SPI version independently. From 1.0 onward, only additive changes ship within a major, and one prior major stays supported. | Current. |
 | `cpt-cf-usage-collector-adr-consistency-contract` | Floor-and-ceiling split. The gear publishes an eventual floor with no upper bound, and each plugin publishes its own ceiling. | Current. |
 | `cpt-cf-usage-collector-adr-record-identity-derivation` | The identifier is a UUIDv5 over the dedup identity, which is tenant, type, key, and both covered-period bounds. | Current. |
@@ -270,35 +270,21 @@ surfaces on an invoice weeks later.
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-idempotency-by-key`
 
-Every record carries a client-provided idempotency key, and every invalidation a
-key the gateway derives as `inv:` followed by its target's `id`. A
-same-identity submission resolves into exactly one of two outcomes. An
-exact-equality retry is silently deduplicated. Any divergent caller-supplied
-field, including a metadata-only difference, is a fail-closed conflict against
-a converged entry rather than a silent drop. The dedup identity is
-`(tenant, gts_type, key, window_start, window_end)`. Submissions that differ in
-period are therefore distinct entries rather than conflicts, and an emitter does
-not encode the period into the key. The key must still distinguish what the
-identity omits — resource, subject, and a second entry in one period — and a
-retry must repeat its submission's key exactly. The `inv:` prefix is reserved,
-so a record and an invalidation never share a key.
+Every entry is deduplicated on `(tenant, gts_type, key, window_start,
+window_end)`. A record carries a client-provided key, and an invalidation one
+the gateway derives from its target. An exact-equality retry is silently
+absorbed. Any divergent caller-supplied field, metadata alone included, is a
+fail-closed conflict rather than a silent drop. Because the period is part of
+the identity, an emitter does not encode it into the key, but the key must
+distinguish what the identity omits — resource, subject, and a second entry in
+one period — and a retry must repeat it exactly.
 
-The guarantee is stated as an outcome, not as a uniqueness constraint. On every
-plugin, one identity shows its first write in the store's own commit order, and
-nothing else, on every read, in every fold, and in reconciliation, and a
-divergent submission against a converged entry is a conflict. A race before
-convergence resolves at the plugin's declared **dedup level**: `linearizable`
-rejects the later divergent write, and `eventual` may acknowledge it, then
-discards it and counts the collision.
-
-The horizon is **per-meter and bounded**. An identity stays visible for at
-least as long as the type's retention policy keeps the entry, measured from
-the covered period. Ingestion never reaches past it: retention is at least the
-backfill window plus one replay horizon
-(`cpt-cf-usage-collector-fr-billing-retention-floor`), so an over-aged covered
-period is refused on the window bound before deduplication is consulted. A
-charging consumer's exactly-once property rests on its own deduplication by
-entry identifier.
+The guarantee is an outcome, not a uniqueness constraint: one identity yields
+one entry on every read, and a race before convergence resolves at the
+plugin's declared dedup level. The horizon is **per-meter and bounded** by the
+type's retention. A charging consumer's exactly-once property rests on its own
+deduplication by entry identifier. The rules are the §3.1 invariants from
+Dedup identity through Idempotency horizon.
 
 **ADRs**: `cpt-cf-usage-collector-adr-mandatory-idempotency`,
 `cpt-cf-usage-collector-adr-record-identity-derivation`
@@ -349,11 +335,9 @@ therefore migrate on independent schedules.
 
 The gateway owns, issues, decodes, and validates every opaque continuation token
 (`toolkit_odata::CursorV1`), on both the raw-query and feed paths. Plugins never
-mint, encode, or interpret a wire cursor. On the raw path a plugin receives a
-structured keyset tuple. On the feed path it receives back the opaque position
-it issued earlier, which the gateway carries inside its tokens without reading
-it. On both paths it returns rows plus the position to
-continue from. This keeps cursor versioning, signing posture,
+mint, encode, or interpret a wire cursor: they receive a structured keyset on
+the raw path and their own opaque `FeedPosition` on the feed path, and return
+rows plus the position to continue from. This keeps cursor versioning, signing posture,
 and validation at one platform-owned location.
 
 **ADRs**: `cpt-cf-usage-collector-adr-feed-aggregate-split`
@@ -532,12 +516,12 @@ a vendor-specific dependency requires a Plugin SPI major-version revision.
 | `ResourceRef` | Caller-supplied `(resource_id, resource_type)`. Both leaves are mandatory on every entry. The gear validates presence and shape only. Ownership is a PDP decision. |
 | `SubjectRef` | Caller-supplied `(subject_id, optional subject_type)`. Absent for system-level consumption. `subject_type` cannot appear without `subject_id`. |
 | `AggregationFold` | Closed set — `SUM`, `COUNT`, `MAX`, `MIN`, `LATEST`. Declared per GTS type, immutable, and read on the aggregate path only. `SUM` is the only fold that yields a chargeable period quantity. |
-| `IdempotencyKey` | Opaque string, one component of the five-part dedup identity. Caller-supplied and required on a record, where the `inv:` prefix is reserved. Absent from an invalidation submission: the gateway derives it as `inv:` followed by the target's `id`, lowercase hyphenated. |
+| `IdempotencyKey` | Opaque string, one component of the five-part dedup identity. Caller-supplied on a record, gateway-derived on an invalidation (see Invalidation key). |
 | `RecordMetadata` | Closed-shape key/value map. The GTS type declares the admissible keys. Values are strings in v1. The size cap is per deployment. |
 | `SecurityContext` | `toolkit_security::SecurityContext`, the platform-authenticated caller context. Declared in `libs/toolkit-security`, which is the only normative statement of its shape. Input to authorization only. |
 | `UsageRecordFilterField` | The admissible `$filter` and `group_by` field set: `tenant_id`, `resource_id`, `resource_type`, `subject_id`, `subject_type`, `entry_type`, `origin`, and `invalidates`, plus the queried type's declared metadata keys. Resolved per request. |
 | `Keyset` | The typed last-row sort tuple behind an opaque cursor. Raw reads use `(window_end, id)`, which a caller `$orderby` prefixes rather than replaces. Feed reads carry a `FeedPosition` instead. |
-| `FeedPosition` | A point in the feed's order. The storage plugin issues it, and decides whether one point covers a whole subscription or it keeps finer partitions of its own. It is opaque to the gateway and never appears on the wire. Its **age** is the acceptance instant it marks, which is what the retention-floor refusal reads. How a plugin assigns it — a store counter, a time-derived value, or anything else its backend offers — is plugin-internal, provided the feed-order invariant below holds. |
+| `FeedPosition` | A point in the feed's order, issued and interpreted by the storage plugin alone. It is opaque to the gateway and never appears on the wire. Its **age** is the acceptance instant it marks, which the retention-floor refusal reads. How a plugin assigns it is plugin-internal, provided the Feed order invariant below holds. |
 | `AggregationResult` | Grouped buckets. Each carries the dimension values in `group_by` order and the folded quantity as `bigdecimal::BigDecimal` — unbounded, and deliberately not the per-entry `rust_decimal::Decimal`, because a fold is not bounded by the per-entry ceiling. `null` where no entry matched. Neither the fold nor the queried type rides the result: both are inputs to the call. |
 | `FeedSubscription` | The set of GTS types one consumer reads. It bounds that consumer's pages and cursor. |
 | `FeedPage` | Settled entries in feed order and an opaque cursor holding a `FeedPosition`. Everything before the cursor is delivered and final. |
@@ -578,20 +562,20 @@ on `nominal_sampling_interval`.
 | Value object / Invariant | Definition | Enforced by |
 | --- | --- | --- |
 | `MeterTypeId` | A GTS identifier derived from the base `gts.cf.core.uc.usage_record.v1~`. An identifier outside that base is rejected. | Type Resolver |
-| Dedup identity | `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`. `resource_ref` and `subject_ref` are compared on a collision but are not part of it. One key shared across two resources over one period is therefore a conflict. One identity yields at most one entry on every read path, in every fold, in reconciliation counters and watermarks, and in any materialised aggregate. | plugin, at its declared dedup level |
-| Invalidation key | An invalidation carries no caller key. The gateway derives it as `inv:` followed by the target's `id`, lowercase hyphenated, and rejects a submission that supplies one. A record key beginning with `inv:` is rejected, so a record and an invalidation never share a key. | Ingestion Gateway |
-| Identity derivation | `id` is the UUIDv5 over the dedup identity. `invalidates` is deliberately excluded. An invalidation's `id` is still a function of its target alone, through its derived key. | Ingestion Gateway |
-| Collision resolution | A collision on the full identity resolves by exact equality of the caller-supplied fields. All equal, the entry is silently deduplicated. Any field differing, including metadata alone, is rejected as a conflict when answered after the identity has converged. Two same-identity entries inside one request resolve the same way at the gateway, before dispatch, the later against the earlier accepted one. A conflict on an invalidation is reported as `AlreadyInvalidated`, since the faithful copy leaves only the reason code to differ. | Ingestion Gateway + plugin |
-| Dedup level | Races under one identity resolve by the store's **commit order** — the order the plugin's own state records writes durable in, such as a replicated insert-block number or the row order inside one coalesced write, never a gateway timestamp. The first write in commit order is the **survivor**: every read path, fold, reconciliation figure, materialised aggregate, and the feed show it and nothing else under the identity, and a read before convergence may show a write that proves not to be first, never two. An identity has **converged** once its survivor is final — no write preceding it in commit order can still become visible — the survivor is visible to every dedup check the plugin runs, and no persist call under the identity that did not see the survivor is still to return its outcome; the survivor is then a converged entry, until retention frees the identity no other write under it ever is, and every later write is decided against it. The plugin establishes that from its own commit or replication state, never from elapsed time, and declares a **convergence bound** — the longest time from acknowledgement to convergence — and a dedup level in its deployment guide (§3.10); a late convergence is a defect counted on a named metric. No later write displaces a converged survivor, and the guarantee is tied to the moment the plugin returns its outcome, not to when a write arrived, gateway forwarding excluded: no acknowledgement returned after the identity has converged accepts divergent content — an identical write is absorbed, a divergent one is `IdempotencyConflict` — while one returned before convergence may be of a write later discarded. A write whose caller was already answered, as for a timed-out insert that commits late, is discarded and counted when it diverges. `linearizable`: the bound is zero, and every write is decided against those before it as it commits. `eventual`: a write can be acknowledged before the plugin knows an earlier one precedes it, and is then discarded on convergence, each divergent discard counted on a named metric; the feed never returns a discarded write, since an entry is settled only once converged; a materialised aggregate or reconciliation figure that counted one recomputes on convergence. A discarded write's acknowledgement disagrees with later reads — in `accepted_at` and `origin`, and for a divergent write in content, whose later retry is a conflict. That divergent case is the one silent drop the gear admits, reachable only by a caller reusing a key with different content and being acknowledged before the identity converges. No meter is gated on the level. | plugin (§3.3 contract test) |
+| Dedup identity | `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`. `resource_ref` and `subject_ref` are compared on a collision but are not part of it. One key shared across two resources over one period is therefore a conflict. One identity yields at most one entry on every read path, fold, reconciliation figure, and materialised aggregate. | plugin, at its declared dedup level |
+| Invalidation key | An invalidation carries no caller key: the gateway derives `inv:` followed by the target's `id`, lowercase hyphenated, and rejects a supplied one. A record key beginning with `inv:` is rejected. Every invalidation of one record therefore shares one dedup identity. | Ingestion Gateway |
+| Identity derivation | `id` is the UUIDv5 over the dedup identity. `invalidates` and `entry_type` are excluded. | Ingestion Gateway |
+| Collision resolution | A collision on the full identity resolves by exact equality of the caller-supplied fields. All equal, the entry is absorbed. Any field differing, metadata alone included, is `IdempotencyConflict` once the identity has converged (see Dedup level). Two same-identity entries in one request resolve the same way at the gateway, the later against the earlier. On an invalidation the conflict is reported as `AlreadyInvalidated`, since the faithful copy leaves only the reason code to differ. | Ingestion Gateway + plugin |
+| Dedup level | Races under one identity resolve by the store's **commit order** — the order the plugin's own state makes writes durable in, never a gateway timestamp. The first write in commit order is the **survivor**, and every read path, fold, reconciliation figure, materialised aggregate, and the feed show it and nothing else; a read before convergence may show a write that proves not to be first, never two. An identity **converges** once no earlier write can still become visible, the survivor is visible to every dedup check the plugin runs, and no persist call that missed it is still to return; the plugin establishes this from its commit or replication state, never from elapsed time, within a declared **convergence bound**; converging later is a conformance defect. From then until retention frees the identity, no later write displaces the survivor and no outcome returned accepts divergent content: an identical write is absorbed, a divergent one is `IdempotencyConflict`. A write whose caller was already answered, such as a timed-out insert that commits late, is discarded, counted when divergent. Before convergence the declared level applies. `linearizable`: the bound is zero, and every write is decided as it commits. `eventual`: a write can be acknowledged and then discarded, each divergent discard counted; the feed never returns it, and an aggregate or reconciliation figure that counted it recomputes. Such an acknowledgement disagrees with later reads in `accepted_at` and `origin`, and a divergent one in content, whose later retry is a conflict — the one silent drop the gear admits, reachable only by a caller reusing a key with different content. The level, bound, and metrics are published per §3.10. No meter is gated on the level. | plugin (§3.3 contract test) |
 | Idempotency horizon | A dedup identity stays visible for at least the declared retention of its type, measured from the covered period. Ingestion cannot reach past it: retention is at least the backfill window plus one replay horizon, so an over-aged covered period is refused on the window bound before deduplication is consulted. | plugin retention (§3.10) + backfill window bound (§3.2) |
 | Append-only invariant | No surface modifies an accepted entry. A correction is an appended invalidation entry. There is no status column, no lifecycle flag, and no row to rewrite. | absence of a mutation operation on REST, SDK, and SPI |
 | Point-event invariant | `window_start <= window_end`. Equal bounds mark a point event, not an error. | Ingestion Gateway |
 | Period-end selection | Every range selects an entry when `from <= window_end < to`, whatever the length of the period. No path matches by overlap or by containment, and no path reads `window_start` to select. | Query Gateway + every plugin (§3.3 contract test) |
-| Quantity fidelity | A quantity read back equals the quantity submitted, digit for digit. No conversion, scaling, rounding, or truncation on any path. The published range is at most 28 significant decimal digits (leading zeros excluded) and at most 28 digits after the decimal point — magnitude below 10^28, smallest non-zero value 1×10^-28 — negative half included. That bound is deliberately narrower than the `rust_decimal::Decimal` carrier, which reaches 29 significant digits; where the two disagree, the published bound is normative. The wire patterns cannot express the significant-digit bound and are a necessary but not sufficient check — the gear enforces it at ingestion. Wire-encoded as a JSON string, never a float, because a `SUM` fold MUST be bit-exact. | plugin exact-decimal storage (§3.3 contract test) |
+| Quantity fidelity | A quantity read back equals the quantity submitted, digit for digit, across the full published range of `UsageQuantity` in `usage-collector-v1.yaml`, negative half included. No conversion, scaling, rounding, or truncation on any path. Wire-encoded as a JSON string, never a float, because a `SUM` fold MUST be bit-exact. | plugin exact-decimal storage (§3.3 contract test) |
 | Faithful copy | An invalidation entry repeats every caller-supplied field of its target and departs in exactly three: `invalidates`, `reason_code`, and the idempotency key the gateway derives from `invalidates`. For `subject_ref`, presence against absence is a mismatch. A rejection names the field that differs. | Ingestion Gateway |
 | Echo, not compensation | The copied quantity restates what is withdrawn. It is never negated or adjusted, and no signed compensating entry exists on any surface. | Ingestion Gateway |
 | Both-or-neither | `invalidates` and `reason_code` appear together or not at all. An entry carrying neither is an ordinary record, whatever its other fields. | wire schema + Ingestion Gateway |
-| At most one invalidation | A record carries at most one accepted invalidation. Every invalidation of one record derives one key and so one dedup identity: a second one under the same reason code is absorbed, and under a different one is `AlreadyInvalidated`. Concurrent attempts resolve at the plugin's dedup level. No store-side rule exists beyond the dedup identity. | Ingestion Gateway (key derivation) + plugin (dedup identity) |
+| At most one invalidation | A record carries at most one accepted invalidation, as a consequence of Invalidation key: a second one under the same reason code is absorbed, under a different one is `AlreadyInvalidated`, and concurrent ones resolve at the dedup level. No store-side rule exists beyond the dedup identity. | Ingestion Gateway (key derivation) + plugin (dedup identity) |
 | No invalidation of an invalidation | The target MUST itself be a record, carrying no `invalidates` of its own. | Ingestion Gateway |
 | Permanence | An accepted invalidation has no reversal. A correction to a mis-measured quantity is an invalidation, then a fresh emission under a new key with the same attribution and period. | absence of a reversal operation |
 | Withdrawal exclusion | Inside any fold, a withdrawn record and its invalidation each contribute nothing. Both carry one period end, so no range selects one without the other. Ledger read paths return both, as persisted. | Query Gateway + every plugin (§3.3 contract test) |
@@ -599,8 +583,8 @@ on `nominal_sampling_interval`.
 | Additivity | A consumer reading entries directly sums quantities only where the declared fold is `SUM`, and MUST leave out every withdrawn pair. Under any other fold the quantities are observations and summing them is invalid. | consumer contract |
 | `COUNT` quantity | Under `COUNT` the quantity means nothing: one record is one event. An emitter sends `1`. Ingestion does not enforce this, because it never consults the fold. | consumer contract |
 | `COUNT` exclusion | `COUNT` counts the records in range that no accepted invalidation withdraws. It counts no invalidation entry and no withdrawn record, so a withdrawn pair counts none. | Query Gateway + every plugin (§3.3 contract test) |
-| `LATEST` tie-break | Greatest `window_end`, then greatest `accepted_at`, then greatest `id` in byte order. `id` is unique, so the order is total. The gear assigns all three keys, and each compares across tenants and types, so the order also holds over a group spanning tenants — which is what a request produces when it neither narrows to one tenant nor groups by tenant. `MAX` and `MIN` need no such rule. | plugin (§3.3 contract test) |
-| Feed order | The feed serves one deterministic order over a subscription, realised by the plugin through `FeedPosition`. No other ordering is claimed — in particular not acceptance-instant order. Two properties bind it. **Completeness**: a page carries only settled entries — converged entries (§3.1 Dedup level) before which nothing more can become visible — so no entry becomes visible behind a returned cursor, however many writers accept concurrently and in whatever order their writes commit. A page that reaches the settled head of the feed returns its cursor at that head rather than at its last entry, so a cursor's age reflects how far its consumer has read, not when an entry last arrived. **Correction order**: an invalidation follows its target. | plugin (§3.3 contract test) |
+| `LATEST` tie-break | Greatest `window_end`, then greatest `accepted_at`, then greatest `id` in byte order. `id` is unique, so the order is total, and all three keys compare across tenants and types, so it also holds for a group spanning tenants. `MAX` and `MIN` need no such rule. | plugin (§3.3 contract test) |
+| Feed order | One deterministic order over a subscription, realised by the plugin through `FeedPosition`. No other ordering is claimed, acceptance-instant order included. **Completeness**: a page carries only settled entries — converged, with nothing more able to become visible before them — so no entry ever becomes visible behind a returned cursor, whatever the concurrency or commit order. A page reaching the settled head returns its cursor at the head, so a cursor's age reflects its consumer's progress, not the last arrival. **Correction order**: an invalidation follows its target. | plugin (§3.3 contract test) |
 | Declaration immutability | The fold, the canonical unit, and the metadata surface are immutable for the life of a GTS type. A meter that must change one is a new type. A persisted quantity carries neither unit nor fold of its own, so an edit in place would silently restate every entry already accepted. | `types-registry` |
 | Fail-closed resolution | An entry whose `gts_type_id` resolves nowhere is rejected and not persisted. The gear never substitutes a default for a declared attribute, and never relaxes validation to protect ingestion availability. Steady-state resolution is served from a local cache, so a registry outage degrades new-type introduction rather than ingestion. A declaration the registry has lost is restored from the mirror table (§3.7), where a row exists and the registry returns a definite not-found answer. | Type Resolver |
 | Closed metadata shape | An undeclared key is rejected before persistence. There is no free-form remainder and no open-extras escape hatch. Admissibility is recomputed per request, so a freshly declared property is usable on the next request. | Ingestion Gateway + Query Gateway |
@@ -662,10 +646,8 @@ plugin.
   is validated.
 - Validates the structural attribution tuple (tenant, resource, optional
   subject, `gts_type_id`).
-- Requires a caller idempotency key on every record and rejects one beginning
-  with the reserved `inv:` prefix. Rejects a key supplied on an invalidation and
-  derives it instead, as `inv:` followed by the target's `id`. Derives `id` as
-  the deterministic UUIDv5 over the 5-tuple.
+- Requires the caller key on a record and derives it on an invalidation
+  (§3.1 Invalidation key), then derives `id` (§3.1 Identity derivation).
 - Validates the covered period: `window_start <= window_end`, UTC normalization,
   rejection of offset-less timestamps, and the live path's two-sided time bound.
   That bound rejects a period ending further into the future than the configured
@@ -677,15 +659,11 @@ plugin.
 - Resolves the declaration through the Type Resolver and validates the metadata
   against its closed schema and the configurable size cap. Rejects an entry
   whose type binds no unit.
-- **Enforces the invalidation rules.** These are the faithful copy of every
-caller-supplied field, the target reference that marks the entry as a
-withdrawal, a resolvable and converged target with `entry_type = record`, and
-the mandatory reason code. The target lookup reads converged entries only, so a
-faithful copy is never checked against a write the plugin later discards. At
-most one invalidation per record is not a rule it checks: it
-follows from the derived key, and the plugin's dedup identity enforces it. The
-gateway lifts a conflict on an invalidation to `AlreadyInvalidated`. The copied
-period is bounded by period validation above, not by a rule of its own.
+- **Enforces the §3.1 invalidation rules**: faithful copy, target reference,
+  mandatory reason code, and a target with `entry_type = record`. The target is
+  looked up converged-only, so a copy is never checked against a write the
+  plugin later discards. At most one invalidation per record needs no check of
+  its own, and the copied period is bounded by period validation above.
 - Applies per-caller and per-(caller, tenant) ingestion quotas, rejecting
   over-quota submissions with an actionable throttle error carrying retry
   guidance.
@@ -827,19 +805,15 @@ obligations also have no analogue on the query paths.
 
 - Accepts a subscription declaring the GTS types a consumer reads, and excludes
   everything else from the pages and the cursor.
-- Serves cursor-paginated pages in the deterministic order the active plugin
-  realises: the same cursor yields the same continuation, extended only by
-  entries accepted since. A replay bounded by a
-  cursor recorded later is identical, entry for entry.
-- Returns a next cursor with every page of a live read, including a page with
-  fewer entries than requested, and none once a bounded replay reaches `until`.
-  The feed reads forward only, so it returns no previous cursor. The cursor
-  proves completeness: everything before it is delivered
-  and final, because a page carries only settled entries.
+- Serves cursor-paginated pages in feed order (§3.1): the same cursor yields
+  the same continuation, extended only by entries settled since, and a replay
+  bounded by a later cursor (`until`) is identical, entry for entry.
+- Returns a next cursor with every page of a live read, short pages included,
+  and none once a bounded replay reaches `until`. The feed reads forward only.
 - Surfaces the plugin's refusal of a cursor older than the retention floor as
   an actionable error, rather than serving a silently truncated range.
-- Serves corrections as ordinary entries at their own feed position. No
-  feed entry represents a change to an already-delivered entry.
+- Serves corrections as ordinary entries. No feed entry represents a change
+  to an already-delivered entry.
 
 ##### Responsibility boundaries
 
@@ -952,15 +926,9 @@ metadata — are REST-only.
 pub trait UsageCollectorClientV1: Send + Sync + 'static {
     /// Ingest one ledger entry — a measurement or an invalidation.
     ///
-    /// `id` is derived from the dedup identity, never supplied, and so is an
-    /// invalidation's key. Against a converged entry, an exact-equality
-    /// retry returns the persisted entry, and any difference under the same
-    /// identity is `Conflict(IdempotencyConflict)`, or
-    /// `Conflict(AlreadyInvalidated)` for a second invalidation of one
-    /// record. A race before convergence resolves at the plugin's dedup
-    /// level. An invalidation of a target not yet converged is
-    /// `Conflict(TargetNotConverged)`, which clears within the plugin's
-    /// convergence bound plus its query-path lag bound.
+    /// `id` and an invalidation's key are derived, never supplied. An
+    /// absorbed retry returns the persisted entry. Dedup outcomes follow
+    /// §3.1 and surface as the `Conflict` reasons of the error contract.
     async fn create_usage_record(
         &self,
         ctx: &SecurityContext,
@@ -1023,12 +991,11 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError>;
 
-    /// Replay-safe feed page, in the feed's deterministic order.
+    /// Replay-safe feed page in feed order (§3.1).
     ///
-    /// Snapshot-consistent, unlike the query paths (§3.10). A consumer that
-    /// must not miss entries reads this and not `list_usage_records`. A
-    /// cursor older than the retention floor is refused. `until`, a cursor
-    /// recorded later, bounds a replay to exactly the pages read before.
+    /// Snapshot-consistent, unlike the query paths (§3.10): a consumer that
+    /// must not miss entries reads this and not `list_usage_records`.
+    /// `until`, a later cursor, bounds a replay.
     async fn read_usage_feed(
         &self,
         ctx: &SecurityContext,
@@ -1074,15 +1041,8 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// Read one entry by identifier, with its correction linkage.
     ///
     /// `scope` is the compiled PDP scope, projected into a `toolkit_odata`
-    /// filter. A row outside it is not returned. The gateway sets
-    /// `converged_only` when resolving an invalidation target, a pre-1.0
-    /// change to this method's signature shipped in place. Such a lookup
-    /// applies `scope` first and treats a row outside it as absent. It
-    /// returns the survivor once converged, never reports an acknowledged,
-    /// retained entry missing, and answers `UsageRecordNotConverged` only until it
-    /// can decide: within the convergence bound plus the published
-    /// query-path lag bound it returns the survivor or `UsageRecordNotFound`,
-    /// reading an authoritative source where a lagging pool cannot decide.
+    /// filter. A row outside it is absent. The gateway sets `converged_only`
+    /// when resolving an invalidation target (see the obligations below).
     async fn get_usage_record(
         &self,
         id: Uuid,
@@ -1112,11 +1072,9 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;
 
-    /// Snapshot-consistent feed page, in the feed's deterministic order.
+    /// Snapshot-consistent feed page in feed order (§3.1).
     ///
-    /// `page_after` carries back a position this plugin issued, and
-    /// `until` a later one bounding a replay. Only the
-    /// plugin assigns or reads them. A page carries only settled entries.
+    /// `page_after` and `until` carry back positions this plugin issued.
     async fn read_feed_page(
         &self,
         subscription: &[MeterTypeId],
@@ -1137,8 +1095,8 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
 ```
 
 **Plugin obligations.** These sit on top of the §3.1 invariants a plugin
-enforces (period-end selection, quantity fidelity, dedup identity at its
-declared level, feed order, `LATEST` tie-break, recomputation):
+enforces (period-end selection, quantity fidelity, dedup identity and level,
+feed order, `LATEST` tie-break, recomputation):
 
 - **Do not re-validate.** The gateway enforces PDP attribution, type
   resolution, declaration validation, metadata shape, quantity range, period
@@ -1160,24 +1118,15 @@ declared level, feed order, `LATEST` tie-break, recomputation):
   only after every entry it reports accepted is durable, so a buffer holds only
   unacknowledged entries. A crash loses no acknowledged entry, and the caller's
   retry lands on the dedup identity.
-- **Declare a dedup level and meet it.** The floor binds every plugin. One
-  identity shows its survivor, the first write in the store's commit order, and
-  nothing else on every read path, in every fold, and in reconciliation. A retry
-  against a converged entry is absorbed, a divergent submission against one is
-  `IdempotencyConflict`, and a late-committing write never displaces it. Above
-  the floor the plugin declares its commit order, a convergence bound, and
-  `linearizable` or `eventual` (§3.1 Dedup level). A backend with a uniqueness
-  constraint meets the `linearizable` dedup rule directly, and still owes the
-  converged-only lookup rule when it reads from isolated pools. One without it
-  declares `eventual`, or reaches `linearizable` through a coordinator of its
-  own. No invalidation-specific check exists: a second invalidation arrives as
-  an ordinary collision.
-- **Latency planning values** (§3.11.2): 75 ms p95 of the 200 ms ingestion
-  budget, 425 ms p95 of the 500 ms aggregated-query budget. These are defaults,
-  not conformance bounds. A plugin may spend more where the end-to-end NFR
-  still holds, and publishes its measured persist and aggregate p95. For batched
-  ingestion, raw paging, feed reads, and reconciliation, reserve at least
-  25 ms of the end-to-end envelope for gateway, PDP, and core overhead.
+- **Declare a dedup level and meet it** (§3.1 Dedup level, published per
+  §3.10). A second invalidation is an ordinary collision with no check of its
+  own.
+- **Decide converged-only lookups.** A lookup with `converged_only` applies
+  `scope` first. It returns the survivor once converged, never reports an
+  acknowledged, retained entry missing, and answers `UsageRecordNotConverged`
+  only until it can decide: within the convergence bound plus the published
+  query-path lag bound it returns the survivor or `UsageRecordNotFound`.
+- **Latency**: plan against §3.11.2.
 - **`AggregationBucket.key` encoding**: `tenant_id` as `Uuid::to_string()`
   (lowercase, hyphenated), every other dimension verbatim.
 
@@ -1188,15 +1137,15 @@ declared level, feed order, `LATEST` tie-break, recomputation):
 | --- | --- |
 | `window-end-selection` | A range selects by period end, exclusive at the upper bound. A point event needs no special case. An entry wider than the range is still selected when that range holds its period end. |
 | `invalidation-excluded-from-fold` | A withdrawn pair folds to nothing while both entries stay readable. Excluding only the record double-counts the withdrawn measurement. |
-| `at-most-one-invalidation` | Two invalidations of one record share one derived identity: at the SPI, a second one under the same reason code returns the stored invalidation, and under a different one is `IdempotencyConflict`. Under concurrent submissions the outcome follows the declared dedup level. |
-| `converged-target-lookup` | With `converged_only`, a lookup of an unconverged entry is `UsageRecordNotConverged` and returns the survivor once converged. A lookup served by a lagging read pool straight after acknowledgement is never `UsageRecordNotFound`. An identifier that never existed is `UsageRecordNotFound` within the convergence bound plus the published query-path lag bound, and an out-of-scope entry draws the same answers as an absent one. |
+| `at-most-one-invalidation` | At the SPI, a second invalidation of one record under the same reason code returns the stored invalidation, and under a different one is `IdempotencyConflict`. Concurrent submissions follow the declared dedup level. |
+| `converged-target-lookup` | The converged-only lookup obligation, including a lagging read pool straight after acknowledgement, an identifier that never existed, and an out-of-scope entry, which answers as an absent one. |
 | `dedup-identity-over-window` | Both period bounds are part of the identity, so a same-key submission over a different period is a distinct entry. |
-| `dedup-floor` | One identity folds, reads, and counts in reconciliation at most once. Against a converged entry an exact-equality retry returns the stored entry, and a divergent submission is `IdempotencyConflict`. Two same-identity entries in one batch call resolve the same way, the later against the earlier. |
-| `dedup-concurrent` | An identical pair and a divergent pair on one identity are driven through several gateway replicas before the identity converges. `linearizable`: the identical pair is absorbed, and the divergent pair yields one acceptance and one `IdempotencyConflict`. `eventual`: each pair leaves one survivor, the first in commit order; no read path or reconciliation figure shows two at any point; the feed delivers only the survivor; the divergent pair adds one collision on the declared metric. An insert reported `Transient` that commits after the identity has converged on a divergent retry, stamped with an earlier `accepted_at`, leaves the converged entry and its feed delivery unchanged at either level. |
+| `dedup-floor` | One identity reads, folds, and counts at most once. Against a converged entry a retry returns the stored entry and a divergent submission is `IdempotencyConflict`, as is the later of two same-identity entries in one batch call. |
+| `dedup-concurrent` | Identical and divergent pairs on one identity, driven through several gateway replicas before convergence. `linearizable`: the identical pair is absorbed, and the divergent pair yields one acceptance and one `IdempotencyConflict`. `eventual`: only the first write in commit order ever shows on any read, figure, or feed page, and the divergent pair counts one collision. At either level, an insert reported `Transient` that commits after convergence on a divergent retry, despite an earlier `accepted_at`, changes nothing. |
 | `quantity-round-trip` | The full published range round-trips digit for digit, negative half included. |
-| `feed-snapshot-and-replay` | A paginated scan observes no entry appearing, disappearing, or changing, except append-only arrivals ahead of the cursor. Replay from one cursor yields the same entries in the same order, extended only by entries accepted since. Bounded by a cursor recorded later, the replay is identical — including over a subscription spanning many tenants, some never written. |
-| `feed-completeness` | Under concurrent ingestion of measurements and invalidation entries through several gateway replicas, no page carries an entry that is not yet settled, no entry becomes visible behind a returned cursor, a page reaching the head returns its cursor at the head so a consumer that keeps reading is never refused however long its subscription stays quiet, and every invalidation follows its target. |
-| `latest-tie-break` | Greatest `window_end`, then greatest `accepted_at`, then greatest `id` in byte order. Two entries sharing a period resolve to the later-accepted one, and an aggregate that spans tenants resolves ties by the same order. |
+| `feed-snapshot-and-replay` | A paginated scan observes no entry appearing, disappearing, or changing, except arrivals ahead of the cursor. Replay from one cursor yields the same entries in the same order, extended only by entries settled since, and replay bounded by `until` is identical — including over a subscription spanning many tenants, some never written. |
+| `feed-completeness` | The Feed order invariant under concurrent ingestion of records and invalidations through several gateway replicas, including a subscription that stays quiet while its consumer keeps reading, which is never refused. |
+| `latest-tie-break` | The §3.1 order, including two entries sharing a period and an aggregate spanning tenants. |
 
 #### REST API — `cpt-cf-usage-collector-interface-rest-api`
 
@@ -1254,25 +1203,20 @@ owns `toolkit_odata::CursorV1` on both paginated paths. The SPI never sees the
 wire token. The two paths anchor differently. Raw query uses the keyset
 `(window_end, id)`, ordering the ledger by the column selection reads. That
 tuple is unique within its scope, so successive page boundaries neither skip
-nor repeat rows within a stable filter scope. The feed anchors on
-the `FeedPosition` the plugin issued. The gateway carries it inside the token
-and never reads it, and the feed-order invariant (§3.1) gives the same no-skip,
-no-repeat property. The cursor binds the order and a hash of the
+nor repeat rows within a stable filter scope. The feed anchors on the plugin's
+`FeedPosition`, and the Feed order invariant (§3.1) gives the same property.
+The cursor binds the order and a hash of the
 filter it was minted under, so that stability is enforced and not trusted. A
 malformed token, a changed filter, or an order supplied alongside a cursor is
 rejected as `InvalidArgument` with a `cursor` field violation —
 `INVALID_CURSOR`, `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`, and, in process only
 where a caller can set both at once, `ORDER_MISMATCH`.
 
-A feed cursor carries the plugin's `FeedPosition` and binds the subscription as
-a raw cursor binds its filter. The position never becomes wire contract. The
-SPI receives it decoded as `FeedPosition` and is the only component that
-interprets it, including its age for the retention-floor refusal. No second token exists: a feed cursor already proves that everything
-before it is delivered and final, because a page carries only settled entries.
-The optional `until` bound is a cursor too, validated on the same terms and
-rejected with an `until` field violation. It is not part of the scope a feed
-cursor binds: adding `until` to a request that resends a cursor, or dropping
-it, is not a `FILTER_MISMATCH`.
+A feed cursor binds the subscription as a raw cursor binds its filter. The
+optional `until` bound is a cursor too, validated on the same terms and
+rejected with an `until` field violation. It is not part of the bound scope:
+adding or dropping `until` alongside a resent cursor is not a
+`FILTER_MISMATCH`.
 
 #### Error Contract
 
@@ -1305,8 +1249,9 @@ the reason. The reason vocabularies are declared in
 `is_retryable()` is true for `ServiceUnavailable` alone. `ResourceExhausted` is
 retryable after the indicated delay and is reported separately, so a caller can
 tell backpressure from infrastructure failure. `Conflict(TargetNotConverged)` is
-retryable, clears within the active plugin's convergence bound plus its
-query-path lag bound, and carries `context.retryable = true`. Every other `Conflict` reason is final.
+retryable (`context.retryable = true`) and clears within the active plugin's
+convergence bound plus its query-path lag bound. Every other `Conflict` reason
+is final.
 
 `UsageCollectorPluginError` — the SPI taxonomy, translated at the dispatch
 boundary in `usage-collector/src/domain/service.rs`:
@@ -1315,7 +1260,7 @@ boundary in `usage-collector/src/domain/service.rs`:
 | --- | --- |
 | `Transient(detail)` | `ServiceUnavailable` |
 | `Internal(detail)` | `Internal` |
-| `IdempotencyConflict { idempotency_key, existing }` | `Conflict(IdempotencyConflict)` on a record, naming `existing.id`. `Conflict(AlreadyInvalidated)` on an invalidation, naming the target, the accepted invalidation's `id` as `invalidated_by`, and its `reason_code`. `existing` is the stored entry, so the gateway reads both from it. |
+| `IdempotencyConflict { idempotency_key, existing }` | `Conflict(IdempotencyConflict)` naming `existing.id`, or, when the dispatched entry is an invalidation, `Conflict(AlreadyInvalidated)` naming the target, `existing.id` as `invalidated_by`, and `existing.reason_code`. |
 | `UsageRecordNotFound { id }` | `NotFound` |
 | `UsageRecordNotConverged { id }` | `Conflict(TargetNotConverged)`, retryable |
 | `CursorBeyondRetention` | `InvalidArgument(CursorBeyondRetention)` |
@@ -1324,10 +1269,7 @@ Six variants, deliberately. Type resolution, faithful-copy and reason-code
 checks, metadata shape and size, quantity range, cursor decoding, and
 authorization are all gateway-side. The SPI therefore carves no variant for any
 of them, and a plugin that observes a violation of one has observed a
-host-contract breach and returns `Internal(detail)`. An already-invalidated
-target carries no variant either: a second invalidation of one record collides
-on its derived identity, and the host classifies that conflict by the entry it
-dispatched. There is no `Unready` variant. A plugin can add
+host-contract breach and returns `Internal(detail)`. There is no `Unready` variant. A plugin can add
 per-variant context fields as long as the classification and the
 `error_category` metric mapping (§3.11.5) hold.
 
@@ -1503,16 +1445,11 @@ sequenceDiagram
     IG-->>S: acknowledgement | Conflict(AlreadyInvalidated)
 ```
 
-The entry travels the ordinary ingestion path: same PDP attribution, same dedup
-identity, same quota machinery, and the same covered-period bounds. It carries
-no caller key. The gateway derives it from the target, so every invalidation of
-one record lands on one identity, and a second one resolves as a retry or as
-`AlreadyInvalidated`, at the plugin's dedup level. No separate at-most-one check
-runs in the plugin.
-
-The period is the target's, so a withdrawal reaching past the live past
-tolerance is rejected there and belongs on `/records/backfill`, which the
-rejection names.
+The entry travels the ordinary ingestion path — same PDP attribution, dedup
+identity, quotas, and covered-period bounds — under a key derived from its
+target, so a second invalidation of one record is an ordinary collision. The
+period is the target's, so a withdrawal reaching past the live past tolerance
+belongs on `/records/backfill`, which the rejection names.
 
 #### Query Aggregated Usage
 
@@ -1650,11 +1587,9 @@ declarations in memory, and it is dropped when that changes
 Concrete table shapes are plugin-internal per `DATA-DESIGN-NO-001`, and each
 plugin's own DESIGN document owns them. These shapes cover column types,
 primary keys, indexes, partitioning, retention, materialised views, and
-acceleration structures. Two obligations bind them from here. The dedup identity
-over the 5-tuple must meet the floor and the declared level of §3.1, and be
-preserved for the retention horizon. A uniqueness constraint is one way to meet
-it, not the requirement. The plugin realises the feed's order in whatever way its
-backend allows, and must meet the feed-order invariant of §3.1.
+acceleration structures. Two obligations bind them from here: the dedup
+identity meets §3.1 at the declared level and is preserved for the retention
+horizon, and the feed order meets §3.1. Neither prescribes a mechanism.
 
 ### 3.8 Deployment Topology
 
@@ -1757,14 +1692,9 @@ paths. The decision is recorded in
 - **Ingestion ack** — after an ingestion call returns the persisted entry, that
 entry is durable. Its dedup identity stays visible to subsequent ingestion
 attempts for as long as the referenced type's retention policy keeps it. The dedup
-  window is therefore **per-meter and bounded**, not unbounded. A plugin that
-  buffers writes still acknowledges only after durability, so buffering adds
-  latency and never weakens this floor. At every dedup level one identity yields
-  at most one entry. Under `eventual` an acknowledged entry can still be
-  discarded before convergence when an earlier write under its identity
-  precedes it in the store's commit order. For an identical write that loses
-  nothing measured, and for a divergent one only a caller reusing a key can
-  cause it.
+  window is therefore **per-meter and bounded**, not unbounded. Under
+  `eventual` an acknowledged entry can still lose a race before convergence
+  (§3.1 Dedup level).
 - **Read paths (raw, aggregate, point lookup, feed)** — **eventually consistent
   with no upper bound** relative to a same-tenant ingestion ack. The window is
   driven by the active plugin's replication topology, not by Usage Collector.
@@ -1808,8 +1738,7 @@ publish that plugin's actual consistency profile. A consumer needing a tighter
 bound can then opt in by coupling to it. Every guide MUST state:
 
 1. whether ingestion and query land on the same backend pool or on isolated
-   pools, and the published upper bound on query-path lag, which with the
-   convergence bound also bounds a converged-only target lookup
+   pools, and the published upper bound on query-path lag
 2. **acceptance → feed visibility, p95.** A deployment whose plugin publishes
    no qualifying ceiling here MUST NOT feed a charging consumer
    (`nfr-billing-feed-freshness`, ≤ 5 minutes p95)
@@ -1856,9 +1785,8 @@ grouping dimension execute in the plugin's native acceleration structures. The
 gear never iterates rows. **Declaration caching**: steady-state type resolution
 is an in-memory lookup, so ingestion does not pay a registry round-trip.
 **Batch ingestion**: a first-class SPI method so each plugin drives its native
-bulk-write path. The size of a backend write is the plugin's choice and is
-independent of the per-request cap. A plugin whose backend prefers large
-writes may coalesce concurrent calls.
+bulk-write path. A backend write's size is the plugin's choice, independent of
+the per-request cap, and a plugin may coalesce concurrent calls.
 
 #### 3.11.2 Latency Budgets (PERF-DESIGN-003)
 
@@ -1872,14 +1800,13 @@ Canonical NFR p95 budgets:
 Default SPI planning values: **75 ms** of the ingestion budget and **425 ms**
 of the aggregated-query budget. The totals above are the conformance bounds,
 and these values are not. A plugin may spend more of a budget where its
-end-to-end p95 still meets the NFR, as a columnar plugin does when it waits to
-coalesce writes. Per-component PDP enforcement dominates ingestion
+end-to-end p95 still meets the NFR. Per-component PDP enforcement dominates ingestion
 latency. Aggregation pushdown dominates query latency. Type resolution adds no
 round-trip in the steady state — a cache miss is a cold-path cost, not a budget
 line. DESIGN carves no sub-allocation for batched ingestion, raw paging, or feed
 reads. For those, plugins **SHOULD** reserve ≥ 25 ms of the end-to-end envelope for
-gateway, PDP, and core overhead. Plugins must publish their measured
-SPI-internal p95 in their deployment guide.
+gateway, PDP, and core overhead. Measured SPI-internal p95 is published per
+§3.10.
 
 #### 3.11.3 Resource Efficiency (PERF-DESIGN-004)
 

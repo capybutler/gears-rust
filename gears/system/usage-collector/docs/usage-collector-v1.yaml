@@ -77,48 +77,20 @@ paths:
       tags: [Usage Records]
       summary: Ingest a batch of usage records or invalidation entries
       description: |
-        Submit ledger entries up to the per-request cap. The cap is operator
-        configuration, 100 by default. An empty or over-cap submission is
-        rejected whole with `400` on `records`. Every entry is deduplicated
-        on `(tenant_id, gts_type_id, idempotency_key, window_start,
-        window_end)`. A measurement carries the caller's `idempotency_key`;
-        an invalidation carries none, and the server derives it as `inv:`
-        followed by the `invalidates` identifier.
+        Submit ledger entries up to the per-request cap, which is operator
+        configuration (100 by default). An empty or over-cap submission is
+        rejected whole with `400` on `records`. Supplying `invalidates` makes
+        an entry an invalidation. Dedup, identity, and invalidation rules are
+        specified in DESIGN.md §3.1, and per-entry rejections are listed on
+        `RejectedUsageRecord`.
 
-        The presence of `invalidates` is the sole discriminator between an
-        ordinary measurement and an invalidation; an entry is never
-        identified as a correction by the value or sign of its quantity. An
-        invalidation entry is a faithful copy of the record it withdraws,
-        carrying additionally the target reference and a reason code. Every
-        invalidation of one record derives one dedup identity, so a second
-        one under the same reason code is absorbed as a retry, and one under
-        a different reason code is rejected with `ALREADY_INVALIDATED`. An
-        invalidation whose target has not yet converged under the storage
-        plugin's dedup level is rejected with `TARGET_NOT_CONVERGED`, which
-        is retryable and clears within the plugin's convergence bound plus
-        its query-path lag bound.
-
-        **The live path bounds the covered period on both sides, for every
-        entry it admits.** An entry whose period ends further into the
-        future than the configured future tolerance (default 5 minutes) is
-        rejected with
-        `context.field_violations[N].reason = FUTURE_WINDOW`, and one whose
-        period ends further into the past than the configured past
-        tolerance (default 48 hours) is rejected with
-        `context.field_violations[N].reason = PAST_WINDOW`.
-        Each violation names the offending instant and the bound it
-        breached. A period older than the past bound is never admitted
-        here: the error names
-        `POST /usage-collector/v1/records/backfill` as the route that
-        accepts it.
-
-        Both bounds govern an invalidation entry too, over the period it
-        copies from its target. Withdrawing a record older than the past
-        tolerance goes to the backfill route, not to this one.
-
-        An `idempotency_key` or `gts_type_id` carrying a control character
-        is rejected before the entry identifier is derived, because that
-        derivation concatenates both values under a `0x1F` separator.
+        The live path bounds the covered period of every entry, an
+        invalidation's copied period included. A period ending beyond the
+        future tolerance (default 5 minutes) is rejected with
+        `context.field_violations[N].reason = FUTURE_WINDOW`, and one ending
+        beyond the past tolerance (default 48 hours) with `PAST_WINDOW`,
+        which names `POST /usage-collector/v1/records/backfill` as the route
+        that accepts it. Each violation names the instant and the bound.
 
         Returns `200` if every entry was accepted or deduplicated, `207
         Multi-Status` if at least one was rejected.
@@ -336,33 +308,14 @@ paths:
       tags: [Usage Feed]
       summary: Read a page of the usage feed
       description: |
-        Deterministic, replay-safe, pull-based read path for charging
-        consumers.
-
-        Entries come in a deterministic order chosen by the storage plugin.
-        The only ordering promised beyond determinism is that an
-        invalidation follows the entry it withdraws; no position value is
-        exposed. A page carries only settled entries, so everything before
-        a returned cursor is delivered and final, and no entry becomes
-        visible behind it. On a live read every page returns a
-        `page_info.next_cursor`, even one with fewer entries than `limit`;
-        it is `null` only once a replay reaches `until`, and `prev_cursor`
-        is always `null`, since the feed reads forward only. The same
-        cursor yields
-        the same continuation, extended only by entries accepted since. A
-        replay bounded by `until`, a cursor recorded later, is identical,
-        entry for entry.
-
-        A paginated scan does not observe entries appearing, disappearing,
-        or changing mid-scan, except append-only arrivals, which land ahead
-        of the cursor. Corrections arrive as ordinary
-        entries at their own feed position; an accepted invalidation
-        removes neither entry from the feed.
+        Replay-safe, snapshot-consistent, pull-based read path for charging
+        consumers. Order, completeness, and replay guarantees are specified
+        in DESIGN.md §3.1 (Feed order) and §3.2 (Feed Gateway); cursor
+        representation is on `FeedPage`.
 
         A cursor older than the retention floor is refused with `400` and a
-        `cursor` field violation (`context.field_violations[0].field =
-        cursor`, `.reason = CURSOR_BEYOND_RETENTION`) rather than served as
-        a silently truncated range.
+        `cursor` field violation (`CURSOR_BEYOND_RETENTION`) rather than
+        served as a silently truncated range.
       parameters:
         - name: gts_type_id
           in: query
@@ -568,16 +521,10 @@ components:
       in: query
       required: false
       description: |
-        A feed cursor this operation returned earlier, used as an upper
-        bound. Reading stops at its position, so a
-        replay from an earlier cursor up to it is identical entry for
-        entry. The page that reaches it carries a `null`
-        `next_cursor`. Omit it to read the live feed.
-
-        It is validated as `cursor` is and must be minted under the same
-        subscription; a violation is rejected `400` with an `until` field
-        violation. One older than the retention floor is refused as a
-        cursor is.
+        A later feed cursor bounding a replay: reading stops at its
+        position. Omit it to read the live feed. It is validated and
+        refused past the retention floor as `cursor` is, under the same
+        subscription, with violations reported on `until`.
       schema:
         type: string
 
@@ -678,34 +625,20 @@ components:
       pattern: '^-?(?:0|[1-9][0-9]{0,27})(?:\.[0-9]{1,28})?$'
       example: "42.5"
       description: |
-        Finite, signed decimal measurement in the canonical unit bound to
-        the entry's GTS type. Wire-encoded as a JSON **string**, never a
-        JSON number, so client and server representations cannot round-trip
-        through float and silently lose precision. The carrier on every
-        server surface is `rust_decimal::Decimal`, persisted in an exact
-        decimal type.
-
-        **The sign is never constrained.** A negative quantity records a
-        real decrease in consumption and is an ordinary measurement, not a
-        correction. Absent, non-numeric, non-finite, or out-of-range values
-        are rejected at ingestion.
+        Finite, signed decimal in the canonical unit of the entry's GTS
+        type, wire-encoded as a JSON **string** so it never round-trips
+        through float. The sign is never constrained: a negative quantity is
+        an ordinary measurement, not a correction.
 
         Published range: at most 28 significant decimal digits (leading
-        zeros excluded) and at most 28 digits after the decimal point.
-        The magnitude is therefore below 10²⁸, and the smallest non-zero
-        value is 1×10⁻²⁸.
-
-        The pattern bounds the integer and fraction parts separately and
-        cannot express the significant-digit bound, so it is a necessary
-        but not sufficient check — the gear enforces the full bound at
-        ingestion. The published bound is deliberately narrower than the
-        `rust_decimal::Decimal` carrier, which reaches 29 significant
-        digits; where the two disagree, the published bound is normative.
-
-        Every storage plugin MUST round-trip that full range —
-        **including its negative half** — and the full precision without
-        loss, and no path may convert, scale, round, or truncate a
-        quantity between acceptance and read.
+        zeros excluded) and at most 28 digits after the decimal point, so
+        the magnitude is below 10²⁸ and the smallest non-zero value is
+        1×10⁻²⁸, negative half included. The pattern cannot express the
+        significant-digit bound, which the gear enforces at ingestion. The
+        bound is narrower than the `rust_decimal::Decimal` carrier's 29
+        significant digits; where the two disagree, this bound is
+        normative. Fidelity across the range is DESIGN.md §3.1 (Quantity
+        fidelity).
 
     AggregatedQuantity:
       type: string
@@ -726,38 +659,16 @@ components:
       not:
         pattern: '^inv:'
       description: |
-        Caller-supplied dedup key on a measurement. The dedup identity is
-        the 5-tuple `(tenant_id, gts_type_id, idempotency_key,
-        window_start, window_end)`, so submissions differing in period are
-        distinct entries rather than duplicates and an emitter does not
-        encode the period into the key.
+        Caller-supplied dedup key on a measurement; an invalidation carries
+        none (`StoredIdempotencyKey`). It is one part of the dedup identity
+        `(tenant_id, gts_type_id, idempotency_key, window_start,
+        window_end)`; how to choose it and the dedup outcomes are specified
+        in DESIGN.md §2.1 (Idempotency-by-key) and §3.1.
 
-        **The key carries what the identity does not.** `resource_ref` and
-        `subject_ref` are compared on a collision but are not part of the
-        identity, so one key shared across two resources in one period is a
-        conflict, not a duplicate. Two entries covering one period need two
-        keys, and a retry must repeat its key exactly. An invalidation
-        carries no caller key: the server derives it, as `StoredIdempotencyKey`
-        describes.
-
-        An exact-equality retry on that identity is absorbed and the stored
-        entry is returned. Any differing caller-supplied field — including a
-        metadata-only difference — is rejected as a conflict when it is
-        answered after the identity has converged, and so is the later of
-        two such entries in one request. A race answered before the
-        identity converges resolves by the store's commit order at the active plugin's
-        declared dedup level;
-        at every level one identity yields at most one entry on every
-        read.
-
-        **Control characters are excluded.** The entry identifier
-        derivation concatenates this value with the other dedup-identity
-        inputs under a `0x1F` separator, so a key carrying a control
-        character would break the derivation's injectivity. **The `inv:`
-        prefix is reserved** for derived invalidation keys, so the two key
-        spaces never meet. The charset is otherwise unconstrained, and the
-        length is bounded at 1 to 256 characters. No token shape is
-        enforced.
+        Control characters are excluded because the identifier derivation
+        joins the identity inputs under a `0x1F` separator. The `inv:`
+        prefix is reserved for derived invalidation keys. No token shape is
+        otherwise enforced.
 
     StoredIdempotencyKey:
       type: string
@@ -765,12 +676,10 @@ components:
       maxLength: 256
       pattern: '^[^\x00-\x1F\x7F]+$'
       description: |
-        The dedup key an accepted entry carries on read. On a measurement it
-        is the caller's `IdempotencyKey`. On an invalidation it is
-        server-derived: `inv:` followed by the `invalidates` identifier in
-        lowercase hyphenated form. Every invalidation of one record
-        therefore shares one dedup identity, which is what keeps a record
-        withdrawn at most once.
+        The dedup key an accepted entry carries: the caller's
+        `IdempotencyKey` on a measurement, and on an invalidation the
+        server-derived `inv:` followed by the `invalidates` identifier,
+        lowercase hyphenated.
 
     GtsTypeId:
       type: string
@@ -911,14 +820,9 @@ components:
           format: uuid
           description: |
             Server-derived UUIDv5 over
-            `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
-            Stable across exact-equality retries and reproducible offline by
-            the emitter, so a correction reference can be computed before
-            submission. `invalidates` is deliberately excluded from the
-            derivation, and so is the `entry_type` derived from it; an
-            invalidation's key is itself derived from its target, so every
-            invalidation of one record derives one identifier. The
-            namespace constant is recorded in the identity ADR.
+            `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`,
+            reproducible offline by the emitter. The namespace constant is
+            recorded in the identity ADR.
         tenant_id:
           type: string
           format: uuid
@@ -952,11 +856,7 @@ components:
           type: string
           format: uuid
           description: |
-            The entry this one withdraws. Present exactly when
-            `reason_code` is; its presence is what makes this entry an
-            invalidation. The target MUST exist and MUST itself be a
-            `record`. It is withdrawn at most once, because every
-            invalidation of it derives one dedup identity.
+            The `record` this invalidation withdraws.
         reason_code:
           $ref: "#/components/schemas/ReasonCode"
         metadata:
@@ -988,28 +888,13 @@ components:
           properties:
             idempotency_key: false
       description: |
-        Ingestion projection of `UsageRecord`: the same shape minus the three
-        server-owned fields — `id`, `accepted_at`, and `origin` — minus the
-        derived `entry_type`, and, on an invalidation, minus
-        `idempotency_key`, which the server derives. A stray value for
-        any of the server-owned or derived fields is rejected as an unknown
-        field; an `idempotency_key` on an invalidation fails the
-        `invalidation` branch below and is reported as a validation error.
-
-        The same schema carries both entry types, distinguished by
-        `invalidates` alone: supplying it makes the submission an
-        invalidation, omitting it makes it an ordinary record. There is no
-        caller-supplied discriminator, so a marker cannot disagree with the
-        payload it marks. `invalidates` and `reason_code` are
-        both-or-neither, and `idempotency_key` is required on a record and
-        forbidden on an invalidation, whose key the server derives from
-        `invalidates`; the two `oneOf` branches enforce both rules.
-
-        For an invalidation the server additionally enforces that every
-        caller-supplied field equals the target's — tenant, type, resource,
-        subject (presence against absence is itself a mismatch), covered
-        period, quantity, and metadata — rejecting any difference by naming
-        the field that differs.
+        Ingestion projection of `UsageRecord`, without the server-owned
+        `id`, `accepted_at`, and `origin` and the derived `entry_type`; a
+        stray value for any of them is rejected as an unknown field. The
+        `oneOf` branches tell the two entry types apart by `invalidates`
+        alone, with no caller-supplied discriminator. An invalidation must
+        also be a faithful copy of its target (DESIGN.md §3.1), and a
+        mismatch is rejected naming the field that differs.
       properties:
         tenant_id:
           type: string
@@ -1037,9 +922,7 @@ components:
           type: string
           format: uuid
           description: |
-            The entry this submission withdraws. Supplying it makes the
-            submission an invalidation and requires `reason_code`; omitting
-            it makes the submission an ordinary record.
+            The `record` this invalidation withdraws.
         reason_code:
           $ref: "#/components/schemas/ReasonCode"
         metadata:
@@ -1069,24 +952,14 @@ components:
           accepted: "#/components/schemas/AcceptedUsageRecord"
           rejected: "#/components/schemas/RejectedUsageRecord"
       description: |
-        Per-record acknowledgement, internally tagged on `outcome`. Every
-        submitted record yields exactly one entry and `results` preserves
-        input order, so `index` is redundant with the array position and
-        is carried anyway to keep an entry self-describing once it is
-        lifted out of the array.
+        Per-record acknowledgement, tagged on `outcome`. `results` preserves
+        input order, and `index` repeats the array position so an entry
+        stays self-describing once lifted out of the array.
 
-        There is no `duplicate` outcome on the wire. An exact-equality
-        retry is absorbed on the dedup identity `(tenant_id, gts_type_id,
-        idempotency_key, window_start, window_end)` and reported as
-        `accepted` carrying the already-persisted record. A same-key
-        submission whose canonical fields differ from a converged entry, or
-        from an earlier entry in the same request, is `rejected` with
-        `IDEMPOTENCY_CONFLICT`, or with `ALREADY_INVALIDATED` where it is a
-        second invalidation of one record under a different reason code.
-        Under a plugin declaring the `eventual` dedup level, submissions
-        under one identity racing before convergence can each be
-        `accepted`, carrying their own `accepted_at`; the store keeps the
-        first in its commit order, which later reads return.
+        There is no `duplicate` outcome: an absorbed retry is `accepted` and
+        carries the persisted entry. Under the `eventual` dedup level, an
+        `accepted` entry can still lose a race and be discarded (DESIGN.md
+        §3.1, Dedup level).
 
     AcceptedUsageRecord:
       type: object
@@ -1109,15 +982,12 @@ components:
       additionalProperties: false
       required: [outcome, index, error]
       description: |
-        The record failed validation, PDP authorization, the emission
-        semantics matrix, a same-key canonical-field mismatch
-        (`IDEMPOTENCY_CONFLICT`), a second invalidation of an
-        already-withdrawn record (`ALREADY_INVALIDATED`, whose `context`
-        names the target, `invalidated_by`, and the stored `reason_code`),
-        or an invalidation of a target not yet converged
-        (`TARGET_NOT_CONVERGED`, with `context.retryable = true`). `error`
-        is the same canonical envelope a
-        single-record failure would have surfaced, folded into the batch.
+        The record failed validation, authorization, or deduplication.
+        `error` is the envelope a single-record failure would have surfaced.
+        Dedup rejections carry `context.reason`: `IDEMPOTENCY_CONFLICT`;
+        `ALREADY_INVALIDATED`, whose `context` names the target,
+        `invalidated_by`, and the stored `reason_code`; or
+        `TARGET_NOT_CONVERGED`, with `context.retryable = true`.
       properties:
         outcome:
           type: string
@@ -1160,16 +1030,11 @@ components:
       additionalProperties: false
       required: [entries, page_info]
       description: |
-        A page of the usage feed, in the feed's deterministic order.
-
-        The page carries only settled entries, so everything before its
-        next cursor is delivered and final. It uses the shared `PageInfo`.
-        On a live read `next_cursor` is never `null`, even on a page with
-        fewer entries than `limit`: the feed has no end, and a later
-        request with that cursor returns only entries settled since.
-        `next_cursor` is `null` only on the page that reaches `until`, and
-        `prev_cursor` is always `null`. There is no separate completeness
-        token: the cursor is the proof.
+        A page of the usage feed in feed order (DESIGN.md §3.1). Everything
+        before `next_cursor` is delivered and final. On a live read
+        `next_cursor` is never `null`, even on a short page; it is `null`
+        only on the page that reaches `until`. `prev_cursor` is always
+        `null`.
       properties:
         entries:
           type: array
@@ -1341,9 +1206,7 @@ components:
         `accepted_count` and `quantity_summary` cover exactly the entries
         the requested range selects (`from <= window_end < to`), the same
         rule every read path applies. The two watermarks are current as
-        of the response and are not bounded by the range. Every figure
-        reflects one entry per dedup identity, so a write the storage
-        plugin discards on convergence contributes to none of them.
+        of the response and are not bounded by the range.
       properties:
         scope:
           type: object
