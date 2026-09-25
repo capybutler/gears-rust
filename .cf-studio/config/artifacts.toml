@@ -72,9 +72,8 @@ patterns = ["gears/system/oagw/docs/adr-*.md"]
 
 
 [[ignore]]
-reason = "Ignore usage-collector DECOMPOSITION, features and code — they still describe the superseded model (counter/gauge usage kinds, event deactivation, signed compensation) and reference identifiers the current specs no longer define, pending their rewrite to aggregation folds and invalidation."
+reason = "Ignore usage-collector features and code — they still describe the superseded model (counter/gauge usage kinds, event deactivation, signed compensation) and reference identifiers the current specs no longer define, pending their rewrite to aggregation folds and invalidation."
 patterns = [
-  "gears/system/usage-collector/docs/DECOMPOSITION.md",
   "gears/system/usage-collector/docs/features/*",
   "gears/system/usage-collector/usage-collector/src/*",
   "gears/system/usage-collector/usage-collector/tests/*",
