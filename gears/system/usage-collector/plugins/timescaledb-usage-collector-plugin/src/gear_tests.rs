@@ -4,6 +4,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use toolkit::contracts::RunnableCapability;
 use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
 
 use super::TimescaleDbUsageCollectorPlugin;
@@ -40,7 +41,7 @@ async fn init_aborts_before_startup_io_when_already_cancelled() {
         cancel,
     );
 
-    let err = TimescaleDbUsageCollectorPlugin
+    let err = TimescaleDbUsageCollectorPlugin::default()
         .init(&ctx)
         .await
         .expect_err("a cancelled token must abort init before any startup I/O");
@@ -49,4 +50,25 @@ async fn init_aborts_before_startup_io_when_already_cancelled() {
         err.to_string().contains("init cancelled during shutdown"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn start_before_init_is_refused() {
+    let plugin = TimescaleDbUsageCollectorPlugin::default();
+    let err = plugin
+        .start(CancellationToken::new())
+        .await
+        .expect_err("start must refuse to run a sweep init never built");
+    assert!(
+        err.to_string().contains("init() must run before start()"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn stop_without_start_is_a_no_op() {
+    TimescaleDbUsageCollectorPlugin::default()
+        .stop(CancellationToken::new())
+        .await
+        .expect("stopping a plugin that never started succeeds");
 }

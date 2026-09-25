@@ -1,9 +1,10 @@
 //! Injection-safe filter translation: a validated `FilterNode<F>` becomes a
 //! parameterized `PostgreSQL` `WHERE` fragment plus an ordered bind list.
 //!
-//! Identifiers come only from the closed allowlists ([`record_column`] /
-//! [`usage_type_column`]); values are always bound (`$N`) via
-//! [`crate::infra::storage::query::bind::odata_value_to_bind`].
+//! Identifiers come only from the closed allowlist ([`record_column`]); every
+//! value is bound as `$N` through
+//! [`crate::infra::storage::query::bind::odata_value_to_bind`], never
+//! interpolated.
 //!
 //! # Verified `toolkit-odata` / SDK API (Task E1)
 //!
@@ -19,28 +20,35 @@
 //! - `FilterField` (`toolkit_odata::filter::FilterField`): `const FIELDS:
 //!   &'static [Self]`, `fn name(&self) -> &'static str`, `fn kind(&self) ->
 //!   FieldKind`, `fn from_name(name: &str) -> Option<Self>`. `name()` returns
-//!   the macro field's snake-case name — for `UsageRecordFilterField` those are
-//!   exactly `"id"`, `"created_at"`, `"tenant_id"`, `"resource_id"`,
-//!   `"resource_type"`, `"subject_id"`, `"subject_type"`, `"corrects_id"`,
-//!   `"status"`; for `UsageTypeFilterField`, `"gts_id"` and `"kind"`. The
-//!   identity column allowlists below rely on that.
+//!   the macro field's snake-case name — for `UsageRecordFilterField` (the
+//!   `UsageRecordQuery` shape in `usage-collector-sdk/src/models.rs`) those are
+//!   exactly `"id"`, `"window_start"`, `"window_end"`, `"tenant_id"`,
+//!   `"resource_id"`, `"resource_type"`, `"subject_id"`, `"subject_type"`,
+//!   `"invalidates"`, `"entry_type"`, `"origin"`. The identity column
+//!   allowlist below relies on that, and covers all eleven.
 //! - `ODataValue` path: `toolkit_odata::filter::ODataValue` is a `pub use` of
 //!   `toolkit_odata::ast::Value`. Variants: `Null`, `Bool(bool)`,
 //!   `Number(bigdecimal::BigDecimal)`, `Uuid(uuid::Uuid)`,
 //!   `DateTime(chrono::DateTime<chrono::Utc>)`, `Date(chrono::NaiveDate)`,
 //!   `Time(chrono::NaiveTime)`, `String(String)`.
-//! - `UsageRecordFilterField` / `UsageTypeFilterField` are SDK re-exports
-//!   (`UsageRecordQueryFilterField` / `UsageTypeQueryFilterField`,
-//!   `#[derive(ODataFilterable)]`-generated). Tests build them via
-//!   `<UsageRecordFilterField as FilterField>::from_name("status")`.
-//! - `UsageTypeGtsId`: `new(impl Into<String>) -> Result<Self,
-//!   UsageCollectorError>` (validated); reads back via `AsRef<str>`
-//!   (`as_ref()`). `ResourceRef::new(resource_id, resource_type) -> Result<_,
+//! - `UsageRecordFilterField` is an SDK re-export
+//!   (`UsageRecordQueryFilterField`, `#[derive(ODataFilterable)]`-generated).
+//!   Tests build it via
+//!   `<UsageRecordFilterField as FilterField>::from_name("entry_type")`.
+//! - `MeterTypeId`: `new(impl Into<String>) -> Result<Self,
+//!   UsageCollectorError>` (validated); reads back via `as_str()`, or through
+//!   its `AsRef<str>`, which forwards to it. It replaced the retired
+//!   `UsageTypeGtsId` this list used to name.
+//!   `ResourceRef::new(resource_id, resource_type) -> Result<_,
 //!   _>`; `SubjectRef::new(subject_id, Option<subject_type>) -> Result<_, _>`;
 //!   `MetadataKey::new(impl Into<String>) -> Result<_, _>`;
 //!   `IdempotencyKey::new(impl Into<String>) -> Result<_, _>`.
 
-use toolkit_odata::filter::{FilterField, FilterNode, FilterOp};
+use std::collections::BTreeSet;
+
+use toolkit_odata::ast;
+use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, convert_expr_to_filter_node};
+use usage_collector_sdk::UsageRecordFilterField;
 
 pub use super::bind::{SqlBind, bind_one, bind_one_query, odata_value_to_bind};
 pub use toolkit_odata::filter::ODataValue;
@@ -48,32 +56,39 @@ pub use toolkit_odata::filter::ODataValue;
 /// Closed allowlist mapping a `usage_records` filter-field name to its column.
 ///
 /// The map is the identity (field name == column name); the closed `match` is
-/// the security boundary — only these nine identifiers can ever reach the SQL
-/// string. `gts_id` is intentionally absent: it is a typed parameter on the
-/// SPI, not a `$filter` field.
+/// the security boundary — only these eleven identifiers can ever reach the SQL
+/// string. `gts_type_id` is intentionally absent: it is a typed parameter on
+/// the SPI, not a `$filter` field. The covered period is likewise not
+/// filterable — it arrives as `time_range` — but its columns *are* mapped, for
+/// the reason below.
+///
+/// The set is the published eight (`usage-collector-v1.yaml:440`) plus `id`,
+/// which the filterable schema carries so a caller can pin one entry and so the
+/// canonical cursor tiebreaker resolves, plus `window_start` and `window_end`.
+/// Those last two are reserved on `$filter` but sit in
+/// [`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`], and `window_end` must
+/// resolve for the canonical `(window_end, id)` keyset to render at all.
+///
+/// `entry_type` resolves to the stored generated column
+/// (`CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END`),
+/// which is why the field is filterable here at all: the SDK stores no such
+/// attribute and its value hook cannot carry one.
 #[must_use]
 pub fn record_column(field_name: &str) -> Option<&'static str> {
+    // Declaration order of `UsageRecordQuery`, so the module doc's list above
+    // and this match can be checked against the SDK side by side.
     match field_name {
         "id" => Some("id"),
-        "created_at" => Some("created_at"),
+        "window_start" => Some("window_start"),
+        "window_end" => Some("window_end"),
         "tenant_id" => Some("tenant_id"),
         "resource_id" => Some("resource_id"),
         "resource_type" => Some("resource_type"),
         "subject_id" => Some("subject_id"),
         "subject_type" => Some("subject_type"),
-        "corrects_id" => Some("corrects_id"),
-        "status" => Some("status"),
-        _ => None,
-    }
-}
-
-/// Closed allowlist mapping a `usage_type_catalog` filter-field name to its
-/// column. Identity map over the two filterable catalog fields.
-#[must_use]
-pub fn usage_type_column(field_name: &str) -> Option<&'static str> {
-    match field_name {
-        "gts_id" => Some("gts_id"),
-        "kind" => Some("kind"),
+        "invalidates" => Some("invalidates"),
+        "entry_type" => Some("entry_type"),
+        "origin" => Some("origin"),
         _ => None,
     }
 }
@@ -82,13 +97,15 @@ pub fn usage_type_column(field_name: &str) -> Option<&'static str> {
 ///
 /// `next` is the next `$N` index to emit; `binds` is the ordered list of
 /// values to apply (via [`bind_one`]) in `$1, $2, …` order. Callers seed the
-/// start index so a filter fragment can follow leading binds (e.g. a `gts_id`
-/// bound at `$1`).
+/// start index so a filter fragment can follow a bind applied outside the
+/// counter — the point lookup's `id` at `$1` is the one such caller left. The
+/// collection paths seed at 1: their leading value is the meter, and it is
+/// pushed through this counter like everything else.
 pub struct SqlCtx {
     next: usize,
     /// Accumulated binds in placeholder order. Crate-visible: read only by the
-    /// in-crate stores (record/catalog) and the query tests — never by an
-    /// external consumer.
+    /// in-crate record store and the query tests — never by an external
+    /// consumer.
     pub(crate) binds: Vec<SqlBind>,
 }
 
@@ -132,12 +149,107 @@ fn op_sql(op: FilterOp) -> Result<&'static str, String> {
     }
 }
 
+/// Translate a compiled PDP scope into a **self-delimiting** parameterized
+/// `WHERE` fragment, pushing each value onto `ctx` as a bind.
+///
+/// This is the whole road from the `ast::Expr` a read path is handed to the SQL
+/// it may conjoin, and every read path takes it: the point lookup with the
+/// scope alone, `list` and `aggregate` with the gateway's composition of that
+/// scope and the caller's `$filter` (the Query Gateway composes them "so the
+/// result can only narrow", so what arrives is one expression). Three
+/// transcriptions of these four lines would be three chances to get the
+/// security boundary wrong in different ways.
+///
+/// **Two gates, in this order.** [`convert_expr_to_filter_node`] resolves each
+/// identifier against [`UsageRecordFilterField`], the SDK's filterable schema —
+/// fixing the vocabulary a scope may name in one place — and
+/// [`translate_record_filter`] resolves it again against the closed
+/// [`record_column`] allowlist and binds every value as `$N`. No identifier
+/// reaches the SQL string from caller input either way.
+///
+/// **The result is parenthesized, and that is the point of the return being a
+/// fragment rather than a clause vector.** Callers conjoin it — the point
+/// lookup after `id = $1`, the collection paths inside a `clauses.join(" AND
+/// ")` — and `AND` binds tighter than `OR`, so an unparenthesized `A OR B`
+/// conjoined after another predicate `P` reads as `(P AND A) OR B`: every row
+/// matching `B`, whatever `P` said. A multi-constraint grant compiles to
+/// exactly that shape through the host gear's
+/// `authz::scope_to_odata_filter` — a left-nested `or` chain of tenant-pinned
+/// conjunctions — and nothing downstream can tell how many constraints the PDP
+/// returned, so the wrap is unconditional. The recursive walker below already
+/// parenthesizes a `Composite`, and `composite_or_joins_children_with_or_inside_parens`
+/// pins that; the wrap here means a caller never has to know it, and never has
+/// to re-check it when the translator grows a node kind.
+///
+/// # Errors
+///
+/// Returns `invalid read predicate: …` when either gate refuses — an identifier
+/// off the schema or off the allowlist, an operator SQL cannot express, an
+/// empty `IN` list, or a value that cannot be bound. The prefix names neither
+/// half on purpose: on the collection paths the two are composed into one
+/// expression before this function sees it, so which of them is malformed is
+/// not knowable at this layer.
+///
+/// **A caller must propagate it.** A scope that fails to translate and is
+/// dropped instead leaves the read unscoped, which turns a translation failure
+/// into an authorization bypass; there is deliberately no "renders to nothing"
+/// success here to drop. Nor is recovering and continuing without the scope
+/// sound even if it were permitted: this is **not atomic on failure** — a
+/// partially-walked `Composite` has already pushed its binds onto `ctx`, so
+/// `ctx` is only usable by a caller that abandons the whole statement.
+pub fn translate_scope(scope: &ast::Expr, ctx: &mut SqlCtx) -> Result<String, String> {
+    let node = convert_expr_to_filter_node::<UsageRecordFilterField>(scope)
+        .map_err(|e| format!("invalid read predicate: {e}"))?;
+    let fragment =
+        translate_record_filter(&node, ctx).map_err(|e| format!("invalid read predicate: {e}"))?;
+    Ok(format!("({fragment})"))
+}
+
+/// Every filter-field name `expr` references, resolved through the same
+/// schema gate [`translate_scope`] applies first.
+///
+/// The aggregate path uses it to decide whether a query's predicate can be
+/// applied to rollup rows, which it can only when every name is a rollup grain
+/// column. It is the whole of that decision's view of the filter, so it walks
+/// every node kind, including under `not`.
+///
+/// # Errors
+///
+/// Returns `invalid read predicate: …` when an identifier is off the schema,
+/// the same refusal [`translate_scope`] would give.
+pub fn filter_fields(expr: &ast::Expr) -> Result<BTreeSet<&'static str>, String> {
+    let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
+        .map_err(|e| format!("invalid read predicate: {e}"))?;
+    let mut names = BTreeSet::new();
+    collect_filter_fields(&node, &mut names);
+    Ok(names)
+}
+
+fn collect_filter_fields<F: FilterField>(node: &FilterNode<F>, out: &mut BTreeSet<&'static str>) {
+    match node {
+        FilterNode::Binary { field, .. } | FilterNode::InList { field, .. } => {
+            out.insert(field.name());
+        }
+        FilterNode::Composite { children, .. } => {
+            for child in children {
+                collect_filter_fields(child, out);
+            }
+        }
+        FilterNode::Not(inner) => collect_filter_fields(inner, out),
+    }
+}
+
 /// Translate a `usage_records` filter node into a parameterized `WHERE`
 /// fragment, pushing each value onto `ctx` as a bind.
 ///
 /// Identifiers resolve through [`record_column`]; an unmapped field is an
 /// error (never interpolated). Values resolve through
 /// [`odata_value_to_bind`].
+///
+/// **Returns the walker's fragment as-is** — parenthesized only for a
+/// `Composite`. To translate a compiled scope, or a composed `$filter`, for
+/// conjoining with another predicate, use [`translate_scope`]: a bare `A OR B`
+/// pushed into a `clauses.join(" AND ")` reads as `(P AND A) OR B`.
 ///
 /// # Errors
 ///
@@ -151,21 +263,10 @@ pub fn translate_record_filter<F: FilterField>(
     translate_filter(node, ctx, record_column)
 }
 
-/// Translate a `usage_type_catalog` filter node into a parameterized `WHERE`
-/// fragment. Identical to [`translate_record_filter`] but resolves identifiers
-/// through [`usage_type_column`].
-///
-/// # Errors
-///
-/// Same conditions as [`translate_record_filter`].
-pub fn translate_usage_type_filter<F: FilterField>(
-    node: &FilterNode<F>,
-    ctx: &mut SqlCtx,
-) -> Result<String, String> {
-    translate_filter(node, ctx, usage_type_column)
-}
-
-/// Shared recursive walker parameterized over the column allowlist.
+/// Recursive walker over the filter AST. No identifier reaches the SQL from
+/// caller input: every column name is resolved through `col`, a closed
+/// allowlist, and every value is bound as `$N`, so injection safety holds for
+/// any AST shape this walks.
 fn translate_filter<F: FilterField>(
     node: &FilterNode<F>,
     ctx: &mut SqlCtx,

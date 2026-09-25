@@ -24,6 +24,7 @@
 //! as metric labels; they belong in structured logs and traces.
 
 use toolkit_macros::domain_model;
+use usage_collector_sdk::{EntryType, RecordOrigin};
 
 /// Label key constants shared by the instrument families below.
 pub mod key {
@@ -37,36 +38,45 @@ pub mod key {
     pub const ERROR_CATEGORY: &str = "error_category";
     /// `outcome` — request/record completion outcome.
     pub const OUTCOME: &str = "outcome";
-    /// `record_kind` — usage vs compensation record.
-    pub const RECORD_KIND: &str = "record_kind";
+    /// `entry_type` — measurement vs withdrawal.
+    pub const ENTRY_TYPE: &str = "entry_type";
+    /// `origin` — which ingestion path admitted the entry.
+    pub const ORIGIN: &str = "origin";
     /// `query_kind` — aggregated vs raw query.
     pub const QUERY_KIND: &str = "query_kind";
+    /// `result` — Type Resolver call outcome.
+    pub const RESULT: &str = "result";
 }
 
 /// `operation` label for the PDP-helper instruments (`uc_pdp_*`,
-/// `uc_authz_decisions_total`) — the nine-value gateway set from DESIGN
-/// §3.11.5.
+/// `uc_authz_decisions_total`) — the usage-record gateway set. The
+/// usage-type catalog surface (and its four PDP operations) is gone: every
+/// type declaration is now owned by `types-registry` and resolved through
+/// the Type Resolver, which is not a PDP-enforcing component.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdpOp {
-    /// Usage-record ingestion (single + batch emit).
+    /// Live usage-record ingestion (single + batch emit) — see
+    /// [`Self::Backfill`] for the import route's own label.
     Ingest,
+    /// Bulk historical import — the backfill route's own ingestion.
+    ///
+    /// A **route** label, and it is not the same thing as the PEP verb
+    /// `usage_record::actions::BACKFILL`, whose string it happens to
+    /// share. The label follows the entry point; the verb follows the
+    /// covered period. So a backfill-route entry whose period ends inside
+    /// the configured window is labelled `operation="backfill"` here and
+    /// authorized against `create` — and every entry of a backfill batch
+    /// carries this label whichever verb it was authorized against, which
+    /// is what keeps a bulk import's PDP latency and denial rate separable
+    /// from live emission's.
+    Backfill,
     /// Raw (non-aggregated) usage-record listing.
     QueryRaw,
     /// Aggregated usage-record query.
     QueryAggregated,
     /// Read a single usage record by id.
     GetRecord,
-    /// Deactivate a usage record.
-    Deactivate,
-    /// Register a usage type.
-    UsageTypeCreate,
-    /// Read a single usage type.
-    UsageTypeGet,
-    /// List usage types.
-    UsageTypeList,
-    /// Delete a usage type.
-    UsageTypeDelete,
 }
 
 impl PdpOp {
@@ -75,44 +85,32 @@ impl PdpOp {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ingest => "ingest",
+            Self::Backfill => "backfill",
             Self::QueryRaw => "query_raw",
             Self::QueryAggregated => "query_aggregated",
             Self::GetRecord => "get_record",
-            Self::Deactivate => "deactivate",
-            Self::UsageTypeCreate => "usage_type_create",
-            Self::UsageTypeGet => "usage_type_get",
-            Self::UsageTypeList => "usage_type_list",
-            Self::UsageTypeDelete => "usage_type_delete",
         }
     }
 }
 
 /// `operation` label for the plugin-host instruments
 /// (`uc_plugin_call_duration_seconds`, `uc_plugin_accept_errors_total`) —
-/// the ten Plugin SPI method names from DESIGN §3.11.5.
+/// the Plugin SPI method names. The four usage-type catalog SPI methods no
+/// longer exist on [`usage_collector_sdk::UsageCollectorPluginV1`]: storage
+/// plugins are pure usage-record persistence now.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginOp {
-    /// SPI Method 1.
+    /// `create_usage_record`.
     CreateUsageRecord,
-    /// SPI Method 2.
+    /// `create_usage_records`.
     CreateUsageRecords,
-    /// SPI Method 3.
+    /// `query_aggregated_usage_records`.
     QueryAggregatedUsageRecords,
-    /// SPI Method 4.
+    /// `list_usage_records`.
     ListUsageRecords,
-    /// SPI Method 10.
+    /// `get_usage_record`.
     GetUsageRecord,
-    /// SPI Method 5.
-    DeactivateUsageRecord,
-    /// SPI Method 6.
-    CreateUsageType,
-    /// SPI Method 7.
-    GetUsageType,
-    /// SPI Method 8.
-    ListUsageTypes,
-    /// SPI Method 9.
-    DeleteUsageType,
 }
 
 impl PluginOp {
@@ -125,11 +123,6 @@ impl PluginOp {
             Self::QueryAggregatedUsageRecords => "query_aggregated_usage_records",
             Self::ListUsageRecords => "list_usage_records",
             Self::GetUsageRecord => "get_usage_record",
-            Self::DeactivateUsageRecord => "deactivate_usage_record",
-            Self::CreateUsageType => "create_usage_type",
-            Self::GetUsageType => "get_usage_type",
-            Self::ListUsageTypes => "list_usage_types",
-            Self::DeleteUsageType => "delete_usage_type",
         }
     }
 }
@@ -212,9 +205,13 @@ impl PluginErrorCategory {
 
 // ── Phase 2: per-component gateway label vocabularies (DESIGN §3.11.5) ──
 
-/// `outcome` label shared by the query, deactivation, and usage-type request
-/// counters (their §3.11.5 vocabularies are identical: `success` on a
-/// successful return, `denied` on a completed PDP deny, `error` otherwise).
+/// `outcome` label for `uc_query_requests_total` (§3.11.5: `success` on a
+/// successful return, `denied` on a completed PDP deny, `error`
+/// otherwise). A second counter shared this vocabulary until its
+/// instrument was retired; the query counter is its sole consumer now.
+/// `uc_ingestion_requests_total` is also request-scoped but keeps its own
+/// vocabulary in [`IngestRequestOutcome`], because a batch has a partial
+/// outcome the tri-state here cannot express.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestOutcome {
@@ -313,26 +310,14 @@ impl RecordOutcome {
     }
 }
 
-/// `record_kind` label for `uc_ingestion_records_total`.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordKind {
-    /// Ordinary usage record (`corrects_id` unset).
-    Usage,
-    /// Compensation record (`corrects_id` set).
-    Compensation,
-}
-
-impl RecordKind {
-    /// The bounded `record_kind` label value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Usage => "usage",
-            Self::Compensation => "compensation",
-        }
-    }
-}
+// The `entry_type` label for `uc_ingestion_records_total` is
+// [`usage_collector_sdk::EntryType`] itself, not a second enum declared here.
+// The two would be the same closed pair spelled twice, and the label value a
+// dashboard groups by has to be the value the wire and the `$filter` surface
+// carry — one vocabulary, one spelling, and `EntryType::as_str` is already
+// the function that produces it. Nothing about that type is
+// infrastructure-shaped, so importing it costs the port no layer violation:
+// the domain already depends on the SDK for every shape it names.
 
 /// `error_category` label for `uc_ingestion_records_total` (per-record).
 #[domain_model]
@@ -342,10 +327,41 @@ pub enum RecordErrorCategory {
     None,
     /// PDP deny for this record's attribution tuple.
     Authz,
-    /// Catalog-absent `UsageType` (`NotFound` with the usage-type resource).
+    /// The referenced `gts_type_id` does not resolve to a usable declaration
+    /// (the Type Resolver's `DeclarationNotFound`).
     UnknownUsageType,
-    /// Counter/gauge semantics violation or an L1 `corrects_id` referential fault.
+    /// A submission rejected against its meter's declaration or the shape
+    /// rules of the ingest path — a covered period the identity derivation
+    /// refuses, and the metadata-adjacent validation reasons that are not
+    /// the closed-shape or size-cap pair below.
+    ///
+    /// It also carries a lookup that resolved to nothing without being an
+    /// invalidation rule: an entry id the store does not hold. On the
+    /// ingestion path that is the residual case, **not** the documented
+    /// flow — a plugin's `UsageRecordNotFound` from the invalidation-target
+    /// lookup is converted at the fan-out and counts as
+    /// [`Self::InvalidationRule`], so an operator triaging a
+    /// record-not-found during ingest looks there first. Only a
+    /// `UsageRecordNotFound` raised from some other SPI call, which is a
+    /// misbehaving plugin, lands here. The two share the `NotFound`
+    /// variant and are separated by the typed `NotFoundReason`, not by
+    /// `detail` prose. See `crate::domain::service`'s
+    /// `classify_record_error`.
     SemanticsViolation,
+    /// An invalidation rejected against the entry it withdraws. DESIGN
+    /// §3.11.5 gives it "the copy, reference and at-most-one rules alone",
+    /// and this carries all three: the copy rule, the at-most-one rule, and
+    /// the reference rule whole — a target that is itself an invalidation,
+    /// a half-shaped reference from the REST fold point, and a reference
+    /// that resolves to nothing. The last of those is a `NotFound` and used
+    /// to fall to [`Self::SemanticsViolation`] for want of a discriminator;
+    /// `usage_collector_sdk::NotFoundReason` supplies one, so the series no
+    /// longer under-counts the reference rule.
+    ///
+    /// A period-bound rejection is not an invalidation rule for either
+    /// entry type, because the bound belongs to the path rather than to the
+    /// withdrawal.
+    InvalidationRule,
     /// Metadata size-cap or closed-shape rejection (the sole metadata category).
     MetadataSize,
     /// Same-key canonical-field mismatch.
@@ -363,6 +379,7 @@ impl RecordErrorCategory {
             Self::Authz => "authz",
             Self::UnknownUsageType => "unknown_usage_type",
             Self::SemanticsViolation => "semantics_violation",
+            Self::InvalidationRule => "invalidation_rule",
             Self::MetadataSize => "metadata_size",
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::PluginError => "plugin_error",
@@ -401,15 +418,33 @@ pub enum QueryErrorCategory {
     MissingSecurityContext,
     /// PDP deny (or empty-constraint fail-closed) / substrate-unreachable authz exit.
     Authz,
-    /// Unregistered `UsageType` surfaced from the plugin as `NotFound`.
+    /// The referenced `gts_type_id` does not resolve to a usable declaration
+    /// (the Type Resolver's `DeclarationNotFound`).
     UnknownUsageType,
     /// Cursor decode failure (REST-handler boundary; reserved at this seam).
     CursorDecode,
     /// Cursor `$orderby` mismatch (REST-handler boundary; reserved at this seam).
     OrderMismatch,
-    /// Cursor `$filter` mismatch (REST-handler boundary; reserved at this seam).
+    /// A continuation refused because the cursor was minted over a
+    /// different query than the request carrying it — a changed `$filter`
+    /// or a changed typed parameter (`gts_type_id`, the read range, a
+    /// `metadata.<key>` filter). Emitted at the service seam, which owns
+    /// that comparison on every surface.
     FilterMismatch,
-    /// Missing / one-sided mandatory bounded time window (scan-scope budget guard).
+    /// The catch-all for a query the gateway refused on its own surface: a
+    /// `$filter` naming a field reserved to a typed parameter, an
+    /// undeclared `group_by` / `metadata_filter` key, an aggregate result
+    /// over the declared bucket cap, or an `$orderby` that cannot be
+    /// floored into a keyset (mixed sort directions, or a key that is not
+    /// a mandatory record attribute — both reachable in the domain since
+    /// the keyset floor moved there). The mandatory read range never lands
+    /// here: it is a typed parameter validated at the edge, before the
+    /// service is entered.
+    ///
+    /// Wider than its name, and knowingly so. A continuation whose bound
+    /// order is not a keyset folds in too, for want of a category that
+    /// describes it — see `classify_query_result`, where that case has an
+    /// explicit arm.
     QueryBudget,
     /// Plugin transport / readiness / backend failure.
     PluginError,
@@ -433,101 +468,66 @@ impl QueryErrorCategory {
     }
 }
 
-/// `error_category` label for `uc_deactivation_requests_total`.
+/// Outcome of one [`crate::domain::type_resolver::TypeResolver::resolve`]
+/// call, for the failure and staleness instruments DESIGN §3.11.5 requires.
+/// Replaces the deleted catalog-lifecycle instruments
+/// (`uc_usage_type_requests_total`, `uc_usage_types`): the catalog surface
+/// is gone, and every fold / unit / metadata-surface read now goes through
+/// the Type Resolver instead.
+///
+/// DESIGN §3.11.5 documents `uc_type_resolution_total{result}` with a
+/// five-value `result` set: `cache_hit`, `cache_miss`, `served_stale`,
+/// `unresolved`, `registry_error`, plus `restored` — a mirror-table restore
+/// path (§3.7 / `cpt-cf-usage-collector-adr-declaration-rehydration`)
+/// this gear does not implement yet, so no variant
+/// below emits it. This enum names the five values `TypeResolver::resolve`
+/// / `populate` (`domain/type_resolver/mod.rs`) actually emit:
+///
+/// - a fresh cache hit ([`Self::CacheHit`]);
+/// - a successful fetch-and-parse from `types-registry`, whether the key
+///   was cold or past its TTL ([`Self::CacheMiss`]);
+/// - a fetch that failed with a stale cached entry to fall back on
+///   ([`Self::ServedStale`]);
+/// - a definite not-found, **or** an incomplete declaration — a schema that
+///   fetched fine but does not carry what a meter needs (a missing trait, an
+///   unserved fold) ([`Self::Unresolved`]). The two share one variant
+///   deliberately: in both, `types-registry` answered fine and the
+///   *declaration* is the problem, not the registry — the distinction the
+///   alert `PromQL` (DESIGN §3.11.5) keys on to tell "a caller asked for a
+///   type that does not exist" apart from "the registry is unreachable";
+/// - a fetch that failed (registry unreachable, timed out, ...) with
+///   nothing cached to fall back on ([`Self::RegistryError`]). Unlike
+///   [`Self::Unresolved`], here the registry itself failed to answer — no
+///   verdict on the type was ever reached.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeactivationErrorCategory {
-    /// `outcome` was `success`.
-    None,
-    /// Reserved/defensive — rejected upstream / unreachable on SDK.
-    MissingSecurityContext,
-    /// PDP deny (metric records the true denial) or PDP fail-closed.
-    Authz,
-    /// Prefetch or Method-5 `UsageRecordNotFound`.
-    NotFound,
-    /// Target record was already `inactive`.
-    AlreadyInactive,
-    /// Plugin transport / readiness / persistence fault.
-    PluginError,
+pub enum TypeResolutionOutcome {
+    /// Served from a fresh cache entry.
+    CacheHit,
+    /// Fetched from `types-registry` (cold key or past-TTL refresh).
+    CacheMiss,
+    /// Served from a cached entry past its TTL because the registry failed.
+    ServedStale,
+    /// The type does not resolve: a definite not-found, or a declaration
+    /// that fetched fine but is incomplete. The registry answered fine; the
+    /// declaration is simply unusable. The operation is rejected.
+    Unresolved,
+    /// The fetch itself failed (registry unreachable, timed out, ...) and
+    /// nothing cached exists to serve instead — no verdict on the type was
+    /// reached. The operation is rejected.
+    RegistryError,
 }
 
-impl DeactivationErrorCategory {
-    /// The bounded `error_category` label value.
+impl TypeResolutionOutcome {
+    /// The bounded `result` label value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::None => "none",
-            Self::MissingSecurityContext => "missing_security_context",
-            Self::Authz => "authz",
-            Self::NotFound => "not_found",
-            Self::AlreadyInactive => "already_inactive",
-            Self::PluginError => "plugin_error",
-        }
-    }
-}
-
-/// `operation` label for `uc_usage_type_requests_total`.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageTypeOp {
-    /// Register a usage type.
-    Create,
-    /// Read a single usage type.
-    Get,
-    /// List usage types.
-    List,
-    /// Delete a usage type.
-    Delete,
-}
-
-impl UsageTypeOp {
-    /// The bounded `operation` label value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Create => "create",
-            Self::Get => "get",
-            Self::List => "list",
-            Self::Delete => "delete",
-        }
-    }
-}
-
-/// `error_category` label for `uc_usage_type_requests_total`.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageTypeErrorCategory {
-    /// `outcome` was `success`.
-    None,
-    /// Reserved/defensive — rejected upstream / unreachable on SDK.
-    MissingSecurityContext,
-    /// PDP deny.
-    Authz,
-    /// Request-shape / kind / shape-validation rejection.
-    Validation,
-    /// Duplicate registration on create (HTTP 409).
-    Conflict,
-    /// `UsageTypeNotFound` on get / delete.
-    NotFound,
-    /// Referentially-unsafe delete rejection (HTTP 409).
-    Referenced,
-    /// Plugin transport / availability / persistence failure.
-    PluginError,
-}
-
-impl UsageTypeErrorCategory {
-    /// The bounded `error_category` label value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::MissingSecurityContext => "missing_security_context",
-            Self::Authz => "authz",
-            Self::Validation => "validation",
-            Self::Conflict => "conflict",
-            Self::NotFound => "not_found",
-            Self::Referenced => "referenced",
-            Self::PluginError => "plugin_error",
+            Self::CacheHit => "cache_hit",
+            Self::CacheMiss => "cache_miss",
+            Self::ServedStale => "served_stale",
+            Self::Unresolved => "unresolved",
+            Self::RegistryError => "registry_error",
         }
     }
 }
@@ -539,7 +539,8 @@ impl UsageTypeErrorCategory {
 /// `uc_plugin_call_duration_seconds`) and the PDP-helper set
 /// (`uc_pdp_ready`, `uc_pdp_failures_total`, `uc_pdp_duration_seconds`,
 /// `uc_authz_decisions_total`). Phase 2 adds the per-component gateway
-/// instruments (ingestion, query, deactivation, usage-type).
+/// instruments (ingestion, query) plus the Type Resolver
+/// instrument that replaced the deleted usage-type catalog counters.
 pub trait UsageCollectorMetrics: Send + Sync {
     /// `uc_pdp_ready` gauge — set to `1` while the `authz-resolver` client is
     /// bound in the bootstrap-constructed `PolicyEnforcer`, `0` otherwise.
@@ -580,20 +581,30 @@ pub trait UsageCollectorMetrics: Send + Sync {
     /// submission, before per-record processing.
     fn observe_ingestion_batch_size(&self, size: u64);
 
-    /// Observe `uc_ingestion_duration_seconds` (label-free) — one per
-    /// completed ingestion request (single-emit call or batch submission).
-    fn observe_ingestion_duration(&self, seconds: f64);
+    /// Observe `uc_ingestion_duration_seconds{origin}` — one per completed
+    /// ingestion request (single-emit call or batch submission). The label
+    /// separates the bulk-import latency profile from the live path's,
+    /// which the live-path p95 budget depends on not being averaged
+    /// together with a catch-up job's.
+    fn observe_ingestion_duration(&self, seconds: f64, origin: RecordOrigin);
 
     /// Observe `uc_record_metadata_bytes` — one per submitted record that
     /// carries metadata (recorded before the size-cap comparison).
     fn observe_record_metadata_bytes(&self, bytes: u64);
 
-    /// Increment `uc_ingestion_records_total{outcome, record_kind, error_category}`
-    /// once per record in a batch acknowledgement (and once for a single emit).
+    /// Increment
+    /// `uc_ingestion_records_total{outcome, entry_type, origin, error_category}`
+    /// once per entry in a batch acknowledgement (and once for a single
+    /// emit).
+    ///
+    /// `entry_type` carries the correction share and `origin` the backfill
+    /// share — between them, what makes a withdrawal of closed history
+    /// visible in the ingestion profile at all.
     fn record_ingestion_record(
         &self,
         outcome: RecordOutcome,
-        kind: RecordKind,
+        entry_type: EntryType,
+        origin: RecordOrigin,
         error_category: RecordErrorCategory,
     );
 
@@ -630,31 +641,11 @@ pub trait UsageCollectorMetrics: Send + Sync {
         seconds: f64,
     );
 
-    // ── Deactivation handler (event-deactivation) ──
+    // ── Type Resolver (usage-type-lifecycle successor) ──
 
-    /// Observe `uc_deactivation_duration_seconds` plus increment
-    /// `uc_deactivation_requests_total{outcome, error_category}` — once per
-    /// completed deactivation attempt.
-    fn record_deactivation_request(
-        &self,
-        outcome: RequestOutcome,
-        error_category: DeactivationErrorCategory,
-        seconds: f64,
-    );
-
-    // ── UsageType catalog (usage-type-lifecycle) ──
-
-    /// Increment `uc_usage_type_requests_total{operation, outcome, error_category}`
-    /// once per completed UsageType-lifecycle attempt.
-    fn record_usage_type_request(
-        &self,
-        op: UsageTypeOp,
-        outcome: RequestOutcome,
-        error_category: UsageTypeErrorCategory,
-    );
-
-    /// Set `uc_usage_types` (no labels) to the current catalog entry count.
-    fn set_usage_types(&self, count: u64);
+    /// Increment `uc_type_resolution_total{result}` once per
+    /// [`crate::domain::type_resolver::TypeResolver::resolve`] call.
+    fn record_type_resolution(&self, outcome: TypeResolutionOutcome);
 }
 
 /// No-op implementation for tests and pre-bootstrap contexts.
@@ -674,23 +665,21 @@ impl UsageCollectorMetrics for NoopMetrics {
     fn record_plugin_call(&self, _: PluginOp, _: f64) {}
     fn record_plugin_accept_error(&self, _: PluginOp, _: PluginErrorCategory) {}
     fn observe_ingestion_batch_size(&self, _: u64) {}
-    fn observe_ingestion_duration(&self, _: f64) {}
+    fn observe_ingestion_duration(&self, _: f64, _: RecordOrigin) {}
     fn observe_record_metadata_bytes(&self, _: u64) {}
-    fn record_ingestion_record(&self, _: RecordOutcome, _: RecordKind, _: RecordErrorCategory) {}
+    fn record_ingestion_record(
+        &self,
+        _: RecordOutcome,
+        _: EntryType,
+        _: RecordOrigin,
+        _: RecordErrorCategory,
+    ) {
+    }
     fn record_ingestion_request(&self, _: IngestRequestOutcome, _: IngestRequestErrorCategory) {}
     fn query_inflight_inc(&self, _: QueryKind) {}
     fn query_inflight_dec(&self, _: QueryKind) {}
     fn observe_query_result_rows(&self, _: QueryKind, _: u64) {}
     fn record_query_request(&self, _: QueryKind, _: RequestOutcome, _: QueryErrorCategory, _: f64) {
     }
-    fn record_deactivation_request(&self, _: RequestOutcome, _: DeactivationErrorCategory, _: f64) {
-    }
-    fn record_usage_type_request(
-        &self,
-        _: UsageTypeOp,
-        _: RequestOutcome,
-        _: UsageTypeErrorCategory,
-    ) {
-    }
-    fn set_usage_types(&self, _: u64) {}
+    fn record_type_resolution(&self, _: TypeResolutionOutcome) {}
 }

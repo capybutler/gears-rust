@@ -1,7 +1,19 @@
 //! Postgres-backed [`RecordStore`] over the `usage_records` hypertable.
 //!
-//! All operations — `create` / `create_batch` / `get` / `list` / `aggregate` /
-//! `deactivate` — are real `sqlx`.
+//! All operations — `create` / `create_batch` / `get` / `list` / `aggregate` —
+//! are real `sqlx`.
+//!
+//! **On this file's size.** Task 13 of the `TimescaleDB` port considered
+//! splitting the 23 free functions here (845 lines, none of which touches
+//! `PgRecordStore` or `sqlx`) into a sibling module and **decided against it**.
+//! The argument that motivated the split — letting a future task
+//! `#[path]`-include a real file instead of a regenerated extract — expired
+//! when the crate started compiling, and more than half of what would move is
+//! read-path, so no name describes the boundary except "these don't touch
+//! `sqlx`". Re-open it if this file becomes hard to *edit* for a concrete
+//! reason, not on line count. Full reasoning:
+//! `docs/superpowers/plans/2026-09-09-usage-collector-timescaledb-port.md`,
+//! Task 13 Step 2c.
 
 // Vendored TimescaleDB raw-SQL backend: `sqlx` is required infra (hypertable
 // time-series, `time_bucket` aggregation, keyset pagination — see DESIGN.md). Tenant
@@ -10,74 +22,189 @@
 // not SecureConn/AccessScope.
 #![allow(unknown_lints, de0706_no_direct_sqlx)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use rand::RngExt as _;
 use rust_decimal::Decimal;
-use sqlx::AssertSqlSafe;
 use sqlx::pool::PoolConnection;
-use sqlx::{Connection, PgPool, Postgres, Row};
+use sqlx::postgres::PgRow;
+use sqlx::{Acquire as _, AssertSqlSafe, PgPool, Postgres, Row};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
-use toolkit_odata::filter::{FilterField, convert_expr_to_filter_node};
-use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, SortDir};
+use toolkit_odata::filter::FilterField;
+use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, SortDir, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationBucket, AggregationDimension, AggregationResult, AggregationSpec, MetadataFilter,
-    UsageCollectorPluginError, UsageRecord, UsageRecordFilterField, UsageTypeGtsId,
-    is_keyset_safe_record_field,
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, MetadataFilter,
+    MeterTypeId, TimeRange, UsageCollectorPluginError, UsageRecord, UsageRecordFilterField,
+    canonical_period_bound, is_keyset_safe_record_field,
 };
 
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
 use crate::infra::storage::entity::UsageRecordRow;
-use crate::infra::storage::error::{
-    DbErrorClass, acquire_error_clears_readiness, classify_db, db_code_and_constraint, map_sqlx_err,
-};
+use crate::infra::storage::error::{acquire_error_clears_readiness, map_sqlx_err};
 use crate::infra::storage::mapper::{
-    gts_id_str, metadata_jsonb_to_map, metadata_map_to_jsonb, record_row_to_model,
+    invalidation_to_row, metadata_map_to_jsonb, record_row_to_model,
 };
 use crate::infra::storage::query::aggregate::{
-    agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
+    aggregate_limit_clause, dimension_presence_guard, dimension_select_expr, fold_select_expr,
+    withdrawal_exclusion_clause,
 };
-use crate::infra::storage::query::effective_page_size;
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
 };
+use crate::infra::storage::query::rollup::{build_rollup_aggregate_sql, rollup_eligible};
 use crate::infra::storage::query::translate::{
-    SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_record_filter,
+    SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_scope,
 };
+use crate::infra::storage::query::{
+    effective_page_size, ledger_from_clause, push_metadata_filter_clauses,
+    push_meter_and_range_clauses,
+};
+use crate::infra::storage::type_key::TypeKeyCache;
 
 /// Default page size when the caller omits `$top` (`query.limit`).
 const DEFAULT_PAGE_SIZE: u64 = 100;
 
 /// Column list for every `usage_records` SELECT / RETURNING, in
 /// [`UsageRecordRow`] field order. A static const (never caller input), so
-/// `sqlx::query_as::<_, UsageRecordRow>` decodes positionally without risk of
-/// SQL injection.
-const RECORD_COLUMNS: &str = "id, tenant_id, gts_id, value, created_at, resource_id, \
-     resource_type, subject_id, subject_type, idempotency_key, corrects_id, status, metadata, \
-     ingested_at";
+/// there is no risk of SQL injection.
+///
+/// `sqlx`'s derived `FromRow` looks each column up by the struct's own field
+/// name, so the order here is a reading convenience — matching the struct and
+/// the DDL — rather than a decode requirement. **Omission is the hazard**: a
+/// missing column fails the decode with `no column found for name: <field>`.
+///
+/// The ledger's `entry_type` is deliberately absent. It is a stored generated
+/// column that exists so `$filter=entry_type eq 'invalidation'` resolves to a
+/// real column; nothing decodes it, because [`UsageRecordRow`] has no field
+/// for it (see that struct's doc).
+const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
+     window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
+     invalidates, reason_code, origin, acceptance_sequence, metadata, accepted_at";
+
+/// The columns every insert writes: the same set as [`RECORD_COLUMNS`],
+/// ordered so `metadata` is last. `entry_type` is generated and appears in
+/// neither.
+///
+/// **One spelling, used four times** — the single-row insert's column list, the
+/// batch insert's column list, its `SELECT` list and its `UNNEST` alias list.
+/// Written out four times instead, a name transposed in any one of them binds a
+/// `text[]` to the wrong `text` column, which Postgres accepts without
+/// complaint and which no row-level test can see. `metadata` is deliberately
+/// **last**, because the batch `SELECT` appends `::jsonb` to this string rather
+/// than restating it (see [`BATCH_INSERT_SQL`]) — the cast binds to the final
+/// identifier only, which is what makes the `SELECT` list unable to be a
+/// transposition rather than merely tested not to be. A test asserts the
+/// position directly, because deriving it from an order assertion whose oracle
+/// happens to end in `metadata` would not survive a migration that declares a
+/// column after it.
+const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
+     window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
+     invalidates, reason_code, origin, acceptance_sequence, accepted_at, metadata";
+
+/// Postgres array types for [`INSERT_COLUMNS`], **in the same order**, as the
+/// batch insert's `UNNEST` needs them. The length is what fixes the placeholder
+/// count for both inserts.
+const INSERT_COLUMN_ARRAY_TYPES: [&str; 18] = [
+    "uuid",
+    "uuid",
+    "text",
+    "int",
+    "numeric",
+    "timestamptz",
+    "timestamptz",
+    "text",
+    "text",
+    "text",
+    "text",
+    "text",
+    "uuid",
+    "text",
+    "text",
+    "bigint",
+    "timestamptz",
+    "text",
+];
+
+/// The dedup 5-tuple plus the partition key the hypertable requires in every UNIQUE, as an `ON CONFLICT` arbiter. Both insert paths spend their one arbiter here.
+const DEDUP_CONFLICT_TARGET: &str =
+    "tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key";
+
+/// `$1, $2, …, $n`.
+fn placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The single-row `INSERT … ON CONFLICT (5-tuple) DO NOTHING RETURNING`.
+///
+/// Built rather than inlined so a test can read the column list, the
+/// placeholder count and the conflict target back out of it — and built
+/// **once**, because every input to it is a constant and the alternative is
+/// eighteen `format!`s per write.
+static SINGLE_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "INSERT INTO usage_records ({INSERT_COLUMNS}) VALUES ({}) \
+         ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
+         RETURNING {RECORD_COLUMNS}",
+        placeholders(INSERT_COLUMN_ARRAY_TYPES.len()),
+    )
+});
+
+/// The multi-row `INSERT … SELECT FROM UNNEST(…) ON CONFLICT (5-tuple) DO
+/// NOTHING RETURNING`.
+///
+/// The column list, the `SELECT` list and the `UNNEST` alias list are all
+/// [`INSERT_COLUMNS`], so they cannot be transposed relative to one another —
+/// the `SELECT` differs only by the trailing `::jsonb`, which works because
+/// `metadata` is the last column. `UNNEST`'s parameters are
+/// [`INSERT_COLUMN_ARRAY_TYPES`] in the same order, so `$n` is column `n`.
+///
+/// Built once, for the same reason as [`SINGLE_INSERT_SQL`].
+static BATCH_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
+    let unnest = INSERT_COLUMN_ARRAY_TYPES
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| format!("${}::{ty}[]", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO usage_records ({INSERT_COLUMNS}) \
+         SELECT {INSERT_COLUMNS}::jsonb FROM UNNEST({unnest}) AS t({INSERT_COLUMNS}) \
+         ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
+         RETURNING {RECORD_COLUMNS}"
+    )
+});
 
 /// `sqlx`-backed implementation of [`RecordStore`] over the `usage_records`
 /// hypertable.
 ///
 /// Every operation acquires its connection through [`Self::timed_acquire`], so
-/// `pool.acquire.duration` is recorded per acquire and `tls.handshake.failure.count`
-/// is incremented when a fresh physical connection fails its TLS handshake (via
+/// `uc_timescaledb_pool_acquire_duration_seconds` is recorded per acquire and
+/// `uc_timescaledb_tls_handshake_failures_total` is incremented when a fresh
+/// physical connection fails its TLS handshake (via
 /// [`Self::record_backend_error`]).
 #[derive(Debug, Clone)]
 pub struct PgRecordStore {
     pool: PgPool,
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
+    type_keys: Arc<TypeKeyCache>,
+    /// Whether `aggregate` may serve an eligible query from `usage_rollup_1h`.
+    /// Always `true` outside tests; [`Self::without_rollup`] turns it off so
+    /// the integration suite can compare both reads over one database.
+    rollup_enabled: bool,
 }
 
 impl PgRecordStore {
@@ -91,7 +218,18 @@ impl PgRecordStore {
             pool,
             metrics,
             cancel,
+            type_keys: Arc::new(TypeKeyCache::default()),
+            rollup_enabled: true,
         }
+    }
+
+    /// The same store with the rollup read switched off, so every aggregate
+    /// takes the exact scan. Test-only: the equivalence suite compares the two.
+    #[cfg(any(test, feature = "postgres"))]
+    #[must_use]
+    pub fn without_rollup(mut self) -> Self {
+        self.rollup_enabled = false;
+        self
     }
 
     /// Map a `sqlx` error via [`map_sqlx_err`] and, as a side effect, increment
@@ -101,7 +239,8 @@ impl PgRecordStore {
     /// it slots into the existing `.map_err(...)` call sites unchanged.
     fn record_backend_error(&self, err: &sqlx::Error) -> UsageCollectorPluginError {
         // A TLS handshake failure is the plugin's one metered transport-security
-        // signal (DESIGN §Observability); count it before the generic mapping.
+        // signal (`uc_timescaledb_tls_handshake_failures_total`); count it
+        // before the generic mapping.
         if matches!(err, sqlx::Error::Tls(_)) {
             self.metrics.inc_tls_handshake_failure();
         }
@@ -115,32 +254,8 @@ impl PgRecordStore {
         mapped
     }
 
-    /// Single-row insert error mapping. A foreign-key violation on
-    /// `usage_records.gts_id` means the referenced usage type is absent from the
-    /// catalog — the narrow TOCTOU race where it is deleted between the core's
-    /// pre-insert catalog existence check and this insert. Surface it as the
-    /// typed [`UsageCollectorPluginError::UsageTypeNotFound`] (the core lifts it
-    /// to a 404) instead of a generic Internal (500); every other error falls
-    /// through to [`Self::record_backend_error`] (which also meters it). Mirrors
-    /// the catalog-store FK → `UsageTypeReferenced` mapping. The batch path is
-    /// intentionally excluded: a multi-`gts_id` UNNEST insert cannot attribute a
-    /// single FK violation to one `gts_id`, so a typed mapping there would lie.
-    fn map_insert_error(
-        &self,
-        err: &sqlx::Error,
-        gts_id: &UsageTypeGtsId,
-    ) -> UsageCollectorPluginError {
-        if let Some((code, constraint)) = db_code_and_constraint(err)
-            && classify_db(&code, constraint.as_deref()) == DbErrorClass::ForeignKeyViolation
-        {
-            return UsageCollectorPluginError::UsageTypeNotFound {
-                gts_id: gts_id.clone(),
-            };
-        }
-        self.record_backend_error(err)
-    }
-
-    /// Acquire a pooled connection, recording `pool.acquire.duration`. Errors map
+    /// Acquire a pooled connection, recording
+    /// `uc_timescaledb_pool_acquire_duration_seconds`. Errors map
     /// through [`Self::record_backend_error`] (which also catches a TLS-handshake
     /// failure on a fresh physical connection). Every operation acquires through
     /// this path so the acquire-latency histogram is representative.
@@ -149,9 +264,10 @@ impl PgRecordStore {
         match self.pool.acquire().await {
             Ok(conn) => {
                 self.metrics.record_pool_acquire(t.elapsed().as_secs_f64());
-                // A successful acquire re-arms readiness (DESIGN §Observability:
-                // `ready` recovers once the pool serves a connection again), but
-                // only while not shutting down: once `cancel` fires the shutdown
+                // A successful acquire re-arms readiness (this crate's
+                // readiness contract: `uc_timescaledb_ready` recovers once the
+                // pool serves a connection again), but only while not shutting
+                // down: once `cancel` fires the shutdown
                 // watcher owns the gauge, so a drain-time acquire must not flip it
                 // back to 1. This gate narrows — it does not fully close — the
                 // check-then-set window against the watcher; that residual race
@@ -177,88 +293,145 @@ impl PgRecordStore {
     }
 
     /// Core single-row insert path: dedup on the `usage_records`
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` UNIQUE
-    /// (`usage_records_dedup_uniq`) via `INSERT … ON CONFLICT … DO NOTHING`, then
-    /// lost-the-race absorb-vs-conflict resolution.
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+    /// UNIQUE (`usage_records_dedup_uniq`) via `INSERT … ON CONFLICT … DO
+    /// NOTHING`, then lost-the-race absorb-vs-conflict resolution.
     ///
-    /// `ON CONFLICT DO NOTHING` is the serialization authority: a concurrent
-    /// same-key insert blocks on the in-progress speculative tuple until the
-    /// winner commits, then its `DO NOTHING` returns no row and it resolves
-    /// absorb-vs-conflict against the now-visible committed row. The operation is
-    /// one `INSERT` plus at most one `SELECT` (both read-committed), so no
-    /// explicit transaction is needed.
+    /// **One backend transaction.** The entry's `acceptance_sequence` is
+    /// claimed from `usage_acceptance_sequence` (the gear's DESIGN §3.7) and
+    /// inserted in the same transaction, so the two commit or roll back
+    /// together.
+    ///
+    /// `ON CONFLICT DO NOTHING` remains the dedup serialization authority: a
+    /// concurrent same-key insert blocks on the in-progress speculative tuple
+    /// until the winner commits — bounded by the connection's `lock_timeout`
+    /// ([`crate::infra::storage::pool`]), so the wait cannot pin the connection
+    /// indefinitely — then its `DO NOTHING` returns no row and it resolves
+    /// absorb-vs-conflict against the now-visible committed row.
     ///
     /// This carries the per-row counters (dedup absorbed / idempotency conflict
-    /// / compensation / backend error) so they are recorded exactly once per
-    /// row whether the caller is [`RecordStore::create`] (single) or
-    /// [`RecordStore::create_batch`] (per-row loop). The `insert.duration`
-    /// histogram is deliberately NOT recorded here — the public methods time
-    /// the whole call and tag it with the correct `mode`.
+    /// / invalidation accepted / backend error) so they
+    /// are recorded exactly once per row whether the caller is
+    /// [`RecordStore::create`] (single) or [`RecordStore::create_batch`]
+    /// (per-row loop). The `uc_timescaledb_insert_duration_seconds` histogram is
+    /// deliberately NOT recorded here — the public methods time the whole call
+    /// and tag it with the correct `mode`.
     async fn create_inner(
         &self,
         record: UsageRecord,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         let mut conn = self.timed_acquire().await?;
 
-        // 1. Insert, deduplicated on the 4-tuple UNIQUE. `RETURNING` yields the
+        // The type's partition key, resolved in autocommit before the write
+        // transaction opens (see `TypeKeyCache::resolve`).
+        let type_key = self
+            .type_keys
+            .resolve(&mut conn, record.gts_type_id.as_str())
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
+
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
+
+        // 1. Claim this entry's acceptance_sequence inside the transaction that
+        //    will insert it, so the two commit or roll back together.
+        let acceptance_sequence = match claim_acceptance_sequence(
+            &mut tx,
+            record.tenant_id,
+            record.gts_type_id.as_str(),
+            1,
+        )
+        .await
+        {
+            Ok(seq) => seq,
+            Err(e) => {
+                rollback(tx).await;
+                return Err(self.record_backend_error(&e));
+            }
+        };
+
+        // 2. Insert, deduplicated on the 5-tuple UNIQUE. `RETURNING` yields the
         //    row only when we won the slot — `DO NOTHING` suppresses it on a
         //    conflict — so `Some` = fresh insert, `None` = a row with this
-        //    4-tuple already exists.
-        let insert_sql = format!(
-            "INSERT INTO usage_records \
-             (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING \
-             RETURNING {RECORD_COLUMNS}"
-        );
+        //    5-tuple already exists. Every one of the eighteen [`RECORD_COLUMNS`]
+        //    is bound here now that `accepted_at` is written rather than
+        //    defaulted; `entry_type` is generated and is not one of them.
         let subject_id = record
             .subject_ref
             .as_ref()
             .map(usage_collector_sdk::SubjectRef::subject_id);
         let subject_type = record.subject_ref.as_ref().and_then(|s| s.subject_type());
         let metadata = metadata_map_to_jsonb(&record.metadata);
-        let is_compensation = record.corrects_id.is_some();
+        // One helper for both columns, so the half-populated pair the read
+        // direction refuses is unrepresentable on the way out too.
+        let (invalidates, reason_code) = invalidation_to_row(record.invalidation.as_ref());
+        let is_invalidation = invalidates.is_some();
 
-        let inserted = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(insert_sql))
-            .bind(record.id)
-            .bind(record.tenant_id)
-            .bind(gts_id_str(&record.gts_id))
-            .bind(record.value)
-            .bind(record.created_at)
-            .bind(record.resource_ref.resource_id())
-            .bind(record.resource_ref.resource_type())
-            .bind(subject_id)
-            .bind(subject_type)
-            .bind(record.idempotency_key.as_str())
-            .bind(record.corrects_id)
-            .bind(metadata)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| self.map_insert_error(&e, &record.gts_id))?;
+        let attempted =
+            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(SINGLE_INSERT_SQL.as_str()))
+                .bind(record.id)
+                .bind(record.tenant_id)
+                .bind(record.gts_type_id.as_str())
+                .bind(type_key)
+                .bind(record.quantity.as_decimal())
+                .bind(record.window_start)
+                .bind(record.window_end)
+                .bind(record.resource_ref.resource_id())
+                .bind(record.resource_ref.resource_type())
+                .bind(subject_id)
+                .bind(subject_type)
+                .bind(record.idempotency_key.as_str())
+                .bind(invalidates)
+                .bind(reason_code)
+                .bind(record.origin.as_str())
+                .bind(acceptance_sequence)
+                .bind(record.accepted_at)
+                .bind(metadata)
+                .fetch_optional(&mut *tx)
+                .await;
+
+        let inserted = match attempted {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                rollback(tx).await;
+                return Err(self.record_backend_error(&e));
+            }
+        };
 
         if let Some(row) = inserted {
-            // 2a. Won the slot — fresh insert.
-            if is_compensation {
-                self.metrics.inc_compensation();
+            // 3a. Won the slot — fresh insert. Commit it together with the
+            //     sequence claim it was assigned.
+            tx.commit()
+                .await
+                .map_err(|e| self.record_backend_error(&e))?;
+            if is_invalidation {
+                self.metrics.inc_invalidation();
             }
             return record_row_to_model(row);
         }
 
-        // 2b. Lost the slot — a row with this 4-tuple already exists. Read it and
-        //     resolve absorb-vs-conflict. The read mutates nothing.
+        // 3b. Lost the slot — a row with this 5-tuple already exists. Read it
+        //     and resolve absorb-vs-conflict. The read mutates nothing, and the
+        //     rollback that follows releases the sequence value claimed in
+        //     step 1, which is why an absorbed single-row retry leaves no gap
+        //     (a batch's block claim does; see [`claim_acceptance_sequence`]).
         let select_sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records \
-             WHERE tenant_id = $1 AND gts_id = $2 AND idempotency_key = $3 AND created_at = $4"
+             WHERE tenant_id = $1 AND gts_type_id = $2 AND idempotency_key = $3 \
+               AND window_start = $4 AND window_end = $5"
         );
         let stored = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(record.tenant_id)
-            .bind(gts_id_str(&record.gts_id))
+            .bind(record.gts_type_id.as_str())
             .bind(record.idempotency_key.as_str())
-            .bind(record.created_at)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
+            .bind(record.window_start)
+            .bind(record.window_end)
+            .fetch_optional(&mut *tx)
+            .await;
+        rollback(tx).await;
+        let stored = stored.map_err(|e| self.record_backend_error(&e))?;
 
         if let Some(row) = stored {
             self.resolve_dedup_hit(row, &record)
@@ -276,121 +449,85 @@ impl PgRecordStore {
         }
     }
 
-    /// Resolve a dedup-key hit into absorb (stored row) vs `IdempotencyConflict`
-    /// via [`canonical_equal`]. Called from the conflict branch of
-    /// `create_inner` when an existing dedup slot's stored record is found.
-    /// Increments the matching per-row counter: `dedup.absorbed` on an
-    /// exact-equality absorb, `idempotency.conflict` on a canonical-field
-    /// mismatch. A stored-metadata decode failure propagates as `Internal`
-    /// rather than masquerading as a conflict.
+    /// Resolve a dedup-key hit into absorb or conflict.
+    ///
+    /// The stored row is mapped into a [`UsageRecord`] and compared with
+    /// [`UsageRecord::caller_supplied_eq`], the SDK's one definition of the
+    /// comparison, so `origin` and `accepted_at` are ignored and the quantity
+    /// compares digit for digit. `id` is compared as well, as defence in depth:
+    /// it is derived from the identity both sides share, so a mismatch is the
+    /// shape a corrupted stored row takes. Equal is absorbed and answers with
+    /// the stored entry; different is
+    /// [`UsageCollectorPluginError::IdempotencyConflict`] carrying it. A stored
+    /// row that cannot be mapped (corrupt metadata, say) is `Internal`.
     fn resolve_dedup_hit(
         &self,
         row: UsageRecordRow,
         record: &UsageRecord,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
-        if canonical_equal(&row, record)? {
-            // Exact-equality retry — silently absorb, returning the stored row.
+        let stored = record_row_to_model(row)?;
+        if stored.id == record.id && stored.caller_supplied_eq(record) {
             self.metrics.inc_dedup_absorbed();
-            record_row_to_model(row)
+            Ok(stored)
         } else {
             self.metrics.inc_idempotency_conflict();
-            Err(UsageCollectorPluginError::IdempotencyConflict {
-                idempotency_key: record.idempotency_key.as_str().to_owned(),
-                existing_id: row.id,
-            })
+            Err(UsageCollectorPluginError::idempotency_conflict(
+                record.idempotency_key.as_str(),
+                stored,
+            ))
         }
     }
 
     /// Insert all distinct-key representatives in one multi-row
-    /// `INSERT … ON CONFLICT (4-tuple) DO NOTHING RETURNING`. The returned rows
+    /// `INSERT … ON CONFLICT (5-tuple) DO NOTHING RETURNING`. The returned rows
     /// are exactly the slots we won — `DO NOTHING` suppresses any row whose
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` already exists — so the
-    /// result maps each won [`DedupKey`] to its stored row. `reps` must be sorted
-    /// by [`DedupKey`] so concurrent batches insert in one global order
-    /// (deadlock-free). `metadata` is bound as `text[]` of JSON strings and cast
-    /// `::jsonb` per-row to sidestep `jsonb[]` array encoding.
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+    /// already exists — so the result maps each won [`DedupKey`] to its stored
+    /// row. `reps` must be sorted by [`DedupKey`] so concurrent batches insert
+    /// in one global order (deadlock-free), and `sequences` must be the
+    /// acceptance-sequence values claimed for them, in the same order.
+    /// `type_keys` must be the partition keys resolved for `reps`, in the same
+    /// order.
+    ///
+    /// Errors come back as the raw `sqlx::Error` rather than mapped: the caller
+    /// holds the transaction that has to be rolled back first.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `sequences` is produced from `reps` by
+    /// [`claim_batch_sequences`], one value per representative.
     async fn insert_records_on_conflict(
-        &self,
-        conn: &mut sqlx::PgConnection,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
         reps: &[&UsageRecord],
-    ) -> Result<HashMap<DedupKey, UsageRecordRow>, UsageCollectorPluginError> {
+        sequences: &[i64],
+        type_keys: &[i32],
+    ) -> Result<HashMap<DedupKey, UsageRecordRow>, sqlx::Error> {
         if reps.is_empty() {
             return Ok(HashMap::new());
         }
+        let cols = InsertColumns::build(reps, sequences, type_keys);
 
-        let ids: Vec<Uuid> = reps.iter().map(|r| r.id).collect();
-        let tenants: Vec<Uuid> = reps.iter().map(|r| r.tenant_id).collect();
-        let gtss: Vec<String> = reps
-            .iter()
-            .map(|r| gts_id_str(&r.gts_id).to_owned())
-            .collect();
-        let values: Vec<Decimal> = reps.iter().map(|r| r.value).collect();
-        let cats: Vec<OffsetDateTime> = reps.iter().map(|r| r.created_at).collect();
-        let resource_ids: Vec<String> = reps
-            .iter()
-            .map(|r| r.resource_ref.resource_id().to_owned())
-            .collect();
-        let resource_types: Vec<String> = reps
-            .iter()
-            .map(|r| r.resource_ref.resource_type().to_owned())
-            .collect();
-        let subject_ids: Vec<Option<String>> = reps
-            .iter()
-            .map(|r| {
-                r.subject_ref
-                    .as_ref()
-                    .map(|s| usage_collector_sdk::SubjectRef::subject_id(s).to_owned())
-            })
-            .collect();
-        let subject_types: Vec<Option<String>> = reps
-            .iter()
-            .map(|r| {
-                r.subject_ref
-                    .as_ref()
-                    .and_then(|s| s.subject_type())
-                    .map(str::to_owned)
-            })
-            .collect();
-        let idem_keys: Vec<String> = reps
-            .iter()
-            .map(|r| r.idempotency_key.as_str().to_owned())
-            .collect();
-        let corrects: Vec<Option<Uuid>> = reps.iter().map(|r| r.corrects_id).collect();
-        let metadata: Vec<String> = reps
-            .iter()
-            .map(|r| metadata_map_to_jsonb(&r.metadata).to_string())
-            .collect();
-
-        let sql = format!(
-            "INSERT INTO usage_records \
-             (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             SELECT id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata::jsonb \
-             FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::numeric[], $5::timestamptz[], \
-              $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::uuid[], $12::text[]) \
-              AS t(id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-                   subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING \
-             RETURNING {RECORD_COLUMNS}"
-        );
-
-        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
-            .bind(&ids)
-            .bind(&tenants)
-            .bind(&gtss)
-            .bind(&values)
-            .bind(&cats)
-            .bind(&resource_ids)
-            .bind(&resource_types)
-            .bind(&subject_ids)
-            .bind(&subject_types)
-            .bind(&idem_keys)
-            .bind(&corrects)
-            .bind(&metadata)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
+        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(BATCH_INSERT_SQL.as_str()))
+            .bind(&cols.ids)
+            .bind(&cols.tenants)
+            .bind(&cols.gts_type_ids)
+            .bind(&cols.type_keys)
+            .bind(&cols.quantities)
+            .bind(&cols.window_starts)
+            .bind(&cols.window_ends)
+            .bind(&cols.resource_ids)
+            .bind(&cols.resource_types)
+            .bind(&cols.subject_ids)
+            .bind(&cols.subject_types)
+            .bind(&cols.idem_keys)
+            .bind(&cols.invalidates)
+            .bind(&cols.reason_codes)
+            .bind(&cols.origins)
+            .bind(&cols.sequences)
+            .bind(&cols.accepted_ats)
+            .bind(&cols.metadata)
+            .fetch_all(&mut **tx)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -398,14 +535,15 @@ impl PgRecordStore {
             .collect())
     }
 
-    /// For the not-won keys, read the existing `usage_records` row by its 4-tuple
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` — the batch analogue of
-    /// the single path's conflict branch. Maps each key to `Stored` (row found →
-    /// resolve absorb/conflict) or `Stale` (the conflicting row's chunk was
-    /// dropped by retention between the conflicting insert and this read).
+    /// For the not-won keys, read the existing `usage_records` row by its
+    /// 5-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
+    /// window_end)` — the batch analogue of the single path's conflict branch.
+    /// Maps each key to `Stored` (row found → resolve absorb/conflict) or
+    /// `Stale` (the conflicting row's chunk was dropped by retention between
+    /// the conflicting insert and this read).
     async fn read_conflict_records(
         &self,
-        conn: &mut sqlx::PgConnection,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
         not_won: &[&UsageRecord],
     ) -> Result<HashMap<DedupKey, ConflictRead>, UsageCollectorPluginError> {
         let mut out: HashMap<DedupKey, ConflictRead> = HashMap::new();
@@ -416,27 +554,30 @@ impl PgRecordStore {
         let tenants: Vec<Uuid> = not_won.iter().map(|r| r.tenant_id).collect();
         let gtss: Vec<String> = not_won
             .iter()
-            .map(|r| gts_id_str(&r.gts_id).to_owned())
+            .map(|r| r.gts_type_id.as_str().to_owned())
             .collect();
         let keys: Vec<String> = not_won
             .iter()
             .map(|r| r.idempotency_key.as_str().to_owned())
             .collect();
-        let cats: Vec<OffsetDateTime> = not_won.iter().map(|r| r.created_at).collect();
+        let starts: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_start).collect();
+        let ends: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_end).collect();
 
         let select_sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records \
-             WHERE (tenant_id, gts_id, idempotency_key, created_at) IN \
-               (SELECT t1, t2, t3, t4 \
-                FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[]) \
-                  AS t(t1, t2, t3, t4))"
+             WHERE (tenant_id, gts_type_id, idempotency_key, window_start, window_end) IN \
+               (SELECT t1, t2, t3, t4, t5 \
+                FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[], \
+                            $5::timestamptz[]) \
+                  AS t(t1, t2, t3, t4, t5))"
         );
         let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(&tenants)
             .bind(&gtss)
             .bind(&keys)
-            .bind(&cats)
-            .fetch_all(&mut *conn)
+            .bind(&starts)
+            .bind(&ends)
+            .fetch_all(&mut **tx)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
@@ -466,42 +607,36 @@ impl PgRecordStore {
 
     /// Resolve every input row in original order against its authoritative
     /// record, recording the per-row counters exactly as the single path does.
+    ///
+    /// `inserted` is the set of slots this batch won — it *is* the answer to
+    /// "did we win this key", so there is no separate `won` set to disagree
+    /// with it. An earlier shape passed both, which made two states
+    /// representable that the code cannot produce (a won key with no inserted
+    /// row) and so two `Internal` arms that only a hand-built map could reach.
     fn resolve_batch(
         &self,
         records: &[UsageRecord],
         plan: &BatchPlan<'_>,
-        won: &HashSet<DedupKey>,
         inserted: &HashMap<DedupKey, UsageRecordRow>,
         conflict: &HashMap<DedupKey, ConflictRead>,
     ) -> Vec<Result<UsageRecord, UsageCollectorPluginError>> {
         let mut results = Vec::with_capacity(records.len());
         for (i, record) in records.iter().enumerate() {
             let key = dedup_key(record);
-            let is_winner = won.contains(&key) && plan.first_index.get(&key) == Some(&i);
-            let outcome = if is_winner {
-                match inserted.get(&key) {
-                    Some(row) => {
-                        if record.corrects_id.is_some() {
-                            self.metrics.inc_compensation();
-                        }
-                        record_row_to_model(row.clone())
+            let outcome = match inserted.get(&key) {
+                // We won this slot and this input row is its first occurrence:
+                // the fresh insert.
+                Some(row) if plan.first_index.get(&key) == Some(&i) => {
+                    if record.invalidation.is_some() {
+                        self.metrics.inc_invalidation();
                     }
-                    None => Err(dedup_invariant_break(
-                        record,
-                        "won dedup slot but no inserted record was returned \
-                         (concurrent-insert invariant break)",
-                    )),
+                    record_row_to_model(row.clone())
                 }
-            } else if won.contains(&key) {
-                match inserted.get(&key) {
-                    Some(row) => self.resolve_dedup_hit(row.clone(), record),
-                    None => Err(dedup_invariant_break(
-                        record,
-                        "intra-batch duplicate of a won key with no inserted record",
-                    )),
-                }
-            } else {
-                match conflict.get(&key) {
+                // We won the slot, but an earlier input row is its winner — so
+                // this is an in-batch duplicate, resolved against the row we
+                // just wrote exactly as the single path resolves a same-key hit.
+                Some(row) => self.resolve_dedup_hit(row.clone(), record),
+                None => match conflict.get(&key) {
                     Some(ConflictRead::Stored(row)) => {
                         // Clone the inner row directly; `*row.clone()` would
                         // round-trip through a throwaway `Box` allocation. The
@@ -523,18 +658,21 @@ impl PgRecordStore {
                         record,
                         "conflicting record not found during dedup resolution; retry",
                     )),
-                }
+                },
             };
             results.push(outcome);
         }
         results
     }
 
-    /// Orchestrate one batch on a single connection: insert (dedup on the
-    /// 4-tuple UNIQUE) → read conflicts for the not-won keys → resolve per row in
-    /// input order. The multi-row `INSERT … ON CONFLICT DO NOTHING` is itself
-    /// atomic, so no explicit transaction is required; `won` is the set of keys
-    /// the insert actually claimed (its `RETURNING` rows).
+    /// Orchestrate one batch inside **one transaction**: claim an
+    /// acceptance-sequence block per scope → insert (dedup on the 5-tuple
+    /// UNIQUE) → read conflicts for the not-won keys → commit → resolve per row
+    /// in input order. The insert's `RETURNING` rows are themselves the set of
+    /// keys it claimed, so nothing else records that.
+    ///
+    /// The transaction is not decoration. `acceptance_sequence` is claimed here
+    /// and inserted here, so the two must commit or roll back together.
     async fn create_batch_inner(
         &self,
         records: &[UsageRecord],
@@ -544,130 +682,683 @@ impl PgRecordStore {
 
         let mut conn = self.timed_acquire().await?;
 
-        let inserted = self
-            .insert_records_on_conflict(&mut conn, &plan.reps)
-            .await?;
-        let won: HashSet<DedupKey> = inserted.keys().cloned().collect();
+        // One partition key per representative, aligned to `plan.reps`, resolved
+        // in autocommit before the write transaction opens. A type already seen
+        // costs no round trip.
+        let mut type_keys: Vec<i32> = Vec::with_capacity(plan.reps.len());
+        for rep in &plan.reps {
+            let key = self
+                .type_keys
+                .resolve(&mut conn, rep.gts_type_id.as_str())
+                .await
+                .map_err(|e| self.record_backend_error(&e))?;
+            type_keys.push(key);
+        }
+
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
+
+        let sequences = match claim_batch_sequences(&mut tx, &plan.reps).await {
+            Ok(sequences) => sequences,
+            Err(e) => {
+                rollback(tx).await;
+                return Err(self.record_backend_error(&e));
+            }
+        };
+
+        let inserted =
+            match Self::insert_records_on_conflict(&mut tx, &plan.reps, &sequences, &type_keys)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    rollback(tx).await;
+                    return Err(self.record_backend_error(&e));
+                }
+            };
+        // `inserted` is the won set; there is no second copy of it to drift.
         let not_won: Vec<&UsageRecord> = plan
             .reps
             .iter()
             .copied()
-            .filter(|r| !won.contains(&dedup_key(r)))
+            .filter(|r| !inserted.contains_key(&dedup_key(r)))
             .collect();
-        let conflict = self.read_conflict_records(&mut conn, &not_won).await?;
+        let conflict = match self.read_conflict_records(&mut tx, &not_won).await {
+            Ok(conflict) => conflict,
+            Err(e) => {
+                // Every other failure path here rolls back explicitly; `?` would
+                // leave this one to the lazy drop-rollback alone.
+                rollback(tx).await;
+                return Err(e);
+            }
+        };
+        tx.commit()
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
 
-        Ok(self.resolve_batch(records, &plan, &won, &inserted, &conflict))
+        Ok(self.resolve_batch(records, &plan, &inserted, &conflict))
     }
 }
 
-/// Append the metadata side-channel filters as parameterized `WHERE` clauses.
+/// The eighteen per-column vectors one multi-row insert binds.
 ///
-/// Shared by [`PgRecordStore::list`] and [`PgRecordStore::aggregate`] so both
-/// expand the side channel identically: AND across filters, OR within one
-/// filter's values (`metadata ->> $key IN ($v1, $v2, …)`). The key and every
-/// value are bound via `ctx` (`$N`); only the `metadata ->> $N` shape is
-/// interpolated, so this is injection-safe. An empty value set matches nothing
-/// (the gateway rejects it, but be defensive): a `FALSE` clause is emitted so
-/// the result is empty rather than unfiltered.
-fn push_metadata_filter_clauses(
-    metadata_filter: &[MetadataFilter],
-    ctx: &mut SqlCtx,
-    clauses: &mut Vec<String>,
-) {
-    for mf in metadata_filter {
-        if mf.values().is_empty() {
-            clauses.push("FALSE".to_owned());
-            continue;
+/// `sqlx` binds arrays, not rows, so the batch insert `UNNEST`s these back into
+/// rows. Keeping them in one struct built by one function keeps the column
+/// list, the `UNNEST` list and the bind order readable side by side instead of
+/// spread across eighteen locals in the middle of the query.
+struct InsertColumns {
+    ids: Vec<Uuid>,
+    tenants: Vec<Uuid>,
+    gts_type_ids: Vec<String>,
+    type_keys: Vec<i32>,
+    quantities: Vec<Decimal>,
+    window_starts: Vec<OffsetDateTime>,
+    window_ends: Vec<OffsetDateTime>,
+    resource_ids: Vec<String>,
+    resource_types: Vec<String>,
+    subject_ids: Vec<Option<String>>,
+    subject_types: Vec<Option<String>>,
+    idem_keys: Vec<String>,
+    invalidates: Vec<Option<Uuid>>,
+    reason_codes: Vec<Option<String>>,
+    origins: Vec<String>,
+    sequences: Vec<i64>,
+    accepted_ats: Vec<OffsetDateTime>,
+    metadata: Vec<String>,
+}
+
+impl InsertColumns {
+    /// Pivot `reps` (plus the acceptance sequences claimed for them, in the
+    /// same order) into per-column vectors.
+    ///
+    /// `metadata` is carried as `text[]` of JSON strings and cast `::jsonb`
+    /// per-row in the query, to sidestep `jsonb[]` array encoding. The
+    /// invalidation pair goes through [`invalidation_to_row`] rather than being
+    /// read out of the record twice, so the two columns cannot drift apart.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `sequences` comes from [`claim_batch_sequences`] over
+    /// the same `reps`, so it is the same length; `type_keys` comes from a
+    /// resolve loop over the same `reps` too. A shorter one would be a caller
+    /// invariant break, and panicking beats silently writing a wrong
+    /// acceptance sequence or a wrong partition key.
+    fn build(reps: &[&UsageRecord], sequences: &[i64], type_keys: &[i32]) -> Self {
+        assert_eq!(
+            reps.len(),
+            sequences.len(),
+            "one acceptance sequence must be claimed per batch representative"
+        );
+        assert_eq!(
+            reps.len(),
+            type_keys.len(),
+            "one partition key must be resolved per batch representative"
+        );
+        let mut cols = Self {
+            ids: Vec::with_capacity(reps.len()),
+            tenants: Vec::with_capacity(reps.len()),
+            gts_type_ids: Vec::with_capacity(reps.len()),
+            type_keys: type_keys.to_vec(),
+            quantities: Vec::with_capacity(reps.len()),
+            window_starts: Vec::with_capacity(reps.len()),
+            window_ends: Vec::with_capacity(reps.len()),
+            resource_ids: Vec::with_capacity(reps.len()),
+            resource_types: Vec::with_capacity(reps.len()),
+            subject_ids: Vec::with_capacity(reps.len()),
+            subject_types: Vec::with_capacity(reps.len()),
+            idem_keys: Vec::with_capacity(reps.len()),
+            invalidates: Vec::with_capacity(reps.len()),
+            reason_codes: Vec::with_capacity(reps.len()),
+            origins: Vec::with_capacity(reps.len()),
+            sequences: sequences.to_vec(),
+            accepted_ats: Vec::with_capacity(reps.len()),
+            metadata: Vec::with_capacity(reps.len()),
+        };
+        for r in reps {
+            let (invalidates, reason_code) = invalidation_to_row(r.invalidation.as_ref());
+            cols.ids.push(r.id);
+            cols.tenants.push(r.tenant_id);
+            cols.gts_type_ids.push(r.gts_type_id.as_str().to_owned());
+            cols.quantities.push(r.quantity.as_decimal());
+            cols.window_starts.push(r.window_start);
+            cols.window_ends.push(r.window_end);
+            cols.resource_ids
+                .push(r.resource_ref.resource_id().to_owned());
+            cols.resource_types
+                .push(r.resource_ref.resource_type().to_owned());
+            cols.subject_ids.push(
+                r.subject_ref
+                    .as_ref()
+                    .map(|sr| usage_collector_sdk::SubjectRef::subject_id(sr).to_owned()),
+            );
+            cols.subject_types.push(
+                r.subject_ref
+                    .as_ref()
+                    .and_then(|sr| sr.subject_type())
+                    .map(str::to_owned),
+            );
+            cols.idem_keys.push(r.idempotency_key.as_str().to_owned());
+            cols.invalidates.push(invalidates);
+            cols.reason_codes.push(reason_code.map(str::to_owned));
+            cols.origins.push(r.origin.as_str().to_owned());
+            cols.accepted_ats.push(r.accepted_at);
+            cols.metadata
+                .push(metadata_map_to_jsonb(&r.metadata).to_string());
         }
-        let key_n = ctx.push(SqlBind::Str(mf.key().as_str().to_owned()));
-        let placeholders = mf
-            .values()
-            .iter()
-            .map(|v| format!("${}", ctx.push(SqlBind::Str(v.clone()))))
-            .collect::<Vec<_>>();
-        clauses.push(format!(
-            "metadata ->> ${key_n} IN ({})",
-            placeholders.join(", ")
-        ));
+        cols
     }
+}
+
+/// Roll `tx` back now, logging a failure rather than propagating it.
+///
+/// Dropping a `Transaction` rolls it back too, but lazily — the `ROLLBACK` is
+/// queued and sent when the connection is next used. Every caller here rolls
+/// back precisely because it is about to return the connection to the pool
+/// after a failure, so "now" is the property that matters. A
+/// rollback that itself fails says the connection is gone; the pool discards
+/// it, and the caller's original error is the one worth returning.
+async fn rollback(tx: sqlx::Transaction<'_, Postgres>) {
+    if let Err(err) = tx.rollback().await {
+        tracing::warn!(
+            error = %err,
+            "rolling back a usage-record write transaction failed"
+        );
+    }
+}
+
+/// Claim a contiguous block of `count` `acceptance_sequence` values for
+/// `(tenant_id, gts_type_id)`, returning the block's **last** value — the block
+/// is `[returned - count + 1, returned]`.
+///
+/// Strictly monotonic per scope, which is the gear's DESIGN §3.7 obligation. It
+/// is **not** gapless and does not need to be: a batch claims one block per
+/// scope up front and then commits whatever the dedup `ON CONFLICT` let it win,
+/// so every value claimed for a slot it lost is spent without ever being
+/// stored. (A single-row insert that loses its slot rolls back instead, so that
+/// path leaves no gap.) Density is not the obligation and nothing reads the
+/// sequence expecting it.
+///
+/// Runs inside the caller's transaction so the claim and the insert commit or
+/// roll back together, and the counter row's lock is therefore held to commit.
+///
+/// **That lock is not the price of monotonicity — it is the price of ordered
+/// visibility, and the distinction matters.** A plain Postgres `SEQUENCE` would
+/// give strict monotonicity lock-free, with gaps this doc already declares
+/// permitted. What it would *not* give is that claim order equals commit order:
+/// the next claimer blocks on this row until the holder commits, so within a
+/// scope a lower `acceptance_sequence` is always visible before a higher one.
+/// The Feed Gateway serves pages "ordered by `acceptance_sequence` within each
+/// `(tenant, gts_type)` scope" (`cpt-cf-usage-collector-fr-billing-usage-feed`,
+/// the gear's `docs/DESIGN.md` §1.2 driver table), so a consumer that has read
+/// past N must never afterwards see an N-1 commit. Swap this for a sequence and
+/// the feed breaks silently. Scopes do not contend with each other.
+///
+/// That lock is also why `55P03 lock_not_available` belongs in the transient set
+/// ([`crate::infra::storage::error`]): ingest now waits on a per-scope row on
+/// every write, so timing out on a hot scope is an ordinary contention outcome
+/// rather than a defect.
+async fn claim_acceptance_sequence(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    gts_type_id: &str,
+    count: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO usage_acceptance_sequence (tenant_id, gts_type_id, next_value) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (tenant_id, gts_type_id) \
+         DO UPDATE SET next_value = usage_acceptance_sequence.next_value + $3 \
+         RETURNING next_value",
+    )
+    .bind(tenant_id)
+    .bind(gts_type_id)
+    .bind(count)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Claim one `acceptance_sequence` per representative, aligned to `reps` order.
+///
+/// `reps` are sorted by [`DedupKey`], whose first two components are exactly
+/// the sequence's scope, so same-scope representatives are contiguous and the
+/// scopes are visited in one global order — the same discipline that keeps the
+/// dedup tuple locks deadlock-free, applied to the counter rows.
+///
+/// One statement per scope rather than one per entry: the block claim advances
+/// the counter by `count` and returns the block's last value, so a batch of `n`
+/// entries in one scope costs one round trip and takes the counter's row lock
+/// once.
+async fn claim_batch_sequences(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    reps: &[&UsageRecord],
+) -> Result<Vec<i64>, sqlx::Error> {
+    let mut out: Vec<i64> = Vec::with_capacity(reps.len());
+    for (start, end) in scope_runs(reps) {
+        // `end - start` is a slice length, so it fits an i64 on every target
+        // this builds for; saturating keeps the conversion total regardless.
+        let count = i64::try_from(end - start).unwrap_or(i64::MAX);
+        let last = claim_acceptance_sequence(
+            tx,
+            reps[start].tenant_id,
+            reps[start].gts_type_id.as_str(),
+            count,
+        )
+        .await?;
+        out.extend(sequence_block(last, count));
+    }
+    Ok(out)
+}
+
+/// The half-open `[start, end)` runs of `reps` that share one
+/// `(tenant_id, gts_type_id)` acceptance-sequence scope.
+///
+/// Split out of [`claim_batch_sequences`] because it is the half that can be
+/// wrong without a database noticing: it assumes `reps` is sorted by
+/// [`DedupKey`], whose first two components *are* the scope, so same-scope
+/// representatives are contiguous. A run that ended early would claim two
+/// blocks for one scope — still monotonic, so no constraint would object —
+/// and a run that ran on would hand one scope's values to another's entries.
+fn scope_runs(reps: &[&UsageRecord]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = 0usize;
+    while start < reps.len() {
+        let scope = (reps[start].tenant_id, reps[start].gts_type_id.as_str());
+        let mut end = start + 1;
+        while end < reps.len() && (reps[end].tenant_id, reps[end].gts_type_id.as_str()) == scope {
+            end += 1;
+        }
+        runs.push((start, end));
+        start = end;
+    }
+    runs
+}
+
+/// Expand a claimed block into the values it covers.
+///
+/// [`claim_acceptance_sequence`] returns the block's **last** value, because
+/// that is what `RETURNING next_value` yields after adding `count`; the block
+/// is `[last - count + 1, last]`. Getting the off-by-one wrong here reuses one
+/// scope's sequence value or skips one, and nothing in the schema can object —
+/// the counter row is the sole authority and the ledger does not re-check what
+/// it hands out (`migrations/0001_init.sql`).
+fn sequence_block(last: i64, count: i64) -> Vec<i64> {
+    let first = last - count + 1;
+    (0..count).map(|offset| first + offset).collect()
 }
 
 /// Extract a single order-field value from a row as its cursor-key string.
 ///
 /// Inverse of [`cursor_key_to_bind`](crate::infra::storage::query::keyset::cursor_key_to_bind):
-/// `id` / `corrects_id` render via [`Uuid::to_string`], `created_at` as
-/// RFC 3339, `tenant_id` via its `Uuid` string, and the text columns
-/// (`resource_id` / `resource_type` / `subject_id` / `subject_type` / `status`)
-/// as-is. Returns `None` for an unknown field or a `NULL` optional column (a
-/// `NULL` value can't seed a stable keyset boundary).
+/// the `uuid` columns render via [`Uuid::to_string`], the `timestamptz` bounds
+/// as RFC 3339, and the text columns as-is — each the spelling that helper
+/// parses back for the field's declared kind, so a minted boundary re-binds to
+/// the value it was read from.
+///
+/// **The arms are [`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`], and that
+/// is the whole rule.** A key that is not on that list is one the SDK does not
+/// carry as an attribute of every entry *in its own right* — either it can be
+/// absent, or it is derived from an attribute that can be. For the first kind a
+/// `NULL` compares as `NULL` inside the row-value tuple and silently drops the
+/// row; for the second the SDK simply gives no guarantee to rest a keyset on.
+/// `entry_type` is the case that makes the distinction necessary: it is present
+/// on every entry, and still not keyset-safe. `None` here therefore means "this
+/// order field is not a keyset key on the row", which is a refusal to mint
+/// rather than a missing value.
+///
+/// This is one half of a two-sided map: [`record_column`] resolves an order
+/// field to the column the `ORDER BY` and the keyset tuple are rendered from,
+/// and this resolves the same field to the value the boundary carries. Nothing
+/// in the type system couples them — the two-sided coupling test in
+/// `record_store_tests.rs` does, by naming the value each arm must produce
+/// from a row whose columns are all distinguishable.
 fn record_row_key(row: &UsageRecordRow, field: &str) -> Option<String> {
     match field {
         "id" => Some(row.id.to_string()),
-        "corrects_id" => row.corrects_id.map(|id| id.to_string()),
-        "created_at" => row.created_at.format(&Rfc3339).ok(),
+        "window_start" => row.window_start.format(&Rfc3339).ok(),
+        "window_end" => row.window_end.format(&Rfc3339).ok(),
         "tenant_id" => Some(row.tenant_id.to_string()),
         "resource_id" => Some(row.resource_id.clone()),
         "resource_type" => Some(row.resource_type.clone()),
-        "subject_id" => row.subject_id.clone(),
-        "subject_type" => row.subject_type.clone(),
-        "status" => Some(row.status.clone()),
+        "origin" => Some(row.origin.clone()),
         _ => None,
     }
 }
 
+/// The gateway's fingerprint of the query a page is read under, or a refusal.
+///
+/// The SPI guarantees `query.filter_hash` "on this method": the gateway
+/// populates it for every `list_usage_records` dispatch, first page included,
+/// "so an implementation of this method never has to handle `None`, and an
+/// absent value is a gateway breach rather than a case to paper over". This is
+/// where that `None` is turned into the refusal, for the two places the value
+/// is load-bearing — the continuation guard, whose `Option`-to-`Option`
+/// comparison would otherwise *pass* with both sides absent, and the mint,
+/// where [`encode_next_cursor`] now takes a `&str` precisely so the decision
+/// cannot be made by accident.
+fn require_filter_hash(query: &ODataQuery) -> Result<&str, String> {
+    query.filter_hash.as_deref().ok_or_else(|| {
+        "list_usage_records dispatched without query.filter_hash (gateway breach)".to_owned()
+    })
+}
+
+/// Build the point-lookup SQL and the binds that go with it: the asked-for
+/// `id` at `$1`, conjoined with the caller's compiled PDP scope.
+///
+/// **The scope is the whole filter beyond the `id`.** This path carries no
+/// caller-supplied `$filter`, and nothing above the SPI re-checks the row that
+/// comes back, so a lookup selecting on `id` alone would answer with any row
+/// whose `id` a caller can name — an existence oracle over every tenant's
+/// entries.
+///
+/// The scope itself is translated by [`translate_scope`], which every read path
+/// shares: it owns both allowlist gates, the bind numbering, and the
+/// parentheses that let the fragment be conjoined safely. What is left here is
+/// statement assembly, and that is all this function should ever grow.
+///
+/// Binds start at `$2` because the `id` occupies `$1`; [`PgRecordStore::get`]
+/// binds the `id` first, before these, for that reason. **This is the only
+/// seeded caller on a production path** — `aggregate_tests.rs` and
+/// `translate_tests.rs` seed as fixtures, exercising the offset itself. Both
+/// collection paths seed at 1: their leading
+/// value is the meter, and it goes through the same [`SqlCtx`] as everything
+/// else (`push_meter_and_range_clauses`), so there is no bind outside the
+/// counter for them to seed past. Only the ordered bind values are returned,
+/// not the [`SqlCtx`]: the statement is finished, so there is nothing left for a
+/// caller to legitimately push.
+///
+/// # Errors
+///
+/// Propagates [`translate_scope`]'s refusal unchanged. A scope that fails to
+/// translate and is dropped instead leaves `WHERE id = $1` — a translation
+/// failure turned into an authorization bypass — so this returns `Err` rather
+/// than a partial statement, and it is the only producer of this path's SQL.
+fn build_get_sql(scope: &ast::Expr) -> Result<(String, Vec<SqlBind>), String> {
+    // `$1` is the `id`; every scope bind therefore starts at `$2`.
+    let mut ctx = SqlCtx::new(2);
+    let fragment = translate_scope(scope, &mut ctx)?;
+    Ok((
+        format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1 AND {fragment}"),
+        ctx.binds,
+    ))
+}
+
+/// Build the keyset page's SQL and the binds that go with it, and be the only
+/// producer of this path's statement.
+///
+/// The `WHERE` is assembled in bind order: the meter at `$1`, the covered
+/// period's two bounds at `$2` and `$3`, then the caller's composed `$filter`,
+/// the metadata side channel, and the keyset continuation. Identifiers come
+/// from the [`record_column`] allowlist, the static [`RECORD_COLUMNS`], and the
+/// literal column names the shared builders write — `r.gts_type_id` and
+/// `r.window_end` from [`push_meter_and_range_clauses`], `r.metadata ->>` from
+/// [`push_metadata_filter_clauses`]. None is caller input, and every
+/// caller-derived value is bound, save the clamped page size, which is a `u64`
+/// this function renders itself into the `LIMIT`.
+///
+/// **Selection reads the covered-period end alone** — `from <= window_end <
+/// to`, per `cpt-cf-usage-collector-adr-window-end-selection` — and the
+/// predicate never names `window_start`. This is a rule about which bound is
+/// read, not an optimization: overlap would select an entry into two adjacent
+/// ranges and containment would drop one out of both, and a period longer than
+/// the range is the case that tells the three apart. `time_range` is a typed
+/// parameter and is deliberately not reachable through `query.filter`, which
+/// the gateway refuses to let name either bound.
+///
+/// **No withdrawal exclusion, and none belongs here.** `aggregate` excludes a
+/// withdrawn pair because a total that counts one is a wrong total; that is a
+/// derived view and this is the ledger. The SPI says it in as many words for
+/// this method — "a withdrawn pair MUST likewise be returned as persisted
+/// here" — and [`PgRecordStore::get`] carries no exclusion either
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+///
+/// `query.order` is rendered as handed, and the keyset tuple is built from the
+/// same `query.order` in the same field order a few lines above, so the two
+/// cannot name different columns or disagree about direction. That the tuple
+/// and the `ORDER BY` agree is what makes a continuation resume from the
+/// boundary the previous page ended on.
+///
+/// # Errors
+///
+/// Returns an error string when the composed `$filter` cannot be translated
+/// (propagated from [`translate_scope`] unchanged, and never dropped — a
+/// dropped scope leaves the read unscoped), when a cursor is backward, carries
+/// a different fingerprint or a different order, when an order or keyset field
+/// is off the allowlist or not keyset-safe, or when the order is empty or
+/// mixed-direction. A caller must propagate it: this is the only producer of
+/// the statement, so a partial one is never returned in its place.
+fn build_list_sql(
+    gts_type_id: &MeterTypeId,
+    time_range: TimeRange,
+    query: &ODataQuery,
+    metadata_filter: &[MetadataFilter],
+    limit: u64,
+) -> Result<(String, Vec<SqlBind>), String> {
+    let mut ctx = SqlCtx::new(1);
+    let mut clauses: Vec<String> = Vec::new();
+
+    // The meter scope and the covered-period range, from the one spelling both
+    // read paths share. Read rather than transcribed, so `aggregate` cannot
+    // drift from this on the ADR obligation both are held to.
+    push_meter_and_range_clauses(gts_type_id, time_range, &mut ctx, &mut clauses);
+
+    // The composed `$filter`, through the seam every read path shares. What
+    // arrives is the caller's filter `And`-composed with the compiled PDP
+    // scope, or the scope alone when the caller supplied none — either way one
+    // expression, and in the second case the scope's own outermost node, which
+    // for a multi-constraint grant is an `Or`.
+    // [`translate_scope`] returns a parenthesized fragment,
+    // which is what makes pushing it into a `join(" AND ")` safe; the
+    // `convert_expr_to_filter_node` + `translate_record_filter` pair this call
+    // replaces returned a bare one.
+    if let Some(expr) = query.filter() {
+        clauses.push(translate_scope(expr, &mut ctx)?);
+    }
+
+    // Metadata side-channel: AND across filters, OR within one filter's
+    // values (see [`push_metadata_filter_clauses`]).
+    push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
+
+    if let Some(cursor) = query.cursor.as_ref() {
+        // Forward-only: the keyset operator is derived from the sort
+        // direction, not from `cursor.d`, so a backward cursor would silently
+        // page forward. Reject it fail-closed.
+        ensure_forward_cursor(cursor)?;
+        // Resolved rather than compared as an `Option`: `cursor.f == None` and
+        // `query.filter_hash == None` are equal, so the old comparison passed
+        // on exactly the breach it exists to catch and left the gateway to
+        // refuse the token on page two.
+        let filter_hash = require_filter_hash(query)?;
+        if cursor.f.as_deref() != Some(filter_hash) {
+            return Err("cursor filter hash mismatch".to_owned());
+        }
+        // The cursor's keys (`cursor.k`) are positional, bound against the
+        // live `query.order` columns below. If the order changed between pages
+        // at the same arity, old keys would bind to new columns — silently
+        // wrong pagination. The cursor carries the signed sort tokens
+        // (`cursor.s`) precisely to detect this, mirroring the guard above.
+        if !query.order.equals_signed_tokens(&cursor.s) {
+            return Err("cursor sort order mismatch".to_owned());
+        }
+        let order_pairs: Vec<(&str, bool)> = query
+            .order
+            .0
+            .iter()
+            .map(|key| (key.field.as_str(), matches!(key.dir, SortDir::Asc)))
+            .collect();
+        clauses.push(keyset_predicate(
+            &order_pairs,
+            &cursor.k,
+            record_column,
+            |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
+            is_keyset_safe_record_field,
+            &mut ctx,
+        )?);
+    }
+
+    let order_sql = render_order_by(&query.order, record_column)?;
+
+    Ok((
+        format!(
+            "SELECT {RECORD_COLUMNS} FROM {} WHERE {} ORDER BY {order_sql} LIMIT {}",
+            // Called, never spelled: with a literal here the shared constant
+            // would be decorative, and an alias change would red a test that
+            // then gets "fixed" by editing the literal back.
+            ledger_from_clause(),
+            clauses.join(" AND "),
+            // The look-ahead: one row past the page, so the page can tell "this
+            // is the last page" from "there is another" without a second query.
+            // [`build_list_page`] consumes it, and its `rows.len() > page_size`
+            // is the other half of this convention — the `+ 1` here is what
+            // makes that `>` correct rather than `>=`.
+            limit.saturating_add(1),
+        ),
+        ctx.binds,
+    ))
+}
+
+/// Turn the look-ahead read into the page the caller gets: drop the extra row,
+/// mint the continuation from the last in-page row, and map the rest.
+///
+/// **`query.filter_hash` is carried into `next_cursor.f` verbatim**, which is
+/// the one SPI requirement with no compiler backstop of its own —
+/// `require_cursor_fingerprint` calls it "the one requirement in this gear's
+/// Plugin SPI that gives an implementor no compiler error — a plugin written
+/// before it recompiles clean and paginates exactly once". The gateway
+/// recomputes the same string from the follow-up request and refuses a token
+/// carrying a different one, or none. Nothing here interprets the value: it is
+/// opaque, and its shape is the gateway's to change.
+///
+/// The boundary values are read in `query.order` field order, one per key, so a
+/// caller ordering by `id` gets its keys in that order rather than in a
+/// canonical one this function assumed.
+///
+/// # Precondition
+///
+/// `limit >= 1`, and `rows` is the look-ahead read
+/// [`build_list_sql`] asked for — at most `limit + 1` rows. The two halves of
+/// that convention are the `+ 1` there and the `rows.len() > page_size` here:
+/// the `>` is correct precisely because the extra row was requested, and would
+/// have to be `>=` if it were not. [`effective_page_size`] is what floors the
+/// limit to 1; this signature does not, so a caller passing `0` truncates the
+/// whole page away and reaches the `Err` below.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] when `query.filter_hash` is
+/// absent (a gateway breach, not a case to paper over), when an order field is
+/// not a keyset key on the row, when the cursor cannot be encoded, or when a
+/// stored row cannot be mapped to the SDK model — and, distinctly from all
+/// four, `"non-empty page lost its tail"` when the precondition above is
+/// broken, which is a bug in this crate rather than anything a caller of the
+/// SPI can provoke.
+fn build_list_page(
+    mut rows: Vec<UsageRecordRow>,
+    query: &ODataQuery,
+    limit: u64,
+) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
+    let page_size = usize::try_from(limit).unwrap_or(usize::MAX);
+
+    // Look-ahead row present -> a next page exists; drop it before mapping.
+    let has_next = rows.len() > page_size;
+    if has_next {
+        rows.truncate(page_size);
+    }
+
+    let next_cursor = if has_next {
+        let last = rows
+            .last()
+            .ok_or_else(|| UsageCollectorPluginError::internal("non-empty page lost its tail"))?;
+        let filter_hash =
+            require_filter_hash(query).map_err(UsageCollectorPluginError::internal)?;
+        let keys = query
+            .order
+            .0
+            .iter()
+            .map(|key| {
+                record_row_key(last, &key.field).ok_or_else(|| {
+                    UsageCollectorPluginError::internal(format!(
+                        "order field `{}` is not a keyset key on the row",
+                        key.field
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Some(
+            encode_next_cursor(&query.order, &keys, filter_hash)
+                .map_err(UsageCollectorPluginError::internal)?,
+        )
+    } else {
+        None
+    };
+
+    let items = rows
+        .into_iter()
+        .map(record_row_to_model)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ODataPage::new(
+        items,
+        PageInfo {
+            next_cursor,
+            prev_cursor: None,
+            limit,
+        },
+    ))
+}
+
 /// The dedup identity, mirroring the `usage_records_dedup_uniq` UNIQUE
-/// `(tenant_id, gts_id, idempotency_key, created_at)`. The `created_at` component
-/// is the microsecond count (see [`to_micros`]) so an in-memory key built from a
-/// caller's `OffsetDateTime` matches the µs-truncated `created_at` Postgres
-/// returns via `RETURNING` (timestamptz stores microseconds; sub-µs nanos do not
-/// survive the round-trip).
-type DedupKey = (Uuid, String, String, i128);
+/// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)` — the
+/// same five inputs the entry `id` is a `UUIDv5` projection of
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so the two can
+/// never disagree about what one entry is.
+///
+/// The two covered-period bounds enter as
+/// [`canonical_period_bound`](usage_collector_sdk::canonical_period_bound)
+/// renders them, not as `OffsetDateTime`s. That is the SDK's own canonical
+/// microsecond form, shared with the identity derivation, and it is what makes
+/// an in-memory key built from a caller's value match the key built from what
+/// Postgres returned: `timestamptz` stores microseconds, so sub-µs nanos and a
+/// non-UTC offset do not survive the round trip, and the rendering flattens
+/// both. Using the SDK's function rather than a local truncation means a
+/// precision change in one crate cannot silently diverge them.
+type DedupKey = (Uuid, String, String, String, String);
 
 /// Build the [`DedupKey`] for an incoming record.
 fn dedup_key(record: &UsageRecord) -> DedupKey {
     (
         record.tenant_id,
-        gts_id_str(&record.gts_id).to_owned(),
+        record.gts_type_id.as_str().to_owned(),
         record.idempotency_key.as_str().to_owned(),
-        to_micros(record.created_at),
+        canonical_period_bound(record.window_start),
+        canonical_period_bound(record.window_end),
     )
 }
 
 /// Build the [`DedupKey`] for a stored row, so an `INSERT … RETURNING` result
-/// and an incoming record map to the same key (µs-normalized `created_at`).
+/// and an incoming record map to the same key (both bounds canonicalized).
 fn row_dedup_key(row: &UsageRecordRow) -> DedupKey {
     (
         row.tenant_id,
-        row.gts_id.clone(),
+        row.gts_type_id.clone(),
         row.idempotency_key.clone(),
-        to_micros(row.created_at),
+        canonical_period_bound(row.window_start),
+        canonical_period_bound(row.window_end),
     )
-}
-
-/// Log a dedup-path invariant break (an `Internal`, "this should never happen"
-/// condition) at `error` with the record's identifiers, then return the matching
-/// [`UsageCollectorPluginError::Internal`]. Centralizing the log + build keeps
-/// each silent break observable (DESIGN §Observability puts unbounded
-/// identifiers in logs, not metric labels) without inflating the hot ingest
-/// path's control flow.
-fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
-    tracing::error!(
-        tenant_id = %record.tenant_id,
-        gts_id = %gts_id_str(&record.gts_id),
-        idempotency_key = %record.idempotency_key.as_str(),
-        "{msg}"
-    );
-    UsageCollectorPluginError::internal(msg)
 }
 
 /// Log a retryable dedup-path transient at `warn` with the record's identifiers,
 /// then return the matching [`UsageCollectorPluginError::Transient`]. The
 /// degraded path is self-healing on retry but must still surface at `warn` so an
-/// operator can see it (DESIGN §Observability).
+/// operator can see it. This helper only logs and builds the error: any counter
+/// is the caller's, `inc_dedup_stale` on the retention-race sites and none on
+/// the defensive not-found arm, which is unreachable by construction. Stated as
+/// a kind rather than a count because the call sites move.
 fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
     tracing::warn!(
         tenant_id = %record.tenant_id,
-        gts_id = %gts_id_str(&record.gts_id),
+        gts_type_id = %record.gts_type_id.as_str(),
         idempotency_key = %record.idempotency_key.as_str(),
         "{msg}"
     );
@@ -678,18 +1369,22 @@ fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPlu
 ///
 /// `reps` are the first-occurrence representative records, one per distinct
 /// dedup key, **sorted** by [`DedupKey`] so concurrent batches take the
-/// 4-tuple-UNIQUE conflict locks in one global order (deadlock-free).
-/// `first_index` maps each key to the input index of its first occurrence — the
-/// only row that can win the slot; later same-key rows resolve against the
-/// winner's record, exactly as the single-row path resolves a same-key hit.
+/// 5-tuple-UNIQUE conflict locks — and the per-scope acceptance-sequence row
+/// locks — in one global order (deadlock-free). `first_index` maps each key to
+/// the input index of its first occurrence, the only row that can win the slot.
+/// Later same-key rows resolve against the winner's stored row, exactly as the
+/// single-row path resolves a same-key hit.
 struct BatchPlan<'a> {
     reps: Vec<&'a UsageRecord>,
     first_index: HashMap<DedupKey, usize>,
 }
 
-/// Collapse a batch to its distinct dedup keys (first occurrence wins),
-/// sorted for a stable lock order. Pure — no DB. `reps` borrow from `records`,
-/// which outlives the plan, so no record is cloned onto the plan.
+/// Collapse a batch to its distinct dedup keys (first occurrence wins), sorted
+/// for a stable lock order. Pure — no DB. `reps` borrow from `records`.
+///
+/// Two invalidations of one target in one batch share the derived
+/// `inv:<target>` key and so one slot: the later resolves against the earlier
+/// like any other same-key pair.
 fn plan_batch(records: &[UsageRecord]) -> BatchPlan<'_> {
     let mut first_index: HashMap<DedupKey, usize> = HashMap::new();
     let mut reps: Vec<(DedupKey, &UsageRecord)> = Vec::new();
@@ -714,10 +1409,11 @@ const MAX_BATCH_ATTEMPTS: u32 = 3;
 
 /// Deterministic pre-jitter backoff base for the `attempt`-th retry (1-based).
 /// A short exponential — 5 ms, 10 ms, … — because a deadlock victim can retry
-/// almost immediately: the surviving transaction has already committed or
-/// aborted by the time Postgres aborts the victim, so the contended dedup locks
-/// are free. The shift is saturated so the schedule can never overflow
-/// regardless of how `MAX_BATCH_ATTEMPTS` grows.
+/// almost immediately: the transaction that survived the deadlock has already
+/// committed or aborted by the time Postgres aborts the victim, so the
+/// contended dedup and acceptance-sequence locks are free. The shift is
+/// saturated so the schedule can never overflow regardless of how
+/// `MAX_BATCH_ATTEMPTS` grows.
 fn batch_retry_backoff_base(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(6);
     Duration::from_millis(5u64 << shift)
@@ -747,13 +1443,17 @@ fn batch_retry_backoff(attempt: u32) -> Duration {
 /// Retry predicate for [`with_retry`] around `create_batch`: retry **only** an
 /// outer [`UsageCollectorPluginError::Transient`].
 ///
-/// The deadlock victim surfaces as an outer `Transient` (the whole transaction
-/// rolled back); serialization failures (`40001`) and connection blips collapse
-/// to the same bucket inside the storage helpers, and all are safe to re-run
-/// for this idempotent batch. `Internal`, `IdempotencyConflict`, and the typed
-/// domain errors are non-retryable and returned unchanged. Per-row `Transient`
-/// outcomes carried inside an `Ok(vec)` are deliberately not seen here — the
-/// batch as a whole succeeded, so the loop never inspects them.
+/// The deadlock victim surfaces as an outer `Transient` — `create_batch_inner`
+/// runs the whole batch in one transaction, and that transaction rolled back,
+/// so the attempt left nothing behind. Serialization failures (`40001`), lock
+/// timeouts (`55P03`, which ingest can now hit on the per-scope
+/// acceptance-sequence row) and connection blips collapse to the same bucket
+/// inside the storage helpers, and all are safe to re-run for this idempotent
+/// batch. `Internal`,
+/// `IdempotencyConflict` and the other typed domain outcomes are non-retryable
+/// and returned unchanged. Per-row
+/// `Transient` outcomes carried inside an `Ok(vec)` are deliberately not seen
+/// here — the batch as a whole succeeded, so the loop never inspects them.
 fn is_retryable_batch_error(err: &UsageCollectorPluginError) -> bool {
     matches!(err, UsageCollectorPluginError::Transient { .. })
 }
@@ -772,12 +1472,14 @@ fn is_retryable_batch_error(err: &UsageCollectorPluginError) -> bool {
 /// told apart from a bubbled transient failure.
 ///
 /// Generic and DB-free so the retry mechanics are unit-tested without a
-/// transaction. `operation` is an `Fn` invoked fresh each attempt (it borrows
-/// the caller's input, so re-invocation is allocation-free), which is exactly
-/// the right unit of retry for `create_batch_inner`: every attempt acquires a
-/// fresh connection and opens a fresh transaction. There is zero happy-path
-/// cost — on success the loop runs the operation once and neither sleeps,
-/// allocates a backoff, nor calls `on_retry`.
+/// database at all. `operation` is an `Fn` invoked fresh each attempt (it
+/// borrows the caller's input, so re-invocation is allocation-free), which is
+/// exactly the right unit of retry for `create_batch_inner`: every attempt
+/// acquires a fresh connection and opens a fresh transaction on it, so a failed
+/// attempt leaves neither a claimed acceptance sequence nor a half-written
+/// batch behind. There is zero happy-path cost — on success the loop runs the
+/// operation once and neither sleeps, allocates a backoff, nor calls
+/// `on_retry`.
 async fn with_retry<T, E, Op, Fut>(
     max_attempts: u32,
     backoff: impl Fn(u32) -> Duration,
@@ -817,92 +1519,225 @@ enum ConflictRead {
     Stale,
 }
 
-/// `OffsetDateTime` at microsecond precision, as the unix-epoch microsecond
-/// count.
+/// One assembled aggregate statement: the SQL, the binds in placeholder order,
+/// and **the dimension count the SELECT list was actually built from**.
 ///
-/// Postgres `timestamptz` stores microseconds; an incoming `OffsetDateTime`
-/// may carry sub-microsecond nanos that never survive the round-trip. Comparing
-/// the microsecond counts makes the canonical-equality check agree with what
-/// the DB actually persisted.
+/// `dim_count` is carried rather than recomputed by the caller. It is the count
+/// [`build_aggregate_sql`] used to number the `GROUP BY` ordinals and to place
+/// the fold at the end of the SELECT list, and it is what the decoder must read
+/// the same number of key columns with. Derived a second time at the call site
+/// — from `group_by.len()`, which is equal today — the two could drift with
+/// nothing to notice: no unit test executes a statement, so a decoder reading
+/// the wrong number of columns is invisible until a live query.
 ///
-/// Delegates to the SDK's [`usage_collector_sdk::created_at_micros`] so this
-/// dedup-equality projection and the identity derivation in
-/// [`usage_collector_sdk::derive_usage_record_id`] share one canonical µs
-/// primitive — a precision change in one crate cannot silently diverge them.
-fn to_micros(dt: OffsetDateTime) -> i128 {
-    usage_collector_sdk::created_at_micros(dt)
+/// Returning it makes that **one derivation with one restatement rather than
+/// two**, not a construction that cannot be wrong, and
+/// `the_builder_reports_the_dimension_count_its_select_list_was_built_from` is
+/// what holds the restatement. The distinction matters here more than it
+/// usually would: `dim_count` is the one output of [`build_aggregate_sql`] that
+/// leaves no trace in the SQL string. `sql` is pinned by hand-transcribed
+/// oracles and `binds` by value in placeholder order, but a count that merely
+/// *describes* the statement without appearing in it is beyond the reach of any
+/// text oracle — which is why a mutation setting it to a constant left every
+/// SQL assertion in the crate green.
+///
+/// Contrast `dimension_presence_guard`, which really is by construction: the
+/// guard string literally contains the select expression, so making the two
+/// disagree means making the SQL wrong, and the SQL is pinned.
+struct AggregateStatement {
+    sql: String,
+    binds: Vec<SqlBind>,
+    dim_count: usize,
 }
 
-/// Compare the caller-supplied canonical fields of a stored row against an
-/// incoming record (§3.6: absorb vs conflict).
+/// Build the pushed-down aggregate statement and its binds, in placeholder
+/// order.
 ///
-/// The canonical set compared here is `id`, `value`, `resource_ref`,
-/// `subject_ref`, `corrects_id`, and `metadata`. Excluded are the dedup-key
-/// fields (`tenant_id` / `gts_id` / `idempotency_key` / `created_at`) — the
-/// lookup key, already matched — and server-managed `status` / `ingested_at`.
-/// `metadata` is compared after decoding the stored `jsonb` back to the typed
-/// map.
+/// ```sql
+/// SELECT <dimension exprs…>, <fold expr>
+/// FROM usage_records r
+/// WHERE r.gts_type_id = $1 AND r.type_key = (…) AND r.window_end >= $2 AND r.window_end < $3
+///   AND <withdrawal exclusion>
+///   [AND <translated $filter>] [AND <metadata filters>] [AND <presence guards>]
+/// [GROUP BY 1, 2, …] [LIMIT MAX_AGGREGATION_BUCKETS + 1]
+/// ```
 ///
-/// NOTE — `created_at` is excluded because it is part of the dedup key (the
-/// `(tenant_id, gts_id, idempotency_key, created_at)` 4-tuple UNIQUE): this
-/// function only runs once that key has already matched, so the timestamps are
-/// equal by construction. A same-`idempotency_key` request carrying a
-/// *different* `created_at` is a distinct 4-tuple — a distinct record with a
-/// distinct `id` (ADR-0014 makes `created_at` part of the record identity), not
-/// a conflict; see DESIGN.md §2.2.
+/// Every line but the last two comes from a shared builder rather than from a
+/// second transcription here: [`ledger_from_clause`] is the `FROM`,
+/// [`push_meter_and_range_clauses`] the meter and the covered-period range,
+/// [`withdrawal_exclusion_clause`] the two obligations a withdrawn pair places
+/// on every fold, and [`push_metadata_filter_clauses`] the side channel. The
+/// range predicate especially: read from one place, it cannot drift onto
+/// `window_start` in this path alone, which would fail `window-end-selection`
+/// and `quantity-round-trip` at once (`DIVERGENCES.md` §F).
 ///
-/// NOTE — the record `id` is compared here (stored `id` column vs the
-/// incoming record's `id`). Since `id` is a deterministic projection of the
-/// 4-tuple dedup key `(tenant_id, gts_id, idempotency_key, created_at)`
-/// (ADR-0014) and this function only runs once that full key has matched, the
-/// two ids are equal by construction, so this comparison is a defensive
-/// tautology rather than a fail-closed guard against a mismatched
-/// caller-supplied identity. It is kept so a future non-deterministic-id path
-/// (or a corrupted stored row) still surfaces as an `IdempotencyConflict`
-/// rather than a silent absorb.
+/// The `$filter` goes through [`translate_scope`], which parenthesizes what it
+/// returns. What arrives is the caller's filter `And`-composed with the
+/// compiled PDP scope, **or the scope alone when the caller supplied none** —
+/// and a multi-constraint grant compiles to a disjunction, so a bare fragment
+/// pushed into a `join(" AND ")` would read as `(P AND A) OR B` and answer rows
+/// outside the grant. Nothing at this layer can tell how many constraints the
+/// PDP returned, so the parenthesized spelling is the only safe one.
 ///
-/// Comparing `id` here is explicitly sanctioned by the SPI contract:
-/// plugin-spi.md §"Plugin-specific outputs" (Create single record output) and
-/// domain-model.md §2.5 `IdempotencyKey` exclude only the server-managed
-/// `status` from the caller-canonical comparison, and both note that a plugin
-/// MAY defensively verify the deterministic `id` against the derived value —
-/// surfacing a corrupted stored row as `IdempotencyConflict` rather than a
-/// silent absorb — without changing the outcome for well-formed data. That is
-/// exactly the guard described above.
+/// **No slot of `query` beyond `filter` is read.**
+/// This path paginates nothing and mints no cursor, so `query.cursor`,
+/// `query.filter_hash` and `query.limit` reach neither the statement nor the
+/// binds — the SPI is explicit that an aggregate implementation must not read
+/// the fingerprint slot, and the gateway assigns this call none.
 ///
-/// The one edge the tautology relies on: a pre-`id`-determinism row would break
-/// it — its stored `id` is the old *caller-supplied* `uuid`, not the derived
-/// value — surfacing an exact retry as a false `IdempotencyConflict`.
-/// Deployments are greenfield, so no such row exists; see migration
-/// `0002_rename_uuid_to_id.sql`.
+/// Identifiers all come from closed enum matches
+/// ([`fold_select_expr`], [`dimension_select_expr`], `record_column`); the only
+/// caller-derived values — a grouped metadata key, `$filter` operands, side
+/// channel keys and values — are bound (`$N`).
 ///
 /// # Errors
 ///
-/// Returns [`UsageCollectorPluginError::Internal`] when the stored `metadata`
-/// `jsonb` cannot be decoded back to the typed map — a stored-data invariant
-/// break, distinct from a canonical-field mismatch (which returns `Ok(false)`).
-fn canonical_equal(
-    row: &UsageRecordRow,
-    incoming: &UsageRecord,
-) -> Result<bool, UsageCollectorPluginError> {
-    let stored_metadata = metadata_jsonb_to_map(row.metadata.clone())?;
-    Ok(row.id == incoming.id
-        && row.value == incoming.value
-        && row.resource_id == incoming.resource_ref.resource_id()
-        && row.resource_type == incoming.resource_ref.resource_type()
-        && row.subject_id.as_deref()
-            == incoming
-                .subject_ref
-                .as_ref()
-                .map(usage_collector_sdk::SubjectRef::subject_id)
-        && row.subject_type.as_deref()
-            == incoming.subject_ref.as_ref().and_then(|s| s.subject_type())
-        && row.corrects_id == incoming.corrects_id
-        && stored_metadata == incoming.metadata)
+/// Returns the translation error string when the composed filter names a field
+/// outside the allowlist, uses an unsupported operator, or carries a value that
+/// cannot be bound.
+fn build_aggregate_sql(
+    gts_type_id: &MeterTypeId,
+    time_range: TimeRange,
+    fold: AggregationFold,
+    query: &ODataQuery,
+    metadata_filter: &[MetadataFilter],
+    group_by: &[AggregationDimension],
+) -> Result<AggregateStatement, String> {
+    let mut ctx = SqlCtx::new(1);
+    let mut clauses: Vec<String> = Vec::new();
+
+    push_meter_and_range_clauses(gts_type_id, time_range, &mut ctx, &mut clauses);
+
+    // The one rule this path applies that the ledger paths do not: an
+    // invalidation entry contributes nothing, and neither does the record an
+    // accepted invalidation names. Unconditional, because both obligations hold
+    // under every fold.
+    clauses.push(withdrawal_exclusion_clause().to_owned());
+
+    if let Some(expr) = query.filter() {
+        clauses.push(translate_scope(expr, &mut ctx)?);
+    }
+
+    push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
+
+    // Dimension SELECT exprs in `GROUP BY` order, each binding its metadata key
+    // at most once, each contributing a presence guard when its column can be
+    // `NULL`.
+    let mut select_dims: Vec<String> = Vec::with_capacity(group_by.len());
+    for dim in group_by {
+        let expr = dimension_select_expr(dim, &mut ctx);
+        if let Some(guard) = dimension_presence_guard(dim, &expr) {
+            clauses.push(guard);
+        }
+        select_dims.push(expr);
+    }
+
+    // SELECT list = the dimension exprs, then the fold. With no dimensions the
+    // SELECT is the fold alone, which is what makes the no-grouping case one
+    // aggregate row rather than none.
+    let dim_count = select_dims.len();
+    let mut select_parts = select_dims;
+    select_parts.push(fold_select_expr(fold).to_owned());
+    let select_list = select_parts.join(", ");
+
+    // `GROUP BY` by ordinal (1..=k), so a bound metadata expr is written once
+    // and the second reference cannot renumber its placeholder. Omitted
+    // entirely with no dimensions: `GROUP BY` with an empty ordinal list is a
+    // syntax error, and grouping by nothing is what a bare aggregate already
+    // does.
+    let group_by_sql = if dim_count == 0 {
+        String::new()
+    } else {
+        let ordinals = (1..=dim_count)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" GROUP BY {ordinals}")
+    };
+
+    Ok(AggregateStatement {
+        sql: format!(
+            "SELECT {select_list} FROM {} WHERE {}{group_by_sql}{}",
+            // Called, never spelled: with a literal here the shared constant
+            // would be decorative, and an alias change would red a test that
+            // then gets "fixed" by editing the literal back.
+            ledger_from_clause(),
+            clauses.join(" AND "),
+            aggregate_limit_clause(dim_count),
+        ),
+        binds: ctx.binds,
+        // The same count the SELECT list above was built from, handed to the
+        // decoder rather than derived again there.
+        dim_count,
+    })
+}
+
+/// Read one aggregate result row into a bucket: `dim_count` dimension columns
+/// as the key, then the folded value.
+///
+/// Split out so the caller is a 1:1 `map` over the fetched rows. That is the
+/// shape the no-grouping case needs: with no `GROUP BY` the statement is a bare
+/// aggregate and `PostgreSQL` answers exactly one row, which becomes exactly one
+/// bucket with an empty key — the shape a conforming plugin owes, where an
+/// empty bucket list is not. A short circuit that answered `[]` for an empty
+/// fetch would need a branch this shape has nowhere to put.
+///
+/// A `NULL` dimension reads as the empty string. With the presence guards
+/// [`dimension_presence_guard`] emits, the nullable dimensions cannot produce
+/// one; the fallback stands for the columns that never can.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] when a column cannot be
+/// decoded at its expected type — `TEXT` for a dimension, `numeric` for the
+/// fold.
+fn aggregate_bucket(
+    row: &PgRow,
+    dim_count: usize,
+) -> Result<AggregationBucket, UsageCollectorPluginError> {
+    let mut key = Vec::with_capacity(dim_count);
+    for i in 0..dim_count {
+        let dim = row.try_get::<Option<String>, _>(i).map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "aggregate dimension column {i} read failed: {e}"
+            ))
+        })?;
+        key.push(dim.unwrap_or_default());
+    }
+    let value = row
+        .try_get::<Option<BigDecimal>, _>(dim_count)
+        .map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "aggregate value column {dim_count} read failed: {e}"
+            ))
+        })?;
+    Ok(AggregationBucket { key, value })
 }
 
 #[async_trait]
 impl RecordStore for PgRecordStore {
+    /// **This path deliberately does not retry, and the asymmetry with
+    /// [`Self::create_batch`] is a decision rather than an omission.**
+    ///
+    /// Task 9 made the wait structural — every single-row write now takes the
+    /// per-scope `usage_acceptance_sequence` row lock before it inserts — so a
+    /// `55P03` on a hot scope is an ordinary outcome here, not a rarity. It is
+    /// still returned unretried, because a `Transient` lifts to
+    /// `ServiceUnavailable` at the dispatch boundary and reaches the caller as
+    /// a 503 with a `Retry-After` slot: the client already holds the one record,
+    /// and re-submitting it is cheap and exactly idempotent.
+    ///
+    /// A batch is the opposite trade: re-submitting it is expensive for the
+    /// caller, and its value is a vector of per-row outcomes that cannot be
+    /// partially returned — so absorbing a transient in-process is worth the
+    /// jittered milliseconds, where here it would only duplicate a retry the
+    /// caller can make just as well.
+    ///
+    /// Note what is *not* part of this argument: a retry costs no pooled
+    /// connection. `conn` is a local of [`Self::create_inner`] and
+    /// `create_batch_inner`, so it is dropped and returned to the pool when
+    /// that `async fn` returns — before [`with_retry`] reaches `on_retry` or
+    /// its backoff sleep. Neither path holds a connection across a wait.
     // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-dedup:p2
     async fn create(&self, record: UsageRecord) -> Result<UsageRecord, UsageCollectorPluginError> {
         // Time the whole single-row call; the per-row counters live in
@@ -935,10 +1770,12 @@ impl RecordStore for PgRecordStore {
         //
         // Wrap the whole call in a bounded retry: on an outer `Transient` (the
         // classic ABBA deadlock victim aborted as `40P01`, a serialization
-        // failure `40001`, or a connection blip) re-run the operation up to
-        // `MAX_BATCH_ATTEMPTS` times. Each attempt acquires a fresh connection
-        // and opens a fresh transaction (`create_batch_inner` does both), so a
-        // rolled-back attempt leaves no state behind. Re-running is safe: the
+        // failure `40001`, a `55P03` lock timeout on a hot scope's
+        // acceptance-sequence row, or a connection blip) re-run the operation up
+        // to `MAX_BATCH_ATTEMPTS` times. Each attempt acquires a fresh
+        // connection and opens a fresh transaction on it (`create_batch_inner`
+        // does both), so a rolled-back attempt leaves no state behind — not even
+        // the acceptance-sequence block it had claimed. Re-running is safe: that
         // transaction is atomic and the dedup keys make it idempotent, so a
         // re-run either re-claims the same slots or absorbs/conflicts against
         // the now-committed survivor. `Ok(vec)` is never retried — per-row
@@ -956,7 +1793,8 @@ impl RecordStore for PgRecordStore {
             |attempt, err| {
                 // Make the retry observable: a distinct warn + counter so a
                 // self-healed deadlock victim can be told apart from a returned
-                // transient error (which only moves the backend-error counter).
+                // transient error, which moves this counter not at all (most
+                // move the backend-error counter instead).
                 tracing::warn!(
                     attempt,
                     max_attempts = MAX_BATCH_ATTEMPTS,
@@ -979,55 +1817,104 @@ impl RecordStore for PgRecordStore {
         result
     }
 
-    async fn get(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
+    /// Point lookup by `id`, intersected with the caller's compiled PDP scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorPluginError::UsageRecordNotFound`] when no row
+    /// satisfies both the `id` and the scope — the two cases are one answer, on
+    /// purpose — [`UsageCollectorPluginError::Internal`] when the scope cannot
+    /// be translated or a stored row cannot be mapped, and the mapped backend
+    /// error when the query itself fails.
+    async fn get(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
         // Lookup by the public `id`. This relies on a one-record-per-`id`
         // contract, which the hypertable schema cannot enforce on its own — a
-        // `UNIQUE` there must include the `created_at` partition key, so only the
-        // composite PK `(id, created_at)` is enforced. `fetch_optional` therefore
-        // returns the first matching row.
+        // `UNIQUE` there must include the `window_end` partition column, so only
+        // the composite PK `(id, window_end)` is enforced. `fetch_optional`
+        // therefore returns the first matching row.
         //
-        // `id` is a `UUIDv5` of the full 4-tuple dedup key
-        // `(tenant_id, gts_id, idempotency_key, created_at)` (ADR-0014), which is
-        // exactly this plugin's dedup identity, so each stored row carries a
-        // distinct `id`: `WHERE id = $1` matches at most one row. (Before
-        // ADR-0014 `id` excluded `created_at`, so the same 3-tuple at two
-        // `created_at` values shared one `id`; folding `created_at` into the
-        // derivation closed that collision — see DESIGN.md §2.2.)
-        let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1");
+        // `id` is a `UUIDv5` over the 5-tuple dedup identity
+        // `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+        // (`cpt-cf-usage-collector-adr-record-identity-derivation`), which is
+        // exactly this plugin's dedup identity — the same five inputs
+        // `usage_records_dedup_uniq` is built over — so each stored row carries
+        // a distinct `id` and `WHERE id = $1` matches at most one row.
+        //
+        // **No `invalidates` predicate belongs in this query, and none ever
+        // will.** The asymmetry with the fold is deliberate, not an oversight
+        // waiting to be tidied up: `aggregate` excludes a withdrawn pair
+        // because a total that counts a withdrawn entry is a wrong total, and
+        // that is a derived view. This is the ledger itself. The SPI states it
+        // outright — a withdrawn pair MUST be returned as persisted, and a
+        // plugin MUST NOT withhold a withdrawn entry from this path as a
+        // kindness — because hiding either half destroys the audit trail the
+        // append-only model exists to keep. Nor is this path a special case:
+        // the SPI puts `list_usage_records` under the same obligation in as
+        // many words — "a withdrawn pair MUST likewise be returned as
+        // persisted here" — and `list` below carries no exclusion either. A
+        // consumer that wants the netted view has what it needs: an
+        // invalidation names its target (`UsageRecord::invalidation`), so the
+        // fold happens on the reader's side. Neither `invalidates IS NULL` nor
+        // an `entry_type` restriction is a kindness here; both are data loss
+        // (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+        //
+        // The scope is translated before a connection is acquired, so a scope
+        // that cannot be rendered never reaches the pool and never reads a row.
+        let (sql, binds) = build_get_sql(scope).map_err(UsageCollectorPluginError::internal)?;
+        let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).bind(id);
+        for b in &binds {
+            q = bind_one(q, b);
+        }
         let mut conn = self.timed_acquire().await?;
-        let row = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
-            .bind(id)
+        let row = q
             .fetch_optional(&mut *conn)
             .await
             .map_err(|err| self.record_backend_error(&err))?;
 
         match row {
             Some(row) => record_row_to_model(row),
+            // One arm for both "no such entry" and "exists, but outside your
+            // scope": the scope is part of the `WHERE`, so a withheld row is
+            // already indistinguishable from an absent one by the time we get
+            // here. Nothing may be logged, counted or timed that would tell
+            // them apart — that distinction *is* the existence oracle.
             None => Err(UsageCollectorPluginError::UsageRecordNotFound { id }),
         }
     }
 
-    /// Keyset-paginated `usage_records` list, scoped to `gts_id` (bound at
-    /// `$1`), with optional `$filter`, metadata side-channel filters, and a
-    /// cursor.
+    /// Keyset-paginated ledger read over one meter and one covered-period
+    /// range, with the caller's composed `$filter`, the metadata side channel
+    /// and an optional cursor.
     ///
-    /// Builds `SELECT {RECORD_COLUMNS} FROM usage_records WHERE gts_id = $1
-    /// [AND <filter>] [AND <metadata>] [AND <keyset>] ORDER BY <order> LIMIT
-    /// <n+1>`. The extra `+1` row is the look-ahead that detects a following
-    /// page; it is truncated before mapping. All identifiers come from the
-    /// [`record_column`] allowlist and the static [`RECORD_COLUMNS`]; every
-    /// value is bound (`$N`).
+    /// The statement is [`build_list_sql`]'s and the page is
+    /// [`build_list_page`]'s; what is left here is the round trip between
+    /// them. Both halves are pure, so both are tested without a database. That
+    /// matters here because the fingerprint obligation below has no compiler
+    /// backstop and no visible effect until page two: a unit test is what makes
+    /// the mint observable at the moment it happens, rather than a page later.
+    ///
+    /// Selection reads the covered-period end alone, `from <= window_end <
+    /// to`; entries are returned as persisted, withdrawn pairs included; and
+    /// `query.filter_hash` is carried into `next_cursor.f` verbatim. Each of
+    /// the three is stated where it is enforced rather than only here.
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorPluginError::Internal`] when the filter AST
-    /// references an unknown field, the cursor's filter hash disagrees with
-    /// `query.filter_hash`, an order/keyset field is off the allowlist, a stored
-    /// row cannot be mapped, or the DB query fails.
+    /// Returns [`UsageCollectorPluginError::Internal`] when the statement
+    /// cannot be built (an untranslatable `$filter`, an order or keyset field
+    /// off the allowlist, a refused cursor) or the page cannot be assembled (an
+    /// absent `query.filter_hash`, an order field that is not a keyset key, a
+    /// stored row that cannot be mapped), and the mapped backend error when the
+    /// query itself fails.
     // @cpt-flow:cpt-cf-uc-plugin-seq-list-keyset:p2
     async fn list(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
@@ -1037,176 +1924,153 @@ impl RecordStore for PgRecordStore {
         let _timer =
             OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Query(QueryKind::Raw));
         self.metrics.inc_query_request(QueryKind::Raw);
+
         // Defense-in-depth: clamp the caller's `$top` to `MAX_PAGE_SIZE` so a
         // value that slipped past the core gateway's `$top` cap can never drive
         // an unbounded `LIMIT n+1 ... fetch_all`.
         let limit = effective_page_size(query.limit, DEFAULT_PAGE_SIZE);
 
-        // `$1` is reserved for the `gts_id` scope bind; every translated bind
-        // therefore starts at `$2`.
-        let mut ctx = SqlCtx::new(2);
-        let mut clauses: Vec<String> = vec!["gts_id = $1".to_owned()];
-
-        // `$filter` (validated AST -> typed node -> parameterized fragment).
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment = translate_record_filter(&node, &mut ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Metadata side-channel: AND across filters, OR within one filter's
-        // values (see [`push_metadata_filter_clauses`]).
-        push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
-
-        // Keyset continuation (forward only). The cursor's filter hash must
-        // match the live query's so a cursor is never replayed against a
-        // different filter.
-        if let Some(cursor) = query.cursor.as_ref() {
-            // Forward-only: the keyset operator is derived from the sort
-            // direction, not from `cursor.d`, so a backward cursor would
-            // silently page forward. Reject it fail-closed.
-            ensure_forward_cursor(cursor).map_err(UsageCollectorPluginError::internal)?;
-            if cursor.f.as_deref() != query.filter_hash.as_deref() {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor filter hash mismatch",
-                ));
-            }
-            // The cursor's keys (`cursor.k`) are positional, bound against the
-            // live `query.order` columns below. If the order changed between
-            // pages at the same arity, old keys would bind to new columns —
-            // silently wrong pagination. The cursor carries the signed sort
-            // tokens (`cursor.s`) precisely to detect this, mirroring the
-            // filter-hash guard above.
-            if !query.order.equals_signed_tokens(&cursor.s) {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor sort order mismatch",
-                ));
-            }
-            let order_pairs: Vec<(&str, bool)> = query
-                .order
-                .0
-                .iter()
-                .map(|key| (key.field.as_str(), matches!(key.dir, SortDir::Asc)))
-                .collect();
-            let predicate = keyset_predicate(
-                &order_pairs,
-                &cursor.k,
-                record_column,
-                |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
-                is_keyset_safe_record_field,
-                &mut ctx,
-            )
-            .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(predicate);
-        }
-
-        let order_sql = render_order_by(&query.order, record_column)
+        // Built before a connection is acquired, so a query that cannot be
+        // rendered never reaches the pool and never reads a row.
+        let (sql, binds) = build_list_sql(&gts_type_id, time_range, query, metadata_filter, limit)
             .map_err(UsageCollectorPluginError::internal)?;
 
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records WHERE {} ORDER BY {order_sql} LIMIT {}",
-            clauses.join(" AND "),
-            limit.saturating_add(1),
-        );
-
-        let mut q =
-            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).bind(gts_id_str(&gts_id));
-        for b in &ctx.binds {
+        let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql));
+        for b in &binds {
             q = bind_one(q, b);
         }
         let mut conn = self.timed_acquire().await?;
-        let mut rows = q
+        let rows = q
             .fetch_all(&mut *conn)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        // Look-ahead row present -> a next page exists; drop it before mapping.
-        let has_next = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
-        if has_next {
-            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        }
-
-        let next_cursor = if has_next {
-            let last = rows.last().ok_or_else(|| {
-                UsageCollectorPluginError::internal("non-empty page lost its tail")
-            })?;
-            let keys = query
-                .order
-                .0
-                .iter()
-                .map(|key| {
-                    record_row_key(last, &key.field).ok_or_else(|| {
-                        UsageCollectorPluginError::internal(format!(
-                            "order field `{}` has no cursor key on the row",
-                            key.field
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let token = encode_next_cursor(&query.order, &keys, query.filter_hash.as_deref())
-                .map_err(UsageCollectorPluginError::internal)?;
-            Some(token)
-        } else {
-            None
-        };
-
-        let items = rows
-            .into_iter()
-            .map(record_row_to_model)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // `_timer` records `query.duration` on drop (success and error alike).
-        Ok(ODataPage::new(
-            items,
-            PageInfo {
-                next_cursor,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+        // `_timer` records `uc_timescaledb_query_duration_seconds` on drop
+        // (success and error alike).
+        build_list_page(rows, query, limit)
     }
 
-    /// Pushed-down aggregation over `usage_records`, scoped to `gts_id` (bound
-    /// at `$1`) and to `status = 'active'`, with optional `$filter`, metadata
-    /// side-channel filters, and a `GROUP BY` over the spec's dimensions
-    /// (§3.6 aggregated query).
+    /// Pushed-down fold over one meter's entries in one covered-period range,
+    /// optionally grouped.
     ///
-    /// Builds `SELECT <dim exprs…>, <AGG> FROM usage_records WHERE gts_id = $1
-    /// AND status = 'active' [AND corrects_id IS NULL] [AND <filter>] [AND
-    /// <metadata>] [AND <subject-not-null guards>] [GROUP BY 1, 2, …]`. The
-    /// aggregate ([`agg_select_expr`]) and each dimension
-    /// ([`dimension_select_expr`]) come from closed enum allowlists; the only
-    /// caller-derived values (a grouped metadata key, `$filter` operands,
-    /// metadata side-channel values) are bound (`$N`). `status = 'active'` is
-    /// always applied. The `corrects_id IS NULL` partition is op-dependent
-    /// ([`corrects_id_partition_clause`]): `SUM` nets across all active rows —
-    /// compensations carry a signed `value` — so it omits the partition; every
-    /// other op (`COUNT`/`MIN`/`MAX`/`AVG`) restricts to `corrects_id IS NULL`
-    /// rows, since compensations adjust `SUM` and are not events (plugin-spi.md
-    /// §Method 3). With an empty `group_by` there is no `GROUP BY` clause, so
-    /// the query yields exactly one bucket with `key = []`.
+    /// The statement is [`build_aggregate_sql`]'s; the rules it encodes are
+    /// documented there. Two properties are this method's rather than the
+    /// builder's:
     ///
-    /// Each returned row maps to one [`AggregationBucket`]: the `k` dimension
-    /// columns read positionally as `Option<String>` (a `NULL` dimension
-    /// becomes the empty string — relevant only when a grouped metadata key is
-    /// absent on some active rows), and the aggregate at index `k` reads as
-    /// `Option<BigDecimal>` (arbitrary precision, carried through as-is;
-    /// `NULL` -> `None`).
+    /// - **The statement is built before a connection is acquired**, so a query
+    ///   that cannot be rendered never reaches the pool and never reads a row.
+    /// - **Each fetched row becomes exactly one bucket**
+    ///   ([`aggregate_bucket`]), so an empty `group_by` — a bare aggregate with
+    ///   no `GROUP BY`, which `PostgreSQL` answers with exactly one row — yields
+    ///   the single empty-keyed bucket the SPI asks for rather than an empty
+    ///   bucket list. `COUNT` over an empty selection is `Some(0)` for the same
+    ///   reason: it is `SELECT COUNT(*)`'s own answer, not a special case here
+    ///   ([`usage_collector_sdk::AggregationBucket::value`]).
+    ///
+    /// Both are held rather than asserted, by one test each against a lazy pool
+    /// at a dead DSN — where reaching the pool answers `Transient` and stopping
+    /// before it answers `Internal`.
+    /// `a_fold_that_cannot_be_built_never_reaches_the_pool` gives the fold a
+    /// filter naming a field the allowlist refuses and requires the `Internal`,
+    /// which is the ordering claim: a statement that cannot be rendered must
+    /// not have acquired a connection first.
+    /// `the_ungrouped_fold_still_reaches_the_pool` gives it a renderable one and
+    /// requires the `Transient`, so the ungrouped fold cannot answer without
+    /// asking. `Transient` alone would not have pinned the order — it is
+    /// consistent with acquiring first — which is why the pair is needed and
+    /// not either half.
+    ///
+    /// The dimension columns read positionally as `Option<String>` and the fold
+    /// at index `k` as `Option<BigDecimal>` — arbitrary precision, so a wide
+    /// `SUM` cannot overflow on decode.
+    ///
+    /// **`LATEST` materializes before it picks, and the peak is O(largest
+    /// group).** Its expression is `(ARRAY_AGG(r.quantity ORDER BY …))[1]`, so
+    /// `PostgreSQL` builds a group's values into an array before taking the
+    /// head. Measured on `timescale/timescaledb:2.29.2-pg18` (`PostgreSQL`
+    /// 18.6) at the **image's tuned** `work_mem` — the image runs
+    /// `001_timescaledb_tune.sh` at initdb, so a fresh container reports
+    /// `work_mem = 7837kB` and `shared_buffers = 1959MB` on the measuring host
+    /// rather than `PostgreSQL`'s compiled 4 MB default. No `SET` was issued;
+    /// the tuned values are what these numbers ran under.
+    ///
+    /// **Read the deltas, not the absolutes.** Every figure below is from one
+    /// host and one fixture table whose shape is not published here, and the
+    /// absolutes move with both — an independent replication of the same four
+    /// queries reported peak RSS an order of magnitude lower throughout,
+    /// because peak RSS counts the shared buffers a backend has touched. What
+    /// reproduced exactly is the differences between the four, and the
+    /// differences are the whole claim.
+    ///
+    /// * **The planner does not choose between a hash and a sorted plan here;
+    ///   there is nothing to choose.** An aggregate carrying its own `ORDER BY`
+    ///   takes the grouped node off the hash path entirely: with `enable_sort`
+    ///   *and* `enable_incremental_sort` off, the plan is still `Sort →
+    ///   GroupAggregate` with the `Sort` reported `Disabled: true` — and a
+    ///   disabled node is chosen only when no alternative path exists, while
+    ///   `HashAggregate` was never disabled. The same statement with the inner
+    ///   `ORDER BY` removed plans as a `HashAggregate` immediately; adding one
+    ///   ordered aggregate beside a plain `MAX` takes that query off the hash
+    ///   path too; and `COUNT(DISTINCT …)` behaves the same way. So it is a
+    ///   property of ordered and distinct aggregation generally, not of this
+    ///   expression, this data or this row count.
+    /// * So exactly one array is live at a time, and the peak is **O(largest
+    ///   group)**. On the worst case for it — 1 000 000 rows in a single group,
+    ///   parallelism off — peak backend RSS ran **+34 MB over `MAX(r.quantity)`**
+    ///   on the same rows (1 022.7 MB against 988.6 MB here), reproducible to
+    ///   ±0.2 MB across runs and to ±0.6 MB against an independent replication
+    ///   on another host. That is **about 34 bytes per row in the largest
+    ///   group**, and the array does not spill.
+    /// * The `Sort` beneath it does materialize the whole selection, but it is
+    ///   `work_mem`-bounded and spills rather than growing: `external merge`,
+    ///   and the size is scan-sized. At 1 000 000 rows it was ~10 MB in each of
+    ///   four workers under the image's default parallelism, and 41 MB as a
+    ///   single sort with `max_parallel_workers_per_gather = 0` — the absolute
+    ///   is fixture-dependent (an independent replication saw 33 MB), the shape
+    ///   is not. **Every candidate formulation needs that same sort**, so it is
+    ///   not a cost of this one.
+    ///
+    /// [`aggregate_limit_clause`] offers no protection, because it bounds
+    /// groups and never the rows within one; the only row bound is the
+    /// `time_range`, which is a request parameter. A `LATEST` meter read whose
+    /// largest group is wide is therefore a server-side allocation sized by
+    /// caller input.
+    ///
+    /// **Both alternatives were measured and both were kept out.** On that same
+    /// single-group worst case, `DISTINCT ON` and
+    /// `ROW_NUMBER() OVER (PARTITION BY …) = 1` both peaked **~25 MB below**
+    /// this form (997.6 MB and 997.4 MB here; 25.8 MB and 26.1 MB below in the
+    /// independent replication), and both are O(1) per group rather than
+    /// O(largest group) — with execution times inside the run-to-run noise of
+    /// the parallel plan (86-111 ms at 100 000 rows, 257-293 ms at 1 000 000,
+    /// all three formulations). The 25 MB does not buy the composition it would
+    /// cost: neither is a `SELECT`-list expression a caller can drop in beside
+    /// `SUM`, and neither can express the ungrouped fold — `DISTINCT ON ()` is
+    /// a syntax error and `PARTITION BY` nothing, like the `ORDER BY … LIMIT 1`
+    /// rewrite, answers **zero** rows over an empty selection where this method
+    /// owes exactly one empty-keyed bucket. Adopting either means a second
+    /// statement shape for one fold, with its own empty-selection special case.
+    ///
+    /// An eligible `SUM` or `COUNT` is served from `usage_rollup_1h` (see
+    /// `query::rollup`); the result is numerically identical to the scan's, up
+    /// to the rollup's refresh watermark (spec §8.1) and given spec §5.2's
+    /// invariants.
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorPluginError::Internal`] when the filter AST
-    /// references an unknown field or is otherwise invalid, the DB query fails,
-    /// or a result column cannot be read at its expected type.
+    /// Returns [`UsageCollectorPluginError::Internal`] when the composed filter
+    /// cannot be translated, the query fails, or a result column cannot be
+    /// decoded at its expected type; a pool-acquisition failure surfaces as
+    /// whatever `timed_acquire` classifies it as.
     // @cpt-flow:cpt-cf-uc-plugin-seq-query-aggregated:p2
     async fn aggregate(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        spec: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
         // Time the full aggregated-query call and count the request. The
         // drop-timer records the histogram on every return, not just success.
@@ -1215,79 +2079,51 @@ impl RecordStore for PgRecordStore {
             TimedOp::Query(QueryKind::Aggregated),
         );
         self.metrics.inc_query_request(QueryKind::Aggregated);
-        // `$1` is reserved for the `gts_id` scope bind; every translated bind
-        // therefore starts at `$2`.
-        let mut ctx = SqlCtx::new(2);
-        let mut clauses: Vec<String> =
-            vec!["gts_id = $1".to_owned(), "status = 'active'".to_owned()];
 
-        // `corrects_id` partition (plugin-spi.md §Method 3): `SUM` nets across
-        // all active rows (compensations carry a signed `value`); every other op
-        // operates over `corrects_id IS NULL` rows only, since compensations
-        // adjust `SUM` and are not events. Load-bearing for `COUNT`-on-counter.
-        if let Some(clause) = corrects_id_partition_clause(spec.op) {
-            clauses.push(clause.to_owned());
-        }
-
-        // `$filter` (validated AST -> typed node -> parameterized fragment).
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment = translate_record_filter(&node, &mut ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Metadata side-channel (same expansion as `list`).
-        push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
-
-        // Build dimension SELECT exprs in GROUP-BY order, binding any metadata
-        // keys, and emit subject-not-null guards so subject-less rows are
-        // excluded from subject grouping (per the SDK dimension docs).
-        let mut select_dims: Vec<String> = Vec::with_capacity(spec.group_by.len());
-        for dim in &spec.group_by {
-            match dim {
-                AggregationDimension::SubjectId => {
-                    clauses.push("subject_id IS NOT NULL".to_owned());
-                }
-                AggregationDimension::SubjectType => {
-                    clauses.push("subject_type IS NOT NULL".to_owned());
-                }
-                _ => {}
-            }
-            select_dims.push(dimension_select_expr(dim, &mut ctx));
-        }
-
-        // SELECT list = dimension exprs ++ the aggregate. With no dimensions
-        // the SELECT is just the aggregate (single-bucket / no-grouping case).
-        let dim_count = select_dims.len();
-        let mut select_parts = select_dims;
-        select_parts.push(agg_select_expr(spec.op).to_owned());
-        let select_list = select_parts.join(", ");
-
-        // GROUP BY by ordinal (1..=k) so the bound metadata expr is not
-        // repeated; omitted entirely when there are no dimensions.
-        let group_by = if dim_count == 0 {
-            String::new()
+        // The rollup answers an eligible SUM/COUNT exactly (spec §6); every
+        // other query takes the scan it always has. The eligibility test reads
+        // the same composed filter the scan would translate.
+        let routed = if self.rollup_enabled {
+            Some(rollup_eligible(
+                fold,
+                query.filter(),
+                metadata_filter,
+                group_by,
+                time_range,
+            ))
         } else {
-            let ordinals = (1..=dim_count)
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(" GROUP BY {ordinals}")
+            None
+        };
+        let statement = match routed {
+            Some(Ok(split)) => {
+                let st =
+                    build_rollup_aggregate_sql(&gts_type_id, split, fold, query.filter(), group_by)
+                        .map_err(UsageCollectorPluginError::internal)?;
+                self.metrics.record_aggregate_path(None);
+                AggregateStatement {
+                    sql: st.sql,
+                    binds: st.binds,
+                    dim_count: st.dim_count,
+                }
+            }
+            other => {
+                if let Some(Err(reason)) = other {
+                    self.metrics.record_aggregate_path(Some(reason));
+                }
+                build_aggregate_sql(
+                    &gts_type_id,
+                    time_range,
+                    fold,
+                    query,
+                    metadata_filter,
+                    group_by,
+                )
+                .map_err(UsageCollectorPluginError::internal)?
+            }
         };
 
-        // Bound the distinct-group cardinality so a high-cardinality `group_by`
-        // cannot materialize an unbounded bucket set into memory; the gateway
-        // rejects an over-cap result (plugin-spi.md §Method 3).
-        let limit_clause = aggregate_limit_clause(dim_count);
-        let sql = format!(
-            "SELECT {select_list} FROM usage_records WHERE {}{group_by}{limit_clause}",
-            clauses.join(" AND "),
-        );
-
-        let mut q = sqlx::query(AssertSqlSafe(sql)).bind(gts_id_str(&gts_id));
-        for b in &ctx.binds {
+        let mut q = sqlx::query(AssertSqlSafe(statement.sql));
+        for b in &statement.binds {
             q = bind_one_query(q, b);
         }
         let mut conn = self.timed_acquire().await?;
@@ -1296,102 +2132,30 @@ impl RecordStore for PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        let mut buckets = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut key = Vec::with_capacity(dim_count);
-            for i in 0..dim_count {
-                let dim = row.try_get::<Option<String>, _>(i).map_err(|e| {
-                    UsageCollectorPluginError::internal(format!(
-                        "aggregate dimension column {i} read failed: {e}"
-                    ))
-                })?;
-                // A NULL dimension (e.g. a grouped metadata key absent on some
-                // active rows) becomes the empty string in the bucket key.
-                key.push(dim.unwrap_or_default());
-            }
-            let value = row
-                .try_get::<Option<BigDecimal>, _>(dim_count)
-                .map_err(|e| {
-                    UsageCollectorPluginError::internal(format!(
-                        "aggregate value column {dim_count} read failed: {e}"
-                    ))
-                })?;
-            buckets.push(AggregationBucket { key, value });
-        }
+        // One bucket per row, in the order `PostgreSQL` emitted them. The
+        // `map` is what keeps the no-grouping case honest: no branch on
+        // `group_by.is_empty()` exists to answer an empty bucket list with.
+        //
+        // The count comes from the statement that was built, not from a second
+        // reading of `group_by` here, so the decoder cannot read a different
+        // number of key columns than the SELECT list emits. From this call site
+        // that is structural; that the builder reports the count it actually
+        // used is the other half, and
+        // `the_builder_reports_the_dimension_count_its_select_list_was_built_from`
+        // is what holds it.
+        //
+        // What no unit test can still see is a short circuit placed *after* the
+        // fetch, where the branch is a no-op on an empty row set. One placed
+        // where it would actually be written — above the acquire, to skip the
+        // query — is covered by `the_ungrouped_fold_still_reaches_the_pool`.
+        let buckets = rows
+            .iter()
+            .map(|row| aggregate_bucket(row, statement.dim_count))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        // `_timer` records `query.duration` on drop (success and error alike).
+        // `_timer` records `uc_timescaledb_query_duration_seconds` on drop
+        // (success and error alike).
         Ok(AggregationResult { buckets })
-    }
-
-    /// Deactivate a record and its depth-1 active compensations in one
-    /// transaction (§3.6 deactivate-cascade).
-    ///
-    /// Locks the target row `FOR UPDATE` and reads its `status`: a missing row
-    /// is `UsageRecordNotFound`, an already-`inactive` row is
-    /// `UsageRecordAlreadyInactive`. An `active` target and every `active` row
-    /// whose `corrects_id` points at it (depth-1 only) flip to `inactive` in a
-    /// single `UPDATE`. The transition is one-way and mutates no other column;
-    /// rows already `inactive` and unrelated rows are untouched.
-    ///
-    /// `WHERE id = $1` addresses one logical record. The schema does not carry a
-    /// plain `UNIQUE (id)` (a hypertable UNIQUE must include the `created_at`
-    /// partition key, so only the composite PK `(id, created_at)` and the dedup
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` UNIQUE exist), but `id`
-    /// is a `UUIDv5` of that full 4-tuple (ADR-0014), so each stored row carries
-    /// a distinct `id` and this `UPDATE` flips at most one row.
-    // @cpt-flow:cpt-cf-uc-plugin-seq-deactivate-cascade:p2
-    async fn deactivate(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        // Time the full deactivation cascade; the drop-timer records the
-        // duration on every return — including the not-found / already-inactive
-        // and error arms — not just on a successful commit.
-        let _timer = OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Deactivate);
-        let mut conn = self.timed_acquire().await?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
-
-        // Lock + read the target's status. Since `id` is a `UUIDv5` of the full
-        // 4-tuple dedup key including `created_at` (ADR-0014), each stored row
-        // carries a distinct `id`, so this locks the single addressed row and
-        // the `WHERE id = $1` UPDATE below flips exactly that row.
-        let status = sqlx::query_scalar::<_, String>(
-            "SELECT status FROM usage_records WHERE id = $1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| self.record_backend_error(&e))?;
-
-        match status {
-            None => {
-                tx.rollback().await.ok();
-                return Err(UsageCollectorPluginError::UsageRecordNotFound { id });
-            }
-            Some(s) if s == "inactive" => {
-                tx.rollback().await.ok();
-                return Err(UsageCollectorPluginError::UsageRecordAlreadyInactive { id });
-            }
-            Some(_) => {}
-        }
-
-        // Flip the target and its depth-1 active compensations. One-way; the
-        // `status = 'active'` guard on the compensations keeps already-inactive
-        // children untouched and bounds the cascade to a single level.
-        sqlx::query(
-            "UPDATE usage_records SET status = 'inactive' \
-             WHERE id = $1 OR (corrects_id = $1 AND status = 'active')",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| self.record_backend_error(&e))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
-        // `_timer` records `deactivate.duration` on drop.
-        Ok(())
     }
 }
 

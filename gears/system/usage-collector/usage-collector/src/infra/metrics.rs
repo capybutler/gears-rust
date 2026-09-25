@@ -20,11 +20,11 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 
 use crate::domain::ports::metrics::{
-    AuthzDecision, DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome,
-    PdpFailureCause, PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind,
-    RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
-    UsageTypeErrorCategory, UsageTypeOp, key,
+    AuthzDecision, IngestRequestErrorCategory, IngestRequestOutcome, PdpFailureCause, PdpOp,
+    PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
+    RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics, key,
 };
+use usage_collector_sdk::{EntryType, RecordOrigin};
 
 /// Bucket boundaries (seconds) for `uc_pdp_duration_seconds` — brackets the
 /// PDP share of the 200 ms ingestion p95 budget (DESIGN §3.11.5).
@@ -36,9 +36,8 @@ const PDP_DURATION_BUCKETS_SECONDS: [f64; 9] =
 const PLUGIN_CALL_DURATION_BUCKETS_SECONDS: [f64; 10] =
     [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0];
 
-/// Buckets (seconds) for `uc_ingestion_duration_seconds` and
-/// `uc_deactivation_duration_seconds` — bracket the 200 ms ingestion p95
-/// budget; deactivation mirrors the ingestion write path (DESIGN §3.11.5).
+/// Buckets (seconds) for `uc_ingestion_duration_seconds` — bracket the
+/// 200 ms ingestion p95 budget (DESIGN §3.11.5).
 const INGESTION_DURATION_BUCKETS_SECONDS: [f64; 9] =
     [0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0];
 
@@ -46,9 +45,24 @@ const INGESTION_DURATION_BUCKETS_SECONDS: [f64; 9] =
 /// aggregated-query p95 budget (DESIGN §3.11.5).
 const QUERY_DURATION_BUCKETS_SECONDS: [f64; 8] = [0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0];
 
-/// Buckets for `uc_ingestion_batch_size` (records per request) — upper bucket
-/// equals the wire batch cap (DESIGN §3.11.5).
-const INGESTION_BATCH_SIZE_BUCKETS: [f64; 7] = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0];
+/// The fixed ladder `uc_ingestion_batch_size` buckets are cut from.
+const INGESTION_BATCH_SIZE_LADDER: [f64; 7] = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0];
+
+/// Buckets for `uc_ingestion_batch_size` (records per request): the ladder
+/// entries below the configured cap, then the cap itself, so the upper bucket
+/// is always the cap (DESIGN §3.11.5).
+#[must_use]
+pub fn ingestion_batch_size_buckets(cap: usize) -> Vec<f64> {
+    // A cap is a count of entries, far below 2^52, so the cast is exact.
+    #[allow(clippy::cast_precision_loss)]
+    let cap = cap as f64;
+    INGESTION_BATCH_SIZE_LADDER
+        .iter()
+        .copied()
+        .filter(|bound| *bound < cap)
+        .chain(std::iter::once(cap))
+        .collect()
+}
 
 /// Buckets (bytes) for `uc_record_metadata_bytes` — upper bucket equals the
 /// 8 KiB metadata cap (DESIGN §3.11.5).
@@ -60,7 +74,9 @@ const QUERY_RESULT_ROWS_BUCKETS: [f64; 8] =
 
 /// The full OpenTelemetry instrument set: the foundation-owned plugin-host +
 /// PDP-helper instruments (Phase 1) plus the per-component gateway
-/// instruments for ingestion, query, deactivation, and usage-type (Phase 2).
+/// instruments for ingestion and query (Phase 2), plus the
+/// Type Resolver instrument that replaced the deleted usage-type catalog
+/// counters.
 pub struct UcMetricsMeter {
     // ── Plugin-host (owned by foundation §2.1) ──
     plugin_ready: Gauge<i64>,
@@ -86,13 +102,8 @@ pub struct UcMetricsMeter {
     query_inflight: opentelemetry::metrics::UpDownCounter<i64>,
     query_result_rows: Histogram<f64>,
 
-    // ── Deactivation handler (§2.5 event-deactivation) ──
-    deactivation_requests: Counter<u64>,
-    deactivation_duration_seconds: Histogram<f64>,
-
-    // ── UsageType catalog (§2.2 usage-type-lifecycle) ──
-    usage_type_requests: Counter<u64>,
-    usage_types: Gauge<i64>,
+    // ── Type Resolver (§2.2 usage-type-lifecycle successor) ──
+    type_resolution: Counter<u64>,
 }
 
 impl UcMetricsMeter {
@@ -109,7 +120,7 @@ impl UcMetricsMeter {
     // @cpt-dod:cpt-cf-usage-collector-dod-foundation-observability-alert-integration:p2
     // @cpt-begin:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1:inst-binding-meter-bootstrap
     #[must_use]
-    pub fn new(meter: &Meter, prefix: &str) -> Self {
+    pub fn new(meter: &Meter, prefix: &str, max_batch_records: usize) -> Self {
         Self {
             plugin_ready: meter
                 .i64_gauge(format!("{prefix}_plugin_ready"))
@@ -160,18 +171,19 @@ impl UcMetricsMeter {
             ingestion_records: meter
                 .u64_counter(format!("{prefix}_ingestion_records_total"))
                 .with_description(
-                    "Per-record ingestion acknowledgements by outcome, record_kind, error_category",
+                    "Per-record ingestion acknowledgements by outcome, entry_type, origin, \
+                     error_category",
                 )
                 .build(),
             ingestion_duration_seconds: meter
                 .f64_histogram(format!("{prefix}_ingestion_duration_seconds"))
-                .with_description("Ingestion request wall-clock")
+                .with_description("Ingestion request wall-clock by origin")
                 .with_boundaries(INGESTION_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             ingestion_batch_size: meter
                 .f64_histogram(format!("{prefix}_ingestion_batch_size"))
                 .with_description("Records per received batch submission")
-                .with_boundaries(INGESTION_BATCH_SIZE_BUCKETS.to_vec())
+                .with_boundaries(ingestion_batch_size_buckets(max_batch_records))
                 .build(),
             record_metadata_bytes: meter
                 .f64_histogram(format!("{prefix}_record_metadata_bytes"))
@@ -200,29 +212,13 @@ impl UcMetricsMeter {
                 .with_boundaries(QUERY_RESULT_ROWS_BUCKETS.to_vec())
                 .build(),
 
-            // ── Deactivation handler ──
-            // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-nfr-operational-visibility:p2
-            deactivation_requests: meter
-                .u64_counter(format!("{prefix}_deactivation_requests_total"))
-                .with_description("Completed deactivation attempts by outcome and error_category")
-                .build(),
-            deactivation_duration_seconds: meter
-                .f64_histogram(format!("{prefix}_deactivation_duration_seconds"))
-                .with_description("Deactivation request wall-clock")
-                .with_boundaries(INGESTION_DURATION_BUCKETS_SECONDS.to_vec())
-                .build(),
-
-            // ── UsageType catalog ──
-            // @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-nfr-operational-visibility:p2
-            usage_type_requests: meter
-                .u64_counter(format!("{prefix}_usage_type_requests_total"))
+            // ── Type Resolver ──
+            type_resolution: meter
+                .u64_counter(format!("{prefix}_type_resolution_total"))
                 .with_description(
-                    "Completed UsageType-lifecycle attempts by operation, outcome, error_category",
+                    "Completed Type Resolver calls by result (cache_hit / cache_miss / \
+                     served_stale / unresolved / registry_error)",
                 )
-                .build(),
-            usage_types: meter
-                .i64_gauge(format!("{prefix}_usage_types"))
-                .with_description("Current entry count of the plugin-owned usage_type_catalog")
                 .build(),
         }
     }
@@ -280,13 +276,14 @@ impl UsageCollectorMetrics for UcMetricsMeter {
     // ── Ingestion gateway ──
 
     fn observe_ingestion_batch_size(&self, size: u64) {
-        // f64 histogram; batch sizes (1..=100) are exactly representable.
+        // f64 histogram; batch sizes (1..=cap) are exactly representable.
         #[allow(clippy::cast_precision_loss)]
         self.ingestion_batch_size.record(size as f64, &[]);
     }
 
-    fn observe_ingestion_duration(&self, seconds: f64) {
-        self.ingestion_duration_seconds.record(seconds, &[]);
+    fn observe_ingestion_duration(&self, seconds: f64, origin: RecordOrigin) {
+        self.ingestion_duration_seconds
+            .record(seconds, &[KeyValue::new(key::ORIGIN, origin.as_str())]);
     }
 
     fn observe_record_metadata_bytes(&self, bytes: u64) {
@@ -297,14 +294,16 @@ impl UsageCollectorMetrics for UcMetricsMeter {
     fn record_ingestion_record(
         &self,
         outcome: RecordOutcome,
-        kind: RecordKind,
+        entry_type: EntryType,
+        origin: RecordOrigin,
         error_category: RecordErrorCategory,
     ) {
         self.ingestion_records.add(
             1,
             &[
                 KeyValue::new(key::OUTCOME, outcome.as_str()),
-                KeyValue::new(key::RECORD_KIND, kind.as_str()),
+                KeyValue::new(key::ENTRY_TYPE, entry_type.as_str()),
+                KeyValue::new(key::ORIGIN, origin.as_str()),
                 KeyValue::new(key::ERROR_CATEGORY, error_category.as_str()),
             ],
         );
@@ -363,45 +362,11 @@ impl UsageCollectorMetrics for UcMetricsMeter {
         );
     }
 
-    // ── Deactivation handler ──
+    // ── Type Resolver ──
 
-    fn record_deactivation_request(
-        &self,
-        outcome: RequestOutcome,
-        error_category: DeactivationErrorCategory,
-        seconds: f64,
-    ) {
-        self.deactivation_duration_seconds.record(seconds, &[]);
-        self.deactivation_requests.add(
-            1,
-            &[
-                KeyValue::new(key::OUTCOME, outcome.as_str()),
-                KeyValue::new(key::ERROR_CATEGORY, error_category.as_str()),
-            ],
-        );
-    }
-
-    // ── UsageType catalog ──
-
-    fn record_usage_type_request(
-        &self,
-        op: UsageTypeOp,
-        outcome: RequestOutcome,
-        error_category: UsageTypeErrorCategory,
-    ) {
-        self.usage_type_requests.add(
-            1,
-            &[
-                KeyValue::new(key::OPERATION, op.as_str()),
-                KeyValue::new(key::OUTCOME, outcome.as_str()),
-                KeyValue::new(key::ERROR_CATEGORY, error_category.as_str()),
-            ],
-        );
-    }
-
-    fn set_usage_types(&self, count: u64) {
-        #[allow(clippy::cast_possible_wrap)]
-        self.usage_types.record(count as i64, &[]);
+    fn record_type_resolution(&self, outcome: TypeResolutionOutcome) {
+        self.type_resolution
+            .add(1, &[KeyValue::new(key::RESULT, outcome.as_str())]);
     }
 }
 
@@ -414,10 +379,10 @@ impl UsageCollectorMetrics for UcMetricsMeter {
 /// `Gear::init` runs, so this binds to the OTLP-push pipeline.
 // @cpt-begin:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1:inst-binding-meter-bootstrap
 #[must_use]
-pub fn build_default_adapter(prefix: &str) -> Arc<UcMetricsMeter> {
+pub fn build_default_adapter(prefix: &str, max_batch_records: usize) -> Arc<UcMetricsMeter> {
     let scope = opentelemetry::InstrumentationScope::builder("usage-collector").build();
     let meter = opentelemetry::global::meter_with_scope(scope);
-    Arc::new(UcMetricsMeter::new(&meter, prefix))
+    Arc::new(UcMetricsMeter::new(&meter, prefix, max_batch_records))
 }
 // @cpt-end:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1:inst-binding-meter-bootstrap
 

@@ -8,12 +8,12 @@
 //! returns a well-formed default response. MUST NOT be used in production.
 
 use async_trait::async_trait;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, MetadataFilter, UsageCollectorPluginError,
-    UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
+    TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 
 #[derive(Debug, Default)]
@@ -48,16 +48,36 @@ impl UsageCollectorPluginV1 for NoopBackend {
         Ok(records.into_iter().map(Ok).collect())
     }
 
-    async fn get_usage_record(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        _scope: &ast::Expr,
+        _converged_only: bool,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::UsageRecordNotFound { id })
     }
 
+    /// Persists nothing, so every fold is taken over an empty selection and
+    /// the withdrawal exclusion the SPI states has nothing to leave out.
+    ///
+    /// The empty `buckets` vector is this backend's well-formed default,
+    /// **not** the shape a conforming plugin answers with: the no-grouping
+    /// case is a single bucket carrying an empty `key`
+    /// ([`AggregationResult`]), whose value is absent for every fold but
+    /// `COUNT`. The gear does read the count — it refuses a result over the
+    /// declared aggregate-bucket cap and observes the count as result-row
+    /// telemetry — and it passes the buckets through to the wire, so a
+    /// caller sees the difference too. Zero is under every cap and reads as
+    /// an empty result, which is why the default is harmless here and only
+    /// here: this is a backend that MUST NOT be used in production.
     async fn query_aggregated_usage_records(
         &self,
-        _gts_id: UsageTypeGtsId,
+        _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
+        _fold: AggregationFold,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
-        _aggregation: AggregationSpec,
+        _group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
         Ok(AggregationResult {
             buckets: Vec::new(),
@@ -66,44 +86,12 @@ impl UsageCollectorPluginV1 for NoopBackend {
 
     async fn list_usage_records(
         &self,
-        _gts_id: UsageTypeGtsId,
+        _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
         _query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
         Ok(ODataPage::empty(0))
-    }
-
-    async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::UsageRecordNotFound { id })
-    }
-
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1
-    async fn create_usage_type(
-        &self,
-        usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        Ok(usage_type)
-    }
-
-    async fn get_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::UsageTypeNotFound { gts_id })
-    }
-
-    async fn list_usage_types(
-        &self,
-        _query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorPluginError> {
-        Ok(ODataPage::empty(0))
-    }
-
-    async fn delete_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::UsageTypeNotFound { gts_id })
     }
 }
 

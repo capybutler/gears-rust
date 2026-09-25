@@ -2,28 +2,34 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use toolkit_macros::domain_model;
-use toolkit_odata::{ODataQuery, Page as ODataPage};
+use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, MetadataFilter, UsageCollectorPluginError,
-    UsageCollectorPluginV1, UsageRecord, UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
+    TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 
-use crate::domain::ports::{CatalogStore, RecordStore};
+use crate::domain::ports::RecordStore;
 
-/// The single implementation of `UsageCollectorPluginV1`. Delegates record ops
-/// to the [`RecordStore`] port and catalog ops to the [`CatalogStore`] port.
+/// The single implementation of `UsageCollectorPluginV1`. Delegates every SPI
+/// method to the [`RecordStore`] port.
+///
+/// `pub` for the same reason [`crate::domain`] is: this is the only type in
+/// the crate that implements the SPI, so the DESIGN section 3.3 contract
+/// suite — which takes a `&dyn UsageCollectorPluginV1` — cannot be run from
+/// `tests/contract_conformance_pg.rs` unless the test crate can name it. Not
+/// public API; `#[doc(hidden)]` on the module keeps it off the rendered
+/// surface, and external consumers reach the SPI through `ClientHub`.
 #[domain_model]
-pub(crate) struct StorageAdapter {
+pub struct StorageAdapter {
     record: Arc<dyn RecordStore>,
-    catalog: Arc<dyn CatalogStore>,
 }
 
 impl StorageAdapter {
     #[must_use]
-    pub(crate) fn new(record: Arc<dyn RecordStore>, catalog: Arc<dyn CatalogStore>) -> Self {
-        Self { record, catalog }
+    pub fn new(record: Arc<dyn RecordStore>) -> Self {
+        Self { record }
     }
 }
 
@@ -44,60 +50,46 @@ impl UsageCollectorPluginV1 for StorageAdapter {
         self.record.create_batch(records).await
     }
 
-    async fn get_usage_record(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
-        self.record.get(id).await
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+        _converged_only: bool,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        // Single primary, one pool: every read is converged, so the flag changes nothing (DESIGN §3.3 converged-only lookups).
+        self.record.get(id, scope).await
     }
 
     async fn query_aggregated_usage_records(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        aggregation: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
         self.record
-            .aggregate(gts_id, query, metadata_filter, aggregation)
+            .aggregate(
+                gts_type_id,
+                time_range,
+                fold,
+                query,
+                metadata_filter,
+                group_by,
+            )
             .await
     }
 
     async fn list_usage_records(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
-        self.record.list(gts_id, query, metadata_filter).await
-    }
-
-    async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        self.record.deactivate(id).await
-    }
-
-    async fn create_usage_type(
-        &self,
-        usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        self.catalog.create(usage_type).await
-    }
-
-    async fn get_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        self.catalog.get(gts_id).await
-    }
-
-    async fn list_usage_types(
-        &self,
-        query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorPluginError> {
-        self.catalog.list(query).await
-    }
-
-    async fn delete_usage_type(
-        &self,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorPluginError> {
-        self.catalog.delete(gts_id).await
+        self.record
+            .list(gts_type_id, time_range, query, metadata_filter)
+            .await
     }
 }

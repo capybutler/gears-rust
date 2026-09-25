@@ -13,6 +13,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgConnection, PgPool};
 
 use crate::config::TimescaleDbPluginConfig;
+use crate::infra::storage::rollup_maintenance::apply_rollup_policies;
 
 /// Embedded schema migrations (`migrations/` at crate root).
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -65,18 +66,25 @@ fn is_plaintext(mode: PgSslMode) -> bool {
     matches!(mode, PgSslMode::Disable)
 }
 
-/// Fixed upper bound on how long a request-path statement waits to acquire a row
-/// lock (e.g. the deactivate `SELECT ... FOR UPDATE`). A contended lock then fails
-/// fast (`55P03 lock_not_available`) instead of blocking on — and pinning — a
-/// pooled connection.
+/// Fixed upper bound on how long a request-path statement waits on a contended
+/// lock. Ingest waits on two: the `usage_acceptance_sequence` row for the
+/// entry's `(tenant_id, gts_type_id)` scope, which every write claims from, and
+/// the speculative tuple an `INSERT ... ON CONFLICT ... DO NOTHING` meets when
+/// a not-yet-committed duplicate of the same dedup 5-tuple is in flight. The
+/// wait then fails fast (`55P03 lock_not_available`) instead of blocking on —
+/// and pinning — a pooled connection.
+///
+/// `55P03` is classified transient ([`super::error`]) precisely because these
+/// are ordinary contention outcomes on a hot scope, so a timed-out batch is
+/// retried rather than returned as a non-retryable failure.
 const LOCK_TIMEOUT: &str = "5s";
 
-/// Session GUCs applied to every request-path pool connection at connect time,
-/// bounding how long a statement may run (`statement_timeout`, config-driven) and
-/// how long it waits on a row lock (`lock_timeout`, fixed [`LOCK_TIMEOUT`]) so a
-/// wedged backend cannot pin pool connections indefinitely and exhaust the pool.
-/// Applied as `-c name=value` startup parameters so the bound holds from the
-/// connection's first query, with no extra round-trip.
+/// Session GUCs applied to every request-path pool connection at connect time:
+/// `statement_timeout` (config-driven) bounds how long a statement may run, and
+/// `lock_timeout` (fixed at [`LOCK_TIMEOUT`]) how long it waits on a contended
+/// lock, so a wedged backend cannot pin pool connections indefinitely and
+/// exhaust the pool. Applied as `-c name=value` startup parameters so the bound
+/// holds from the connection's first query, with no extra round-trip.
 fn connection_gucs(statement_timeout_secs: u64) -> [(&'static str, String); 2] {
     [
         ("statement_timeout", format!("{statement_timeout_secs}s")),
@@ -154,44 +162,40 @@ async fn acquire_init_lock(lock_conn: &mut PgConnection) -> Result<(), sqlx::Err
     Ok(())
 }
 
-/// Run the post-migration policy registration under a database advisory lock so
-/// concurrently-initializing replicas serialize here.
+/// Run the post-migration partitioning and rollup-policy setup under a
+/// database advisory lock so concurrently-initializing replicas serialize
+/// here.
 ///
-/// [`apply_retention_policy`]'s remove-then-add sequence is non-atomic, and
-/// `add_retention_policy` (no `if_not_exists`) *errors* if a policy already
-/// exists — so two pods racing this section could leave a half-applied state or
-/// fail outright. A session-level `pg_advisory_lock` held on a dedicated
-/// connection for the whole section lets only one replica apply at a time; the
-/// rest block until it releases. (Schema migrations themselves are already
-/// serialized by sqlx's own migration lock; this covers the registration that
-/// sqlx does not.)
+/// A session-level `pg_advisory_lock` held on a dedicated connection for the
+/// whole section lets only one replica apply at a time; the rest block until it
+/// releases. (Schema migrations themselves are already serialized by sqlx's own
+/// migration lock; this covers the setup that sqlx does not.)
 ///
-/// The policy/job functions keep running in autocommit on the pool, exactly as
-/// before — deliberately *not* wrapped in an explicit transaction, since
-/// `TimescaleDB` policy functions are happiest in autocommit. The lock is
-/// released on every return path; if the holding process dies, Postgres releases
-/// it when the session ends.
+/// The setup statements keep running in autocommit on the pool — deliberately
+/// *not* wrapped in an explicit transaction, since `TimescaleDB` policy
+/// functions are happiest in autocommit. The lock is released on every return
+/// path; if the holding process dies, Postgres releases it when the session
+/// ends.
 ///
 /// The wait to *acquire* the lock is bounded by the connection-level
 /// `statement_timeout` (see [`acquire_init_lock`]) so a wedged peer cannot stall
 /// init forever.
 ///
 /// # Errors
-/// Returns `sqlx::Error` if the lock cannot be acquired or either registration
-/// step fails.
+/// Returns `sqlx::Error` if the lock cannot be acquired or a setup statement
+/// fails.
 pub async fn apply_post_migration_setup(
     pool: &PgPool,
-    retention_secs: u64,
+    cfg: &TimescaleDbPluginConfig,
 ) -> Result<(), sqlx::Error> {
-    // Hold a session-level advisory lock on a dedicated connection for the whole
-    // critical section. Concurrent replicas block on this `pg_advisory_lock`
-    // until the holder releases it below, so only one applies at a time. The wait
-    // is bounded by the connection-level `statement_timeout` (see
-    // `acquire_init_lock`) so a wedged peer cannot stall init forever.
     let mut lock_conn = pool.acquire().await?;
     acquire_init_lock(&mut lock_conn).await?;
 
-    let result = apply_retention_policy(pool, retention_secs).await;
+    let result = async {
+        apply_partitioning(pool, cfg.chunk_time_interval_secs, cfg.type_key_slice_width).await?;
+        apply_rollup_policies(pool, cfg).await
+    }
+    .await;
 
     // Release on every path (including the error path) so a failing replica
     // never wedges the others. If the unlock itself fails the session is likely
@@ -210,27 +214,40 @@ pub async fn apply_post_migration_setup(
     result
 }
 
-/// Idempotently register the config-driven retention policy, **updating** it if
-/// it already exists so a changed `retention_secs` takes effect on restart.
-/// Runs after migrations.
+/// Remove any table-wide retention policy and apply the configured chunk
+/// intervals. Idempotent: a restart with changed values applies them.
 ///
-/// `add_retention_policy(if_not_exists => TRUE)` would *skip* an existing
-/// policy and silently keep the old window; remove-then-add applies the new
-/// one. The sub-second gap with no policy is harmless — retention is a slow
-/// background job.
+/// The policy removal matters for a database an earlier build initialized: a
+/// table-wide `policy_retention` drops every type at one horizon, underneath the
+/// per-type retention sweep.
+///
+/// Both intervals apply to chunks created afterwards; existing chunks keep their
+/// ranges. `dimension_name` is required on both calls — with two dimensions,
+/// `TimescaleDB` refuses an unnamed interval change as ambiguous.
 ///
 /// # Errors
-/// Returns `sqlx::Error` if either statement fails.
-pub async fn apply_retention_policy(pool: &PgPool, retention_secs: u64) -> Result<(), sqlx::Error> {
-    let secs = i64::try_from(retention_secs).unwrap_or(i64::MAX);
+/// Returns `sqlx::Error` if any statement fails.
+pub async fn apply_partitioning(
+    pool: &PgPool,
+    chunk_time_interval_secs: u64,
+    type_key_slice_width: u32,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT remove_retention_policy('usage_records', if_exists => TRUE)")
         .execute(pool)
         .await?;
+    let secs = i64::try_from(chunk_time_interval_secs).unwrap_or(i64::MAX);
     sqlx::query(
-        "SELECT add_retention_policy('usage_records', \
-         drop_after => make_interval(secs => $1::double precision))",
+        "SELECT set_chunk_time_interval('usage_records', \
+         make_interval(secs => $1::double precision), dimension_name => 'window_end')",
     )
     .bind(secs)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "SELECT set_chunk_time_interval('usage_records', $1::bigint, \
+         dimension_name => 'type_key')",
+    )
+    .bind(i64::from(type_key_slice_width))
     .execute(pool)
     .await?;
     Ok(())

@@ -20,11 +20,11 @@ use std::sync::Arc;
 use toolkit_gts::gts_id;
 
 use authz_resolver_sdk::models::EvaluationRequest;
-use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    IdempotencyKey, ResourceRef, SubjectRef, UsageRecord, UsageRecordStatus, UsageTypeGtsId,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, SubjectRef,
+    UsageRecord,
 };
 use uuid::Uuid;
 
@@ -32,9 +32,10 @@ use super::{
     AttributionTupleKey, authorize_attribution_tuple, authorize_usage_record, usage_record,
 };
 use crate::domain::ports::metrics::{NoopMetrics, PdpOp};
-use crate::domain::test_support::{CapturingTenantPermitResolver, enforcer_for};
+use crate::domain::test_support::{CapturingTenantPermitResolver, enforcer_for, qty};
 
-const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+const SAMPLE_GTS_TYPE_ID: &str =
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
 /// Arbitrary RG member-handle type for group-filter fixtures — usage-collector
 /// rejects group predicates regardless of the type, so only the shape matters.
@@ -52,16 +53,18 @@ fn ctx() -> SecurityContext {
 fn record_with(subject: Option<SubjectRef>) -> UsageRecord {
     UsageRecord {
         id: Uuid::from_u128(0x0001),
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_GTS_TYPE_ID).expect("valid gts_type_id"),
         tenant_id: Uuid::from_u128(0xC330),
         resource_ref: ResourceRef::new("rsc-eq", "compute.vm").expect("valid resource ref"),
         subject_ref: subject,
         metadata: BTreeMap::new(),
-        value: Decimal::from(1),
+        quantity: qty("1"),
         idempotency_key: IdempotencyKey::new("idem-eq").expect("valid idempotency key"),
-        corrects_id: None,
-        status: UsageRecordStatus::Active,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        accepted_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        origin: RecordOrigin::Live,
+        invalidation: None,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     }
 }
 
@@ -152,24 +155,32 @@ async fn key_and_record_compose_byte_identical_pdp_requests_with_full_subject() 
 
 /// Two records that hash-equal under `AttributionTupleKey` MUST always
 /// produce equal PDP requests -- even when their *non*-tuple fields
-/// (`id`, `gts_id`, `value`, `idempotency_key`, `metadata`,
-/// `corrects_id`, `created_at`) differ wildly. This pins the
-/// projection-correctness premise of the dedup directly: "share the
+/// (`id`, `gts_type_id`, `quantity`, `idempotency_key`, `accepted_at`,
+/// `origin`, `metadata`, `invalidation`, and both covered-period bounds)
+/// differ wildly. This pins
+/// the projection-correctness premise of the dedup directly: "share the
 /// tuple => share the PDP payload".
+///
+/// Both period bounds are varied, and independently of each other, because
+/// the tuple key must be blind to the covered period as a whole: a key that
+/// admitted either bound would split one PDP decision into two and defeat
+/// the dedup.
 #[tokio::test]
 async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_differ() {
     let record_a = UsageRecord {
         id: Uuid::from_u128(0xAAAA),
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_GTS_TYPE_ID).expect("valid gts_type_id"),
         tenant_id: Uuid::from_u128(0xDEAD),
         resource_ref: ResourceRef::new("rsc-shared", "compute.vm").expect("valid resource ref"),
         subject_ref: Some(SubjectRef::new("sub-shared", Some("user")).expect("valid subject")),
         metadata: BTreeMap::new(),
-        value: Decimal::from(1),
+        quantity: qty("1"),
         idempotency_key: IdempotencyKey::new("idem-A").expect("valid idempotency key"),
-        corrects_id: None,
-        status: UsageRecordStatus::Active,
-        created_at: OffsetDateTime::UNIX_EPOCH,
+        accepted_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        origin: RecordOrigin::Live,
+        invalidation: None,
+        window_start: OffsetDateTime::UNIX_EPOCH,
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
     };
     let record_b = UsageRecord {
         // Same tuple-key fields …
@@ -178,13 +189,25 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
         subject_ref: record_a.subject_ref.clone(),
         // … wildly different non-tuple fields:
         id: Uuid::from_u128(0xBBBB),
-        gts_id: UsageTypeGtsId::new(SAMPLE_GTS_ID).expect("valid gts_id"),
+        gts_type_id: MeterTypeId::new(SAMPLE_GTS_TYPE_ID).expect("valid gts_type_id"),
         metadata: BTreeMap::new(),
-        value: Decimal::from(-999),
+        quantity: qty("-999"),
         idempotency_key: IdempotencyKey::new("idem-B-different").expect("valid idempotency key"),
-        corrects_id: Some(Uuid::from_u128(0xCCCC)),
-        status: UsageRecordStatus::Active,
-        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
+        accepted_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(96),
+        // Admitted by the other ingestion path. The attribution tuple is
+        // blind to which route admitted an entry, so an imported record and
+        // a live one sharing the tuple must still collapse onto one PDP
+        // decision.
+        origin: RecordOrigin::Backfill,
+        // The one axis that used to be two fields: record B is a withdrawal
+        // and record A a measurement, and the tuple key must still collapse
+        // them onto one PDP decision.
+        invalidation: Some(Invalidation {
+            target: Uuid::from_u128(0xCCCC),
+            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+        }),
+        window_start: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
+        window_end: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(72),
     };
 
     let key_a = AttributionTupleKey::from_record(&record_a, usage_record::actions::CREATE);
@@ -231,19 +254,27 @@ async fn equal_tuple_keys_produce_equal_pdp_requests_even_when_non_tuple_fields_
 }
 
 /// Same attribution attributes, different `action` MUST NOT hash-equal.
+///
+/// `CREATE` is the only verb that composes a tuple key today — the point
+/// lookup authorizes through `authorize_get_usage_record_scope`, which
+/// builds no key at all — so this pins the struct's identity contract
+/// rather than a request the gear can currently issue. That is the point:
+/// `action` is a field of the key, so a second tuple-keyed verb added
+/// later cannot silently collapse onto `CREATE`'s decision. Drop `action`
+/// from the hash and nothing fails until that verb exists, which is the
+/// wrong time to find out.
 #[test]
 fn different_actions_yield_distinct_tuple_keys_for_same_attribution() {
     let record = record_with(Some(
         SubjectRef::new("sub-action", Some("user")).expect("valid subject"),
     ));
     let create = AttributionTupleKey::from_record(&record, usage_record::actions::CREATE);
-    let deactivate = AttributionTupleKey::from_record(&record, usage_record::actions::DEACTIVATE);
+    let get = AttributionTupleKey::from_record(&record, usage_record::actions::GET);
     assert_ne!(
-        create, deactivate,
-        "action MUST participate in AttributionTupleKey hash/eq; \
-         otherwise a batch mixing CREATE and DEACTIVATE for the same \
-         tuple would share a single PDP decision and silently bypass \
-         per-action policy",
+        create, get,
+        "action MUST participate in AttributionTupleKey hash/eq; without it \
+         a second tuple-keyed verb would share CREATE's PDP decision for the \
+         same attribution tuple and silently bypass per-action policy",
     );
 }
 
@@ -290,6 +321,33 @@ async fn authorize_attribution_tuple_denies_record_outside_granted_tenant() {
     authorize_attribution_tuple(&enforcer, &NoopMetrics, PdpOp::Ingest, &ctx(), &granted_key)
         .await
         .expect("a record owned by the granted tenant is permitted");
+}
+
+/// The `usage_record` action vocabulary, spelled out.
+///
+/// These four strings are a contract against the PDP policy bundle and
+/// against `gts/permissions.rs`, which derives one permission instance per
+/// action: renaming a constant here silently re-points a deployed grant at
+/// a verb no policy mentions, and the compiler cannot see it because both
+/// sides read the same constant. So the literals are pinned here, once,
+/// where a rename shows up as a diff a reviewer must justify.
+///
+/// Distinctness follows from the literal list rather than being asserted
+/// separately — four distinct literals cannot collapse — but it is the
+/// property that matters: two constants sharing one string would give two
+/// permissions the same `(resource_type, action)` pair, and
+/// `AttributionTupleKey`'s action-aware hash would stop separating them.
+/// That hash contract is pinned by
+/// [`different_actions_yield_distinct_tuple_keys_for_same_attribution`].
+#[test]
+fn the_usage_record_action_vocabulary_is_four_distinct_spellings() {
+    let actions = [
+        usage_record::actions::CREATE,
+        usage_record::actions::GET,
+        usage_record::actions::LIST,
+        usage_record::actions::BACKFILL,
+    ];
+    assert_eq!(actions, ["create", "get", "list", "backfill"]);
 }
 
 // ---------------------------------------------------------------------------

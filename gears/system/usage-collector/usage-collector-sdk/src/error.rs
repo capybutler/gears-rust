@@ -4,26 +4,63 @@
 //!
 //! - [`UsageCollectorError`] — public envelope returned by every
 //!   [`crate::api::UsageCollectorClientV1`] method. A flat, AIP-193-shaped
-//!   set of **seven category variants**: the discriminator
-//!   inside a category is a typed [`crate::reason`] sub-enum
-//!   ([`ValidationReason`] / [`ConflictReason`]) rather than a dedicated
-//!   variant per failure.
+//!   set of **eight category variants**: the discriminator
+//!   inside a category is normally a typed [`crate::reason`] sub-enum
+//!   ([`ValidationReason`], [`ConflictReason`], [`NotFoundReason`]) rather
+//!   than a dedicated variant per failure. The exception is
+//!   [`UsageCollectorError::CursorRejected`], the one 400 whose wire code
+//!   belongs to `toolkit_odata` rather than to this gear (Spec §3.13): it
+//!   is a dedicated variant, its discriminator is the upstream
+//!   `toolkit_odata::Error` it carries, and it carries no `resource_type`
+//!   of its own.
 //! - [`UsageCollectorPluginError`] — plugin-side vocabulary returned by
 //!   every [`crate::plugin_api::UsageCollectorPluginV1`] method.
 //!
 //! This crate does NOT depend on `toolkit-canonical-errors`; the host crate
 //! owns the lift to RFC-9457 `Problem` at the REST boundary. The category +
-//! typed reason + `resource_type` carried here are exactly what the lift
-//! projects onto the canonical envelope, so callers dispatch on the variant
-//! (and, within a category, the typed reason) rather than parsing strings.
+//! typed reason + `resource_type` carried here are what the lift projects
+//! onto the canonical envelope, so callers dispatch on the variant (and,
+//! within a category, the typed reason) rather than parsing strings — with
+//! one reason deliberately held back from the wire: [`NotFoundReason`]
+//! reaches in-process consumers but is not projected, because the
+//! platform-shared `toolkit_canonical_errors::NotFoundV1` context has no
+//! reason slot to project it onto.
+//! `CursorRejected` is again the exception on both counts: the lift reads
+//! its wire `field` and `reason` off the upstream error and supplies the
+//! `USAGE_RECORD_RESOURCE` scope itself, since the variant has none to
+//! carry.
 
-use rust_decimal::Decimal;
 use thiserror::Error;
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-use crate::gts::{USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE};
-use crate::models::{AggregationOp, UsageKind, UsageTypeGtsId};
-use crate::reason::{ConflictReason, ValidationReason};
+use crate::gts::USAGE_RECORD_RESOURCE;
+use crate::models::{BACKFILL_ROUTE_PATH, MeterTypeId, WINDOW_END_FIELD};
+use crate::reason::{ConflictReason, NotFoundReason, ValidationReason};
+
+/// Renders an instant the way a caller-facing `detail` must echo it: RFC
+/// 3339, matching the wire `Timestamp` contract.
+///
+/// [`OffsetDateTime`]'s own `Display` is space-separated, unpadded, and
+/// offset-suffixed rather than `Z` (`2023-11-15 1:43:20.0 +00:00:00`), so it
+/// echoes back neither what the caller sent nor anything they could
+/// resubmit. Every timestamp-bearing constructor below routes through here
+/// so no single one can drift back onto `Display`.
+///
+/// Formatting can fail, and on the *value* rather than the descriptor:
+/// [`Rfc3339`] rejects a year outside `0..10_000` and an offset carrying
+/// non-zero seconds, both of which an in-process caller can construct even
+/// though no RFC 3339 wire payload can express either. So the fallback is a
+/// genuine last resort, not dead code — it trades a panic for a `Display`
+/// rendering that is at least self-consistent. Callers reduce how often it
+/// can be reached by normalizing to UTC before constructing the error,
+/// which is what [`crate::CreateUsageRecord::try_into_usage_record`] does.
+fn rfc3339(instant: OffsetDateTime) -> String {
+    instant
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| instant.to_string())
+}
 
 /// Public error envelope for the Usage Collector SDK and REST surfaces.
 #[derive(Debug, Error)]
@@ -43,18 +80,20 @@ pub enum UsageCollectorError {
     /// the attributed request field, `reason` the typed
     /// [`ValidationReason`] discriminator, and `detail` the wire
     /// `field_violations[0].description`. `resource_type` identifies the GTS
-    /// resource the violation is about (a `gts_id`-shaped field violation
-    /// attributes to the usage type even on the ingestion surface);
-    /// `resource_name`, when present, is the offending `gts_id`.
+    /// resource the violation is about (a `gts_type_id`-shaped field
+    /// violation attributes to the referenced meter even on the ingestion
+    /// surface); `resource_name`, when present, is the offending identifier.
     #[error("invalid argument [{field}/{reason}]: {detail}")]
     InvalidArgument {
-        /// GTS resource type — [`USAGE_TYPE_RESOURCE`] or
-        /// [`USAGE_RECORD_RESOURCE`].
+        /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
-        /// Offending resource name (`gts_id`), when the violation is about a
-        /// specific resource; `None` otherwise.
+        /// The offending identifier, when the violation is about a
+        /// specific resource; `None` otherwise. Which identifier depends on
+        /// what the violation is about: a `gts_id` for a meter-shaped
+        /// violation, the target's `UsageRecord.id` for one about an
+        /// invalidation's target.
         resource_name: Option<String>,
-        /// Attributed request field (`value`, `records`, `metadata`, …).
+        /// Attributed request field (`quantity`, `records`, `metadata`, …).
         field: String,
         /// Typed `field_violations[0].reason` discriminator.
         reason: ValidationReason,
@@ -62,15 +101,51 @@ pub enum UsageCollectorError {
         detail: String,
     },
 
+    /// A continuation token refused by the gear, carrying the wire code
+    /// `toolkit_odata` owns.
+    ///
+    /// Spec §3.13 gives `INVALID_CURSOR`, `FILTER_MISMATCH` and
+    /// `ORDER_WITH_CURSOR` to `toolkit_odata`: the gear no longer
+    /// originates any of them, because a second declaration is a second
+    /// place the same code can be read and disagree. `source` is the
+    /// upstream error and is the only thing that decides the wire `field`
+    /// and `reason`; the host lift obtains both by converting it.
+    ///
+    /// `detail` is the gear's own, and is why this variant carries two
+    /// things rather than one. Upstream's descriptions name the condition
+    /// but not the recovery: `FilterMismatch` renders as "Filter mismatch
+    /// between cursor and query", which tells a caller nothing about
+    /// resending the query. The gear knows which of its checks refused and
+    /// how the caller gets moving again, so propagating the bare upstream
+    /// error would satisfy the naming rule by discarding the guidance —
+    /// the code comes from upstream and the prose stays here.
+    #[error("cursor rejected [{source}]: {detail}")]
+    CursorRejected {
+        /// The upstream cursor error. Sole source of the wire `field` and
+        /// `reason`.
+        source: toolkit_odata::Error,
+        /// Gear-authored caller guidance, rendered as the violation
+        /// description.
+        detail: String,
+    },
+
     /// Referenced resource not found (HTTP 404). `resource_type` is the GTS
-    /// type, `name` the raw identifier (`gts_id` or record UUID).
+    /// type, `name` the raw identifier (a `gts_type_id` or a record UUID),
+    /// and `reason` says which lookup failed.
     #[error("not found [{resource_type}]: {detail}")]
     NotFound {
-        /// GTS resource type — [`USAGE_TYPE_RESOURCE`] or
-        /// [`USAGE_RECORD_RESOURCE`].
+        /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
         /// Raw identifier whose row was not present.
         name: String,
+        /// Which lookup failed. **Not projected onto the wire:** an
+        /// in-process consumer reads it, but the platform-shared
+        /// `toolkit_canonical_errors::NotFoundV1` context has no reason
+        /// slot, so the host lift drops it and a REST client still tells
+        /// the cases apart only by `detail`. It exists so the gear can
+        /// classify its own metric labels without matching a substring of
+        /// caller-facing prose.
+        reason: NotFoundReason,
         /// Wire `detail` message.
         detail: String,
     },
@@ -79,7 +154,7 @@ pub enum UsageCollectorError {
     /// resubmission is idempotent and returns the stored row on `Ok`.
     #[error("already exists [{resource_type}]: {detail}")]
     AlreadyExists {
-        /// GTS resource type — [`USAGE_TYPE_RESOURCE`].
+        /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
         /// Raw identifier (`gts_id`) that collided.
         name: String,
@@ -93,13 +168,18 @@ pub enum UsageCollectorError {
     /// `name` identify the row involved.
     #[error("conflict [{reason}]: {detail}")]
     Conflict {
-        /// GTS resource type — [`USAGE_TYPE_RESOURCE`] or
-        /// [`USAGE_RECORD_RESOURCE`].
+        /// GTS resource type — [`USAGE_RECORD_RESOURCE`].
         resource_type: String,
         /// Raw identifier of the row involved (`gts_id` / record UUID).
         name: String,
         /// Typed `context.reason` discriminator.
         reason: ConflictReason,
+        /// For [`ConflictReason::AlreadyInvalidated`]: the stored invalidation
+        /// that already withdrew the target. `None` for every other reason.
+        invalidated_by: Option<Uuid>,
+        /// For [`ConflictReason::AlreadyInvalidated`]: the reason code the stored
+        /// invalidation carries. `None` for every other reason.
+        reason_code: Option<crate::models::ReasonCode>,
         /// Wire `detail` message.
         detail: String,
     },
@@ -139,30 +219,6 @@ impl UsageCollectorError {
 
     // ── InvalidArgument (400) ───────────────────────────────────────────
 
-    /// Counter ordinary record carried a negative value (`value >= 0`).
-    #[must_use]
-    pub fn negative_counter_value(value: Decimal) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "value".to_owned(),
-            reason: ValidationReason::SemanticsViolation,
-            detail: format!("counter ordinary record requires value >= 0 (got {value})"),
-        }
-    }
-
-    /// Counter compensation row carried a non-negative value (`value < 0`).
-    #[must_use]
-    pub fn non_negative_counter_compensation(value: Decimal) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "value".to_owned(),
-            reason: ValidationReason::SemanticsViolation,
-            detail: format!("counter compensation requires value < 0 (got {value})"),
-        }
-    }
-
     /// Batch submission size out of bounds (empty or over the per-call cap).
     #[must_use]
     pub fn invalid_batch_size(actual: usize, min: usize, max: usize) -> Self {
@@ -172,6 +228,19 @@ impl UsageCollectorError {
             field: "records".to_owned(),
             reason: ValidationReason::Validation,
             detail: format!("batch size {actual} out of bounds (expected [{min}, {max}])"),
+        }
+    }
+
+    /// A quantity outside the published `UsageQuantity` range or precision.
+    /// `field` is `quantity`.
+    #[must_use]
+    pub fn quantity_out_of_range(detail: impl Into<String>) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "quantity".to_owned(),
+            reason: ValidationReason::QuantityOutOfRange,
+            detail: detail.into(),
         }
     }
 
@@ -187,56 +256,152 @@ impl UsageCollectorError {
         }
     }
 
-    /// `CreateUsageType.metadata_fields[index]` was not a well-formed
-    /// metadata key. `empty` selects the empty-string vs. invalid-key reason.
+    /// A covered-period bound carried finer than microsecond precision.
+    ///
+    /// The `detail` names the offending bound, echoes it back in a form the
+    /// caller can resubmit, and states the remedy, because the caller's
+    /// only route forward is to round the value themselves — the gear
+    /// deliberately will not do it for them.
     #[must_use]
-    pub fn invalid_metadata_field(index: usize, empty: bool) -> Self {
-        let reason = if empty {
-            ValidationReason::MetadataFieldEmptyString
-        } else {
-            ValidationReason::MetadataFieldInvalidKey
-        };
-        let wire = reason.as_wire().to_owned();
-        Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: None,
-            field: format!("metadata_fields[{index}]"),
-            reason,
-            detail: format!("metadata_fields[{index}] rejected: {wire}"),
-        }
-    }
-
-    /// Duplicate entry in `CreateUsageType.metadata_fields`.
-    #[must_use]
-    pub fn duplicate_metadata_field(index: usize) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: None,
-            field: format!("metadata_fields[{index}]"),
-            reason: ValidationReason::MetadataFieldDuplicate,
-            detail: format!("metadata_fields[{index}] is a duplicate entry"),
-        }
-    }
-
-    /// A raw / aggregated query omitted the mandatory bounded `created_at`
-    /// window.
-    #[must_use]
-    pub fn missing_time_window() -> Self {
+    pub fn sub_microsecond_period_bound(field: &str, bound: OffsetDateTime) -> Self {
         Self::InvalidArgument {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: None,
-            field: "$filter".to_owned(),
-            reason: ValidationReason::MissingTimeWindow,
-            detail: "query requires a bounded created_at window: supply both a lower \
-                     (created_at ge|gt ...) and an upper (created_at le|lt ...) bound as \
-                     top-level $filter conjuncts"
-                .to_owned(),
+            field: field.to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "covered-period bound `{field}` requires at most microsecond \
+                 precision (got {}, carrying {} ns); round the bound to the \
+                 microsecond before submitting — the entry identity \
+                 derivation reads a fixed-width microsecond form, so a finer \
+                 value is rejected rather than truncated",
+                rfc3339(bound),
+                bound.nanosecond(),
+            ),
+        }
+    }
+
+    /// The covered period was inverted (`window_end < window_start`).
+    ///
+    /// Attributed to `window_end` rather than to the period as a whole: the
+    /// period is not a wire field, and the end is the bound a caller
+    /// computes from the start.
+    #[must_use]
+    pub fn inverted_covered_period(
+        window_start: OffsetDateTime,
+        window_end: OffsetDateTime,
+    ) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: WINDOW_END_FIELD.to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "covered period requires window_start <= window_end (got \
+                 window_start={}, window_end={}); equal bounds are a point \
+                 event and are valid",
+                rfc3339(window_start),
+                rfc3339(window_end),
+            ),
+        }
+    }
+
+    /// The covered period ends beyond the ingestion path's future tolerance.
+    ///
+    /// Raised on **both** routes: the backfill route lifts the past bound
+    /// and nothing else, so the detail deliberately does not mention it.
+    /// Pointing a clock-skewed emitter at the backfill route would send a
+    /// defect somewhere it is just as invalid.
+    #[must_use]
+    pub fn covered_period_beyond_future_tolerance(
+        window_end: OffsetDateTime,
+        now: OffsetDateTime,
+        tolerance: Duration,
+    ) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: WINDOW_END_FIELD.to_owned(),
+            reason: ValidationReason::FutureWindow,
+            detail: format!(
+                "covered period ends at {}, more than {tolerance} after now \
+                 ({}); every ingestion path admits only a period ending \
+                 within that tolerance of the present",
+                rfc3339(window_end),
+                rfc3339(now),
+            ),
+        }
+    }
+
+    /// The covered period ends beyond the live path's past tolerance.
+    ///
+    /// The detail names the backfill route on both surfaces, per
+    /// `cpt-cf-usage-collector-adr-backfill-isolation`: "The rejection names
+    /// the route, and both surfaces carry it." A REST caller needs the path
+    /// and an in-process caller needs the method, and a URL tells the
+    /// latter nothing.
+    ///
+    /// It says "entry" rather than "record" because the same rejection
+    /// meets an invalidation withdrawing a closed period — which is the
+    /// ordinary case for a correction, not a rare one.
+    #[must_use]
+    pub fn covered_period_before_past_tolerance(
+        window_end: OffsetDateTime,
+        now: OffsetDateTime,
+        tolerance: Duration,
+    ) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: WINDOW_END_FIELD.to_owned(),
+            reason: ValidationReason::PastWindow,
+            detail: format!(
+                "covered period ends at {}, more than {tolerance} before now \
+                 ({}); the live path admits only a period ending within that \
+                 tolerance. Submit this entry on the backfill route instead \
+                 — `POST {BACKFILL_ROUTE_PATH}`, or `backfill_usage_records` \
+                 on the SDK trait",
+                rfc3339(window_end),
+                rfc3339(now),
+            ),
+        }
+    }
+
+    /// A read-path time range was empty or inverted (`to <= from`).
+    ///
+    /// [`crate::TimeRange`] is mandatory on both range-taking read paths
+    /// (the point lookup selects by `id` and takes none) and selects an
+    /// entry when `from <= window_end < to`
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`), so a range that
+    /// is not strictly ordered selects nothing whatever is stored.
+    /// Rejecting it here names the caller's mistake instead of reporting an
+    /// empty result that would read as "no usage".
+    #[must_use]
+    pub fn invalid_time_range(from: OffsetDateTime, to: OffsetDateTime) -> Self {
+        let from = rfc3339(from);
+        let to = rfc3339(to);
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            // `field` names the range as a whole rather than either bound:
+            // both parsed, and the ordering between them is what failed.
+            // The constructor is shared by both read paths and cannot know
+            // which carrier the caller used, so the detail names both —
+            // `field` alone would name nothing a raw-path caller sent.
+            field: "time_range".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "time range requires from < to (got from={from}, to={to}); supply a \
+                 lower bound strictly before the upper bound. The range arrives as \
+                 the `from` / `to` query parameters on the raw path and as \
+                 `time_range` in the aggregate request body"
+            ),
         }
     }
 
     /// An aggregated query produced more than `cap`
     /// ([`crate::MAX_AGGREGATION_BUCKETS`]) buckets — a high-cardinality
-    /// `group_by` (e.g. a per-record metadata key) over a wide window. The
+    /// `group_by` (e.g. a per-record metadata key) over a wide range. The
     /// plugin bounds its own scan to `cap + 1` rows (memory guard); the gateway
     /// rejects the over-cap result as this client-fixable `400`.
     #[must_use]
@@ -248,32 +413,37 @@ impl UsageCollectorError {
             reason: ValidationReason::AggregationResultTooLarge,
             detail: format!(
                 "aggregated query produced more than {cap} groups; narrow the \
-                 created_at window or drop a high-cardinality group_by dimension"
+                 time range or drop a high-cardinality group_by dimension"
             ),
         }
     }
 
-    /// `UsageTypeGtsId::new` rejected `raw` — malformed / wrong-base `gts_id`.
+    /// `MeterTypeId::new` rejected `raw` — malformed, wrong-base, or
+    /// multi-segment `gts_type_id`.
     #[must_use]
-    pub fn invalid_usage_type_gts_id(raw: &str, reason: &str) -> Self {
+    pub fn invalid_meter_type_id(raw: &str, reason: &str) -> Self {
         Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: None,
-            field: "gts_id".to_owned(),
+            field: "gts_type_id".to_owned(),
             reason: ValidationReason::InvalidBaseGtsId,
-            detail: format!("gts_id `{raw}` rejected: {reason}"),
+            detail: format!("gts_type_id `{raw}` rejected: {reason}"),
         }
     }
 
-    /// `UsageKind::from_str` received a string other than `counter`/`gauge`.
+    /// `AggregationFold::from_str` received a string outside the declared
+    /// set. Raised when a resolved declaration names a fold this major
+    /// version does not serve.
     #[must_use]
-    pub fn invalid_usage_kind(raw: &str) -> Self {
+    pub fn invalid_aggregation_fold(raw: &str) -> Self {
         Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             resource_name: None,
-            field: "kind".to_owned(),
+            field: "aggregation_fold".to_owned(),
             reason: ValidationReason::Validation,
-            detail: format!("unknown usage kind `{raw}`; expected `counter` or `gauge`"),
+            detail: format!(
+                "unknown aggregation fold `{raw}`; expected one of SUM, COUNT, MAX, MIN, LATEST"
+            ),
         }
     }
 
@@ -321,139 +491,358 @@ impl UsageCollectorError {
         Self::newtype_validation("idempotency_key", detail)
     }
 
-    /// Compensation submitted against a gauge usage type. Emitted on the
-    /// ingestion surface, so the wire `resource_type` is the usage **record**
-    /// resource, with `resource_name` carrying the offending gauge `gts_id`
-    /// (`field` = `corrects_id`).
+    /// `ReasonCode::new` rejected the input. `field` is `reason_code`.
     #[must_use]
-    pub fn gauge_compensation_rejected(gts_id: &UsageTypeGtsId) -> Self {
+    pub fn invalid_reason_code(detail: impl Into<String>) -> Self {
+        Self::newtype_validation("reason_code", detail)
+    }
+
+    /// A caller key began with the reserved `inv:` prefix. `field` is
+    /// `idempotency_key`.
+    #[must_use]
+    pub fn reserved_idempotency_key_prefix() -> Self {
         Self::InvalidArgument {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: Some(gts_id.as_ref().to_owned()),
-            field: "corrects_id".to_owned(),
-            reason: ValidationReason::GaugeCompensationRejected,
-            detail: format!("compensation against gauge usage type {gts_id} is rejected"),
+            resource_name: None,
+            field: "idempotency_key".to_owned(),
+            reason: ValidationReason::ReservedKeyPrefix,
+            detail: "idempotency_key must not begin with `inv:`, which is reserved for the \
+                     keys the gateway derives for invalidations"
+                .to_owned(),
         }
     }
 
-    /// Aggregation op requested against a usage kind that does not admit it
-    /// (`SUM` on a gauge, or `MIN`/`MAX`/`AVG` on a counter). Attributes to
-    /// the usage-type resource with the offending `gts_id` as `resource_name`
-    /// and the aggregation operator field as `field`.
+    /// An invalidation carried an idempotency key. `field` is
+    /// `idempotency_key`.
     #[must_use]
-    pub fn aggregation_op_not_allowed_for_kind(
-        op: AggregationOp,
-        kind: UsageKind,
-        gts_id: &UsageTypeGtsId,
-    ) -> Self {
-        let op_str = match op {
-            AggregationOp::Sum => "sum",
-            AggregationOp::Count => "count",
-            AggregationOp::Min => "min",
-            AggregationOp::Max => "max",
-            AggregationOp::Avg => "avg",
-        };
-        let (kind_str, allowed) = match kind {
-            UsageKind::Counter => ("counter", "sum, count"),
-            UsageKind::Gauge => ("gauge", "min, max, avg, count"),
-        };
+    pub fn idempotency_key_on_invalidation() -> Self {
         Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: Some(gts_id.as_ref().to_owned()),
-            field: "aggregation.op".to_owned(),
-            reason: ValidationReason::OpNotAllowedForKind,
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "idempotency_key".to_owned(),
+            reason: ValidationReason::KeyOnInvalidation,
+            detail: "an invalidation carries no idempotency_key: the gateway derives \
+                     `inv:<invalidates>`, so omit it"
+                .to_owned(),
+        }
+    }
+
+    /// A record carried no idempotency key. `field` is `idempotency_key`.
+    #[must_use]
+    pub fn missing_idempotency_key() -> Self {
+        Self::newtype_validation("idempotency_key", "idempotency_key is required on a record")
+    }
+
+    /// An attribution component exceeded its character cap. `field` is the
+    /// component's dotted path, e.g. `resource_ref.resource_id`.
+    #[must_use]
+    pub fn attribution_too_long(field: &str, max: usize) -> Self {
+        Self::newtype_validation(field, format!("{field} must be at most {max} characters"))
+    }
+
+    /// Ingestion supplied a metadata key not declared in the referenced
+    /// meter's resolved closed `metadata_fields`. Attributed to the record
+    /// resource, with `resource_name` carrying the offending `gts_type_id`.
+    #[must_use]
+    pub fn unknown_metadata_key(gts_type_id: &MeterTypeId, key: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: Some(gts_type_id.as_ref().to_owned()),
+            field: "metadata".to_owned(),
+            reason: ValidationReason::UnknownMetadataKey,
+            detail: format!("unknown metadata key '{key}' for meter {gts_type_id}"),
+        }
+    }
+
+    /// A `$filter` predicate named a field reserved to a typed parameter
+    /// (`gts_type_id`, or the covered-period bounds `window_start` /
+    /// `window_end`). Each already travels as a typed parameter alongside
+    /// `$filter`, so a predicate naming one in `$filter` would express a
+    /// second, possibly contradictory, constraint on something already
+    /// fixed — rejected rather than silently honored. Attributed to
+    /// `$filter`.
+    #[must_use]
+    pub fn reserved_filter_field(field: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "$filter".to_owned(),
+            reason: ValidationReason::Validation,
             detail: format!(
-                "aggregation op `{op_str}` is not valid for {kind_str} usage type \
-                 {gts_id}; {kind_str} allows {{{allowed}}}"
+                "'{field}' is reserved and cannot be named in $filter: it travels \
+                 as a typed parameter, not a filterable property"
             ),
         }
     }
 
-    /// Ingestion supplied a metadata key not declared in the usage type's
-    /// closed `metadata_fields`. Attributes to the usage type resource.
+    /// A caller order mixed sort directions across its keys. The keyset
+    /// continuation is a row-value tuple comparison, which only composes
+    /// over a single direction, so a mixed-direction order can never
+    /// become a usable keyset — it is refused rather than forwarded to a
+    /// plugin that would reject it late and unspecifically. Attributed to
+    /// `$orderby`, the surface a caller names an order on, and naming the
+    /// first key whose direction deviates so the caller can see which of
+    /// their keys to flip.
     #[must_use]
-    pub fn unknown_metadata_key(gts_id: &UsageTypeGtsId, key: &str) -> Self {
+    pub fn mixed_direction_order(deviating_field: &str) -> Self {
         Self::InvalidArgument {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            resource_name: Some(gts_id.as_ref().to_owned()),
-            field: "metadata".to_owned(),
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "$orderby".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "order keys must all share one sort direction, but \
+                 '{deviating_field}' sorts against the first key: keyset \
+                 pagination is a row-value tuple comparison and cannot \
+                 compose a mixed-direction tuple"
+            ),
+        }
+    }
+
+    /// A caller order named a key that is not sound to paginate on — a
+    /// domain-optional attribute, one derived from an optional attribute,
+    /// or a name that is not a record attribute at all. Every caller key
+    /// leads the effective keyset, and a row-value tuple whose leading
+    /// column is NULL compares as NULL, so NULL-keyed rows would silently
+    /// drop out of the page; a derived attribute is one the SDK guarantees
+    /// no plugin holds a key for. The
+    /// classification is [`crate::is_keyset_safe_record_field`], which is
+    /// a fail-closed allowlist — hence the same rejection for an unknown
+    /// name. Attributed to `$orderby`, and naming the whole admissible set
+    /// — [`crate::KEYSET_SAFE_RECORD_FIELDS`] is closed and short, so the
+    /// caller is told what they may order by instead of only what they may
+    /// not.
+    #[must_use]
+    pub fn inadmissible_order_key(field: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: "$orderby".to_owned(),
+            reason: ValidationReason::Validation,
+            detail: format!(
+                "order key '{field}' is not supported: keyset pagination needs a \
+                 record attribute present on every entry in its own right, so an \
+                 optional or derived attribute, or an unrecognised name, is \
+                 refused; order by one of {:?}",
+                crate::KEYSET_SAFE_RECORD_FIELDS,
+            ),
+        }
+    }
+
+    /// A continuation token's bound order is not a usable keyset.
+    ///
+    /// A cursor request carries its keyset in the token, so by the time the
+    /// read path sees it there is nothing left to normalize: the order
+    /// either already is the keyset the page was minted under, or the token
+    /// did not come from a conforming plugin. Appending a missing key would
+    /// leave the order wider than the boundary values the token carries and
+    /// hand the plugin a misaligned continuation — a silently wrong page,
+    /// where refusing is merely a refused one.
+    ///
+    /// The field and the wire code are not chosen here. This carries
+    /// `toolkit_odata`'s own `InvalidCursor`, and the host lift converts it
+    /// to obtain both — so the attribution to `cursor` and the code the
+    /// caller reads are upstream's decode failures' attribution and code by
+    /// construction, not by a matching pair of declarations that could
+    /// drift apart (Spec §3.13).
+    ///
+    /// The detail names the defect and the recovery, and deliberately does
+    /// not blame a component: a token can be forged, truncated or replayed
+    /// by the caller just as easily as mis-minted by a plugin, and the
+    /// caller can act on neither hypothesis. The plugin-conformance
+    /// reading belongs in the operator log at the refusal site.
+    #[must_use]
+    pub fn inadmissible_cursor_keyset(defect: impl Into<String>) -> Self {
+        let defect = defect.into();
+        Self::CursorRejected {
+            source: toolkit_odata::Error::InvalidCursor,
+            detail: format!(
+                "the cursor's bound order is not a usable keyset ({defect}); \
+                 restart pagination without a cursor"
+            ),
+        }
+    }
+
+    /// A continuation token was minted over a different query than the
+    /// request carrying it.
+    ///
+    /// `CursorV1::f` exists so a caller who changes their query between
+    /// pages is refused rather than served a keyset continuation that means
+    /// nothing over their new row set — and a wrong page is a `200`, so
+    /// nothing else in the stack would notice. The bound query is every
+    /// input that selects rows: the caller's `$filter` and the three typed
+    /// parameters — `gts_type_id`, the read range, and `metadata_filter`.
+    /// None of the three is a `$filter` conjunct, so each has to enter the
+    /// fingerprint explicitly; otherwise a page-2 request could carry the
+    /// same cursor against a different meter, range or metadata filter and
+    /// be served.
+    ///
+    /// This carries `toolkit_odata`'s own `FilterMismatch`, and the host
+    /// lift converts it to obtain the wire field and code; the gear spells
+    /// neither (Spec §3.13). Reusing upstream's filter-hash comparison
+    /// rather than minting a gear code is also the right classification: a
+    /// changed range, meter or metadata filter is a changed query from the
+    /// caller's side, and a new code per typed parameter would split one
+    /// caller-visible condition across four.
+    ///
+    /// The detail names the recovery rather than the mismatching value: the
+    /// fingerprint is opaque and a caller can do nothing with either half
+    /// of the comparison.
+    #[must_use]
+    pub fn cursor_query_mismatch() -> Self {
+        Self::CursorRejected {
+            source: toolkit_odata::Error::FilterMismatch,
+            detail: "the cursor was minted over a different query: continue a page by \
+                     resending the same request, cursor apart, or restart pagination \
+                     without a cursor. The cursor binds `gts_type_id`, the `from` / \
+                     `to` range, `$filter` and every `metadata.<key>` filter, so \
+                     changing any of them invalidates it"
+                .to_owned(),
+        }
+    }
+
+    /// A `group_by` dimension named a metadata key the queried meter's
+    /// resolved declaration does not declare. The admissible `group_by`
+    /// surface is recomputed per request from the declaration (Spec §3.11),
+    /// so this can never be satisfied by adjusting a stale cache — only by
+    /// naming a key the declaration actually carries. Attributed to
+    /// `group_by`, with `resource_name` carrying the offending
+    /// `gts_type_id` — the same operator-log shape as
+    /// [`Self::unknown_metadata_key`].
+    #[must_use]
+    pub fn undeclared_metadata_dimension(gts_type_id: &MeterTypeId, key: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: Some(gts_type_id.as_ref().to_owned()),
+            field: "group_by".to_owned(),
             reason: ValidationReason::UnknownMetadataKey,
-            detail: format!("unknown metadata key '{key}' for usage type {gts_id}"),
+            detail: format!(
+                "unknown metadata key '{key}' in group_by for meter {gts_type_id}: not declared"
+            ),
+        }
+    }
+
+    /// A REST submission carried a reference without a reason code, or the
+    /// reverse. The two are both-or-neither
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`): the
+    /// reference is what makes the entry an invalidation, and the reason
+    /// carries the intent, so half the pair describes nothing. `field`
+    /// names the **missing** half, which is the one the caller has to add.
+    ///
+    /// Reachable from the REST fold point alone. The domain carries the
+    /// pair as one [`crate::Invalidation`], so an in-process caller cannot
+    /// construct the shape this rejects, and nothing downstream of the fold
+    /// re-checks it — the host's `record_request_into_domain` is its only
+    /// caller, raising it from two call sites, one per direction of the
+    /// half-shape.
+    #[must_use]
+    pub fn invalidation_reference_incomplete(missing_field: &str) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: None,
+            field: missing_field.to_owned(),
+            reason: ValidationReason::InvalidationReferenceIncomplete,
+            detail: format!(
+                "an invalidation carries both a target reference and a reason code; \
+                 `{missing_field}` is missing"
+            ),
+        }
+    }
+
+    /// An invalidation's target was itself an invalidation. A correction
+    /// cannot be reversed: withdrawal applies to measurements, so the
+    /// entry that withdrew one is not itself withdrawable. The separate
+    /// cap of one withdrawal per entry follows from the derived
+    /// `inv:<target>` key ([`Self::already_invalidated`]), not from this check.
+    #[must_use]
+    pub fn invalidation_target_not_record(target: Uuid) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: Some(target.to_string()),
+            field: "invalidates".to_owned(),
+            reason: ValidationReason::InvalidationTargetNotRecord,
+            detail: format!("invalidates {target} references an invalidation, not a record"),
+        }
+    }
+
+    /// An invalidation departed from its target in a field it must copy.
+    ///
+    /// `field` names **the field that differs**, which is the whole point
+    /// of the diagnostic: the entry is a faithful copy in every
+    /// caller-supplied field, departing only in its derived `inv:<target>`
+    /// idempotency key, `invalidates` and `reason_code`, so a rejection
+    /// that only said "mismatch" would leave the emitter diffing two
+    /// payloads by hand.
+    #[must_use]
+    pub fn invalidation_field_mismatch(field: &str, target: Uuid) -> Self {
+        Self::InvalidArgument {
+            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+            resource_name: Some(target.to_string()),
+            field: field.to_owned(),
+            reason: ValidationReason::InvalidationFieldMismatch,
+            detail: format!(
+                "`{field}` differs from usage record {target}; an invalidation copies every \
+                 caller-supplied field of the entry it withdraws"
+            ),
         }
     }
 
     // ── NotFound (404) ──────────────────────────────────────────────────
 
-    /// Catalog `gts_id` not present (catalog admin op, ingestion, or query).
-    #[must_use]
-    pub fn usage_type_not_found(gts_id: &UsageTypeGtsId) -> Self {
-        Self::NotFound {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            name: gts_id.as_ref().to_owned(),
-            detail: format!("usage type not found: {gts_id}"),
-        }
-    }
-
-    /// Deactivation / get referenced a `UsageRecord.id` that does not exist.
+    /// A lookup referenced a `UsageRecord.id` that does not exist.
     #[must_use]
     pub fn usage_record_not_found(id: Uuid) -> Self {
         Self::NotFound {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             name: id.to_string(),
+            reason: NotFoundReason::UsageRecordNotFound,
             detail: format!("usage record not found: {id}"),
         }
     }
 
-    /// A compensation's `corrects_id` referenced a row that does not exist.
-    /// (Collapsed into the record `NotFound` category — no distinct wire
-    /// `context.reason`; the `detail` text carries the human distinction.)
+    /// An invalidation's `invalidates` resolved to nothing.
+    ///
+    /// `NotFound` rather than a conflict: the reference names an entry the
+    /// ledger does not hold. `name` carries the target uuid, and
+    /// [`NotFoundReason::InvalidationTargetNotFound`] is what separates this
+    /// in-process from the other `NotFound` a submission can raise. That
+    /// discriminator does not reach the wire — the 404 envelope has no
+    /// `context.reason` slot — so a *client* telling the cases apart still
+    /// has only the `detail` text to do it with.
     #[must_use]
-    pub fn corrects_id_not_found(corrects_id: Uuid) -> Self {
+    pub fn invalidation_target_not_found(target: Uuid) -> Self {
         Self::NotFound {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: corrects_id.to_string(),
-            detail: format!(
-                "corrects_id {corrects_id} does not reference an existing usage record"
-            ),
-        }
-    }
-
-    // ── AlreadyExists (409) ─────────────────────────────────────────────
-
-    /// `create_usage_type` collided with an existing, payload-different row.
-    #[must_use]
-    pub fn usage_type_already_exists(gts_id: &UsageTypeGtsId) -> Self {
-        Self::AlreadyExists {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            name: gts_id.as_ref().to_owned(),
-            detail: format!("usage type already exists: {gts_id}"),
+            name: target.to_string(),
+            reason: NotFoundReason::InvalidationTargetNotFound,
+            detail: format!("invalidates {target} does not reference an existing usage record"),
         }
     }
 
     // ── Conflict / Aborted (409) ────────────────────────────────────────
 
-    /// `delete_usage_type` refused: still referenced by `sample_ref_count`
-    /// samples (at least `1`).
+    /// A second invalidation of a record under a reason code other than the
+    /// stored one: the dedup conflict of an invalidation. Every invalidation of
+    /// one record shares the derived `inv:<target>` key, so the store reports an
+    /// ordinary `IdempotencyConflict`, and the gateway, knowing the dispatched
+    /// entry is an invalidation, reports it as this. `name` is the target;
+    /// `invalidated_by` and `reason_code` name the invalidation in place.
     #[must_use]
-    pub fn usage_type_referenced(gts_id: &UsageTypeGtsId, sample_ref_count: u64) -> Self {
-        Self::Conflict {
-            resource_type: USAGE_TYPE_RESOURCE.to_owned(),
-            name: gts_id.as_ref().to_owned(),
-            reason: ConflictReason::UsageTypeReferenced,
-            detail: format!(
-                "usage type {gts_id} is still referenced by {sample_ref_count} samples"
-            ),
-        }
-    }
-
-    /// Deactivation targeted a record whose status was already `Inactive`.
-    #[must_use]
-    pub fn already_inactive(id: Uuid) -> Self {
+    pub fn already_invalidated(
+        target: Uuid,
+        invalidated_by: Uuid,
+        reason_code: crate::models::ReasonCode,
+    ) -> Self {
         Self::Conflict {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: id.to_string(),
-            reason: ConflictReason::AlreadyInactive,
-            detail: format!("usage record already inactive: {id}"),
+            name: target.to_string(),
+            reason: ConflictReason::AlreadyInvalidated,
+            detail: format!(
+                "usage record {target} is already invalidated by {invalidated_by} with reason code {}",
+                reason_code.as_str()
+            ),
+            invalidated_by: Some(invalidated_by),
+            reason_code: Some(reason_code),
         }
     }
 
@@ -469,42 +858,26 @@ impl UsageCollectorError {
             detail: format!(
                 "idempotency key {idempotency_key} already bound to record {existing_id}"
             ),
+            invalidated_by: None,
+            reason_code: None,
         }
     }
 
-    /// A compensation's `corrects_id` referenced another compensation row.
+    /// An invalidation's target has not converged under the active plugin's
+    /// dedup level. `name` is the target. Retryable through the wire
+    /// `context.retryable = true` only: [`Self::is_retryable`] stays true for
+    /// `ServiceUnavailable` alone (DESIGN §3.3).
     #[must_use]
-    pub fn corrects_id_targets_compensation(corrects_id: Uuid) -> Self {
+    pub fn target_not_converged(target: Uuid) -> Self {
         Self::Conflict {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: corrects_id.to_string(),
-            reason: ConflictReason::CorrectsIdTargetsCompensation,
-            detail: format!("corrects_id {corrects_id} targets a compensation row"),
-        }
-    }
-
-    /// A compensation's `corrects_id` referenced a row in a different
-    /// `(tenant, usage type, resource, subject)` identity tuple.
-    #[must_use]
-    pub fn corrects_id_wrong_scope(corrects_id: Uuid) -> Self {
-        Self::Conflict {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: corrects_id.to_string(),
-            reason: ConflictReason::CorrectsIdWrongScope,
+            name: target.to_string(),
+            reason: ConflictReason::TargetNotConverged,
             detail: format!(
-                "corrects_id {corrects_id} references a row in a different tenant, usage type, resource, or subject"
+                "invalidates {target} names an entry that has not converged yet; retry"
             ),
-        }
-    }
-
-    /// A compensation's `corrects_id` referenced an `inactive` row.
-    #[must_use]
-    pub fn corrects_id_inactive(corrects_id: Uuid) -> Self {
-        Self::Conflict {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            name: corrects_id.to_string(),
-            reason: ConflictReason::CorrectsIdInactive,
-            detail: format!("corrects_id {corrects_id} references an inactive usage record"),
+            invalidated_by: None,
+            reason_code: None,
         }
     }
 
@@ -577,7 +950,7 @@ impl UsageCollectorError {
 /// - [`Self::Internal`] — non-retryable unclassified failure (plugin
 ///   invariant broken, uncategorized backend error). Lifts to
 ///   [`UsageCollectorError::Internal`].
-/// - The catalog / record variants below — typed domain outcomes.
+/// - The record variants below — typed domain outcomes.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum UsageCollectorPluginError {
@@ -596,60 +969,35 @@ pub enum UsageCollectorPluginError {
         retry_after_seconds: Option<u64>,
     },
 
-    /// `get_usage_type` / `delete_usage_type` referenced a `gts_id` absent
-    /// from the catalog.
-    #[error("usage type not found: {gts_id}")]
-    UsageTypeNotFound {
-        /// Catalog `gts_id` that was not found.
-        gts_id: UsageTypeGtsId,
-    },
-
-    /// `create_usage_type` collided with an existing row whose payload
-    /// differs.
-    #[error("usage type already exists: {gts_id}")]
-    UsageTypeAlreadyExists {
-        /// Catalog `gts_id` that collided.
-        gts_id: UsageTypeGtsId,
-    },
-
-    /// `delete_usage_type` was rejected because the usage type is still
-    /// referenced by `sample_ref_count` samples (a bounded count, at
-    /// least `1`).
-    #[error("usage type {gts_id} is still referenced by {sample_ref_count} samples")]
-    UsageTypeReferenced {
-        /// Catalog `gts_id` that could not be deleted.
-        gts_id: UsageTypeGtsId,
-        /// Bounded sample count of referencing rows.
-        sample_ref_count: u64,
-    },
-
-    /// Idempotency conflict at the persistence boundary: the supplied
-    /// `idempotency_key` is already bound to a different stored record.
-    /// Carries the id of the previously persisted record (the plugin
-    /// detects the conflict against a specific row, so the row's id is
-    /// the actionable handle for the gateway).
-    #[error("idempotency conflict: key {idempotency_key} already bound to record {existing_id}")]
+    /// Idempotency conflict at the persistence boundary: an entry with this
+    /// dedup identity is already stored, and its caller-supplied fields differ
+    /// from the submission's ([`crate::models::UsageRecord::caller_supplied_eq`]).
+    /// `existing` is the stored entry, so the gateway can name it, and when the
+    /// dispatched entry is an invalidation, report the conflict as
+    /// `AlreadyInvalidated` naming `existing.id` and its reason code.
+    #[error("idempotency conflict: key {idempotency_key} already bound to record {}", .existing.id)]
     IdempotencyConflict {
-        /// Caller-supplied idempotency key.
+        /// The dispatched entry's idempotency key (`inv:<target>` on an invalidation).
         idempotency_key: String,
-        /// `UsageRecord.id` of the previously persisted row the key is
-        /// already bound to.
-        existing_id: Uuid,
+        /// The stored entry the key is already bound to.
+        existing: Box<crate::models::UsageRecord>,
     },
 
-    /// `get_usage_record` / `deactivate_usage_record` referenced an `id`
-    /// that does not exist.
+    /// A lookup referenced a `UsageRecord.id` the store does not hold —
+    /// `get_usage_record`, or the target of a submitted invalidation.
     #[error("usage record not found: {id}")]
     UsageRecordNotFound {
         /// Caller-supplied target `UsageRecord.id`.
         id: Uuid,
     },
 
-    /// `deactivate_usage_record` targeted a record whose status was
-    /// already `Inactive`.
-    #[error("usage record already inactive: {id}")]
-    UsageRecordAlreadyInactive {
-        /// Caller-supplied target `UsageRecord.id`.
+    /// A converged-only lookup cannot yet decide whether `id` exists: its
+    /// identity has not converged under the plugin's dedup level. Only
+    /// `get_usage_record(.., converged_only = true)` may answer it. The
+    /// gateway lifts it to a retryable `Conflict(TargetNotConverged)`.
+    #[error("usage record not converged: {id}")]
+    UsageRecordNotConverged {
+        /// The `UsageRecord.id` the lookup named.
         id: Uuid,
     },
 
@@ -661,6 +1009,19 @@ pub enum UsageCollectorPluginError {
 }
 
 impl UsageCollectorPluginError {
+    /// Constructs a [`UsageCollectorPluginError::IdempotencyConflict`] against
+    /// the stored entry.
+    #[must_use]
+    pub fn idempotency_conflict(
+        idempotency_key: impl Into<String>,
+        existing: crate::models::UsageRecord,
+    ) -> Self {
+        Self::IdempotencyConflict {
+            idempotency_key: idempotency_key.into(),
+            existing: Box::new(existing),
+        }
+    }
+
     /// Constructs a [`UsageCollectorPluginError::Internal`].
     #[must_use]
     pub fn internal(detail: impl Into<String>) -> Self {

@@ -37,3 +37,13 @@ toolkit = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-odata = { workspace = true }
 toolkit-odata-macros = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+# The DESIGN §3.3 plugin contract suite, plus the in-memory reference
+# backend it is validated against. Off by default: a production build of a
+# plugin has no use for either, and the reference backend must never be
+# reachable from one by accident.
+contract = []

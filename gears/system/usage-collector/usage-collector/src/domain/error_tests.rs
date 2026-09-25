@@ -7,20 +7,12 @@
 //! error-envelope compaction — the public envelope is terminal — so these
 //! tests exercise the plugin->domain and domain->SDK directions only.
 
-use toolkit_gts::gts_id;
 use usage_collector_sdk::{
-    ConflictReason, USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageCollectorError,
-    UsageCollectorPluginError, UsageTypeGtsId, ValidationReason,
+    ConflictReason, MeterTypeId, NotFoundReason, USAGE_RECORD_RESOURCE, UsageCollectorError,
+    UsageCollectorPluginError, ValidationReason,
 };
 
 use super::*;
-
-const SAMPLE_USAGE_TYPE_ID: &str =
-    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
-
-fn sample_gts_id() -> UsageTypeGtsId {
-    UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived usage-type gts_id")
-}
 
 #[test]
 fn plugin_transient_maps_to_service_unavailable() {
@@ -122,106 +114,11 @@ fn plugin_not_found_maps_to_service_unavailable() {
 }
 
 #[test]
-fn domain_usage_type_not_found_lifts_to_sdk_not_found() {
-    let gts_id = sample_gts_id();
-    let domain = DomainError::UsageTypeNotFound {
-        gts_id: gts_id.clone(),
-    };
-    let sdk: UsageCollectorError = domain.into();
-    match sdk {
-        UsageCollectorError::NotFound {
-            resource_type,
-            name,
-            ..
-        } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
-            assert_eq!(name, gts_id.as_ref());
-        }
-        other => panic!("expected NotFound, got {other:?}"),
-    }
-}
-
-#[test]
-fn plugin_usage_type_not_found_lifts_to_domain_variant() {
-    let gts_id = sample_gts_id();
-    let domain: DomainError = UsageCollectorPluginError::UsageTypeNotFound {
-        gts_id: gts_id.clone(),
-    }
-    .into();
-    assert!(matches!(
-        &domain,
-        DomainError::UsageTypeNotFound { gts_id: g } if g == &gts_id
-    ));
-}
-
-#[test]
-fn domain_usage_type_already_exists_lifts_to_sdk_already_exists() {
-    let gts_id = sample_gts_id();
-    let domain = DomainError::UsageTypeAlreadyExists {
-        gts_id: gts_id.clone(),
-    };
-    let sdk: UsageCollectorError = domain.into();
-    match sdk {
-        UsageCollectorError::AlreadyExists {
-            resource_type,
-            name,
-            ..
-        } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
-            assert_eq!(name, gts_id.as_ref());
-        }
-        other => panic!("expected AlreadyExists, got {other:?}"),
-    }
-}
-
-#[test]
-fn plugin_usage_type_already_exists_lifts_to_domain_variant() {
-    let gts_id = sample_gts_id();
-    let domain: DomainError = UsageCollectorPluginError::UsageTypeAlreadyExists {
-        gts_id: gts_id.clone(),
-    }
-    .into();
-    assert!(matches!(
-        &domain,
-        DomainError::UsageTypeAlreadyExists { gts_id: g } if g == &gts_id
-    ));
-}
-
-#[test]
-fn plugin_usage_type_referenced_lifts_to_sdk_conflict() {
-    let gts_id = sample_gts_id();
-    let domain: DomainError = UsageCollectorPluginError::UsageTypeReferenced {
-        gts_id: gts_id.clone(),
-        sample_ref_count: 42,
-    }
-    .into();
-    assert!(matches!(
-        &domain,
-        DomainError::UsageTypeReferenced { gts_id: g, sample_ref_count: 42 } if g == &gts_id
-    ));
-    let sdk: UsageCollectorError = domain.into();
-    match sdk {
-        UsageCollectorError::Conflict {
-            resource_type,
-            name,
-            reason,
-            detail,
-        } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
-            assert_eq!(name, gts_id.as_ref());
-            assert_eq!(reason, ConflictReason::UsageTypeReferenced);
-            assert!(detail.contains("referenced by 42 samples"));
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
-}
-
-#[test]
 fn domain_unknown_metadata_key_lifts_to_invalid_argument() {
-    let gts_id = sample_gts_id();
+    let gts_type_id = sample_meter_id();
     let key = "unexpected_field".to_owned();
     let domain = DomainError::UnknownMetadataKey {
-        gts_id: gts_id.clone(),
+        gts_type_id: gts_type_id.clone(),
         key: key.clone(),
     };
     let sdk: UsageCollectorError = domain.into();
@@ -233,8 +130,8 @@ fn domain_unknown_metadata_key_lifts_to_invalid_argument() {
             detail,
             ..
         } => {
-            assert_eq!(resource_type, USAGE_TYPE_RESOURCE);
-            assert_eq!(resource_name.as_deref(), Some(gts_id.as_ref()));
+            assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
+            assert_eq!(resource_name.as_deref(), Some(gts_type_id.as_ref()));
             assert_eq!(reason, ValidationReason::UnknownMetadataKey);
             assert!(detail.contains(&key));
         }
@@ -242,37 +139,7 @@ fn domain_unknown_metadata_key_lifts_to_invalid_argument() {
     }
 }
 
-#[test]
-fn idempotency_conflict_lifts_to_conflict_keyed_by_existing_id() {
-    let existing_id = uuid::Uuid::from_u128(0x1234_5678);
-    let key = "idem-1".to_owned();
-    let domain: DomainError = UsageCollectorPluginError::IdempotencyConflict {
-        idempotency_key: key.clone(),
-        existing_id,
-    }
-    .into();
-    assert!(matches!(
-        &domain,
-        DomainError::IdempotencyConflict { idempotency_key: ik, existing_id: u }
-            if ik == &key && *u == existing_id
-    ));
-    let sdk: UsageCollectorError = domain.into();
-    match sdk {
-        UsageCollectorError::Conflict {
-            resource_type,
-            name,
-            reason,
-            ..
-        } => {
-            assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
-            assert_eq!(name, existing_id.to_string());
-            assert_eq!(reason, ConflictReason::IdempotencyConflict);
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
-}
-
-// ── event-deactivation feature: deactivate-record error variants ────
+// ── Entry-lookup and invalidation error variants ────────────────────
 
 #[test]
 fn plugin_usage_record_not_found_lifts_to_sdk_not_found() {
@@ -284,38 +151,275 @@ fn plugin_usage_record_not_found_lifts_to_sdk_not_found() {
         UsageCollectorError::NotFound {
             resource_type,
             name,
+            reason,
             ..
         } => {
             assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
             assert_eq!(name, id.to_string());
+            assert_eq!(reason, NotFoundReason::UsageRecordNotFound);
         }
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
 
 #[test]
-fn plugin_usage_record_already_inactive_lifts_to_sdk_conflict() {
-    let id = uuid::Uuid::from_u128(0xCAFE_BABE);
-    let domain: DomainError = UsageCollectorPluginError::UsageRecordAlreadyInactive { id }.into();
-    assert!(matches!(domain, DomainError::UsageRecordAlreadyInactive { id: d } if d == id));
+fn sdk_already_invalidated_is_not_retryable() {
+    let err = UsageCollectorError::already_invalidated(
+        uuid::Uuid::nil(),
+        uuid::Uuid::nil(),
+        usage_collector_sdk::ReasonCode::new("emitter_defect").expect("valid reason code"),
+    );
+    assert!(!err.is_retryable(), "AlreadyInvalidated is not retryable");
+}
+
+// ---------------------------------------------------------------------------
+// DeclarationNotFound — Type Resolver's fail-closed "does not resolve" case.
+// Both constructors build this one variant: a genuine not-found
+// answer from the registry and an incomplete declaration collapse to the
+// identical wire failure, per DESIGN §3.2/§3.3 (see the variant's doc
+// comment).
+// ---------------------------------------------------------------------------
+
+fn sample_meter_id() -> MeterTypeId {
+    MeterTypeId::new("gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~")
+        .expect("valid usage_record-derived meter type id")
+}
+
+#[test]
+fn declaration_not_found_names_the_identifier_and_says_not_declared() {
+    let id = sample_meter_id();
+    let err = DomainError::declaration_not_found(&id);
+    assert!(matches!(
+        &err,
+        DomainError::DeclarationNotFound { gts_type_id, reason }
+            if gts_type_id == id.as_str() && reason == "is not declared"
+    ));
+    assert!(err.is_declaration_not_found());
+}
+
+#[test]
+fn declaration_incomplete_names_the_identifier_and_carries_the_reason() {
+    let id = sample_meter_id();
+    let err = DomainError::declaration_incomplete(&id, "declares no `canonical_unit`");
+    assert!(matches!(
+        &err,
+        DomainError::DeclarationNotFound { gts_type_id, reason }
+            if gts_type_id == id.as_str() && reason == "declares no `canonical_unit`"
+    ));
+    assert!(
+        err.to_string().contains("canonical_unit"),
+        "diagnostic must name the offending trait, got: {err}"
+    );
+    // Same predicate as a genuine not-found: the Type Resolver's cache must
+    // not treat an incomplete declaration as more resolvable than an absent
+    // one.
+    assert!(err.is_declaration_not_found());
+}
+
+#[test]
+fn other_domain_errors_are_not_declaration_not_found() {
+    assert!(!DomainError::Internal("boom".to_owned()).is_declaration_not_found());
+}
+
+#[test]
+fn declaration_not_found_lifts_to_sdk_not_found_naming_the_usage_record_resource() {
+    let id = sample_meter_id();
+    let domain = DomainError::declaration_not_found(&id);
     let sdk: UsageCollectorError = domain.into();
     match sdk {
-        UsageCollectorError::Conflict {
+        UsageCollectorError::NotFound {
             resource_type,
             name,
             reason,
-            ..
+            detail,
         } => {
             assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
-            assert_eq!(name, id.to_string());
-            assert_eq!(reason, ConflictReason::AlreadyInactive);
+            assert_eq!(name, id.as_str());
+            assert_eq!(reason, NotFoundReason::DeclarationNotFound);
+            assert!(detail.contains(id.as_str()));
+            assert!(detail.contains("is not declared"));
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DomainError::invalid_metadata / InvalidMetadata: the closed
+// metadata surface a meter declares. `CompiledMetadataSchema::validate` has
+// no `gts_type_id` in scope (only the entry's own metadata map), so — unlike
+// `UnknownMetadataKey` above — this lifts attributed to the record surface,
+// not a specific resource name.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn invalid_metadata_carries_the_joined_detail() {
+    let err = DomainError::invalid_metadata("'tier' was unexpected; \"\" is too short");
+    assert!(matches!(&err, DomainError::InvalidMetadata(detail) if detail.contains("tier")));
+    assert!(err.to_string().contains("tier"));
+}
+
+#[test]
+fn invalid_metadata_lifts_to_invalid_argument_on_the_record_resource() {
+    let domain = DomainError::invalid_metadata("'tier' was unexpected");
+    let sdk: UsageCollectorError = domain.into();
+    match sdk {
+        UsageCollectorError::InvalidArgument {
+            resource_type,
+            resource_name,
+            field,
+            reason,
+            detail,
+        } => {
+            assert_eq!(resource_type, USAGE_RECORD_RESOURCE);
+            assert_eq!(resource_name, None);
+            assert_eq!(field, "metadata");
+            assert_eq!(reason, ValidationReason::MetadataValidation);
+            assert!(detail.contains("tier"));
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_not_converged_answer_outside_a_target_lookup_is_internal() {
+    let domain: DomainError = UsageCollectorPluginError::UsageRecordNotConverged {
+        id: uuid::Uuid::from_u128(0xC0),
+    }
+    .into();
+    assert!(matches!(domain, DomainError::Internal(_)), "got {domain:?}");
+}
+
+#[test]
+fn target_not_converged_lifts_to_a_conflict_naming_the_target() {
+    let target = uuid::Uuid::from_u128(0xC1);
+    let sdk: UsageCollectorError = DomainError::TargetNotConverged { target }.into();
+    match sdk {
+        UsageCollectorError::Conflict { name, reason, .. } => {
+            assert_eq!(name, target.to_string());
+            assert_eq!(reason, ConflictReason::TargetNotConverged);
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    assert!(
+        !UsageCollectorError::target_not_converged(target).is_retryable(),
+        "retryability rides the wire context, not is_retryable (DESIGN \u{a7}3.3)"
+    );
+}
+
+// ── Lifting a store conflict by the dispatched entry's kind ─────────
+
+fn stored_entry(
+    invalidation: Option<usage_collector_sdk::Invalidation>,
+) -> usage_collector_sdk::UsageRecord {
+    let key = invalidation
+        .is_none()
+        .then(|| usage_collector_sdk::IdempotencyKey::new("idem-stored").expect("valid key"));
+    usage_collector_sdk::CreateUsageRecord {
+        gts_type_id: MeterTypeId::new("gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~")
+            .expect("valid meter id"),
+        tenant_id: uuid::Uuid::from_u128(0x7E57),
+        resource_ref: usage_collector_sdk::ResourceRef::new("res-1", "compute.vm")
+            .expect("valid resource ref"),
+        subject_ref: None,
+        metadata: std::collections::BTreeMap::new(),
+        quantity: usage_collector_sdk::UsageQuantity::parse("1").expect("valid quantity"),
+        idempotency_key: key,
+        invalidation,
+        window_start: time::OffsetDateTime::UNIX_EPOCH,
+        window_end: time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+    }
+    .try_into_usage_record(
+        usage_collector_sdk::RecordOrigin::Live,
+        time::OffsetDateTime::UNIX_EPOCH,
+    )
+    .expect("valid fixture")
+}
+
+#[test]
+fn a_conflict_on_a_dispatched_record_is_an_idempotency_conflict_naming_the_stored_entry() {
+    let existing = stored_entry(None);
+    let err = UsageCollectorPluginError::idempotency_conflict("idem-stored", existing.clone());
+    let domain = super::lift_dispatch_error(err, None);
+    assert!(
+        matches!(
+            &domain,
+            DomainError::IdempotencyConflict { idempotency_key, existing_id }
+                if idempotency_key == "idem-stored" && *existing_id == existing.id
+        ),
+        "got {domain:?}"
+    );
+    match UsageCollectorError::from(domain) {
+        UsageCollectorError::Conflict {
+            name,
+            reason,
+            invalidated_by,
+            reason_code,
+            ..
+        } => {
+            assert_eq!(name, existing.id.to_string());
+            assert_eq!(reason, ConflictReason::IdempotencyConflict);
+            assert_eq!(invalidated_by, None);
+            assert_eq!(reason_code, None);
         }
         other => panic!("expected Conflict, got {other:?}"),
     }
 }
 
 #[test]
-fn sdk_already_inactive_is_not_retryable() {
-    let err = UsageCollectorError::already_inactive(uuid::Uuid::nil());
-    assert!(!err.is_retryable(), "AlreadyInactive is not retryable");
+fn a_conflict_on_a_dispatched_invalidation_is_already_invalidated() {
+    let target = uuid::Uuid::from_u128(0x7A);
+    let stored_reason =
+        usage_collector_sdk::ReasonCode::new("emitter_defect").expect("valid reason code");
+    let existing = stored_entry(Some(usage_collector_sdk::Invalidation {
+        target,
+        reason: stored_reason.clone(),
+    }));
+    let dispatched = usage_collector_sdk::Invalidation {
+        target,
+        reason: usage_collector_sdk::ReasonCode::new("late_correction").expect("valid reason code"),
+    };
+    let err =
+        UsageCollectorPluginError::idempotency_conflict(format!("inv:{target}"), existing.clone());
+    match UsageCollectorError::from(super::lift_dispatch_error(err, Some(&dispatched))) {
+        UsageCollectorError::Conflict {
+            name,
+            reason,
+            invalidated_by,
+            reason_code,
+            ..
+        } => {
+            assert_eq!(name, target.to_string(), "the rejection names the target");
+            assert_eq!(reason, ConflictReason::AlreadyInvalidated);
+            assert_eq!(invalidated_by, Some(existing.id));
+            assert_eq!(
+                reason_code,
+                Some(stored_reason),
+                "the stored reason code, not the submitted one"
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_stored_entry_that_is_not_an_invalidation_is_an_invariant_breach() {
+    let target = uuid::Uuid::from_u128(0x7B);
+    let dispatched = usage_collector_sdk::Invalidation {
+        target,
+        reason: usage_collector_sdk::ReasonCode::new("emitter_defect").expect("valid reason code"),
+    };
+    let err = UsageCollectorPluginError::idempotency_conflict(
+        format!("inv:{target}"),
+        stored_entry(None),
+    );
+    assert!(matches!(
+        super::lift_dispatch_error(err, Some(&dispatched)),
+        DomainError::Internal(_)
+    ));
+}
+
+#[test]
+fn a_conflict_reaching_the_context_free_lift_is_internal() {
+    let err = UsageCollectorPluginError::idempotency_conflict("idem-stored", stored_entry(None));
+    assert!(matches!(DomainError::from(err), DomainError::Internal(_)));
 }

@@ -1,182 +1,374 @@
 #![cfg(feature = "postgres")]
-// Shared across test binaries: not every binary uses every fixture, and these
-// fixtures panic on invalid test input by design.
+// Shared across test binaries: `mod common;` compiles a private copy into each
+// one, so a helper another binary uses is `dead_code` in this one. These
+// helpers also panic on invalid test input by design.
+//
+// The allowance is earned by that sharing and by nothing else — `dead_code`
+// hides a helper with no callers at all just as well, which is how
+// `insert_raw_usage_record` kept an `INSERT` naming columns the table does not
+// have, and a doc citing a foreign key the schema does not have, until Task 14
+// deleted it. Before adding a helper here, check it has a caller somewhere;
+// the lint will not.
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 //! Shared `TimescaleDB` testcontainer harness. Requires Docker.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use testcontainers::core::WaitFor;
+use testcontainers::core::logs::LogSource;
+use testcontainers::core::wait::LogWaitStrategy;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
+use toolkit_odata::ast;
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    IdempotencyKey, MetadataKey, ResourceRef, SubjectRef, UsageKind, UsageRecord, UsageType,
-    UsageTypeGtsId,
+    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef,
+    UsageQuantity, UsageRecord, derive_usage_record_id,
 };
 
 use timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig;
+use timescaledb_usage_collector_plugin::domain::adapter::StorageAdapter;
+use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
-use timescaledb_usage_collector_plugin::infra::storage::catalog_store::PgCatalogStore;
 use timescaledb_usage_collector_plugin::infra::storage::pool::{
     MIGRATOR, apply_post_migration_setup, build_pool,
 };
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
 
-/// Monotonic seed so each raw record insert gets a distinct `id` and
-/// `idempotency_key` (the workspace `uuid` crate has no `v4` feature, so we
-/// mint deterministic-but-unique ids via [`Uuid::from_u128`]).
-static RAW_RECORD_SEQ: AtomicU64 = AtomicU64::new(1);
-
 pub struct TsHarness {
     pub pool: PgPool,
+    pub cfg: TimescaleDbPluginConfig,
     _container: ContainerAsync<GenericImage>,
 }
 
-/// Retention window for harnesses whose fixtures are deliberately backdated to a
-/// fixed instant (`fixture_usage_record`'s `created_at`, 2023-11-14).
+/// How many containers [`bring_up_with`] will burn through before giving up,
+/// and how long it waits before starting the next one.
 ///
-/// `apply_post_migration_setup` registers a REAL `policy_retention` job, and the
-/// image's background scheduler fires it on its own roughly 3 seconds after
-/// registration — i.e. while the test body is still running. At the production
-/// default window (365 days) the backdated fixtures are ~2.5 years past the
-/// cutoff and share one 7-day chunk, so that first scheduled run drops the chunk
-/// out from under the test. A stalled insert loop (parallel containers on a
-/// loaded CI box) then sees rows vanish mid-test: one aggregation bucket short,
-/// a `count` off by one, a cursor walk ending early.
-///
-/// At the config's documented ceiling (`MAX_RETENTION_SECS`, `src/config.rs` —
-/// private, so the value is repeated here) the cutoff lands in 1926, no chunk is
-/// ever drop-eligible, and the registered policy is a structural no-op: still
-/// registered, still scheduled, still run — it just finds nothing to delete.
-pub const NO_DROP_RETENTION_SECS: u64 = 100 * 365 * 86_400;
+/// Three, because the failures it absorbs are contention against the Docker
+/// daemon and a third attempt has never been needed; the backoff is there
+/// because an immediate restart re-enters the contention that just lost.
+const CONTAINER_ATTEMPTS: u32 = 3;
+const CONTAINER_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// The production default (365 days). Only for tests whose subject IS retention.
-pub const REAL_RETENTION_SECS: u64 = 365 * 86_400;
+/// How many times [`bring_up_with`] tries to open the pool against **one**
+/// container, and how long it waits between tries - 10 seconds per container,
+/// 30 seconds across all three.
+///
+/// Stated rather than inlined as a bare `0..20` because it is the only thing
+/// that absorbs a server which has announced itself but is not yet accepting
+/// connections, so its size decides whether the suite is flaky under load.
+const CONNECT_ATTEMPTS: u32 = 20;
+const CONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub async fn bring_up() -> anyhow::Result<TsHarness> {
-    // Default pool bounds and statement timeout (mirrors the config defaults),
-    // plus a retention window that cannot reach the backdated fixtures.
-    bring_up_with(30, 2, 16, NO_DROP_RETENTION_SECS).await
+    // Default pool bounds and statement timeout (mirrors the config defaults).
+    bring_up_with(30, 2, 16).await
 }
 
-/// Like [`bring_up`] but with the production 365-day retention window, and with
-/// the registered job's background schedule disabled.
-///
-/// For tests whose subject is retention itself: they insert genuinely aged rows
-/// and fire the policy by hand (`CALL run_job`). Leaving the job scheduled would
-/// let the background scheduler drop those rows first, both flaking the
-/// "exists before retention runs" precondition and letting the assertion pass
-/// for the wrong reason (background run did the work, the manual one was a
-/// no-op). Unscheduling makes the explicit `run_job` the only deleter, so the
-/// test observes exactly the policy it registered.
-pub async fn bring_up_real_retention() -> anyhow::Result<TsHarness> {
-    let h = bring_up_with(30, 2, 16, REAL_RETENTION_SECS).await?;
-    // `alter_job(scheduled => false)` keeps the job row (so the schema test's
-    // "a policy is registered" assertion still holds) and leaves `run_job`
-    // working; it only stops the scheduler from firing it unprompted.
-    let unscheduled = sqlx::query(
-        "SELECT alter_job(job_id, scheduled => false) \
-         FROM timescaledb_information.jobs \
-         WHERE proc_name = 'policy_retention' AND hypertable_name = 'usage_records'",
-    )
-    .execute(&h.pool)
-    .await?
-    .rows_affected();
-    // A `WHERE` that matches nothing is not an error, so an unschedule that
-    // quietly hit zero rows would leave the job scheduled and re-arm the very
-    // race this harness exists to remove — and the retention test would then
-    // pass on the background run's work. Fail loudly instead, so a TimescaleDB
-    // bump that reshapes `timescaledb_information.jobs` surfaces here.
-    anyhow::ensure!(
-        unscheduled == 1,
-        "expected to unschedule exactly 1 policy_retention job on usage_records, \
-         matched {unscheduled}"
-    );
-    Ok(h)
-}
-
-/// Like [`bring_up`] but with an explicit request-path `statement_timeout` (secs),
-/// pool bounds, and retention window. Used to assert the init path does not leak
-/// a modified `statement_timeout` onto pooled connections: pass a value distinct
-/// from any the init path might set, and a small fixed pool so every connection
-/// can be inspected.
-///
-/// `retention_secs` is threaded into the config JSON rather than left to
-/// `#[serde(default)]`: the default is the production 365-day window, which arms
-/// a live chunk-dropper against the backdated fixtures (see
-/// [`NO_DROP_RETENTION_SECS`]).
+/// Like [`bring_up`] but with an explicit request-path `statement_timeout` (secs)
+/// and pool bounds. Used to assert the init path does not leak a modified
+/// `statement_timeout` onto pooled connections: pass a value distinct from any
+/// the init path might set, and a small fixed pool so every connection can be
+/// inspected.
 pub async fn bring_up_with(
     statement_timeout_secs: u64,
     pool_size_min: u32,
     pool_size_max: u32,
-    retention_secs: u64,
 ) -> anyhow::Result<TsHarness> {
     // The tag lives in `test_containers::TIMESCALEDB_TAG`; keep that constant
     // in sync with `TimescaleDbSidecar.IMAGE` in `testing/e2e/lib/sidecars.py`.
     // A skew means these migrations are validated against a different
     // PostgreSQL major than E2E runs.
-    let image = test_containers::timescaledb()
-        .with_wait_for(WaitFor::message_on_stderr(
-            "database system is ready to accept connections",
+    // A closure, not a value: `ContainerRequest` is consumed by `start()` and is
+    // not `Clone`, so the retry below needs to build a fresh one per attempt.
+    let image = || {
+        test_containers::timescaledb()
+            // Wait for the **second** "ready", across **both** streams. Both
+            // halves of that are load-bearing.
+            //
+            // *Why the second.* This image announces readiness twice, and only
+            // the second server is one a test can reach. `docker-entrypoint.sh`
+            // runs a temporary bootstrap server for initdb with
+            // `-c listen_addresses=''` (entrypoint line 297), i.e. **unix
+            // socket only**; that one announces itself first. The image then
+            // runs `/docker-entrypoint-initdb.d/001_timescaledb_tune.sh` - which
+            // is also what makes `work_mem` 7837kB rather than the compiled
+            // 4 MB - stops the bootstrap server, and starts the real one, which
+            // announces itself again. Measured on
+            // `timescale/timescaledb:2.29.2-pg18`: the bootstrap server at
+            // `21:42:21.855`, the tune script, `PostgreSQL init process
+            // complete`, then the real server at `21:42:22.498`. Waiting for
+            // the first hands back a container whose published TCP port
+            // refuses connections, leaving `build_pool`'s retry budget below as
+            // the only thing between this suite and `pool connect failed`.
+            //
+            // *Why `BothStd`.* The two lines are not on the same stream as the
+            // Docker API frames them: measured against this exact API,
+            // `LogSource::StdErr` with `times(2)` never fires (45 s timeout),
+            // while `BothStd` with `times(2)` returns in ~1.2 s and `BothStd`
+            // with `times(3)` never fires - so there are exactly two in total
+            // and they are split across the streams. Do not "tighten" this to
+            // `stderr`; it was tried, and it hangs.
+            //
+            // Every container here is freshly created, so the count is always
+            // exactly 2. A reused volume would skip initdb and log it once,
+            // which is one more reason this harness never reuses one.
+            .with_wait_for(WaitFor::log(
+                LogWaitStrategy::new(
+                    LogSource::BothStd,
+                    "database system is ready to accept connections",
+                )
+                .with_times(2),
+            ))
+            .with_env_var("POSTGRES_USER", "user")
+            .with_env_var("POSTGRES_PASSWORD", "pass")
+            .with_env_var("POSTGRES_DB", "app")
+            // Cap the shared-memory segment. This lane starts one container
+            // per integration test and nextest runs them at
+            // `test-threads = num_cpus`, so the peak is (num_cpus) live
+            // servers at once. Each one runs
+            // `/docker-entrypoint-initdb.d/001_timescaledb_tune.sh`, which
+            // sizes `shared_buffers` from **host** RAM and has no idea it has
+            // siblings: measured at `1959MB` on this 7.83 GB box, i.e. the
+            // usual quarter of total RAM. Every container believing it owns
+            // the machine is fine at one container and is N x that on a wide
+            // runner.
+            //
+            // `SHOW shared_buffers` was read off a live container both ways:
+            // `1959MB` with no override, `256MB` with the argument below, and
+            // the readiness message still appears exactly twice, so the wait
+            // strategy above is unaffected. `work_mem` stays at the tuned
+            // `7837kB` either way - the argument overrides the one setting it
+            // names and leaves the rest of the tune script's work in place.
+            //
+            // 256 MB is twice PostgreSQL's own compiled default, so no test
+            // here has less headroom than it would get from a stock server;
+            // the largest fixture in the suite is a hundred rows.
+            //
+            // Set at THIS call site rather than in `test_containers::
+            // timescaledb()`: the concurrency that makes the default bite is
+            // this lane's, and the shared helper hands back a bare
+            // `GenericImage` precisely so callers supply their own runtime
+            // arguments.
+            .with_cmd(["postgres", "-c", "shared_buffers=256MB"])
+    };
+    // Start a container and connect to it, and treat **the whole of that** as
+    // one attempt that may be retried with a fresh container.
+    //
+    // Three failure modes were measured on a fully loaded run of this suite,
+    // and they are all the same underlying thing - the Docker daemon's port
+    // publication racing a container that is already running - so they are
+    // handled together rather than one at a time:
+    //
+    // 1. `get_host_port_ipv4` answers `container '<id>' does not expose port
+    //    5432/tcp`. Measured at ~11 occurrences across 6 full runs of ~264
+    //    containers each, i.e. under 1%.
+    // 2. `start()` exceeds its startup timeout waiting for a readiness message
+    //    a loaded box is slow to produce.
+    // 3. **The published port answers, and an HTTP server is behind it.**
+    //    Observed once as `pool connect failed … UnexpectedEof "expected to
+    //    read 1414811696 bytes, got 47 bytes at EOF"`. Decoded against the
+    //    `sqlx-postgres` this workspace locks (0.9.0):
+    //    `connection/stream.rs` reads a five-byte header, requires byte 0 to
+    //    be a valid `BackendMessageFormat` (`message/mod.rs`, or the error
+    //    would read `unknown message type` instead), takes bytes 1..5 as
+    //    `message_len`, and reports `expected_len = message_len + 1`. So the
+    //    length prefix on the wire was `1414811695 = 0x5454502F`, the ASCII
+    //    bytes `TTP/`, and byte 0 was `b'H'` (`CopyOutResponse`) - the only
+    //    valid format byte that precedes `TTP/` in a real payload. **The first
+    //    five bytes were `HTTP/`**, and
+    //    `HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n` is exactly
+    //    the 47 bytes the error reports.
+    //
+    //    So the peer was an HTTP server - a Docker Desktop port-forwarder or
+    //    API endpoint, or another local service holding that ephemeral port -
+    //    and not a Postgres that was merely slow. It happened in the one run
+    //    of six that also retried a container, which ties it to the same race.
+    //    On a recurrence, that is a checkable culprit class: find what is
+    //    listening on the port and whether it speaks HTTP.
+    //
+    // (3) is why the pool connect is **inside** this loop rather than after it:
+    // no amount of retrying `build_pool` against a wrong port can help, because
+    // the port stays wrong. Discarding the container and starting another is
+    // the only thing that can, and it is what the earlier shape - retry the
+    // port lookup, then retry the pool separately for 30 s - could not do.
+    //
+    // Bounded at three containers. The two `start()` / port arms return the
+    // last attempt's error **unchanged**, so an image that genuinely does not
+    // expose 5432 still fails with the message that says so; the pool arm
+    // wraps, because "every one of three containers refused a connection" is
+    // itself the diagnosis - but it carries the underlying `sqlx` error
+    // verbatim, which is how failure mode 3 above was decoded at all. That is
+    // also why this is here rather than `nextest --retries`: a blanket retry
+    // cannot tell a harness failure from an assertion failure, and would mask
+    // the second.
+    //
+    // The backoff is not decoration - the stated cause is contention, so an
+    // immediate restart re-enters exactly what just lost.
+    //
+    // **The messages below land on the stderr of a test that then passes**,
+    // which nextest captures and discards. A rate rising from 1-in-100 to
+    // 1-in-3 is therefore invisible until an attempt-3 failure. To see it:
+    // `cargo nextest run … --success-output immediate | grep -c "starting
+    // another"`.
+    let mut brought_up: Option<(
+        ContainerAsync<GenericImage>,
+        PgPool,
+        TimescaleDbPluginConfig,
+    )> = None;
+    for attempt in 1..=CONTAINER_ATTEMPTS {
+        let last = attempt == CONTAINER_ATTEMPTS;
+        let container = match image().start().await {
+            Ok(container) => container,
+            Err(err) if last => return Err(err.into()),
+            Err(err) => {
+                eprintln!(
+                    "timescaledb container failed to start (attempt {attempt}/\
+                     {CONTAINER_ATTEMPTS}): {err}; starting another"
+                );
+                tokio::time::sleep(CONTAINER_RETRY_BACKOFF).await;
+                continue;
+            }
+        };
+        let port = match container.get_host_port_ipv4(5432).await {
+            Ok(port) => port,
+            Err(err) if last => return Err(err.into()),
+            Err(err) => {
+                eprintln!(
+                    "timescaledb container came up without a published port (attempt \
+                     {attempt}/{CONTAINER_ATTEMPTS}): {err}; starting another"
+                );
+                drop(container);
+                tokio::time::sleep(CONTAINER_RETRY_BACKOFF).await;
+                continue;
+            }
+        };
+
+        // The test container serves no TLS; `sslmode=disable` is the deliberate
+        // opt-out that `build_pool` honors (production DSNs without an explicit
+        // sslmode are upgraded to `require` - see `connect_options`). Built by
+        // deserialization because the secret-wrapped `database_url` has no
+        // public literal constructor (the production path is always serde +
+        // expand-vars).
+        let cfg: TimescaleDbPluginConfig = serde_json::from_str(&format!(
+            r#"{{ "database_url": "postgres://user:pass@127.0.0.1:{port}/app?sslmode=disable",
+                  "statement_timeout_secs": {statement_timeout_secs},
+                  "pool_size_min": {pool_size_min}, "pool_size_max": {pool_size_max} }}"#
         ))
-        .with_env_var("POSTGRES_USER", "user")
-        .with_env_var("POSTGRES_PASSWORD", "pass")
-        .with_env_var("POSTGRES_DB", "app");
-    let container = image.start().await?;
-    let port = container.get_host_port_ipv4(5432).await?;
+        .expect("valid test config json");
 
-    // The test container serves no TLS; `sslmode=disable` is the deliberate
-    // opt-out that `build_pool` honors (production DSNs without an explicit
-    // sslmode are upgraded to `require` — see `connect_options`). Built by
-    // deserialization because the secret-wrapped `database_url` has no public
-    // literal constructor (the production path is always serde + expand-vars).
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(&format!(
-        r#"{{ "database_url": "postgres://user:pass@127.0.0.1:{port}/app?sslmode=disable",
-              "statement_timeout_secs": {statement_timeout_secs},
-              "pool_size_min": {pool_size_min}, "pool_size_max": {pool_size_max},
-              "retention_period_secs": {retention_secs} }}"#
-    ))
-    .expect("valid test config json");
-
-    let mut pool = None;
-    let mut last = None;
-    for _ in 0..20 {
-        match build_pool(&cfg).await {
-            Ok(p) => {
-                pool = Some(p);
+        // A server that has announced itself is not the same as one accepting a
+        // TCP connection this instant under load, so a connect gets its own
+        // short budget before the container is written off. Ten seconds per
+        // container, three containers: the same 30 s ceiling the flat loop had,
+        // spent where it can actually help.
+        let mut pool = None;
+        let mut connect_err = None;
+        for _ in 0..CONNECT_ATTEMPTS {
+            match build_pool(&cfg).await {
+                Ok(p) => {
+                    pool = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    connect_err = Some(e);
+                    tokio::time::sleep(CONNECT_INTERVAL).await;
+                }
+            }
+        }
+        match pool {
+            Some(pool) => {
+                brought_up = Some((container, pool, cfg));
                 break;
             }
-            Err(e) => {
-                last = Some(e);
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            None if last => {
+                return Err(anyhow::anyhow!(
+                    "pool connect failed on every one of {CONTAINER_ATTEMPTS} containers, \
+                     each given {CONNECT_ATTEMPTS} attempts over {:?}: {connect_err:?}",
+                    CONNECT_INTERVAL * CONNECT_ATTEMPTS,
+                ));
+            }
+            None => {
+                let detail = connect_err
+                    .as_ref()
+                    .map_or_else(|| "no error recorded".to_owned(), ToString::to_string);
+                eprintln!(
+                    "timescaledb container published a port that would not serve a pool \
+                     (attempt {attempt}/{CONTAINER_ATTEMPTS}): {detail}; starting another"
+                );
+                drop(container);
+                tokio::time::sleep(CONTAINER_RETRY_BACKOFF).await;
             }
         }
     }
-    let pool = pool.ok_or_else(|| anyhow::anyhow!("pool connect failed: {last:?}"))?;
+    let (container, pool, cfg) = brought_up
+        .ok_or_else(|| anyhow::anyhow!("container bring-up loop ended without a container"))?;
 
     MIGRATOR.run(&pool).await?;
-    apply_post_migration_setup(&pool, cfg.retention_period_secs).await?;
+    apply_post_migration_setup(&pool, &cfg).await?;
+    settle_and_remove_rollup_policies(&pool).await?;
     Ok(TsHarness {
         pool,
+        cfg,
         _container: container,
     })
 }
 
+/// Wait for the two refresh policies' first run, which `TimescaleDB` starts
+/// within seconds of creating them, then delete them. A background refresh
+/// racing a test would make "stale until refreshed" assertions flaky; tests
+/// refresh explicitly through [`refresh_rollup`] instead. A test that
+/// re-applies setup (which re-creates the policies) must call this again
+/// afterwards, once it is done asserting on the policies, so they cannot race
+/// the sweep.
+pub async fn settle_and_remove_rollup_policies(pool: &PgPool) -> anyhow::Result<()> {
+    for _ in 0..60 {
+        let ran: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM timescaledb_information.jobs j \
+             JOIN timescaledb_information.job_stats js ON js.job_id = j.job_id \
+             WHERE j.proc_name = 'policy_refresh_continuous_aggregate' AND js.total_runs >= 1",
+        )
+        .fetch_one(pool)
+        .await?;
+        if ran >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    sqlx::query(
+        "SELECT delete_job(job_id) FROM timescaledb_information.jobs \
+         WHERE proc_name = 'policy_refresh_continuous_aggregate'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Materialise every invalidated range of the rollup now. Autocommit only:
+/// `refresh_continuous_aggregate` refuses a transaction block.
+pub async fn refresh_rollup(pool: &PgPool) {
+    sqlx::query("CALL refresh_continuous_aggregate('usage_rollup_1h', NULL, NULL)")
+        .execute(pool)
+        .await
+        .expect("refresh the rollup");
+}
+
 /// Build a fresh metric inventory over `pool`.
+///
+/// Private: [`record_store`] is its only caller, and a `pub` helper here is a
+/// helper the `dead_code` allowance would hide if that caller went away.
 ///
 /// The stores now take an `Arc<Metrics>`; tests only need a live handle, not to
 /// assert on it, so each call mints its own inventory against the global meter
 /// provider (recording is a no-op without an exporter installed).
 #[must_use]
-pub fn metrics(pool: &PgPool) -> Arc<Metrics> {
+fn metrics(pool: &PgPool) -> Arc<Metrics> {
     Arc::new(Metrics::new(pool.clone()))
 }
 
@@ -186,161 +378,277 @@ pub fn record_store(pool: &PgPool) -> PgRecordStore {
     PgRecordStore::new(pool.clone(), metrics(pool), CancellationToken::new())
 }
 
-/// Convenience builder for a [`PgCatalogStore`] with its own metric handle.
-#[must_use]
-pub fn catalog_store(pool: &PgPool) -> PgCatalogStore {
-    PgCatalogStore::new(pool.clone(), metrics(pool), CancellationToken::new())
+/// Bring up a migrated `TimescaleDB` and return the SPI implementation over it.
+///
+/// The DESIGN section 3.3 contract suite takes a `&dyn
+/// UsageCollectorPluginV1`, and [`StorageAdapter`] is the crate's only
+/// implementation of it, so this is the whole of the wiring: the same
+/// container [`bring_up`] starts, the same [`PgRecordStore`] every other
+/// caller of [`record_store`] drives, behind the adapter the gear registers
+/// in `ClientHub`.
+///
+/// Nothing in the harness drops data: chunks are dropped only by the retention
+/// sweep, which a test runs explicitly.
+///
+/// The returned [`TsHarness`] owns the container: hold it for the length of
+/// the test, or the database goes away with it. The suite writes entries and
+/// never removes them, but each call starts a container of its own, so a run
+/// never meets a previous run's rows and the fixtures' keying assumptions
+/// never come into it.
+///
+/// # Panics
+///
+/// If the container or the migration fails; there is no test to run without
+/// a backend.
+pub async fn start_backend() -> (TsHarness, StorageAdapter) {
+    let harness = bring_up()
+        .await
+        .expect("contract suite needs a migrated TimescaleDB container");
+    let store: Arc<dyn RecordStore> = Arc::new(record_store(&harness.pool));
+    (harness, StorageAdapter::new(store))
 }
 
-/// Build a valid [`UsageTypeGtsId`] from a raw string.
+// ---------------------------------------------------------------------------
+// Ledger-entry fixtures
+//
+// Authored here rather than in each suite because four of the five share them,
+// which is the same sharing the file-header `dead_code` allowance is earned by.
+// What Task 14 declined to do was *port* the retired builders; these are built
+// against the current `UsageRecord` and every one of them is run.
+//
+// The one decision a fixture cannot avoid is the covered period, because both
+// bounds are inputs to the derived identity
+// (`cpt-cf-usage-collector-adr-record-identity-derivation`). It is taken once,
+// here, as [`FIXTURE_WINDOW_START`] / [`FIXTURE_WINDOW_END`], so a suite that
+// needs a *different* period says so at the call site instead of every suite
+// picking one.
+// ---------------------------------------------------------------------------
+
+/// A valid meter type id: the reserved base plus one derivation segment,
+/// `~`-terminated, which is what `MeterTypeId::new` validates.
+pub const VCPU_METER: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~";
+
+/// A second meter, for the assertions whose subject is that a scope is per
+/// `(tenant_id, gts_type_id)` rather than per tenant.
+pub const GB_METER: &str = "gts.cf.core.uc.usage_record.v1~cf.storage._.gb_hours.v1~";
+
+/// Inclusive start of the covered period every fixture carries by default:
+/// `2023-11-14T22:13:20Z`.
+pub const FIXTURE_WINDOW_START_UNIX: i64 = 1_700_000_000;
+
+/// Exclusive end of that period, one hour later. Distinct from the start, so a
+/// fixture is a period rather than a point event — a point event is a case the
+/// suites ask for explicitly (`window_start == window_end`) rather than the
+/// shape everything else accidentally inherits.
+pub const FIXTURE_WINDOW_END_UNIX: i64 = 1_700_003_600;
+
+/// The parsed [`FIXTURE_WINDOW_START_UNIX`].
 ///
-/// `UsageTypeGtsId::new` validates against the reserved GTS base
-/// [`UsageTypeGtsId::USAGE_RECORD_BASE`]
-/// (`gts.cf.core.uc.usage_record.v1~`), so callers must pass a fully-formed
-/// derived instance id (e.g.
-/// `gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1`).
+/// # Panics
+///
+/// Never: the constant is a valid Unix instant.
 #[must_use]
-pub fn fixture_gts_id(gts: &str) -> UsageTypeGtsId {
-    UsageTypeGtsId::new(gts).expect("fixture gts_id must be a valid usage-type GTS instance id")
+pub fn fixture_window_start() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(FIXTURE_WINDOW_START_UNIX).expect("valid instant")
 }
 
-/// Build a [`UsageType`] fixture from raw parts.
+/// The parsed [`FIXTURE_WINDOW_END_UNIX`].
 ///
-/// `kind` is `"counter"` / `"gauge"` (parsed via the SDK `FromStr`); `fields`
-/// become validated [`MetadataKey`]s.
+/// # Panics
+///
+/// Never: the constant is a valid Unix instant.
 #[must_use]
-pub fn fixture_usage_type(gts: &str, kind: &str, fields: &[&str]) -> UsageType {
-    let kind: UsageKind = kind.parse().expect("fixture kind must be counter/gauge");
-    let metadata_fields = fields
-        .iter()
-        .map(|field| MetadataKey::new(*field).expect("fixture metadata field must be valid"))
-        .collect();
-    UsageType {
-        gts_id: fixture_gts_id(gts),
-        kind,
-        metadata_fields,
-    }
+pub fn fixture_window_end() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(FIXTURE_WINDOW_END_UNIX).expect("valid instant")
 }
 
-/// Build a minimal [`UsageRecord`] fixture referencing `gts_id`.
+/// A meter id from its wire string.
 ///
-/// `id` is minted from `seq` via [`Uuid::from_u128`] (the workspace `uuid`
-/// crate has no `v4` feature); `created_at` is a fixed post-epoch instant so
-/// assertions stay deterministic and round-trip through Postgres `timestamptz`
-/// without sub-microsecond drift. `corrects_id` and `subject_ref` are absent;
-/// `metadata` is empty. Mutate the returned record's fields directly in the
-/// test for the compensation case (set a negative `value` + `corrects_id`).
+/// # Panics
+///
+/// If `id` is not a valid meter type id; every caller here passes a constant.
 #[must_use]
-pub fn fixture_usage_record(
-    gts: &str,
-    tenant_id: Uuid,
+pub fn meter(id: &str) -> MeterTypeId {
+    MeterTypeId::new(id).expect("valid meter type id")
+}
+
+/// An ordinary measurement over an explicit covered period, with the derived
+/// identity the Ingestion Gateway would stamp on it.
+///
+/// The `id` is [`derive_usage_record_id`] over the same five inputs the ledger's
+/// `usage_records_dedup_uniq` is built over — this is the gateway's job, not the
+/// plugin's, so deriving it here is standing in for the gateway rather than
+/// asking the code under test to check itself.
+///
+/// Every field that is **not** one of those five (quantity, attribution, metadata,
+/// origin, the invalidation pair) can be overwritten with a struct update
+/// afterwards without invalidating the identity. The five that are appear in
+/// this signature for exactly that reason.
+///
+/// # Panics
+///
+/// If `idem` is not a valid idempotency key, or the fixed resource reference
+/// fails to validate; both are constants here.
+#[must_use]
+pub fn entry_over(
+    meter_id: &MeterTypeId,
+    tenant: Uuid,
     idem: &str,
     value: Decimal,
-    seq: u128,
+    window_start: OffsetDateTime,
+    window_end: OffsetDateTime,
 ) -> UsageRecord {
+    let idempotency_key = IdempotencyKey::new(idem).expect("valid idempotency key");
     UsageRecord {
-        id: Uuid::from_u128(seq),
-        gts_id: fixture_gts_id(gts),
-        tenant_id,
-        resource_ref: ResourceRef::new("res-1", "compute.vm")
-            .expect("fixture resource_ref must be valid"),
+        id: derive_usage_record_id(tenant, meter_id, &idempotency_key, window_start, window_end),
+        gts_type_id: meter_id.clone(),
+        tenant_id: tenant,
+        resource_ref: ResourceRef::new("res-1", "compute.vm").expect("valid resource ref"),
         subject_ref: None,
-        metadata: std::collections::BTreeMap::new(),
-        value,
-        idempotency_key: IdempotencyKey::new(idem).expect("fixture idempotency_key must be valid"),
-        corrects_id: None,
-        status: usage_collector_sdk::UsageRecordStatus::Active,
-        // A fixed whole-second instant (no sub-microsecond component) so the
-        // value persisted by Postgres equals the value asserted in tests.
-        //
-        // 2023-11-14 — years outside any realistic retention window, so a
-        // harness must NOT arm a droppable retention policy against it or the
-        // registered `policy_retention` job deletes these rows mid-test. See
-        // `NO_DROP_RETENTION_SECS`.
-        created_at: OffsetDateTime::from_unix_timestamp(1_700_000_000)
-            .expect("fixture created_at must be a valid unix timestamp"),
+        metadata: BTreeMap::new(),
+        quantity: UsageQuantity::try_from(value).expect("fixture quantity"),
+        idempotency_key,
+        accepted_at: fixture_window_end(),
+        origin: RecordOrigin::Live,
+        invalidation: None,
+        window_start,
+        window_end,
     }
 }
 
-/// Build a [`UsageRecord`] fixture with a caller-chosen `resource_id`.
-///
-/// [`fixture_usage_record`] hard-codes `resource_id = "res-1"`; the aggregation
-/// group-by-resource test needs records spread across distinct resource ids, so
-/// this variant rebuilds [`UsageRecord::resource_ref`] via
-/// [`ResourceRef::new`] (keeping the same `resource_type`). All other fields
-/// match [`fixture_usage_record`].
+/// [`entry_over`] at the default covered period.
 #[must_use]
-pub fn fixture_usage_record_with_resource(
-    gts: &str,
-    tenant_id: Uuid,
-    idem: &str,
-    value: Decimal,
-    seq: u128,
-    resource_id: &str,
-) -> UsageRecord {
-    let mut rec = fixture_usage_record(gts, tenant_id, idem, value, seq);
-    rec.resource_ref =
-        ResourceRef::new(resource_id, "compute.vm").expect("fixture resource_ref must be valid");
-    rec
-}
-
-/// Build a [`UsageRecord`] fixture carrying a `subject_ref`.
-///
-/// [`fixture_usage_record`] leaves `subject_ref` absent; the subject-dimension
-/// aggregation and the subject round-trip tests need records that actually
-/// persist a subject, so this variant sets [`UsageRecord::subject_ref`] via
-/// [`SubjectRef::new`]. `subject_type` is optional. All other fields match
-/// [`fixture_usage_record`].
-#[must_use]
-pub fn fixture_usage_record_with_subject(
-    gts: &str,
-    tenant_id: Uuid,
-    idem: &str,
-    value: Decimal,
-    seq: u128,
-    subject_id: &str,
-    subject_type: Option<&str>,
-) -> UsageRecord {
-    let mut rec = fixture_usage_record(gts, tenant_id, idem, value, seq);
-    rec.subject_ref =
-        Some(SubjectRef::new(subject_id, subject_type).expect("fixture subject_ref must be valid"));
-    rec
-}
-
-/// Insert a raw `usage_records` row referencing `gts_id`, bypassing the
-/// (not-yet-implemented) record store.
-///
-/// Used by the FK-referenced-delete test to create a child row. `status`,
-/// `metadata`, and `ingested_at` take their column defaults. The `id` and
-/// `idempotency_key` are minted from a process-wide counter so repeated calls
-/// do not collide on the primary key or the dedup unique constraint.
-///
-/// # Errors
-///
-/// Returns any `sqlx` error from the `INSERT`.
-pub async fn insert_raw_usage_record(
-    pool: &PgPool,
-    gts_id: &str,
-    tenant_id: Uuid,
-) -> anyhow::Result<()> {
-    let seq = RAW_RECORD_SEQ.fetch_add(1, Ordering::Relaxed);
-    let id = Uuid::from_u128(u128::from(seq));
-    let idempotency_key = format!("raw-idem-{seq}");
-
-    sqlx::query(
-        "INSERT INTO usage_records \
-         (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, idempotency_key) \
-         VALUES ($1, $2, $3, $4, now(), $5, $6, $7)",
+pub fn entry(meter_id: &MeterTypeId, tenant: Uuid, idem: &str, value: Decimal) -> UsageRecord {
+    entry_over(
+        meter_id,
+        tenant,
+        idem,
+        value,
+        fixture_window_start(),
+        fixture_window_end(),
     )
-    .bind(id)
-    .bind(tenant_id)
-    .bind(gts_id)
-    .bind(Decimal::ONE)
-    .bind("res-1")
-    .bind("compute.vm")
-    .bind(&idempotency_key)
-    .execute(pool)
-    .await?;
+}
 
-    Ok(())
+/// A faithful withdrawal of `target`: a copy of the entry it withdraws, plus the
+/// invalidation pair, under its derived `inv:<target>` idempotency key.
+///
+/// "A faithful copy of the entry it withdraws" is the schema's own phrase, and
+/// every field copied below is copied for a reason rather than for tidiness:
+///
+/// * **The quantity** — an invalidation echoes what it withdraws rather than
+///   negating it (`cpt-cf-usage-collector-adr-append-only-invalidation`), which
+///   is why netting the two would now double-count.
+/// * **The covered period** — two of the five dedup-identity inputs, so a
+///   withdrawal carrying a different period is a different identity and no
+///   longer collides with another withdrawal of the same target.
+/// * **The attribution, metadata and origin** — so the only fields separating
+///   the pair are `invalidates`, `reason_code` and the idempotency key. A
+///   withdrawal that quietly differed in, say, `resource_type` would let a
+///   `$filter` test look like it discriminated when it had only found an
+///   asymmetry the fixture put there.
+///
+/// The idempotency key is the one input to the derivation the two do not
+/// share, and is therefore the whole reason their identifiers differ — but it
+/// is no longer caller-chosen: every withdrawal of `target` derives
+/// `inv:<target.id>`
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so two
+/// withdrawals of one target now derive one identifier regardless of what a
+/// caller might otherwise have passed as its key. There is no longer a
+/// parameter for it: `entry_over`'s `idem` argument only ever seeded a value
+/// this function immediately overwrites, so the placeholder below stands in
+/// for it instead of every call site carrying a string that is never read.
+///
+/// # Panics
+///
+/// If the fixed reason code fails to validate.
+#[must_use]
+pub fn withdrawal_of(target: &UsageRecord) -> UsageRecord {
+    rederive(UsageRecord {
+        idempotency_key: IdempotencyKey::for_invalidation(target.id),
+        invalidation: Some(Invalidation {
+            target: target.id,
+            reason: ReasonCode::new("duplicate_submission").expect("valid reason code"),
+        }),
+        resource_ref: target.resource_ref.clone(),
+        subject_ref: target.subject_ref.clone(),
+        metadata: target.metadata.clone(),
+        origin: target.origin,
+        ..entry_over(
+            &target.gts_type_id,
+            target.tenant_id,
+            "withdrawal-of-placeholder-key",
+            target.quantity.as_decimal(),
+            target.window_start,
+            target.window_end,
+        )
+    })
+}
+
+/// A withdrawal of `target` carrying `reason` instead of [`withdrawal_of`]'s
+/// fixed `"duplicate_submission"`.
+///
+/// Every withdrawal of one target now derives the same `inv:<target>` key
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so two
+/// withdrawals of one target built through [`withdrawal_of`] alone would be
+/// byte-for-byte identical and absorbed as an idempotent replay rather than
+/// decided against each other. `reason_code` is the one field that survives
+/// that exclusion, so a test building a *second* withdrawal of one target
+/// uses this to keep the two apart.
+///
+/// # Panics
+///
+/// If `reason` fails to validate.
+#[must_use]
+pub fn withdrawal_of_with_reason(target: &UsageRecord, reason: &str) -> UsageRecord {
+    UsageRecord {
+        invalidation: Some(Invalidation {
+            target: target.id,
+            reason: ReasonCode::new(reason).expect("valid reason code"),
+        }),
+        ..withdrawal_of(target)
+    }
+}
+
+/// Restamp `record`'s derived identity after one of the five dedup-identity
+/// inputs was changed by a struct update.
+///
+/// [`entry_over`] takes all five as parameters precisely so this is rarely
+/// needed — every field a caller usually overwrites afterwards (quantity,
+/// attribution, metadata, origin, the invalidation pair) is outside the
+/// derivation. The exception is a test that starts from [`withdrawal_of`] and
+/// then moves the entry into a different scope: `tenant_id` and `gts_type_id`
+/// *are* inputs, so leaving the stamped id alone would store a row whose id no
+/// emitter could reproduce, and the ledger's `id` and its dedup UNIQUE would
+/// disagree about what the entry is.
+///
+/// # Panics
+///
+/// Never: the record already carries a validated key and meter.
+#[must_use]
+pub fn rederive(record: UsageRecord) -> UsageRecord {
+    UsageRecord {
+        id: derive_usage_record_id(
+            record.tenant_id,
+            &record.gts_type_id,
+            &record.idempotency_key,
+            record.window_start,
+            record.window_end,
+        ),
+        ..record
+    }
+}
+
+/// The compiled PDP scope a read is intersected with: every entry of `tenant`.
+///
+/// `get` takes the scope as its whole filter, so a test that wants a point
+/// lookup to succeed has to hand it one the row satisfies. This is the narrowest
+/// honest one — a real grant is a disjunction over the tenants a principal
+/// holds, and a single-tenant grant is one arm of it.
+#[must_use]
+pub fn tenant_scope(tenant: Uuid) -> ast::Expr {
+    ast::Expr::Compare(
+        Box::new(ast::Expr::Identifier("tenant_id".to_owned())),
+        ast::CompareOperator::Eq,
+        Box::new(ast::Expr::Value(ast::Value::Uuid(tenant))),
+    )
 }

@@ -1,15 +1,13 @@
 //! Wire DTOs for the foundation REST surface.
 //!
-//! Two resource families share this module:
-//!
-//! * `UsageType` catalog — per-row response body and the register-request DTO
-//!   for the `/usage-collector/v1/usage-types` catalog routes. List-page
-//!   envelopes use [`toolkit_odata::Page`] directly; `OData` query parameters
-//!   (`limit`, `cursor`) are parsed by the toolkit `OData` extractor and need
-//!   no module-local DTO.
-//! * `UsageRecord` create / deactivation — batch create request /
-//!   response shapes for `POST /usage-collector/v1/records`. Deactivation
-//!   returns no body (HTTP 204 No Content) so it carries no response DTO.
+//! `UsageRecord` create — batch create request / response shapes for
+//! `POST /usage-collector/v1/records`. A withdrawal is an ordinary entry
+//! on that same create surface, so it needs no DTO of its own. List-page
+//! envelopes use [`toolkit_odata::Page`] directly; `OData` query parameters
+//! (`limit`, `cursor`) are parsed by the toolkit `OData` extractor and need
+//! no module-local DTO. Every usage-type declaration is now owned by
+//! `types-registry`; this gear registers no usage-type REST surface and
+//! declares no usage-type DTO.
 //!
 //! Every wire-facing type is declared as a thin DTO with
 //! `#[toolkit_macros::api_dto(...)]` so the emitted OAS references a stable
@@ -19,71 +17,13 @@
 use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
-use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use toolkit_canonical_errors::Problem;
 use usage_collector_sdk::{
-    AggregationBucket, AggregationDimension, AggregationOp, AggregationResult, AggregationSpec,
-    MetadataKey, ResourceRef, SubjectRef, UsageCollectorError, UsageKind, UsageRecord,
-    UsageRecordStatus, UsageType,
+    AggregationBucket, AggregationDimension, AggregationResult, MetadataKey, ResourceRef,
+    SubjectRef, TimeRange, UsageCollectorError, UsageRecord,
 };
 use uuid::Uuid;
-
-// ---------------------------------------------------------------------------
-// UsageType catalog DTOs
-// ---------------------------------------------------------------------------
-
-/// Wire projection of [`usage_collector_sdk::UsageType`]. `gts_id` is
-/// flattened to `String` so the type can derive `utoipa::ToSchema`
-/// without pulling `utoipa` into the SDK crate (the SDK's
-/// `UsageTypeGtsId` newtype carries the validation semantics). `kind` is
-/// projected to its lowercase string form (`"counter"` / `"gauge"`) for
-/// the same reason — `UsageKind`'s closed-enum serde shape lives in the
-/// SDK; the host-side wire DTO mirrors it via `String`.
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(response)]
-pub struct UsageTypeDto {
-    pub gts_id: String,
-    pub kind: String,
-    pub metadata_fields: Vec<String>,
-}
-
-impl From<UsageType> for UsageTypeDto {
-    fn from(value: UsageType) -> Self {
-        Self {
-            gts_id: value.gts_id.to_string(),
-            kind: match value.kind {
-                UsageKind::Counter => "counter".to_owned(),
-                UsageKind::Gauge => "gauge".to_owned(),
-            },
-            metadata_fields: value
-                .metadata_fields
-                .into_iter()
-                .map(MetadataKey::into_inner)
-                .collect(),
-        }
-    }
-}
-
-/// Register-request body for `POST /usage-collector/v1/usage-types`.
-///
-/// Carries `gts_id` as a permissive `String` rather than the validating
-/// [`usage_collector_sdk::UsageTypeGtsId`] newtype so the handler can
-/// synthesise the canonical `invalid_base_gts_id` `Problem` envelope on
-/// rejection — relying on the newtype's `Deserialize` would surface
-/// bad-base payloads as axum's default `text/plain` 422. `kind` is the
-/// closed counter / gauge discriminator carried as `String` for the same
-/// `utoipa`-isolation reason as `gts_id`; the handler parses it through
-/// the SDK [`usage_collector_sdk::UsageKind`] enum so unknown values are
-/// rejected (per ADR-0012 amendment 2026-06-08).
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(request)]
-#[serde(deny_unknown_fields)]
-pub struct CreateUsageTypeRequest {
-    pub gts_id: String,
-    pub kind: String,
-    pub metadata_fields: Vec<String>,
-}
 
 // ---------------------------------------------------------------------------
 // UsageRecord create DTOs
@@ -141,9 +81,8 @@ impl TryFrom<SubjectRefDto> for SubjectRef {
     }
 }
 
-/// Per-record create payload. Carries `gts_id` as a permissive `String`
-/// (same rationale as [`CreateUsageTypeRequest`]) so a bad-prefix value
-/// surfaces as the per-record `Problem` instead of axum's default
+/// Per-record create payload. Carries `gts_type_id` as a permissive `String`
+/// so a bad-prefix value surfaces as the per-record `Problem` instead of axum's default
 /// `text/plain` 422 for the entire batch. per-record problem envelopes
 /// still surface for closed-shape membership, size-cap, and key
 /// validation. Intentionally has no identity field: `id` is
@@ -153,51 +92,87 @@ impl TryFrom<SubjectRefDto> for SubjectRef {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUsageRecordRequest {
-    pub gts_id: String,
+    pub gts_type_id: String,
     pub tenant_id: Uuid,
     pub resource_ref: ResourceRefDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_ref: Option<SubjectRefDto>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub value: Decimal,
-    /// Mandatory caller-supplied idempotency key per
-    /// `cpt-cf-usage-collector-dod-usage-emission-fr-idempotency`. The
-    /// plugin SPI dedups every persisted record on
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` (ADR-0014); a
-    /// missing key surfaces as a request-deserialization failure.
-    pub idempotency_key: String,
-    /// When set, marks this submission as a counter compensation
-    /// referencing a previously emitted ordinary usage row. Absent on
-    /// ordinary submissions. The four-cell value matrix and L1 referential
-    /// rule are enforced at the gateway per
-    /// `cpt-cf-usage-collector-algo-usage-emission-semantics-enforcement-on-ingest-v2`.
+    /// The measured quantity as its wire text (a JSON string). Parsed into
+    /// [`usage_collector_sdk::UsageQuantity`] where the DTO is folded into the
+    /// domain type, so an out-of-range value rejects its own entry rather
+    /// than the whole batch.
+    pub quantity: String,
+    /// The caller's key, required on a record and forbidden on an
+    /// invalidation: an invalidation's key is derived by the gateway as
+    /// `inv:` followed by `invalidates`. A record key may not begin with
+    /// `inv:`.
+    /// An explicit `null` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrects_id: Option<Uuid>,
-    /// Caller-supplied measurement timestamp (RFC 3339 UTC).
+    #[schema(nullable = false)]
+    pub idempotency_key: Option<String>,
+    /// The entry this submission withdraws. Supplying it makes the
+    /// submission an invalidation and requires [`Self::reason_code`];
+    /// omitting it makes the submission an ordinary record. There is no
+    /// caller-supplied discriminator on this shape, so a marker cannot
+    /// disagree with the payload it marks
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidates: Option<Uuid>,
+    /// Why the withdrawal was issued. Both-or-neither with
+    /// [`Self::invalidates`], which the wire contract states as
+    /// `dependentRequired` and `record_request_into_domain` — the create
+    /// handler's fold point — enforces when it folds the pair into the
+    /// domain's one field.
+    ///
+    /// The pair stays flat here because that is what the OAS declares and
+    /// what `api_dto` emits into the served document; folding it on this
+    /// shape would change the published schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// Inclusive start of the covered period this submission measures (RFC
+    /// 3339, offset mandatory).
     #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
+    pub window_start: OffsetDateTime,
+    /// Exclusive end of the covered period (RFC 3339, offset mandatory).
+    /// Equal bounds submit a point event.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: OffsetDateTime,
 }
 
 /// Batch create request body for `POST /usage-collector/v1/records`.
+///
+/// `records` is decoded one entry at a time by the handler
+/// (`decode_record_entry`), after the batch-cap check, so one malformed
+/// entry rejects only its own index rather than the whole request. The
+/// schema still publishes the entry shape via `#[schema(value_type = ...)]`.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUsageRecordsRequest {
-    pub records: Vec<CreateUsageRecordRequest>,
+    #[schema(value_type = Vec<CreateUsageRecordRequest>)]
+    pub records: Vec<serde_json::Value>,
 }
 
-/// Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_id` is
-/// flattened to `String` (same rationale as [`UsageTypeDto`]) so the type
-/// can derive `utoipa::ToSchema` without pulling `utoipa` into the SDK
-/// crate; `created_at` is emitted as RFC 3339 to match the SDK wire shape.
-/// `status` is projected to its lowercase string form for the same reason.
+/// Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_type_id` is
+/// flattened to `String` so the type can derive `utoipa::ToSchema` without
+/// pulling `utoipa` into the SDK crate; both covered-period bounds are
+/// emitted as RFC 3339 to match the SDK wire shape. `entry_type` is
+/// flattened to `String` for the first of those reasons and not the second:
+/// the SDK wire shape carries no `entry_type` at all — the discriminator is
+/// derived from `invalidates` and never stored — so there is no encoding
+/// here to mirror, only a `utoipa::ToSchema` derive to keep out of the SDK
+/// crate. `origin` is the third flattening, and for `gts_type_id`'s reason
+/// rather than `entry_type`'s: the SDK carries it as a closed enum whose
+/// wire form is already the lowercased variant name, so this `String`
+/// mirrors an encoding that does exist, and only the `utoipa::ToSchema`
+/// derive is being kept out of the SDK.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct UsageRecordDto {
     pub id: Uuid,
-    pub gts_id: String,
+    pub gts_type_id: String,
     pub tenant_id: Uuid,
     pub resource_ref: ResourceRefDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,28 +181,62 @@ pub struct UsageRecordDto {
     /// Omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub value: Decimal,
+    /// The persisted quantity as a JSON string, digit for digit as stored.
+    pub quantity: String,
     /// Mandatory caller-supplied idempotency key per
     /// `cpt-cf-usage-collector-dod-usage-emission-fr-idempotency`. Every
     /// persisted record carries a non-empty key.
     pub idempotency_key: String,
-    /// Present when this record is a counter compensation referencing a
-    /// previously emitted ordinary usage row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrects_id: Option<Uuid>,
-    /// Lifecycle status: `"active"` on a fresh insert, `"inactive"` after a
-    /// depth-1 deactivation cascade.
-    pub status: String,
+    /// Gear-assigned instant of acceptance (RFC 3339). On an absorbed retry,
+    /// the stored entry's instant.
     #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
+    pub accepted_at: OffsetDateTime,
+    /// Which ingestion path admitted the entry — `live` or `backfill`.
+    /// Server-assigned, `required` on the OAS `UsageRecord`, so it is never
+    /// omitted. Flattened to `String` for the same reason as
+    /// [`Self::gts_type_id`]: to keep `utoipa` out of the SDK crate.
+    pub origin: String,
+    /// The entry this one withdraws, absent on an ordinary measurement.
+    /// Both-or-neither with [`Self::reason_code`] — the SDK carries the
+    /// pair as one field, so a response can never show half of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidates: Option<Uuid>,
+    /// Why the withdrawal was issued. Absent on an ordinary measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// `record` or `invalidation`, **derived** from [`Self::invalidates`]
+    /// rather than stored
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    /// `readOnly` on the wire: it appears on this read shape and on no
+    /// ingestion shape, and it is `required`, so it is never omitted.
+    pub entry_type: String,
+    /// Inclusive start of the covered period the entry measures.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_start: OffsetDateTime,
+    /// Exclusive end of the covered period — the bound the read paths
+    /// select on, via the mandatory `from` / `to` range
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`), and a key
+    /// every raw-path page order names.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: OffsetDateTime,
 }
 
 impl From<UsageRecord> for UsageRecordDto {
     fn from(value: UsageRecord) -> Self {
+        // Read before the destructuring below moves `invalidation` out:
+        // `entry_type()` borrows the record, so computing it afterwards is
+        // a borrow-after-move the compiler refuses.
+        let entry_type = value.entry_type().as_str().to_owned();
+        let (invalidates, reason_code) = match value.invalidation {
+            Some(invalidation) => (
+                Some(invalidation.target),
+                Some(invalidation.reason.into_inner()),
+            ),
+            None => (None, None),
+        };
         Self {
             id: value.id,
-            gts_id: value.gts_id.to_string(),
+            gts_type_id: value.gts_type_id.to_string(),
             tenant_id: value.tenant_id,
             resource_ref: value.resource_ref.into(),
             subject_ref: value.subject_ref.map(Into::into),
@@ -236,14 +245,18 @@ impl From<UsageRecord> for UsageRecordDto {
                 .into_iter()
                 .map(|(k, v)| (k.into_inner(), v))
                 .collect(),
-            value: value.value,
+            quantity: value.quantity.to_string(),
             idempotency_key: value.idempotency_key.into_inner(),
-            corrects_id: value.corrects_id,
-            status: match value.status {
-                UsageRecordStatus::Active => "active".to_owned(),
-                UsageRecordStatus::Inactive => "inactive".to_owned(),
-            },
-            created_at: value.created_at,
+            accepted_at: value.accepted_at,
+            // `entry_type` is hoisted above the destructure because it
+            // borrows the whole record; a plain field read needs no such
+            // treatment.
+            origin: value.origin.as_str().to_owned(),
+            invalidates,
+            reason_code,
+            entry_type,
+            window_start: value.window_start,
+            window_end: value.window_end,
         }
     }
 }
@@ -281,45 +294,6 @@ pub struct CreateUsageRecordsResponse {
 // ---------------------------------------------------------------------------
 // Aggregated-query DTOs
 // ---------------------------------------------------------------------------
-
-/// Wire projection of [`usage_collector_sdk::AggregationOp`]. Identical
-/// lowercase encoding — the wrapper exists so the OAS can pin the closed
-/// enum schema without pulling `utoipa` into the SDK. (The macro-applied
-/// `rename_all = "snake_case"` collapses to the same single-token form
-/// as the SDK's `rename_all = "lowercase"` for these variants.)
-#[derive(Debug, Clone, Copy)]
-#[toolkit_macros::api_dto(request, response)]
-pub enum AggregationOpDto {
-    Sum,
-    Count,
-    Min,
-    Max,
-    Avg,
-}
-
-impl From<AggregationOpDto> for AggregationOp {
-    fn from(value: AggregationOpDto) -> Self {
-        match value {
-            AggregationOpDto::Sum => AggregationOp::Sum,
-            AggregationOpDto::Count => AggregationOp::Count,
-            AggregationOpDto::Min => AggregationOp::Min,
-            AggregationOpDto::Max => AggregationOp::Max,
-            AggregationOpDto::Avg => AggregationOp::Avg,
-        }
-    }
-}
-
-impl From<AggregationOp> for AggregationOpDto {
-    fn from(value: AggregationOp) -> Self {
-        match value {
-            AggregationOp::Sum => AggregationOpDto::Sum,
-            AggregationOp::Count => AggregationOpDto::Count,
-            AggregationOp::Min => AggregationOpDto::Min,
-            AggregationOp::Max => AggregationOpDto::Max,
-            AggregationOp::Avg => AggregationOpDto::Avg,
-        }
-    }
-}
 
 /// Wire projection of [`usage_collector_sdk::AggregationDimension`]. The
 /// closed dimensions are encoded as snake-case bare strings; the
@@ -370,40 +344,100 @@ impl From<AggregationDimension> for AggregationDimensionDto {
     }
 }
 
-/// Aggregated-query request body for
-/// `POST /usage-collector/v1/records/aggregate`. The typed `gts_id`, the
-/// `OData` `$filter`, and the `metadata.<key>` side-channel remain query
-/// parameters (mirroring `GET /usage-collector/v1/records`); only the
-/// aggregation spec (operator + group-by dimensions) ships in the body.
+/// Wire projection of [`usage_collector_sdk::TimeRange`] — the mandatory
+/// bounded range on the aggregate path (`AggregationRequest.time_range` in
+/// `docs/usage-collector-v1.yaml`). The raw path carries the same range as
+/// the `from` / `to` query parameters instead, because a `GET` has no body.
+///
+/// Both bounds deserialize through `time::serde::rfc3339`, which rejects an
+/// offset-less timestamp: a bare local time would attribute usage to
+/// whatever offset the server happened to assume.
+///
+/// `Copy`, like the SDK [`TimeRange`] it projects onto — two plain
+/// timestamps — so reading it out of a request body does not partially
+/// move the body away from the group-by projection that follows.
+#[derive(Debug, Clone, Copy)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct TimeRangeDto {
+    /// Inclusive lower bound (RFC 3339, offset mandatory).
+    #[serde(with = "time::serde::rfc3339")]
+    pub from: OffsetDateTime,
+    /// Exclusive upper bound (RFC 3339, offset mandatory).
+    #[serde(with = "time::serde::rfc3339")]
+    pub to: OffsetDateTime,
+}
+
+impl TryFrom<TimeRangeDto> for TimeRange {
+    type Error = UsageCollectorError;
+
+    fn try_from(value: TimeRangeDto) -> Result<Self, Self::Error> {
+        Self::new(value.from, value.to)
+    }
+}
+
+/// Request body for `POST /usage-collector/v1/records/aggregate`.
+///
+/// Named for the `AggregationRequest` component in
+/// `docs/usage-collector-v1.yaml`. It carries no `Dto` suffix: the suffix on
+/// `UsageRecordDto`, `TimeRangeDto` and their siblings disambiguates a DTO
+/// from an SDK type of the same bare name that this module imports, and
+/// there is no `AggregationRequest` in `usage_collector_sdk` to collide
+/// with — so the published component name and the contract's are the same
+/// string, with nothing to reconcile.
+///
+/// It does **not** mirror that component's field set, and deliberately so:
+/// the contract declares five properties and this carries two. The next
+/// paragraph says which, and why the other three are query parameters.
+///
+/// Carries the mandatory `time_range` and the group-by dimensions; the
+/// typed `gts_type_id`, the `OData` `$filter`, and the `metadata.<key>`
+/// side-channel remain query parameters (mirroring
+/// `GET /usage-collector/v1/records`). Carries no aggregation parameter:
+/// the fold is resolved from the queried type's declaration, so no request
+/// is well-formed and semantically wrong.
+///
+/// `time_range` has no `#[serde(default)]` — the contract marks it
+/// required, so a body omitting it is a deserialization failure rather than
+/// an unbounded scan.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
-pub struct QueryAggregatedUsageRecordsRequest {
-    pub op: AggregationOpDto,
+pub struct AggregationRequest {
+    pub time_range: TimeRangeDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_by: Vec<AggregationDimensionDto>,
 }
 
-impl TryFrom<QueryAggregatedUsageRecordsRequest> for AggregationSpec {
-    type Error = UsageCollectorError;
-
-    fn try_from(value: QueryAggregatedUsageRecordsRequest) -> Result<Self, Self::Error> {
-        let group_by = value
-            .group_by
+impl AggregationRequest {
+    /// Projects the wire `group_by` dimensions into their typed SDK form.
+    ///
+    /// A free method rather than a `TryFrom` impl: the target,
+    /// `Vec<AggregationDimension>`, is foreign to this crate (both `Vec`
+    /// and `AggregationDimension` live outside it), so a blanket
+    /// `TryFrom<AggregationRequest> for Vec<AggregationDimension>`
+    /// would violate the orphan rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorError`] when a `Metadata` dimension carries a
+    /// key [`MetadataKey::new`] rejects (e.g. empty or oversized).
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    pub fn into_group_by(self) -> Result<Vec<AggregationDimension>, UsageCollectorError> {
+        self.group_by
             .into_iter()
             .map(AggregationDimension::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(AggregationSpec {
-            op: value.op.into(),
-            group_by,
-        })
+            .collect()
     }
 }
 
 /// Wire projection of [`usage_collector_sdk::AggregationBucket`]. `value`
 /// is an arbitrary-precision `bigdecimal::BigDecimal` carried as a JSON
 /// string via `usage_collector_sdk::serde_helpers::bigdecimal_str_option`
-/// (the same string-on-the-wire discipline as `UsageRecord.value`, but
+/// (the same string-on-the-wire discipline as `UsageRecordDto.quantity`, but
 /// without `Decimal`'s magnitude ceiling); `None` materializes as `null`
 /// per the SDK contract for empty-set buckets.
 #[derive(Debug, Clone)]

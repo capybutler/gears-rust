@@ -25,8 +25,8 @@ use toolkit_odata::filter::ODataValue;
 /// A storage-typed value ready to be bound to a `PostgreSQL` placeholder.
 ///
 /// Each variant maps 1:1 to a `sqlx` `.bind` target whose Rust type matches a
-/// `usage_records` / `usage_type_catalog` column (`uuid`, `text`, `numeric`,
-/// `timestamptz`, `boolean`).
+/// `usage_records` column (`uuid`, `text`, `numeric`, `timestamptz`,
+/// `boolean`).
 #[derive(Debug, Clone)]
 pub enum SqlBind {
     /// `uuid` column bind.
@@ -77,8 +77,8 @@ pub fn odata_value_to_bind(v: &ODataValue) -> Result<SqlBind, String> {
 }
 
 /// Apply a single [`SqlBind`] to a `sqlx` `QueryAs` builder, returning it with
-/// the bind appended. Generic over the row type `O` so it serves every
-/// `query_as::<_, Row>` paginator (records and catalog).
+/// the bind appended. Generic over the row type `O` so it composes with any
+/// `query_as::<_, Row>` builder without naming the row.
 ///
 /// Binds borrow from `v` for the `'q` lifetime, matching `sqlx`'s
 /// borrow-the-argument binding model.

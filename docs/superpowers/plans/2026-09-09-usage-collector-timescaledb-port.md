@@ -1,0 +1,6063 @@
+# TimescaleDB Storage Plugin Port Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Port `cf-gears-timescaledb-usage-collector-plugin` onto the SPI that slices 1-6 reshaped, until `usage_collector_sdk::contract::run_all` reports no violations against it and it is a workspace member again.
+
+**Architecture:** The crate keeps its DDD-light layering — `gear` (GTS handshake) → `domain` (SPI adapter + store port) → `infra` (sqlx/Postgres). Three things change shape underneath it: the usage-type catalog is deleted outright (typing moved to `types-registry` in slice 2), the ledger table is replaced by a fresh schema carrying the covered period, the append-only invalidation pair, `origin`, and a plugin-assigned `acceptance_sequence`, and the query plane is rebuilt around `(window_end, id)` keyset pagination over the published eight-field `$filter` surface.
+
+**Tech Stack:** Rust 2024, `sqlx` (Postgres + TimescaleDB), `toolkit-odata` (filter AST, cursors, keyset), `rust_decimal` / `bigdecimal`, `time`, `tokio`, `cf-gears-usage-collector-sdk` (SPI + contract suite).
+
+---
+
+## Ground rules — read before Task 1
+
+These are inherited from slices 4-6 and each one was paid for. They are not
+optional and they are not restated per task.
+
+- **Name the mutation, or it is not a test.** Before accepting any test, state
+  the one-token edit to production code that makes it red. If you cannot name
+  one, it is not a test. Tautological length assertions over fixed-size arrays,
+  `std::any::type_name` checks, and fixtures that are green under the old
+  behaviour too have all shipped here before.
+- **A surviving mutation is a claim about a build, so check the build.** The
+  `#[path]` harness (Task 5 Step 8) compiles files that live outside its own
+  package, and cargo decides staleness by **mtime**, so any mutation vehicle
+  that carries an mtime across leaves the harness running the *old* object
+  code: `Finished` with no `Compiling` line, every test green, and "the
+  mutation survived" — which argues for deleting a working test. Measured in
+  this tree at the Task 6 run: `shutil.copy2` (and `cp -p`, `rsync -t`,
+  `install -p`, editors that preserve timestamps) reproduces it exactly;
+  writing the file then `touch`ing it does **not** — four runs, all rebuilt.
+  Two defences, use both: **`touch` the harness's own `src/lib.rs`** as well
+  as the mutated file — verified to force the rebuild even when the mutated
+  file's mtime is stale — and **treat a missing `Compiling` line as a failed
+  run, not as a result.**
+- **Anchor a mutation to a unique site, or count the occurrences first.** Same
+  family as the rule above, and it cost a wrong conclusion at Task 13. A
+  mutation applied with `str.replace(old, new, 1)` — or `sed` without an address
+  — lands on the *first* match, and test files repeat their setup lines: two
+  mutations "survived" there, both having edited a different test function than
+  the one being measured, and together they produced a confident, false,
+  **"Measured:"** claim that went into the source. **A mutation applied to the
+  wrong site is a false survivor in exactly the way an mtime-stale rebuild is,
+  and argues in the same direction — for deleting a working check.** Count the
+  occurrences before mutating (`grep -c`, remembering it exits non-zero on 0),
+  target the last one with `rindex` when the site you want is the newest, or
+  anchor on surrounding context that is unique. And when a mutation survives,
+  **prove it reached the site**: print the diff, or assert the mutated text is
+  the one you meant.
+- **Do not run a workspace-wide test build.** `target/` reaches ~110 GB and
+  fills the disk. Scope every run with `-p`. **This bites harder now**: Task 16
+  adds this crate to the workspace, so `--workspace` grows.
+- **Tests live in a sibling `*_tests.rs` file** with a
+  `#[cfg(test)] #[cfg_attr(coverage_nightly, coverage(off))] #[path = "..."]`
+  hook, never an inline `mod tests`.
+- **Commits are Conventional Commits with a `Signed-off-by` trailer.** A
+  breaking change takes a `!` and a `BREAKING CHANGE:` trailer. **No
+  attribution lines.**
+- **Clippy is deny-warnings in CI and `clippy::pedantic` is deny at workspace
+  level.** `clippy::non_ascii_literal` means no em dashes inside string
+  literals; doc comments are fine.
+- **Cite ADRs by `cpt-cf-usage-collector-adr-*` id, never by number.**
+- **Verify any `§N.M` DESIGN citation falls inside that section's line span.**
+  Measured spans: §3.1 = 476-592, §3.2 = 593-866, §3.3 = 867-1245,
+  §3.7 = 1526-1552, §3.10 = 1637-1721, §3.11 = 1722-1844
+  (§3.11.5 = 1767-1824).
+- **Never `git add -A`.** Six files in this tree are uncommitted and are not
+  yours to commit or restore: the deleted
+  `docs/superpowers/plans/2026-09-07-usage-collector-record-model-handoff.md`,
+  and untracked `NEXT-SLICE.md`, `SLICE4.md`, `SLICE5.md`, `SLICE6.md`,
+  `SLICE7.md`.
+- **`grep -c` returning 0 exits non-zero** and will silently truncate a `&&`
+  chain.
+- **`timeout` does not exist in this shell.** `timeout 30 docker info` fails
+  with "command not found", so `timeout … && echo up || echo down` reports
+  *down* regardless of the daemon's actual state. This produced a wrong
+  conclusion in this session — Docker was reported unavailable twice while it
+  was running. **Run the command bare, and when a probe reports "unavailable",
+  check the probe before believing it.** The general form of this trap: a
+  wrapper that fails for its own reasons is indistinguishable, through `&&`/`||`,
+  from the thing it wraps failing.
+- **Docker is available** (server 28.3.3), so Tasks 3, 14, 15 and 17 can be
+  verified for real. Clean up containers you start, including on failure.
+- **Never post-filter `grep -rn` on digit patterns** — it matches grep's own
+  line numbers and drops every hit on a line >= 10.
+- **A claim outliving the code is the characteristic defect here.** A retracted
+  claim that is reworded rather than replaced ships anyway. The specific shape
+  that survives review: a conclusion that is correct resting on a supporting
+  mechanism that was invented. Nothing in a test suite sees it.
+- **Rustdoc drops `//` inside a `///` block.** A retraction written that way is
+  not rendered.
+
+### Decisions already made — do not relitigate
+
+Four questions were put to the owner before this plan was written. The answers
+are settled inputs:
+
+1. **`acceptance_sequence` is plugin-only.** It becomes a stored column this
+   backend assigns and orders on. It does **not** go on the SDK `UsageRecord`.
+   `latest-tie-break` therefore stays in `BLOCKED_CHECKS` and entry 19 stands
+   unchanged. Do not add either field to the SDK.
+2. **Fresh schema.** `0001_init.sql` and `0002_rename_uuid_to_id.sql` are
+   replaced by a single new init. No migration path is owed — migration 0002's
+   own comment records that the gear is unreleased and any rows at cutover live
+   on disposable dev databases.
+3. **Both CI steps are restored** (Task 17), and the e2e python is brought
+   current with them.
+4. **`docs/api/api.json` is regenerated at the end of this slice** (Task 18).
+
+### Verification bar
+
+Run after every task that touches Rust:
+
+```bash
+cargo check --workspace --all-targets
+cargo nextest run -p cf-gears-usage-collector -p cf-gears-usage-collector-sdk \
+  -p cf-gears-noop-usage-collector-plugin --no-fail-fast
+cargo nextest run -p cf-gears-usage-collector-sdk --features contract --no-fail-fast
+cargo clippy --workspace --all-targets --all-features
+cargo +nightly fmt
+cargo doc --no-deps -p cf-gears-usage-collector-sdk -p cf-gears-usage-collector
+```
+
+**Baseline measured at `863a1396e`, the commit this slice starts from:**
+
+| Measure | Value |
+| --- | --- |
+| `cargo nextest` across the three packages | **716 passed / 0 skipped** |
+| `cargo nextest -p …-sdk --features contract` | **166 passed / 0 skipped** |
+| `cargo doc` warnings, `cf-gears-usage-collector` | **35** |
+| `cargo doc` warnings, `cf-gears-usage-collector-sdk` | **0** |
+
+Skipped must stay 0. Neither doc-warning count may grow — and an intra-doc link
+from a public doc to a `pub(crate)` item adds one. Read the `generated N
+warnings` line; `grep -c '^warning:'` over-counts by one because rustdoc's own
+summary line begins with `warning:`.
+
+From Task 16 onward the nextest run gains
+`-p cf-gears-timescaledb-usage-collector-plugin`. Its Postgres integration
+tests are behind the `postgres` feature and need a reachable Docker daemon.
+
+---
+
+## File Structure
+
+### Deleted outright
+
+| Path | Lines | Why |
+| --- | --- | --- |
+| `src/infra/storage/catalog_store.rs` | 501 | Slice 2 removed the usage-type catalog from the gear. `types-registry` owns typing; the SPI never sees a declaration. |
+| `src/infra/storage/catalog_store_tests.rs` | 164 | Tests of the above. |
+| `tests/catalog_integration_pg.rs` | 212 | Integration tests of the above. |
+
+### Rewritten
+
+| Path | Responsibility after the port |
+| --- | --- |
+| `migrations/0001_init.sql` | The whole schema, replacing both existing migrations. |
+| `src/infra/storage/entity.rs` | `UsageRecordRow` only, mirroring the new columns. `UsageTypeRow` is deleted. |
+| `src/infra/storage/mapper.rs` | Row <-> `UsageRecord`. Loses status/kind/catalog helpers; gains the invalidation pair, `origin`, and the covered period. |
+| `src/infra/storage/query/translate.rs` | `record_column` brought to the model that exists (DIVERGENCES entry 16). `usage_type_column` deleted. |
+| `src/infra/storage/query/keyset.rs` | `(window_end, id)` canonical keyset; honours `query.order` as given; carries `filter_hash` into `next_cursor.f`. |
+| `src/infra/storage/query/aggregate.rs` | `AggregationFold` (not `AggregationOp`); the two withdrawal-exclusion clauses; `LATEST` via the declared tie-break. |
+| `src/infra/storage/record_store.rs` | The five SPI operations. Gains `acceptance_sequence` assignment and the atomic at-most-one-invalidation rule; loses `deactivate`. |
+| `src/domain/ports.rs` | `RecordStore` only, with the new signatures. `CatalogStore` deleted. |
+| `src/domain/adapter.rs` | Five methods, down from ten. |
+| `src/gear.rs` | Drops the catalog store from the wiring. |
+
+### Created
+
+| Path | Responsibility |
+| --- | --- |
+| `tests/contract_conformance_pg.rs` | The acceptance criterion: `run_all` against a live TimescaleDB backend. |
+
+---
+
+## Task 0: Make the crate buildable at all — DONE before Task 1
+
+**This was done by the controller before Task 1 was dispatched. It is recorded
+here because it changes every verification command in this plan.**
+
+The plugin could not be compiled *in any form* at the start of this slice.
+`cargo check --manifest-path …/Cargo.toml` does not fall back to a standalone
+build — cargo refuses outright:
+
+```
+error: current package believes it's in a workspace when it's not:
+current:   …/plugins/timescaledb-usage-collector-plugin/Cargo.toml
+workspace: /Users/binarycode/code/virtuozzo/gears-rust/Cargo.toml
+```
+
+An empty `[workspace]` table in the plugin manifest is not a way around it
+either: that makes the crate its own workspace root, and every
+`{ workspace = true }` dependency it declares stops resolving.
+
+So workspace membership — originally Task 16 Step 1 — was moved to the front.
+The single line added to the root `Cargo.toml` `members` array:
+
+```toml
+    "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
+```
+
+**The consequence, and it is not optional: `cargo check --workspace` is RED
+from here until Task 13.** That is the whole point of Task 13, and it was
+always going to be true; what changed is that it is now visible in the
+workspace build rather than hidden behind a crate cargo would not look at.
+
+**Intermediate verification bar, Tasks 1-12.** Use this instead of the
+full bar at the top of this file:
+
+```bash
+# The crate under construction — expect errors, and expect them to shrink.
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | tail -40
+
+# The three packages that must stay green throughout. These are unaffected by
+# the plugin and a regression here means you broke something outside your task.
+cargo nextest run -p cf-gears-usage-collector -p cf-gears-usage-collector-sdk \
+  -p cf-gears-noop-usage-collector-plugin --no-fail-fast
+cargo nextest run -p cf-gears-usage-collector-sdk --features contract --no-fail-fast
+```
+
+The full bar — `--workspace` check, clippy, fmt, doc — resumes at Task 13,
+which is the task whose success criterion is that it passes.
+
+**Measured baseline immediately after adding the member line, at `490d42c8e`:**
+
+**Read cargo's own summary lines. Do NOT grep-count diagnostics.**
+
+```bash
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 \
+  | grep 'previous error'
+```
+
+| Target | Errors |
+| --- | --- |
+| lib | **44** |
+| lib test | **63** |
+
+**Two ways a grep count lies here, both hit during Task 1.**
+
+1. **`grep -c '^error\[\|^error:'` over-counts by exactly 2**, because cargo's
+   two `error: could not compile … due to N previous errors` summary lines
+   themselves begin with `error:`. This is the same trap this plan's ground
+   rules already record for `cargo doc`'s `generated N warnings` line, made a
+   second time against a different tool. An earlier draft of this file reported
+   the baseline as "74 total" on that basis; the real figure was 44 + 63.
+2. **`grep -c '^error\['` is not stable across runs.** Cargo does not re-emit
+   every diagnostic on a cached rebuild, so two people at the same commit get
+   different numbers — 59 and 56 were both measured at `ba285ff53`. The summary
+   lines are stable because cargo recomputes them per target.
+
+So the progress metric for Tasks 1-12 is **the pair `(lib, lib test)` from
+cargo's own summary**, and a task's report should quote both.
+
+Error codes present: E0050, E0308, E0407, E0425, E0432, E0433, E0560, E0599,
+E0609. This is the "before" picture Task 1 Step 1 asks for. Judge each of
+Tasks 1-12 by whether this number moves in the right direction and by whether
+the errors that remain are the ones the next task owns.
+
+Task 16 keeps the rest of the rewiring — `Cargo.lock`, the `Makefile` target,
+the example server, the e2e config. Only the `members` line moved.
+
+---
+
+## Task 1: Delete the usage-type catalog
+
+Slice 2 removed the usage-type catalog from the gear entirely. `types-registry`
+owns typing and the SPI never sees a declaration, so `CatalogStore`,
+`PgCatalogStore`, `UsageTypeRow`, `usage_type_column` and the four catalog SPI
+methods have nothing behind them. This is deletion work, not port work, and it
+is first because it makes every later task smaller.
+
+**Measured blast radius:** 877 lines in three dedicated files, plus references
+in 19 other files (`grep -rn 'catalog' --include='*.rs' .` reports 114 hits
+total in the crate).
+
+**Files:**
+- Delete: `src/infra/storage/catalog_store.rs`, `src/infra/storage/catalog_store_tests.rs`, `tests/catalog_integration_pg.rs`
+- Modify: `src/infra/storage.rs`, `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/gear.rs`, `src/infra/storage/entity.rs`, `src/infra/storage/mapper.rs`, `src/infra/storage/query/translate.rs`, `src/infra/storage/error.rs`, `src/infra/metrics.rs`
+
+- [ ] **Step 1: Confirm the starting error count**
+
+Task 0 already made the crate visible to cargo and recorded the baseline: **44
+lib errors, 63 lib-test errors, 74 `error…` lines total** at `490d42c8e`.
+Re-confirm it rather than trusting this file:
+
+```bash
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | tail -40
+```
+
+Save the full output to the session scratchpad — **not to the repository**.
+
+This task will not make the crate compile. Nothing before Task 13 will. Judge
+it by whether the error count drops and by whether the errors that remain are
+the ones a later task owns.
+
+- [ ] **Step 2: Delete the three catalog-dedicated files**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+git rm src/infra/storage/catalog_store.rs \
+       src/infra/storage/catalog_store_tests.rs \
+       tests/catalog_integration_pg.rs
+```
+
+- [ ] **Step 3: Remove the module declaration**
+
+`src/infra/storage.rs` is 7 lines and declares the storage submodules. Remove
+the `pub mod catalog_store;` line. Leave the others.
+
+- [ ] **Step 4: Delete the `CatalogStore` port**
+
+In `src/domain/ports.rs`, delete the entire `CatalogStore` trait (the
+`/// Catalog operations on ‘usage_type_catalog‘. Implemented by infra.` doc
+comment and the `#[async_trait] pub trait CatalogStore { … }` block). Remove
+`UsageType` and `UsageTypeGtsId` from the `usage_collector_sdk` import list if
+nothing else in the file uses them.
+
+- [ ] **Step 5: Delete the four catalog methods from the adapter**
+
+In `src/domain/adapter.rs`, delete `create_usage_type`, `get_usage_type`,
+`list_usage_types` and `delete_usage_type` from the
+`impl UsageCollectorPluginV1 for StorageAdapter` block. Delete the `catalog`
+field from the `StorageAdapter` struct and its parameter from
+`StorageAdapter::new`, leaving:
+
+```rust
+#[domain_model]
+pub(crate) struct StorageAdapter {
+    record: Arc<dyn RecordStore>,
+}
+
+impl StorageAdapter {
+    #[must_use]
+    pub(crate) fn new(record: Arc<dyn RecordStore>) -> Self {
+        Self { record }
+    }
+}
+```
+
+Update the struct doc comment: it currently says "Delegates record ops to the
+[`RecordStore`] port and catalog ops to the [`CatalogStore`] port." The second
+half is now false. **Replace the sentence, do not append a retraction to it** —
+a reworded claim that keeps the dead half ships the dead half.
+
+- [ ] **Step 6: Unwire the catalog store from the gear**
+
+In `src/gear.rs`, delete the `PgCatalogStore` import, the
+`use crate::domain::ports::{CatalogStore, RecordStore};` becomes
+`use crate::domain::ports::RecordStore;`, delete the `let catalog: Arc<dyn CatalogStore> = …`
+binding, and change `StorageAdapter::new(record, catalog)` to
+`StorageAdapter::new(record)`. The `metrics` clone that fed `PgCatalogStore`
+was the last use of the un-cloned `metrics`; pass `metrics` to `PgRecordStore`
+directly rather than `metrics.clone()`.
+
+Update the comment `// Wire the storage stack: record + catalog stores behind
+the adapter.` and the sentence after it (`Both stores share the one metric
+inventory via ‘Arc<Metrics>‘.`) — there is one store now.
+
+- [ ] **Step 7: Delete `UsageTypeRow` and the catalog mapper helpers**
+
+In `src/infra/storage/entity.rs`, delete the `UsageTypeRow` struct. Update the
+module doc: it opens "`sqlx` row structs mirroring the `usage_records`
+hypertable and the `usage_type_catalog` table (see `migrations/0001_init.sql`)"
+and lists `text[]` -> `Vec<String>` among the column type mappings. Both are now
+wrong. Rewrite the paragraph.
+
+In `src/infra/storage/mapper.rs`, delete `parse_kind`, `kind_to_sql` and
+`type_row_to_model`, and remove `UsageKind`, `UsageType` and `UsageTypeRow` from
+the imports. Leave `parse_status`, `status_to_sql`, `gts_id_str` and
+`gts_id_from_str` for now — Task 5 owns them.
+
+- [ ] **Step 8: Delete `usage_type_column`**
+
+In `src/infra/storage/query/translate.rs`, delete the `usage_type_column`
+function and its doc comment. The `SqlCtx::binds` field doc says it is "read
+only by the in-crate stores (record/catalog) and the query tests" — correct it
+to name the record store alone.
+
+- [ ] **Step 9: Sweep the remaining catalog references**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+grep -rn -i 'catalog\|usage_type\|UsageType' --include='*.rs' .
+```
+
+Work the list to empty. The known remainders are in `src/infra/storage/error.rs`
+and `src/infra/storage/error_tests.rs` (a catalog foreign-key error path),
+`src/infra/metrics.rs` and `src/infra/metrics_tests.rs` (catalog-labelled
+metrics), `src/infra/storage/query/bind.rs` (a doc reference), and the four
+surviving `tests/*_pg.rs` files (which seed the catalog in their fixtures).
+
+For the `tests/*_pg.rs` files, delete only the catalog seeding — the rest of
+each file is rewritten in Task 15, and deleting them wholesale now loses the
+record of what they asserted.
+
+**The `--include='*.rs'` filter above is too narrow and will miss things.** It
+structurally cannot see `README.md`, `migrations/*.sql`, or any doc. Run the
+sweep again without it and handle what it finds:
+
+```bash
+grep -rn -i 'catalog\|usage_type' \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/
+```
+
+The plugin's own `README.md` **is** in scope — no other task owns it, and it
+advertises the catalog in its opening description. `migrations/0001_init.sql`
+is **not**: it still creates `usage_type_catalog`, and Task 3 replaces the
+whole file. The plugin's `docs/` directory is **not**: it is deliberately
+stale, it is where the `@cpt-` traceability marker ids resolve, and DIVERGENCES
+entries 5 and 14 cover it. Leave both alone, and say in your report that you
+did.
+
+**For every deletion in this step, state which of the two it is:** "deleted
+because the thing it tested no longer exists" or "deleted because it fails".
+Those look identical in a diff and only the first is legitimate here. Report a
+per-item verdict.
+
+**A third category is illegitimate and is the one to watch for: "deleted so a
+grep would come back empty."** A test asserting something that still exists is
+a live test even when its subject is scheduled for removal two tasks later.
+`tests/schema_integration_pg.rs` is the specific trap: it probes
+`usage_type_catalog` with raw SQL naming no Rust symbol, so that table still
+exists until Task 3 replaces the schema. If a sweep pressures you toward
+deleting a live assertion, stop and report it — the sweep is what is wrong.
+
+- [ ] **Step 10: Confirm the catalog is gone and the error count dropped**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+grep -rn -i 'catalog' --include='*.rs' . ; echo "exit=$?"
+```
+
+Expected: no output, `exit=1`. (`grep` exits 1 on no match — the `echo` is why
+this is not chained with `&&`.)
+
+```bash
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | grep -c '^error\[\|^error:'
+```
+
+Expected: fewer errors than Step 1 recorded, and no error naming bare
+`UsageType`, `UsageKind` or `CatalogStore`.
+
+**`UsageTypeGtsId` errors are expected to remain and are not yours.** Step 4
+says to keep it where it is still used, and it survives on `RecordStore::list`
+and `RecordStore::aggregate` (`ports.rs`), on the adapter's two matching
+methods, and throughout `mapper.rs`. Those are *record*-path signatures, not
+catalog ones: the SDK replaced the type with `MeterTypeId`, and Tasks 5, 11 and
+12 do the replacement. `UsageTypeNotFound` likewise stays until Task 9 rewrites
+`map_insert_error`.
+
+**Do not delete anything merely to make a grep return empty.** If a grep hit
+belongs to a later task, leave it and say so in your report.
+
+- [ ] **Step 11: Commit**
+
+```bash
+cd /Users/binarycode/code/virtuozzo/gears-rust
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+git commit -s -m "refactor(timescaledb-plugin)!: delete the usage-type catalog
+
+Slice 2 moved typing to types-registry and the SPI never sees a declaration,
+so CatalogStore, PgCatalogStore, UsageTypeRow and usage_type_column have
+nothing behind them. Delete the catalog store, its tests, its integration
+suite, and the four catalog methods on the SPI adapter.
+
+BREAKING CHANGE: the plugin no longer serves the usage-type catalog SPI
+methods, which the SPI no longer declares."
+```
+
+---
+
+## Task 2: Delete `deactivate` and the correction-era store surface
+
+Slice 4 replaced `status` / `corrects_id` with an appended invalidation entry.
+A correction is no longer a mutation of an existing row, so
+`deactivate_usage_record` has no meaning: the SPI does not declare it and
+nothing can call it.
+
+**Files:**
+- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`, `src/infra/metrics.rs`, `src/infra/metrics_tests.rs`, `src/config.rs`, `src/infra/storage/pool.rs`, and three `tests/*_pg.rs`
+
+**Measured blast radius — wider than the trait method.** `grep -rn 'deactivate'
+--include='*.rs'` reports **41 hits across 9 files**, not the 4 an earlier draft
+of this task listed. Beyond the port, adapter and store:
+
+- **`src/infra/metrics.rs` publishes a whole metric for the operation**:
+  `uc_timescaledb_deactivate_duration_seconds`, its `deactivate_duration`
+  histogram field, its registration in `Metrics::new`, the `record_deactivate`
+  recorder, and a `TimedOp::Deactivate` variant with its match arm. **All of it
+  goes.** A metric measuring an operation that cannot be invoked is worse than
+  a dead function: an operator can build an alert on it and the alert never
+  fires. That is the same defect class DIVERGENCES entry 4 is filed under, and
+  this task is where it would be introduced rather than inherited.
+- ~~**`src/infra/metrics_tests.rs`** asserts on that metric.~~ **This was wrong.**
+  That file contains zero `deactivate` references and never did; Task 2's
+  implementer verified it at the base commit and correctly deleted nothing
+  rather than inventing a deletion to satisfy the step.
+- **`src/config.rs:79` and `src/infra/storage/pool.rs:69`** each cite the
+  deactivate `SELECT … FOR UPDATE` as the worked example in a doc comment about
+  lock timeouts. The surrounding guidance is still true; only the example is
+  dead. **Re-point the example at a live statement rather than deleting the
+  paragraph** — the lock-timeout rationale is load-bearing and losing it to
+  tidy away one clause would be a real regression.
+
+  **Amended after execution: "re-point at a live `SELECT … FOR UPDATE`" was
+  impossible.** The `deactivate` body held the only `FOR UPDATE`, and indeed the
+  only `UPDATE` or `DELETE`, anywhere in `src/`. After this task the plugin is
+  insert-and-select only and takes no explicit row lock, so no equivalent
+  example existed to point at. The right answer was to cite a *different* real
+  statement and adjust the surrounding claim to match: the example became an
+  ingest `INSERT … ON CONFLICT … DO NOTHING` meeting an uncommitted duplicate,
+  and "row lock" was widened to "contended lock", because that conflict waits
+  on the inserting transaction's XID lock rather than a row lock. Keeping "row
+  lock" would have swapped one invented mechanism for another.
+- Three `tests/*_pg.rs` files. Delete only the deactivate coverage; the rest is
+  Task 15's.
+
+- [ ] **Step 1: Delete `deactivate` from the port**
+
+In `src/domain/ports.rs`, delete this line from the `RecordStore` trait:
+
+```rust
+    async fn deactivate(&self, id: Uuid) -> Result<(), UsageCollectorPluginError>;
+```
+
+- [ ] **Step 2: Delete `deactivate_usage_record` from the adapter**
+
+In `src/domain/adapter.rs`, delete:
+
+```rust
+    async fn deactivate_usage_record(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
+        self.record.deactivate(id).await
+    }
+```
+
+- [ ] **Step 3: Delete the implementation**
+
+In `src/infra/storage/record_store.rs`, delete the `async fn deactivate` body
+from `impl RecordStore for PgRecordStore` (it starts at `:1343` and runs to the
+end of the impl block — verify the line before cutting; this file is edited by
+several tasks and line numbers move).
+
+- [ ] **Step 4: Delete its tests, with a per-test verdict**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+grep -rn 'deactivate' --include='*.rs' .
+```
+
+**Not every hit is a deletion.** Sort them into three piles and say which pile
+each went in:
+
+1. **Delete** — the trait method, the adapter method, the store impl, the
+   metric and its recorder, and every test whose subject is one of those. For
+   each, report whether it was deleted "because its question no longer exists"
+   or "because it failed". All should be the former; if any is the latter, stop
+   and say so.
+2. **Re-point** — `src/config.rs:79` and `src/infra/storage/pool.rs:69`. The
+   lock-timeout guidance around the example is still true and load-bearing.
+   Swap the dead `SELECT … FOR UPDATE` example for a live statement; do not
+   delete the paragraph.
+3. **Leave** — anything belonging to a later task. Say what you left and why.
+
+- [ ] **Step 5: Verify**
+
+```bash
+grep -rn 'deactivate' \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/
+```
+
+**Expected: a small number of hits, not zero.** The re-pointed doc comments in
+`config.rs` and `pool.rs` may still name the concept if that reads better than
+a contrived substitute — what must be gone is every *executable* reference and
+every metric.
+
+**Do not delete anything merely to make this grep return empty.** Task 1 shows
+what that pressure produces: a live assertion deleted because a sweep wanted a
+clean result. Confirm instead that no surviving hit is code:
+
+```bash
+grep -rn 'deactivate' \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/ \
+  | grep -v '^\s*//' | grep -v '///'
+```
+
+Then read what that leaves and account for each line in your report.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+git commit -s -m "refactor(timescaledb-plugin)!: delete deactivate_usage_record
+
+Slice 4 replaced status/corrects_id with an appended invalidation entry, so a
+correction is no longer a mutation of an existing row and the SPI no longer
+declares this method.
+
+BREAKING CHANGE: deactivate_usage_record is gone; withdrawal is an appended
+invalidation entry submitted through create_usage_record."
+```
+
+---
+
+## Task 3: Replace the schema
+
+The table predates three model changes. Slice 3 replaced `created_at` with the
+covered period `[window_start, window_end)`; slice 4 replaced
+`status` / `corrects_id` with `invalidates` + `reason_code`; slice 5 added
+`origin`. Per the owner's decision this is a **fresh schema**, not a third
+migration.
+
+**Files:**
+- Rewrite: `migrations/0001_init.sql`
+- Delete: `migrations/0002_rename_uuid_to_id.sql`
+
+### What binds this schema
+
+DESIGN §3.7 (lines 1526-1552) says concrete table shapes are plugin-internal
+per `DATA-DESIGN-NO-001`, and binds them with exactly two obligations:
+
+> The dedup identity must be enforced as a uniqueness constraint over the
+> 5-tuple, and preserved for the retention horizon. The plugin assigns
+> `acceptance_sequence` and must keep it strictly monotonic per
+> `(tenant_id, gts_type_id)`.
+
+The 5-tuple is `(tenant, gts_type, key, window_start, window_end)`
+(`DESIGN.md:62`). `id` is a deterministic UUIDv5 over the same 5-tuple, and
+`entry_type` is deliberately excluded from the derivation (`DESIGN.md:63`).
+
+- [ ] **Step 1: Delete the second migration**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+git rm migrations/0002_rename_uuid_to_id.sql
+```
+
+- [ ] **Step 2: Write the new schema**
+
+Replace the whole of `migrations/0001_init.sql` with:
+
+```sql
+-- TimescaleDB Usage Collector storage backend — base schema.
+--
+-- One ledger table plus its per-scope sequence counters. There is no
+-- usage-type catalog: declarations live in types-registry and the storage SPI
+-- never sees one (the gear's DESIGN §3.7 — not this plugin's, whose §3.7 still
+-- describes the retired schema).
+--
+-- This file replaces the pre-slice-4 schema and its rename migration outright
+-- rather than migrating from them. The gear is unreleased, so no deployment
+-- holds rows worth a migration path; the retired 0002 said as much in its own
+-- header.
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+CREATE TABLE IF NOT EXISTS usage_records (
+    -- Deterministic gateway-derived entry identity: UUIDv5 over the 5-tuple
+    -- dedup identity (cpt-cf-usage-collector-adr-record-identity-derivation).
+    -- `entry_type` is deliberately not an input to it.
+    id                  uuid        NOT NULL,
+    tenant_id           uuid        NOT NULL,
+    gts_type_id         text        NOT NULL,
+    value               numeric     NOT NULL,
+    -- The covered period [window_start, window_end). The only emitter-supplied
+    -- time attribution. The time-range predicate reads the end alone
+    -- (cpt-cf-usage-collector-adr-window-end-selection), which is why the end
+    -- is the hypertable partition column.
+    window_start        timestamptz NOT NULL,
+    window_end          timestamptz NOT NULL,
+    resource_id         text        NOT NULL,
+    resource_type       text        NOT NULL,
+    subject_id          text,
+    subject_type        text,
+    idempotency_key     text        NOT NULL,
+    -- The append-only invalidation pair. An invalidation entry names the entry
+    -- it withdraws and carries a reason; an ordinary measurement carries
+    -- neither (cpt-cf-usage-collector-adr-append-only-invalidation).
+    invalidates         uuid,
+    reason_code         text,
+    origin              text        NOT NULL
+        CONSTRAINT usage_records_origin_valid
+        CHECK (origin IN ('live', 'backfill')),
+    -- Materialized so `$filter=entry_type eq 'invalidation'` resolves to a
+    -- column. The SDK spells out exactly this expression and notes that the
+    -- value hook cannot carry the field instead (models.rs, UsageRecordQuery).
+    entry_type          text        GENERATED ALWAYS AS
+        (CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END) STORED,
+    -- Strictly monotonic per (tenant_id, gts_type_id); assigned by this plugin,
+    -- never by the gear (the gear's DESIGN §3.7). Claimed from
+    -- `usage_acceptance_sequence` below. Gaps are permitted: the obligation is
+    -- monotonicity, not density, and an absorbed idempotent retry consumes a
+    -- value it does not store.
+    --
+    -- The counter row is the sole authority and the ledger does not re-check
+    -- what it hands out, because no constraint here could. A hypertable UNIQUE
+    -- must contain the partition column, and unlike the invalidation index
+    -- below there is no reason two entries in one scope would share a
+    -- `window_end` — so `UNIQUE (tenant_id, gts_type_id, acceptance_sequence,
+    -- window_end)` admits a repeated sequence instead of rejecting it, and the
+    -- form that would reject it is refused by the hypertable.
+    acceptance_sequence bigint      NOT NULL,
+    metadata            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    ingested_at         timestamptz NOT NULL DEFAULT now(),
+
+    -- A hypertable's PRIMARY KEY and every UNIQUE must contain the partition
+    -- column, so both carry `window_end`.
+    --
+    -- This is the same key as the dedup UNIQUE below, since `id` is a UUIDv5
+    -- over that same 5-tuple. It is kept as defense in depth: while the
+    -- derivation is correct the two are redundant, and a defect in it cannot
+    -- then produce two rows for one identity.
+    PRIMARY KEY (id, window_end),
+
+    -- The gear's DESIGN §3.7 dedup obligation, over the 5-tuple verbatim.
+    CONSTRAINT usage_records_dedup_uniq
+        UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end),
+
+    -- A point event is window_start == window_end; a period is strictly
+    -- ordered. Nothing admits window_end < window_start.
+    CONSTRAINT usage_records_window_ordered
+        CHECK (window_start <= window_end),
+
+    -- The pair is all-or-nothing: an invalidation names a target and carries a
+    -- reason, an ordinary measurement does neither. A reason without a target
+    -- would be an unmarked correction, which the model has no room for.
+    CONSTRAINT usage_records_invalidation_pairing
+        CHECK (
+            (invalidates IS NULL AND reason_code IS NULL)
+            OR (invalidates IS NOT NULL AND reason_code IS NOT NULL)
+        ),
+
+    -- `SubjectRef` makes `subject_id` required and `subject_type` optional
+    -- (models.rs), so a type without an id is unrepresentable upstream. Pinned
+    -- here for the same reason as the invalidation pair above: the ledger
+    -- should not accept a shape the model cannot describe.
+    CONSTRAINT usage_records_subject_pairing
+        CHECK (subject_type IS NULL OR subject_id IS NOT NULL)
+);
+
+SELECT create_hypertable('usage_records', 'window_end', if_not_exists => TRUE);
+
+-- At most one accepted invalidation per entry, enforced by the database rather
+-- than by a read-then-write in the store.
+--
+-- Why this can be a plain UNIQUE despite the hypertable partition-column rule:
+-- an invalidation is a faithful copy of the entry it withdraws, so it shares
+-- that entry's covered period and therefore its `window_end`. Two invalidations
+-- of one target necessarily collide on (invalidates, window_end), so including
+-- the partition column costs nothing and satisfies the constraint rule.
+--
+-- It also answers the fold's second withdrawal-exclusion obligation — "is this
+-- entry named by an accepted invalidation?" — since `invalidates` leads it
+-- under exactly that partial predicate. A separate index on (invalidates)
+-- would be wholly subsumed by this one; there deliberately is not one.
+CREATE UNIQUE INDEX IF NOT EXISTS usage_records_one_invalidation_uniq
+    ON usage_records (invalidates, window_end)
+    WHERE invalidates IS NOT NULL;
+
+-- Per-scope acceptance-sequence counters.
+--
+-- A Postgres SEQUENCE is global, and per-scope monotonicity would need one
+-- sequence per (tenant, meter) — unbounded DDL driven by tenant data. A counter
+-- row claimed with `ON CONFLICT DO UPDATE … RETURNING` is per-scope by
+-- construction and serializes concurrent ingest for one scope on the row lock,
+-- which is what strict monotonicity costs.
+CREATE TABLE IF NOT EXISTS usage_acceptance_sequence (
+    tenant_id   uuid   NOT NULL,
+    gts_type_id text   NOT NULL,
+    next_value  bigint NOT NULL,
+    PRIMARY KEY (tenant_id, gts_type_id)
+);
+
+-- Read paths select on the period end within a (tenant, meter) scope. The
+-- trailing `acceptance_sequence` carries the LATEST fold's declared tie-break,
+-- which is greatest `window_end` *then* greatest `acceptance_sequence` — so the
+-- tie-break column has to follow the period end in the same index to be usable.
+CREATE INDEX IF NOT EXISTS usage_records_tenant_type_window_idx
+    ON usage_records (tenant_id, gts_type_id, window_end DESC, acceptance_sequence DESC);
+CREATE INDEX IF NOT EXISTS usage_records_tenant_window_idx
+    ON usage_records (tenant_id, window_end DESC);
+-- The feed's future keyset: it orders by arrival rather than by the column
+-- selection reads, scoped per (tenant, meter).
+CREATE INDEX IF NOT EXISTS usage_records_acceptance_seq_idx
+    ON usage_records (tenant_id, gts_type_id, acceptance_sequence DESC);
+```
+
+**This block is kept byte-identical to the file on disk.** Task 3's two reviews
+diffed them mechanically, so drift here reads as an unexplained deviation. Three
+things in it were *not* in the original draft and were added during execution,
+each for a measured reason:
+
+- **`usage_records_subject_pairing`** — the SDK's `SubjectRef` has a required
+  `subject_id` and an optional `subject_type`, so `subject_type` without
+  `subject_id` is unrepresentable upstream, yet the schema accepted it. The
+  file already CHECKed the `invalidates`/`reason_code` pair, so the asymmetry
+  was an oversight rather than a decision.
+- **`usage_records_tenant_type_window_idx` gained `acceptance_sequence DESC`,
+  and `usage_records_invalidates_idx` was deleted.** The first is load-bearing:
+  the `LATEST` tie-break is *greatest `window_end`, then greatest
+  `acceptance_sequence`*, and the acceptance-sequence index carries no
+  `window_end`, so it cannot serve that order at all. Measured both ways — the
+  old shape planned an `Incremental Sort` with `Presorted Key: window_end`, the
+  new one has no `Sort` node. The second was provably redundant with
+  `usage_records_one_invalidation_uniq`: same predicate, same leading column,
+  identical `Index Cond` under `EXPLAIN` once dropped.
+- **`usage_records_origin_valid`** — the origin CHECK was the file's only
+  unnamed constraint, and `error.rs` classifies by constraint name.
+
+**`acceptance_sequence` monotonicity is documented, not enforced, because the
+database cannot enforce it.** Measured on the pinned image:
+`UNIQUE (tenant_id, gts_type_id, acceptance_sequence)` is *refused* — a
+hypertable unique index must contain the partition column — and the only
+admissible form, with `window_end` folded in, then accepts two rows in one
+scope both at sequence `1`. The same partition-column rule that makes
+`usage_records_one_invalidation_uniq` work here dissolves the constraint: an
+invalidation shares its target's `window_end` by construction, whereas
+`window_end` is exactly what varies across entries in a scope. The counter row
+is the sole authority, and the ledger does not re-check it.
+
+- [ ] **Step 2b: Note what dropping the catalog table releases**
+
+Task 1 removed the catalog seeding from the surviving `tests/*_pg.rs` fixtures,
+and that seeding was the only thing satisfying `usage_records_gts_id_fk` in the
+retired schema. Until this task lands, every record insert in those suites
+would fail with SQLSTATE 23503. Replacing the schema drops both the constraint
+and the table, which resolves it.
+
+**One test is now green for the wrong reason and Task 15 must delete it:**
+`pg_insert_with_unregistered_gts_id_is_usage_type_not_found` asserted that an
+unregistered `gts_id` is refused. After this task there is no registry for an
+id to be absent from, so the assertion cannot fail and cannot discriminate.
+That is a dead question wearing a green tick. Carry it to Task 15 Step 1's
+inventory as an explicit **delete**, not a repoint.
+
+- [ ] **Step 2c: Retire what the dropped constraint stranded**
+
+Dropping `usage_type_catalog` drops `usage_records_gts_id_fk` with it — the
+**only** foreign key in the schema. Three live things exist solely to classify
+its violation and are dead the moment this migration lands:
+
+- `DbErrorClass::ForeignKeyViolation` (`src/infra/storage/error.rs`)
+- its `"23503"` match arm in `classify_db`, and the test
+  `fk_violation_is_foreign_key_class` (`src/infra/storage/error_tests.rs`)
+- `map_insert_error`'s FK branch (`src/infra/storage/record_store.rs`), which
+  returns a `UsageTypeNotFound` the SDK no longer declares
+
+**No other task owns these** — Task 9 is scoped to `map_insert_error` alone, so
+without this step the enum arm and its test survive as live code guarding a
+constraint that no longer exists. Task 1's code review found the gap; this is
+where it closes, because the task that deletes a constraint should delete what
+guards it.
+
+Delete all three, with a per-item verdict. If removing the FK branch from
+`map_insert_error` conflicts with Task 9's rewrite of the same function, leave
+a comment saying so rather than half-doing it, and report it.
+
+**Note for whoever reads this later:** Task 1 already narrowed this class by
+dropping the unreachable `"23001"` arm, having verified no DELETE path exists
+in the plugin and that the FK carried no `ON UPDATE` clause. That was a
+behavior narrowing, not just a comment fix, and it is moot once the FK is gone.
+
+- [ ] **Step 3: Confirm the retention policy needs no change — it does not**
+
+**Measured before this plan was revised: `grep -c 'created_at'
+src/infra/storage/pool.rs` returns 0.** An earlier draft of this step asserted
+the file "names the hypertable's time column" and told you to fix it. That was
+wrong, and the correction matters because acting on it would have produced a
+change with nothing behind it.
+
+`apply_retention_policy` calls:
+
+```sql
+SELECT add_retention_policy('usage_records',
+       drop_after => make_interval(secs => $1::double precision))
+```
+
+`add_retention_policy` takes **no column argument**. It drops chunks by the
+hypertable's own time dimension, whatever `create_hypertable` partitioned on.
+So re-partitioning on `window_end` in Step 2 is sufficient on its own, and this
+file needs no edit.
+
+Confirm rather than assume:
+
+```bash
+grep -n 'created_at\|add_retention_policy\|drop_after' \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/pool.rs
+```
+
+Expected: the two `retention_policy` calls, no `created_at`.
+
+**Say in your report that you checked and changed nothing here.** A step that
+correctly results in no edit is a finding, not a skipped step.
+
+Worth recording once, because it is the reason the outcome is right rather than
+lucky: retention measured from the covered period is what
+`cpt-cf-usage-collector-fr-idempotency` requires — *"The horizon is the type's
+retention policy, measured from the covered period"* — so `window_end` is the
+semantically correct dimension to age chunks on, not merely the mechanically
+required one. Partitioning on it gets both properties from one decision.
+
+- [ ] **Step 4: Verify the SQL parses**
+
+The migration cannot be applied without Docker, and the crate does not compile
+yet, so the check available now is a syntax read. If a TimescaleDB container is
+available, apply it directly:
+
+```bash
+docker run --rm -d --name uc-schema-check -e POSTGRES_PASSWORD=pw -p 55433:5432 \
+  timescale/timescaledb:latest-pg16
+sleep 5
+PGPASSWORD=pw psql -h localhost -p 55433 -U postgres -f \
+  gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/migrations/0001_init.sql
+docker rm -f uc-schema-check
+```
+
+Expected: `CREATE EXTENSION`, `CREATE TABLE`, a `create_hypertable` row,
+`CREATE TABLE`, and **five** `CREATE INDEX` (four read indexes plus the partial
+unique index). No `ERROR:`.
+
+If Docker is unavailable, say so plainly in the task report rather than
+claiming the schema was verified. Task 15 applies it for real.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/migrations
+git commit -s -m "feat(timescaledb-plugin)!: replace the schema with the current model
+
+The table predated three model changes: the covered period replaced
+created_at, invalidates + reason_code replaced status/corrects_id, and origin
+was added. Replace both migrations with a single init carrying the 5-tuple
+dedup constraint DESIGN 3.7 requires, a plugin-assigned acceptance_sequence
+monotonic per (tenant_id, gts_type_id), and a partial unique index enforcing
+at most one invalidation per entry.
+
+The gear is unreleased, so no migration path is owed.
+
+BREAKING CHANGE: the usage_records table shape is replaced and the
+usage_type_catalog table is dropped. An existing database must be recreated."
+```
+
+---
+
+## Task 4: Bring `UsageRecordRow` to the new columns
+
+**Files:**
+- Modify: `src/infra/storage/entity.rs`
+
+- [ ] **Step 1: Rewrite `UsageRecordRow`**
+
+Replace the struct with one mirroring the Task 3 schema. Column order here is
+a reading convenience, **not** a correctness requirement — see the correction
+below.
+
+```rust
+/// One row of the `usage_records` hypertable.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UsageRecordRow {
+    /// `id` — deterministic gateway-derived entry identity (part of the
+    /// composite PK).
+    pub id: Uuid,
+    /// `tenant_id` — owning tenant.
+    pub tenant_id: Uuid,
+    /// `gts_type_id` — the meter this entry was submitted against.
+    pub gts_type_id: String,
+    /// `value` — signed `numeric` quantity.
+    pub value: Decimal,
+    /// `window_start` — inclusive start of the covered period.
+    pub window_start: OffsetDateTime,
+    /// `window_end` — exclusive end of the covered period, and the
+    /// hypertable time dimension. The time-range predicate reads this bound
+    /// alone, `from <= window_end < to` and never overlap or containment
+    /// (`cpt-cf-usage-collector-adr-window-end-selection`);
+    /// `get_usage_record` carries no range at all and looks up by `id`
+    /// instead.
+    pub window_end: OffsetDateTime,
+    /// `resource_id` — resource attribution leaf.
+    pub resource_id: String,
+    /// `resource_type` — resource attribution leaf.
+    pub resource_type: String,
+    /// `subject_id` — optional subject attribution leaf. `NULL` means the
+    /// entry has no subject at all, which is `UsageRecord::subject_ref`
+    /// being `None`.
+    pub subject_id: Option<String>,
+    /// `subject_type` — the subject's type, optional *within* a subject.
+    /// `NULL` alongside a present `subject_id` is an untyped subject. The
+    /// reverse is unrepresentable: `SubjectRef` requires a `subject_id` and
+    /// makes only the type an `Option`, and the
+    /// `usage_records_subject_pairing` constraint refuses a stored type
+    /// without an id.
+    pub subject_type: Option<String>,
+    /// `idempotency_key` — caller-supplied dedup key.
+    pub idempotency_key: String,
+    /// `invalidates` — the entry this one withdraws, when it is an
+    /// invalidation. `NULL` on an ordinary measurement.
+    pub invalidates: Option<Uuid>,
+    /// `reason_code` — why the withdrawal was issued. Present exactly when
+    /// `invalidates` is, by table constraint.
+    pub reason_code: Option<String>,
+    /// `origin` — the ingestion path that admitted this entry, stored in the
+    /// spelling [`RecordOrigin`](usage_collector_sdk::RecordOrigin) owns and
+    /// the DDL `CHECK` pins.
+    pub origin: String,
+    /// `acceptance_sequence` — plugin-assigned, strictly monotonic per
+    /// `(tenant_id, gts_type_id)`. Not carried on the SDK model; see the
+    /// struct doc.
+    pub acceptance_sequence: i64,
+    /// `metadata` — `jsonb` object of declared metadata keys → string values.
+    pub metadata: serde_json::Value,
+    /// `ingested_at` — server insert timestamp (`DEFAULT now()`). Not
+    /// carried on the SDK model; see the struct doc.
+    pub ingested_at: OffsetDateTime,
+}
+```
+
+Note `entry_type` is **not** a field. It is a generated column that exists so
+`$filter` can name it; nothing decodes it, because the SDK model derives the
+same fact from `invalidation.is_some()`. Say that in the struct doc so the next
+reader does not "fix" the omission.
+
+The struct doc above is a placeholder one-liner. It also has to carry the
+paragraph the two field docs point at: `ingested_at` and `acceptance_sequence`
+are the two columns with no counterpart on the SDK's `UsageRecord`, so nothing
+carries them past this struct — `ingested_at` is the server insert time, and
+`acceptance_sequence` is assigned by this plugin, which the gear's DESIGN §3.7
+obliges the plugin to keep strictly monotonic per `(tenant_id, gts_type_id)`.
+Cite that section with its repo-relative path
+(`gears/system/usage-collector/docs/DESIGN.md`), as the shipped source does:
+this plugin has a §3.7 of its own that still describes the retired schema, so
+the path is what makes the citation self-checking. Say that the two columns are
+decoded rather than left out of the struct, so a row is a faithful picture of
+what was stored. **Both field docs say "see the struct doc"**; skipping the
+paragraph leaves two dangling pointers.
+
+- [ ] **Correction: `sqlx::FromRow` decodes by NAME, not by position**
+
+**An earlier draft of this plan said `record_store.rs` "decodes rows
+positionally" and that a `RECORD_COLUMNS` one column out would "fail at runtime
+with a type error naming neither column". That is wrong**, and it was wrong
+everywhere it appeared — Task 4 and Task 9 both carried it. Task 4's
+implementer measured it two ways rather than accepting it:
+
+1. **In the macro source.** `sqlx-macros-core-0.9.0/src/derives/row.rs:107`
+   generates `__row.try_get(#id_s)` for a **named-field** struct, where `id_s`
+   is the field's own name — a by-name lookup. Positional `try_get(#idx)`
+   appears only at `:286`, the **tuple-struct** arm. `UsageRecordRow` has named
+   fields and no `rename_all`.
+2. **Against a live database.** A standalone sqlx 0.9 probe on
+   `timescale/timescaledb:2.29.2-pg18` selected `charlie, alpha, bravo` into a
+   struct declared `alpha, bravo, charlie` — **including two same-typed `text`
+   columns swapped**, the exact case a positional decode would silently
+   mis-assign — and produced output byte-identical to the DDL-order select.
+   Omitting a column failed with `no column found for name: charlie`.
+
+**What this changes:**
+
+- **Permutation is harmless.** `RECORD_COLUMNS` in a different order than the
+  struct decodes correctly.
+- **Omission is the real hazard, and it is loud.** A missing field fails by
+  name, which is a good diagnostic, not the anonymous type error the old text
+  promised.
+
+Keep the struct in DDL order anyway — it makes the file readable against the
+migration — but document it as a convention, **not** as a correctness
+requirement. Writing the load-bearing claim into a doc comment would have been
+this port's characteristic defect committed deliberately.
+
+- [ ] **Measured: the bare `sqlx::FromRow` intra-doc link does not warn**
+
+A follow-up concern held that the link is ambiguous and needs a `trait@`
+disambiguator, because `sqlx` re-exports `FromRow` at its root in two
+namespaces — the trait from `sqlx_core::from_row`, the derive from
+`sqlx_macros`. **Measured, and it does not warn.** A probe crate
+documenting both spellings side by side, plus a deliberately broken control
+link, against sqlx `=0.9.0` with `macros` + `postgres`, on rustdoc 1.95.0 and
+again on 1.97.0 — the channel `rust-toolchain.toml` pins, so the result holds
+on the toolchain this repository actually builds with:
+
+- The control (`sqlx::NoSuchItemAnywhere`) warned and was the **only** warning,
+  under `cargo doc --no-deps` and under a full `cargo doc` alike — so the
+  `rustdoc::broken_intra_doc_links` lint was live in both runs.
+- Under the full `cargo doc`, the bare `sqlx::FromRow` and the explicit
+  `trait@sqlx::FromRow` emitted the byte-identical href
+  `../sqlx_core/from_row/trait.FromRow.html` — resolved to the trait, not the
+  derive. (Under `--no-deps` there are no dependency docs to point at, so both
+  hrefs stay the raw path text; that run answers the warning question, not the
+  href one.)
+
+So `trait@` is not needed, and this line will not grow the doc-warning count
+when Task 16 puts the crate back in the workspace. Note the shape of the
+original concern: "a re-export in two namespaces must warn" was a plausible
+mechanism asserted without measurement — the same defect this port keeps
+producing, one step removed.
+
+- [ ] **Step 2: Fix the module doc**
+
+The header names the `usage_type_catalog` table and lists `text[]` ->
+`Vec<String>`. Both are gone. Rewrite it to name one table and the types the
+new columns actually use.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/entity.rs
+git commit -s -m "refactor(timescaledb-plugin): bring UsageRecordRow to the new columns
+
+Replaces created_at with the covered-period pair, status/corrects_id with
+invalidates/reason_code, and adds origin and the plugin-assigned
+acceptance_sequence. entry_type is a generated column nothing decodes."
+```
+
+---
+
+## Task 5: Bring the mapper to the current model
+
+**Files:**
+- Modify: `src/infra/storage/mapper.rs`, `src/infra/storage/mapper_tests.rs`
+
+- [ ] **Step 1: Write the failing test first**
+
+Add to `src/infra/storage/mapper_tests.rs` a test that a row carrying an
+invalidation maps to a model carrying one:
+
+```rust
+#[test]
+fn an_invalidation_row_maps_to_a_record_carrying_the_pair() {
+    let target = Uuid::new_v4();
+    let row = UsageRecordRow {
+        invalidates: Some(target),
+        reason_code: Some("duplicate_submission".to_owned()),
+        ..sample_row()
+    };
+
+    let model = record_row_to_model(row).expect("row must map");
+
+    let invalidation = model
+        .invalidation
+        .expect("a row with invalidates must map to Some(Invalidation)");
+    assert_eq!(invalidation.target, target);
+    assert_eq!(invalidation.reason.as_str(), "duplicate_submission");
+}
+```
+
+**The mutation that makes this red:** change `record_row_to_model` to write
+`invalidation: None` unconditionally. If that edit leaves the test green, the
+test is not testing anything.
+
+Add a second test for the half-populated row, which the table constraint
+forbids but a mapper must still refuse rather than silently drop:
+
+```rust
+#[test]
+fn a_row_naming_a_target_without_a_reason_is_an_invariant_break() {
+    let row = UsageRecordRow {
+        invalidates: Some(Uuid::new_v4()),
+        reason_code: None,
+        ..sample_row()
+    };
+
+    let err = record_row_to_model(row).expect_err("half a pair must not map");
+
+    assert!(
+        matches!(err, UsageCollectorPluginError::Internal(_)),
+        "a malformed stored row is a plugin invariant break, not a caller error; got {err:?}"
+    );
+}
+```
+
+**The mutation:** make the `(Some(target), None)` arm return
+`Ok(None)` instead of an error.
+
+You will need a `sample_row()` helper returning a valid `UsageRecordRow`. Write
+it by hand from the schema — **not** by calling the mapper's own inverse. A
+fixture built by the code under test proves the round trip is self-consistent
+and nothing else; that is the "two layers tested against themselves" defect,
+and it has shipped here before.
+
+- [ ] **Step 2: Measure first — the crate cannot link a test binary yet**
+
+An earlier draft of this step told you to run
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(mapper)' 2>&1 | tail -20
+```
+
+and expect "compile errors naming `invalidation`, `invalidates` and
+`reason_code`". **That expectation was wrong, and so was Step 7's.**
+`cargo nextest` has to build the *whole* crate to link a test binary, and
+Tasks 6-13 have not run. Measure it rather than assuming:
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+cargo check --all-targets 2>&1 | tail -60
+```
+
+At the Task 5 run this reported **41 errors in the lib and 71 in the lib
+test**, spread across `translate.rs`, `keyset.rs`, `aggregate.rs`,
+`record_store.rs`, `ports.rs`, `adapter.rs` and their sibling test files —
+every one of them owned by Tasks 6-13. **Do not fix them to force a green
+build**; that would make this commit unreviewable.
+
+So an in-crate red-then-green cycle is not available for this task. Two
+honest options, in order of preference:
+
+1. **Run the mapper module out of the crate.** `mapper.rs` and `entity.rs`
+   depend on nothing else in the crate, so a throwaway harness crate in the
+   session scratchpad can `#[path]`-include exactly those two files (plus
+   `mapper_tests.rs`, which `mapper.rs` pulls in itself) and run the tests for
+   real. Step 8 gives the recipe. This is what the Task 5 run did.
+2. **Defer, in writing.** If the harness is not viable, say so in this plan
+   and in the commit, and add the run to Task 13's steps — a deferred
+   verification that is not written down is a verification that does not
+   happen.
+
+- [ ] **Step 3: Delete the dead helpers**
+
+From `src/infra/storage/mapper.rs` delete `parse_status` and `status_to_sql`
+(slice 4 removed `UsageRecordStatus`), and bring the GTS helpers to the type
+that replaced `UsageTypeGtsId`.
+
+**Only the read direction survives as a helper.** An earlier draft kept a
+`meter_type_id_str(&MeterTypeId) -> &str` beside it, mirroring the old
+`gts_id_str`. It is gone, for the reason that removed `origin_to_sql` in Step 4:
+`MeterTypeId::as_str` (`usage-collector-sdk/src/models.rs:641`) already *is* the
+bind direction, and a wrapper is a second spelling of it — more clearly so here,
+since `as_str` is the obvious name and the wrapper is not. Tasks 9-11 bind
+`record.gts_type_id.as_str()`, the same length with no import. They have to
+touch those sites regardless: the field is renamed `gts_id` → `gts_type_id`.
+
+The read direction earns its keep because it is not a rename:
+
+```rust
+/// Reconstruct a validated [`MeterTypeId`] from a stored string.
+///
+/// This is `MeterTypeId::from_str` plus the lift into
+/// [`UsageCollectorPluginError`], and the lift is the whole point: the SDK
+/// reports a bad id as a *caller* error, but a value that is already in the
+/// database is this plugin's invariant to have broken.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] when the stored value is not
+/// a valid meter type id (a stored-data invariant break).
+pub fn meter_type_id_from_str(raw: &str) -> Result<MeterTypeId, UsageCollectorPluginError> {
+    MeterTypeId::new(raw).map_err(|e| {
+        UsageCollectorPluginError::internal(format!("stored gts_type_id `{raw}` invalid: {e}"))
+    })
+}
+```
+
+Confirm `MeterTypeId::new` is the constructor and `AsRef<str>` is implemented
+before writing this — check
+`gears/system/usage-collector/usage-collector-sdk/src/models.rs:559` onward.
+If the constructor is spelled differently, follow the SDK, not this plan.
+
+- [ ] **Step 4: Add the origin and invalidation parsers**
+
+```rust
+/// Parse a stored `origin` string into [`RecordOrigin`].
+///
+/// The accepted vocabulary is taken from [`RecordOrigin::as_str`] rather than
+/// restated here, so this reader and the writer that binds the column cannot
+/// disagree. The DDL `CHECK (origin IN ('live', 'backfill'))` pins the same
+/// two values on the storage side.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] for any other value.
+pub fn parse_origin(raw: &str) -> Result<RecordOrigin, UsageCollectorPluginError> {
+    if raw == RecordOrigin::Live.as_str() {
+        Ok(RecordOrigin::Live)
+    } else if raw == RecordOrigin::Backfill.as_str() {
+        Ok(RecordOrigin::Backfill)
+    } else {
+        Err(UsageCollectorPluginError::internal(format!(
+            "stored origin `{raw}` is not `{}`/`{}`",
+            RecordOrigin::Live.as_str(),
+            RecordOrigin::Backfill.as_str()
+        )))
+    }
+}
+
+/// Reassemble the stored invalidation pair into an [`Invalidation`].
+///
+/// The table constrains the two columns to be both present or both absent, so
+/// a half-populated row is a stored-invariant break rather than a shape the
+/// model can carry.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] when exactly one of the two
+/// is present, or when the stored reason fails [`ReasonCode`] validation.
+pub fn invalidation_from_row(
+    invalidates: Option<Uuid>,
+    reason_code: Option<String>,
+) -> Result<Option<Invalidation>, UsageCollectorPluginError> {
+    match (invalidates, reason_code) {
+        (None, None) => Ok(None),
+        (Some(target), Some(raw)) => {
+            let reason = ReasonCode::new(raw).map_err(|e| {
+                UsageCollectorPluginError::internal(format!("stored reason_code invalid: {e}"))
+            })?;
+            Ok(Some(Invalidation { target, reason }))
+        }
+        (Some(target), None) => Err(UsageCollectorPluginError::internal(format!(
+            "stored entry `{target}` names an invalidation target with no reason_code"
+        ))),
+        (None, Some(raw)) => Err(UsageCollectorPluginError::internal(format!(
+            "stored entry carries reason_code `{raw}` with no invalidation target"
+        ))),
+    }
+}
+```
+
+**There is deliberately no `origin_to_sql`.** An earlier draft of this task
+had one, which would have been a fourth spelling of `'live'`/`'backfill'`
+alongside `RecordOrigin::as_str` (`usage-collector-sdk/src/models.rs:786-796`,
+a `pub const fn` returning `&'static str`), the DDL `CHECK`, and the DDL's own
+`entry_type`-adjacent commentary. `RecordOrigin::as_str` **is** the SQL form
+and its doc already claims that ownership ("the wire spelling, shared by the
+REST projection, the `$filter` surface and the metric label"), so Task 9's
+insert binds `record.origin.as_str()` directly. The SDK offers no parsing
+direction (no `FromStr`, no `TryFrom<&str>`), which is why `parse_origin`
+still exists — but it compares against `RecordOrigin::as_str` rather than
+against bare literals, so the two directions cannot drift.
+
+Verify `ReasonCode`'s constructor name and whether it exposes `as_str` before
+writing the test assertion in Step 1 against it. **It lives in `models.rs`,
+not `reason.rs`** — `reason.rs` holds `ConflictReason` / `NotFoundReason` /
+`ValidationReason`, which are unrelated:
+
+```bash
+grep -n 'impl ReasonCode' -A25 \
+  gears/system/usage-collector/usage-collector-sdk/src/models.rs
+```
+
+- [ ] **Step 5: Rewrite `record_row_to_model`**
+
+```rust
+pub fn record_row_to_model(row: UsageRecordRow) -> Result<UsageRecord, UsageCollectorPluginError> {
+    let gts_type_id = meter_type_id_from_str(&row.gts_type_id)?;
+
+    let resource_ref = ResourceRef::new(row.resource_id, row.resource_type).map_err(|e| {
+        UsageCollectorPluginError::internal(format!("stored resource_ref invalid: {e}"))
+    })?;
+
+    let subject_ref = match row.subject_id {
+        Some(subject_id) => Some(SubjectRef::new(subject_id, row.subject_type).map_err(|e| {
+            UsageCollectorPluginError::internal(format!("stored subject_ref invalid: {e}"))
+        })?),
+        None => None,
+    };
+
+    let idempotency_key = IdempotencyKey::new(row.idempotency_key).map_err(|e| {
+        UsageCollectorPluginError::internal(format!("stored idempotency_key invalid: {e}"))
+    })?;
+
+    let metadata = metadata_jsonb_to_map(row.metadata)?;
+    let origin = parse_origin(&row.origin)?;
+    let invalidation = invalidation_from_row(row.invalidates, row.reason_code)?;
+
+    Ok(UsageRecord {
+        id: row.id,
+        gts_type_id,
+        tenant_id: row.tenant_id,
+        resource_ref,
+        subject_ref,
+        metadata,
+        value: row.value,
+        idempotency_key,
+        origin,
+        invalidation,
+        window_start: row.window_start,
+        window_end: row.window_end,
+    })
+}
+```
+
+That is all twelve `UsageRecord` fields. `acceptance_sequence` and
+`ingested_at` are read off the row and deliberately dropped: neither is on the
+model. Write that down at the function, because "the mapper silently discards
+two columns" is exactly the kind of thing a later reader files as a bug.
+
+- [ ] **Step 6: Update the module header**
+
+It currently explains `UsageTypeGtsId` and the `gts_id_from_str` signature at
+length, and cites "the task skeleton". Rewrite for the types that exist.
+
+- [ ] **Step 7: Run the tests**
+
+An earlier draft expected "the mapper tests pass, other modules still fail to
+compile". **Those two are mutually exclusive** — `cargo nextest` links one test
+binary per crate, so it builds the whole crate or it builds nothing. Run them
+through the Step 8 harness instead, and read the crate-level run as Task 13
+Step 5's job.
+
+- [ ] **Step 8: Prove the new tests discriminate, in a harness outside the crate**
+
+`mapper.rs` and `entity.rs` depend on nothing else in the plugin crate, so both
+the green run and the falsification can happen in a throwaway crate that
+`#[path]`-includes exactly those two files. Build it in **your own session
+scratchpad** — the path is session-specific and printed in your environment, so
+read it there rather than copying a literal from this plan. A mutation script
+writing to a stale path from someone else's session is one of the documented
+ways a falsification lies to you: it edits nothing, the `Compiling` line still
+appears, and "mutation survived" then argues for deleting a working test.
+
+```
+$SCRATCH/mapper-harness/
+  Cargo.toml   # [workspace] (to detach it), path dep on usage-collector-sdk,
+               # plus serde_json / uuid / time / rust_decimal / sqlx at the
+               # versions the workspace pins. sqlx is needed only for
+               # entity.rs's `#[derive(sqlx::FromRow)]`.
+  src/lib.rs   # pub mod storage { #[path="<abs>/entity.rs"] pub mod entity;
+               #                   #[path="<abs>/mapper.rs"] pub mod mapper; }
+```
+
+`mapper.rs` pulls in `mapper_tests.rs` itself, and its `#[path]` resolves
+relative to `mapper.rs`'s own directory, so the real test file is picked up
+with no third entry. Point `CARGO_TARGET_DIR` at the scratchpad: a fresh dep
+graph in the workspace `target/` risks invalidating it, and `target/` reaching
+~110 GB is how this tree fills the disk. Cost measured at the Task 5 run: about
+90 seconds and 280 MB.
+
+To copy the workspace lint set for a clippy run, splice `[workspace.lints.*]`
+out of the root `Cargo.toml` into the harness manifest as `[lints.*]` and copy
+the root `clippy.toml` alongside it — the harness inherits neither otherwise,
+and without them a pedantic-deny finding is invisible.
+
+**Mutate a copy, never the tree.** Copy `entity.rs`, `mapper.rs` and
+`mapper_tests.rs` into `$SCRATCH/mutate/`, keep a second untouched copy in
+`$SCRATCH/pristine/`, and point a second harness at `$SCRATCH/mutate/`. Then
+the working tree is never edited and no restore step can go wrong — which
+matters because `git checkout` restores from HEAD and there is uncommitted work
+here. Confirm the copy is faithful (`diff -r`) and green before mutating
+anything; then for each mutation assert the anchor matches **exactly once**,
+`touch` **both** the mutated file and the harness's own `src/lib.rs`, confirm a
+`Compiling` line, grep the mutated line to confirm the edit landed, and confirm
+the *named* test goes red.
+
+The `src/lib.rs` touch is not belt-and-braces. A `#[path]`-included file sits
+outside the harness package and cargo judges it by mtime alone, so any
+vehicle that preserves one — `mv`, `cp -p`, `shutil.copy2`, `rsync -t`,
+`install -p` — leaves the harness running the previous object code and
+reports every test
+green with no `Compiling` line. Measured at the Task 6 run: `shutil.copy2`
+reproduces that exactly, `shutil.copyfile` + `touch` never did in four runs,
+and touching `src/lib.rs` forces the rebuild even with the mutated file's mtime
+left stale. **A run with no `Compiling` line is a failed run, not a surviving
+mutation.**
+
+Mutations run and killed at the Task 5 run:
+
+| # | Mutation to `mapper.rs` | Test that must go red |
+|---|---|---|
+| 1 | `invalidation,` → `invalidation: None,` in the `UsageRecord` literal | `an_invalidation_row_maps_to_a_record_carrying_the_pair` |
+| 2 | `(Some(target), None)` arm returns `Ok(None)` | `a_row_naming_a_target_without_a_reason_is_an_invariant_break` |
+| 3 | `(None, Some(raw))` arm returns `Ok(None)` | `a_reason_without_a_target_is_an_invariant_break` |
+| 4 | `parse_origin`'s live branch yields `RecordOrigin::Backfill` | `parse_origin_round_trips_through_the_sdk_spelling`, `record_row_to_model_maps_a_valid_row_round_trip` |
+| 5 | the stored-`reason_code` failure is built with `transient` instead of `internal` | `an_unparseable_stored_reason_is_an_invariant_break` |
+| 6 | `parse_origin`'s else branch yields `Ok(RecordOrigin::Live)` | `parse_origin_rejects_unknown`, `record_row_unknown_origin_is_internal` |
+| 7 | `record_row_to_model` hardcodes `let origin = RecordOrigin::Live;` | `a_backfill_row_maps_to_the_backfill_origin`, `record_row_unknown_origin_is_internal` |
+
+**Then sweep every `pub fn` for a mutation that survives.** The table above is
+behaviour mutations, which only reach code some test already calls. The
+question this second pass asks is different: *for each function in the file, is
+there any edit to it that compiles and that nothing catches?* The strongest form
+is a whole-body stub — replace the body with a constant of the right type — but
+not every function admits one, so the pass is per-function coverage rather than
+a uniform recipe:
+
+| Function | Mutation used | Killed by |
+|---|---|---|
+| `meter_type_id_from_str` | whole body: ignore `raw`, return a fixed valid id | its own test, `record_row_invalid_gts_type_id_is_internal`, the row round trip |
+| `metadata_jsonb_to_map` | whole body: `Ok(empty)` | four metadata tests + the row round trip |
+| `metadata_map_to_jsonb` | whole body: empty object | the metadata round trip and the verbatim-key test |
+| `parse_origin` | no single stub: it has two success arms, so the live arm yielding `Backfill` and the else arm yielding `Ok(Live)` (rows 4 and 6 above) together cover what one body stub would | the two origin tests + two row tests |
+| `invalidation_from_row` | no single stub either: `(Some, Some)` → `Ok(None)`, plus rows 2, 3 and 5 above for the other arms | the four invalidation tests |
+| `record_row_to_model` | **cannot take a constant body** — it returns a `UsageRecord`, which has no `Default` and twelve fields to fabricate. Mutated in place instead: swap the two period bounds; hardcode `origin` (row 7 above) | the row round trip, the backfill test |
+
+Two more the mutation of a *single* function would never reach, each found in
+review after the suite was already green:
+
+| Mutation | Killed by |
+|---|---|
+| `SubjectRef::new(subject_id, row.subject_type.or_else(\|\| Some("unknown".to_owned())))` — fabricate a type for every untyped subject | `a_subject_without_a_type_maps_to_an_untyped_subject` |
+| coordinated two-sided: `metadata_map_to_jsonb` writes `md_`-prefixed keys, `metadata_jsonb_to_map` strips the prefix back off | `metadata_map_to_jsonb_writes_the_key_spelling_verbatim` |
+
+The second is the one to learn from. Every round-trip test stays green, because
+both sides move together; only an assertion against a *literal expected value*
+sees it. `empty_metadata_round_trips` asserts a literal but only for the empty
+map, which is why the stub above could be guarded on `!map.is_empty()` and slip
+past. **A round trip proves the pair is self-consistent, never that either side
+is right** — so at least one test per encoded column must name the bytes.
+
+No mutation in either pass survived.
+
+**A test whose mutation cannot be named does not go in — but "cannot be named"
+is a claim to falsify, not to assert.** The Task 5 run wrote a test for a
+`meter_type_id_str(&MeterTypeId) -> &str` helper, then deleted it, reasoning
+that the body is `gts_type_id.as_ref()` and no edit to that expression both
+compiles and changes the result. True of the *expression*, and irrelevant:
+`pub fn meter_type_id_str(_: &MeterTypeId) -> &str { "" }` compiles (`&'static
+str` coerces to the elided lifetime) and survived the whole suite, so the
+function was shipping with zero coverage. Spec review caught it and the test
+was restored. **When you cannot find an inner mutation, stub the body before
+concluding there is none.**
+
+Code review then removed the helper itself (Step 3), and the test went with it.
+That is not a reversal: a *shipped* function owes coverage, a deleted one owes
+none. The sequence is worth reading in order, because the two rounds answer
+different questions — "is this function tested?" and "should this function
+exist?" — and only the second makes the first moot.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/
+git commit -s -m "feat(timescaledb-plugin): map rows to the current record model
+
+Reassembles the invalidation pair from invalidates + reason_code, parses
+origin, and carries the covered period. Drops the status parsers, which have
+no model behind them, and renames the GTS helpers to the MeterTypeId that
+replaced UsageTypeGtsId.
+
+A half-populated invalidation pair is refused as an Internal: the table
+constrains the two columns together, so half a pair is a stored-invariant
+break rather than a shape the model can carry.
+
+parse_origin compares against RecordOrigin::as_str instead of its own string
+literals, and there is no origin_to_sql beside it: the SDK accessor already
+is the SQL spelling, so the two directions cannot drift.
+
+The crate still does not compile (41 lib / 71 lib-test errors, all owned by
+Tasks 6-13), so these tests were run and falsified out of the crate: a
+scratchpad harness path-including mapper.rs and entity.rs alone. Every test
+green, every mutation in Step 8's two passes killed, none surviving."
+```
+
+---
+
+## Task 6: Fix `record_column` (DIVERGENCES entry 16)
+
+**Done in `d162b94b2` + `1d23382b2` (code) and `33beda048` (this block).
+Measured while executing, correcting the preamble below.** `record_column`
+was still at `translate.rs:55` and still mapped exactly the nine identifiers
+named, and the published `$filter` eight at `usage-collector-v1.yaml:440` are
+as stated. Four other claims had drifted:
+
+- The module doc's stale name list is at **`translate.rs:23-26`**, not 22-25.
+- **The SDK's `UsageRecordQuery` declares eleven filter fields, not eight** —
+  the preamble's list omits `invalidates`, `entry_type` and `origin`
+  (`usage-collector-sdk/src/models.rs`, struct at `:1734`). Those eleven are
+  exactly the eleven `record_column` now maps, so the module doc and the
+  allowlist agree by construction. Corrected inline below.
+- `translate_tests.rs` was **585** lines, not 569.
+- The old `record_column` doc said `gts_id`; the SPI parameter is
+  `gts_type_id` (`usage-collector-sdk/src/plugin_api.rs:164`, `:254`), which
+  Step 3's replacement text has right.
+
+A third stale line in the same module doc went with the two named: the
+``from_name("status")`` example, repointed to ``"entry_type"``.
+
+**Step 1's code block compiles as written.** `for field in
+PUBLISHED_FILTER_FIELDS` binds `field: &&str`, which deref-coerces to `&str`
+at the call; the same holds for `KEYSET_SAFE_RECORD_FIELDS` (also a `&[&str]`).
+No `.iter().copied()` was needed, and the block is left unchanged.
+
+**Verification route.** The Task 5 scratchpad harness extended to this file: a
+sibling `translate-harness` `#[path]`-includes `bind.rs`, `keyset.rs` and
+`translate.rs` and adds `toolkit-odata`, `bigdecimal` and `chrono` to the
+Task 5 dependency set. `cargo test` there: **35 passed / 0 failed** (32 before
+the three new tests, of which 9 were already red on HEAD). Clippy
+`--all-targets -- -D warnings` clean; `rustfmt --edition 2024 --check` clean.
+`cargo check --all-targets` inside the crate fell from 41 lib / 71 lib-test to
+**33 lib / 52 lib-test** errors, none in `query/translate`. **No verification
+is deferred to Task 13 by this task.**
+
+
+This is entry 16's own proposed resolution. The allowlist is the closed
+security boundary every `$filter` conjunct passes, and it is wrong in both
+directions.
+
+**Verified against the file at the time of writing:** `record_column` is at
+`src/infra/storage/query/translate.rs:55` and maps nine identifiers — `id`,
+`created_at`, `tenant_id`, `resource_id`, `resource_type`, `subject_id`,
+`subject_type`, `corrects_id`, `status`. (Confirmed on execution.) Re-verify
+before editing; earlier tasks in this plan do not touch this function, but the
+file has moved before.
+
+**The published `$filter` field set is eight** (`usage-collector-v1.yaml:440`):
+`tenant_id`, `resource_id`, `resource_type`, `subject_id`, `subject_type`,
+`entry_type`, `origin`, `invalidates`. The allowlist covers five of them.
+(Eight here and eleven above count different things: the eight are the `$filter`
+names the YAML publishes, the eleven are the fields `UsageRecordQuery` declares,
+which additionally carry `id`, `window_start` and `window_end` — mapped, but
+reserved on `$filter`. Both numbers are correct.)
+
+**Files:**
+- Modify: `src/infra/storage/query/translate.rs`, `src/infra/storage/query/translate_tests.rs`
+
+**Two stale doc blocks in this file are yours, and Task 1's spec review found
+them.** Both assert a field list the SDK no longer has:
+
+- **`translate.rs:22-25`** — the module doc claims `UsageRecordFilterField`'s
+  names "are exactly `"id"`, `"created_at"`, … `"corrects_id"`, `"status"`".
+  The SDK's `UsageRecordQuery` (`usage-collector-sdk/src/models.rs:1734`)
+  declares `id`, `window_start`, `window_end`, `tenant_id`, `resource_id`,
+  `resource_type`, `subject_id`, `subject_type`, `invalidates`, `entry_type`,
+  `origin` — eleven, not the eight this bullet originally listed. Task 1
+  edited this block (stripping its usage-type half) and left the stale list
+  standing.
+- **`record_column`'s own doc** — "only these nine identifiers", corrected by
+  Step 3 below.
+
+Re-verify both line numbers before editing.
+
+- [x] **Step 1: Write the failing tests**
+
+In `src/infra/storage/query/translate_tests.rs`:
+
+```rust
+/// The published `$filter` field set (`usage-collector-v1.yaml:440`). Every
+/// one of these must resolve to a column, or a valid request is answered with
+/// an `Internal`.
+const PUBLISHED_FILTER_FIELDS: &[&str] = &[
+    "tenant_id",
+    "resource_id",
+    "resource_type",
+    "subject_id",
+    "subject_type",
+    "entry_type",
+    "origin",
+    "invalidates",
+];
+
+#[test]
+fn every_published_filter_field_resolves_to_a_column() {
+    for field in PUBLISHED_FILTER_FIELDS {
+        assert!(
+            record_column(field).is_some(),
+            "`$filter={field} eq …` is a predicate the published contract names \
+             and the gear's reject_reserved_filter_fields guard admits, so an \
+             allowlist that drops it answers a valid request with a 500"
+        );
+    }
+}
+
+#[test]
+fn every_keyset_safe_field_resolves_to_a_column() {
+    for field in usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS {
+        assert!(
+            record_column(field).is_some(),
+            "`{field}` is an admissible `$orderby` key, and the canonical \
+             (window_end, id) keyset cannot render at all unless it resolves"
+        );
+    }
+}
+
+#[test]
+fn no_retired_model_field_resolves_to_a_column() {
+    for field in ["created_at", "corrects_id", "status"] {
+        assert!(
+            record_column(field).is_none(),
+            "`{field}` was removed from the model by slices 3 and 4; an \
+             allowlist that still maps it lets a `$filter` naming it past the \
+             boundary and fail against the table"
+        );
+    }
+}
+```
+
+**The mutations:** drop `"origin"` from the match (test 1 red); drop
+`"window_end"` (test 2 red); re-add `"status"` (test 3 red). Each is a single
+line, and each targets a different one of the three.
+
+Note the second test iterates `KEYSET_SAFE_RECORD_FIELDS` rather than a local
+copy. That is deliberate: the SDK growing an eighth keyset field makes this
+test fail here, which is the coupling you want. A hand-copied list would go
+quietly stale — the failure mode this repository is named for.
+
+- [x] **Step 2: Run them and watch them fail**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(translate)' 2>&1 | tail -30
+```
+
+Expected: tests 1 and 2 fail (`entry_type`, `origin`, `invalidates`,
+`window_start`, `window_end` all resolve to `None`); test 3 fails on all three.
+
+- [x] **Step 3: Rewrite the allowlist**
+
+```rust
+/// Closed allowlist mapping a `usage_records` filter-field name to its column.
+///
+/// The map is the identity (field name == column name); the closed `match` is
+/// the security boundary — only these eleven identifiers can ever reach the SQL
+/// string. `gts_type_id` is intentionally absent: it is a typed parameter on
+/// the SPI, not a `$filter` field, and neither is the covered period, which
+/// arrives as `time_range`.
+///
+/// The set is the published eight (`usage-collector-v1.yaml:440`) plus `id`,
+/// which the filterable schema carries so a caller can pin one entry and so the
+/// canonical cursor tiebreaker resolves, plus `window_start` and `window_end`.
+/// Those last two are reserved on `$filter` but sit in
+/// [`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`], and `window_end` must
+/// resolve for the canonical `(window_end, id)` keyset to render at all.
+///
+/// `entry_type` resolves to the stored generated column
+/// (`CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END`),
+/// which is why the field is filterable here at all: the SDK stores no such
+/// attribute and its value hook cannot carry one.
+#[must_use]
+pub fn record_column(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "id" => Some("id"),
+        "tenant_id" => Some("tenant_id"),
+        "resource_id" => Some("resource_id"),
+        "resource_type" => Some("resource_type"),
+        "subject_id" => Some("subject_id"),
+        "subject_type" => Some("subject_type"),
+        "entry_type" => Some("entry_type"),
+        "origin" => Some("origin"),
+        "invalidates" => Some("invalidates"),
+        "window_start" => Some("window_start"),
+        "window_end" => Some("window_end"),
+        _ => None,
+    }
+}
+```
+
+**Count the arms before writing "eleven".** The doc comment on the old version
+said "these nine identifiers" and was correct; a count in prose that disagrees
+with the match below it is precisely the defect this plan's ground rules name.
+A count can also be spelled with no numeral at all, so grep for the members
+rather than for a number.
+
+- [x] **Step 4: Run the tests**
+
+```bash
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(translate)' 2>&1 | tail -20
+```
+
+Expected: all three pass.
+
+- [x] **Step 5: Sweep the rest of the file's tests**
+
+`translate_tests.rs` is 585 lines and was written against the nine-identifier
+map. Some tests will name `created_at` or `status`. Fix each, and give a
+**per-test verdict**: repointed to a live field, or deleted because its question
+no longer exists.
+
+- [x] **Step 5b: Two tests the code review added, and one it repaired**
+
+Not in the plan as written; recorded here because they are the reason Task 6's
+own defect cannot recur. All three were proven red against a named mutation.
+
+- `every_declared_filter_field_maps_to_its_own_column` iterates
+  `<UsageRecordFilterField as FilterField>::FIELDS` and asserts the identity.
+  `translate_filter` resolves a conjunct with `col(field.name())`, so this is
+  the real invariant; the published-eight list is hand-copied and
+  `KEYSET_SAFE_RECORD_FIELDS` covers seven names, so a **twelfth** SDK filter
+  field would slip past both and 500 exactly as `origin` did. Mutation: add a
+  twelfth field to `UsageRecordQuery` — red, and red alone.
+- `a_real_column_that_is_not_a_filter_field_does_not_resolve` probes real
+  `usage_records` columns that are not filter fields (`reason_code`,
+  `gts_type_id`, `value`, `idempotency_key`, `acceptance_sequence`,
+  `metadata`, `ingested_at`). The allowlist is documented as *the* security
+  boundary and its closedness had no test, while `render_order_by(&query.order,
+  record_column)` hands it an arbitrary caller-supplied `$orderby` string.
+  Mutation: add `"reason_code" => Some("reason_code")` — red, and red alone.
+- `keyset_predicate_rejects_mixed_directions` was passing for the wrong
+  reason: its second cursor key was `"x"` against `id` (`FieldKind::Uuid`), so
+  `cursor_key_to_bind` errored on the parse and the bare `is_err()` held even
+  with `keyset.rs`'s mixed-direction rule deleted outright. Both keys are now
+  parseable and the assertion names the message.
+
+`PUBLISHED_FILTER_FIELDS` stays hand-copied **on purpose**, and now says so: it
+is transcribed from the YAML, a different source from the SDK, so it is the one
+test here that can see the code and the published contract drift apart. The
+SDK-coupled tests structurally cannot.
+
+- [x] **Step 6: Prove the mutations**
+
+Run each of the three named mutations from Step 1 under the discipline in
+Task 5 Step 8 (absolute paths, `cp` snapshot, `touch`, confirm `Compiling`,
+grep the mutated line). A count under a `-E` filter is a lower bound; use
+`--no-fail-fast` and no filter for any number you report.
+
+- [x] **Step 7: Commit**
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/
+git commit -s -m "fix(timescaledb-plugin): serve the published \$filter field set
+
+record_column mapped nine identifiers, three of which (created_at,
+corrects_id, status) slices 3 and 4 removed from the model, and was missing
+five the gear needs: entry_type, origin and invalidates are published \$filter
+fields, and window_start/window_end are keyset-safe order keys that must
+resolve for the canonical (window_end, id) keyset to render.
+
+A port that brought the allowlist across unchanged would answer
+\$filter=origin eq 'backfill' with a 500 — a predicate the published contract
+names and the gear's own guard admits.
+
+Closes DIVERGENCES entry 16."
+```
+
+---
+
+## Task 7: Keyset pagination over `(window_end, id)`
+
+`keyset.rs` is structurally sound — the tuple-comparison predicate, the
+fail-closed nullable check, and the kind-driven bind are all still right. What
+is wrong is everything that names `created_at`, and one obligation it does not
+yet meet.
+
+**The obligation it does not meet** is the one the gear says has no compiler
+backstop. `require_cursor_fingerprint` in
+`usage-collector/src/domain/query.rs` says carrying `query.filter_hash` into
+`next_cursor.f` is *"the one requirement in this gear's Plugin SPI that gives
+an implementor no compiler error — a plugin written before it recompiles clean
+and paginates exactly once"*. `encode_next_cursor` already takes a
+`filter_hash` parameter; what matters is that the **caller** in
+`record_store.rs` passes `query.filter_hash` through verbatim (Task 11).
+
+**Done in `00449b23b8`. Measured while executing, correcting the steps
+below.**
+
+- **The Files list was short one file.** `keyset.rs` has no test module of its
+  own; its tests live in `translate_tests.rs`, which `translate.rs:210`
+  `#[path]`-includes. Task 6 swept the `keyset_predicate_*` cases there. Step
+  3's test went there too, and the Files list now names both.
+- **The `usage_type_column` claim was already stale.** No `usage_type_column`
+  survives anywhere in the crate: Task 1's `59f385eea` took it out of
+  `keyset.rs`'s module header along with the catalog. Nothing to do.
+- **The five `created_at` hits Step 1 names are exactly the five in the file**
+  (`keyset.rs:6`, `:15`, `:58`, `:99`, `:206`, all **at `6e788a4b1`** — after
+  the change `:206` lands inside `cursor_key_to_bind`) — none missed, none
+  extra. The
+  only other `created_at` under `query/` is `translate_tests.rs:178`, where
+  `no_retired_model_field_resolves_to_a_column` names it *deliberately* as a
+  retired field; that one stays.
+- **Both SPI quotations verify verbatim**, in the `list_usage_records` doc:
+  "uses one sort direction throughout" at
+  `usage-collector-sdk/src/plugin_api.rs:197-198`, and "guaranteed to be
+  *present*, not to be last: a caller ordering by `id` is handed on as `(id,
+  window_end)`. A plugin MUST read the order it is given rather than assume a
+  position for either key." at `:203-206`.
+- **Step 2 also reaches the error string, not just the doc.** The reject read
+  `"mixed-direction keyset orders are unsupported in v1"` — the same
+  awaiting-implementation framing the doc carried. It now names the guarantee
+  it rests on. The `keyset_predicate_rejects_mixed_directions` assertion is on
+  `"mixed-direction"`, so it still holds.
+- **Step 3's test names three helpers that do not exist under those names.**
+  `translate_tests.rs` resolves the kind through its own `rec_kind` and the
+  keyset-safety predicate through its own `rec_keyset_safe` (which wraps
+  `usage_collector_sdk::is_keyset_safe_record_field`); there is no
+  `field_kind`. The shipped test uses the file's helpers and its
+  `let pairs: &[(&str, bool)] = …` fixture style, and additionally asserts the
+  *binds* follow the given order — a canonicalising implementation that
+  reordered the columns alone would otherwise leave the binds as the only
+  witness.
+- **Step 1 also added a security-boundary paragraph to `render_order_by`
+  (`keyset.rs:61-65`) that neither step asked for.** Recording it because this
+  block is the slice's audit trail: Task 6's review established that
+  `render_order_by(&query.order, record_column)` resolves a caller-supplied
+  string through the allowlist, unlike the `$filter` path where `FilterField`
+  bounds the input, and that property was described nowhere at the function.
+  (Reworded in review from "an arbitrary caller string" to "an untyped caller
+  string": the gateway has already checked every order key against
+  `is_keyset_safe_record_field`, so the string is bounded, just not *typed*.)
+- **The mixed-direction refusal was in one of the three places it had to be,
+  and Step 2 would have documented the hole shut** (`e17722dcc`).
+  `keyset_predicate` refuses a mixed order, but `record_store.rs:1054` calls it
+  only when a cursor is present. `render_order_by` (`:1093`, unconditional)
+  mapped each key's direction independently, and `encode_next_cursor`
+  (`:1136`) took the cursor's `o` from `order.0.first()` alone. So a
+  mixed-direction order reaching the plugin was served as a wrongly ordered
+  first page *plus* a token whose `o` describes an order that page was not read
+  in, failing only on page two as a `500` — exactly the papering-over Step 2's
+  wording says does not happen. The rule is now hoisted into `uniform_dir` and
+  all three entry points resolve their direction through it, each with its own
+  test and its own named mutation. **`N1`-`N3` establish non-redundancy** —
+  bypassing the rule at one entry point reds that entry point's test and no
+  other, so no one of the three stands in for another. **`N4` establishes
+  dependence**: deleting the shared rule reds all four direction tests at once,
+  so it is load-bearing at every site rather than shadowed by a local check.
+  The two claims are different and neither mutation proves the other; the set
+  proves both.
+- **A duplicate empty guard was removed from `render_order_by` in review.** It
+  emitted a message byte-identical to `uniform_dir`'s empty arm, so deleting it
+  left the suite green and `render_order_by_rejects_empty_order` discriminated
+  nothing. Worth recording as its own instance of this slice's recurring shape:
+  the `# Errors` doc claimed "each entry point checks emptiness first, with its
+  own message", which was true of `keyset_predicate` and `encode_next_cursor`
+  and invented for the third — asserted in two places, in code written to fix
+  exactly that defect. `render_order_by` now relies on `uniform_dir` alone, and
+  weakening that arm (`N7`) or changing only its message (`N8`) reds both that
+  function's test and the rule's own.
+- **The reject message no longer cites the guarantee it is evidence against.**
+  It reaches a caller through `record_store.rs:1090` ->
+  `UsageCollectorPluginError::internal` -> `DomainError::Internal` ->
+  `UsageCollectorError::internal`, a caller-facing detail; "the gateway
+  guarantees one sort direction throughout" would print exactly when the
+  gateway did not. It now states a requirement of the call, as every other
+  message in the file does.
+- **Both Step-3 mutations were run, and Task 6's rule-deletion re-run on top
+  of the rewritten doc and message.** Hard-coding the canonical column order
+  (`columns.sort_by_key(|c| u8::from(*c != "window_end"))`) and sorting
+  `order_pairs` before the zip each leave
+  `the_predicate_follows_the_order_it_is_given_rather_than_a_canonical_position`
+  the sole failure; deleting the mixed-direction rule leaves
+  `keyset_predicate_rejects_mixed_directions` the sole failure, so Task 6's
+  repair survives Step 2. Each run showed a `Compiling` line. A first
+  rule-deletion attempt anchored on a regex that swallowed `render_order_by`
+  and failed to build — a failed run, not a survivor; re-anchored on the whole
+  `let cmp = …;` selection.
+
+**Files:**
+- Modify: `src/infra/storage/query/keyset.rs`
+- Modify: `src/infra/storage/query/translate_tests.rs` (Step 3's test)
+
+- [ ] **Step 1: Fix every `created_at` in the docs**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+grep -n 'created_at' src/infra/storage/query/keyset.rs
+```
+
+Known hits: the module header ("The v1 gateway default order is the
+all-ascending `(created_at, id)` tuple"), the `to_signed_tokens` example
+(`"+created_at,+id"`), the `keyset_predicate` v1-limitation note, the
+`render_order_by` example (`"created_at ASC, id ASC"`), and the
+`encode_next_cursor` doc. Every one becomes `window_end`.
+
+~~The module header also names `usage_type_column` in the allowlist-closure
+list. That function was deleted in Task 1.~~ **Stale:** Task 1's `59f385eea`
+removed the name from this header at the same time it deleted the function.
+The header's closure list reads `record_column` alone.
+
+- [ ] **Step 2: Correct the mixed-direction claim**
+
+The `keyset_predicate` doc says mixed-direction orders are a "documented
+limitation". That is now stronger than a limitation and should say why it is
+safe: the gateway guarantees `query.order` "uses one sort direction
+throughout" (SPI doc on `list_usage_records`), so a mixed-direction order is a
+**gateway breach**, not a caller-reachable case. Keep the fail-closed error;
+change the reason from "unimplemented" to "cannot occur, and is refused rather
+than papered over".
+
+Do not overclaim in the other direction either. The SPI also says the two
+canonical names are guaranteed **present, not last** — *"a caller ordering by
+`id` is handed on as `(id, window_end)`. A plugin MUST read the order it is
+given rather than assume a position for either key."* `keyset_predicate`
+already iterates `order_pairs` positionally and assumes nothing, so it is
+correct today; say so at the function rather than leaving it to be rediscovered.
+
+- [ ] **Step 3: Add the test that pins position-independence**
+
+```rust
+#[test]
+fn the_predicate_follows_the_order_it_is_given_rather_than_a_canonical_position() {
+    let mut ctx = SqlCtx::new(1);
+    let sql = keyset_predicate(
+        &[("id", true), ("window_end", true)],
+        &[
+            "3f2504e0-4f89-11d3-9a0c-0305e82c3301".to_owned(),
+            "2026-09-09T00:00:00Z".to_owned(),
+        ],
+        record_column,
+        field_kind,
+        usage_collector_sdk::is_keyset_safe_record_field,
+        &mut ctx,
+    )
+    .expect("an id-led order is admissible; the SPI guarantees presence, not position");
+
+    assert_eq!(sql, "(id, window_end) > ($1, $2)");
+}
+```
+
+**The mutation:** make `keyset_predicate` sort `order_pairs` so `window_end`
+leads, or hard-code the canonical order. Either makes this red.
+
+~~Confirm the helper names (`field_kind`, `is_keyset_safe_record_field`)
+against the crate and SDK before writing~~ — done, and they are wrong. The
+sketch above is illustrative only: `translate_tests.rs` has no `field_kind`,
+and calls the SDK predicate through its own wrapper. Write it against
+`rec_kind` and `rec_keyset_safe`, in that file's fixture style.
+
+- [ ] **Step 4: Run and verify**
+
+~~`cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin`~~ cannot
+run: the crate does not compile until Task 13, so no test binary links. **The
+crate *is* a workspace member** — Task 0 added the `members` line in
+`618e5b67f`, and `-p` resolves — so `cargo check -p … --lib` works and is the
+cheap way to read the error count. It is only `nextest` that is blocked, and by
+the compile errors rather than by membership.
+Use the `translate-harness` from Task 6 (it `#[path]`-includes `keyset.rs` and
+`translate_tests.rs`), unfiltered so the count is not a lower bound:
+
+```bash
+cd <scratchpad>/translate-harness && cargo test --no-fail-fast
+```
+
+The harness's own `target/` is the warm one; do **not** set
+`CARGO_TARGET_DIR`, or a re-runner pays a cold multi-minute build.
+
+**41 tests, 41 passing** at Task 7's close: 37 at Task 6's close, plus Step 3's
+position test and the three the hoisted direction rule needed
+(`uniform_dir_accepts_one_direction_and_refuses_a_mixed_or_empty_order`,
+`render_order_by_refuses_a_mixed_direction_order`,
+`encode_next_cursor_refuses_a_mixed_direction_order`). Then `cargo check
+--all-targets` inside the crate: 33 lib / 52 lib-test errors, unchanged from
+Task 6's close, none naming `query/keyset`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/keyset.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/translate_tests.rs
+git commit -s -m "refactor(timescaledb-plugin): key pagination on the covered-period end
+
+The canonical keyset is (window_end, id); created_at is gone. Corrects every
+doc naming it, and pins that the predicate follows the order it is handed
+rather than assuming a position for either canonical key — the SPI guarantees
+both are present, not that either is last."
+```
+
+---
+
+## Task 8: Aggregation over the current fold and withdrawal rules
+
+Two semantic changes here, and the second inverts the existing behaviour.
+
+**`AggregationOp` became `AggregationFold`**: `Avg` is gone, `Latest` is new.
+Verify against
+`gears/system/usage-collector/usage-collector-sdk/src/models.rs` before
+writing — the measured variants are `Sum`, `Count`, `Max`, `Min`, `Latest`.
+
+**Withdrawal exclusion replaced compensation netting, and the old rule was the
+opposite of the new one.** `corrects_id_partition_clause` implements "SUM nets
+across compensations; every other op filters `corrects_id IS NULL`". Under the
+append-only model an invalidation **echoes** the quantity it withdraws rather
+than negating it, so netting double-counts. The SPI states two obligations that
+hold under *every* fold:
+
+> 1. An **invalidation entry** contributes nothing to any fold, whether or not
+>    its target is in the selection.
+> 2. A **record an accepted invalidation names** contributes nothing either.
+
+Obligation 1 standing alone is not pedantry: retention is plugin-owned, so a
+conforming deployment can purge a target and keep the invalidation that
+withdrew it. That orphan still contributes nothing.
+
+**Files:**
+- Modify: `src/infra/storage/query/aggregate.rs`, `src/infra/storage/query/aggregate_tests.rs`
+
+- [ ] **Step 1: Write the failing tests**
+
+**Corrected in flight.** The version of this step written before the task ran
+prescribed a single test looping over all five folds, called the zero-argument
+`withdrawal_exclusion_clause()` inside the loop, and named the mutation "make
+`withdrawal_exclusion_clause` return `None`/empty for `Sum`". Those contradict:
+the function takes no fold, so the loop asserts the same two substrings against
+the same string five times, and the named mutation cannot be written against
+the real signature at all. The claim that "the loop is doing real work here and
+is not decoration" was false. It is replaced by what shipped.
+
+Fold-independence is a property of the *signature*, not of an assertion: a
+reintroduced per-fold branch fails to compile against these tests rather than
+failing one. So drop the loop and give each obligation its own test, since the
+clause has two conjuncts implementing two independently-stated obligations and
+neither should ride on the other's coverage:
+
+```rust
+#[test]
+fn an_invalidation_entry_is_excluded_under_every_fold() {
+    assert!(
+        withdrawal_exclusion_clause().contains("r.invalidates IS NULL"),
+        "an invalidation entry must contribute nothing to any fold, got {}",
+        withdrawal_exclusion_clause()
+    );
+}
+
+#[test]
+fn a_record_an_accepted_invalidation_names_is_excluded_under_every_fold() {
+    assert!(
+        withdrawal_exclusion_clause()
+            .contains("NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id)"),
+        "the entry an accepted invalidation names must contribute nothing either, got {}",
+        withdrawal_exclusion_clause()
+    );
+}
+
+#[test]
+fn no_fold_gets_its_own_withdrawal_rule() {
+    assert_eq!(
+        withdrawal_exclusion_clause(),
+        "r.invalidates IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM usage_records w WHERE w.invalidates = r.id)"
+    );
+}
+```
+
+**The mutations**, all writable against the real signature and each verified to
+red a test:
+
+- delete the `r.invalidates IS NULL AND ` conjunct — reds obligation 1's test
+  (and the whole-clause test), obligation 2's survives;
+- delete the ` AND NOT EXISTS (…)` conjunct — reds obligation 2's test (and the
+  whole-clause test), obligation 1's survives;
+- turn the `AND` between them into an `OR` — reds only the whole-clause test,
+  which is what keeps that third test from being redundant.
+
+- [ ] **Step 2: Replace `corrects_id_partition_clause`**
+
+Delete it. In its place:
+
+```rust
+/// The two withdrawal-exclusion obligations, as one `WHERE` fragment.
+///
+/// A withdrawn pair contributes nothing to any fold
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`), and this is two
+/// obligations rather than one conditional:
+///
+/// 1. An invalidation entry contributes nothing, whether or not its target is
+///    in the selection — `invalidates IS NULL`.
+/// 2. An entry an accepted invalidation names contributes nothing either —
+///    the `NOT EXISTS` correlated subquery.
+///
+/// Both hold under every fold, with no per-fold branch. That is a change of
+/// rule and not only of spelling: the retired `corrects_id` model had `SUM`
+/// net across signed compensation rows, so it deliberately did *not* filter
+/// them. An invalidation echoes the quantity it withdraws rather than negating
+/// it, so netting would now double-count.
+///
+/// Obligation 1 standing alone matters because retention is plugin-owned
+/// (DESIGN §3.10): a conforming deployment can purge a target and keep the
+/// invalidation that withdrew it. That orphan still contributes nothing.
+///
+/// The returned string is a `'static` constant, never caller text. `r` is the
+/// outer query's alias for `usage_records`.
+#[must_use]
+pub fn withdrawal_exclusion_clause() -> &'static str {
+    "r.invalidates IS NULL \
+     AND NOT EXISTS (SELECT 1 FROM usage_records w \
+                     WHERE w.invalidates = r.id)"
+}
+```
+
+**Corrected in flight.** The clause shipped as written. What changed is how the
+`r` alias is carried: prose plus a Task 12 grep was judged too weak for a
+coupling with no compile-time backstop, so the module also exports
+
+```rust
+#[must_use]
+pub fn aggregate_from_clause() -> &'static str {
+    "usage_records r"
+}
+```
+
+and `withdrawal_exclusion_clause`'s precondition names *it* rather than naming
+the letter `r`. Task 12 builds its `FROM` from the function (Step 1b there), and
+its assembled-SQL test asserts `sql.contains(aggregate_from_clause())` rather
+than a literal, which is what makes the constant load-bearing rather than
+decorative. Two tests in this file back it: every fragment must qualify its
+columns with an alias it opened, and the `FROM` clause must declare `r`.
+
+**Moved by Task 11**, which made `list` a second reader of the alias: the
+function is now `query::ledger_from_clause()`, since a list path reaching into
+an `aggregate` module for its `FROM` is the wrong shape. Same body, same
+contract, same two tests — the qualification guard stays in `aggregate_tests.rs`
+and is now fed the shared builders too, so it guards the assembled statement
+rather than one module's output.
+
+- [ ] **Step 3: Rewrite `agg_select_expr` for the new fold set**
+
+```rust
+/// SQL aggregate expression for an [`AggregationFold`].
+///
+/// Every fold casts to `numeric` so the result — including the integer-typed
+/// `COUNT(*)` — reads back uniformly as `Option<BigDecimal>`. Reading into
+/// arbitrary-precision `bigdecimal::BigDecimal` (the SDK's
+/// `AggregationBucket.value` type) is why a wide `SUM` no longer hits
+/// `rust_decimal::Decimal`'s ~7.9×10²⁸ ceiling and turns into a 500 on decode.
+///
+/// [`AggregationFold::Latest`] is absent: it is not an aggregate function but
+/// an ordered pick, and [`latest_select_expr`] renders it.
+#[must_use]
+pub fn agg_select_expr(fold: AggregationFold) -> Option<&'static str> {
+    match fold {
+        AggregationFold::Sum => Some("SUM(r.value)::numeric"),
+        AggregationFold::Count => Some("COUNT(*)::numeric"),
+        AggregationFold::Min => Some("MIN(r.value)::numeric"),
+        AggregationFold::Max => Some("MAX(r.value)::numeric"),
+        AggregationFold::Latest => None,
+    }
+}
+```
+
+`Avg` and its `ROUND(…, 6)` scale cap are deleted along with the variant. **Do
+not leave the module-header paragraph explaining the rounding scale** — it
+would be a doc explaining a mechanism that no longer exists, which is this
+repository's characteristic defect.
+
+**Corrected in flight — the `Option` is gone and the function is renamed.** What
+shipped is `fold_select_expr(fold) -> &'static str` with **five** arms, `Latest`
+returning the constant Step 4 describes. The `Option` above modelled no absence:
+`(ARRAY_AGG(r.value ORDER BY …))[1]` composes in a grouped SELECT list exactly
+as `SUM(r.value)` does, and the sole consumer joins the string into a SELECT
+list without inspecting it — so no caller ever needed the distinction, while
+four doc lines, a dedicated test and a prescribed `.unwrap_or_else(…)` at the
+caller existed to explain it. The "ordered pick, not an aggregate function"
+observation survives as doc on the constant, which is where it belongs rather
+than in a return type.
+
+- [ ] **Step 4: Implement `LATEST` with the declared tie-break**
+
+```rust
+/// SQL expression picking the [`AggregationFold::Latest`] quantity.
+///
+/// DESIGN §3.1 declares the rule as *greatest `window_end`, then greatest
+/// `acceptance_sequence`*, and it terminates because the sequence is monotonic
+/// inside the group's scope.
+///
+/// This backend can implement the declared rule exactly, because it assigns
+/// and stores `acceptance_sequence` itself (DESIGN §3.7). That is worth
+/// stating because the SDK's own reference backend cannot: `UsageRecord`
+/// carries no such field, so `InMemoryReferencePlugin` substitutes the
+/// greatest `id`, and the `latest-tie-break` contract check is blocked for the
+/// same reason (DIVERGENCES entries 10 and 19). A green contract run therefore
+/// says nothing about this expression in either direction — nothing asserts it.
+#[must_use]
+pub fn latest_select_expr() -> &'static str {
+    "(ARRAY_AGG(r.value ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric"
+}
+```
+
+`ARRAY_AGG(… ORDER BY …)[1]` is used rather than `DISTINCT ON` because it
+composes with `GROUP BY` over arbitrary dimensions, which `DISTINCT ON` does
+not. Note that in the doc; a reader will otherwise reach for `DISTINCT ON`.
+
+**Corrected in flight, three ways.**
+
+1. **Not a public function.** This shipped as a private `LATEST_SELECT_EXPR`
+   constant, reached only through `fold_select_expr`'s `Latest` arm — see
+   Step 3's note. The doc block above is the constant's doc.
+2. **The termination argument is two claims from two sections, and the sketch
+   above conflated them.** DESIGN §3.1:581 says the sequence is *monotonic
+   inside the group's scope*; "strictly monotonic per `(tenant_id,
+   gts_type_id)`" is §3.7's storage obligation. Those are different scopes, and
+   they coincide only when the group sits inside one tenant. A `group_by
+   resource_id` over a multi-tenant authorized scope is reachable and lies
+   outside the argument DESIGN makes — §3.1:582 disclaims any cross-tenant
+   total order. State it as DESIGN states it, and say where it stops.
+3. **"A green contract run says nothing" is if anything too weak.** The suite in
+   `usage-collector-sdk/src/contract/checks/` reaches the aggregate method at two
+   call sites and passes `AggregationFold::Sum` at both, so it never evaluates
+   this expression at all — and never exercises the withdrawal clause under any
+   other fold either. Do not restate the call-site count in the shipped doc: it
+   is a fact about another crate that an SDK contributor can falsify silently.
+   The stable, reader-actionable half is that `latest-tie-break` is in
+   `BLOCKED_CHECKS`, so nothing asserts the tie-break.
+
+- [ ] **Step 5: Add `Origin` to the dimension match — or confirm it is absent**
+
+`dimension_select_expr` matches `AggregationDimension`. **DIVERGENCES entry 15
+records that `AggregationDimension` carries five of the eight fixed dimensions
+DESIGN gives `group_by`, and growing it is explicitly out of scope for this
+slice.** So the match arms stay as they are: `TenantId`, `ResourceId`,
+`ResourceType`, `SubjectId`, `SubjectType`, `Metadata`.
+
+Alias every column with `r.` to match the exclusion clause. Confirm the variant
+list against the SDK rather than trusting this plan.
+
+**Do not add an `Origin` arm.** If the enum has grown one since this plan was
+written, stop and report it — that is entry 15 moving, and it is not yours.
+
+- [ ] **Step 6: Note the absent-dimension question without deciding it**
+
+DIVERGENCES §G records that the reference backend **drops** a row with no
+`subject_ref` from a `GROUP BY subject_id`, where naive SQL collects them into
+a NULL group — so an exemplar backend and a SQL projection give different sums
+for the same ledger, with nothing failing.
+
+**§G says explicitly: do not write the check first, because a check pins
+whichever answer its author picked, and here that would be a decision made by a
+test rather than by the contract.**
+
+So: in SQL, `GROUP BY subject_id` over a NULL column produces a NULL group, and
+`dimension_select_expr` returns a bare column. Do not silently pick either
+answer. Add a doc comment at `dimension_select_expr` recording that the two
+disagree, naming §G, and saying the answer is a spec owner's. Report it in the
+task summary so it reaches the DIVERGENCES update in Task 18.
+
+**Corrected in flight — the divergence is not where this step said it was.**
+The sentence "that means this backend will **collect** them where the reference
+backend **drops** them" was written from `dimension_select_expr` alone and is
+false about the backend. `record_store.rs`'s `aggregate` pushes
+`subject_id IS NOT NULL` / `subject_type IS NOT NULL` into the `WHERE` clause
+before rendering a subject dimension, so the shipped backend **drops**
+subject-less rows exactly as the reference does. The exclusion decision lives at
+the caller, not in this file, and Task 12 owns whether it survives — so the doc
+comment states the property of the returned expression (a bare column, which on
+its own collects a NULL group, with no not-null guard added or assumed here)
+rather than a claim about the backend that this file cannot make good on.
+
+Two things the divergence write-up must carry that §G does not:
+the same disagreement reaches `Metadata(key)` — the reference's `bucket_key`
+returns `None` for an absent key and drops the row, while `r.metadata ->> $N`
+yields SQL `NULL` — and the caller emits **no** guard for it, so the metadata
+dimension is where the two backends actually disagree today. And the SDK is not
+silent after all: `AggregationDimension::SubjectId`/`SubjectType` document
+"rows without a subject are excluded from the grouping", which reads as the
+drop answer already given for the two subject dimensions and still unstated for
+metadata.
+
+- [ ] **Step 7: Run and commit**
+
+```bash
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(aggregate)' 2>&1 | tail -20
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/aggregate.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/aggregate_tests.rs
+git commit -s -m "feat(timescaledb-plugin)!: fold under the append-only withdrawal rules
+
+Replaces the corrects_id partition with the SPI's two withdrawal-exclusion
+obligations, which hold under every fold. This inverts the old rule rather
+than respelling it: the retired model had SUM net across signed compensation
+rows, and an invalidation echoes the quantity it withdraws rather than
+negating it, so netting would double-count.
+
+Adds LATEST on the declared tie-break (greatest window_end, then greatest
+acceptance_sequence), which this backend can implement exactly because it
+assigns the sequence itself. Drops AVG with its variant.
+
+BREAKING CHANGE: AggregationOp::Avg is no longer served; the fold set is
+Sum, Count, Max, Min, Latest."
+```
+
+---
+
+## Task 9: Persist an entry — `create` and `create_batch`
+
+The largest task. `record_store.rs` is 1,401 lines and this is the half that
+writes.
+
+Three obligations land here, and one of them cannot be met by a read followed
+by a write.
+
+**Files:**
+- Modify: `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`,
+  `src/infra/storage/mapper.rs`, `src/infra/storage/mapper_tests.rs`,
+  `src/infra/storage/error.rs`, `src/infra/storage/error_tests.rs`,
+  `src/infra/storage/pool.rs`
+
+> **FLIGHT CORRECTION (Task 9, as shipped).** Six things below drifted from the
+> files or were settled differently in flight. Each is corrected in place at its
+> step; collected here so a reader does not have to find them.
+>
+> 1. **The insert binds sixteen columns, not fifteen.** Step 5 said "the
+>    seventeen minus `ingested_at` (defaulted) and `acceptance_sequence`
+>    (claimed)". `acceptance_sequence` is `NOT NULL` with no `DEFAULT`, so a
+>    claimed value still has to be *inserted*; only `ingested_at` (defaulted)
+>    and `entry_type` (generated) are omitted.
+> 2. **`claim_acceptance_sequence` gained a `count`.** A batch claims one
+>    contiguous *block* per `(tenant_id, gts_type_id)` scope rather than one
+>    value per row, so a batch of `n` entries in one scope costs one round trip
+>    and takes the counter's row lock once. `count = 1` is the single-row case.
+> 3. **`to_micros` is gone, and so is the SDK function it delegated to.**
+>    `usage_collector_sdk::created_at_micros` no longer exists; the SDK's
+>    canonical microsecond primitive is now
+>    [`canonical_period_bound`], the same rendering the entry `id` is derived
+>    over. The dedup key carries the two bounds in that form, so `DedupKey` is
+>    `(Uuid, String, String, String, String)`.
+> 4. **`map_insert_error` is `async` and takes a connection.** Naming the
+>    invalidation already in place needs a read, and that read must happen after
+>    the aborted transaction is rolled back (a further query on a failed
+>    transaction is refused with `25P02`, not answered). Step 1's sketched
+>    signature `map_insert_error(&err, &record)` is therefore not what shipped —
+>    and the substance of that test moved to `classify_db`, which is
+>    harness-runnable; see the verification note below.
+> 5. **Every line number in Step 6b was stale.** The eight sites are at
+>    `:176 :524 :705 :738 :763 :766 :928 :930`, not `:189 :536 :717 :750 :775
+>    :778 :940 :942`. Verdicts are recorded at the step.
+> 6. **The batch's *cross-call* invalidation collision still fails whole.**
+>    Step 7 fixes the in-batch case in `plan_batch`. A batch carrying a
+>    withdrawal of a target invalidated by an *earlier call* still aborts the
+>    whole multi-row `INSERT` and returns an outer `AlreadyInvalidated` rather
+>    than per-row outcomes. Recorded for Task 18 rather than papered over.
+
+> **Every `:NNN` line anchor in this task was stale**, not just Step 6b's
+> eight. They were written against a draft of `record_store.rs` that is not
+> what Task 9 inherited. Each has been corrected in place to the number in the
+> file **as Task 9 found it** (`7114a7b9b`), verified with `grep -n` on that
+> revision; a bare number that has since been superseded by a rewritten
+> paragraph was dropped rather than re-anchored. Anchors into `error.rs` and
+> `pool.rs` are likewise as-found.
+
+### Verification: the harness does **not** reach `record_store.rs`
+
+**Measured, not assumed.** The Task 5-8 harness pattern — `#[path]`-include the
+real working-tree file into a scratch crate — cannot be applied to
+`record_store.rs`, because a `#[path]` include compiles the *whole file* and
+this file's read half is Tasks 10-12's. Enumerated blockers, all in code Task 9
+must not touch:
+
+- `record_row_key` reads `row.corrects_id` / `row.created_at` / `row.status`,
+  none of which exist on the ported `UsageRecordRow` (Task 11's cursor-key
+  extractor).
+- `list` and `aggregate` take `UsageTypeGtsId` / `AggregationSpec`, both gone
+  from the SDK, and call `gts_id_str`, gone from the mapper (Tasks 11, 12).
+- the `aggregate` dimension loop has a `&AggregationDimension` type mismatch
+  (Task 12).
+
+A shim crate can fake the two missing SDK types and the two missing
+`query::aggregate` functions, but it cannot fake a struct field that is absent
+by design — so the first blocker is fatal and the approach was abandoned.
+
+**What was done instead, and what it does and does not prove:**
+
+- `error.rs` and `mapper.rs` **are** `#[path]`-included as the real files. The
+  `is_constraint` / `classify_db` regression tests and `invalidation_to_row`'s
+  test therefore run against the shipped bytes. Steps 1, 2b, 5b and 6b's
+  substance lives there deliberately, for exactly this reason.
+- For `record_store.rs` the harness compiles a **mechanically regenerated
+  extract** of its write half, produced from the real file by a script on every
+  run (delete the read-half items by anchor, rewrite the `use` block, truncate
+  the sibling test file at its `Read-half tests (Tasks 10-12)` banner). No hand
+  editing; a mutation of the real file propagates into the extract, and the
+  mutation driver greps the mutated line out of the *generated* file so a
+  dropped mutation reads as a failed run rather than a survivor.
+- **Two substitutions in the extract change more than which text is present,
+  and the second is load-bearing.** (a) `toolkit::tokio::time::sleep` becomes
+  `tokio::time::sleep`, to keep the `toolkit` crate out of a scratch target
+  dir. (b) **`#[async_trait] impl RecordStore for PgRecordStore` becomes an
+  inherent `impl PgRecordStore`** — which drops the `async_trait` desugaring (a
+  boxed `Send` future) and drops conformance checking against the `RecordStore`
+  signatures. So the harness proves **neither** that `create` /
+  `create_batch`'s futures are `Send` **nor** that they still satisfy the
+  trait — precisely the class of breakage a first-transaction change can
+  introduce. Both hold in fact: `cargo check --all-targets` emits no `E0277`
+  (non-`Send` future) and no `E0407` anywhere in the run, and `E0050` only in
+  `adapter.rs` — in a run that *did* emit `E0425`/`E0308` from **inside the
+  bodies of `list` and `aggregate`**, which are methods of this very `impl`
+  block, so method-body type-checking demonstrably reached the block and was
+  silent about these two. (Those three errors sat at `record_store.rs:1712`,
+  `:1855` and `:1886` against a block spanning `:1477-1922` when this was last
+  measured, at `Task 9`'s final commit. The numbers are given for reproduction
+  and will drift; **the enclosing functions are the durable half of the
+  citation**, which is the lesson of how this sentence went wrong below.)
+  One caveat: `ports.rs:6` carries an unresolved import, so "conformance
+  checking ran" is strictly true only for methods whose signatures do not name
+  the missing types — which `create` and `create_batch` do not, so the claim
+  holds for the two methods it is about. All of which is cargo saying so, not
+  the instrument this task's confidence otherwise rests on.
+
+  **This sentence was itself wrong once, and how it was wrong is worth
+  keeping.** Its first version cited `E0609` "inside this very `impl` block".
+  Those three errors are in `record_row_key`, a free function some 380 lines
+  *above* the block — a correct conclusion resting on a citation that does not
+  check out, which is this port's signature defect, committed in the very
+  sentence added so the disclosure would not rest on bare assertion. The lesson
+  is not "add evidence": it is that **added evidence needs the same
+  verification as the claim it supports**. `extract_writehalf.py`'s own
+  docstring, which makes no evidence claim at all, was correct as written.
+  Everything else in the extract is the real file's bytes, and every deletion
+  anchor is asserted unique, so a failed anchor raises rather than silently
+  emitting a different extract.
+- **What that does not cover.** Two of these are DB-free and *were* covered
+  after this was first written; they are listed because the original framing —
+  "anything needing a live backend" — quietly excluded them, and they are
+  exactly where a silent corruption would live:
+  - `InsertColumns::build`, the sixteen-way pivot the batch insert binds. A
+    swapped push (`resource_ids`/`resource_types`,
+    `subject_ids`/`subject_types`, the two bounds) corrupts every batched row
+    and is invisible to every other test. **Now covered** by
+    `insert_columns_pivots_each_record_into_the_column_it_is_bound_as`, with
+    three swap mutations.
+  - The insert SQL's own column sequences, one layer below the pivot. The
+    column list, `SELECT` list and `UNNEST` alias list were four literal
+    spellings; a name transposed in one of them binds a `text[]` to the wrong
+    `text` column, which Postgres accepts silently. They are now one
+    `INSERT_COLUMNS` const with `single_insert_sql()` / `batch_insert_sql()`
+    built from it, and four tests read the sequences back out. The
+    column-to-array-type pairing is checked against a **hand transcription of
+    `migrations/0001_init.sql`**, not against the const the SQL is built from —
+    the first version of that test did the latter and a transposition mutation
+    survived it, since both sides moved together. The `.bind()` call order
+    remains genuinely Task 15's.
+  - `claim_batch_sequences`'s pure half, now split out as `scope_runs` and
+    `sequence_block`. An off-by-one there reuses or skips a sequence value that
+    no constraint can object to. **Now covered**, with two mutations.
+  - Genuinely DB-only, and Task 15's: `create_inner`, `create_batch_inner`,
+    `claim_acceptance_sequence` against a real counter row,
+    `find_existing_invalidation` (including its `tenant_id` predicate), and
+    every SQL string. Task 14's contract run covers the behaviour.
+- **Task 13 must re-run these tests through `cargo nextest` once the crate
+  compiles**, since the extract is not what ships. That obligation is written
+  into **Task 13's Step 3b**.
+
+### Obligation 1 — the dedup identity is the 5-tuple
+
+The old dedup key was the 4-tuple `(tenant_id, gts_id, idempotency_key,
+created_at)`. It is now `(tenant_id, gts_type_id, idempotency_key,
+window_start, window_end)`. `dedup_key`, `row_dedup_key` and `canonical_equal`
+all encode the old shape.
+
+### Obligation 2 — at most one invalidation, atomically
+
+The SPI is unusually explicit, and explains why the gateway will not help:
+
+> Where the entry carries an [`UsageRecord::invalidation`], the store MUST
+> reject it if the record it names already has an accepted invalidation, and
+> MUST make that check atomic with the entry it admits — **one backend
+> transaction, not a read followed by a write.** … The gateway does not
+> pre-read for this and will not: a gateway-side check cannot exclude a
+> concurrent second submission, so it would fail exactly when it matters.
+
+The Task 3 partial unique index is the mechanism. The store's job is to catch
+its violation and translate it, not to pre-read.
+
+> a batch is where it is easiest to get wrong: two withdrawals of one record
+> can arrive in the same call, so admitting them one at a time against the
+> state each read is not enough.
+
+The index handles the in-batch case too **only if the batch inserts in one
+statement or one transaction**. Confirm which `insert_records_on_conflict`
+does before relying on it.
+
+### Obligation 3 — assign `acceptance_sequence`
+
+Claim from `usage_acceptance_sequence` in the same transaction as the insert.
+
+### You are adding the first transaction in the crate
+
+**Measured after Task 2: the plugin opens no transactions at all.** `deactivate`
+held the store's only one, and its `sqlx::Connection` import went dead when Task
+2 removed it — `grep -rn 'begin()\|Transaction'` over `src/` returns nothing.
+
+That matters because both obligations above are transactional and the SPI is
+explicit that a read-then-write will not do:
+
+> the store MUST reject it if the record it names already has an accepted
+> invalidation, and MUST make that check atomic with the entry it admits —
+> **one backend transaction, not a read followed by a write.**
+
+So Step 4's `claim_acceptance_sequence(tx: &mut sqlx::Transaction<'_, Postgres>, …)`
+is not slotting into existing machinery; you are re-introducing it. Expect to
+restore the `sqlx::Connection` (or `sqlx::Acquire`) import, and expect the
+single-row and batch insert paths to change shape rather than gain a parameter.
+
+Do not read this as "the crate used to have a transaction, so this is a
+revert" — the one Task 2 deleted wrapped a `SELECT … FOR UPDATE`
+read-modify-write, which is the shape the SPI forbids here.
+
+- [x] **Step 1: Write the failing tests** — DONE
+
+These are unit tests over the SQL and the key derivation; the behavioural
+proof is the contract suite in Task 14 and the pg integration tests in Task 15.
+
+**As shipped.** `the_dedup_key_is_the_five_tuple` names all five components
+plus the exclusion of `value`, and two siblings pin the canonical bounds
+(`the_dedup_key_names_the_canonical_microsecond_bounds` spells the rendered
+bytes out; `a_sub_microsecond_bound_keys_the_same_as_what_postgres_stores`
+pins the precision the ledger actually stores). The invalidation-constraint
+test moved into `error_tests.rs` as
+`a_chunk_local_one_invalidation_index_is_already_invalidated`, because
+`classify_db` is where the discrimination lives and it is harness-runnable
+where `map_insert_error` is not. `pg_unique_violation` was never needed:
+`classify_db` takes `(code, constraint)` as plain values. The one place in this
+repo that *does* build a fake `sqlx::Error::Database` is
+`gears/system/cluster/plugins/postgres-cluster-plugin/src/pg_error.rs`
+(`FakeDbError`), not this crate's `error_tests.rs` — noted so the next task
+that needs one does not go looking in the wrong file.
+
+```rust
+#[test]
+fn the_dedup_key_is_the_five_tuple() {
+    let base = sample_record();
+    let shifted = UsageRecord {
+        window_start: base.window_start - time::Duration::hours(1),
+        ..base.clone()
+    };
+
+    assert_ne!(
+        dedup_key(&base),
+        dedup_key(&shifted),
+        "window_start is one of the five dedup-identity inputs, so two entries \
+         differing only in it are distinct entries, not a retry"
+    );
+}
+
+// ~~SUPERSEDED~~ — this call shape does not exist. `map_insert_error` is
+// `async` and takes a connection (naming the existing invalidation needs a
+// read, after the rollback), and the discrimination this tests moved to
+// `classify_db`. Kept struck-through to show what changed; do not write it.
+//
+// #[test]
+// fn a_unique_violation_on_the_invalidation_index_reads_as_already_invalidated() {
+//     let err = map_insert_error(
+//         &pg_unique_violation("usage_records_one_invalidation_uniq"),
+//         &sample_invalidation_record(),
+//     );
+//     assert!(matches!(err, UsageCollectorPluginError::AlreadyInvalidated { .. }));
+// }
+```
+
+**The mutations:** drop `window_start` from `dedup_key` (test 1 red); route the
+`usage_records_one_invalidation_uniq` constraint name to `Internal` (test 2
+red).
+
+~~`pg_unique_violation` needs to build an `sqlx::Error::Database` carrying a
+constraint name. Check how `error_tests.rs` already constructs one — the crate
+has this problem solved somewhere, and inventing a second way is worse than
+finding the first.~~ **Superseded, and wrong on its facts.** No such helper was
+needed: `classify_db` takes `(code, constraint)` as plain values. And
+`error_tests.rs` does **not** construct an `sqlx::Error::Database` — the only
+place in this repo that does is
+`gears/system/cluster/plugins/postgres-cluster-plugin/src/pg_error.rs`
+(`FakeDbError`). Noted so the next task that needs one looks in the right
+file.
+
+- [x] **Step 2: Update `RECORD_COLUMNS`** — DONE
+
+At `:63` (as found). It must match `UsageRecordRow`'s field order from Task 4 exactly —
+the row struct lists them (a readability convention, not a decode requirement).
+
+```rust
+const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, value, window_start, \
+     window_end, resource_id, resource_type, subject_id, subject_type, \
+     idempotency_key, invalidates, reason_code, origin, acceptance_sequence, \
+     metadata, ingested_at";
+```
+
+**Seventeen columns, and `entry_type` is deliberately not among them** — it is
+generated, and nothing decodes it. Count the names against `UsageRecordRow`'s
+fields one by one. **Omission is the hazard, not order** — see the correction
+in Task 4. A `RECORD_COLUMNS` missing a field fails with
+`no column found for name: <field>`, which names the field; a `RECORD_COLUMNS`
+in a different order than the struct is harmless.
+
+- [x] **Step 2b: Add `invalidation_to_row` to the mapper** — DONE
+
+Task 5 built `invalidation_from_row` and made it go to some trouble to keep
+`(invalidates, reason_code)` inseparable: a half pair is refused as `Internal`
+rather than silently dropped. **The write direction has no such helper, and
+without one this insert will bind the two columns independently** — the exact
+split shape the read direction exists to refuse, reintroduced where nothing
+catches it until Postgres rejects the row on
+`usage_records_invalidation_pairing`, at runtime, in production.
+
+Add it beside its inverse in `src/infra/storage/mapper.rs`, and bind through it:
+
+```rust
+/// Split an [`Invalidation`] back into the two columns that store it.
+///
+/// The inverse of [`invalidation_from_row`], and the reason the insert cannot
+/// bind `invalidates` and `reason_code` separately: going through one function
+/// makes the half-populated pair unrepresentable on the way out, the same way
+/// [`Invalidation`] makes it unrepresentable on the way in.
+#[must_use]
+pub fn invalidation_to_row(invalidation: Option<&Invalidation>) -> (Option<Uuid>, Option<&str>) {
+    match invalidation {
+        None => (None, None),
+        Some(Invalidation { target, reason }) => (Some(*target), Some(reason.as_str())),
+    }
+}
+```
+
+Its test names the bytes rather than round-tripping against
+`invalidation_from_row` — a round trip proves the pair is self-consistent and
+nothing else, which is the rule Step 8 of Task 5 arrived at the hard way:
+
+```rust
+assert_eq!(
+    invalidation_to_row(Some(&inv)),
+    (Some(target), Some("duplicate_submission"))
+);
+assert_eq!(invalidation_to_row(None), (None, None));
+```
+
+Name the mutation before you accept it: returning `(Some(*target), None)` must
+go red.
+
+- [x] **Step 3: Rewrite the dedup helpers** — DONE
+
+`dedup_key`, `row_dedup_key` and `canonical_equal` (at `:615`, `:626`, `:872` as found)
+all carry the 4-tuple. Bring each to the 5-tuple. `canonical_equal` compares a
+submitted record against a stored row to decide absorb-vs-conflict; it must now
+compare the covered-period pair, `origin`, and the invalidation pair too — an
+exact-equality retry means every caller-supplied field matches.
+
+`to_micros` (`:820` as found) normalized an `OffsetDateTime` for comparison by
+delegating to `usage_collector_sdk::created_at_micros`. **That SDK function no
+longer exists**, so the helper was deleted rather than reimplemented: the SDK's
+canonical microsecond primitive is now `canonical_period_bound`, the same
+rendering `derive_usage_record_id` builds its pre-image from, and both bounds
+enter the key through it. Reimplementing a local µs truncation would have been
+a second spelling that could drift from the identity derivation — which is the
+exact property `to_micros`'s doc claimed and delegation is what bought.
+
+`canonical_equal` compares the two bounds through that same rendering rather
+than as raw `OffsetDateTime`s. Comparing them raw would risk a false
+`IdempotencyConflict` on a value that differs only below the microsecond;
+through the canonical form the comparison is the same defensive tautology `id`
+already is, which is what it is documented as.
+
+- [x] **Step 4: Claim the acceptance sequence** — DONE (with a `count`)
+
+Add to `impl PgRecordStore`:
+
+```rust
+/// Claim the next `acceptance_sequence` for `(tenant_id, gts_type_id)`.
+///
+/// Strictly monotonic per scope, which is the DESIGN §3.7 obligation. It is
+/// **not** gapless, and does not need to be: an insert that is absorbed as an
+/// idempotent retry consumes a value it never stores. Density is not the
+/// obligation and nothing reads the sequence expecting it.
+///
+/// Runs inside the caller's transaction so the claim and the insert commit or
+/// roll back together. The row lock this takes serializes concurrent ingest
+/// for one scope, which is what per-scope monotonicity costs; scopes do not
+/// contend with each other.
+async fn claim_acceptance_sequence(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    gts_type_id: &str,
+    count: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO usage_acceptance_sequence (tenant_id, gts_type_id, next_value) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (tenant_id, gts_type_id) \
+         DO UPDATE SET next_value = usage_acceptance_sequence.next_value + $3 \
+         RETURNING next_value",
+    )
+    .bind(tenant_id)
+    .bind(gts_type_id)
+    .bind(count)
+    .fetch_one(&mut **tx)
+    .await
+}
+```
+
+**Shipped with a `count`**, returning the block's *last* value — the block is
+`[returned - count + 1, returned]`. A batch would otherwise pay one round trip
+and one row-lock acquisition per entry. `claim_batch_sequences` groups the
+sorted `reps` by scope (contiguous, because the scope is the `DedupKey`'s first
+two components) and claims one block each, which also keeps the counter-row
+locks in the same global order the dedup tuple locks take.
+
+**The gap story is per-path, and the plan's version was only half right.** A
+single-row insert that loses its dedup slot *rolls back*, releasing its claim,
+so that path leaves no gap. A batch claims its blocks up front and commits
+whatever the `ON CONFLICT` let it win, so every value claimed for a lost slot
+is spent without being stored. Monotonic either way; density was never the
+obligation.
+
+- [x] **Step 5: Rewrite the insert** — DONE
+
+`create_inner` (`:184`) and `insert_records_on_conflict` (`:300`, both as found) carry the
+`ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING`
+dedup authority. The conflict target becomes the 5-tuple, matching the Task 3
+constraint.
+
+**Sixteen columns are bound**, not fifteen: the seventeen above minus
+`ingested_at` (`DEFAULT now()`), and `entry_type` was never among them
+(generated). `acceptance_sequence` is `NOT NULL` with no default, so the value
+Step 4 claims is bound like any other — claiming it elsewhere does not mean
+inserting it elsewhere.
+
+Both run inside the transaction that holds the sequence claim.
+
+`insert_records_on_conflict`'s sixteen per-column vectors moved into an
+`InsertColumns::build` so neither function trips `clippy::too_many_lines`, and
+so the column list, the `UNNEST` list and the bind order can be read side by
+side. It returns the raw `sqlx::Error` rather than a mapped one, because the
+caller holds the transaction that has to be rolled back before the mapping's
+diagnostic read can run.
+
+- [x] **Step 5b: Constraint names arrive chunk-prefixed — exact match is dead** — DONE
+
+**Measured with a standalone sqlx 0.9.0 probe against a live
+`timescale/timescaledb:latest-pg16` running this crate's own
+`migrations/0001_init.sql`.** Not inferred, not read off a psql message —
+`db.constraint()` was printed directly:
+
+```
+DEDUP, chunk A        constraint() = Some("1_usage_records_dedup_uniq")
+DEDUP, chunk B        constraint() = Some("2_usage_records_dedup_uniq")
+2nd INVALIDATION, A   constraint() = Some("_hyper_1_1_chunk_usage_records_one_invalidation_uniq")
+2nd INVALIDATION, B   constraint() = Some("_hyper_1_2_chunk_usage_records_one_invalidation_uniq")
+CHECK window_ordered  constraint() = Some("usage_records_window_ordered")          <- BARE
+usage_acceptance_seq  constraint() = Some("usage_acceptance_sequence_pkey")        <- BARE
+```
+
+**Three facts that change the implementation:**
+
+1. **Neither unique constraint reports its bare name.** `error.rs:41`'s
+   `Some("usage_records_dedup_uniq")` (as found) is **unreachable on a real hypertable**
+   and always has been. It has been invisible because ingest uses
+   `ON CONFLICT … DO NOTHING`, so that arm is defensive and no test could reach
+   it. **Your new `AlreadyInvalidated` arm is on a live path** — written the
+   same way it would be dead on arrival, and the failure would look like a
+   logic bug rather than a string-matching one.
+
+2. **The two constraints prefix differently, for a structural reason.** A
+   constraint declared inside `CREATE TABLE` is cloned by TimescaleDB as
+   `<chunk_id>_<name>`; a standalone `CREATE UNIQUE INDEX` is cloned by
+   Postgres as `<chunk_relname>_<name>`. `usage_records_dedup_uniq` is the
+   former, `usage_records_one_invalidation_uniq` the latter. **A normalization
+   that strips one shape silently misses the other.**
+
+3. **`chunk_id` is a global sequence across every hypertable in the database**,
+   not a per-hypertable counter — a second hypertable's first chunk came back
+   as id `3`. The numeric part is unbounded and unknowable ahead of time, so no
+   fixed prefix can be hardcoded.
+
+**DECIDED: Option A — rely on the index alone, and document the condition.**
+Settled by the owner, after the contract suite's fixture was read directly:
+`at_most_one_fixtures()` in
+`usage-collector-sdk/src/contract/checks/at_most_one_invalidation.rs:274-337`
+builds every withdrawal as
+`fixture_invalidation(&key, quantity, target.window_start, target.window_end,
+target.id)` — so both withdrawals of a target share the target's `window_end`,
+the index catches them, and Task 14's check passes on both the sequential and
+the same-batch-race path. **A green contract run is therefore not evidence that
+the general case is covered**, and this note exists so nobody reads it that
+way.
+
+No in-transaction pre-read and no advisory lock were added. The condition is
+stated at the call site (`create_inner`'s doc) naming *whom* it rests on: a
+faithful withdrawal copies its target's covered period by construction, which
+the Ingestion Gateway enforces upstream; a caller reaching the SPI directly
+with a mismatched period is not bound by that. **Task 18 owns the DIVERGENCES
+entry**; do not write it here.
+
+One partial narrowing fell out of Step 7 for free: *within a single batch* the
+rule is enforced in its true form — at most one withdrawal per target, whatever
+period each carries — because the whole batch is in hand. Only the cross-call
+case depends on the shared `window_end`.
+
+**The index does NOT fully discharge the SPI obligation, and this was
+measured.** Task 3's spec review provoked the constraint on a live container:
+
+- two invalidations of one target with the **same** `window_end` → correctly
+  rejected by `usage_records_one_invalidation_uniq`
+- two invalidations of one target with **different** `window_end` → **both
+  accepted**; `count(*) WHERE invalidates = target` returns 2
+
+So the database guarantee is conditional on every invalidation being a faithful
+copy of its target's covered period — which is the **Ingestion Gateway's**
+enforcement, upstream of the plugin. The SPI text says "**the store** MUST
+reject it". A caller reaching the SPI directly, which is exactly what the
+contract suite does, is not bound by the gateway.
+
+This is not a schema defect: no hypertable-compatible unique index can do
+better, because a UNIQUE must contain the partition column. **It is a decision
+you have to make**, and you are the first task with the means to make it,
+because you are adding the transaction:
+
+- **Option A — rely on the index alone.** Defensible: a faithful copy shares
+  the target's period by construction, so the uncovered case cannot arise
+  through any conforming ingestion path. Write down that the guarantee is
+  conditional and on whom. **← chosen; see the decision note above.**
+- ~~**Option B — add an in-transaction check for the general case.**~~ Not
+  taken. It would have worked, but it buys nothing against a conforming
+  ingestion path and adds a lock the hot path would pay on every withdrawal.
+
+**Use a boundary-anchored suffix match:**
+
+```rust
+/// True when `actual` names `name`, allowing for TimescaleDB's chunk-local
+/// spellings.
+///
+/// A hypertable clones each constraint onto every chunk under a generated
+/// name, and there are two shapes because there are two declaration sites:
+/// `<chunk_id>_<name>` for a constraint declared in `CREATE TABLE`, and
+/// `_hyper_<ht>_<chunk>_chunk_<name>` for a standalone `CREATE INDEX`. Both
+/// end in `_<name>`. Bare equality still holds for CHECK constraints, which
+/// are not renamed, and for non-hypertable tables.
+fn is_constraint(actual: &str, name: &str) -> bool {
+    actual == name || actual.strip_suffix(name).is_some_and(|p| p.ends_with('_'))
+}
+```
+
+The `_` anchor over a plain `ends_with` costs nothing and stops an unrelated
+name that merely ends in the same characters without a separator.
+
+**Suffix matching is safe for this schema, verified exhaustively.** Every
+constraint and index name in `0001_init.sql` was enumerated — including the
+implicit `usage_records_pkey`, `usage_records_origin_check`,
+`usage_acceptance_sequence_pkey` and TimescaleDB's own
+`usage_records_window_end_idx` — and no name is a suffix of any other. Note
+`usage_records_tenant_window_idx` is *not* a suffix of
+`usage_records_tenant_type_window_idx`.
+
+**One rule for future migrations, measured rather than assumed.** Postgres
+truncates identifiers at 63 bytes *from the tail* and the chunk prefix is
+prepended, so a long enough name loses its suffix entirely. Demonstrated with a
+69-character constraint whose chunk-local form kept no suffix at all.
+`usage_records_dedup_uniq` (24 chars) and `usage_records_one_invalidation_uniq`
+(35, chunk-local 52) both have ample headroom. **Keep constraint names under
+~45 characters.**
+
+**Add a regression test with the literal chunk-local strings** as unit inputs to
+`classify_db` — `"1_usage_records_dedup_uniq"` and
+`"_hyper_1_1_chunk_usage_records_one_invalidation_uniq"`. It needs no container
+and it pins the finding so a later refactor cannot quietly restore exact
+matching. **The mutation:** change `is_constraint` back to `actual == name`.
+
+**Do not reach for `ON CONFLICT` to sidestep string matching.** A statement
+admits one arbiter and the ingest insert already spends it on the dedup
+5-tuple, so the one-invalidation index still surfaces as a raw `23505`.
+Error-string discrimination is the route, which is why the match rule is
+load-bearing.
+
+- [x] **Step 6: Translate the new constraint violation** — DONE
+
+**~~First, a stale doc this task inherits.~~ Already done by Task 3 — do not go
+looking for it.** An earlier draft said `map_insert_error`'s doc describes
+`UsageTypeNotFound` "and the code below it still constructs one". **Both halves
+are now false.** Task 3 had to delete that branch: `UsageTypeNotFound` and
+`UsageTypeGtsId` are both gone from the SDK, so it was a hard compile error, not
+a choice. Task 3 also rewrote the doc and dropped the now-unused `gts_id`
+parameter.
+
+What you actually inherit is a clean seam: `map_insert_error` exists, its doc
+names exactly the two constraints you must discriminate, and its parameter list
+is yours to set. Step 1's test already calls it as
+`map_insert_error(&err, &sample_invalidation_record())` — a `&UsageRecord`, not
+the dropped `&UsageTypeGtsId` — so nothing is owed back.
+
+`map_insert_error` (`:124` as found) maps a unique violation to `IdempotencyConflict`.
+It must now discriminate on the constraint name:
+
+- `usage_records_dedup_uniq` -> the existing absorb-or-conflict path
+- `usage_records_one_invalidation_uniq` -> `AlreadyInvalidated`, naming the
+  invalidation already in place
+
+**As shipped.** `AlreadyInvalidated { id, invalidated_by }` — `id` is the
+target the submission tried to withdraw, read straight off
+`record.invalidation.target` with no query; `invalidated_by` is the entry that
+already withdrew it, and **that one needs a read**. `find_existing_invalidation`
+does it, keyed on `(invalidates, window_end)` — the partial index's own key, so
+it finds exactly the row that refused the write. It runs *after* the rollback
+of the transaction the constraint aborted, which is also required for a
+mechanical reason: a further query on a failed transaction is refused with
+`25P02`. If the read finds nothing (the invalidation's chunk aged out between
+the rejection and the read) the result is a retryable `Transient`, never a
+fabricated identifier.
+
+`AlreadyInvalidated`'s fields need reading before you populate them:
+
+```bash
+sed -n '/AlreadyInvalidated/,/}/p' \
+  gears/system/usage-collector/usage-collector-sdk/src/error.rs
+```
+
+If naming the existing invalidation requires a read, that read happens *after*
+the constraint has already rejected the write — so it is diagnostic, not a
+check, and the atomicity obligation is still met by the index. Say that at the
+call site, because it looks like the pre-read the SPI forbids and is not one.
+
+- [x] **Step 6b: Settle every transaction claim in this file, and the 55P03 gap** — DONE
+
+**Eight sites, not two.** An earlier draft named two of them (at line numbers
+that were already stale — see the table); Task 2's code review found three
+more, and a re-count found a further one. Measured with
+`grep -n 'transaction' src/infra/storage/record_store.rs`:
+
+**Every line number here was stale by ~13-14 lines.** Re-measured with
+`grep -n 'transaction' src/infra/storage/record_store.rs` at Task 9's start —
+still eight sites, at `:176 :524 :705 :738 :763 :766 :928 :930`. Verdicts as
+settled:
+
+| Line (real) | Plan said | Says | Verdict as shipped |
+| --- | --- | --- | --- |
+| `:176` | `:189` | "no explicit transaction is needed" | **was true, now false — rewritten.** `create_inner` opens one, and its doc says why it has to. |
+| `:524` | `:536` | "atomic, so no explicit transaction is required" | **was true, now false — rewritten.** `create_batch_inner` opens one; the claim and the insert must commit together. |
+| `:705` | `:717` | "the surviving transaction has already committed or aborted" | **true, kept, sharpened.** True of the server-side transaction that won the deadlock, whoever opened it. Reworded to say "the transaction that survived the deadlock" so it cannot be read as a claim about this crate, and to name the acceptance-sequence lock alongside the dedup lock. |
+| `:738` | `:750` | "the whole transaction rolled back" | **now true of this crate too, and said so.** Rewritten to name `create_batch_inner`'s own transaction, and extended: `55P03` joins the retryable bucket, `AlreadyInvalidated` is explicitly non-retryable (an already-withdrawn target does not become withdrawable by waiting). |
+| `:763` | `:775` | "…transaction. `operation` is an `Fn` invoked fresh each attempt" | **was misleading, rewritten.** It said the mechanics are "unit-tested without a transaction", which read as *there are none*; it now says "without a database at all", which is the actual property. |
+| `:766` | `:778` | "opens a fresh transaction" | **was false, now true — kept and made specific.** Each attempt does open one, and the sentence now says what that buys: a failed attempt leaves neither a claimed acceptance sequence nor a half-written batch. |
+| `:928` | `:940` | "opens a fresh transaction (`create_batch_inner` does both)" | **was false, now true — kept, extended** with the `55P03` case and with "not even the acceptance-sequence block it had claimed". |
+| `:930` | `:942` | "transaction is atomic and the dedup keys make it idempotent" | **was defensible, now literally true** of the transaction this crate opens; "the" changed to "that" so it names it. |
+
+**`pool.rs:70` — done.** "the same dedup 4-tuple" → 5-tuple, and the doc now
+names *both* locks ingest waits on (the `usage_acceptance_sequence` row and the
+speculative dedup tuple), with a pointer to why `55P03` is classified
+transient.
+
+~~The split matters: `:717`, `:750` and `:942` read as true of *Postgres*,
+which wraps every statement in an implicit transaction, whereas `:778` and
+`:940` are false about *this crate*, which after Task 2 opens none. Note the
+direction of travel: `:189` and `:536` are correct *now* and your work makes
+them wrong.~~ ~~**`pool.rs:70` is the sibling case and is also yours:** "the
+same dedup 4-tuple".~~
+
+**Superseded by the table above**, which carries the real line numbers and the
+settled verdict for each of the eight, plus `pool.rs`. Struck rather than
+deleted so the framing that produced the verdicts is still readable — but the
+numbers in it are the stale ones, and `pool.rs` is done, so do not re-open
+either from here. The standing instruction that survives: **decide all eight
+deliberately** — do not fix the obvious ones and leave the lookalikes, which is
+how this file got into its current state.
+
+**The 55P03 decision, which no other task owns.** `is_transient_sqlstate`
+(`error.rs:17-23` as found) matches `08*`, `57P01`, `57P02`, `57P03`, `53300`, `40001`,
+`40P01`. **`55P03 lock_not_available` is absent**, so a statement that hits
+`LOCK_TIMEOUT` falls to `Other` → `Internal` → non-retryable, and
+`is_retryable_batch_error` (`:745` as found) will not retry it.
+
+That is pre-existing, but Task 2 made it visible by electing the ingest
+`ON CONFLICT` path as `LOCK_TIMEOUT`'s worked example — so an inherently
+transient wait is now *documented* as failing into a non-retryable bucket.
+You own the retry path, so you own this call. **Either add `55P03` to the
+transient set, or write down why `Internal` is the intended answer.** Silence
+is the one outcome that is not acceptable, because the next reader will assume
+the omission was considered.
+
+**DECIDED: `55P03` is transient.** Four reasons, in order of weight:
+
+1. The timeout is *self-imposed*. `pool.rs`'s fixed `lock_timeout = 5s` exists
+   so a contended statement fails fast instead of pinning a pooled connection;
+   the failure is the bound doing its job, not the backend reporting a fault.
+2. This task makes lock waits structural rather than incidental.
+   `claim_acceptance_sequence` takes a row lock on `usage_acceptance_sequence`
+   for the entry's scope on **every** write, so a hot `(tenant, meter)` scope
+   now serializes ingest by design. Classifying its ordinary outcome
+   non-retryable would turn contention into 500s.
+3. Re-running is safe by construction: the whole batch is one transaction that
+   rolled back, and the dedup keys make a re-run idempotent — which is exactly
+   what `is_retryable_batch_error`'s doc already argues for `40001` / `40P01`.
+4. The retry is bounded (`MAX_BATCH_ATTEMPTS = 3`, jittered), so a genuinely
+   wedged lock still surfaces after three attempts rather than looping.
+
+One coupling was checked rather than assumed: `acquire_error_clears_readiness`
+routes a backend-reported `Database` error through the same
+`is_transient_sqlstate`, so a transient SQLSTATE there clears the `ready`
+gauge. `55P03` cannot arrive on that path — `pool.acquire()` establishes a
+connection and applies its GUCs as startup parameters, running no lock-taking
+statement — so the gauge is unaffected. Recorded in `is_transient_sqlstate`'s
+doc, which is now the one place the whole set is explained.
+
+- [x] **Step 7: Handle the in-batch collision** — DONE
+
+Two invalidations of one target in one `create_batch` call. Verify what
+happens: if the batch is one multi-row `INSERT`, the index rejects the whole
+statement rather than one row, which is wrong — the SPI wants exactly one
+accepted and the other rejected, with per-record outcomes aligned to input
+order.
+
+If that is what happens, the fix is `plan_batch` (`:681` as found) detecting a
+duplicate `invalidates` target within the batch and pre-rejecting all but the
+first, **in addition to** the index, which still covers the cross-call case.
+Document that the in-batch check is not the enforcement — the index is — so
+nobody later deletes the index as redundant.
+
+Write a test for the in-batch case naming its mutation.
+
+**Measured: that is what happens.** The batch is one multi-row
+`INSERT … SELECT FROM UNNEST(…) ON CONFLICT (5-tuple) DO NOTHING`. A statement
+admits one arbiter and it is spent on the dedup 5-tuple, so
+`usage_records_one_invalidation_uniq` surfaces as a raw `23505` that aborts the
+*statement* — and with it every unrelated entry's outcome.
+
+**Shipped in `plan_batch`.** A `duplicate_withdrawals: HashMap<usize, Uuid>`
+maps the input index of each pre-rejected row to the id of the batch's earlier
+withdrawal of that target; those rows never become `reps`, and `resolve_batch`
+emits `AlreadyInvalidated { id: target, invalidated_by }` for them in input
+order. One subtlety that had to be got right: a row repeating the *same*
+withdrawal (same derived `id`, so all five dedup attributes match) is an
+at-least-once redelivery, not a second withdrawal, and is left to the dedup
+path — guarded by `first_id != record.id`. Both directions are tested and both
+mutations (never pre-reject; pre-reject the identical repeat too) go red.
+
+**The residue, stated rather than hidden.** The cross-call case is still
+whole-batch: a batch carrying a withdrawal of a target invalidated by an
+earlier call aborts the statement and returns an outer `AlreadyInvalidated`,
+not per-row outcomes. Fixing it needs per-row `SAVEPOINT`s, which is a larger
+change than this step scopes. Recorded for Task 18's DIVERGENCES entry.
+
+### Considered and not taken: folding the claim into the insert
+
+**Asked at code-quality review; the honest answer is that it was unconsidered
+at the time, so it is recorded here rather than defended.**
+
+`claim_acceptance_sequence` and the insert are two round trips inside the
+counter row's lock. A data-modifying CTE —
+`WITH seq AS (INSERT INTO usage_acceptance_sequence … RETURNING next_value)
+ INSERT INTO usage_records SELECT …, seq.next_value FROM …` — folds them into
+one, cutting the serialized window per scope by one round trip.
+
+It does **not** shorten the lock hold, which runs to commit either way, so it is
+a latency tweak and not a concurrency fix — and the two-statement shape is what
+lets one `claim_acceptance_sequence` serve both `count = 1` and a batch's
+per-scope blocks. **Routed to Task 15**, which has a live backend and can
+measure the saving instead of reasoning about it.
+
+- [x] **Step 8: Run, verify, commit** — DONE
+
+`cargo nextest` still cannot link a test binary for this crate: the read half
+of `record_store.rs` plus `ports.rs` and `adapter.rs` are Tasks 10-13's. Baseline
+at Task 9's start was **33 lib / 51 lib-test** errors; after Task 9 it is
+**13 lib / 14 lib-test**, and every remaining error is in Tasks 10-13's code
+(`adapter.rs`, `ports.rs`, `record_row_key`, `list`, `aggregate`, and the two
+read-half tests below the banner in `record_store_tests.rs`).
+
+Verified through the harness instead (see the verification note at the top of
+this task): **69 tests pass, 0 fail; clippy `--all-targets` clean; 15
+mutations, all killed, each with a confirmed `Compiling` line.**
+
+```bash
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets
+```
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/record_store.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/record_store_tests.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/mapper.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/mapper_tests.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/error.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/error_tests.rs \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/infra/storage/pool.rs
+git commit -s -m "feat(timescaledb-plugin)!: persist entries under the 5-tuple identity
+
+Moves the dedup authority from the 4-tuple to the 5-tuple DESIGN 3.7 requires,
+assigns acceptance_sequence monotonically per (tenant_id, gts_type_id) inside
+the insert transaction, and enforces at-most-one-invalidation with a partial
+unique index rather than a read followed by a write — the SPI requires the
+check be atomic with the entry it admits, and says why a gateway-side pre-read
+cannot substitute.
+
+BREAKING CHANGE: the dedup identity now includes the covered period, so an
+entry that differs only in window_start is a distinct entry rather than a
+retry."
+```
+
+---
+
+## Task 10: `get_usage_record` intersects the compiled scope
+
+The SPI signature grew a parameter and it is not cosmetic. Slice 3 retired the
+gateway's in-process per-record attribution check, so **"exists but not yours
+reads as `NotFound`" now rests entirely on the plugin intersecting the filter
+it is handed.** Slice 6 wrote the contract check that proves it
+(`SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH`).
+
+The SPI:
+
+> `scope` is the caller's compiled PDP scope … The point lookup carries no
+> caller-supplied filter of its own, so `scope` is the *whole* filter the row
+> must satisfy — a row whose attribution tuple falls outside it MUST NOT be
+> returned; the plugin reports `UsageRecordNotFound` exactly as it would for an
+> `id` that does not exist at all.
+
+And the obligation that pulls the other way:
+
+> A withdrawn pair MUST be returned **as persisted** … a plugin MUST NOT
+> withhold a withdrawn entry from it as a kindness.
+
+**Files:**
+- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs` (Step 5), `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
+
+- [x] **Step 1: Change the port signature** — DONE
+
+```rust
+    async fn get(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError>;
+```
+
+- [x] **Step 2: Write the failing test** — DONE
+
+Neither `parse_scope` nor `build_get_sql` existed; `SqlCtx::new(start)` did,
+and `2` is the right offset (`id` occupies `$1`). `build_get_sql` **owns** its
+`SqlCtx` rather than taking one, so that offset sits inside the function under
+test and a mutation to `SqlCtx::new(1)` is killable. `parse_scope` is a test
+helper over `toolkit_odata::parse_filter_string(..).into_expr()`, which yields
+the same `ast::Expr` the gateway's `scope_to_odata_filter` builds. As shipped:
+
+```rust
+#[test]
+fn the_point_lookup_renders_the_scope_as_its_whole_where_clause() {
+    let scope = parse_scope(&format!("tenant_id eq {SCOPE_TENANT_A}"));
+
+    let (sql, _ctx) = build_get_sql(&scope).expect("a scope must render");
+
+    assert!(
+        sql.contains("WHERE id = $1 AND ("),
+        "the point lookup carries no caller filter, so the compiled scope is \
+         the whole filter the row must satisfy; a lookup that selects on id \
+         alone is an existence oracle. got: {sql}"
+    );
+}
+```
+
+Five more went with it, each named by the mutation it kills: the scope's binds
+land after the `id`, at `$2`/`$3` (kills `SqlCtx::new(1)`); a disjunctive
+scope — the shape `authz::scope_to_odata_filter` actually compiles — keeps its
+own parentheses, asserted against a hand-transcribed `WHERE` clause (kills
+dropping them, which would bind `id = $1 AND A OR B` as `(id = $1 AND A) OR
+B`); the predicate names neither `invalidates` nor `entry_type` (Step 4, as a
+test rather than only a comment); a scope naming a field off the allowlist is
+refused; and — the one no pure test can reach — `get` over a lazy pool answers
+`Internal` naming the field, not the `Transient` a pool touch would give,
+which is what proves the refusal stops the lookup before it reads a row.
+
+**The mutation:** drop the scope conjunct from `build_get_sql`, leaving
+`WHERE id = $1`. That single edit is exactly the defect slice 3 created the
+obligation to prevent, and it must make this red.
+
+- [x] **Step 3: Implement** — DONE
+
+`get` was at **`:1580`** at this task's base (`b37f1b470`), not `:982` — Task 9
+moved the file substantially. It built `SELECT {RECORD_COLUMNS} FROM usage_records WHERE
+id = $1`. It must now conjoin the translated scope. `translate.rs` already has
+the filter-AST-to-SQL machinery `list` uses; reuse it — a second translator is
+two implementations of one security boundary.
+
+A row outside the scope returns `UsageCollectorPluginError::UsageRecordNotFound
+{ id }`, identical to a missing row. Do not add a distinguishing log line at a
+level a caller could observe through timing or volume; the point is that the
+two cases are indistinguishable.
+
+- [x] **Step 4: Do not filter withdrawn entries here** — DONE
+
+The ledger obligation is explicit and points the opposite way from the fold's.
+Add a comment at the query saying no `invalidates` predicate belongs here and
+why — a reader who has just written Task 8's exclusion clause will otherwise
+add one, and it would destroy the audit trail the append-only model exists to
+keep.
+
+- [x] **Step 5: Update the adapter** — DONE
+
+```rust
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        self.record.get(id, scope).await
+    }
+```
+
+- [x] **Step 6: Run and commit** — DONE
+
+```bash
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(record_store)' 2>&1 | tail -20
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/
+git commit -s -m "feat(timescaledb-plugin)!: intersect the compiled scope on the point lookup
+
+Slice 3 retired the gateway's in-process per-record attribution check, so
+'exists but not yours reads as NotFound' now rests entirely on the plugin
+intersecting the filter it is handed. The point lookup carries no caller
+filter, so the scope is the whole WHERE clause beyond the id.
+
+A withdrawn entry is still returned as persisted: that is a ledger path, and
+the exclusion belongs to the fold.
+
+BREAKING CHANGE: RecordStore::get takes the compiled scope."
+```
+
+> **The compiled-scope seam lives in `translate.rs`, and Tasks 11-12 must call
+> it.** `translate_scope(scope: &ast::Expr, ctx: &mut SqlCtx) -> Result<String,
+> String>` is the one road from the `ast::Expr` a read path is handed to the
+> SQL it may conjoin: it owns both allowlist gates
+> (`convert_expr_to_filter_node::<UsageRecordFilterField>` then
+> `translate_record_filter` over `record_column`), the `invalid scope:` error
+> prefix, and — the part a caller cannot supply for itself — the **parentheses
+> that make the fragment safe to conjoin**. `AND` binds tighter than `OR`, and
+> `authz::scope_to_odata_filter` folds its constraints into a left-nested `or`
+> chain of tenant-pinned conjunctions (the `disjunction` loop in
+> `usage-collector/src/domain/authz.rs`), so a fragment pushed unparenthesized
+> into a `clauses.join(" AND ")` reads as `(leading AND A) OR B` — every row
+> matching the last disjunct. `list` and `aggregate` push their translated
+> `$filter` fragment exactly that way today — both `clauses.push(fragment)`
+> sites, named by symbol because these line numbers move every task — and get
+> none of the protection `get` has. **Replace those four-line blocks with
+> `translate_scope`; do not transcribe them a third and fourth time.**
+>
+> **What Task 10 leaves.**
+>
+> * **One named mutation survives, and it is not a silent one.** Deleting
+>   `get`'s `for b in &ctx.binds { q = bind_one(q, b); }` loop is invisible to
+>   every unit test here — no unit test executes a statement. It is not a quiet
+>   bypass, and cannot become one: the `WHERE` text still carries the scope
+>   conjunct, so the result set cannot widen under any parameter semantics — a
+>   short parameter list is rejected outright, and even if a missing parameter
+>   were read as `NULL`, `tenant_id = NULL` is `NULL` and matches nothing.
+>   **Task 15 is where it dies**, on the first `get` its rewritten suite makes
+>   under a scope.
+> * **Five `store.get(id)` call sites, across three files in `tests/`, now
+>   need a second argument** — `tests/id_uniqueness_integration_pg.rs:71,73`,
+>   `tests/records_ingest_integration_pg.rs:176,500`,
+>   `tests/records_query_integration_pg.rs:699`. Left as they are: Task 15
+>   rewrites all six `tests/` files wholesale and no test binary links before
+>   Task 13.
+> * **The scope's allowlist is the `$filter` allowlist, exactly.** `get`
+>   resolves identifiers through
+>   `convert_expr_to_filter_node::<UsageRecordFilterField>` and then
+>   `record_column` — the same two gates `list` uses — so a scope can name what
+>   a `$filter` can name and nothing more. The host's extra
+>   `reject_reserved_filter_fields` guard (`gts_type_id`, the window bounds) is
+>   a gateway-side `$filter` reservation that does not, and need not, apply to
+>   a compiled scope: the five attributes `scope_to_odata_filter` can emit
+>   (`tenant_id`, `subject_id`, `resource_id`, `resource_type`,
+>   `subject_type`) are all mapped.
+
+---
+
+## Task 11: `list_usage_records` — time range, order, cursor
+
+> **Added by Task 6's code review — `record_row_key` is the uncoupled half of
+> this task.** `record_store.rs:591` maps an order-field name to that row's
+> cursor-key value: the inverse of `record_column` on the pagination path, and
+> nothing couples the two. After Task 6 they disagree. `record_column` resolves
+> `window_start`, `window_end` and `origin`; `record_row_key` returns `None`
+> for all three, and all three are `$orderby`-admissible
+> (`KEYSET_SAFE_RECORD_FIELDS`). The `_ => None` arm becomes "order field has
+> no cursor key on the row" and **500s while minting `next_cursor`** — with no
+> compile error, and the canonical `(window_end, id)` order hits it. It has
+> zero tests today.
+>
+> It cannot be missed outright, because it still reads `row.created_at`,
+> `row.status` and `row.corrects_id`, which Task 4 deleted — but it can easily
+> be half-fixed, and Step 3 below points at `:1028` rather than `:591`.
+>
+> **Add a test iterating `usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS` and
+> asserting `record_row_key(&sample_row, field).is_some()` for each** — the
+> same SDK coupling shape Task 6 used, so the SDK growing an order key fails
+> here rather than at runtime. Name the mutation: dropping any one arm must
+> turn it red.
+
+**Files:**
+- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`, `src/infra/storage/record_store_tests.rs`
+
+### The three obligations
+
+**Selection reads the period end alone.** `from <= window_end < to`
+(`cpt-cf-usage-collector-adr-window-end-selection`). Not overlap, not
+containment — those make adjacent ranges double count or drop entries. **The
+time-range predicate never reads `window_start`.** DIVERGENCES §F notes that a
+backend selecting on `window_start` fails both `window-end-selection` **and**
+`quantity-round-trip`, because the latter's read-back range is
+`[window_end, window_end + 1s)` while each fixture's `window_start` sits an hour
+earlier. **If both go red, diagnose the period rule, not the decimals.**
+
+**`query.order` MUST be honoured** — it is the keyset the continuation is built
+from. `time_range` is a typed parameter and never appears in `query.filter`.
+
+**`query.filter_hash` is guaranteed on this method** and MUST be carried into
+`next_cursor.f` verbatim. This is the obligation with no compiler backstop: a
+plugin that drops it recompiles clean and paginates exactly once.
+
+- [x] **Step 1: Change the port signature** — DONE
+
+```rust
+    async fn list(
+        &self,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        query: &ODataQuery,
+        metadata_filter: &[MetadataFilter],
+    ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;
+```
+
+- [x] **Step 2: Write the failing tests** — DONE
+
+**Shipped as assertions on `build_list_sql` / `build_list_page`** — the two
+pure halves `list` was split into. No separate `build_time_range_clause` or
+`mint_next_cursor` was introduced; the code block below names them, and they
+exist nowhere.
+
+```rust
+#[test]
+fn selection_reads_the_period_end_alone() {
+    let mut ctx = SqlCtx::new(1);
+    let sql = build_time_range_clause(sample_range(), &mut ctx);
+
+    assert!(
+        sql.contains("window_end >= $") && sql.contains("window_end < $"),
+        "selection is `from <= window_end < to` on every path: it needs no case \
+         for a point event and must not match by overlap or containment. got: {sql}"
+    );
+    assert!(
+        !sql.contains("window_start"),
+        "the time-range clause never reads window_start; a backend that \
+         selects on it fails window-end-selection AND quantity-round-trip \
+         (DIVERGENCES F). got: {sql}"
+    );
+}
+
+#[test]
+fn the_minted_cursor_carries_the_gateways_filter_hash_verbatim() {
+    let hash = "e3b0c44298fc1c14";
+    let token = mint_next_cursor(&canonical_order(), &sample_row_keys(), Some(hash))
+        .expect("a page ending mid-range mints a cursor");
+
+    let decoded = toolkit_odata::CursorV1::decode(&token).expect("round-trips");
+    assert_eq!(
+        decoded.f.as_deref(),
+        Some(hash),
+        "the gateway recomputes this from the follow-up request and refuses a \
+         token carrying a different one, or none, with FilterMismatch. This is \
+         the one SPI requirement with no compiler backstop: a plugin that drops \
+         it recompiles clean and paginates exactly once."
+    );
+}
+```
+
+**The mutations:** change `>=` to `>` on the lower bound, or add a
+`window_start` conjunct (test 1 red); pass `None` for the filter hash at the
+mint site (test 2 red).
+
+Test 2's mutation is the important one. Name it out loud in the task report.
+
+- [x] **Step 3: Implement** — DONE
+
+**Translate `query.filter` through `translate_scope`** (Task 10,
+`query/translate.rs`) rather than repeating the
+`convert_expr_to_filter_node` + `translate_record_filter` pair inline. It
+returns a parenthesized fragment, so pushing it into `clauses` is safe; the
+inline version here is not, and what arrives in `query.filter` is the
+caller's filter `And`-composed with the compiled scope, **or the scope alone
+when the caller supplied none** — in which case the scope's own outermost
+node is the outermost node. A multi-constraint grant compiles that to a
+disjunction of tenant-pinned conjunctions, and nothing at this layer can tell
+how many constraints the PDP returned.
+
+Rewrite `list` (`:1028`). The shape:
+
+```sql
+SELECT {RECORD_COLUMNS} FROM usage_records r
+WHERE r.gts_type_id = $1
+  AND r.window_end >= $2 AND r.window_end < $3
+  [AND <translated $filter>]
+  [AND <metadata filter clauses>]
+  [AND <keyset predicate from the cursor>]
+ORDER BY <render_order_by(query.order)>
+LIMIT <clamped limit + 1>
+```
+
+No withdrawal exclusion. This is a ledger path.
+
+Mint `next_cursor` from the last in-page row's key values in `query.order`
+field order, passing `query.filter_hash` through verbatim. `encode_next_cursor`
+already takes the parameter — the defect this task guards against is passing
+`None` at the call site, so read the call, not the signature.
+
+An empty `query.order` or an absent `query.filter_hash` is a **gateway breach**,
+not a case to paper over. Fail loudly.
+
+**Change `encode_next_cursor`'s parameter to `filter_hash: &str`** (from
+`Option<&str>`), in `query/keyset.rs`. Task 7 documented the obligation at that
+function and could go no further: nothing inside it can enforce that its caller
+passes `query.filter_hash` through. A non-optional parameter can. The SPI says
+the value is "guaranteed **on this method**", that "an absent value is a gateway
+breach rather than a case to paper over", and that "a `next_cursor` MUST carry
+that value through verbatim as its `f`"; `require_cursor_fingerprint`
+(`usage-collector/src/domain/query.rs:695`) calls this "the one requirement in
+this gear's Plugin SPI that gives an implementor no compiler error — a plugin
+written before it recompiles clean and paginates exactly once". This is that
+compiler error, and it is cheap: `encode_next_cursor` has exactly one
+non-test caller (`record_store.rs:1136`), it is internal to this crate, and the
+plugin-side guard at `record_store.rs:1059`
+(`cursor.f.as_deref() != query.filter_hash.as_deref()`) **passes when both are
+`None`**, so the plugin itself notices nothing — the gateway is what refuses,
+on page two. Turn the breach into a `None` the *caller* must handle, and update
+`encode_next_cursor_rejects_row_key_order_arity_mismatch` (`translate_tests.rs`)
+which currently passes `None`.
+
+- [x] **Step 4: Run, prove the mutations, commit** — DONE
+
+```bash
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast -E 'test(record_store)' 2>&1 | tail -30
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/
+git commit -s -m "feat(timescaledb-plugin)!: page the ledger on the covered-period end
+
+Selection is from <= window_end < to on every path, reading the period end
+alone: no case for a point event, and never overlap or containment. Honours
+query.order as the keyset it is handed and carries query.filter_hash into
+next_cursor.f verbatim — the one SPI requirement with no compiler backstop.
+
+Withdrawn entries are returned as persisted; this is a ledger path.
+
+BREAKING CHANGE: RecordStore::list takes the meter and time range as typed
+parameters."
+```
+
+---
+
+## Task 12: `query_aggregated_usage_records`
+
+> **Inherited from Task 9's review, and now Task 12's — three citations in
+> `aggregate` point at files that do not exist.** `record_store.rs` cites
+> `plugin-spi.md` §Method 3 in three places, **anchored by symbol rather than
+> by line, because the line numbers have already gone stale twice**: in
+> `aggregate`'s rustdoc (the `corrects_id` partition rationale), in the
+> `corrects_id` partition comment inside the body, and at the aggregate cap
+> comment. **`git ls-files | grep -iE 'plugin-spi|domain-model'` is empty** —
+> neither file is in the tree, and the string "Plugin-specific outputs"
+> appears nowhere but in this one source file. The SPI is rustdoc on
+> `usage_collector_sdk::UsageCollectorPluginV1`. Task 9 removed two others in
+> its own paragraph (`canonical_equal`) rather than propagate them; **Task 12
+> rewrites all three of these, so re-point each at the rustdoc that actually
+> says the thing, or drop the reference** — do not carry it across.
+>
+> **Settled.** All three are gone, and none was re-pointed at a `plugin-spi.md`
+> anchor: the rustdoc citation was folded into the sentence that needed it, or
+> the sentence went with the rule. The `corrects_id` partition rationale in
+> `aggregate`'s doc and the partition comment in the body both described the
+> retired netting model, which Task 8's `withdrawal_exclusion_clause` replaced
+> outright, so both were deleted with the code they explained. The aggregate cap
+> comment now names `usage_collector_sdk::MAX_AGGREGATION_BUCKETS`, whose own
+> rustdoc carries the "the gateway rejects a result exceeding this cap with a
+> `400`" sentence the citation was standing in for. `grep -rn 'plugin-spi' src/`
+> is empty.
+
+**Files:**
+- Modify: `src/domain/ports.rs`, `src/domain/adapter.rs`, `src/infra/storage/record_store.rs`
+
+- [x] **Step 1: Change the port signature**
+
+```rust
+    async fn aggregate(
+        &self,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        query: &ODataQuery,
+        metadata_filter: &[MetadataFilter],
+        group_by: &[AggregationDimension],
+    ) -> Result<AggregationResult, UsageCollectorPluginError>;
+```
+
+- [x] **Step 1b: Two things Task 2's review handed to this task**
+
+**A live `status = 'active'` clause now has zero test coverage.** `aggregate`
+still applies it unconditionally (`record_store.rs:1222`, documented at
+`:1172-1182`), and the retired time model's `status` column still exists in the
+migration and in `mapper.rs`. Task 2 deleted `pg_aggregate_excludes_inactive`,
+which was the only test exercising it — correctly, because `deactivate` was the
+only writer of `inactive` and the SDK never let a caller set it, so the test
+could no longer be set up. But that leaves the clause live and unguarded.
+
+**This task is where it goes.** The withdrawal-exclusion clause from Task 8
+replaces it outright: `status` is not a column in the Task 3 schema, so
+`status = 'active'` must be gone from the assembled SQL. Grep the built query
+in a test and assert `status` does not appear in it.
+
+**Done, over the whole statement rather than its tail.** Task 10's trap — a
+"column X is absent" assertion matching the SELECT list instead of the WHERE
+clause, because `RECORD_COLUMNS` names `invalidates` — does not reach an
+aggregate statement, and that is a property of what builds an aggregate SELECT
+list rather than of one call: it is the grouped dimension expressions followed
+by the fold expression, never `RECORD_COLUMNS`. None of the six dimension
+expressions and none of the five fold expressions names `status`, and a
+caller-derived metadata key is bound rather than interpolated. So
+`the_fold_carries_no_status_predicate` greps the whole SQL, under every fold,
+grouping by every dimension at once — the widest text the builder can produce —
+and `statement_tail` is not needed here.
+
+**`UsageRecordStatus` survives in five files, not the two an earlier note
+claimed** — `mapper.rs`, `mapper_tests.rs`, `record_store_tests.rs`,
+`tests/common/mod.rs`, `tests/records_ingest_integration_pg.rs`. Task 5 removes
+it from the mapper; the test files are Task 15's. Neither count is this task's
+to fix, but do not be surprised by the remainder.
+
+- [x] **Step 2: Rewrite `aggregate`**
+
+**Translate `query.filter` through `translate_scope`** (Task 10,
+`query/translate.rs`), for the reason Task 11's Step 3 gives: the inline pair
+this file still carries pushes an unparenthesized fragment into a
+`clauses.join(" AND ")`, and what arrives is the caller's filter
+`And`-composed with the compiled scope, **or the scope alone when the caller
+supplied none** — in which case the scope's own outermost node is the
+outermost node. A multi-constraint grant compiles that to a disjunction of
+tenant-pinned conjunctions, and nothing at this layer can tell how many
+constraints the PDP returned.
+
+At `:1204`. The shape:
+
+```sql
+SELECT <dimension exprs…>, <fold expr>
+FROM usage_records r
+WHERE r.gts_type_id = $1
+  AND r.window_end >= $2 AND r.window_end < $3
+  AND <withdrawal_exclusion_clause()>
+  [AND <translated $filter>]
+  [AND <metadata filter clauses>]
+[GROUP BY 1, 2, …]
+[LIMIT MAX_AGGREGATION_BUCKETS + 1]
+```
+
+The table **must** be aliased `r` — `withdrawal_exclusion_clause` binds to it.
+Grep the assembled SQL in a test rather than assuming.
+
+**Task 11 hoisted three of those lines into `query.rs`; consume them, do not
+transcribe them.** `ledger_from_clause()` is the `FROM` (it moved out of
+`aggregate.rs`, which is why `aggregate_from_clause` no longer exists),
+`push_meter_and_range_clauses(&gts_type_id, time_range, &mut ctx, &mut clauses)`
+is the meter-and-range predicate, and `push_metadata_filter_clauses` is the
+side channel — the last now emitting the **alias-qualified**
+`r.metadata ->> $N`, which is what Step 2b's presence guard needs to sit beside
+without one statement holding a qualified and an unqualified reference to one
+column. Reading the range predicate rather than transcribing it is the point:
+DIVERGENCES §F says getting it wrong fails `window-end-selection` **and**
+`quantity-round-trip` at once, and `list` already has the test that notices.
+
+- [x] **Step 2b: Three things Task 8 hands to this task**
+
+**1. `agg_select_expr` is now `fold_select_expr(fold) -> &'static str`, with
+five arms and no branch to take.** An earlier draft of this step prescribed
+`.map(str::to_owned).unwrap_or_else(…)` against an `Option` whose `None` was
+`Latest`. That `Option` modelled no absence: `(ARRAY_AGG(r.value ORDER BY …))[1]`
+composes in a grouped SELECT list exactly as `SUM(r.value)` does, and the only
+consumer joins the string into a SELECT list without inspecting it. It was
+deleted, along with the misreading hazard that a `None` meant "unsupported
+fold". Push `fold_select_expr(fold).to_owned()` and nothing else. The "ordered
+pick, not an aggregate function" observation survives as doc on the arm's
+constant, which is where it belongs.
+
+**1b. Build the `FROM` from `ledger_from_clause()`, and assert it in the
+test.** The `r` alias is no longer a convention several files honour separately
+— `query.rs` exports the clause (`"usage_records r"`), a test asserts it
+declares `r`, `list` already builds its `FROM` from it, and every fragment binds
+to it. Write
+`format!("SELECT {select_list} FROM {} WHERE …", ledger_from_clause())`
+rather than spelling the table and alias again here. (Task 11 moved this out of
+`aggregate.rs`: it serves both read paths now, so `list` reaching into an
+`aggregate` module for it would have been the wrong shape.)
+
+**The last link is yours, and it is one character of test.** Nothing forces this
+task to *call* the function: the fragments still spell `r` in their own text,
+and Task 8's tests can only pin that they agree with each other. So the
+assembled-SQL test must assert `sql.contains(ledger_from_clause())` and
+**not** a literal `"usage_records r"`. With the literal, the constant is
+decorative and a future alias change reds a test that then gets "fixed" by
+editing the literal; with the call, the two sides cannot drift without the test
+following.
+
+**2. The absent-dimension rule is settled: drop the row — and `Metadata` is the
+dimension that does not yet obey it.** (Settled by *this plan*, at Task 18.
+**`DIVERGENCES.md` §G still records the question as open** — "DESIGN says
+nothing about the case", "that is an argument, not a ruling", "do not write the
+check first" — and Task 18 rewrites it. So §G is not a citation for the rule;
+the SDK's own `models.rs:1587-1592` and `contract/reference.rs:801` are, and a
+divergence pointer must read "resolved by Task 18". Task 12 corrected three
+sites that cited §G as the ruling, one of them propagated from Task 8.)
+
+`aggregate` today pushes
+`subject_id IS NOT NULL` / `subject_type IS NOT NULL` before rendering a subject
+dimension, and pushes nothing for `Metadata`, so a row missing the grouped key
+lands in a `NULL` bucket where `InMemoryReferencePlugin` drops it. **The spec
+owner has decided in favour of dropping** (see Task 18), matching the reference
+backend and the SDK's own docs at `models.rs:1587-1592`. So emit a presence
+guard for the metadata dimension alongside the two subject ones, spelled
+**`r.metadata ->> $N IS NOT NULL`** against the same bound key, so all six
+dimensions drop absent-dimension rows consistently rather than five doing so by
+accident. Use that spelling and not `?`: they are not equivalent — for a key
+present with JSON `null`, `?` is true while `->>` is `NULL` — and `->> IS NOT
+NULL` is by construction the exact negation of "the grouping expression yields
+NULL", so it cannot drift from the expression it guards. (If containment is ever
+what is wanted, the unambiguous spelling is `jsonb_exists(r.metadata, $N)`;
+bare `?` collides with the placeholder syntax of some drivers.) Note in a comment that
+the consequence is deliberate: **grouped buckets need not sum to the ungrouped
+total.** That is already true for subject today; this makes it uniform.
+
+The guard cannot live in `dimension_select_expr` — a `GROUP BY` ordinal carries
+no `WHERE` predicate — which is why it is yours and not Task 8's.
+
+**3. `LATEST` materializes each group. Record it; do not try to fix it in SQL
+here.** The `Latest` arm is `(ARRAY_AGG(r.value ORDER BY …))[1]`, so Postgres
+builds an array of a group's values before taking the head.
+
+**Peak state is O(rows scanned), not O(largest group)** — say it that way,
+because the weaker phrasing understates it by orders of magnitude. Under a
+HashAggregate plan **every group's array is live simultaneously**; only a sorted
+GroupAggregate gives O(largest group), and the planner chooses. `aggregate_limit_clause`
+offers *zero* protection: it bounds the number of groups, never the rows within
+one. The only row bound is the gateway's time window, which is a request
+parameter — so a `LATEST` meter queried over a wide window is a server-side
+allocation sized by caller input. `MIN`/`MAX`/`SUM`/`COUNT` carry no such cost.
+
+Do not reformulate the SQL in this task: the crate does not compile, no Postgres
+is reachable in this slice, and any alternative needs `EXPLAIN` rather than
+reasoning. Carry the fact into the write-up; Task 15 measures it and Task 18
+publishes it.
+
+**Recorded, not fixed.** The paragraph now lives on `RecordStore::aggregate`'s
+rustdoc in `record_store.rs`, in the O(rows scanned) phrasing, naming the
+`HashAggregate`/`GroupAggregate` split, `aggregate_limit_clause`'s irrelevance
+to it, and the `time_range` as the only row bound. No SQL was changed.
+
+> **Superseded by Task 15's measurement — do not carry the phrasing above
+> forward.** This paragraph was reasoning, correctly labelled as such and
+> correctly routed to Task 15 for measurement, and the measurement came back
+> the other way: `PostgreSQL` never plans a `HashAggregate` for an aggregate
+> carrying its own `ORDER BY`, so peak state is **O(largest group)** — about
+> 34 bytes per row in the largest group, measured — and the O(rows-scanned)
+> part is the mandatory `Sort`, which is `work_mem`-bounded, spills, and is
+> needed by every candidate formulation alike. `aggregate_limit_clause`'s zero
+> protection and the time window being caller input both survive unchanged.
+> Task 15 corrected the rustdoc this paragraph describes; the numbers and the
+> two rejected alternatives are in Task 18's twentieth-entry bullet.
+
+- [x] **Step 3: Get the no-grouping case right**
+
+The noop plugin's doc records the trap precisely: an empty `buckets` vector is
+**not** the shape a conforming plugin answers with. The no-grouping case is a
+**single bucket carrying an empty `key`**, whose value is absent for every fold
+but `COUNT`.
+
+`COUNT` over an empty selection is `Some(0)`, not `None` — "counting an empty
+selection is zero rather than absent, the same split `SELECT COUNT(*)` makes
+against `SELECT MIN(v)` over no rows". Postgres already does this; the risk is
+a hand-written empty-result short circuit that does not.
+
+Write a test for the empty-selection `COUNT` case naming its mutation.
+
+**Done, and the short circuit is covered.**
+`the_no_grouping_case_is_one_bare_aggregate_row` pins the *statement*: an empty
+`group_by` emits no `GROUP BY` and no `LIMIT`, so `PostgreSQL` answers a bare
+aggregate with exactly one row and `COUNT(*)` with `0` rather than `NULL`. Two
+mutations die on it (`GROUP BY` emitted unconditionally; the bucket `LIMIT`
+emitted with no grouping).
+
+The short circuit this step names —
+`if group_by.is_empty() { return Ok(AggregationResult { buckets: vec![] }) }` —
+**dies too**, and needs no live backend to do it. It is a `return` whose whole
+purpose is to skip the query, so it is written *above* the acquire, and the
+crate already owns the discriminator: `lazy_store()` holds a lazy pool at a dead
+DSN, so a path that reaches the pool answers `Transient` and one that
+short-circuits answers `Ok`.
+`the_ungrouped_fold_still_reaches_the_pool` requires the `Transient`.
+
+**A separate test pins the ordering**, and it has to be separate: `Transient` is
+what a pool timeout answers under *either* order, so a swap of the acquire and
+the build leaves the test above green.
+`a_fold_that_cannot_be_built_never_reaches_the_pool` gives the fold a filter
+naming a field the allowlist refuses and requires an `Internal` carrying the
+field name — which acquiring first would have replaced with a `Transient`. It is
+the fold analogue of `a_page_that_cannot_be_built_never_reaches_the_pool`, which
+`list` already had.
+
+What is left needs Postgres, and only that: a short circuit placed *after* the
+fetch, where the branch is a no-op on an already-fetched empty row set. The
+dimension count is **no longer** on this list: `build_aggregate_sql` returns the
+count its own SELECT list was built from, so the decoder cannot derive a
+different one, and
+`the_builder_reports_the_dimension_count_its_select_list_was_built_from` pins
+the reported count against the `GROUP BY` ordinals — the two outputs of the
+builder that must agree.
+
+- [x] **Step 4: `MUST NOT` read `filter_hash` here**
+
+The SPI is explicit: this method paginates nothing, mints no cursor, and the
+gateway assigns it no fingerprint. **"An aggregate implementation MUST NOT read
+the slot."** Confirm the implementation does not, and say so in a comment.
+
+**Done, and it did turn out to be testable.** `build_aggregate_sql` reads
+`query.filter` and nothing else, which is stated in its rustdoc. The absence has
+a named mutation after all — not a deliberate read, but the cursor block copied
+across from `build_list_sql`, which resolves `query.filter_hash` through
+`require_filter_hash` and errors when it is absent, then pushes a keyset
+predicate. `the_fold_reads_neither_the_cursor_nor_the_fingerprint_slot` renders
+the same fold three times — plain, with a cursor, with a fingerprint — and
+requires byte-identical SQL and equal binds. What it does **not** reach is a
+read whose value is then discarded: that leaves no trace in either the statement
+or the binds, and the test says so.
+
+- [x] **Step 5: Update the adapter, run, commit**
+
+```rust
+    async fn query_aggregated_usage_records(
+        &self,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        query: &ODataQuery,
+        metadata_filter: &[MetadataFilter],
+        group_by: &[AggregationDimension],
+    ) -> Result<AggregationResult, UsageCollectorPluginError> {
+        self.record
+            .aggregate(gts_type_id, time_range, fold, query, metadata_filter, group_by)
+            .await
+    }
+```
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/src/
+git commit -s -m "feat(timescaledb-plugin)!: fold over the typed meter, range and group_by
+
+The fold, meter, time range and group_by all arrive as typed parameters;
+declarations never reach the SPI. Applies the two withdrawal-exclusion
+obligations and answers the no-grouping case as a single bucket with an empty
+key rather than an empty bucket list.
+
+BREAKING CHANGE: RecordStore::aggregate takes AggregationFold and group_by in
+place of AggregationSpec."
+```
+
+---
+
+## Task 13: Compile — metrics, config, gear, lib
+
+The first task whose success criterion is `cargo check` passing.
+
+**Files:**
+- Modify: `src/infra/metrics.rs`, `src/infra/metrics_tests.rs`, `src/config.rs`, `src/gear.rs`, `src/lib.rs`, `src/gear_tests.rs`
+
+- [x] **Step 1: Bring the metric inventory to DESIGN §3.11.5** — done
+
+**Span verified**: §3.11.5 opens at `DESIGN.md:1767` and §3.11.6 at `:1824`, so
+1767-1824 is right.
+
+**The premise was two commits stale.** `src/infra/metrics.rs` was **446** lines,
+not 486, and carried no catalog-labelled metric and no `deactivate` label:
+`59f385eea` ("delete the usage-type catalog") and `76016fc69` ("delete
+deactivate_usage_record") had already taken both out. What the correction era
+had actually left behind was smaller and different, and it is what this step
+removed.
+
+**What §3.11.5 binds this plugin to, and what it does not.** Its closing
+paragraph is `DESIGN.md:1821-1822` — not `:1819-1821`; `:1819` is the
+`MetricsConfig.cardinality_limit` sentence — and reads, verbatim:
+
+> Plugins may expose backend-internal metrics under their own prefix. Those
+> series are owned by the plugin's deployment guide.
+
+Note that it delegates ownership to the plugin's **deployment guide**, a
+document, and not to any piece of code. Every instrument in §3.11.5's three
+tables is emitted by
+ingestion-gateway, query-gateway, feed-gateway, type-resolver or plugin-host —
+**none by a storage plugin**. So the section constrains this crate by exactly
+two rules, both of which it already satisfied: full-literal Prometheus
+instrument names (`_total` / `_seconds`, no `.with_unit()`), and bounded label
+vocabularies with no unbounded identifier as a dimension. It obliges no
+particular instrument, which is what makes Step 2b a judgement call.
+
+**Changed** (all of it inside `uc_timescaledb_`, nothing gear-side):
+
+1. `uc_timescaledb_compensations_total` → **`uc_timescaledb_invalidations_total`**,
+   `Metrics::inc_compensation` → `inc_invalidation`, description "Inserts
+   carrying a corrects_id (compensating records)" → "Accepted invalidation
+   entries (append-only withdrawals)". Both call sites already fired on
+   `record.invalidation.is_some()` / `is_invalidation` — the counter had been
+   re-pointed at the new model and left with the old model's name. Safe to
+   rename: the gear is unreleased (see "Decisions already made", item 2), so no
+   dashboard names the old series.
+2. **Seven prose citations naming instruments that do not exist**, all in
+   `record_store.rs`: `pool.acquire.duration` (`:182`, `:274`),
+   `tls.handshake.failure.count` (`:182`), `insert.duration` (`:347`),
+   `dedup.absorbed` and `idempotency.conflict` (`:479-480`), and
+   `query.duration` twice (`:2185`, `:2301`). These are a pre-`uc_timescaledb_`
+   dotted spelling; §3.11.5's naming rule is the one this crate is bound by, so
+   they now read as the literals the meter builds.
+3. The module doc's realization anchor. It cited the plugin's own
+   `docs/DESIGN.md` §Observability, which is **wholesale stale** (see the
+   handover below) and would have contradicted item 1 the moment it shipped. It
+   now quotes §3.11.5's delegation clause and states plainly that this module is
+   the authority on what the plugin emits.
+4. The new counter of Step 2b.
+
+DIVERGENCES entries 4, 9, 13 and 14 all concern metric labels and **none of
+them is yours**. Entry 4 (`uc_query_requests_total` lists a label that cannot
+fire), entry 9 (`uc_ingestion_records_total`'s label row), entry 13
+(`uc_pdp_duration_seconds`) and entry 14 (`docs/features/usage-emission.md`)
+are gear-side or doc-side. Change only what this plugin emits.
+
+**Handover to Task 18 — a twenty-first DIVERGENCES entry is owed.** The
+plugin's own `gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/DESIGN.md`
+is **710 lines and stale wholesale**: `gts_id` on 37 lines, `catalog` on 30,
+`created_at` on 29, `usage_type` on 25, `corrects_id` on 10, `deactivate` on 7.
+Its §4 Observability table (`:622-686`) still lists
+`uc_timescaledb_deactivate_duration_seconds`,
+`uc_timescaledb_usage_type_referenced_total` and
+`uc_timescaledb_usage_type_catalog_size` — three instruments this crate deleted
+— and says `compensations_total` "increments on inserts carrying `corrects_id`".
+**No DIVERGENCES entry owns this file.** Entry 5 owns
+`gears/system/usage-collector/docs/DECOMPOSITION.md` and entry 14 declares
+itself "the entry that owns `docs/features/`"; neither reaches into the plugin's
+directory, and the plan's own self-review lists only those two as
+out-of-scope-and-registered. So it is stale *and* unregistered, which is the
+worse of the two states. **This task deliberately did not fix the §4 table**,
+for the reason entry 14 gives about `usage-query.md`: one current paragraph
+inside a wholesale-stale document is harder to notice than a uniformly stale
+one. §3.11.5 makes that file the *owner* of these series, so the register
+needs to say it cannot currently be read as one.
+
+- [x] **Step 2: Fix the remaining compile errors**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets 2>&1 | tail -60
+```
+
+**As of Task 12 the command above already exits 0**, sooner than this plan
+expected: Task 12 was the last holder of a lib error, and the files this task
+owns turned out to need no signature change to compile. `cargo test -p
+cf-gears-timescaledb-usage-collector-plugin --lib` runs 211 tests green, and
+`cargo clippy --all-targets -- -D warnings` is clean. So Step 2 is a *review*
+step, not a repair one: `src/lib.rs`'s module doc still describes a `domain`
+layer holding "the SPI adapter and store port traits" — plural, and there is one
+now.
+
+**Reviewed at Task 13.** `src/lib.rs:7` now reads "the SPI adapter and the store
+port trait" (`domain/ports.rs` declares exactly one `pub trait`, `RecordStore`).
+`config.rs`, `config_tests.rs`, `gear.rs` and `gear_tests.rs` carry no retired
+name at all — no `catalog`, `deactivate`, `status`, `corrects_id` or
+`usage_type` between them — and needed no edit. The metric work is Step 1's.
+
+**Mind the feature gate — `--all-targets` alone does not reach `tests/`.** Every
+file there opens with `#![cfg(feature = "postgres")]`, so without the feature
+the five integration targets compile to nothing and report nothing. Add the
+feature and the count is **61 errors**, every one of them in `tests/`:
+
+```bash
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets --features postgres
+```
+
+They are the retired time model showing through — `UsageTypeGtsId`,
+`AggregationSpec`, `AggregationOp`, `UsageRecordStatus`, and the `gts_id` /
+`corrects_id` / `status` / `created_at` fields — plus the three SPI signatures
+this slice reshaped. **None is this task's**: Task 15 rewrites all five files
+wholesale. Do not chase them here, and do not read a green `--all-targets` as
+the tests being sound.
+
+**And the lint backlog a resolution error was hiding is narrower than it
+sounds.** An unresolved import suppresses every rustc and clippy lint for the
+whole crate, old code included, and blocks rustdoc too (confirmed with a
+two-line probe crate: one `E0432` gave 0 lints, removing it gave 5). But the
+successive scratch harnesses compiled and linted `record_store.rs`,
+`record_store_tests.rs`, `query.rs`, `query_tests.rs` and all of `query/` under
+the identical deny set throughout, at zero warnings. The genuinely unlinted
+surface was `lib.rs`, `gear.rs` (+tests), `config.rs` (+tests), `domain.rs`,
+`domain/adapter.rs`, `domain/ports.rs`, `infra.rs`, `infra/storage.rs` and
+`pool.rs` (+tests) — and with the crate compiling, clippy reports **nothing**
+across all of those. The five files under `tests/` are still unlinted, because
+they still do not compile; they become lintable when Task 15 rewrites them.
+
+**Add `cargo doc` to this pass.** It has one thing left to say:
+
+```bash
+cargo doc --no-deps -p cf-gears-timescaledb-usage-collector-plugin
+```
+
+Seven `private_intra_doc_links` warnings, all pre-dating Task 12 (`build_pool`
+→ `connect_options`/`connection_gucs`, `apply_post_migration_setup` →
+`acquire_init_lock`, `aggregate_limit_clause` → `LATEST_SELECT_EXPR`,
+`PgRecordStore` → `Self::timed_acquire`/`Self::record_backend_error`,
+`AlreadyInvalidated` → `ONE_INVALIDATION_UNIQUE`). Intra-doc link density has
+roughly doubled since Task 9 and this had never been run against the crate.
+
+**Still exactly those seven after Task 13**, same items, none added. The one new
+cross-crate link this task wrote (`usage_collector_sdk::Invalidation`) resolves.
+
+- [x] **Step 3: `cargo check` must pass**
+
+```bash
+cargo check -p cf-gears-timescaledb-usage-collector-plugin --all-targets
+```
+
+Expected: exits 0. **This is the first time since slice 4** — for the
+default feature set; `--features postgres` still carries Task 15's 61.
+
+**Confirmed at Task 13.** Default features: exits 0. `--features postgres`:
+**61 errors, every one under `tests/`** — 26 in `records_query_integration_pg.rs`,
+14 in `records_ingest_integration_pg.rs`, 12 in `id_uniqueness_integration_pg.rs`,
+6 in `common/mod.rs`, 3 in `cleanup_integration_pg.rs`. Count them with
+`--message-format short | grep -E ': error'`; a plain `grep -cE '^error'` reports
+**66**, because it also counts the five "could not compile … due to N previous
+errors" summary lines, one per integration target.
+
+- [x] **Step 2b: Consider observing the at-most-one rejection (from Task 9's review)**
+
+**A consideration, not a required metric.** The SPI singles out at-most-one
+invalidation as the plugin's *one* admission-time obligation, and its two
+rejection paths are observed asymmetrically today: the in-batch pre-reject
+(`duplicate_withdrawal_in_batch`) logs a `warn` naming the target and the entry
+that already withdrew it; the cross-call one, which `map_insert_error` builds
+from the index violation, logs nothing. **Neither moves a metric.**
+
+That is thin for the outcome the SPI cares most about — an operator cannot see
+whether withdrawals are being refused at all. You own the metric inventory, so
+this is yours to weigh against DESIGN §3.11.5.
+
+**Correction to this step's own framing before the decision.** It said the
+plugin's `docs/DESIGN.md` inventory is "deliberately stale (DIVERGENCES 5 and
+14)". The conclusion — that no doc obliges a new counter — is right; the
+mechanism was invented. Entry 5 owns
+`gears/system/usage-collector/docs/DECOMPOSITION.md` and entry 14 owns
+`gears/system/usage-collector/docs/features/`; **neither mentions the plugin's
+directory**, and the plan's self-review registers only those two as
+out-of-scope. The plugin's `docs/DESIGN.md` is stale in fact and registered
+nowhere (Step 1's handover). What actually leaves this free is DESIGN
+§3.11.5's own closing paragraph, which delegates backend-internal series to the
+plugin's prefix and names no instrument for a storage plugin at all.
+
+**Decision: yes — added.** Two counters, incremented on the two refusal paths:
+`uc_timescaledb_invalidation_rejected_rows_total` at `resolve_batch`'s
+`duplicate_withdrawals` pre-reject (`plan_batch`, in-batch), and
+`uc_timescaledb_invalidation_rejected_statements_total` in `map_insert_error`
+once the classifier has said the partial unique index refused the statement
+(cross-call). Reasoning, in the order it carried weight:
+
+1. **The plugin's own inventory was already asymmetric, not deliberately
+   silent.** It counts its *other* admission-time refusal —
+   `uc_timescaledb_idempotency_conflicts_total` — and both dedup outcomes
+   besides. Leaving the one obligation the SPI singles out as the store's own
+   uncounted was an omission, not a considered exclusion.
+2. **Task 18 Step 4b item 1 makes it worth more, not less.** The at-most-one
+   guarantee is conditional on the Ingestion Gateway copying a target's covered
+   period, because no hypertable-compatible index can key on `invalidates`
+   alone. The refusal rate is then the only in-plugin evidence the rule is
+   being exercised at all — and the series it belongs beside,
+   `uc_timescaledb_invalidations_total`, is the denominator.
+3. **The split is the content.** The two paths differ in mechanism and in fix
+   (`plan_batch` pre-reject vs. the index aborting a whole multi-row `INSERT` —
+   Task 18 Step 4b item 2), so a single counter cannot tell an operator which is
+   firing.
+
+**Two instruments, not one instrument with a `scope` label — and this was
+reversed during review, so the reasoning is recorded rather than the outcome
+alone.** The first version was `uc_timescaledb_invalidation_rejections_total`
+with `scope` ∈ {`in_batch`, `cross_call`}, and it was wrong for a reason that
+outlives this counter:
+
+> **A Prometheus label asserts that its arms are one measurement partitioned.**
+> That assertion is what makes `sum by (...)` meaningful, and it is machine-read
+> — every dashboard and alerting tool aggregates on it. These two arms have
+> different units: the in-batch pre-reject counts refused **rows**, the index's
+> cross-call refusal counts refused **statements**. Under one instrument the
+> only thing standing between an operator and a meaningless sum is prose in
+> `with_description`, and **nobody can write a test that stops someone writing
+> the wrong PromQL**. Splitting puts the unit in the series name, where no query
+> can lose it, and leaves nothing to sum across because there is no shared
+> series.
+
+Two consequences worth keeping:
+
+- **The `scope` label and the `InvalidationRejection` enum are both gone.** The
+  crate's own convention decides this: `InsertMode`, `QueryKind` and
+  `ErrorClass` exist because each *has* a label; separate instruments
+  (`inc_dedup_absorbed`, `inc_dedup_stale`, `inc_idempotency_conflict`) get
+  separate methods and no enum. A constant-valued label on a single-series
+  instrument is noise.
+- **`..._statements_total` still needs two caveats, and they are in its
+  description** — where an operator reads them — as well as in rustdoc. It
+  counts statements, not withdrawals: one aborted batch withdrawing two
+  *different* already-withdrawn targets is a single increment, because
+  `plan_batch` pre-rejects same-target duplicates only. And a retried batch
+  counts once per attempt, up to `MAX_BATCH_ATTEMPTS`, because the refusal can
+  surface as a retryable `Transient` — so it is read beside
+  `uc_timescaledb_batch_retries_total`. **The same argument that moved the
+  not-addable warning into the description applies to the retry caveat**, which
+  is why both are there rather than one.
+
+**Alternatives, so the next reader does not re-litigate this.** *One instrument
+plus label* was reviewed and accepted before being reversed; it groups "one
+obligation, two mechanisms" nicely and is what §3.11.5's own tables look like —
+but every label in those tables partitions a single unit, which is exactly the
+property this pair lacks. *Normalising both to rows* would need the index to
+report which rows of an aborted statement offended, which Postgres does not tell
+us. *Dropping the cross-call counter* loses the only signal for the path the SPI
+actually obliges.
+
+**Where the cross-call increment sits, and why it moved.** The first version
+put it in `map_insert_error`'s `Ok(Some(..))` arm — the one that can name the
+entry that already withdrew the target. That undercounts, and undercounts
+precisely where the counter is worth most: the `Ok(None)` arm is a refusal too
+(the index refused, and the refusing entry's chunk aged out before the
+attributing read), and it is the retention-race an operator would most want to
+see. The increment is now above the `match`, at the point where
+`DbErrorClass::AlreadyInvalidated` has established that
+`usage_records_one_invalidation_uniq` refused the statement — a fact no arm
+below can change. The description "refused by the at-most-one rule" is then
+true of every increment rather than of most of them.
+
+**The two arms are not addable, and `cross_call` under-counts within itself.**
+`in_batch` counts refused **rows**; `cross_call` counts refused **statements**,
+because the index aborts a multi-row `INSERT` whole (Task 18 Step 4b item 2).
+Sharper than "the units differ", and it is the reason they differ: one aborted
+batch withdrawing two *different* already-withdrawn targets is a **single**
+increment, because `plan_batch` pre-rejects same-target duplicates only and
+nothing splits the statement per row. `cross_call` answers "how often is a batch
+refused", never "how many withdrawals were refused".
+
+**That warning lives in the instrument's `description`, not only in rustdoc** —
+`InvalidationRejection`'s rustdoc, both call sites *and* the description all
+carry it, because **a Prometheus series carries no rustdoc**. The description an
+operator actually reads is the only one that can stop the sum, and the first
+version of it ("Withdrawals refused by the at-most-one rule, by scope") invited
+exactly the sum the rustdoc forbade.
+`metrics_tests::the_rejection_counters_description_warns_against_summing_its_arms`
+pins it: both label values, both unit nouns, and "do not sum" must be present.
+Mutations, both red with a `Compiling` line — delete the "do not sum" clause;
+change "counts refused statements" to "counts refused batches".
+
+**One consequence of the hoist that did not exist before it.** The `Ok(None)`
+arm returns `Transient`, which `is_retryable_batch_error` admits, so a
+retention-race batch re-enters `map_insert_error` on each of up to
+`MAX_BATCH_ATTEMPTS` (3) attempts and increments `cross_call` every time.
+Correct under that label's unit — three attempts are three refused statements —
+and `uc_timescaledb_batch_retries_total` moves beside it, so neither masks the
+other. Recorded because **before the hoist the counter could not fire twice for
+one request**, and the `with_retry` call site now says so.
+
+**Not** changed: the logging asymmetry. The in-batch path still `warn`s and the
+cross-call path still does not. The metric is what makes refusals visible in
+aggregate, which is what this step asked for; per-event logging on the
+cross-call path is a separate question and the error already reaches the caller
+naming both entries.
+
+**Tests and their mutations**, each run confirmed to carry a `Compiling` line:
+
+| Mutation | Reds |
+| --- | --- |
+| collapse `inc_invalidation_rejected_row` onto the statements counter | `…separate_instruments_because_their_units_differ` |
+| re-introduce a `scope` label on either instrument | same |
+| `self.invalidation.add(1, &[])` → `.add(0, &[])` | same |
+| instrument name `"uc_timescaledb_invalidations_total"` → `…_totalX` | same |
+| **swap the two descriptions between the instruments** | `…description_carries_its_own_unit` |
+| drop "a retried batch counts once per attempt" | same |
+| a dotted instrument name (`uc_timescaledb.dedup.absorbed`) | `…obeys_the_naming_convention` |
+| `uc_timescaledb_query_duration_seconds` → `…_duration_secs` | same |
+| rename an instrument in `with_meter` only | same (set equality) |
+| `uc_timescaledb_dedup_absorbed_total` → drop `_total`, both sides | same (kind rule) |
+| `uc_timescaledb_insert_duration_seconds` → `…_insert_latency_ms`, both sides | same (bucket-layout rule; a name-based guard misses this) |
+| drop any single driver call | same (set equality) |
+| re-introduce a label spelled anything at all | `…separate_instruments…` (zero-attribute assert) |
+| `uc_timescaledb_batch_rows` → `…_batch_seconds` | `…obeys_the_naming_convention` (the direction a one-way rule missed) |
+| `metadata jsonb` → `json` in the migration | `each_inserted_column_is_unnested_as_…` |
+
+**The description test asserts contiguous phrases, not loose substrings.** An
+earlier version checked for `"rows"`, `"statements"` and `"do not sum"`
+independently, which stays green when the two units are **swapped between the
+instruments** — and which arm carries which unit is the entire content of the
+warning. That is the mutation row above.
+
+**`every_exported_instrument_obeys_the_naming_convention` is the mechanism for a
+claim the module doc had been making unbacked.** The doc states the two rules
+§3.11.5 binds this crate by; the bounded-label rule has the closed `as_label`
+enums, and the naming rule had nothing.
+
+It asserts **off each instrument's kind, over the exact exported set**:
+
+- `_total` on everything the SDK exports as a `Sum` — all **11** counters, where
+  the first version enforced it through five hardcoded names, which is the
+  hand-kept list its own rustdoc claimed to avoid.
+- The `_seconds` suffix and the **`DURATION_BOUNDARIES_SECS` bucket layout**
+  agree **in both directions**, the layout read back off the exported bounds.
+  Not "every histogram whose *name* contains duration": that guard only inspects
+  names that already announce themselves, so `uc_timescaledb_insert_latency_ms`
+  sails through it. Biconditional rather than one-way, so a non-duration
+  histogram *gaining* the suffix reds too — `uc_timescaledb_batch_rows` renamed
+  to `…_batch_seconds` is the mutation, and the one-way form passed it.
+  `batch_rows` is the f64 histogram correctly not in seconds, and
+  `BATCH_ROW_BOUNDARIES` is what says so. The histogram arm also asserts it got
+  a data point, so the bounds check cannot pass vacuously.
+- The exported set **equals** `Metrics::declared_instrument_names()`, which
+  destructures `Self` with **no `..`**. Be exact about what that buys: the
+  compiler refuses to let anyone *reach* that list without accounting for a new
+  field (`E0027`), but it does not force the name into the `vec!` beside it —
+  `foo: _`, no string, never driven, and the run is green. Two omissions in one
+  edit, at the one place whose job is to list them, so the risk is low and the
+  mechanism is still far stronger than a hand-kept array; it is not a
+  guarantee, and the rustdoc no longer says it is. A floor (`>= 16`) was the
+  first version and it was wrong twice over: it cannot notice an instrument
+  disappearing, and it hid an untested belief that the two observable pool
+  gauges are collected by their callbacks on this path. **They are: the set is
+  exactly 18.**
+
+**A measurement inside this task came out backwards and was caught by re-running
+it correctly — the mechanism is worth keeping.** Two mutations "survived",
+apparently showing that the driver block was decoration and that the SDK exports
+instruments it has built but never recorded. Both had been applied with
+`str.replace(old, new, 1)` on a literal that occurs in **two** test functions,
+so they mutated the *other* test and never touched the one under measurement. A
+mutation applied to the wrong site is a false survivor exactly as an mtime-stale
+rebuild is — and it argues, in the same direction, for deleting a working check.
+Re-run against the right site, every driver call is load-bearing: **an
+instrument the SDK has built but never recorded on is not exported at all**,
+counter, histogram and gauge alike — independently confirmed against
+`opentelemetry_sdk-0.32.1/src/metrics/pipeline.rs:138-165`, where an aggregation
+returning `len == 0` hits `_ => continue` and is never pushed.
+
+**The rule this produced is in "Ground rules — read before Task 1", beside the
+mtime rule it is a sibling of** — not here, because Tasks 14-18 all write and
+mutate tests and none of them reads a closed task's step. This paragraph is the
+narrative; the rule is the artifact.
+
+**Left for Task 15, and routed into Task 15's own section rather than only
+recorded here.** Both increments sit on paths that need a live backend, so this
+task pins the instruments and their descriptions and Task 15 observes the call
+sites.
+
+- [x] **Step 2c: Decide whether to split `record_store.rs` (from Task 9's review)**
+
+**A decision point, deliberately placed here — and the numbers Task 9 wrote it
+with are stale, so here are measured ones.** `record_store.rs` is **2,290
+lines** (not ~1,840), and **843 of them** (not ~400) are **23** free functions
+with their doc comments, none of which touches `PgRecordStore` or `sqlx`:
+
+```
+placeholders, scope_runs, sequence_block, invalidation_index_slots,
+record_row_key, require_filter_hash, build_get_sql, build_list_sql,
+build_list_page, dedup_key, row_dedup_key, dedup_invariant_break,
+dedup_transient, plan_batch, duplicate_withdrawal_in_batch,
+batch_retry_backoff_base, full_jitter, batch_retry_backoff,
+is_retryable_batch_error, with_retry, canonical_equal, build_aggregate_sql,
+aggregate_bucket
+```
+
+Regenerate that list rather than trusting it, and **use this command, not
+`grep -n '^fn '`**:
+
+```bash
+grep -nE '^(pub(\(crate\))? )?(async )?(const )?fn ' src/infra/storage/record_store.rs
+```
+
+A free function is exactly one that starts at column zero — true, and `^fn `
+does not implement it. It misses the five column-zero **`async fn`**s.
+`rollback`, `claim_acceptance_sequence`, `claim_batch_sequences` and
+`find_existing_invalidation` take `sqlx` types and fall outside the move set
+anyway, but **`with_retry` (`:1636`, 51 lines) does not** — it is generic over
+`Op: Fn() -> Fut` and touches neither `PgRecordStore` nor `sqlx`. Run the wrong
+line and you move `batch_retry_backoff_base`, `full_jitter`,
+`batch_retry_backoff` and `is_retryable_batch_error` while leaving their head
+behind, **splitting the retry family across the boundary you just drew** — the
+family Task 9's own scoping named as one unit.
+
+Tasks 10-12 grew the pure half faster than the impure one:
+`build_list_sql`, `build_list_page`, `build_aggregate_sql` and `aggregate_bucket`
+are all read-path builders that arrived in this slice, which is worth noticing
+because **it also means the "write_plan" name Task 9 chose no longer fits** —
+about half of what would move is read-path.
+
+Moving them into a sibling module would give a real physical split in place of
+the banner comment in `record_store_tests.rs`, and would let a future task
+`#[path]`-include a real file instead of regenerating an extract (see Task 9's
+Verification note for why that mattered).
+
+**Task 9 deliberately did not do it**: Tasks 10-12 were about to edit this file
+and the merge cost would have landed on them. Those are all closed now, so this
+is the cheapest place to take it.
+
+One exception: **if Task 10's implementer finds the extractor painful, they may
+pull the split forward.** The benefit is largest before the read half is
+rewritten, not after.
+
+**Decision: defer, and do not carry it forward as an open question.**
+Regenerated with the corrected command at Task 13: **27** column-zero `fn`s,
+**23** in the move set (the 23 named above, `with_retry` already among them),
+**845** lines, **477** of them read-path, in a file of **2,338** lines as Task 13
+leaves it (2,309 at its base commit). The figures this step was written with
+were one commit stale (2,290 / 843), which is what regenerating is for — and the
+first pass at regenerating them produced a 28 and a 2,310 of its own, one from
+miscounting the printed list and one from a `split('\n')` trailing element.
+**Re-run the command; do not trust this paragraph either** — the file length in
+particular moves with every commit that touches it.
+
+Why it does not happen:
+
+1. **Its enabling argument has expired.** Task 9's case was that a split would
+   "let a future task `#[path]`-include a real file instead of regenerating an
+   extract". The crate compiles from Task 12 onward and Step 3b below runs the
+   write-half tests in the real build, so **no future task needs a harness**.
+   That benefit is not deferred, it is gone.
+2. **The boundary it would draw is not the one a name could describe.** Of the
+   845 lines, `build_list_sql` (133), `build_aggregate_sql` (121),
+   `build_list_page` (89), `aggregate_bucket` (41), `build_get_sql` (40),
+   `record_row_key` (37) and `require_filter_hash` (16) — **477, more than
+   half** — are read path. So `write_plan` is wrong, as this step already
+   observed, and every honest replacement names the *property* (pure, free,
+   `sqlx`-free) rather than the subject. A module whose only claim is "these
+   don't touch `sqlx`" organises a file by its dependency graph, not by what it
+   is about.
+3. **The churn lands on the two tasks least able to absorb it.** 845 lines
+   moved immediately before Task 14 runs the contract suite and Task 15 rewrites
+   all five integration files. And it would not stop there:
+   `record_store_tests.rs` is **2,877 lines** and its banner comment tracks the
+   same boundary, so a faithful split roughly doubles the diff.
+
+What is left is file size alone, which is real but is the weakest of Task 9's
+three arguments and the only one still standing. **Re-open it only if a later
+change makes `record_store.rs` hard to edit for a concrete reason** — not on
+line count.
+
+**The same decision covers where the DDL oracle lives.** Task 9's review found
+that its `DDL_COLUMN_ARRAY_TYPES` — a hand transcription of
+`migrations/0001_init.sql` — duplicates an instrument this crate already has:
+`aggregate_tests.rs:203-256` (Task 8's `migration_ledger_columns()`)
+`include_str!`s the same migration, parses it, and checks `LEDGER_COLUMNS`
+against it, recognizing what a column is *not* so an unrecognized construct
+reds the test rather than vanishing from it.
+
+The column sequence now has **six hand-kept spellings** with exactly derivable
+relationships: `LEDGER_COLUMNS` (18, parser-verified), `RECORD_COLUMNS` (17,
+`= LEDGER_COLUMNS − {entry_type}`), `INSERT_COLUMNS` (16,
+`= LEDGER_COLUMNS − {entry_type, ingested_at}`), `INSERT_COLUMN_ARRAY_TYPES`,
+`DDL_COLUMN_ARRAY_TYPES`, and `InsertColumns`' field order.
+`migration_ledger_columns()` already splits the type token off and discards it;
+extending it to yield `(name, type)` and deriving the oracle's name half from
+it would leave only the sixteen type strings and the one declared `metadata`
+divergence hand-written.
+
+**Not a Task 9 defect**, and not urgent: the silent-failure window needs a DDL
+change reflected in neither the oracle nor the code, which Task 15's live insert
+would reject outright. It belongs here because it is the same question as the
+file split — where shared test machinery lives — and because **the anchoring
+chain is now one independent oracle feeding everything else, which is precisely
+why the anchor's quality is the whole guarantee.**
+
+**Decision: done, and taken further than proposed.** The proposal was to derive
+the oracle's *name* half and leave "the sixteen type strings and the one
+declared `metadata` divergence hand-written". The DDL turns out to spell every
+column's type as a single token on the same line, so the parser yields
+`(name, type)` for free and **only the `metadata` divergence stays by hand** —
+`DDL_COLUMN_ARRAY_TYPES` is deleted outright. Six hand-kept spellings become
+five, and the fifth is one entry rather than sixteen pairs.
+
+**Where it lives.** A new `#[cfg(test)] pub(crate) mod` at
+`src/infra/storage/migration_probe.rs` — not in either test file, because both
+`aggregate_tests` and `record_store_tests` now read it and a parser that lives
+in one of them is the duplication this removes. It holds `MIGRATION_SQL`,
+`ledger_columns() -> Vec<(&'static str, &'static str)>` (moved from
+`aggregate_tests`, which keeps a two-line names-only adapter so
+`ledger_columns_are_the_migrations_columns` is untouched), and
+`insertable_columns()`.
+
+**The one thing that had to stay hand-written, and why.** `insertable_columns()`
+excludes `entry_type` and `ingested_at` **by name**, not by filtering against
+`INSERT_COLUMNS`. `INSERT_COLUMNS` is one of the constants the oracle exists to
+check, so deriving the exclusion from it would let a column dropped from
+`INSERT_COLUMNS` disappear from the expectation along with it — the oracle would
+move with the code under test, which is the exact failure the hand transcription
+was there to prevent. "Has a `DEFAULT`" does not work as a derivation either:
+`metadata` has one and *is* inserted.
+
+**A real defect surfaced on the first run**, which is the evidence the
+derivation does work: the parser's second token keeps the trailing comma on a
+nullable column (`subject_id text,` → `text,`), so four of the sixteen types
+came out wrong and the pairing test went red. Fixed with
+`trim_end_matches(',')`, and the failure mode is documented on the function —
+this parser fails loudly in every direction it can fail.
+
+**Mutations** (each run confirmed to carry a `Compiling` line; all red on
+`each_inserted_column_is_unnested_as_the_type_the_migration_declares`):
+
+| Mutation | Where |
+| --- | --- |
+| transpose `"text"` / `"numeric"` in `INSERT_COLUMN_ARRAY_TYPES` | `record_store.rs` |
+| `acceptance_sequence bigint` → `integer` in the migration | `migrations/0001_init.sql` — proves the oracle reads the DDL, not the code |
+| drop the `metadata` `jsonb`→`text` arm | `record_store_tests.rs` |
+| stop excluding `entry_type` | `migration_probe.rs` |
+| drop `trim_end_matches(',')` | `migration_probe.rs` |
+
+**Note for Task 15**: `migration_probe` is `#[cfg(test)]`, so it is reachable
+from `src/**` unit tests only — the `tests/*.rs` integration crates cannot see
+it. If Task 15 wants the same parse, it needs its own path to the migration.
+
+- [x] **Step 3b: Re-run Task 9's deferred unit tests through `cargo nextest`**
+
+**A verification Task 9 could not perform, written down here so it happens.**
+Task 9's write-half tests in `record_store_tests.rs` have never run in the
+build that ships. `record_store.rs` could not be `#[path]`-included into a
+scratch harness — a `#[path]` include compiles the whole file and its read half
+is Tasks 10-12's — so they were run against a *mechanically regenerated
+extract* of the write half instead. The extract is faithful (regenerated from
+the real file on every run, mutations propagate, the driver greps the mutated
+line out of the generated file) but it is not what compiles into the crate.
+
+This is the first step at which they can run for real:
+
+```bash
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast \
+  -E 'test(record_store) + test(mapper) + test(error)' 2>&1 | tail -40
+```
+
+Expected: all pass, unchanged. **If any fails, it is Task 9's defect surfacing,
+not yours to paper over** — report it rather than adjusting the test. The
+mapper and error tests did run against the real files in the harness and should
+be uneventful; `record_store`'s are the ones this step exists for.
+
+**Result: 115 run, 115 passed, 0 failed, not one test adjusted.** Task 9's
+write-half tests pass in the build that ships, so the mechanically regenerated
+extract was faithful and the deferral cost nothing. Breakdown from
+`cargo nextest list`: `record_store_tests` **75**, `error_tests` **16**,
+`mapper_tests` **24** — 115. None of the three things a `#[path]` harness cannot
+see bit: the crate root's `coverage_attribute` feature gate, feature unification
+with `postgres`, and sibling-module collisions all came out clean.
+
+- [x] **Step 4: Clippy**
+
+```bash
+cargo clippy -p cf-gears-timescaledb-usage-collector-plugin --all-targets -- -D warnings
+```
+
+Expected: exits 0. `clippy::pedantic` is deny at workspace level. Watch for
+`clippy::non_ascii_literal` — no em dashes inside string literals.
+
+**`--all-features` cannot pass at this task and the command above no longer
+carries it.** `--all-features` turns on `postgres`, which pulls in the five
+`tests/` targets and their 61 errors; clippy then aborts on the compile failure
+and lints nothing. Verified at Task 13: `--all-targets` alone exits 0 at zero
+warnings. Nothing is owed here — **Task 16 Step 6 already runs
+`cargo clippy --workspace --all-targets --all-features`**, which is the first
+run that reaches these five files, and that step now carries the note.
+
+**One lint the new test-support module tripped**, recorded because the next
+`#[cfg(test)]` shared module will hit it too: `clippy::redundant_pub_crate`
+denies `pub(crate) fn` inside a module that is itself `pub(crate)`. Declare the
+items `pub` — the module's own visibility already caps them.
+
+- [x] **Step 5: Unit tests**
+
+```bash
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast 2>&1 | tail -10
+```
+
+Report `N passed / M skipped` unfiltered. A count under an `-E` filter is a
+lower bound and is not the number to report.
+
+**This is the first in-crate run of the mapper tests.** Task 5 could not run
+them here — the crate had 41 lib errors and 71 lib-test errors at the time —
+so it ran them, and its mutation falsification, in a scratchpad harness that
+`#[path]`-included `mapper.rs` and `entity.rs` alone (Task 5 Step 8). Confirm
+here that every `mapper_tests` case is present and green in the real crate.
+(Count them in the file rather than trusting a number written down elsewhere:
+a literal here rots the first time a test is added, which is exactly what
+happened to the figure this sentence used to carry.)
+
+**Measured at Task 13: 24**, two ways that agree — `grep -cE '^#\[(tokio::)?test\]'`
+over `src/infra/storage/mapper_tests.rs`, and `cargo nextest list` filtered to
+`infra::storage::mapper::mapper_tests`. All 24 green. **Baseline for whoever
+reads this next: 214 passed / 0 skipped** unfiltered (211 before this task, plus
+three metrics tests). Per module: `record_store_tests` 75,
+`translate_tests` 46, `mapper_tests` 24, `error_tests` 16, `config_tests` 14,
+`query_tests` 12, `aggregate_tests` 12, `pool_tests` 9, `metrics_tests` 5,
+`gear_tests` 1.
+
+If any of them fails to compile in this context, the harness proof does not
+cover it and the gap is yours to close. What the harness cannot see, in the
+order worth checking:
+
+1. **The crate root's `#![cfg_attr(coverage_nightly, feature(coverage_attribute))]`**
+   (`src/lib.rs:1`). The harness has no crate root of the plugin's, so the
+   `#[cfg_attr(coverage_nightly, coverage(off))]` on the test module is inert
+   there and load-bearing here.
+2. **Feature unification.** The harness builds `mapper.rs` alone; the crate
+   builds it alongside the `postgres` feature and everything that turns on.
+3. **Sibling-module name collisions.** `mapper.rs` sits next to `translate.rs`,
+   `keyset.rs`, `aggregate.rs` and `record_store.rs` here and next to nothing
+   there.
+
+**Not** the sqlx feature delta. The harness's set is a strict *subset* of the
+plugin's — the plugin adds `bigdecimal` and `migrate` — and cargo unifies
+features additively, so nothing the harness compiled can narrow here. A
+mismatch in that direction is impossible; do not spend time on it.
+
+- [x] **Step 6: Commit**
+
+One commit per change, not one per task. Task 13 shipped **five**: the metric
+inventory (Steps 1 + 2b), the DDL oracle's move to a shared parse (Step 2c), the
+plan, and two review rounds. `src/` and this plan only — **never** `git add -A`;
+six paths in this tree are not yours.
+
+---
+
+## Task 14: The acceptance criterion — run the contract suite
+
+**Files:**
+- Create: `tests/contract_conformance_pg.rs`
+- Modify: `Cargo.toml`, and — not foreseen when this was written —
+  `src/domain/adapter.rs` (`StorageAdapter` was `pub(crate)`, see Step 3) and
+  `tests/common/mod.rs` (it carried 6 of Task 15's 61 errors and
+  `mod common;` cannot skip them, see Step 3 and Task 15)
+
+### Read this before relying on a green run
+
+`contract.rs`'s module header and DIVERGENCES §F both say a green run is **not**
+the same as being a conforming plugin. Specifically:
+
+- **Five of DESIGN §3.3's seven checks are written.** `feed-snapshot-and-replay`
+  is blocked on the feed (out of scope, entry 18); `latest-tie-break` is blocked
+  because `UsageRecord` carries no `acceptance_sequence` (entry 19, and the
+  owner's decision keeps it that way). `run_all` also runs
+  `SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH`, which DESIGN states as an obligation
+  without tabulating.
+- **Nothing in the suite exercises the SPI's keyset obligations.** The reference
+  backend serves the canonical order, ignores `query.order`, and mints no
+  `next_cursor` — and a real plugin owes all three. Task 11's cursor-fingerprint
+  test and Task 15's pg tests are what cover it here.
+- **Two checks are coupled and the coupling points the wrong way.** A backend
+  selecting on `window_start` fails both `window-end-selection` and
+  `quantity-round-trip`. Both red means diagnose the period rule.
+
+**When reporting coverage, report `IMPLEMENTED_CHECKS`, `UNWRITTEN_CHECKS`,
+`BLOCKED_CHECKS` and `ADDITIONAL_CHECKS` together.** `IMPLEMENTED_CHECKS` alone
+under-reports what `run_all` ran.
+
+- [x] **Step 1: Add the dev-dependency** — DONE
+
+**The alias is the key, not the package name.** What landed:
+
+```toml
+usage-collector-sdk = { workspace = true, features = ["contract"] }
+```
+
+`contract.rs`'s own module header (and the snippet this step carried) writes
+`cf-gears-usage-collector-sdk`, which is the package name. Two things settle
+it against that: `[dependencies]` in this crate already names the package
+`usage-collector-sdk`, and the workspace table at `Cargo.toml:366` supplies
+the `package = "cf-gears-usage-collector-sdk"` rename — a second key for one
+package would be a second dependency under a second extern name. And it
+matches how the workspace already does this: `postgres-cluster-plugin` writes
+`cluster-sdk = { workspace = true, features = ["otel"] }`
+(`gears/system/cluster/plugins/postgres-cluster-plugin/Cargo.toml:46`) against
+`cluster-sdk = { package = "cf-gears-cluster-sdk", ... }` at `Cargo.toml:360`.
+
+The SDK header's `[dev-dependencies]` snippet is written for a consumer
+outside this workspace, so it is not wrong there — but it is not copyable
+here, and Task 18 may want to say so.
+
+- [x] **Step 2: Write the test** — DONE
+
+`tests/contract_conformance_pg.rs`:
+
+```rust
+#![cfg(feature = "postgres")]
+
+//! The DESIGN §3.3 plugin contract suite, run against a live TimescaleDB
+//! backend.
+//!
+//! This is the acceptance criterion for the port. It is **not** a conformance
+//! certificate: the suite writes five of DESIGN's seven checks plus one
+//! DESIGN states without tabulating, and nothing in it exercises the SPI's
+//! keyset obligations. See `contract.rs`'s module header and DIVERGENCES §F.
+
+use usage_collector_sdk::contract;
+
+mod common;
+
+#[tokio::test]
+async fn the_timescale_backend_conforms() {
+    let (_container, backend) = common::start_backend().await;
+
+    let violations = contract::run_all(&backend).await;
+
+    assert!(
+        violations.is_empty(),
+        "plugin contract violations ({} of DESIGN §3.3's seven checks are \
+         written; {:?} are blocked): {violations:#?}",
+        contract::IMPLEMENTED_CHECKS.len(),
+        contract::BLOCKED_CHECKS,
+    );
+}
+```
+
+Confirm the exported constant names and shapes against
+`usage-collector-sdk/src/contract.rs` before writing — `BLOCKED_CHECKS` carries
+each name with its blocker, so its element type may not be a bare `&str`.
+
+**DONE, with the assertion message widened.** `BLOCKED_CHECKS` is
+`&[(&str, &str)]`, so it renders as pairs. The shipped message reports all
+four constants rather than the two the snippet named, because
+`IMPLEMENTED_CHECKS` plus `BLOCKED_CHECKS` accounts for seven names and
+`run_all` ran **six** checks — the sixth being `ADDITIONAL_CHECKS`'
+`scope-is-a-filter-on-every-read-path`, which DESIGN obliges without
+tabulating. A reader of a failure message that named only the first two would
+under-report the run in exactly the way the module header warns against. The
+message reads `ran: [...] plus [...] / not run: [...] unwritten, [...]
+blocked`, and the mutation run below shows it rendering all four.
+
+- [x] **Step 3: `common::start_backend`** — DONE
+
+`tests/common/mod.rs` already starts a TimescaleDB container via
+`testcontainers` for the existing pg suites. Extend it with a helper returning
+a `StorageAdapter` wired to a migrated pool, rather than writing a second
+container harness.
+
+The suite "writes entries and never removes them, so a backend under test
+starts each run from whatever state the previous one left". A fresh container
+per run makes that moot; if the harness reuses one, read the fixtures' keying
+assumptions before relying on repeated runs.
+
+**DONE. The harness starts a container per `bring_up` call**, so the
+keying question never arises: `start_backend` calls `bring_up`, and
+`TsHarness` owns the `ContainerAsync` — a run never meets a previous run's
+rows.
+
+**`bring_up`'s retention window turned out to be load-bearing here**, not
+incidental. `bring_up` passes `NO_DROP_RETENTION_SECS`; the suite offsets
+every fixture period from `FIXTURE_EPOCH` (`2020-01-01T00:00:00Z`,
+`contract/fixtures.rs`), which the production 365-day window puts years past
+the cutoff. Under the default the scheduled `policy_retention` job would drop
+the chunk mid-run and the checks would report a conforming backend as losing
+entries. Recorded in `start_backend`'s doc rather than left to `bring_up`'s.
+
+**One source change was required and it is not in this task's file list:
+`StorageAdapter` was `pub(crate)`.** `run_all` takes a
+`&dyn UsageCollectorPluginV1` and `StorageAdapter` is the crate's only
+implementation of it, so no `tests/*.rs` crate could name it. It and
+`StorageAdapter::new` are now `pub`, which is exactly the exemption
+`lib.rs:14-19` already writes down for `config`, `domain` and `infra`
+("Exposed `pub` only so the crate's integration tests ... can construct the
+stores, config, and metrics directly"); `domain` is `#[doc(hidden)]`, so
+`cargo doc --no-deps` stays at 7 warnings.
+
+**Task 15 inherits a partly-repaired `tests/common/mod.rs` — see the entry
+added to its section.**
+
+- [x] **Step 4: Run it** — DONE, **PASS**, first run, no backend change.
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres \
+  --no-fail-fast -E 'test(the_timescale_backend_conforms)' 2>&1 | tail -40
+```
+
+**Scope the run to `--test contract_conformance_pg`.** An unscoped
+`--features postgres` invocation builds all six integration targets and dies
+on the five Task 15 owns, before this one is ever linked.
+
+Needs a reachable Docker daemon. Expected: PASS.
+
+**If it fails, the violation list names each check.** Do not patch the check;
+fix the backend. If a violation looks like a defect in the suite rather than in
+the backend, stop and report it — that would be a twentieth DIVERGENCES entry,
+and this plan's Task 18 is where it lands.
+
+**The run:**
+
+```
+Starting 1 test across 1 binary
+    PASS [   1.713s] cf-gears-timescaledb-usage-collector-plugin::contract_conformance_pg the_timescale_backend_conforms
+  Summary [   1.714s] 1 test run: 1 passed, 0 skipped
+```
+
+Nothing to route to DIVERGENCES: the suite found nothing.
+
+**A green run over an acceptance criterion is worth as little as an
+unfalsified one, so it was falsified.** The two range clauses in
+`push_meter_and_range_clauses` (`query.rs:71`, `:75` — one occurrence each,
+counted before mutating) were flipped from `r.window_end` to `r.window_start`
+and the test re-run with a `Compiling` line present. It went red with **8**
+violations, and the shape is the coupling this section warns about, observed
+rather than reasoned: 5 × `quantity-round-trip` ("accepted by
+`create_usage_record` but a `list_usage_records` range containing its
+`window_end` did not return it, so its quantity could not be compared at
+all") and 3 × `window-end-selection`, including both boundary cases. **Both
+red means the period rule, and the decimals are innocent** — now a measured
+claim. The mutation was reverted (`query.rs` is byte-identical to
+`5fc029a75`) and the suite re-run green with a `Compiling` line.
+
+- [x] **Step 5: Commit** — DONE
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/ \
+        gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/Cargo.toml
+git commit -s -m "test(timescaledb-plugin): run the DESIGN 3.3 contract suite
+
+The acceptance criterion for the port. Five of DESIGN's seven checks are
+written plus one DESIGN states without tabulating; the assertion message
+reports the blocked ones alongside the violations, because a green run over
+five checks must not read as a run over seven."
+```
+
+**What the run covered, reported as the four constants require:**
+
+| constant | contents |
+| --- | --- |
+| `IMPLEMENTED_CHECKS` | `quantity-round-trip`, `window-end-selection`, `dedup-identity-over-window`, `invalidation-excluded-from-fold`, `at-most-one-invalidation` |
+| `ADDITIONAL_CHECKS` | `scope-is-a-filter-on-every-read-path` (run; DESIGN obliges it without tabulating) |
+| `UNWRITTEN_CHECKS` | empty |
+| `BLOCKED_CHECKS` | `feed-snapshot-and-replay` (no feed method on the SPI), `latest-tie-break` (no `acceptance_sequence` on `UsageRecord`) |
+
+Six checks ran, of DESIGN's seven names five are green, two never executed.
+Two further things a green run does **not** say, both still true after it:
+the suite touches none of the SPI's keyset obligations (order, `next_cursor`,
+cursor fingerprint), and it reaches the `Latest` fold at no site — `contract/checks/`
+dispatches `query_aggregated_usage_records` at exactly two places
+(`invalidation_excluded_from_fold.rs:292`,
+`scope_is_a_filter_on_every_read_path.rs:437`) and both pass
+`AggregationFold::Sum` with an empty `group_by`. `AggregationFold` has five
+variants, so `Count`, `Max`, `Min` and `Latest` are all untouched, as is
+every grouping dimension. Task 15
+owns both gaps.
+
+---
+
+## Task 15: Rewrite the Postgres integration suites
+
+Five suites survive Task 1 and every one was written against the old model.
+
+**Files:**
+- Rewrite: `tests/records_ingest_integration_pg.rs` (702), `tests/records_query_integration_pg.rs` (919), `tests/cleanup_integration_pg.rs` (239), `tests/id_uniqueness_integration_pg.rs` (93), `tests/schema_integration_pg.rs` (75), `tests/common/mod.rs` (346)
+
+**This task is also the first point in the slice where Postgres is reachable,
+which makes it the owner of one measurement nobody earlier could take** — see
+Step 1b.
+
+**And of two claims about `aggregate` that only a live backend can settle**,
+handed over by Task 12 rather than left implied. Both are facts about what
+`PostgreSQL` answers, so a real query decides them and a unit test reaches only
+the statement that leads there. Claim 2 survives every unit test in the crate
+outright, and claim 1 partly — Task 12 killed the short circuit at the placement
+it would actually be written, and item 1 says which placement is left:
+
+A third claim was on this list and has been **retired rather than routed**: that
+`aggregate_bucket` is handed the same dimension count the SELECT list was built
+from. It was the one of the three that was not a Postgres-semantics question, so
+it never needed a backend — `build_aggregate_sql` now returns that count with
+the statement, and a test pins it against the `GROUP BY` ordinals.
+
+1. **A bare aggregate returns exactly one row**, so an empty `group_by` yields
+   the single empty-keyed bucket the SPI asks for. Task 12 pins the *statement*
+   (no `GROUP BY`, no `LIMIT`), shapes the decode as a 1:1 `map`, and kills the
+   short circuit at the placement it would actually be written — above the
+   acquire, where `the_ungrouped_fold_still_reaches_the_pool` catches it. What
+   survives is only the weaker placement, *after* the fetch, where the branch is
+   a no-op on an empty row set and no unit test can tell.
+2. **`COUNT` over an empty selection is `Some(0)`, not `None`.** That is
+   `SELECT COUNT(*)`'s own answer rather than anything the plugin does, which is
+   exactly why only a real query demonstrates it.
+
+Task 12's `--all-targets` count of zero is a green **without** `--features
+postgres`; with it, these files carry the errors that are yours.
+
+**Re-measured at Task 14**, after `tests/common/mod.rs` and
+`tests/contract_conformance_pg.rs` were made to compile. `cargo check -p
+cf-gears-timescaledb-usage-collector-plugin --features postgres --all-targets`
+now attributes **87** errors to four files, against **61** at `5fc029a75`.
+
+**The count rose because this task deleted the four fixture builders**: 50 of
+the 87 are new `error[E0425]: cannot find function … in module common` at
+their call sites (`records_ingest` 26, `records_query` 19, `cleanup` 3,
+`id_uniqueness` 2), while the pre-existing model-drift errors **fell from 55
+to 37**. At base no target aborted early — each already reported its own
+errors alongside `common/mod.rs`'s 6, which is what rustc's base summaries
+say: `due to 32 / 20 / 18 / 9 / 6 previous errors` for `records_query`,
+`records_ingest`, `id_uniqueness`, `cleanup` and `schema`, i.e. 26+6, 14+6,
+12+6, 3+6 and 0+6.
+
+| file | base | HEAD | of which new `E0425` |
+| --- | --- | --- | --- |
+| `records_query_integration_pg.rs` | 26 | 42 | 19 |
+| `records_ingest_integration_pg.rs` | 14 | 34 | 26 |
+| `id_uniqueness_integration_pg.rs` | 12 | **8** | 2 |
+| `cleanup_integration_pg.rs` | 3 | 3 | 3 |
+| `schema_integration_pg.rs` | 0 | **0 — it already compiles** | — |
+| `common/mod.rs` | 6 | 0 | — |
+
+So **the number to plan against is 37, not 87**: 57% of the total is
+call-site breakage this task created, and it clears the moment the fixtures
+are authored. And there are no fixtures to *port* — Task 14 deleted them, so
+Step 1 onwards authors them against the current model. `id_uniqueness` going
+**12 → 8** is the check on any other reading: a decrease is not something a
+"targets stopped aborting early" story can produce.
+
+`schema_integration_pg.rs` compiling is not the same as its assertions being
+right; Step 2 still owns it, and a file that builds against the old schema's
+expectations is exactly the shape Step 2 exists to catch.
+
+**Three things Task 13 hands you, none of them a defect to fix:**
+
+1. **Two metric increments that no unit test can reach.** Both at-most-one
+   rejection counters —
+   `uc_timescaledb_invalidation_rejected_rows_total` (in `resolve_batch`) and
+   `uc_timescaledb_invalidation_rejected_statements_total` (in
+   `map_insert_error`) — sit on paths that need a live backend. Task 13 pinned
+   the instruments and their descriptions in `metrics_tests`; **the call sites
+   themselves are unobserved until this task**. Assert them where you already
+   drive a duplicate withdrawal.
+2. **`migration_probe` is reachable from your crates — use it, do not write a
+   second parser.** `src/infra/storage/migration_probe.rs` is gated
+   `#[cfg(any(test, feature = "postgres"))] pub mod`, and `postgres` is exactly
+   the feature your five files compile under, so
+   `cf_gears_timescaledb_usage_collector_plugin::infra::storage::migration_probe::{ledger_columns, insertable_columns}`
+   resolves from `tests/`. It yields `(name, type)` parsed from
+   `migrations/0001_init.sql` and is the crate's **one** independent oracle for
+   the column sequence; a second transcription in `tests/common/mod.rs` would
+   undo that.
+3. **One link in the anchoring chain is yours to close, and only you can.**
+   `InsertColumns`' field order reaches the DDL through the `.bind()` sequence
+   at `record_store.rs`, and **nothing in-process observes that sequence**: swap
+   two binds of the same SQL type — `resource_id` and `resource_type` are both
+   `text` and both `NOT NULL` — and Postgres accepts the row,
+   `InsertColumns::build`'s field-by-field test still passes, and
+   `migration_probe` says nothing, because every constant it checks is still
+   correct. **Write one row through `create_batch` and read every column back**;
+   that is the only thing that catches it.
+
+- [x] **Step 1: Inventory what each suite asserts, before changing any of it**
+
+For each file, list the questions it asks. Then mark each: **still a live
+question** (repoint it), or **a question the model no longer has** (delete it).
+
+- [x] **Step 1b: Measure what `LATEST` costs, and whether another formulation is cheaper**
+
+Task 8 shipped the `Latest` fold as `(ARRAY_AGG(r.value ORDER BY r.window_end
+DESC, r.acceptance_sequence DESC))[1]::numeric`, which materializes a group's
+values before picking one. Task 12 carried the fact; **this task can measure
+it**, because it has Docker and the crate compiles by now. Nobody earlier could:
+the alternative formulations differ by planner behaviour, and that needs
+`EXPLAIN (ANALYZE, BUFFERS)`, not reasoning.
+
+Two questions, in this order:
+
+1. **What is the peak actually?** Run a grouped `LATEST` over a wide window and
+   read the plan. A HashAggregate keeps every group's array live at once —
+   O(rows scanned); a sorted GroupAggregate keeps one — O(largest group). Which
+   the planner picks, and at what row count it switches, is the number Task 18
+   publishes.
+2. **Is there a formulation with the same semantics and a bounded peak?** The
+   candidates are a `DISTINCT ON` in a subquery joined back per group, and a
+   window function (`ROW_NUMBER() OVER (PARTITION BY … ORDER BY window_end DESC,
+   acceptance_sequence DESC)`) filtered to `= 1`. Both were rejected at Task 8 on
+   composition grounds — reasoning, unmeasured. If one is both correct and
+   cheaper, that is a change to `aggregate.rs` with a test, and it belongs here
+   rather than in a slice that could only guess.
+
+Report the numbers either way. A "measured, and the current form is fine" is a
+result Task 18 can publish; an unmeasured claim is not.
+Produce that list in the task report. "Deleted the failing test" and "deleted
+the test whose question no longer exists" look identical in a diff, and only
+the second is legitimate.
+
+**What Task 14 already did to `tests/common/mod.rs`, and what it left.**
+
+Task 14's `tests/contract_conformance_pg.rs` does `mod common;`, so it could
+not compile until that file did — and each file in `tests/` is its own crate,
+so a broken `records_ingest_integration_pg.rs` does not block it. Task 14
+therefore repaired `common/mod.rs` alone, to the minimum, and the file is now
+**219 lines** (not the 346 in the list above, which was already stale at 318).
+The per-file error counts below are unchanged by the second deletion, because
+the helper it removed had no callers:
+
+- **Changed.** Dropped the `usage_collector_sdk::{IdempotencyKey, ResourceRef,
+  SubjectRef, UsageRecord, UsageTypeGtsId}` import and `time::OffsetDateTime`;
+  added `domain::adapter::StorageAdapter` and `domain::ports::RecordStore`.
+  Added `start_backend() -> (TsHarness, StorageAdapter)`. Repointed
+  `NO_DROP_RETENTION_SECS`' doc, which named `fixture_usage_record`'s
+  `created_at` — a field the model no longer has — at the `window_end` the
+  policy actually measures from.
+- **Deleted, not ported: `fixture_gts_id`, `fixture_usage_record`,
+  `fixture_usage_record_with_resource`, `fixture_usage_record_with_subject`**
+  (97 lines). They carried all six of the file's compile errors, every one in
+  a field the current `UsageRecord` does not have (`gts_id`, `corrects_id`,
+  `status`, `created_at`) or a type it no longer exports (`UsageTypeGtsId`,
+  `UsageRecordStatus`). Porting them means choosing a `window_start` /
+  `window_end` for every fixture and deciding whether the id stays
+  `Uuid::from_u128(seq)` now that it is a UUIDv5 over the 5-tuple — decisions
+  that belong to the suites in Steps 2-6, not to a file repaired so a
+  different test could link. **A ported-but-never-run fixture is the worse
+  inheritance**: it compiles, so it reads as validated.
+- **Also deleted: `insert_raw_usage_record` and `RAW_RECORD_SEQ`** (37 more
+  lines). **The fact that decides it is that it has no callers** — `grep -rn
+  "insert_raw_usage_record" tests/` finds only its own definition, across all
+  six files including the five that do not compile. It survived on
+  `#![allow(dead_code)]` alone. Every clause of it was false: the `INSERT`
+  named `gts_id` (the column is `gts_type_id`) and `created_at` (no such
+  column) and omitted `window_start`, `window_end`, `origin` and
+  `acceptance_sequence`, all `NOT NULL` with no default; its doc called
+  `PgRecordStore` "not-yet-implemented" 40 lines below where the file
+  constructs one, cited a FK-referenced-delete test when `grep REFERENCES
+  migrations/0001_init.sql` returns nothing, and said `status` takes its
+  column default when `status` is not a column. **Nothing here for Task 15 to
+  repair; it is already gone.**
+
+  The `dead_code` allowance stays, because it is separately earned:
+  `mod common;` compiles a private copy into each binary, so
+  `bring_up_real_retention` (called from `cleanup_integration_pg.rs:106`) and
+  `bring_up_with` (`:69`) really are dead in the contract binary. The header
+  comment now says that the allowance covers exactly that, and that it hides
+  a caller-less helper just as well — with this deletion as the worked
+  example.
+
+**Three things that must survive this task's rewrite, one that saves a
+search, and one claim of Task 14's that expires with your Step 7:**
+
+1. **`start_backend`, `bring_up` and `NO_DROP_RETENTION_SECS` are the
+   acceptance test's harness — do not fold them into whatever the five
+   rewritten suites use.** After this task those five drive `PgRecordStore`
+   directly while `contract_conformance_pg.rs` drives it through
+   `StorageAdapter`, and that split is deliberate rather than duplication:
+   the port's contract obligation is at the SPI, the mechanics the five
+   suites assert are at the store. Unifying them either drops the SPI from
+   the acceptance path or drags the adapter into tests that mean to reach
+   past it. **If `start_backend` stops compiling, Task 14's acceptance
+   criterion has regressed** — re-run it before Step 7's unfiltered count.
+2. **The retention window is not cosmetic.** `bring_up` must keep passing
+   `NO_DROP_RETENTION_SECS`, for the reason its doc gives: the contract
+   fixtures sit at `FIXTURE_EPOCH` + 0/30/60/90/120/150 days, six distinct
+   7-day chunks, all past a 365-day cutoff.
+3. **The fixture-id decision has an ADR.** The derived id is a UUIDv5 over
+   the 5-tuple under
+   `cpt-cf-usage-collector-adr-record-identity-derivation`, which
+   `migrations/0001_init.sql:15-17` cites by name; Step 3's `id_uniqueness`
+   assertions are that ADR's, so read it rather than re-deriving the rule
+   from the schema.
+4. **Delete a clause from `contract_conformance_pg.rs`'s module doc once the
+   five suites compile.** Its keyset-coverage bullet reads "…and, once Task
+   15 rewrites them, the other pg suites — which today do not compile, so
+   they cover nothing yet." Task 14 wrote that true and it goes false the
+   moment your Step 7 is green: **drop the "which today do not compile, so
+   they cover nothing yet" clause**, and the "once Task 15 rewrites them"
+   hedge with it. Nothing else collects this — the sentence lives in a file
+   this task does not otherwise touch, which is exactly how a claim outlives
+   its code. It is the only clause there with an expiry: the coverage bullet
+   is pinned to the SDK's constants and carries no counts, and the two
+   `record_store_tests` names beside it are citations that a rename breaks
+   visibly rather than claims that quietly go false.
+
+**One item Task 1 handed forward, and one that has already closed itself:**
+
+- **`setup_with_type(_gts, _fields)` is already gone.** `grep -rn
+  setup_with_type gears/system/usage-collector/` returns nothing as of
+  `5fc029a75`; Task 1 removed it with the catalog. Nothing to close — do not
+  go looking for it.
+- **`pg_insert_with_unregistered_gts_id_is_usage_type_not_found` must be
+  deleted, not repointed** (see Task 3 Step 2b). It passes for the wrong
+  reason once the catalog table is gone.
+
+- [x] **Step 2: `schema_integration_pg.rs`**
+
+Asserts the DDL. Rewrite against Task 3's schema: the hypertable partitions on
+`window_end`, the dedup UNIQUE spans the 5-tuple, the partial unique index on
+`(invalidates, window_end)` exists, `entry_type` is a stored generated column,
+and `usage_type_catalog` **does not exist**.
+
+That last one is a real assertion, not a formality — it is what catches a stale
+database surviving a migration change.
+
+- [x] **Step 3: `id_uniqueness_integration_pg.rs`**
+
+The id is a UUIDv5 over the 5-tuple. Assert that two entries differing only in
+`window_start` get different ids, and that `entry_type` is **not** an input to
+the derivation (`DESIGN.md:63`) — an invalidation and its target differ in
+`invalidates` and `idempotency_key`, and the latter is what separates their ids.
+
+- [x] **Step 4: `records_ingest_integration_pg.rs`**
+
+The behavioural home for Task 9. Cover:
+
+- an exact-equality retry under the same idempotency key is absorbed and
+  returns the previously persisted row
+- a divergent same-key write is a fail-closed `IdempotencyConflict`
+- `acceptance_sequence` is strictly monotonic per `(tenant_id, gts_type_id)`,
+  and two different scopes do **not** share a sequence
+- a second invalidation of one target is `AlreadyInvalidated` — **including
+  when both arrive in one `create_batch`**, which is the case the SPI singles
+  out
+- per-record outcomes in a batch are aligned with input order
+
+The concurrency case is worth a real test: two concurrent `create_usage_record`
+calls invalidating one target, exactly one accepted. That is what the atomicity
+obligation is for, and a sequential test cannot see it.
+
+- [x] **Step 4b: Two tests assert the rule Task 8 inverted — delete, do not repoint**
+
+`tests/records_query_integration_pg.rs` carries two tests that encode the
+*retired* compensation semantics, found during Task 2:
+
+- `pg_aggregate_sum_nets_compensation` (`:336`)
+- `pg_aggregate_count_excludes_active_compensation` (`:383`)
+
+Both set `compensation.corrects_id = Some(original_id)` (`:348`, `:398`), and
+`corrects_id` no longer exists anywhere in the SDK (`grep -rn 'corrects_id'`
+over `usage-collector-sdk/src/` returns nothing). So neither compiles.
+
+**They must be deleted rather than ported, and the reason is semantic, not
+mechanical.** Their subject is the rule Task 8 *inverted*: the old model had
+`SUM` net across signed compensation rows and `COUNT` filter
+`corrects_id IS NULL`. An invalidation echoes the quantity it withdraws rather
+than negating it, so netting now double-counts, and both halves of a withdrawn
+pair are excluded under every fold. A test "ported" by swapping `corrects_id`
+for `invalidates` would assert the opposite of the current contract while
+looking like a faithful translation. That is the most dangerous shape available
+here.
+
+The replacement coverage is the three withdrawal-exclusion tests Task 8
+shipped in `aggregate_tests.rs` (`an_invalidation_entry_is_excluded_under_every_fold`,
+`a_record_an_accepted_invalidation_names_is_excluded_under_every_fold` and
+`no_fold_gets_its_own_withdrawal_rule`) plus the behavioural cases in Step 5
+below. Write the verdict as "deleted
+because the rule it asserted was replaced by its opposite", and name the
+replacement.
+
+**The module doc at `:6-7` still advertises `SUM nets compensation`.** Task 2
+dropped its `active-only` sibling but deliberately left this one, because the
+fold rewrite is yours. Remove it in the same pass.
+
+- [x] **Step 5: `records_query_integration_pg.rs`**
+
+The behavioural home for Tasks 10, 11 and 12. Cover:
+
+- `from <= window_end < to` at both boundaries, and a point event
+  (`window_start == window_end`) needing no special case
+- an entry whose `window_start` is inside the range but whose `window_end` is
+  outside is **not** selected
+- `$filter` on each of the published eight resolves and discriminates —
+  especially `origin` and `entry_type`, the two entry 16 could not serve
+- `$orderby` on each of `KEYSET_SAFE_RECORD_FIELDS`
+- a page boundary falling **between** an invalidation and its target, which the
+  SPI names explicitly: the pair shares a `window_end` but not an `id`
+- a `next_cursor` round-trips and its `f` equals the `filter_hash` passed in
+- the point lookup returns `NotFound` for a row outside the compiled scope,
+  and the **same** error for an id that does not exist
+- both halves of a withdrawn pair are returned by `list` and `get`, and
+  contribute nothing to any fold
+- an orphan invalidation whose target was purged still contributes nothing
+
+- [x] **Step 6: `cleanup_integration_pg.rs`**
+
+Retention. The policy now measures from `window_end` (Task 3 Step 3). Assert
+the retention horizon is measured from the covered period, which is what
+`cpt-cf-usage-collector-fr-idempotency` requires.
+
+- [x] **Step 7: Run the whole pg suite**
+
+```bash
+cd gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin
+cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres --no-fail-fast 2>&1 | tail -20
+```
+
+Report the unfiltered `N passed / M skipped`.
+
+**Harness bring-up: what was wrong, what it cost, and what is left.**
+
+Spec review and code review between them turned Task 15's "one unexplained
+failure" into a measured defect with a fix. Recorded here because Task 17 owns
+the CI lane and inherits the numbers.
+
+1. **The wait strategy matched the wrong server.** The harness waited for the
+   **first** "database system is ready to accept connections", and this image
+   logs it **twice**: `docker-entrypoint.sh` runs a bootstrap server for initdb
+   with `-c listen_addresses=''` (entrypoint line 297, **unix socket only**),
+   then `001_timescaledb_tune.sh`, then the real server. Measured 0.64 s apart.
+   Waiting for the first handed back a container whose published TCP port
+   refuses connections, leaving `build_pool`'s undocumented 10-second budget as
+   the only thing between the suite and `pool connect failed`.
+
+   Fixed to wait for the second, **across both streams**: measured against the
+   Docker API this harness uses, `LogSource::StdErr` with `times(2)` never
+   fires (45 s timeout) while `BothStd` with `times(2)` returns in ~1.2 s and
+   `BothStd` with `times(3)` never fires - so there are exactly two and they
+   are split across the streams. Do not "tighten" it to `stderr`.
+
+2. **The published port sometimes answers, with an HTTP server behind it.**
+   Observed once as `pool connect failed … UnexpectedEof "expected to read
+   1414811696 bytes, got 47 bytes at EOF"`. Decoded against the
+   `sqlx-postgres` this workspace locks (0.9.0), whose `connection/stream.rs`
+   requires byte 0 to be a valid `BackendMessageFormat` and reports
+   `expected_len = message_len + 1`: the wire prefix was
+   `1414811695 = 0x5454502F` (`TTP/`) behind a byte 0 of `b'H'`
+   (`CopyOutResponse`) - **the first five bytes were `HTTP/`** - and
+   `HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n` is exactly the 47
+   bytes reported. So the peer was a Docker Desktop port-forwarder or API
+   endpoint, or another local HTTP service holding that ephemeral port, and
+   **not** a slow Postgres. It occurred in the one run of six that also retried
+   a container, which ties it to the same port-publication race. **Retrying
+   `build_pool` cannot help** - the port stays wrong - so the pool connect now
+   sits **inside** the container retry loop and a container whose port will not
+   serve a pool is discarded for a fresh one. On a recurrence this names a
+   checkable culprit class rather than a mystery.
+
+   (Task 15 first decoded this as `TRAP` / `0x54524150`. That is a different
+   number - 1 414 676 816 - and it ignored the `+ 1` framing. The third
+   load-bearing measurement this task got wrong on first writing, and the third
+   caught by review; each is corrected in place rather than quietly amended.)
+
+3. **Measured before and after**, full unfiltered runs of ~265 tests, one
+   container per integration test:
+
+   | | port retries | `pool connect failed` |
+   | --- | --- | --- |
+   | before (first "ready", flat 10 s connect budget) | ~9 per run | 2 in 10 runs |
+   | after (second "ready", connect inside the retry) | **3 across 8 runs** | **0 in 8 runs** |
+
+   That is ~0.14% of bring-ups against ~3.4%, and eight consecutive 265/265
+   runs. **The retry stays** - the residual rate is not zero, the last
+   attempt's error is returned unchanged so a genuine failure still says what
+   it is, and it is not `nextest --retries`, which cannot tell a harness
+   failure from an assertion failure.
+
+4. **Still open.** Task 15's original unexplained single failure was never
+   captured, so it cannot be *proved* to have been (1) or (2) - but both were
+   live in that build, and both are now closed. If a bring-up failure recurs,
+   the messages name which of the three modes it was, and
+   `--success-output immediate | grep -c "starting another"` is how the rate is
+   read; the messages land on the stderr of tests that then pass, so nextest
+   discards them by default.
+
+- [x] **Step 8: Commit**
+
+```bash
+git add gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/tests/
+git commit -s -m "test(timescaledb-plugin): rewrite the Postgres suites for the current model
+
+Covers what the contract suite does not: the keyset obligations, the
+concurrent at-most-one-invalidation case, per-scope acceptance_sequence
+monotonicity, and a page boundary falling between an invalidation and its
+target."
+```
+
+---
+
+## Task 16: Rewire the plugin into the build
+
+Substantially the revert of `8225d8ebd` `build(usage-collector): unwire the
+timescaledb plugin` — **minus the CI half, which is Task 17**, because turning
+CI back on is a decision rather than a revert.
+
+```bash
+git show --stat 8225d8ebd
+```
+
+Measured: 9 files, `.github/workflows/ci.yml` (3 lines),
+`.github/workflows/e2e.yml` (12), `Cargo.lock` (37), `Cargo.toml` (1),
+`Makefile` (12), `apps/cf-gears-example-server/Cargo.toml` (4),
+`apps/cf-gears-example-server/src/registered_gears.rs` (3),
+`testing/e2e/suites/usage_collector/config.yaml` (16),
+`testing/e2e/suites/usage_collector/e2e.yaml` (7).
+
+**Files:**
+- Modify: `Cargo.toml`, `Cargo.lock`, `Makefile`, `apps/cf-gears-example-server/Cargo.toml`, `apps/cf-gears-example-server/src/registered_gears.rs`, `testing/e2e/suites/usage_collector/config.yaml`
+
+- [x] **Step 1: Confirm the workspace member line, and add the dependency alias**
+
+**This step is already done, and the open question in it is answered.** Task 8
+checked both halves so this task's implementer does not re-litigate a settled
+commit.
+
+- **The `members` line is present**, at `Cargo.toml:142`, added by Task 0 in
+  `618e5b67f` — it had to be, because the crate cannot be compiled in any form
+  without it. `cargo metadata` resolves the package and `cargo check -p
+  cf-gears-timescaledb-usage-collector-plugin --lib` works.
+- **No workspace dependency alias was removed.** `git show 8225d8ebd -- Cargo.toml`
+  is a **single hunk** containing only the `members` line, so there is nothing
+  at the measured lines 350/365 to restore.
+- **`Cargo.lock` is done too.** `8225d8ebd` deleted 37 lines; `618e5b67f`
+  restored 36, and cargo reconciles the remainder on the next build.
+
+So Steps 2, 3 and 4 are the whole of the remaining work: the Makefile target
+(12 lines), the example-server registration (`Cargo.toml` 4 lines,
+`registered_gears.rs` 3), and the e2e suite config (16 lines). Confirm rather
+than assume:
+
+```bash
+grep -n 'timescaledb\|test-usage-collector-pg' Makefile
+grep -rn 'timescaledb' apps/cf-gears-example-server/
+grep -n 'timescaledb' testing/e2e/suites/usage_collector/config.yaml
+```
+
+All three answered empty at Task 8's close.
+
+**Confirmed empty again at Task 16's start**, so Steps 2-4 were applied as a
+clean `git apply -R` of `8225d8ebd`'s four non-CI file hunks — every
+surrounding context line was byte-identical, so nothing had drifted and no
+adjustment was needed. The eight config keys the e2e block sets all still exist
+on `TimescaleDbPluginConfig`, which carries `deny_unknown_fields`; and
+`retention_period_secs: 3153600000` is exactly `MAX_RETENTION_SECS`, which
+`validate` bounds inclusively.
+
+`Cargo.toml` needed no edit. `Cargo.lock` gained exactly one line — the example
+server's new dependency edge — which is the remainder cargo was expected to
+reconcile.
+
+- [x] **Step 2: Restore the Makefile target**
+
+`git show 8225d8ebd -- Makefile` shows what was removed. Restore
+`test-usage-collector-pg`, adjusting for anything that has changed in the
+Makefile since.
+
+- [x] **Step 3: Restore the example server registration**
+
+`apps/cf-gears-example-server/Cargo.toml` and `src/registered_gears.rs`.
+
+- [x] **Step 4: Restore the e2e suite config**
+
+`testing/e2e/suites/usage_collector/config.yaml` — the 16 removed lines
+configure the TimescaleDB plugin DSN with the port placeholder `conftest.py`
+substitutes.
+
+**`e2e.yaml` is left for Task 17 — but it is not only a comment.** The 7 lines
+`8225d8ebd` touched there are 6 added comment lines *and one deletion*: the
+`timescaledb-usage-collector` entry in the suite's own `features:` list. That
+line is the build-half twin of the config restored here, and without it the
+e2e server binary is compiled without the plugin, leaving this config block
+inert. Task 17 Step 3 as written only rewrites the header, so **restoring that
+feature line has to happen there too**, or Task 17 Step 4's `make
+e2e-usage-collector` will fail for a reason that has nothing to do with the
+python. Note also that `config/e2e-features.txt` does not list the feature and
+never did — the per-suite `e2e.yaml` list is what carries it.
+
+- [x] **Step 5: `cargo check --workspace` for real**
+
+```bash
+cd /Users/binarycode/code/virtuozzo/gears-rust
+cargo check --workspace --all-targets
+```
+
+This is the first run that includes the plugin. `Cargo.lock` updates itself.
+
+**Clean.** But note what it does *not* cover: the example server's
+`timescaledb-usage-collector` feature is optional and off by default, so
+`--workspace` checks the plugin as its own package and never through the
+server. Step 3's registration edge — the only genuinely new wiring in this
+task — needs its own run:
+
+```bash
+cargo check -p cf-gears-example-server --features timescaledb-usage-collector
+```
+
+Also clean; this is the run that compiled the plugin *into* the server.
+
+- [x] **Step 6: Full verification bar**
+
+```bash
+cargo nextest run -p cf-gears-usage-collector -p cf-gears-usage-collector-sdk \
+  -p cf-gears-noop-usage-collector-plugin \
+  -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast
+cargo nextest run -p cf-gears-usage-collector-sdk --features contract --no-fail-fast
+cargo clippy --workspace --all-targets --all-features
+cargo +nightly fmt
+cargo doc --no-deps -p cf-gears-usage-collector-sdk -p cf-gears-usage-collector
+```
+
+Against baseline: **716 + the plugin's own tests, 0 skipped**; contract
+**166 / 0**; doc warnings **35** (host) and **0** (SDK), neither grown. Read the
+`generated N warnings` line.
+
+**This is the first clippy run that reaches the plugin's `tests/`, and expect a
+backlog.** `--all-features` turns on `postgres`, which is what makes those five
+files compile at all; before Task 15 rewrote them they carried 61 errors, and an
+unresolved import suppresses every lint for the whole crate (Task 13 Step 2).
+So the five integration files have **never been linted** — not in this slice and
+not before it. Budget for it here rather than being surprised: Task 13 verified
+that `-p cf-gears-timescaledb-usage-collector-plugin --all-targets` without the
+feature is clean, so anything this run reports comes from `tests/`.
+
+**The backlog did not materialise: the run is clean, 0 errors and 0 warnings,
+in 3m58s.** Task 15's rewrite had already carried
+`#![allow(clippy::expect_used, clippy::unwrap_used)]` — plus `clippy::panic` on
+the two large suites — at the top of the four files that need it.
+`contract_conformance_pg.rs` needs none, because it calls neither `unwrap` nor
+`expect`.
+
+**Silence here is worth nothing unless the lint provably reaches `tests/`**,
+which is the very failure mode the paragraph above describes. Named mutation:
+inserting `let _clippy_probe: String = "".to_string();` into
+`schema_integration_pg.rs`'s
+`the_ledger_is_a_hypertable_partitioned_on_window_end` makes the scoped run
+fail with `str_to_string` and `manual_string_new`, and cargo names the target —
+`could not compile ... (test "schema_integration_pg")`. Reverted byte-exactly.
+
+**Measured against baseline:**
+
+| Measure | Baseline | This run |
+| --- | --- | --- |
+| four-package `nextest` | 716 + the plugin's | **936 passed / 0 skipped** |
+| contract | 166 / 0 | **166 passed / 0 skipped** |
+| `cargo doc`, `cf-gears-usage-collector` | 35 | **35** |
+| `cargo doc`, `cf-gears-usage-collector-sdk` | 0 | **0** |
+
+The SDK emits no `generated N warnings` line at all, which is how rustdoc
+spells zero. Both crates show a `Documenting` line, so neither count came from
+a cached no-op.
+
+The 936 splits as `cf-gears-usage-collector` 551, `-sdk` 166,
+`noop-usage-collector-plugin` 5, `timescaledb-usage-collector-plugin` 214.
+**The obvious arithmetic is `716 + 214 = 930`, and the extra 6 are the
+plugin's after all**: its `[dev-dependencies]` enables the sdk's `contract`
+feature (`plugins/timescaledb-usage-collector-plugin/Cargo.toml:81`), and cargo
+unifies features across a single invocation, so the sdk's own lib test binary
+gains its `contract` module and goes 160 -> 166 the moment the plugin joins the
+run. Measured with `nextest list`: the three baseline packages alone are still
+551 + 160 + 5 = **716**, exactly the baseline at this plan's line 128, and they
+list **zero** `contract::contract_tests::*` cases; add `-p ...-plugin` and the
+same six appear, all of them under `-sdk`. Nothing is skipped, so the bar holds.
+
+**A consequence for the bar itself: the `contract` row is not an independent
+measurement.** Its 166 is the same 160 + 6 the four-package run already
+contains, so the two rows share a suite rather than corroborating each other.
+
+`cargo +nightly fmt` changed no file.
+
+**The restored Makefile target was run, not merely read.** `make -n
+test-usage-collector-pg` expands to the intended `cargo nextest run -p
+cf-gears-timescaledb-usage-collector-plugin --features postgres`, and that lane
+is **265 tests across 7 binaries**. Rather than spend the 48-container budget
+that Task 17 owns, a single test was run out of it
+(`the_dedup_unique_spans_the_five_tuple`): 1 passed, 264 skipped, container
+reaped.
+
+- [x] **Step 7: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock Makefile apps/cf-gears-example-server \
+        testing/e2e/suites/usage_collector/config.yaml
+git commit -s -m "build(usage-collector): rewire the timescaledb plugin
+
+Reverses the build half of 8225d8ebd. The plugin is a workspace member again,
+the example server registers it, the nextest pg target is back, and the e2e
+suite has its plugin config. The CI steps are restored separately."
+```
+
+---
+
+## Task 17: Un-defer CI and bring the e2e python current
+
+
+**What earlier tasks measured and this task inherits as decisions, not
+discoveries** (items 1 and 2 are Task 15's, item 3 is Task 16's):
+
+1. **The container budget.** The pg lane is now **48 integration tests, one
+   container each**, up from 37. `001_timescaledb_tune.sh` sizes
+   `shared_buffers` from **host** RAM - measured at `1959MB` on a 7.8 GB host,
+   with `work_mem = 7837kB` - so N containers each believe they own the box,
+   and on a wide runner that is N x ~2 GB of shared-memory segments. Either pin
+   `test-threads` for this lane in `.config/nextest.toml`, or pass an explicit
+   `-c shared_buffers=` in `test_containers::timescaledb()`. Task 15 deliberately
+   did neither: the first is a CI-lane decision and the second changes an image
+   helper three gears share.
+
+   **Price the first option knowing `.config/` does not exist** - there is no
+   `nextest.toml` anywhere in the repo, so that route means *creating* the file
+   and inheriting whatever else it then governs, not editing one line of an
+   existing config. Today the lane runs at nextest's default
+   `test-threads = num_cpus`.
+
+2. **`schema_integration_pg.rs` is the cheapest reduction available** - 7 tests,
+   7 containers, all asserting immutable post-migration catalog state with no
+   writes, so a `OnceCell<TsHarness>` takes it to 1. **Not for ingest, query,
+   id-uniqueness or cleanup**: the per-test container is what makes their keying
+   assumptions safe, and `start_backend`'s rustdoc says so in as many words.
+
+3. **After this task, the e2e build is the only thing in CI that compiles the
+   plugin into the server.** `test-usage-collector-pg` and the `ci.yml` step
+   Step 2 restores both test the plugin **standalone**; no CI job passes
+   `--features timescaledb-usage-collector` to the example server, because that
+   feature is optional and off by default (`Makefile:27` excludes it
+   deliberately - see the reason recorded there). So the one
+   `timescaledb-usage-collector` line in the suite's `e2e.yaml` `features:` list
+   is simultaneously the only thing that makes the e2e suite functional **and**
+   the only thing that ever exercises `registered_gears.rs:101-102` in CI.
+   **Drop it and both go quiet at once, neither loudly** - see Step 3b.
+
+Per the owner's decision, **both** removed CI steps come back. The type-plane
+rewrite that justified deferring them ends with this slice.
+
+**Files:**
+- Modify: `.github/workflows/ci.yml`, `.github/workflows/e2e.yml`, `testing/e2e/suites/usage_collector/e2e.yaml`, `testing/e2e/suites/usage_collector/test_integration_seams.py`, and whatever Step 1 turns up
+
+- [x] **Step 1: Read the e2e python before assuming the revert is clean**
+
+```bash
+cd /Users/binarycode/code/virtuozzo/gears-rust/testing/e2e/suites/usage_collector
+grep -rn -i 'usage_type\|corrects\|status\|created_at\|catalog\|old model\|still on the' *.py
+```
+
+`test_integration_seams.py:58` carries a comment saying the plugin "is still on
+the" old model. Read the whole comment and the test under it. Others may name
+retired routes — slice 2 removed two usage-type routes and slice 5 added
+`/records/backfill`.
+
+Produce the same live-question / dead-question inventory Task 15 Step 1 asks
+for, and report per-item verdicts.
+
+- [x] **Step 2: Restore the CI steps**
+
+```bash
+git show 8225d8ebd -- .github/workflows/ci.yml .github/workflows/e2e.yml
+```
+
+Two steps were removed: **"Test timescaledb usage-collector plugin (pg
+integration)"** in `ci.yml` and **"Run usage-collector E2E tests (TimescaleDB
+container)"** in `e2e.yml`. Restore both, adjusting for drift in the
+surrounding workflow.
+
+**Delete the comments that replaced them.** `e2e.yml:100-102` says the
+usage-collector suite "is not run here at all during the type-plane rewrite —
+see testing/e2e/suites/usage_collector/e2e.yaml". Leaving that comment beside a
+restored step is exactly the "claim outliving the code" defect.
+
+**The e2e step also needs a "may not skip itself" gate**, and the repo has
+already settled the argument: `ci.yml` sets `RG_PG_REQUIRE_DOCKER: "1"` with
+the comment *"Fail if Docker is unreachable instead of letting the suite skip
+itself into a green step that asserted nothing."* The usage-collector suite has
+two such skips - `E2E_BINARY` unset and Docker unreachable, both in
+`conftest.py`'s autouse session fixture - and either yields **11 skipped and a
+green step**. That buys more here than it does for resource-group: this step is
+the only job in CI that compiles the storage plugin into a server, so a silent
+skip takes the plugin's only end-to-end exercise with it.
+
+Done as `UC_E2E_REQUIRE_DOCKER: "1"` on the step plus a `_refuse()` helper in
+the suite's conftest that fails when the variable is set and skips otherwise.
+
+**What was actually exercised, which is narrower than "proven both ways":**
+both outcomes of the variable, on ONE of the two refusal sites. With the
+variable set and `E2E_BINARY` unset the run is **11 errors**; with neither set
+it is **11 skipped**. The Docker branch was exercised in neither mode, so the
+combination a real CI outage would take - variable set, binary present, daemon
+down - is the untested one. Both branches funnel through the same `_refuse()`,
+so the residual risk is the branch's own `try`/`except` and not the
+skip-versus-fail decision, but that is a reason to state the extent rather
+than to round it up.
+
+The Rust lane needs nothing - `make test-usage-collector-pg` has no skip path.
+
+The **generic** version of this - a minimum-collected-count assertion in
+`run_e2e.py`, which would cover mini-chat's identical `E2E_BINARY` skip and
+every future self-managed suite - is repo-wide harness work belonging to
+neither Task 17 nor Task 18, and is raised in the PR description instead.
+
+- [x] **Step 3a: Rewrite the `e2e.yaml` header**
+
+It currently opens:
+
+> NOT RUN IN CI during the type-plane rewrite: the step that invoked this suite
+> has been removed from .github/workflows/e2e.yml. … `make e2e-usage-collector`
+> still runs it locally and is expected to fail until the TimescaleDB plugin is
+> ported.
+
+Every clause is now false. **Replace the block, do not append to it.**
+
+- [x] **Step 3b: Restore the `timescaledb-usage-collector` feature line**
+
+**`8225d8ebd` touched 7 lines in `e2e.yaml` and only 6 of them are the comment
+above.** The seventh is a *deletion*: the `timescaledb-usage-collector` entry in
+the suite's own `features:` list (`e2e.yaml:9-10`). Restore it.
+
+It is the build-half twin of the `config.yaml` block Task 16 restored, and
+without it that block is **silently discarded rather than rejected**:
+`run_e2e.py`'s `resolve_features` feeds this list straight to `cargo build
+--features`, the suite uses an explicit `features:` with no `features_file`
+(and `config/e2e-features.txt` does not carry the feature and never did), so
+the server is built without the plugin - and toolkit's bootstrap holds gear
+config as `pub gears: HashMap<String, serde_json::Value>`
+(`libs/toolkit/src/bootstrap/config/mod.rs:115`), looked up per *registered*
+gear, so a block for a gear that was never compiled in is simply never read.
+There is no unknown-key error to warn you.
+
+**This is why it must be done before Step 4, and why Step 4's instruction
+cannot be followed blindly if it is skipped.** The failure mode is the suite's
+persistence assertions failing against the noop backend, which looks exactly
+like a plugin defect; Step 4 says "fix the plugin, not the suite", and that
+would send you the wrong way for a missing build feature.
+
+- [x] **Step 4: Run the suite locally**
+
+```bash
+cd /Users/binarycode/code/virtuozzo/gears-rust
+make e2e-usage-collector
+```
+
+Needs Docker — the suite starts its own TimescaleDB container. Expected: pass.
+If it does not, the suite is telling you something the unit and contract tests
+could not; fix the plugin, not the suite, unless the inventory in Step 1 says
+the assertion is a dead question.
+
+**Outcome: 11 passed, 0 skipped** — after two things the suite surfaced that
+nothing else could, and one decision it forced.
+
+1. **The gear could not withdraw an entry against any conforming backend.**
+   `service::unrestricted_read_filter()` returned `Expr::Value(Bool(true))` for
+   the invalidation-target pre-read. A bare literal in a boolean position is
+   refused by `convert_expr_to_filter_node` (`FilterError::BareLiteral`) **and
+   by the SDK's own reference implementation**, so no plugin can render it: the
+   TimescaleDB backend answered every invalidation submission with a per-record
+   `500 Internal("invalid read predicate")`, before a connection was even
+   acquired. Replaced by `target_pinned_read_filter(target)` - `id eq <target>`,
+   in the published `$filter` vocabulary, selecting exactly the row the `id`
+   argument already selects. Regression test:
+   `service_tests::the_invalidation_target_scope_translates_for_a_conforming_backend`,
+   which asserts the *translation* and keeps the old shape's refusal as its
+   negative half, so it cannot go quiet.
+
+   **A spy for it already existed and had no assertion behind it, and that
+   gap is now closed rather than recorded.** `HappyPathPlugin::last_get_scope()`
+   - whose own doc says it proves the point lookup "actually handed the plugin
+   a compiled PDP scope" - had exactly one caller, on the DESIGN section 3.3
+   path. The invalidation pre-read dispatched through the same spy and nothing
+   looked at what it captured. It could not have, usefully: the spy stored a
+   `Debug` rendering, which can only be substring-matched, and "does the string
+   mention X" is not the question. The double now keeps the `ast::Expr`
+   (`last_get_scope_expr()`), and `assert_translatable_scope` puts the real
+   converter behind the answer at **both** call sites - one assertion per path,
+   because they are separate expressions in separate functions and one says
+   nothing about the other. Proven by reverting each call site in turn: each
+   revert reds its own assertion and leaves the other green, while the
+   direct-call test stays green through both. That last part is why the
+   direct-call test was not enough on its own.
+
+   The single-record path is the one the E2E suite structurally cannot reach:
+   the gear publishes no single-record POST, so `create_usage_record` is
+   reachable only through the in-process `ClientHub` path (`local_client.rs`).
+
+2. **The at-most-one-invalidation refusal is top-level, not per-record.** The
+   partial unique index on `(invalidates, window_end)` refuses the whole
+   multi-row insert and the transaction rolls back (`record_store.rs`,
+   `map_insert_error` / `create_batch_inner`), so `POST /records` answers
+   `409 ALREADY_INVALIDATED` rather than a 207 with a per-entry rejection.
+   That is the backend's documented statement granularity, not a defect, and
+   the e2e now asserts the shipped behaviour. Task 18 Step 4b item 2 already
+   owns the write-up (including that fixing it needs a per-row `SAVEPOINT`
+   pass); this is the HTTP-level confirmation of it, and the consequence a
+   reader will meet first is that a batch mixing a valid measurement with a
+   colliding withdrawal loses both.
+
+3. **Container budget - decided, not deferred.** The preamble's two options
+   were priced and a third, cheaper one taken: the plugin's own harness passes
+   `-c shared_buffers=256MB` at its single `test_containers::timescaledb()`
+   call site (`tests/common/mod.rs`). Measured on a live container: `1959MB`
+   with no override, `256MB` with it, readiness still logged exactly twice, and
+   `work_mem` still the tuned `7837kB`. `.config/nextest.toml` was **not**
+   created - it would cap concurrency without capping per-container memory, and
+   would put a first-of-its-kind repo-wide nextest config in the tree to solve
+   a one-lane problem. `test_containers::timescaledb()` was **not** changed
+   either: it has exactly one caller in the workspace, and the concurrency that
+   makes the tuner's default bite is this lane's alone.
+
+   Preamble item 2's `schema_integration_pg` `OnceCell` reduction was **not**
+   taken. Measured on the capped lane: the whole 265-test run (214 lib + 51
+   integration) finishes in **29.8 s**, and the seven schema tests cost 2.7 -
+   5.2 s each while eight containers run concurrently. The reduction buys six
+   containers inside a half-minute lane, and costs a `TsHarness` held in a
+   `static` that Rust never drops - cleanup would move off
+   `ContainerAsync::drop` and onto the testcontainers reaper. The memory
+   problem it was offered against is already priced by the cap above.
+
+   The lane is **51 integration tests across 6 binaries** (`cargo nextest list
+   -p cf-gears-timescaledb-usage-collector-plugin --features postgres`), one
+   container each - not the 48 the preamble measured. The Makefile comment
+   carried the stale number; it now carries this one and the command to recount
+   it.
+
+**What the rewritten python covers.** Both quarantined modules were rewritten
+rather than repointed, because `make_usage_type` had no successor: a meter is
+now a derived GTS **type** registered in `types-registry`, and the suite
+declares one per test by POSTing the published base schema
+(`docs/schemas/usage_record.v1.schema.json`, read off disk so there is no
+second copy) plus a derived meter to `POST /types-registry/v1/entities`.
+Nothing seeds that base - usage-collector declares no `#[gts_type_schema]` for
+it and no shipped config registers it - which is itself worth Task 18's
+attention: a real deployment has to register it too.
+
+- [x] **Step 5: Commit**
+
+```bash
+git add .github/workflows/ci.yml .github/workflows/e2e.yml \
+        testing/e2e/suites/usage_collector/
+git commit -s -m "ci(usage-collector): run the timescaledb plugin and E2E suites again
+
+Restores the two steps 8225d8ebd removed and deletes the comments that stood
+in for them, which said the suite is not run during the type-plane rewrite.
+That rewrite ends with this slice. Brings the e2e python to the current model.
+
+CI regains a Docker dependency for the usage-collector lanes."
+```
+
+---
+
+## Task 18: Regenerate `api.json`, settle the label, update `DIVERGENCES.md`
+
+Last, because `api.json` is a generated artifact that conflicts noisily.
+
+**Files:**
+- Modify: `docs/api/api.json`, `DIVERGENCES.md`,
+  `gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/README.md`,
+  `gears/system/usage-collector/usage-collector-sdk/src/models.rs`
+  (the last two are Step 4b's entry-4 fix and the `AVG` rustdoc this task was
+  routed; the plan's original file list named only the first two)
+
+> **FLIGHT CORRECTION (Task 18, as shipped).** Four claims below were falsified
+> by measurement while the task ran. Each is corrected in place at its step;
+> collected here so a reader does not have to find them. **Every one is a count
+> or a scope claim** — the defect class this task's own output exists to
+> register, arriving in the instructions for registering it.
+>
+> 1. **Step 4's "Slice 6 contributed three" is four, the plan's total of eleven
+>    is fourteen, and the number the PR actually rests on is thirty.**
+>    `9f64cf22f..HEAD` carries 14: slice 6 contributed four
+>    (`b353c27fc`, `8b30a288d`, `7691b8222`, `7cce8db2e`) and this plan ten —
+>    the predicted Tasks 1, 2, 3, 8, 9, 10, 11, 12 plus Task 13's two metric
+>    renames (`3a37fad36`, `74514f02e`), which are real operator-visible breaks
+>    the plan did not anticipate. **But the label goes on a PR against `main`**,
+>    and `git merge-base main HEAD` is `42e285e9a`, not `9f64cf22f` — that range
+>    carries **30**. The four that removed the very routes and fields the
+>    regeneration deletes (`d027e2089`, `547915dc1`, `b3a3811fe`, `c8a51ea73`)
+>    are in the other sixteen and in none of the plan's counts. Recorded with
+>    its reproducing command in `DIVERGENCES.md` §A, because a numeral in a plan
+>    is exactly what went stale here.
+> 2. **Step 5's §G bullet says "for four of the six dimensions"; it is two of
+>    three.** Measured against `bucket_key` and `dimension_presence_guard`:
+>    three of the six dimensions can be absent at all — `SubjectId`,
+>    `SubjectType`, `Metadata` — and the other three read `NOT NULL` columns, so
+>    the case cannot arise for them. The SDK documented the drop answer for two
+>    of those three, and the undocumented one, `Metadata`, is the one place the
+>    two backends actually differed.
+> 3. **Step 5's LATEST bullet says "DESIGN §3.10 asks each plugin's deployment
+>    guide to state the bounds it can hold"; §3.10's enumeration contains no
+>    memory bound.** It requires a deployment guide per plugin crate and lists
+>    six mandatory statements, all consistency, freshness, retention and
+>    throughput. The bound belongs to that guide **by kind and not by the
+>    enumeration** — and the plugin publishes no such guide at all, which is
+>    entry 23's subject. Entry 20 makes the kind claim; the scope claim would
+>    have been the defect the entry is about.
+> 4. **Step 3's "stop and report it" was read as protecting *accounting*, not
+>    literal prediction, and the task did not stop.** The regeneration contains
+>    items §A does not predict — `AggregationOpDto`'s removal, `TimeRangeDto`,
+>    every added DTO field, and the `from` / `to` parameters — and every one
+>    traces to a commit on this branch. They are enumerated in §A's discharge
+>    rather than left for the next reader. Stopping would have left `api.json`
+>    byte-identical to `main` with the contract workflow red, which is the debt
+>    this task exists to clear.
+
+- [x] **Step 1: Re-verify §A before acting on it**
+
+DIVERGENCES §A records what the regeneration will contain, and slice 6
+corrected it once already.
+
+**Measured at this slice's start:** `git diff --stat main -- docs/api/api.json`
+is **empty** — the file is byte-identical to `main`. `api.json` carries
+`QueryAggregatedUsageRecordsRequest` **twice** and `AggregationRequest`
+**zero** times. §A's three claims — adds `/records/backfill`, removes two
+usage-type routes, renames a published component — check out.
+
+Re-run those three commands before trusting these numbers; Tasks 1-17 have
+landed since.
+
+- [x] **Step 2: Regenerate**
+
+```bash
+cd /Users/binarycode/code/virtuozzo/gears-rust
+make openapi
+git diff --stat docs/api/api.json
+```
+
+- [x] **Step 3: Read the diff against §A**
+
+Confirm it adds `/records/backfill`, removes the two usage-type routes, and
+renames `QueryAggregatedUsageRecordsRequest` to `AggregationRequest`. **If the
+diff contains anything §A does not predict, stop and report it** rather than
+committing a generated file whose contents you have not accounted for.
+
+- [x] **Step 4: Settle the `breaking-api-acknowledged` label**
+
+The slice-6 breaking changes plus this slice's. Enumerate:
+
+```bash
+git log --oneline 9f64cf22f..HEAD | grep '!'
+```
+
+~~Slice 6 contributed three. This plan adds a `!` to Tasks 1, 2, 3, 8, 9, 10, 11
+and 12.~~ **Both numbers are wrong, and the base commit is the wrong one — see
+flight correction 1.** Slice 6 contributed **four**; this plan **ten** (the eight
+predicted plus Task 13's two metric renames); `9f64cf22f..HEAD` totals
+**fourteen**; and the PR goes against `main`, whose merge-base `42e285e9a`
+yields **thirty**. Enumerate with the merge-base, never with `9f64cf22f`:
+
+```bash
+git log --oneline $(git merge-base main HEAD)..HEAD | grep '!'
+```
+
+Every one is a real wire or SPI break, so the label is owed.
+
+The label goes on the PR, which does not exist yet — the gateway work and this
+port merge together. **Report the enumerated list so whoever opens the PR
+applies the label**; do not open the PR as part of this task unless asked.
+
+- [x] **Step 4b: The DIVERGENCES entries earlier tasks owe you**
+
+**Do not read the count out of this heading or out of the list below** — tasks
+keep adding to it, and a numeral here goes stale the way every other count in
+this plan has. Work the list.
+
+Items 1 and 2 are Task 9's. It deliberately did not edit `DIVERGENCES.md` —
+this task owns it — but it found two published-contract gaps and is required to
+hand them over. Both are about the SPI's at-most-one-invalidation obligation,
+and both are recorded at the call site in `record_store.rs`; neither is a defect
+to fix here.
+
+1. **The at-most-one guarantee is conditional on the gateway.** The SPI says
+   "**the store** MUST reject" a second withdrawal of a target and MUST make
+   the check atomic with the entry it admits. The store's mechanism is the
+   partial unique index `usage_records_one_invalidation_uniq` over
+   `(invalidates, window_end)` — and a hypertable `UNIQUE` **must** contain the
+   partition column, so no hypertable-compatible index can key on `invalidates`
+   alone. Measured on a live container: two withdrawals of one target with the
+   same `window_end` are rejected; with different `window_end` **both are
+   accepted**. Conformance therefore rests on every withdrawal being a faithful
+   copy of its target's covered period, which the Ingestion Gateway enforces
+   upstream — and a caller reaching the SPI directly is not bound by it. Record
+   what the SPI requires, what the index can enforce, why no
+   hypertable-compatible index can do better, and where the residual guarantee
+   lives. Note also that Task 14's contract check passes either way, because
+   its fixture copies the target's period
+   (`usage-collector-sdk/src/contract/checks/at_most_one_invalidation.rs:274-337`),
+   so a green run is not evidence the general case is covered.
+2. **A cross-call invalidation collision fails a batch whole.** Two withdrawals
+   of one target arriving in the *same* `create_batch` are handled per-row
+   (`plan_batch` pre-rejects all but the first). One arriving in a *later* call
+   is caught by the index, which aborts the whole multi-row `INSERT` — so the
+   batch returns an outer `AlreadyInvalidated` rather than per-record outcomes
+   aligned to input order, which is what the SPI asks for. Fixing it needs a
+   per-row `SAVEPOINT` pass; it was scoped out rather than missed.
+
+3. **Task 13's: the plugin's own `docs/DESIGN.md` is stale wholesale and no
+   entry owns it.** `gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/DESIGN.md`
+   is 710 lines, with `gts_id` on 37 of them, `catalog` on 30, `created_at` on
+   29, `usage_type` on 25, `corrects_id` on 10 and `deactivate` on 7. Its §4
+   Observability table (`:622-686`) still lists
+   `uc_timescaledb_deactivate_duration_seconds`,
+   `uc_timescaledb_usage_type_referenced_total` and
+   `uc_timescaledb_usage_type_catalog_size` — three instruments this crate
+   deleted — and describes `compensations_total` as `corrects_id`-driven.
+
+   **The point of the entry is the ownership gap, not the staleness.** Entry 5
+   owns `gears/system/usage-collector/docs/DECOMPOSITION.md`; entry 14 declares
+   itself "the entry that owns `docs/features/`". **Neither reaches the plugin's
+   directory**, and the plan's self-review registers only those two as
+   out-of-scope-and-known. This file is stale *and* unregistered, which is the
+   worse state — and gear DESIGN §3.11.5 makes that file the nominal **owner**
+   of the `uc_timescaledb_` series, a role its own traceability row (`:90`)
+   claims, so the register needs to say it cannot currently be read as one.
+
+   Task 13 deliberately did not patch the §4 table, on entry 14's own rule
+   about `usage-query.md`: one current paragraph inside a wholesale-stale
+   document is harder to notice than a uniformly stale one. **Register it; do
+   not fix it line by line.**
+
+4. **Task 14's: the plugin's `README.md` is materially wrong and unowned —
+   and unlike entry 3, it is short enough to fix rather than register.**
+   The plan named Task 1 as README's only owner; Task 1 removed the catalog
+   sentence and left the rest. 52 lines, three of them wrong:
+
+   - `:32` calls `UNIQUE (tenant_id, gts_id, idempotency_key, created_at)`
+     the dedup authority and builds a whole paragraph on the "4-tuple" over
+     `created_at`, including a **Note** declaring an "intentional divergence
+     from the SPI's 3-tuple contract". The shipped constraint is
+     `usage_records_dedup_uniq UNIQUE (tenant_id, gts_type_id,
+     idempotency_key, window_start, window_end)`
+     (`migrations/0001_init.sql:73-74`) — the gear's DESIGN §3.7 5-tuple
+     verbatim, which is the opposite of a divergence. **This is the largest
+     surviving instance of the defect class in the crate**: a claim that
+     outlived its code and now describes a rule the schema inverted.
+   - `:34` documents a **Deactivation** bullet — `deactivate` flipping a
+     target and its depth-1 `corrects_id` compensations to `inactive`. Task 2
+     deleted that surface and `corrects_id` no longer exists in the SDK.
+   - `:38` says SPI "conformance is enforced at compile time" because the
+     adapter satisfies the trait. That is a claim about the *signature*.
+     Behavioural conformance is what `tests/contract_conformance_pg.rs` now
+     runs, and the README does not mention it — nor that a green run covers
+     six checks and not DESIGN's seven, which is exactly the reading the
+     suite's own module header exists to prevent.
+
+   Fix all three and say what the acceptance criterion actually is. The
+   contrast with entry 3 is the point: `docs/DESIGN.md` is 710 lines of
+   uniform staleness and gets registered, while a 52-line README with three
+   wrong lines gets corrected — a mostly-right document is where a wrong line
+   does its damage.
+
+5. **Task 16's: the `.cf-studio` ignore block whose trigger has now fired, and
+   which no task mentions.** `.cf-studio/config/artifacts.toml:84-91` ignores
+   the plugin's `docs/`, `src/` and `tests/` from traceability validation,
+   reasoning that "its specs **and code** still describe the superseded model
+   … pending the plugin's own update to aggregation folds and invalidation once
+   the rewrite tracked in PRD section 13 lands."
+
+   **Tasks 3-15 are that rewrite, so the code half of that reason is now
+   false**, and the ignore currently suppresses validation of markers that
+   *are* current — `@cpt-flow:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1`
+   at `src/gear.rs:34`, for one.
+
+   It stays minor rather than a defect because the block's own final clause —
+   "ignoring the specs alone would orphan the plugin's code traceability
+   markers" — keeps it internally coherent for as long as the docs stay stale,
+   and entry 3 above is exactly that docs staleness. **Handle the two
+   together**: whatever entry 3 decides about `docs/DESIGN.md` determines
+   whether this ignore can narrow to `docs/*` or must stand as written.
+
+   **This is routed here because it is otherwise ownerless**: `grep -c
+   'artifacts.toml\|cf-studio'` over this plan returned **0** before this
+   entry, so nothing would have brought anyone back to the file.
+
+6. **Task 17's: nothing seeds the abstract base type, so no deployment can
+   meter anything out of the box.** A meter is a derived GTS **type** of
+   `gts.cf.core.uc.usage_record.v1~` and the gear resolves it through
+   `types-registry`; the base itself is registered by nothing. usage-collector
+   declares no `#[gts_type_schema]` for it (its only link-time type schema is
+   the storage-plugin spec, `usage-collector-sdk/src/gts.rs`), and no shipped
+   config file carries it in `gears.types-registry.config.entities` — verified
+   by grepping every `*.yaml` / `*.json` in the tree for the id, which finds it
+   only in the gear's own `docs/schemas/` and `docs/usage-collector-v1.yaml`.
+   Until it is registered, every ingest is a 404 "GTS type … is not declared".
+   The E2E suite now posts `docs/schemas/usage_record.v1.schema.json` itself
+   for exactly this reason. Record whether the base is meant to be seeded at
+   link time, shipped in `config/quickstart.yaml` the way the AM platform-root
+   tenant type is, or left as an operator obligation.
+
+- [x] **Step 5: Update `DIVERGENCES.md`**
+
+Measured at slice start: **19 numbered entries** (`grep -c '^## [0-9]'`) and
+**15 load-bearing** markers (`grep -c '^\*\*Load-bearing'`). **Note the
+handoff's "14" was stale** — the entry-8 split added one. Re-run both before
+editing.
+
+Changes owed:
+
+- **Entry 16 is resolved.** Task 6 implemented its proposed resolution
+  verbatim. Mark it resolved; do not delete it.
+- **Entry 10 is unchanged.** `accepted_at` and `acceptance_sequence` are still
+  absent from the SDK model, by the owner's decision. The plugin now assigns a
+  sequence in its own table, which is DESIGN §3.7's obligation and **does not**
+  close entry 10's — that is about the SDK model and the published response
+  shape. **Do not mark it resolved, and do not reword it to imply progress.**
+  Add one sentence recording where the sequence now lives, and why that leaves
+  the entry open.
+- **Entry 19 is unchanged.** `latest-tie-break` stays blocked for the same
+  reason. Worth adding: this backend implements the declared tie-break exactly
+  while the reference backend cannot, so the two now differ on a rule no check
+  asserts — which sharpens the entry rather than resolving it.
+- **Entry 14's inventory for `docs/features/usage-query.md` is two lines, and
+  the file is stale wholesale.** Entry 14 declares itself "the entry that owns
+  `docs/features/`" and entry 5 defers the file to it (`DIVERGENCES.md:276-277`),
+  so the register is the index a reader trusts for what is stale — and it names
+  only `:127` and `:139`. Measured at Task 7 (verify before writing, these are
+  the numbers this slice keeps paying for):
+  `gears/system/usage-collector/docs/features/usage-query.md` is **951 lines**;
+  the retired `(created_at, id)` order appears on **14** of them — `:147 :215
+  :232 :331 :333 :347 :349 :356 :453 :763 :786 :877 :932 :939` — and
+  `created_at` on **18** lines / **35** occurrences in that file alone
+  (**62** lines / **93** occurrences across
+  `gears/system/usage-collector/docs/`). The whole read-path description is
+  pre-slice-3: `TimeWindow` in `$filter`, `MISSING_TIME_WINDOW` (18 lines),
+  `last_keyset` (15), `page_after` (14), `validate_cursor_against` (17), a
+  `status` filter field (12).
+  **Do not fix the file, and do not fix it line by line** — one current
+  paragraph inside a wholesale-stale document is harder to notice than a
+  uniformly stale one. Add a paragraph to entry 14 carrying the count and the
+  line list, so the register stops implying the file has two stale paragraphs.
+- **§A is discharged** by Steps 2-3.
+- **§G is resolved by owner decision: drop the row.** Record it as resolved,
+  not as an open divergence. Task 8 Step 6 reframed the question and it went to
+  the owner in that form; the answer matches `InMemoryReferencePlugin` and the
+  published wire shape, where `AggregationBucket.key` types every item as a
+  non-nullable string with no null spelling available. Two corrections to §G's
+  current text, and one thing to add to it:
+  - **The live case was metadata, not subject.** §G is written about
+    `GROUP BY subject_id`, but `record_store.rs`'s `aggregate` already pushes
+    `subject_id IS NOT NULL` / `subject_type IS NOT NULL`, so the two backends
+    agreed on subject all along. It pushes nothing for `Metadata`, and
+    `InMemoryReferencePlugin`'s `bucket_key` returns `None` for an absent
+    metadata key too (`contract/reference.rs:801`) — so the metadata dimension
+    was the one place they actually differed. Task 12 closes it with a presence
+    guard.
+  - **"DESIGN says nothing about the case" understates what was already
+    written.** The SDK documents the drop answer on
+    `AggregationDimension::SubjectId` and `SubjectType` at `models.rs:1587-1592`
+    — "rows without a subject are excluded from the grouping". DESIGN is silent;
+    the SDK was not. ~~for four of the six dimensions~~ **Two of three — see
+    flight correction 2.** Three of the six dimensions can be absent at all
+    (`SubjectId`, `SubjectType`, `Metadata`); the other three read `NOT NULL`
+    columns. The SDK answered two of those three, and the unanswered one is the
+    one that mattered.
+  - **§G already states the consequence** — "grouped buckets need not sum to
+    the ungrouped total", `DIVERGENCES.md:1435-1437` — so do not re-report it as
+    a gap. What is new is that it becomes **uniform rather than accidental**:
+    today it holds for subject because the caller guards those two dimensions,
+    not because anyone decided it should. Add that, and leave the consequence
+    sentence where it is.
+- **A twentieth entry is owed: `LATEST` has an unbounded server-side
+  allocation driven by caller input.** The `Latest` fold is
+  `(ARRAY_AGG(r.value ORDER BY …))[1]`, which materializes a group's values
+  before picking one. `aggregate_limit_clause` gives **zero** protection,
+  because it bounds the number of groups and never the rows within one; the only
+  row bound is the gateway's time window, a request parameter.
+  `MIN`/`MAX`/`SUM`/`COUNT` carry no such cost.
+
+  **Task 15 took the measurement, and it overturned two of the four elements
+  this bullet used to carry.** What it said — "peak state is O(rows scanned),
+  not O(largest group): under a HashAggregate plan every group's array is live
+  at once, and only a sorted GroupAggregate gives the weaker bound, the planner
+  chooses" — is false, and the entry must not publish it. Measured on
+  `timescale/timescaledb:2.29.2-pg18` (`PostgreSQL` 18.6) at the **image's
+  tuned** `work_mem`, not `PostgreSQL`'s compiled 4 MB default: the image runs
+  `001_timescaledb_tune.sh` at initdb, so a fresh container reports
+  `work_mem = 7837kB` and `shared_buffers = 1959MB` on the measuring host. No
+  `SET` was issued. (Task 15 first wrote "default 4 MB `work_mem`" from the
+  compiled default rather than from the `SHOW`; spec review caught it. Nothing
+  downstream moves — hash aggregation is unavailable at any `work_mem`, and the
+  array peak is not `work_mem`-bounded.)
+
+  **The entry must publish the deltas, not the absolutes.** Every RSS figure
+  below is from one host and one fixture table whose shape this plan does not
+  state, and peak RSS counts the shared buffers a backend has touched — so on
+  that tuned 1 959 MB `shared_buffers` the absolutes are an order of magnitude
+  above what an independent replication saw (76.8 / 84.5 / 84.2 / 110.3 MB for
+  the same four queries). **The differences reproduced exactly**, and the
+  differences are the whole claim.
+
+  1. **The planner never chooses a HashAggregate here.** An aggregate carrying
+     its own `ORDER BY` takes the grouped node off the hash path entirely: with
+     `enable_sort` *and* `enable_incremental_sort` off, the plan is still
+     `Sort → GroupAggregate` with the `Sort` reported `Disabled: true` — and a
+     disabled node is chosen only when no alternative path exists, while
+     `HashAggregate` was never disabled. The same statement with the inner
+     `ORDER BY` dropped plans as a `HashAggregate` immediately; adding one
+     ordered aggregate beside a plain `MAX` takes that query off the hash path
+     too; `COUNT(DISTINCT …)` behaves identically; and with an index supplying
+     the order and every scan method disabled the node is *still*
+     `GroupAggregate`. It is a property of ordered and distinct aggregation
+     generally, not of this expression, this data or this row count.
+  2. **So the peak is O(largest group), and it is real.** Exactly one array is
+     live at a time. On the worst case for it — 1 000 000 rows in one group,
+     parallelism off — peak backend RSS ran **+34 MB over `MAX(r.value)`** on
+     the same rows (1 022.7 MB against 988.6 MB here; +33.5 MB in the
+     independent replication), i.e. **≈34 bytes per row in the largest group**,
+     reproducible to ±0.2 MB across runs. The array does not spill.
+  3. **The `Sort` beneath does scan-sized work, and is not this fold's cost.**
+     It materializes the whole selection but is `work_mem`-bounded and spills
+     rather than growing: `external merge`, ~10 MB in each of four workers under
+     the image's default parallelism at 1 000 000 rows, and 41 MB as a single
+     sort with `max_parallel_workers_per_gather = 0` (33 MB in the independent
+     replication — fixture-dependent absolute, same shape). Every candidate
+     formulation needs the same sort.
+
+  **Both alternatives were measured and both stay out.** On that single-group
+  worst case `DISTINCT ON` and `ROW_NUMBER() OVER (PARTITION BY …) = 1` both
+  peaked **~25 MB below** the shipped form (997.6 MB and 997.4 MB here; 25.8 MB
+  and 26.1 MB below in the independent replication), O(1) per group — with
+  execution times inside the run-to-run noise of the parallel plan (86-111 ms at
+  100 000 rows, 257-293 ms at 1 000 000, all three formulations). Neither is a
+  `SELECT`-list expression that composes beside `SUM`, and neither can express
+  the ungrouped fold: `DISTINCT ON ()` is a syntax error, and `PARTITION BY`
+  nothing — like the `ORDER BY … LIMIT 1` rewrite — answers **zero** rows over
+  an empty selection where the SPI owes exactly one empty-keyed bucket. So
+  `aggregate.rs` is unchanged, and the entry publishes a limit rather than a
+  fix.
+
+  **This is a limit to publish, not a question to weigh.** ~~DESIGN §3.10 asks
+  each plugin's deployment guide to state the bounds it can hold~~ — **a scope
+  claim; see flight correction 3.** §3.10 requires a deployment guide per plugin
+  crate and enumerates six mandatory statements, none of them a memory bound.
+  The bound belongs to that guide by **kind**, not by the enumeration, and the
+  plugin publishes no such guide at all. Write the kind claim; the scope claim
+  is the defect this entry is about.
+
+  **The entry's content is the three numbered facts above plus
+  `aggregate_limit_clause`'s zero protection and the time window being caller
+  input** — an entry that keeps only the headline is not this entry. The same
+  correction is already on `RecordStore::aggregate`'s rustdoc and on
+  `LATEST_SELECT_EXPR`'s, which ship; what does not exist until this entry is
+  written is the register a reviewer reads.
+- **One stale SDK doc Task 15 found and correctly did not touch.**
+  `AggregationBucket::value`'s rustdoc
+  (`usage-collector-sdk/src/models.rs`, the `value` field of
+  `AggregationBucket`) still discusses `AVG`: "`AVG` is now exact in magnitude
+  but may still carry a backend/plugin-chosen rounding scale on non-terminating
+  quotients", and names it again in "a wide `SUM` (or large-magnitude `AVG`)".
+  **`AVG` is not an `AggregationFold`** — the set is `Sum`, `Count`, `Max`,
+  `Min`, `Latest` — so the sentence describes a fold no surface can request and
+  no plugin can be asked to serve. It is the retired vocabulary surviving in
+  prose after the enum moved, which is why Task 15 deleted
+  `pg_aggregate_avg_rounds_non_terminating_quotient` outright rather than
+  porting it. The precision paragraph's `SUM`/`MIN`/`MAX`/`COUNT` half is
+  correct and stays; only the two `AVG` clauses go. Outside the plugin crate,
+  so it was routed here rather than fixed in Task 15's commits.
+- **Any further entry** this port turned up, beyond the `LATEST` one above.
+
+- [x] **Step 6: Full verification bar, one last time**
+
+```bash
+cargo check --workspace --all-targets
+cargo nextest run -p cf-gears-usage-collector -p cf-gears-usage-collector-sdk \
+  -p cf-gears-noop-usage-collector-plugin \
+  -p cf-gears-timescaledb-usage-collector-plugin --no-fail-fast
+cargo nextest run -p cf-gears-usage-collector-sdk --features contract --no-fail-fast
+cargo clippy --workspace --all-targets --all-features
+cargo +nightly fmt
+cargo doc --no-deps -p cf-gears-usage-collector-sdk -p cf-gears-usage-collector
+```
+
+0 skipped. Doc warnings 35 / 0, neither grown.
+
+- [x] **Step 7: Commit**
+
+```bash
+git add docs/api/api.json DIVERGENCES.md
+git commit -s -m "docs(usage-collector): regenerate api.json and record what the port closed
+
+api.json was byte-identical to main and the contract workflow fails on any
+diff. The regeneration adds /records/backfill, removes the two usage-type
+routes, and renames QueryAggregatedUsageRecordsRequest to AggregationRequest.
+
+DIVERGENCES entry 16 is resolved by this slice. Entries 10 and 19 are not:
+acceptance_sequence now exists in the plugin's own table, which is DESIGN
+3.7's obligation, and neither it nor accepted_at reached the SDK model or the
+published response shape, so the LATEST fold still has nothing to read and
+latest-tie-break stays blocked."
+```
+
+**Shipped as four commits, not one.** The plan's `git add` names two files, but
+Step 4b also required fixing the plugin's `README.md` (entry 4) and the `AVG`
+rustdoc in `usage-collector-sdk/src/models.rs`, which are different scopes from
+a generated artifact and from the register:
+
+| Commit | Scope |
+| --- | --- |
+| `a0661a9a8` | `docs(usage-collector)`: regenerate `api.json`, with the whole delta accounted for |
+| `f77b1a0e5` | `docs(timescaledb-plugin)`: the README's stale claims |
+| `2a698584f` | `docs(usage-collector-sdk)`: drop `AVG` from `AggregationBucket::value` |
+| `308f3b319` | `docs(usage-collector)`: `DIVERGENCES.md` — entries 20-25 and the amendments |
+
+A fifth carries this plan update and the review fixes. **The README needed a
+fourth line, not the three Step 4b named:** `:52` sends a reader to
+`docs/DESIGN.md` for "the full architecture, sequences, schema, and constraint
+catalog" — the file entry 23 registers as stale wholesale, schema included, and
+which `migrations/0001_init.sql:5-6` already calls out by name. Leaving it would
+have been the exact defect the entry-3/entry-4 contrast exists to teach.
+
+**Bar at the end, unmoved:** `cargo check --workspace --all-targets` clean;
+four-package nextest **937 / 0 skipped**; contract **166 / 0**; clippy
+`--workspace --all-targets --all-features` **0 warnings**; `cargo +nightly fmt`
+a no-op; `cargo doc` **35** on the host gear and **0** on the SDK, read off the
+`generated N warnings` summary line and not by counting `^warning:`.
+
+---
+
+## Self-review — run this before declaring the plan done
+
+1. **Scope coverage.** Every item in SLICE7.md's "What the port actually is"
+   has a task: the 229 stale references (Tasks 1, 2, 4, 5, 6, 8, 9), the SPI
+   signature move (Tasks 10, 11, 12), `catalog_store` (Task 1), the migrations
+   (Task 3), entry 16 (Task 6), the rewiring commit (Tasks 16, 17), the
+   api.json debt (Task 18).
+
+2. **Out of scope, and no task touches them:** the usage feed and
+   reconciliation, `CursorBeyondRetention` (entry 18), gear-level workload
+   isolation (entry 12), `AggregationDimension` growing `Origin` (entry 15),
+   regenerating `DECOMPOSITION.md` or `docs/features/*` (entries 5, 14), any
+   crate version bump. Task 8 Step 5 says explicitly not to add an `Origin`
+   dimension arm.
+
+3. **Type consistency.** `MeterTypeId` (not `UsageTypeGtsId`),
+   `AggregationFold` (not `AggregationOp`/`AggregationSpec`), `gts_type_id`
+   (not `gts_id`), `window_start`/`window_end` (not `created_at`),
+   `invalidates`/`reason_code` (not `corrects_id`/`status`), `RecordOrigin`,
+   `Invalidation`, `TimeRange`. Used consistently across Tasks 4-13.
+
+4. **Every named test carries its mutation.** Tasks 5, 6, 7, 8, 9, 10, 11, 12
+   each name the one-token edit that makes each new test red. A test whose
+   mutation you cannot name does not go in.

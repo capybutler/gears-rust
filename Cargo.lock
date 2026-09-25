@@ -3419,6 +3419,7 @@ dependencies = [
  "cf-gears-toolkit",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-utils",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "cf-gears-usage-collector-sdk",
@@ -4074,6 +4075,7 @@ dependencies = [
  "futures",
  "gts",
  "inventory",
+ "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
  "rust_decimal",
@@ -4108,6 +4110,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "time",
+ "tokio",
  "uuid",
 ]
 

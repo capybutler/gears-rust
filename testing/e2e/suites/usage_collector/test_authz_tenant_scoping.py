@@ -10,52 +10,47 @@ from .conftest import (
     TENANT_B,
     TOKEN_B,
     accepted_records,
-    now_rfc3339,
+    covered_period,
     record_payload,
+    rejected_records,
+    selection_range,
     unique_suffix,
-    window_filter,
 )
 
 
-async def test_cross_tenant_ingest_denied(api, make_usage_type):
+async def test_cross_tenant_ingest_denied(api, make_meter):
     """Seam: per-record attribution gate vs. the PDP-returned scope.
 
     Tenant A's token submits a record attributed to tenant B. Ingest is a BATCH
     path that authorizes per record (grouped by attribution tuple), so the
     denial arrives as 207 with a `rejected` entry — NOT a top-level 403.
     """
-    gts_id, _ = await make_usage_type()
+    meter_id = await make_meter()
     async with api() as client:
         resp = await client.post("/records", json={"records": [
-            record_payload(gts_id, tenant_id=TENANT_B),
+            record_payload(meter_id, tenant_id=TENANT_B),
         ]})
 
-    assert resp.status_code == 207, (
-        f"a foreign-tenant record must be rejected per-record, got "
-        f"{resp.status_code}: {resp.text}"
-    )
-    results = resp.json()["results"]
-    assert len(results) == 1
-    assert results[0]["outcome"] == "rejected", results[0]
-    assert results[0]["index"] == 0
     # `error` carries the full canonical Problem verbatim (api/rest/dto.rs
     # CreateUsageRecordResultDto::Rejected), not just a bare message — assert on
     # its `status` being the forbidden class so a record rejected for an
-    # unrelated reason (unknown usage type, validation failure, storage error)
+    # unrelated reason (undeclared meter, validation failure, storage error)
     # cannot masquerade as the attribution gate having fired.
-    assert results[0]["error"]["status"] == 403, results[0]["error"]
+    problems = rejected_records(resp)
+    assert len(problems) == 1
+    assert problems[0]["status"] == 403, problems[0]
 
 
-async def test_cross_tenant_read_no_existence_leak(api, make_usage_type):
+async def test_cross_tenant_read_no_existence_leak(api, make_meter):
     """Seam: a foreign reader gets 404, not 403 — no existence leak.
 
     403 would confirm the record exists. The single-record read path fails at
     the top level (unlike batch ingest).
     """
-    gts_id, _ = await make_usage_type()
+    meter_id = await make_meter()
     async with api() as client:
         created = accepted_records(
-            await client.post("/records", json={"records": [record_payload(gts_id)]})
+            await client.post("/records", json={"records": [record_payload(meter_id)]})
         )
         record_id = created[0]["id"]
 
@@ -68,29 +63,33 @@ async def test_cross_tenant_read_no_existence_leak(api, make_usage_type):
     )
 
 
-async def test_idempotent_repost_returns_same_record(api, make_usage_type):
-    """Seam: dedup on (tenant_id, gts_id, idempotency_key, created_at).
+async def test_idempotent_repost_returns_same_record(api, make_meter):
+    """Seam: dedup on (tenant_id, gts_type_id, idempotency_key, period).
 
     An identical re-POST is deduplicated, not duplicated: same record id back,
-    and one row visible in the listing (ADR-0004, ADR-0014 — created_at is part
-    of the dedup identity, so it is pinned here rather than regenerated).
+    and one row visible in the listing. The covered period is part of the dedup
+    identity (`cpt-cf-usage-collector-adr-record-identity-derivation`), so it is
+    pinned here rather than regenerated per call — a second `covered_period()`
+    would move the window bounds and make the two submissions distinct entries
+    rather than a retry.
     """
-    gts_id, _ = await make_usage_type()
+    meter_id = await make_meter()
     payload = record_payload(
-        gts_id,
+        meter_id,
         idempotency_key=f"e2e-idem-fixed-{unique_suffix()}",
-        created_at=now_rfc3339(),
+        period=covered_period(),
     )
+    frm, to = selection_range()
 
     async with api() as client:
         first = accepted_records(await client.post("/records", json={"records": [payload]}))
         second = accepted_records(await client.post("/records", json={"records": [payload]}))
 
         listing = await client.get("/records", params={
-            "gts_id": gts_id, "$filter": window_filter(), "limit": 1000,
+            "gts_type_id": meter_id, "from": frm, "to": to, "limit": 1000,
         })
 
     assert first[0]["id"] == second[0]["id"], "re-POST must dedup onto the same record"
     assert listing.status_code == 200, listing.text
     ids = [item["id"] for item in listing.json()["items"]]
-    assert ids.count(first[0]["id"]) == 1, f"expected exactly one row, saw {ids}"
+    assert ids == [first[0]["id"]], f"expected exactly one row, saw {ids}"

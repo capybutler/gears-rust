@@ -10,12 +10,12 @@ use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
 use crate::domain::ports::metrics::{
-    AuthzDecision, DeactivationErrorCategory, IngestRequestErrorCategory, IngestRequestOutcome,
-    PdpFailureCause, PdpOp, PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind,
-    RecordErrorCategory, RecordKind, RecordOutcome, RequestOutcome, UsageCollectorMetrics,
-    UsageTypeErrorCategory, UsageTypeOp,
+    AuthzDecision, IngestRequestErrorCategory, IngestRequestOutcome, PdpFailureCause, PdpOp,
+    PluginErrorCategory, PluginOp, QueryErrorCategory, QueryKind, RecordErrorCategory,
+    RecordOutcome, RequestOutcome, TypeResolutionOutcome, UsageCollectorMetrics,
 };
 use crate::infra::metrics::{UcMetricsMeter, build_default_adapter};
+use usage_collector_sdk::{EntryType, RecordOrigin};
 
 const TEST_PREFIX: &str = "uc";
 
@@ -28,7 +28,11 @@ fn local_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
 }
 
 fn meter(provider: &SdkMeterProvider, prefix: &str) -> UcMetricsMeter {
-    UcMetricsMeter::new(&provider.meter("usage-collector"), prefix)
+    UcMetricsMeter::new(
+        &provider.meter("usage-collector"),
+        prefix,
+        crate::domain::service::DEFAULT_MAX_BATCH_RECORDS,
+    )
 }
 
 fn counter_sum(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
@@ -107,6 +111,34 @@ fn histogram_count(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
                 {
                     return h
                         .data_points()
+                        .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
+                        .sum();
+                }
+            }
+        }
+    }
+    0
+}
+
+fn histogram_count_with_label(
+    exporter: &InMemoryMetricExporter,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> u64 {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for metric in sm.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::F64(MetricData::Histogram(h)) = metric.data()
+                {
+                    return h
+                        .data_points()
+                        .filter(|dp| {
+                            dp.attributes()
+                                .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                        })
                         .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
                         .sum();
                 }
@@ -227,7 +259,7 @@ fn plugin_call_records_duration_with_buckets() {
 fn plugin_accept_error_counter_carries_labels() {
     let (provider, exporter) = local_provider();
     let m = meter(&provider, TEST_PREFIX);
-    m.record_plugin_accept_error(PluginOp::GetUsageType, PluginErrorCategory::Unready);
+    m.record_plugin_accept_error(PluginOp::GetUsageRecord, PluginErrorCategory::Unready);
     m.record_plugin_accept_error(
         PluginOp::CreateUsageRecord,
         PluginErrorCategory::BackendError,
@@ -270,7 +302,7 @@ fn plugin_ready_gauge_reflects_structural_fact() {
 fn prefix_is_substituted_into_every_name() {
     let (provider, exporter) = local_provider();
     let m = meter(&provider, "acme");
-    m.record_pdp_decision(PdpOp::Deactivate, AuthzDecision::Permit, 0.01);
+    m.record_pdp_decision(PdpOp::GetRecord, AuthzDecision::Permit, 0.01);
     provider.force_flush().unwrap();
 
     assert_eq!(counter_sum(&exporter, "acme_authz_decisions_total"), 1);
@@ -283,9 +315,9 @@ fn build_default_adapter_binds_to_global_provider_without_panicking() {
     // process the global provider is the NoopMeterProvider, so nothing is wired
     // to a reader and the emitted series can't be read back; this only proves
     // construction against the global provider and a record call don't panic.
-    let m = build_default_adapter("uc");
+    let m = build_default_adapter("uc", crate::domain::service::DEFAULT_MAX_BATCH_RECORDS);
     m.set_pdp_ready(true);
-    m.record_plugin_call(PluginOp::ListUsageTypes, 0.001);
+    m.record_plugin_call(PluginOp::ListUsageRecords, 0.001);
     // The constructor hands back a live, uniquely-owned handle ready to share.
     assert_eq!(std::sync::Arc::strong_count(&m), 1);
 }
@@ -298,16 +330,18 @@ fn ingestion_instruments_render_names_labels_and_buckets() {
     let m = meter(&provider, TEST_PREFIX);
 
     m.observe_ingestion_batch_size(20);
-    m.observe_ingestion_duration(0.05);
+    m.observe_ingestion_duration(0.05, RecordOrigin::Live);
     m.observe_record_metadata_bytes(1500);
     m.record_ingestion_record(
         RecordOutcome::Accepted,
-        RecordKind::Compensation,
+        EntryType::Invalidation,
+        RecordOrigin::Backfill,
         RecordErrorCategory::None,
     );
     m.record_ingestion_record(
         RecordOutcome::Rejected,
-        RecordKind::Usage,
+        EntryType::Record,
+        RecordOrigin::Live,
         RecordErrorCategory::MetadataSize,
     );
     m.record_ingestion_request(
@@ -339,8 +373,8 @@ fn ingestion_instruments_render_names_labels_and_buckets() {
         counter_sum_with_label(
             &exporter,
             "uc_ingestion_records_total",
-            "record_kind",
-            "compensation",
+            "entry_type",
+            "invalidation",
         ),
         1,
     );
@@ -353,12 +387,85 @@ fn ingestion_instruments_render_names_labels_and_buckets() {
         ),
         1,
     );
+    // The two counter calls were given different origins, so a label pinned
+    // to a constant rather than read from the argument fails one of these.
+    assert_eq!(
+        counter_sum_with_label(&exporter, "uc_ingestion_records_total", "origin", "live"),
+        1,
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_ingestion_records_total",
+            "origin",
+            "backfill"
+        ),
+        1,
+    );
     assert_eq!(
         counter_sum_with_label(
             &exporter,
             "uc_ingestion_requests_total",
             "outcome",
             "partial"
+        ),
+        1,
+    );
+}
+
+#[test]
+fn batch_size_buckets_end_at_the_configured_cap() {
+    use crate::infra::metrics::ingestion_batch_size_buckets;
+    assert_eq!(
+        ingestion_batch_size_buckets(100),
+        vec![1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+    );
+    assert_eq!(
+        ingestion_batch_size_buckets(30),
+        vec![1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+    );
+    assert_eq!(ingestion_batch_size_buckets(1), vec![1.0]);
+    assert_eq!(
+        ingestion_batch_size_buckets(500),
+        vec![1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 500.0]
+    );
+}
+
+#[test]
+fn the_ingestion_instruments_separate_live_from_backfilled_entries() {
+    // `uc_ingestion_duration_seconds` carries the latency budget, and a bulk
+    // import's latency profile is not the live path's — averaging them
+    // together is what would hide a catch-up job degrading live ingestion.
+    //
+    // The histogram is the half of DESIGN §3.11.5's `origin` pair that no
+    // other test can cover: it was label-free before this slice, so both
+    // observations used to land in one series, and `histogram_count` /
+    // `histogram_bounds` are label-blind — the total of 2 below holds
+    // whether these landed in one series or two. Only the per-origin counts
+    // tell those apart. The counter's `origin` vocabulary is left to
+    // `ingestion_instruments_render_names_labels_and_buckets`, which already
+    // drives both values through it.
+    let (provider, exporter) = local_provider();
+    let m = meter(&provider, TEST_PREFIX);
+
+    m.observe_ingestion_duration(0.05, RecordOrigin::Live);
+    m.observe_ingestion_duration(0.4, RecordOrigin::Backfill);
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        histogram_count(&exporter, "uc_ingestion_duration_seconds"),
+        2
+    );
+    assert_eq!(
+        histogram_count_with_label(&exporter, "uc_ingestion_duration_seconds", "origin", "live"),
+        1,
+    );
+    assert_eq!(
+        histogram_count_with_label(
+            &exporter,
+            "uc_ingestion_duration_seconds",
+            "origin",
+            "backfill",
         ),
         1,
     );
@@ -427,71 +534,34 @@ fn query_instruments_render_names_labels_and_buckets() {
     );
 }
 
-// ── Phase 2: deactivation-handler instruments ────────────────────────
+// ── Type Resolver instrument ──────────────────────────────────────────
 
 #[test]
-fn deactivation_instruments_render_names_and_labels() {
+fn type_resolution_counter_renders_name_and_result_labels() {
     let (provider, exporter) = local_provider();
     let m = meter(&provider, TEST_PREFIX);
 
-    m.record_deactivation_request(
-        RequestOutcome::Denied,
-        DeactivationErrorCategory::Authz,
-        0.02,
-    );
+    m.record_type_resolution(TypeResolutionOutcome::CacheHit);
+    m.record_type_resolution(TypeResolutionOutcome::CacheMiss);
+    m.record_type_resolution(TypeResolutionOutcome::ServedStale);
+    m.record_type_resolution(TypeResolutionOutcome::Unresolved);
+    m.record_type_resolution(TypeResolutionOutcome::RegistryError);
     provider.force_flush().unwrap();
 
-    assert_eq!(
-        histogram_count(&exporter, "uc_deactivation_duration_seconds"),
-        1
-    );
-    assert_eq!(counter_sum(&exporter, "uc_deactivation_requests_total"), 1);
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_deactivation_requests_total",
-            "outcome",
-            "denied"
-        ),
-        1,
-    );
-}
-
-// ── Phase 2: usage-type-catalog instruments ──────────────────────────
-
-#[test]
-fn usage_type_instruments_render_names_and_labels() {
-    let (provider, exporter) = local_provider();
-    let m = meter(&provider, TEST_PREFIX);
-
-    m.record_usage_type_request(
-        UsageTypeOp::Create,
-        RequestOutcome::Error,
-        UsageTypeErrorCategory::Conflict,
-    );
-    m.set_usage_types(7);
-    provider.force_flush().unwrap();
-
-    assert_eq!(counter_sum(&exporter, "uc_usage_type_requests_total"), 1);
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "operation",
-            "create"
-        ),
-        1,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_usage_type_requests_total",
-            "error_category",
-            "conflict"
-        ),
-        1,
-    );
-    assert_eq!(gauge_last(&exporter, "uc_usage_types"), Some(7));
+    assert_eq!(counter_sum(&exporter, "uc_type_resolution_total"), 5);
+    for result in [
+        "cache_hit",
+        "cache_miss",
+        "served_stale",
+        "unresolved",
+        "registry_error",
+    ] {
+        assert_eq!(
+            counter_sum_with_label(&exporter, "uc_type_resolution_total", "result", result),
+            1,
+            "expected exactly one uc_type_resolution_total{{result=\"{result}\"}} sample",
+        );
+    }
 }
 
 /// Read the summed value of an `i64` `UpDownCounter` series filtered to a

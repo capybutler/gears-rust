@@ -1,18 +1,13 @@
 //! PEP gate and per-resource vocabulary for the usage-collector domain.
 //!
-//! Per ADR-0001 (`cpt-cf-usage-collector-adr-pdp-centric-authorization`) the
+//! Per `cpt-cf-usage-collector-adr-pdp-centric-authorization` the
 //! collector keeps NO local policy table and NO PDP-decision cache; every
-//! decision is delegated to the bound `authz-resolver` client. Catalog
-//! resources are platform-global per ADR-0012 / PRD §5.8 (no owning tenant,
-//! no resource id, no per-row scoping), so catalog authz is subject-only;
-//! the ingestion surface declares per-record attribution attributes
-//! (tenant, optional subject, resource type and id) so policy can reason
-//! over them. The catalog surface opts out of `require_constraints`
-//! (subject-only authz, so an unconstrained `allow_all` permit is the
-//! legitimate happy-path outcome); the per-record ingestion surface runs
-//! under `require_constraints(true)` and gates each record's owning tenant
+//! decision is delegated to the bound `authz-resolver` client. The ingestion
+//! surface declares per-record attribution attributes (tenant, optional
+//! subject, resource type and id) so policy can reason over them, and runs
+//! under `require_constraints(true)`, gating each record's owning tenant
 //! against the PDP-returned row scope, so a tenant-scoped caller cannot
-//! attribute usage to — or read / deactivate a record of — a tenant outside
+//! attribute usage to — or read a record of — a tenant outside
 //! its closure.
 //!
 //! Fail-closed wiring (transport → `AuthorizationUnavailable`, deny /
@@ -38,8 +33,8 @@ use super::error::DomainError;
 /// four PDP-helper instruments in DESIGN §3.11.5
 /// (`uc_pdp_ready`, `uc_pdp_duration_seconds`, `uc_authz_decisions_total`,
 /// `uc_pdp_failures_total`). Every `domain/authz.rs` helper routes through
-/// this wrapper so instrumentation cannot drift between the catalog,
-/// per-record, and query PDP call sites.
+/// this wrapper so instrumentation cannot drift between the per-record and
+/// query PDP call sites — the three `pdp_scope_with` calls in this file.
 ///
 /// **`uc_authz_decisions_total` records the EFFECTIVE gear decision, not the
 /// raw `access_scope_with` return.** Under `require_constraints(true)` a permit
@@ -50,8 +45,8 @@ use super::error::DomainError;
 /// decision off the raw `Ok` would count a cross-tenant attribution attempt —
 /// the very reconnaissance signal the deny-anomaly alert (DESIGN §3.11.6) keys
 /// off — as a `permit`. So the `permit` sample is emitted only after `gate`
-/// admits; a gate rejection records `deny`. The catalog surface (no row scope)
-/// passes an always-admitting gate, so its permit is final at the PDP boundary.
+/// admits; a gate rejection records `deny`. Every call site here runs under
+/// `require_constraints(true)`, so no permit is final at the PDP boundary.
 ///
 /// Classification (matches `cpt-cf-usage-collector-algo-foundation-pdp-authorize`),
 /// each case also observing duration: `Ok(scope)` with `gate` admitting → permit
@@ -152,10 +147,14 @@ async fn pdp_scope_with<T>(
 ///
 /// `action` participates in the hash/eq contract so a batch carrying
 /// records bound to different actions cannot collapse onto a single PDP
-/// decision. Today every batch caller passes a constant
-/// (`usage_record::actions::CREATE`); promoting `action` into the key
-/// makes the safety property hold structurally for any future caller
-/// that mixes actions in one batch.
+/// decision. The backfill route is the caller that mixes them: it picks
+/// each entry's verb from that entry's own covered period
+/// ([`crate::domain::covered_period::ingestion_action`]), so one batch
+/// spanning the configured backfill window carries `create` and
+/// `backfill` together — under a single attribution tuple when the two
+/// entries share a tenant, resource and subject. Drop `action` from the
+/// key and those two collapse, and the entry reaching past the window
+/// rides in on the other's `create` permit.
 #[domain_model]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct AttributionTupleKey {
@@ -190,28 +189,6 @@ impl AttributionTupleKey {
             subject_type,
             action,
         }
-    }
-}
-
-/// PEP vocabulary for the `UsageType` catalog.
-///
-/// Platform-global resource (ADR-0012 / PRD §5.8): no owning tenant, no
-/// resource id, no per-`UsageType` scoping. The PDP authorizes the subject
-/// alone and the [`RESOURCE`] declares no attributes.
-pub(crate) mod usage_type {
-    use authz_resolver_sdk::pep::ResourceType;
-    use usage_collector_sdk::USAGE_TYPE_RESOURCE;
-
-    /// PEP resource type for the `UsageType` catalog.
-    pub const RESOURCE: ResourceType = ResourceType::from_static(USAGE_TYPE_RESOURCE, &[]);
-
-    /// `UsageType` action vocabulary. Renaming any of these is a contract
-    /// change against the PDP policy bundle.
-    pub mod actions {
-        pub const CREATE: &str = "create";
-        pub const GET: &str = "get";
-        pub const LIST: &str = "list";
-        pub const DELETE: &str = "delete";
     }
 }
 
@@ -257,91 +234,51 @@ pub(crate) mod usage_record {
     /// change against the PDP policy bundle.
     pub mod actions {
         pub const CREATE: &str = "create";
-        pub const DEACTIVATE: &str = "deactivate";
         pub const GET: &str = "get";
         pub const LIST: &str = "list";
+        /// Import or withdraw a covered period ending further back than the
+        /// configured backfill window.
+        ///
+        /// The elevated grant of
+        /// `cpt-cf-usage-collector-adr-backfill-isolation`. It is **not**
+        /// the backfill route's action — an entry on that route whose
+        /// period ends inside the window authorizes [`CREATE`], because it
+        /// needs no privilege a live emission does not. This one is
+        /// granted to an import job, so an emitter that finds a gap older
+        /// than the window cannot close it on its own.
+        pub const BACKFILL: &str = "backfill";
     }
 }
 
-/// Run the PDP check for `(resource_type, action)` and lift the outcome into
-/// [`DomainError`].
-///
-/// Subject-only authz: the request carries no resource attributes and opts
-/// out of `require_constraints`, so a permit with no constraints (`allow_all`)
-/// is the legitimate happy-path outcome. Deny / transport failure / compile
-/// failure fail closed through the existing `From<EnforcerError>` mapping.
-///
-/// # Errors
-///
-/// * [`DomainError::AuthorizationDenied`] when the PDP denies or returns an
-///   uncompilable constraint shape.
-/// * [`DomainError::AuthorizationUnavailable`] when the PDP transport fails.
-// @cpt-flow:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1
-// @cpt-algo:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-principle-pdp-centric-authorization:p2
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-principle-fail-closed:p2
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-contract-authz-resolver:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-entity-pdp-decision:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-adr-pdp-centric-authorization:p2
-pub(crate) async fn authorize(
-    enforcer: &PolicyEnforcer,
-    metrics: &dyn UsageCollectorMetrics,
-    op: PdpOp,
-    // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-input
-    ctx: &SecurityContext,
-    resource_type: &ResourceType,
-    action: &str,
-    // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-input
-) -> Result<(), DomainError> {
-    // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-compose-tuple
-    // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-compose
-    // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-resolver-call
-    // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-call
-    // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-return
-    // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-return
-    pdp_scope_with(
-        enforcer,
-        metrics,
-        op,
-        ctx,
-        resource_type,
-        action,
-        None,
-        &AccessRequest::new().require_constraints(false),
-        // Subject-only authz opts out of `require_constraints`, so an
-        // unconstrained (`allow_all`) permit is the legitimate happy-path
-        // outcome: the gate always admits, and the PDP permit is the final
-        // decision recorded by the wrapper.
-        |_scope| Ok(()),
-    )
-    .await
-    // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-return
-    // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-return
-    // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-call
-    // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-resolver-call
-    // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-compose
-    // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-compose-tuple
-}
-
-/// Run the PDP check for `(usage_record, action)` carrying the caller-supplied
-/// (for `CREATE`) or plugin-loaded (for `DEACTIVATE`) attribution-tuple
-/// attributes lifted off the [`UsageRecord`]: the owning tenant
-/// (`record.tenant_id`), the optional subject reference (its mandatory
-/// `subject_id` plus optional `subject_type` qualifier), and the mandatory
-/// resource reference. `action` selects the verb the PDP authorizes against
-/// (`actions::CREATE` for emission, `actions::DEACTIVATE` for event
-/// deactivation); the per-verb PEP vocabulary is identical so policy authors
-/// reason over a single attribute set. Unlike [`authorize`], this path runs
-/// under `require_constraints(true)` and applies the per-record attribution
-/// gate in [`scope_admits_attribution_tuple`]: `access_scope_with` fails
-/// closed only on an
-/// outright PDP deny / transport / compile error, so a *permit* carrying a
+/// Run the PDP check for `(usage_record, action)` carrying the
+/// caller-supplied attribution-tuple attributes lifted off the
+/// [`UsageRecord`]: the owning tenant (`record.tenant_id`), the optional
+/// subject reference (its mandatory `subject_id` plus optional
+/// `subject_type` qualifier), and the mandatory resource reference.
+/// `action` selects the verb the PDP authorizes against. The batch
+/// ingestion path passes whatever
+/// [`crate::domain::covered_period::ingestion_action`] picks per entry —
+/// `actions::CREATE`, or `actions::BACKFILL` past the configured backfill
+/// window — and [`AttributionTupleKey`]'s own doc carries the rule that
+/// keeps two such verbs in one batch from silently sharing a decision.
+/// This helper is the single-emit path's, which is live-only and therefore
+/// always `CREATE`; the same call is written through `ingestion_action`
+/// rather than that constant so the two paths cannot answer differently if
+/// a single-emit import route is ever added. Unlike the query-path helpers,
+/// which project their constraints into an `OData` filter, this path
+/// runs under `require_constraints(true)` and applies the per-record
+/// attribution gate in [`scope_admits_attribution_tuple`]:
+/// `access_scope_with` fails closed only on an outright PDP deny /
+/// transport / compile error, so a *permit* carrying a
 /// row-scope narrowing constraint (e.g. `OWNER_TENANT_ID In [caller's tenant
 /// closure]`) is returned as `Ok(scope)` and the SDK does NOT auto-match it
 /// against the request's resource properties. The record's owning tenant
 /// must therefore be matched against the granted scope here, or cross-tenant
-/// attribution (create) / cross-tenant read (get) / cross-tenant deactivate
-/// would slip through.
+/// attribution (create) or cross-tenant read (get) would slip through.
+///
+/// On a permit, returns the granted [`AccessScope`]: an invalidation's target
+/// lookup reads under it, compiled by [`scope_to_odata_filter`] (SPEC-DIFF
+/// decision S-A1).
 ///
 /// # Errors
 ///
@@ -350,7 +287,6 @@ pub(crate) async fn authorize(
 ///   the record's owning tenant.
 /// * [`DomainError::AuthorizationUnavailable`] when the PDP transport fails.
 // @cpt-algo:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1
-// @cpt-algo:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-tenant-attribution:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-resource-attribution:p1
 // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-subject-attribution:p1
@@ -367,7 +303,7 @@ pub(crate) async fn authorize_usage_record(
     ctx: &SecurityContext,
     record: &UsageRecord,
     action: &'static str,
-) -> Result<(), DomainError> {
+) -> Result<AccessScope, DomainError> {
     let key = AttributionTupleKey::from_record(record, action);
     authorize_attribution_tuple(enforcer, metrics, op, ctx, &key).await
 }
@@ -381,6 +317,10 @@ pub(crate) async fn authorize_usage_record(
 /// **structural** invariant rather than a coupling between two files —
 /// see the type-level docs on [`AttributionTupleKey`].
 ///
+/// On a permit, returns the granted [`AccessScope`]: an invalidation's target
+/// lookup reads under it, compiled by [`scope_to_odata_filter`] (SPEC-DIFF
+/// decision S-A1).
+///
 /// # Errors
 ///
 /// Same envelope as [`authorize_usage_record`]:
@@ -393,11 +333,10 @@ pub(crate) async fn authorize_attribution_tuple(
     op: PdpOp,
     ctx: &SecurityContext,
     key: &AttributionTupleKey,
-) -> Result<(), DomainError> {
+) -> Result<AccessScope, DomainError> {
     // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-compose-tuple
     // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-compose
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-compose-tuple
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-compose-tuple
     let mut request = AccessRequest::new()
         .require_constraints(true)
         .resource_property(pep_properties::OWNER_TENANT_ID, key.tenant_id.to_string())
@@ -411,7 +350,6 @@ pub(crate) async fn authorize_attribution_tuple(
                 request.resource_property(usage_record::PROP_SUBJECT_TYPE, subject_type.clone());
         }
     }
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-compose-tuple
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-compose-tuple
     // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-compose
     // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-compose-tuple
@@ -420,10 +358,6 @@ pub(crate) async fn authorize_attribution_tuple(
     // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-call
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-deny
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-allow
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-call
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-deny
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-fail-closed
-    // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-allow
     // Per-record attribution gate (see [`scope_admits_attribution_tuple`]),
     // applied as the wrapper's post-permit gate. A permit that narrows the grant
     // (to the caller's tenant closure, and possibly other attribution
@@ -444,7 +378,7 @@ pub(crate) async fn authorize_attribution_tuple(
         &request,
         |scope| {
             if scope_admits_attribution_tuple(&scope, key) {
-                Ok(())
+                Ok(scope)
             } else {
                 tracing::warn!(
                     target: "authz",
@@ -463,10 +397,6 @@ pub(crate) async fn authorize_attribution_tuple(
         },
     )
     .await
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-allow
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-fail-closed
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-deny
-    // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-call
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-allow
     // @cpt-end:cpt-cf-usage-collector-algo-usage-emission-attribution-and-pdp-authorization:p1:inst-algo-attrib-pdp-deny
     // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-call
@@ -481,7 +411,7 @@ pub(crate) async fn authorize_attribution_tuple(
 /// SDK does NOT auto-match that scope against the request's resource
 /// properties — confirming the record falls inside the granted scope is the
 /// gear's responsibility. Without this check a `/tenants/{A}`-scoped caller
-/// could create / read / deactivate records attributed to any other tenant:
+/// could create or read records attributed to any other tenant:
 /// the resolver returns a permit plus an `OWNER_TENANT_ID In [A's closure]`
 /// narrowing, but nothing otherwise rejects an out-of-closure record.
 ///
@@ -739,6 +669,56 @@ pub(crate) async fn authorize_list_usage_records(
         // `Expr` out — would ripple the composition path and its fail-closed
         // tests for no behavioral gain).
         |scope| scope_to_odata_filter(&scope).map(|_| scope),
+    )
+    .await
+}
+
+/// Authorize a `get_usage_record` (point lookup) request and return the
+/// **already-projected** `OData` filter expression the plugin must apply.
+///
+/// Mirrors [`authorize_list_usage_records`] in every respect (pre-row PEP
+/// request — no per-record attribution attributes, because the id-only
+/// boundary doesn't have the record's tenant / resource / subject fields
+/// yet — under `require_constraints(true)`, the same
+/// [`scope_to_odata_filter`] projectability gate) except the PEP `action`:
+/// `usage_record::actions::GET`, not `LIST`. The two verbs share the same
+/// resource and attribute set (see [`usage_record::RESOURCE`]) but are
+/// distinct PEP actions, so a policy permitting one need not permit the
+/// other — reusing `authorize_list_usage_records`'s `LIST` action here
+/// would authorize the wrong verb.
+///
+/// Unlike [`authorize_list_usage_records`], the gate's success value is
+/// the projected [`ast::Expr`] itself, not the [`AccessScope`] it came
+/// from: the point lookup carries no caller-supplied filter to AND it
+/// with (there is no [`compose_query_with_scope`](super::query::compose_query_with_scope)
+/// analogue here), so the projected scope *is* the whole filter handed to
+/// `UsageCollectorPluginV1::get_usage_record` — nothing downstream needs
+/// the raw `AccessScope` again.
+///
+/// # Errors
+///
+/// * [`DomainError::AuthorizationDenied`] when the PDP denies, or returns
+///   an unconstrained / deny-all / un-projectable (tree predicate, unknown
+///   property, not tenant-pinned) constraint shape — see
+///   [`scope_to_odata_filter`] for the full fail-closed enumeration.
+/// * [`DomainError::AuthorizationUnavailable`] when the PDP transport
+///   fails.
+pub(crate) async fn authorize_get_usage_record_scope(
+    enforcer: &PolicyEnforcer,
+    metrics: &dyn UsageCollectorMetrics,
+    op: PdpOp,
+    ctx: &SecurityContext,
+) -> Result<ast::Expr, DomainError> {
+    pdp_scope_with(
+        enforcer,
+        metrics,
+        op,
+        ctx,
+        &usage_record::RESOURCE,
+        usage_record::actions::GET,
+        None,
+        &AccessRequest::new().require_constraints(true),
+        |scope| scope_to_odata_filter(&scope),
     )
     .await
 }

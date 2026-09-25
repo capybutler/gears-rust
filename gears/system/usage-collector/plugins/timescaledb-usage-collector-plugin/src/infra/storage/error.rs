@@ -7,48 +7,98 @@
 
 use usage_collector_sdk::UsageCollectorPluginError;
 
+/// Name of the dedup UNIQUE declared in `migrations/0001_init.sql`, over the
+/// 5-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
+/// window_end)`.
+const DEDUP_UNIQUE: &str = "usage_records_dedup_uniq";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbErrorClass {
     DedupUniqueViolation,
-    CatalogUniqueViolation,
-    ForeignKeyViolation,
     Transient,
     Other,
 }
 
+/// `55P03 lock_not_available` is in the transient set deliberately, and it is
+/// the one member that is not a connectivity or serialization fault.
+///
+/// Every request-path connection carries a fixed `lock_timeout`
+/// ([`crate::infra::storage::pool`]), so a statement that waits too long on a
+/// contended lock fails with `55P03` rather than pinning a pooled connection.
+/// The ingest path takes one such lock on **every** entry — the
+/// `usage_acceptance_sequence` row for the entry's `(tenant_id, gts_type_id)`
+/// scope — and waits on a second only when it meets one: the speculative tuple
+/// an in-flight same-key insert holds. Losing either race is an ordinary
+/// contention outcome on a hot scope, self-healing on retry. Left in
+/// `Other` it maps to a non-retryable `Internal` and
+/// `is_retryable_batch_error` refuses to re-run a batch that is idempotent by
+/// construction.
+///
+/// The one coupling worth naming: `acquire_error_clears_readiness` routes a
+/// backend-reported `Database` error through this same predicate, so a
+/// transient SQLSTATE there clears the `ready` gauge. `55P03` cannot arrive on
+/// that path: `pool.acquire()` usually hands back an idle pooled connection and
+/// runs nothing at all, and when it does have to open a new one the session
+/// GUCs travel as startup parameters ([`crate::infra::storage::pool`]) rather
+/// than as `SET` statements — so no lock-taking statement runs either way and
+/// the gauge is unaffected.
 fn is_transient_sqlstate(code: &str) -> bool {
     code.starts_with("08")
         || matches!(
             code,
-            "57P01" | "57P02" | "57P03" | "53300" | "40001" | "40P01"
+            "57P01" | "57P02" | "57P03" | "53300" | "40001" | "40P01" | "55P03"
         )
 }
 
+/// True when `actual` names the constraint `name`, allowing for `TimescaleDB`'s
+/// chunk-local spellings.
+///
+/// A hypertable clones each constraint onto every chunk under a generated
+/// name, and there are two shapes because there are two declaration sites:
+/// `<chunk_id>_<name>` for a constraint declared in `CREATE TABLE`, and
+/// `_hyper_<ht>_<chunk>_chunk_<name>` for a standalone `CREATE UNIQUE INDEX`.
+/// Both end in `_<name>`, and `chunk_id` is a global sequence across every
+/// hypertable in the database, so no fixed prefix can be hardcoded. Bare
+/// equality still holds for CHECK constraints, which are not renamed, and for
+/// non-hypertable tables such as `usage_acceptance_sequence`.
+///
+/// The `_` anchor over a plain `ends_with` costs nothing and stops an
+/// unrelated name that merely ends in the same characters without a separator.
+///
+/// Suffix matching is safe for this schema because no name in
+/// `migrations/0001_init.sql` is a suffix of any other — note in particular
+/// that `usage_records_tenant_window_idx` is *not* a suffix of
+/// `usage_records_tenant_type_window_idx`. One rule follows for future
+/// migrations: Postgres truncates an identifier to its **first** 63 bytes, and
+/// the chunk prefix is *prepended* — so it is the tail that gets cut, and a
+/// long enough name loses the suffix this function matches on entirely. Keep
+/// constraint names under ~45 characters, which leaves room for the longest
+/// chunk prefix observed (`_hyper_<ht>_<chunk>_chunk_`).
+fn is_constraint(actual: &str, name: &str) -> bool {
+    actual == name || actual.strip_suffix(name).is_some_and(|p| p.ends_with('_'))
+}
+
+/// 23503 `foreign_key_violation` has no arm: the schema declares no foreign
+/// key, so it is unreachable and falls to `Other`.
 #[must_use]
 pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
     match code {
-        // Match each unique constraint by name. A new unique constraint (or a
-        // records PK `(id, created_at)` collision) must fall through to
-        // `Other` rather than be silently misread as a catalog conflict.
+        // Match the dedup constraint by name. Any other unique constraint —
+        // the records PK `(id, window_end)`, say — must fall through to
+        // `Other`.
         //
-        // `usage_records_dedup_uniq` is the dedup authority, but the ingest path
-        // reaches it via `INSERT … ON CONFLICT … DO NOTHING`, which suppresses
-        // the 23505 — so this arm is defensive: it only fires if a dedup-unique
+        // [`DEDUP_UNIQUE`] is the dedup authority, but the ingest path reaches
+        // it via `INSERT … ON CONFLICT … DO NOTHING`, which suppresses the
+        // 23505 — so that arm is defensive: it only fires if a dedup-unique
         // violation ever surfaces as a raw error (e.g. a future write path that
         // bypasses `ON CONFLICT`), keeping it classified rather than `Other`.
+        //
+        // It is matched through [`is_constraint`], not by equality: on a
+        // real hypertable it does not report its bare name.
         "23505" => match constraint {
-            Some("usage_records_dedup_uniq") => DbErrorClass::DedupUniqueViolation,
-            Some("usage_type_catalog_pkey") => DbErrorClass::CatalogUniqueViolation,
+            Some(c) if is_constraint(c, DEDUP_UNIQUE) => DbErrorClass::DedupUniqueViolation,
             _ => DbErrorClass::Other,
         },
-        // 23503 `foreign_key_violation` is what PostgreSQL <= 17 reports for the
-        // `usage_records.gts_id` -> catalog RESTRICT guard. PostgreSQL 18
-        // reports the standard 23001 `restrict_violation` for `ON DELETE
-        // RESTRICT` instead ("violates RESTRICT setting of foreign key
-        // constraint ..."), so both codes mean the same thing to this plugin:
-        // the row is still referenced. Verified against
-        // timescale/timescaledb:2.17.2-pg16 (23503) and 2.29.2-pg18 (23001).
-        "23503" | "23001" => DbErrorClass::ForeignKeyViolation,
         c if is_transient_sqlstate(c) => DbErrorClass::Transient,
         _ => DbErrorClass::Other,
     }

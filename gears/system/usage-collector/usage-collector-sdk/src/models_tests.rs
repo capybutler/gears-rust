@@ -3,28 +3,24 @@
 use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
-use rust_decimal::Decimal;
 use serde_json::json;
-use toolkit_gts::{GTS_ID_PREFIX, gts_id};
+use toolkit_gts::gts_id;
+use toolkit_odata::filter::FilterField as _;
 use uuid::Uuid;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::{
-    AggregationBucket, AggregationDimension, AggregationOp, AggregationResult, AggregationSpec,
-    CreateUsageRecord, IdempotencyKey, MetadataFilter, MetadataKey, ResourceRef, SubjectRef,
-    UsageKind, UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
-    is_keyset_safe_record_field, is_keyset_safe_type_field,
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord,
+    EntryType, IdempotencyKey, Invalidation, MetadataFilter, MetadataKey, MeterTypeId, ReasonCode,
+    RecordOrigin, ResourceRef, SubjectRef, UsageRecord, WINDOW_END_FIELD, WINDOW_START_FIELD,
+    is_keyset_safe_record_field,
 };
 use crate::error::UsageCollectorError;
 use crate::reason::ValidationReason;
 
 fn metadata_key(value: &str) -> MetadataKey {
     MetadataKey::new(value).expect("test fixture supplies a valid metadata key")
-}
-
-fn metadata_keys<const N: usize>(values: [&str; N]) -> BTreeSet<MetadataKey> {
-    values.into_iter().map(metadata_key).collect()
 }
 
 fn metadata_map<const N: usize>(entries: [(&str, &str); N]) -> BTreeMap<MetadataKey, String> {
@@ -34,493 +30,460 @@ fn metadata_map<const N: usize>(entries: [(&str, &str); N]) -> BTreeMap<Metadata
         .collect()
 }
 
-const SAMPLE_USAGE_TYPE_ID: &str =
-    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
+const SAMPLE_METER_TYPE_ID: &str =
+    gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~");
 
-fn sample_id() -> UsageTypeGtsId {
-    UsageTypeGtsId::new(SAMPLE_USAGE_TYPE_ID).expect("valid usage_record-derived id")
+fn sample_meter_id() -> MeterTypeId {
+    MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid usage_record-derived meter type id")
 }
 
-fn sample_usage_type() -> UsageType {
-    UsageType {
-        gts_id: sample_id(),
-        kind: UsageKind::Counter,
-        metadata_fields: metadata_keys(["region", "tier"]),
+/// `1970-01-01T00:00:00Z` — the inclusive start of the fixture period.
+const SAMPLE_WINDOW_START: time::OffsetDateTime = time::OffsetDateTime::UNIX_EPOCH;
+/// `1970-01-01T01:00:00Z` — one hour later, so the two bounds are distinct
+/// and a test that confused them would fail rather than pass by symmetry.
+const SAMPLE_WINDOW_END: time::OffsetDateTime =
+    SAMPLE_WINDOW_START.saturating_add(time::Duration::hours(1));
+/// `1970-01-01T01:05:00Z` — five minutes after [`SAMPLE_WINDOW_END`], so a
+/// test that confused `accepted_at` with a covered-period bound would fail
+/// rather than pass by coincidence.
+const SAMPLE_ACCEPTED_AT: time::OffsetDateTime =
+    SAMPLE_WINDOW_END.saturating_add(time::Duration::minutes(5));
+
+/// The entry a fixture invalidation withdraws.
+fn target_id() -> Uuid {
+    Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("target uuid")
+}
+
+fn reason_code(value: &str) -> ReasonCode {
+    ReasonCode::new(value).expect("test fixture supplies a valid reason code")
+}
+
+fn qty(s: &str) -> crate::UsageQuantity {
+    crate::UsageQuantity::parse(s).expect("test quantity")
+}
+
+/// The withdrawal a fixture invalidation carries. Both fixtures take an
+/// `Option<Uuid>` and build the whole [`Invalidation`] from it, because the
+/// type admits no other arrangement: a target without a reason is
+/// unrepresentable in Rust and can only be built as JSON.
+fn sample_invalidation(target: Uuid) -> Invalidation {
+    Invalidation {
+        target,
+        reason: reason_code("emitter_duplicate"),
     }
 }
 
-fn sample_usage_record(subject_ref: Option<SubjectRef>, corrects_id: Option<Uuid>) -> UsageRecord {
+fn sample_usage_record(subject_ref: Option<SubjectRef>, invalidates: Option<Uuid>) -> UsageRecord {
     UsageRecord {
         id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("record id"),
-        gts_id: sample_id(),
+        gts_type_id: sample_meter_id(),
         tenant_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("tenant uuid"),
         resource_ref: ResourceRef::new("vm-1", "compute.vm").expect("valid resource ref"),
         subject_ref,
         metadata: metadata_map([("region", "eu"), ("tier", "gold")]),
-        value: Decimal::from(42),
-        idempotency_key: IdempotencyKey::new("k-1").expect("valid idempotency key"),
-        corrects_id,
-        status: UsageRecordStatus::Active,
-        created_at: time::OffsetDateTime::from_unix_timestamp(0).expect("epoch"),
+        quantity: qty("42"),
+        idempotency_key: match invalidates {
+            Some(t) => IdempotencyKey::for_invalidation(t),
+            None => IdempotencyKey::new("k-1").expect("valid idempotency key"),
+        },
+        accepted_at: SAMPLE_ACCEPTED_AT,
+        // `live` by default: no test that builds a record by hand has the
+        // admitting path as its subject. The ones that do go through
+        // `try_into_usage_record`, which is what stamps an origin — or
+        // override this field after building, as the metadata cases do.
+        origin: RecordOrigin::Live,
+        invalidation: invalidates.map(sample_invalidation),
+        window_start: SAMPLE_WINDOW_START,
+        window_end: SAMPLE_WINDOW_END,
     }
 }
 
 fn sample_create_usage_record(
     subject_ref: Option<SubjectRef>,
-    corrects_id: Option<Uuid>,
+    invalidates: Option<Uuid>,
 ) -> CreateUsageRecord {
     CreateUsageRecord {
-        gts_id: sample_id(),
+        gts_type_id: sample_meter_id(),
         tenant_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("tenant uuid"),
         resource_ref: ResourceRef::new("vm-1", "compute.vm").expect("valid resource ref"),
         subject_ref,
         metadata: metadata_map([("region", "eu"), ("tier", "gold")]),
-        value: Decimal::from(42),
-        idempotency_key: IdempotencyKey::new("k-1").expect("valid idempotency key"),
-        corrects_id,
-        created_at: time::OffsetDateTime::from_unix_timestamp(0).expect("epoch"),
+        quantity: qty("42"),
+        idempotency_key: invalidates
+            .is_none()
+            .then(|| IdempotencyKey::new("k-1").expect("valid idempotency key")),
+        invalidation: invalidates.map(sample_invalidation),
+        window_start: SAMPLE_WINDOW_START,
+        window_end: SAMPLE_WINDOW_END,
     }
 }
 
 // ---------------------------------------------------------------------------
-// CreateUsageRecord::into_usage_record — identity stamp on create
+// CreateUsageRecord::try_into_usage_record — period validation and the
+// identity stamp on create
 // ---------------------------------------------------------------------------
 
-// `into_usage_record` is the single point where a submission acquires its
-// identity: it stamps the deterministic derived `id`, initializes `status`
-// to `Active`, and forwards every caller-supplied field verbatim.
+// `try_into_usage_record` is the single point where a submission acquires its
+// identity: it validates the submission's own shape and covered period,
+// stamps the deterministic derived `id`, and forwards every caller-supplied
+// field verbatim — the invalidation reference and its reason included.
 #[test]
-fn into_usage_record_stamps_derived_id_and_active_status() {
+fn try_into_usage_record_stamps_the_derived_id_and_forwards_every_field() {
     let subject = SubjectRef::new("sub-1", Some("user".to_owned())).expect("valid subject ref");
-    let corrects = Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("corrects uuid");
-    let input = sample_create_usage_record(Some(subject), Some(corrects));
+    let input = sample_create_usage_record(Some(subject), Some(target_id()));
 
-    let expected_id = crate::id::derive_usage_record_id(
-        input.tenant_id,
-        &input.gts_id,
-        &input.idempotency_key,
-        input.created_at,
-    );
+    let record = input
+        .clone()
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("the fixture period is valid");
 
-    let record = input.clone().into_usage_record();
-
-    assert_eq!(
-        record.id, expected_id,
-        "id must be the deterministic derivation of the dedup key",
-    );
-    assert_eq!(
-        record.status,
-        UsageRecordStatus::Active,
-        "a fresh submission must be stamped Active",
-    );
     // Every caller-supplied field is forwarded verbatim.
-    assert_eq!(record.gts_id, input.gts_id);
+    assert_eq!(record.gts_type_id, input.gts_type_id);
     assert_eq!(record.tenant_id, input.tenant_id);
     assert_eq!(record.resource_ref, input.resource_ref);
     assert_eq!(record.subject_ref, input.subject_ref);
     assert_eq!(record.metadata, input.metadata);
-    assert_eq!(record.value, input.value);
-    assert_eq!(record.idempotency_key, input.idempotency_key);
-    assert_eq!(record.corrects_id, input.corrects_id);
-    assert_eq!(record.created_at, input.created_at);
+    assert_eq!(record.quantity, input.quantity);
+    // The one field that is not forwarded: an invalidation carries no
+    // caller key, so its stored key is derived rather than copied.
+    assert_eq!(
+        record.idempotency_key,
+        IdempotencyKey::for_invalidation(target_id())
+    );
+    assert_eq!(record.invalidation, input.invalidation);
+    assert_eq!(record.window_start, input.window_start);
+    assert_eq!(record.window_end, input.window_end);
 }
 
-// A submission whose dedup key matches an existing `UsageRecord` projects to
-// the SAME `id` that record carries — the derivation is a pure function of
-// `(tenant_id, gts_id, idempotency_key, created_at)`, so the create input and
-// the persisted shape agree on identity without the caller ever supplying it.
 #[test]
-fn into_usage_record_id_matches_full_record_with_same_dedup_key() {
+fn try_into_usage_record_stamps_the_given_acceptance_instant() {
+    let record = sample_create_usage_record(None, None)
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("projects");
+    assert_eq!(record.accepted_at, SAMPLE_ACCEPTED_AT);
+    let encoded = serde_json::to_value(&record).expect("serializes");
+    assert_eq!(encoded["accepted_at"], json!("1970-01-01T01:05:00Z"));
+}
+
+#[test]
+fn a_submission_carrying_accepted_at_is_refused() {
+    let mut body = serde_json::to_value(sample_create_usage_record(None, None)).unwrap();
+    body["accepted_at"] = json!("1970-01-01T01:05:00Z");
+    serde_json::from_value::<CreateUsageRecord>(body)
+        .expect_err("accepted_at is server-assigned and must be refused as unknown");
+}
+
+#[test]
+fn try_into_usage_record_derives_the_id_over_the_five_tuple() {
+    let submission = sample_create_usage_record(None, None);
+    let expected = crate::id::derive_usage_record_id(
+        submission.tenant_id,
+        &submission.gts_type_id,
+        submission
+            .idempotency_key
+            .as_ref()
+            .expect("fixture record carries a key"),
+        submission.window_start,
+        submission.window_end,
+    );
+    let record = submission
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("the fixture period is valid");
+    assert_eq!(record.id, expected);
+}
+
+// A submission whose dedup identity matches an existing `UsageRecord`
+// projects to the SAME `id` that record carries — the derivation is a pure
+// function of the 5-tuple, so the create input and the persisted shape agree
+// on identity without the caller ever supplying it.
+#[test]
+fn try_into_usage_record_id_matches_full_record_with_same_dedup_identity() {
     let input = sample_create_usage_record(None, None);
     let persisted = sample_usage_record(None, None);
-    // `sample_usage_record` shares the same tenant / gts_id / idempotency_key.
+    // `sample_usage_record` shares the whole dedup identity.
     assert_eq!(input.tenant_id, persisted.tenant_id);
-    assert_eq!(input.gts_id, persisted.gts_id);
-    assert_eq!(input.idempotency_key, persisted.idempotency_key);
+    assert_eq!(input.gts_type_id, persisted.gts_type_id);
+    assert_eq!(
+        input.idempotency_key,
+        Some(persisted.idempotency_key.clone())
+    );
+    assert_eq!(input.window_start, persisted.window_start);
+    assert_eq!(input.window_end, persisted.window_end);
 
     assert_eq!(
-        input.into_usage_record().id,
+        input
+            .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+            .expect("the fixture period is valid")
+            .id,
         crate::id::derive_usage_record_id(
             persisted.tenant_id,
-            &persisted.gts_id,
+            &persisted.gts_type_id,
             &persisted.idempotency_key,
-            persisted.created_at,
+            persisted.window_start,
+            persisted.window_end,
         ),
-        "the create-input identity must equal the derivation of the same dedup key",
-    );
-}
-
-// `into_usage_record` canonicalizes `created_at` to microsecond precision (what
-// Postgres `timestamptz` stores) on the returned record, and derives the id from
-// that same normalized value, so the persisted timestamp / dedup key / id agree.
-#[test]
-fn into_usage_record_truncates_created_at_to_micros() {
-    let sub_us = time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789)
-        .expect("valid instant");
-    let mut input = sample_create_usage_record(None, None);
-    input.created_at = sub_us;
-
-    let record = input.clone().into_usage_record();
-
-    let expected_created_at =
-        time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_000)
-            .expect("valid instant");
-    assert_eq!(
-        record.created_at, expected_created_at,
-        "returned created_at must be truncated to microsecond precision",
-    );
-    assert_eq!(
-        record.id,
-        crate::id::derive_usage_record_id(
-            input.tenant_id,
-            &input.gts_id,
-            &input.idempotency_key,
-            sub_us,
-        ),
-        "id must be derived from the (us-normalized) 4-tuple",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// UsageTypeGtsId — construction validation
-// ---------------------------------------------------------------------------
-
-// UsageTypeGtsId::new enforces derivation from gts.cf.core.uc.usage_record.v1~:
-// every accepted id must left-prefix-match the base AND carry at least one
-// further `~`-separated segment.
-#[test]
-fn usage_type_gts_id_accepts_one_level_derivation() {
-    let input = gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1");
-    let id = UsageTypeGtsId::new(input).expect("one-level derivation accepted");
-    assert_eq!(
-        id.as_ref(),
-        input,
-        "AsRef<str> must preserve the input string"
-    );
-    assert_eq!(
-        id.to_string(),
-        input,
-        "Display must preserve the input string"
+        "the create-input identity must equal the derivation of the same dedup identity",
     );
 }
 
 #[test]
-fn usage_type_gts_id_rejects_unknown_base() {
-    let err = UsageTypeGtsId::new(format!("{GTS_ID_PREFIX}cf.core.metric.v1~z"))
-        .expect_err("non-usage_record base must be rejected");
-    assert!(
-        matches!(
-            err,
-            UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::InvalidBaseGtsId,
-                ..
-            }
-        ),
-        "expected InvalidUsageTypeGtsId, got {err:?}"
-    );
-}
-
-#[test]
-fn usage_type_gts_id_rejects_legacy_counter_base() {
-    // The old counter/gauge bases must be rejected explicitly to surface
-    // wire-shape drift if any legacy producer still emits them.
-    let err = UsageTypeGtsId::new(format!("{GTS_ID_PREFIX}cf.core.usage.counter.v1~legacy"))
-        .expect_err("legacy counter base must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn usage_type_gts_id_rejects_empty_id() {
-    let err = UsageTypeGtsId::new("").expect_err("empty id must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// `GtsInstanceId::new` is infallible and concatenates schema_id + segment
-// without validating that the segment is non-empty. `UsageTypeGtsId::new`
-// MUST reject a bare base (no derivation segment after the trailing `~`)
-// so callers never get a structurally-invalid id past the SDK boundary.
-#[test]
-fn usage_type_gts_id_rejects_bare_base() {
-    let err = UsageTypeGtsId::new(UsageTypeGtsId::USAGE_RECORD_BASE)
-        .expect_err("bare base must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// `UsageTypeGtsId` claims to wrap a GTS *instance* id (no trailing `~`).
-// A derivation segment that itself ends with `~` would produce a GTS
-// *type* id, breaking that invariant — the old byte-level `strip_prefix`
-// path accepted it; the GtsId-routed validator rejects it.
-#[test]
-fn usage_type_gts_id_rejects_derived_type_id_with_trailing_tilde() {
-    let err = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~"
-    ))
-    .expect_err("trailing `~` (a type id, not an instance id) must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// Whitespace in the derivation segment is not a valid GTS character. The
-// old `strip_prefix` path treated the segment as opaque text and would
-// have accepted this; the GtsId parser rejects it as a malformed segment.
-#[test]
-fn usage_type_gts_id_rejects_whitespace_in_segment() {
-    let err = UsageTypeGtsId::new(format!(
-        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~cf.compute _.vcpu_hours.v1"
-    ))
-    .expect_err("whitespace in segment must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// A derivation segment that is not itself a syntactically valid GTS
-// segment (missing `v<major>` version suffix, wrong number of dot-separated
-// fields, etc.) must surface as a validation error rather than producing
-// a malformed `GtsInstanceId`. Covers the family of "non-GTS tail" inputs
-// the prior implementation silently let through.
-#[test]
-fn usage_type_gts_id_rejects_malformed_derivation_segment() {
-    let err = UsageTypeGtsId::new(format!(
-        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~not_a_gts_segment"
-    ))
-    .expect_err("non-GTS-shaped derivation segment must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// Empty inner segment (consecutive `~`) is invalid per the GTS chained-id
-// rules. The old `strip_prefix` would return `Some("~foo")` and the
-// non-empty check would let it through; `GtsId::try_new` flags the empty
-// segment between the two tildes.
-#[test]
-fn usage_type_gts_id_rejects_consecutive_tildes() {
-    let err = UsageTypeGtsId::new(format!(
-        "{GTS_ID_PREFIX}cf.core.uc.usage_record.v1~~foo.bar.v1"
-    ))
-    .expect_err("consecutive tildes must be rejected");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// Catalog admits *direct* derivation only: a deeper chain like
-// `base~mid.v1~tail.v1` has `get_type_id() == Some("base~mid.v1~")`, which
-// is not the bare `USAGE_RECORD_BASE`, so the parent-chain match at
-// `models.rs:`-the-`get_type_id`-equality-site must reject it. Pins this
-// contract against a future GTS parser change.
-#[test]
-fn usage_type_gts_id_rejects_deep_derivation_chain() {
-    let err = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~cf.compute._.tail.v1"
-    ))
-    .expect_err("deep-derivation chain must be rejected - only direct base derivation is admitted");
-    assert!(matches!(
-        err,
-        UsageCollectorError::InvalidArgument {
-            reason: ValidationReason::InvalidBaseGtsId,
-            ..
-        }
-    ));
-}
-
-// ---------------------------------------------------------------------------
-// UsageTypeGtsId — custom Deserialize routes validation through serde
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_type_gts_id_deserialize_round_trips_valid_string() {
-    let decoded: UsageTypeGtsId =
-        serde_json::from_value(json!(SAMPLE_USAGE_TYPE_ID)).expect("valid gts_id deserializes");
-    assert_eq!(decoded.as_ref(), SAMPLE_USAGE_TYPE_ID);
-}
-
-#[test]
-fn usage_type_gts_id_deserialize_surfaces_validation_as_serde_error() {
-    let err = serde_json::from_value::<UsageTypeGtsId>(json!(format!(
-        "{GTS_ID_PREFIX}cf.core.metric.v1~oops"
-    )))
-    .expect_err("malformed gts_id must surface as a serde error");
-    assert!(
-        err.to_string().contains("usage type gts_id"),
-        "serde error must carry the Validation detail; got {err}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// UsageKind — serde + FromStr
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_kind_serde_round_trips_lowercase() {
-    let counter_json = serde_json::to_string(&UsageKind::Counter).expect("serialize counter");
-    let gauge_json = serde_json::to_string(&UsageKind::Gauge).expect("serialize gauge");
-    assert_eq!(counter_json, "\"counter\"");
-    assert_eq!(gauge_json, "\"gauge\"");
-    let decoded_c: UsageKind = serde_json::from_str("\"counter\"").expect("decode counter");
-    let decoded_g: UsageKind = serde_json::from_str("\"gauge\"").expect("decode gauge");
-    assert_eq!(decoded_c, UsageKind::Counter);
-    assert_eq!(decoded_g, UsageKind::Gauge);
-}
-
-#[test]
-fn usage_kind_rejects_unknown_variant_at_deserialize_boundary() {
-    let err = serde_json::from_str::<UsageKind>("\"histogram\"")
-        .expect_err("unknown variant must be rejected at the serde boundary");
-    assert!(err.to_string().contains("unknown variant"));
-}
-
-#[test]
-fn usage_kind_from_str_accepts_counter_and_gauge() {
-    assert_eq!(
-        UsageKind::from_str("counter").expect("counter"),
-        UsageKind::Counter
-    );
-    assert_eq!(
-        UsageKind::from_str("gauge").expect("gauge"),
-        UsageKind::Gauge
-    );
-}
-
-#[test]
-fn usage_kind_from_str_rejects_unknown_variant_as_validation_error() {
-    let err =
-        UsageKind::from_str("histogram").expect_err("unknown kind must be rejected by FromStr");
-    assert!(
-        matches!(err, UsageCollectorError::InvalidArgument { ref field, ref detail, .. } if field == "kind" && detail.contains("histogram")),
-        "expected InvalidUsageKind, got {err:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// UsageType — wire shape
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_type_serde_round_trip_carries_kind_and_metadata_fields() {
-    let usage_type = sample_usage_type();
-    let value = serde_json::to_value(&usage_type).expect("serialize UsageType");
-    assert_eq!(
-        value,
-        json!({
-            "gts_id": SAMPLE_USAGE_TYPE_ID,
-            "kind": "counter",
-            "metadata_fields": ["region", "tier"],
-        }),
-        "wire shape MUST be exactly {{gts_id, kind, metadata_fields}} with `kind` lowercase",
-    );
-    let decoded: UsageType = serde_json::from_value(value).expect("deserialize UsageType");
-    assert_eq!(usage_type, decoded);
-}
-
-#[test]
-fn usage_type_rejects_unknown_fields() {
-    let payload = json!({
-        "gts_id": gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1"),
-        "kind": "counter",
-        "metadata_fields": [],
-        "legacy_schema_field": {"type": "object"},
-    });
-    let err =
-        serde_json::from_value::<UsageType>(payload).expect_err("unknown field must be rejected");
-    assert!(err.to_string().contains("unknown field"));
-}
-
-#[test]
-fn usage_type_rejects_unknown_kind_at_deserialize_boundary() {
-    let payload = json!({
-        "gts_id": gts_id!("cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1"),
-        "kind": "histogram",
-        "metadata_fields": [],
-    });
-    let err =
-        serde_json::from_value::<UsageType>(payload).expect_err("unknown kind must be rejected");
-    assert!(err.to_string().contains("unknown variant"));
-}
-
-// ---------------------------------------------------------------------------
-// UsageType — kind-classification predicates
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_type_kind_classifier_predicates_match_kind_per_variant() {
-    use UsageKind as K;
-
-    // Compile-time exhaustiveness fence: adding a third UsageKind variant
-    // forces a new arm here and signals the developer to also update
-    // `UsageType::is_counter` / `is_gauge` and the table below.
-    const _FENCE: fn(&UsageKind) = |k| match k {
-        K::Counter | K::Gauge => (),
+fn try_into_usage_record_rejects_a_sub_microsecond_window_start() {
+    // `cpt-cf-usage-collector-adr-record-identity-derivation`: a bound finer
+    // than the microsecond is REJECTED, not truncated. Truncating would
+    // persist a period whose read-back derives
+    // an id different from the one the entry carries, which breaks offline
+    // reproduction at the point an emitter needs it.
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_start = submission.window_start.replace_nanosecond(500).unwrap();
+    let err = submission
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("sub-microsecond bound must be rejected");
+    let UsageCollectorError::InvalidArgument { field, .. } = err else {
+        panic!("expected InvalidArgument, got {err:?}");
     };
+    assert_eq!(field, "window_start");
+}
 
-    let cases: &[(UsageKind, bool, bool)] = &[
-        // (kind, expected_is_counter, expected_is_gauge)
-        (K::Counter, true, false),
-        (K::Gauge, false, true),
-    ];
+#[test]
+fn try_into_usage_record_rejects_a_sub_microsecond_window_end() {
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_end = submission.window_end.replace_nanosecond(1).unwrap();
+    let err = submission
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("sub-microsecond bound must be rejected");
+    let UsageCollectorError::InvalidArgument { field, .. } = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(field, "window_end");
+}
 
-    for (kind, expected_counter, expected_gauge) in cases {
-        let usage_type = UsageType {
-            gts_id: sample_id(),
-            kind: *kind,
-            metadata_fields: BTreeSet::new(),
+#[test]
+fn a_sub_microsecond_rejection_reads_the_same_in_every_offset() {
+    // Two claims in one, both about the hoisted UTC normalization that runs
+    // BEFORE the precision checks.
+    //
+    // Behaviour: the same instant submitted in three offsets is rejected
+    // all three times — normalization moves the offset, never the
+    // nanosecond, so it cannot change what the check accepts.
+    //
+    // Diagnostics: all three rejections echo ONE rendering. Before the
+    // hoist, this bound echoed the caller's offset while the sibling
+    // inverted-period error echoed UTC, and an offset carrying non-zero
+    // seconds (which RFC 3339 cannot express) fell through to
+    // `OffsetDateTime`'s space-separated `Display`. Comparing the details
+    // to each other rather than to a literal pins the property without
+    // pinning the wording.
+    let sub_us = SAMPLE_WINDOW_START.replace_nanosecond(500).unwrap();
+    let details: Vec<String> = [
+        time::UtcOffset::UTC,
+        time::UtcOffset::from_hms(5, 30, 0).unwrap(),
+        time::UtcOffset::from_hms(5, 30, 30).unwrap(),
+    ]
+    .into_iter()
+    .map(|offset| {
+        let mut submission = sample_create_usage_record(None, None);
+        submission.window_start = sub_us.to_offset(offset);
+        let err = submission
+            .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+            .expect_err("a sub-microsecond bound must be rejected in ANY offset");
+        let UsageCollectorError::InvalidArgument { field, detail, .. } = err else {
+            panic!("expected InvalidArgument, got {err:?}");
         };
-        assert_eq!(
-            usage_type.is_counter(),
-            *expected_counter,
-            "is_counter mismatch for {kind:?}",
-        );
-        assert_eq!(
-            usage_type.is_gauge(),
-            *expected_gauge,
-            "is_gauge mismatch for {kind:?}",
-        );
-    }
+        assert_eq!(field, WINDOW_START_FIELD);
+        detail
+    })
+    .collect();
+
+    assert!(
+        details.windows(2).all(|pair| pair[0] == pair[1]),
+        "one instant must produce one diagnostic whatever offset it arrived \
+         in; got {details:#?}",
+    );
+    assert!(
+        details[0].contains("Z,"),
+        "the echoed bound must be the UTC rendering, not the caller's \
+         offset; got {}",
+        details[0],
+    );
+}
+
+#[test]
+fn try_into_usage_record_accepts_a_whole_microsecond_bound() {
+    // The ceiling is the microsecond, not the millisecond or the second: a
+    // bound carrying a non-zero microsecond is ordinary valid input. Without
+    // this, relaxing the precondition to a coarser unit would pass every
+    // other test in the file, because the fixture bounds land on whole
+    // seconds.
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_start = submission.window_start.replace_nanosecond(1_000).unwrap();
+    submission.window_end = submission
+        .window_end
+        .replace_nanosecond(999_999_000)
+        .unwrap();
+    let record = submission
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("whole-microsecond bounds are valid");
+    assert_eq!(record.window_start.nanosecond(), 1_000);
+    assert_eq!(record.window_end.nanosecond(), 999_999_000);
+}
+
+#[test]
+fn try_into_usage_record_accepts_equal_bounds_as_a_point_event() {
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_end = submission.window_start;
+    let record = submission
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("point event is valid input");
+    assert_eq!(record.window_start, record.window_end);
+}
+
+#[test]
+fn try_into_usage_record_rejects_an_inverted_covered_period() {
+    let mut submission = sample_create_usage_record(None, None);
+    submission.window_end = submission.window_start - time::Duration::seconds(1);
+    let err = submission
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("window_end < window_start must be rejected");
+    let UsageCollectorError::InvalidArgument { field, .. } = err else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(field, "window_end");
+}
+
+#[test]
+fn the_past_tolerance_rejection_names_both_backfill_surfaces() {
+    // `cpt-cf-usage-collector-adr-backfill-isolation`: "The rejection names
+    // the route, and both surfaces carry it." A REST caller needs the path;
+    // an in-process caller needs the trait method, and a URL tells it
+    // nothing. Asserted against literals rather than against
+    // `BACKFILL_ROUTE_PATH`, because this string is what turns a rejection
+    // into an actionable instruction: spelling the expectation from the
+    // same constant the message is built from would let the path move and
+    // the test still pass.
+    let window_end = SAMPLE_WINDOW_END;
+    let now = window_end.saturating_add(time::Duration::days(30));
+    let err = UsageCollectorError::covered_period_before_past_tolerance(
+        window_end,
+        now,
+        time::Duration::hours(48),
+    );
+    let UsageCollectorError::InvalidArgument {
+        reason,
+        field,
+        detail,
+        ..
+    } = &err
+    else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(*reason, ValidationReason::PastWindow);
+    assert_eq!(field, WINDOW_END_FIELD);
+    assert!(
+        detail.contains("/usage-collector/v1/records/backfill"),
+        "{detail}"
+    );
+    assert!(detail.contains("backfill_usage_records"), "{detail}");
+    // `cpt-cf-usage-collector-fr-live-future-time-bound` requires the error
+    // to identify the offending instant AND the bound it breached. The
+    // tolerance is the half rendered by a third-party `Display` impl — 48
+    // hours normalises to `2d` — so it is the half likelier to be mangled.
+    assert!(
+        detail.contains("2d"),
+        "the rejection must name the bound it breached; got {detail}"
+    );
+}
+
+#[test]
+fn the_future_tolerance_rejection_does_not_name_the_backfill_route() {
+    // The backfill route lifts the past bound and nothing else. Pointing a
+    // clock-skewed emitter at it would send a defect somewhere it is just
+    // as invalid, and the route's own description says so: it exists "for
+    // exactly the periods that bound rejects", meaning the past one.
+    let now = SAMPLE_WINDOW_END;
+    let window_end = now.saturating_add(time::Duration::days(30));
+    let err = UsageCollectorError::covered_period_beyond_future_tolerance(
+        window_end,
+        now,
+        time::Duration::minutes(5),
+    );
+    let UsageCollectorError::InvalidArgument {
+        reason,
+        field,
+        detail,
+        ..
+    } = &err
+    else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(*reason, ValidationReason::FutureWindow);
+    assert_eq!(field, WINDOW_END_FIELD);
+    // The claim itself: no mention of the route, in any casing.
+    assert!(!detail.to_lowercase().contains("backfill"), "{detail}");
+    // A `!contains` passes vacuously against an empty detail, so anchor it
+    // on what the rejection must still carry. The PRD names two halves —
+    // the offending instant and the bound it breached — so pin both: the
+    // instant in the RFC 3339 form the caller sent and could resubmit, and
+    // the tolerance, which is rendered by a third-party `Display` impl and
+    // so is the likelier of the two to be mangled.
+    assert!(
+        detail.contains(
+            &window_end
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("the fixture instant is RFC 3339 representable")
+        ),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("5m"),
+        "the rejection must name the bound it breached; got {detail}"
+    );
+}
+
+#[test]
+fn try_into_usage_record_normalizes_both_bounds_to_utc() {
+    let offset = time::UtcOffset::from_hms(-7, 0, 0).unwrap();
+    let mut submission = sample_create_usage_record(None, None);
+    let start = submission.window_start;
+    let end = submission.window_end;
+    submission.window_start = start.to_offset(offset);
+    submission.window_end = end.to_offset(offset);
+    let record = submission
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("the fixture period is valid");
+    assert_eq!(record.window_start.offset(), time::UtcOffset::UTC);
+    assert_eq!(record.window_end.offset(), time::UtcOffset::UTC);
+    // Normalization moves the offset, never the instant, and it must not
+    // move either bound onto the other.
+    assert_eq!(record.window_start, start);
+    assert_eq!(record.window_end, end);
+}
+
+#[test]
+fn one_instant_in_two_offsets_derives_one_id() {
+    // The retry invariant: an emitter that resends the same period in a
+    // different offset must not surface a false IdempotencyConflict.
+    let offset = time::UtcOffset::from_hms(2, 0, 0).unwrap();
+    let utc = sample_create_usage_record(None, None)
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("valid");
+    let mut shifted = sample_create_usage_record(None, None);
+    shifted.window_start = shifted.window_start.to_offset(offset);
+    shifted.window_end = shifted.window_end.to_offset(offset);
+    assert_eq!(
+        utc.id,
+        shifted
+            .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+            .expect("valid")
+            .id,
+    );
 }
 
 // ---------------------------------------------------------------------------
-// UsageRecord — wire shape (RFC-3339 `created_at`, optional skipping,
-// `status` defaulting)
+// UsageRecord — wire shape (RFC-3339 period bounds, optional skipping)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_created_at() {
+fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_period_bounds() {
     let record = sample_usage_record(None, None);
     let value = serde_json::to_value(&record).expect("serialize UsageRecord");
     let object = value
@@ -531,29 +494,58 @@ fn usage_record_serde_round_trip_omits_none_optionals_and_uses_rfc3339_created_a
         "subject_ref must be omitted when None; got {object:?}"
     );
     assert!(
-        !object.contains_key("corrects_id"),
-        "corrects_id must be omitted when None; got {object:?}"
+        !object.contains_key("invalidates"),
+        "invalidates must be omitted when None; got {object:?}"
+    );
+    assert!(
+        !object.contains_key("reason_code"),
+        "reason_code must be omitted when None; got {object:?}"
+    );
+    assert!(
+        !object.contains_key("created_at"),
+        "the single instant is gone: an entry carries a covered period and \
+         no other emitter-supplied time attribution; got {object:?}"
     );
     assert_eq!(
-        object.get("created_at").and_then(|v| v.as_str()),
+        object.get("window_start").and_then(|v| v.as_str()),
         Some("1970-01-01T00:00:00Z"),
-        "created_at must serialize in RFC-3339 form with `Z` UTC marker; got {object:?}"
+        "window_start must serialize in RFC-3339 form with `Z` UTC marker; got {object:?}"
     );
     assert_eq!(
-        object.get("status").and_then(|v| v.as_str()),
-        Some("active"),
-        "status must serialize as lowercase; got {object:?}"
+        object.get("window_end").and_then(|v| v.as_str()),
+        Some("1970-01-01T01:00:00Z"),
+        "window_end must serialize in RFC-3339 form with `Z` UTC marker; got {object:?}"
     );
     let round_tripped: UsageRecord = serde_json::from_value(value).expect("UsageRecord round-trip");
     assert_eq!(record, round_tripped);
 }
 
 #[test]
-fn usage_record_serde_round_trip_carries_subject_ref_and_corrects_id_when_some() {
+fn usage_record_deserialize_requires_both_period_bounds() {
+    // Neither bound is optional and neither has a serde default: a payload
+    // missing one is a malformed entry, not a point event. A `#[serde(
+    // default)]` slipped onto either would silently fabricate the epoch.
+    let full = serde_json::to_value(sample_usage_record(None, None)).expect("serialize");
+    for missing in ["window_start", "window_end"] {
+        let mut value = full.clone();
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove(missing)
+            .expect("fixture carries the field");
+        let err = serde_json::from_value::<UsageRecord>(value)
+            .expect_err("a missing period bound must be rejected");
+        assert!(
+            err.to_string().contains(missing),
+            "deserialize error MUST name the missing bound `{missing}`; got {err}"
+        );
+    }
+}
+
+#[test]
+fn usage_record_serde_round_trip_carries_subject_ref_and_the_withdrawal_pair_when_some() {
     let subject = SubjectRef::new("principal-1", Some("user")).expect("valid subject ref");
-    let correction =
-        Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("correction uuid");
-    let record = sample_usage_record(Some(subject), Some(correction));
+    let record = sample_usage_record(Some(subject), Some(target_id()));
     let value = serde_json::to_value(&record).expect("serialize UsageRecord");
     let object = value
         .as_object()
@@ -563,12 +555,413 @@ fn usage_record_serde_round_trip_carries_subject_ref_and_corrects_id_when_some()
         "subject_ref must be present when Some; got {object:?}"
     );
     assert_eq!(
-        object.get("corrects_id").and_then(|v| v.as_str()),
+        object.get("invalidates").and_then(|v| v.as_str()),
         Some("33333333-3333-3333-3333-333333333333"),
-        "corrects_id must serialize as a UUID string; got {object:?}"
+        "invalidates must serialize as a UUID string; got {object:?}"
+    );
+    assert_eq!(
+        object.get("reason_code").and_then(|v| v.as_str()),
+        Some("emitter_duplicate"),
+        "reason_code must serialize transparently as its string; got {object:?}"
     );
     let round_tripped: UsageRecord = serde_json::from_value(value).expect("UsageRecord round-trip");
     assert_eq!(record, round_tripped);
+}
+
+// ---------------------------------------------------------------------------
+// EntryType — the derived record/invalidation discriminator
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entry_type_is_derived_from_the_reference_it_summarizes() {
+    let record = sample_usage_record(None, None);
+    assert_eq!(record.entry_type(), EntryType::Record);
+
+    let invalidation = sample_usage_record(None, Some(target_id()));
+    assert_eq!(invalidation.entry_type(), EntryType::Invalidation);
+}
+
+#[test]
+fn an_entry_carries_no_serialized_entry_type() {
+    // Derived means derived: a stored discriminator is a second place the
+    // kind can be read, and the two can disagree. `deny_unknown_fields`
+    // makes the negative assertion sharp — a submitted one is refused.
+    // This half guards the shape a plugin returns.
+    let json = serde_json::to_value(sample_usage_record(None, None)).expect("serializes");
+    assert!(json.get("entry_type").is_none());
+
+    let mut with_marker = json.as_object().expect("object").clone();
+    with_marker.insert("entry_type".to_owned(), serde_json::json!("invalidation"));
+    serde_json::from_value::<UsageRecord>(serde_json::Value::Object(with_marker))
+        .expect_err("a submitted entry_type must be refused as an unknown field");
+}
+
+#[test]
+fn a_submission_carries_no_entry_type_either() {
+    // The wire contract states the rule on the ingestion shape — "the
+    // ingestion shape accepts no discriminator field" — and this is the
+    // type a request body deserializes into, so it is where a caller could
+    // actually try to send one.
+    let json = serde_json::to_value(sample_create_usage_record(None, None)).expect("serializes");
+    assert!(json.get("entry_type").is_none());
+
+    let mut with_marker = json.as_object().expect("object").clone();
+    with_marker.insert("entry_type".to_owned(), serde_json::json!("invalidation"));
+    serde_json::from_value::<CreateUsageRecord>(serde_json::Value::Object(with_marker))
+        .expect_err("a submitted entry_type must be refused as an unknown field");
+}
+
+#[test]
+fn entry_type_as_str_matches_the_wire_spelling() {
+    assert_eq!(EntryType::Record.as_str(), "record");
+    assert_eq!(EntryType::Invalidation.as_str(), "invalidation");
+}
+
+#[test]
+fn entry_type_serde_agrees_with_as_str_on_both_variants() {
+    // Two spellings of one vocabulary: `rename_all = "lowercase"` and
+    // `as_str`. A surface may reach for either — the REST projection
+    // serializes the value, a metric label takes the `&'static str` — so
+    // they must not be able to drift. Without the rename the derived
+    // `Serialize` would emit `"Record"` while `as_str` kept `"record"`,
+    // and nothing would notice.
+    for kind in [EntryType::Record, EntryType::Invalidation] {
+        assert_eq!(
+            serde_json::to_value(kind).expect("serialize EntryType"),
+            json!(kind.as_str()),
+            "the serde encoding of {kind:?} must be its `as_str` spelling",
+        );
+    }
+    // Spelled out once as literals too, so the pair cannot drift together.
+    assert_eq!(
+        serde_json::to_string(&EntryType::Invalidation).expect("serialize"),
+        "\"invalidation\"",
+    );
+}
+
+#[test]
+fn a_half_shape_body_is_refused_on_deserialize() {
+    // In Rust the pairing is a property of the type: `Invalidation` holds
+    // both halves, so neither a submission nor an entry can carry one
+    // without the other and there is nothing left for the projection to
+    // check. A JSON body is the one place the two can still arrive apart —
+    // the wire keeps them flat, per the contract — so the deserialization
+    // shadow is where the rule now lives. Each direction is checked
+    // separately: dropping either key must be refused, and one arm covers
+    // the other's shape in neither direction.
+    for (present, missing) in [
+        ("invalidates", "reason_code"),
+        ("reason_code", "invalidates"),
+    ] {
+        let full =
+            serde_json::to_value(sample_usage_record(None, Some(target_id()))).expect("serialize");
+        let mut half = full.as_object().expect("object").clone();
+        half.remove(missing).expect("the pair serializes flat");
+        assert!(
+            half.contains_key(present),
+            "the surviving half `{present}` must still be on the body",
+        );
+        let err = serde_json::from_value::<UsageRecord>(serde_json::Value::Object(half))
+            .expect_err("a half-shape entry body must be refused");
+        assert!(
+            err.to_string().contains(missing),
+            "the refusal must name the missing `{missing}`; got {err}",
+        );
+
+        let full = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
+            .expect("serialize");
+        let mut half = full.as_object().expect("object").clone();
+        half.remove(missing).expect("the pair serializes flat");
+        let err = serde_json::from_value::<CreateUsageRecord>(serde_json::Value::Object(half))
+            .expect_err("a half-shape submission body must be refused");
+        assert!(
+            err.to_string().contains(missing),
+            "the refusal must name the missing `{missing}`; got {err}",
+        );
+    }
+
+    // Both halves present, and neither present, both decode.
+    sample_create_usage_record(None, None)
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("an ordinary record");
+    sample_create_usage_record(None, Some(target_id()))
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("an invalidation");
+}
+
+#[test]
+fn both_entry_shapes_round_trip_through_their_own_codecs() {
+    // Both shapes hand-write `Serialize` and route `Deserialize` through a
+    // shadow, so the two halves of each codec are written twice and only
+    // this test makes them agree. It bites in both directions because the
+    // read shadows carry `deny_unknown_fields`: a key the write half
+    // renames or invents is refused as unknown, and a required key it
+    // stops emitting is refused as missing. Neither failure is one the
+    // compiler can see — the exhaustive destructure in each `Serialize`
+    // catches a *dropped* field, not a *renamed* one.
+    //
+    // `CreateUsageRecord` is the emitter-facing ingestion shape, so drift
+    // there silently changes what an SDK client puts on the wire. It went
+    // unguarded while the entry shape was covered incidentally by its
+    // omit-optionals test; both are named here.
+    // The empty-metadata arm is not decoration: an omitted `metadata` is
+    // the common submission, it is the one field whose absence genuinely
+    // needs `#[serde(default)]` on the read shadows, and the ingestion
+    // shape has no other test that exercises the map-empty → key-absent →
+    // default path.
+    let subject = SubjectRef::new("principal-1", Some("user")).expect("valid subject ref");
+    for invalidates in [None, Some(target_id())] {
+        for subject_ref in [None, Some(subject.clone())] {
+            for metadata in [metadata_map([("region", "eu")]), BTreeMap::new()] {
+                let mut record = sample_usage_record(subject_ref.clone(), invalidates);
+                record.metadata = metadata.clone();
+                let encoded = serde_json::to_value(&record).expect("serialize UsageRecord");
+                assert_eq!(
+                    serde_json::from_value::<UsageRecord>(encoded.clone())
+                        .unwrap_or_else(|e| panic!("UsageRecord must decode its own output: {e}")),
+                    record,
+                    "UsageRecord round-trip must be lossless; encoded as {encoded}",
+                );
+
+                let mut submission = sample_create_usage_record(subject_ref.clone(), invalidates);
+                submission.metadata = metadata;
+                let encoded =
+                    serde_json::to_value(&submission).expect("serialize CreateUsageRecord");
+                assert_eq!(
+                    serde_json::from_value::<CreateUsageRecord>(encoded.clone()).unwrap_or_else(
+                        |e| { panic!("CreateUsageRecord must decode its own output: {e}") }
+                    ),
+                    submission,
+                    "CreateUsageRecord round-trip must be lossless; encoded as {encoded}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_withdrawal_pair_stays_flat_on_the_wire() {
+    // The grouping is a Rust-side shape only. `usage-collector-v1.yaml`
+    // declares `invalidates` and `reason_code` as two sibling properties on
+    // both shapes, so a nested `invalidation` object would be a silent
+    // wire break — invisible to every in-process test that round-trips
+    // through the same type.
+    let invalidation = serde_json::to_value(sample_usage_record(None, Some(target_id())))
+        .expect("serialize an invalidation");
+    let object = invalidation.as_object().expect("object");
+    assert!(
+        object.contains_key("invalidates") && object.contains_key("reason_code"),
+        "the pair must serialize as two flat siblings; got {object:?}",
+    );
+    assert!(
+        !object.contains_key("invalidation"),
+        "the Rust grouping must not reach the wire; got {object:?}",
+    );
+
+    let submission = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
+        .expect("serialize an invalidating submission");
+    let object = submission.as_object().expect("object");
+    assert!(
+        object.contains_key("invalidates") && object.contains_key("reason_code"),
+        "the ingestion shape must carry the same two flat siblings; got {object:?}",
+    );
+    assert!(!object.contains_key("invalidation"));
+
+    for ordinary in [
+        serde_json::to_value(sample_usage_record(None, None)).expect("serialize"),
+        serde_json::to_value(sample_create_usage_record(None, None)).expect("serialize"),
+    ] {
+        let object = ordinary.as_object().expect("object");
+        for absent in ["invalidates", "reason_code", "invalidation"] {
+            assert!(
+                !object.contains_key(absent),
+                "an ordinary measurement carries no `{absent}`; got {object:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn each_entry_shape_serializes_the_exact_wire_key_set() {
+    // A round-trip proves the two halves of one codec agree with each
+    // other; it cannot prove either agrees with the contract. Drift applied
+    // to both shadows of a type — a rename, or a changed value encoding —
+    // round-trips perfectly and still breaks every client. These
+    // assertions are against literals for that reason, and they are the
+    // only thing standing between the wire contract and a symmetric edit.
+    let record = serde_json::to_value(sample_usage_record(None, Some(target_id())))
+        .expect("serialize an entry");
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "accepted_at",
+            "gts_type_id",
+            "id",
+            "idempotency_key",
+            "invalidates",
+            "metadata",
+            "origin",
+            "quantity",
+            "reason_code",
+            "resource_ref",
+            "tenant_id",
+            "window_end",
+            "window_start",
+        ],
+        "the entry shape's wire key set is the contract; got {record}",
+    );
+
+    let submission = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
+        .expect("serialize a submission");
+    let mut keys: Vec<&str> = submission
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "gts_type_id",
+            "invalidates",
+            "metadata",
+            "quantity",
+            "reason_code",
+            "resource_ref",
+            "tenant_id",
+            "window_end",
+            "window_start",
+        ],
+        "the ingestion shape is the entry shape minus the two the server \
+         assigns, `id` and `origin` - and, on an invalidation, minus \
+         `idempotency_key`: its key is derived, not carried; got {submission}",
+    );
+
+    // The quantity is a JSON *string*, never a JSON number, on both shapes.
+    // `UsageRecord::quantity`'s own doc is where this rule is stated: a
+    // number round-trips through a client's float and silently loses
+    // precision. The encoding is declared twice per type now, so a
+    // symmetric removal of the string-only codec would pass every
+    // round-trip.
+    for (shape, encoded) in [("entry", &record), ("submission", &submission)] {
+        let value = encoded
+            .get("quantity")
+            .expect("every shape carries a quantity");
+        assert_eq!(
+            value,
+            &json!("42"),
+            "the {shape} shape must encode `quantity` as a decimal string, never a \
+             JSON number; got {value}",
+        );
+        assert!(
+            value.is_string(),
+            "`quantity` must be a JSON string on {shape}"
+        );
+    }
+
+    // The covered-period bounds are RFC 3339 strings on both shapes, for
+    // the same reason: the encoding is declared once per shadow.
+    for (shape, encoded) in [("entry", &record), ("submission", &submission)] {
+        assert_eq!(
+            encoded.get("window_start"),
+            Some(&json!("1970-01-01T00:00:00Z")),
+            "the {shape} shape must encode window_start as RFC 3339",
+        );
+        assert_eq!(
+            encoded.get("window_end"),
+            Some(&json!("1970-01-01T01:00:00Z")),
+            "the {shape} shape must encode window_end as RFC 3339",
+        );
+    }
+}
+
+#[test]
+fn the_idempotency_key_is_what_moves_the_derived_identity() {
+    // `cpt-cf-usage-collector-adr-record-identity-derivation` excludes the
+    // entry type directly; what an invalidation's reference does is change
+    // which key the five dedup-identity inputs read — derived as
+    // `inv:<target>` rather than caller-supplied
+    // (`an_invalidation_is_stored_under_its_derived_key` and
+    // `id_tests::an_invalidation_differs_from_its_target_only_through_the_key`
+    // pin that side). This test pins the record side: two ordinary records
+    // differing only in their key derive different ids.
+    let target = sample_create_usage_record(None, None);
+
+    let mut rekeyed = target.clone();
+    rekeyed.idempotency_key = Some(IdempotencyKey::new("a-different-key").expect("valid"));
+    assert_ne!(
+        target
+            .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+            .expect("record")
+            .id,
+        rekeyed
+            .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+            .expect("re-keyed")
+            .id,
+        "the idempotency key is the one departure that does move it",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ReasonCode — validated construction and serde routing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reason_code_rejects_the_wire_bounds_and_control_characters() {
+    // The length bounds are the wire contract's `ReasonCode` schema
+    // (`minLength: 1`, `maxLength: 128`), read as characters — the same
+    // reading `IdempotencyKey` gives its own 256.
+    ReasonCode::new("").expect_err("empty");
+    ReasonCode::new("x".repeat(129)).expect_err("over 128 characters");
+    // The cap counts characters, as the wire schema's `maxLength` does.
+    ReasonCode::new("\u{e9}".repeat(129)).expect_err("129 characters");
+    // The schema states no pattern for a reason code, so the control
+    // character exclusion is this newtype's own, and stricter: wire
+    // hygiene for a value that reaches a plugin, not pre-image safety —
+    // the code is no input to the identity derivation.
+    ReasonCode::new("emitter\u{7f}duplicate").expect_err("DEL is a control character");
+    ReasonCode::new("emitter\u{1f}duplicate").expect_err("0x1F is a control character");
+    ReasonCode::new("x".repeat(128)).expect("128 characters is the boundary, inclusive");
+    ReasonCode::new("emitter_duplicate").expect("an ordinary code");
+}
+
+#[test]
+fn reason_code_deserialize_routes_through_new() {
+    let err = serde_json::from_value::<ReasonCode>(json!(""))
+        .expect_err("empty code must surface as a serde error");
+    assert!(
+        err.to_string().contains("reason_code must not be empty"),
+        "serde error must carry the Validation detail; got {err}"
+    );
+}
+
+#[test]
+fn reason_code_serializes_transparently() {
+    let code = reason_code("emitter_duplicate");
+    assert_eq!(
+        serde_json::to_value(&code).expect("serialize"),
+        json!("emitter_duplicate")
+    );
+    assert_eq!(code.as_str(), "emitter_duplicate");
+    assert_eq!(code.to_string(), "emitter_duplicate");
+}
+
+#[test]
+fn reason_code_from_str_routes_through_new() {
+    assert!(ReasonCode::from_str("emitter_duplicate").is_ok());
+    let err = ReasonCode::from_str("").expect_err("empty code must be rejected");
+    assert!(matches!(
+        err,
+        UsageCollectorError::InvalidArgument { ref field, .. } if field.as_str() == "reason_code"
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -655,27 +1048,8 @@ fn metadata_filter_deserialize_rejects_unknown_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// AggregationOp / AggregationDimension / AggregationSpec — wire shapes
+// AggregationDimension — wire shapes
 // ---------------------------------------------------------------------------
-
-#[test]
-fn aggregation_op_serializes_as_lowercase_strings() {
-    for (op, expected) in [
-        (AggregationOp::Sum, "\"sum\""),
-        (AggregationOp::Count, "\"count\""),
-        (AggregationOp::Min, "\"min\""),
-        (AggregationOp::Max, "\"max\""),
-        (AggregationOp::Avg, "\"avg\""),
-    ] {
-        let s = serde_json::to_string(&op).expect("serialize AggregationOp");
-        assert_eq!(
-            s, expected,
-            "AggregationOp::{op:?} must serialize as {expected}"
-        );
-        let decoded: AggregationOp = serde_json::from_str(&s).expect("round-trip");
-        assert_eq!(decoded, op);
-    }
-}
 
 #[test]
 fn aggregation_dimension_serializes_unit_variants_as_snake_case_strings() {
@@ -698,41 +1072,6 @@ fn aggregation_dimension_serializes_metadata_variant_as_tagged_object() {
     assert_eq!(
         decoded,
         AggregationDimension::Metadata(metadata_key("region"))
-    );
-}
-
-#[test]
-fn aggregation_spec_omits_empty_group_by_on_the_wire() {
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: Vec::new(),
-    };
-    let value = serde_json::to_value(&spec).expect("serialize AggregationSpec");
-    assert_eq!(
-        value,
-        json!({"op": "sum"}),
-        "empty group_by must be skipped on the wire; got {value}"
-    );
-    let decoded: AggregationSpec = serde_json::from_value(value).expect("round-trip");
-    assert_eq!(decoded, spec);
-}
-
-#[test]
-fn aggregation_spec_carries_group_by_in_caller_order() {
-    let spec = AggregationSpec {
-        op: AggregationOp::Avg,
-        group_by: vec![
-            AggregationDimension::ResourceType,
-            AggregationDimension::Metadata(metadata_key("region")),
-        ],
-    };
-    let value = serde_json::to_value(&spec).expect("serialize");
-    assert_eq!(
-        value,
-        json!({
-            "op": "avg",
-            "group_by": ["resource_type", {"metadata": "region"}],
-        }),
     );
 }
 
@@ -833,9 +1172,9 @@ fn aggregation_bucket_value_above_rust_decimal_ceiling_round_trips() {
 
 #[test]
 fn aggregation_bucket_negative_value_round_trips() {
-    // Compensation rows carry negative magnitudes (and can net to zero) —
-    // widening the carrier to BigDecimal is motivated exactly by this path.
-    // The sign must survive the string wire encoding round-trip.
+    // A measured decrease is an ordinary entry with a negative quantity, so
+    // a bucket can carry one (and a set of them can net to zero). The sign
+    // must survive the string wire encoding round-trip.
     let bucket = AggregationBucket {
         key: Vec::new(),
         value: Some(BigDecimal::from(-42)),
@@ -844,16 +1183,6 @@ fn aggregation_bucket_negative_value_round_trips() {
     assert_eq!(value, json!({ "value": "-42" }));
     let decoded: AggregationBucket = serde_json::from_value(value).expect("round-trip");
     assert_eq!(decoded, bucket);
-}
-
-#[test]
-fn usage_record_deserialize_defaults_status_to_active_when_missing() {
-    let mut value =
-        serde_json::to_value(sample_usage_record(None, None)).expect("serialize seed UsageRecord");
-    value.as_object_mut().expect("object").remove("status");
-    let decoded: UsageRecord = serde_json::from_value(value)
-        .expect("UsageRecord without status field deserializes via #[serde(default)]");
-    assert_eq!(decoded.status, UsageRecordStatus::Active);
 }
 
 // ---------------------------------------------------------------------------
@@ -897,44 +1226,6 @@ fn metadata_key_serializes_transparently() {
     let key = MetadataKey::new("region").expect("valid key");
     let value = serde_json::to_value(&key).expect("serialize");
     assert_eq!(value, json!("region"));
-}
-
-// ---------------------------------------------------------------------------
-// UsageType.metadata_fields wire shape (BTreeSet<MetadataKey>)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn usage_type_metadata_fields_deserialize_rejects_empty_member_key() {
-    let payload = json!({
-        "gts_id": SAMPLE_USAGE_TYPE_ID,
-        "kind": "counter",
-        "metadata_fields": [""],
-    });
-    let err = serde_json::from_value::<UsageType>(payload)
-        .expect_err("empty member key must be rejected by MetadataKey::deserialize");
-    assert!(err.to_string().contains("metadata key must not be empty"));
-}
-
-#[test]
-fn usage_type_metadata_fields_deserialize_rejects_duplicate_member_keys() {
-    // The custom `deserialize_metadata_fields` routes the JSON array through
-    // `Vec<MetadataKey>` so duplicate keys are rejected at the SDK wire
-    // boundary instead of silently collapsing into the `BTreeSet`. The error
-    // message carries the offending zero-based index. The REST DTO path
-    // additionally surfaces the typed `UsageCollectorError::InvalidArgument`
-    // via `metadata_fields_from_wire`.
-    let payload = json!({
-        "gts_id": SAMPLE_USAGE_TYPE_ID,
-        "kind": "counter",
-        "metadata_fields": ["region", "tier", "region"],
-    });
-    let err = serde_json::from_value::<UsageType>(payload)
-        .expect_err("duplicate metadata field must be rejected at deserialize");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("duplicate metadata field") && msg.contains("index 2"),
-        "expected duplicate-at-index-2 message, got {msg}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1319,21 @@ fn idempotency_key_new_rejects_nul_byte() {
 }
 
 #[test]
+fn idempotency_key_rejects_a_unit_separator_del_and_an_over_long_key() {
+    // A confirmation of
+    // `cpt-cf-usage-collector-adr-record-identity-derivation`: the derivation
+    // concatenates the key under a
+    // 0x1F separator and the key is not the final field, so a key carrying
+    // that byte would inject a separator mid-pre-image. Rejected at
+    // construction, before any derivation can run. DEL and the 256-byte
+    // ceiling come from the same wire schema pattern.
+    IdempotencyKey::new("idem\u{1f}1").expect_err("0x1F in a key must be rejected");
+    IdempotencyKey::new("idem\u{7f}1").expect_err("DEL in a key must be rejected");
+    IdempotencyKey::new("a".repeat(257)).expect_err("over-long key must be rejected");
+    IdempotencyKey::new("a".repeat(256)).expect("256 bytes is the ceiling, not past it");
+}
+
+#[test]
 fn idempotency_key_serializes_transparently() {
     let k = IdempotencyKey::new("idem-1").expect("valid key");
     let value = serde_json::to_value(&k).expect("serialize");
@@ -1053,6 +1359,105 @@ fn idempotency_key_from_str_routes_through_new() {
         err,
         UsageCollectorError::InvalidArgument { ref field, .. } if field.as_str() == "idempotency_key"
     ));
+}
+
+fn reason_of(err: &UsageCollectorError) -> &ValidationReason {
+    match err {
+        UsageCollectorError::InvalidArgument { reason, .. } => reason,
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_caller_key_may_not_use_the_reserved_invalidation_prefix() {
+    let err = IdempotencyKey::new("inv:anything").expect_err("reserved prefix");
+    assert_eq!(field_of(&err), "idempotency_key");
+    assert_eq!(reason_of(&err), &ValidationReason::ReservedKeyPrefix);
+    IdempotencyKey::new("INV:upper-is-not-reserved").expect("the prefix is case-sensitive");
+    serde_json::from_value::<IdempotencyKey>(json!("inv:x"))
+        .expect_err("deserialize routes through new");
+}
+
+#[test]
+fn a_stored_key_may_carry_the_prefix_and_is_otherwise_validated() {
+    let stored = IdempotencyKey::from_stored("inv:33333333-3333-3333-3333-333333333333")
+        .expect("stored invalidation key");
+    assert_eq!(stored.as_str(), "inv:33333333-3333-3333-3333-333333333333");
+    IdempotencyKey::from_stored("").expect_err("still non-empty");
+    IdempotencyKey::from_stored("a\u{1f}b").expect_err("still control-character free");
+}
+
+#[test]
+fn an_invalidation_key_is_the_prefix_and_the_lowercase_hyphenated_target() {
+    let target = Uuid::parse_str("ABCDEF01-2345-6789-ABCD-EF0123456789").unwrap();
+    assert_eq!(
+        IdempotencyKey::for_invalidation(target).as_str(),
+        "inv:abcdef01-2345-6789-abcd-ef0123456789",
+    );
+}
+
+#[test]
+fn a_record_without_a_key_is_refused_at_projection() {
+    let mut s = sample_create_usage_record(None, None);
+    s.idempotency_key = None;
+    let err = s
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("missing key");
+    assert_eq!(field_of(&err), "idempotency_key");
+    assert_eq!(reason_of(&err), &ValidationReason::Validation);
+}
+
+#[test]
+fn an_invalidation_carrying_a_key_is_refused_at_projection() {
+    let mut s = sample_create_usage_record(None, Some(target_id()));
+    s.idempotency_key = Some(IdempotencyKey::new("caller-key").unwrap());
+    let err = s
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("key on invalidation");
+    assert_eq!(field_of(&err), "idempotency_key");
+    assert_eq!(reason_of(&err), &ValidationReason::KeyOnInvalidation);
+}
+
+#[test]
+fn a_record_key_built_with_from_stored_and_the_reserved_prefix_is_refused_at_projection() {
+    // `IdempotencyKey::new` already refuses the `inv:` prefix, so an
+    // in-process caller cannot reach this case through it. `from_stored` is
+    // `pub` and skips that rule to rehydrate a stored invalidation key — an
+    // in-process caller (not REST, which only ever reaches `new`) could
+    // otherwise use it to plant an ordinary record on the dedup slot a
+    // future invalidation of `target` would derive, blocking that
+    // correction forever. The projection must catch it independently of
+    // which constructor produced the key.
+    let mut s = sample_create_usage_record(None, None);
+    let reserved = IdempotencyKey::from_stored(format!("inv:{}", target_id()))
+        .expect("from_stored accepts the reserved prefix");
+    s.idempotency_key = Some(reserved);
+    let err = s
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("reserved prefix on a record");
+    assert_eq!(field_of(&err), "idempotency_key");
+    assert_eq!(reason_of(&err), &ValidationReason::ReservedKeyPrefix);
+}
+
+#[test]
+fn an_invalidation_is_stored_under_its_derived_key() {
+    let record = sample_create_usage_record(None, Some(target_id()))
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("projects");
+    assert_eq!(
+        record.idempotency_key,
+        IdempotencyKey::for_invalidation(target_id())
+    );
+    assert_eq!(
+        record.id,
+        crate::derive_usage_record_id(
+            record.tenant_id,
+            &record.gts_type_id,
+            &IdempotencyKey::for_invalidation(target_id()),
+            record.window_start,
+            record.window_end,
+        ),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,152 +1666,94 @@ fn subject_ref_deserialize_rejects_unknown_fields() {
 // UsageRecordQuery — OData filter surface
 // ---------------------------------------------------------------------------
 //
-// `gts_id` is carried as a typed parameter on `list_usage_records` /
+// `gts_type_id` is carried as a typed parameter on `list_usage_records` /
 // `query_aggregated_usage_records`. The OData filter surface declared by
 // `UsageRecordQuery` deliberately omits it so that
 // `parse_odata_filter::<UsageRecordFilterField>` rejects any
-// `gts_id`-touching predicate at parse time — implementations and the
+// `gts_type_id`-touching predicate at parse time — implementations and the
 // gateway do not need a runtime reject path.
 
 #[test]
-fn usage_record_query_filter_surface_rejects_gts_id_eq() {
+fn usage_record_query_filter_surface_rejects_gts_type_id_eq() {
     let err = toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(
-        "gts_id eq 'gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1'",
+        "gts_type_id eq 'gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~'",
     )
-    .expect_err("gts_id must not be exposed on the OData filter surface");
+    .expect_err("gts_type_id must not be exposed on the OData filter surface");
     assert!(
         matches!(
             &err,
-            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_id"
+            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_type_id"
         ),
-        "expected UnknownField(\"gts_id\"), got {err:?}",
+        "expected UnknownField(\"gts_type_id\"), got {err:?}",
     );
 }
 
 #[test]
-fn usage_record_query_filter_surface_rejects_gts_id_in_list() {
+fn usage_record_query_filter_surface_rejects_gts_type_id_in_list() {
     let err = toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(
-        "gts_id in ('a', 'b')",
+        "gts_type_id in ('a', 'b')",
     )
-    .expect_err("gts_id must not be exposed on the OData filter surface");
+    .expect_err("gts_type_id must not be exposed on the OData filter surface");
     assert!(
         matches!(
             &err,
-            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_id"
+            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_type_id"
         ),
-        "expected UnknownField(\"gts_id\"), got {err:?}",
+        "expected UnknownField(\"gts_type_id\"), got {err:?}",
     );
 }
 
 #[test]
-fn usage_record_query_filter_surface_rejects_gts_id_inside_composite() {
+fn usage_record_query_filter_surface_rejects_gts_type_id_inside_composite() {
     let err = toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(
-        "tenant_id eq 22222222-2222-2222-2222-222222222222 and gts_id eq 'x'",
+        "tenant_id eq 22222222-2222-2222-2222-222222222222 and gts_type_id eq 'x'",
     )
-    .expect_err("gts_id-touching predicates must be rejected at parse time");
+    .expect_err("gts_type_id-touching predicates must be rejected at parse time");
     assert!(
         matches!(
             &err,
-            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_id"
+            toolkit_odata::filter::FilterError::UnknownField(name) if name == "gts_type_id"
         ),
-        "expected UnknownField(\"gts_id\"), got {err:?}",
+        "expected UnknownField(\"gts_type_id\"), got {err:?}",
     );
 }
 
 #[test]
-fn aggregation_op_is_allowed_for_counter() {
-    // Counter allows {SUM, COUNT}; rejects MIN/MAX/AVG.
-    assert!(AggregationOp::Sum.is_allowed_for(UsageKind::Counter));
-    assert!(AggregationOp::Count.is_allowed_for(UsageKind::Counter));
-    assert!(!AggregationOp::Min.is_allowed_for(UsageKind::Counter));
-    assert!(!AggregationOp::Max.is_allowed_for(UsageKind::Counter));
-    assert!(!AggregationOp::Avg.is_allowed_for(UsageKind::Counter));
-}
-
-#[test]
-fn aggregation_op_is_allowed_for_gauge() {
-    // Gauge allows {MIN, MAX, AVG, COUNT}; rejects SUM.
-    assert!(!AggregationOp::Sum.is_allowed_for(UsageKind::Gauge));
-    assert!(AggregationOp::Count.is_allowed_for(UsageKind::Gauge));
-    assert!(AggregationOp::Min.is_allowed_for(UsageKind::Gauge));
-    assert!(AggregationOp::Max.is_allowed_for(UsageKind::Gauge));
-    assert!(AggregationOp::Avg.is_allowed_for(UsageKind::Gauge));
-}
-
-#[test]
-fn aggregation_op_not_allowed_for_kind_builds_invalid_argument() {
-    let gts_id = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
-    ))
-    .expect("valid gts_id");
-
-    let err = crate::UsageCollectorError::aggregation_op_not_allowed_for_kind(
-        AggregationOp::Sum,
-        UsageKind::Gauge,
-        &gts_id,
-    );
-
-    match err {
-        crate::UsageCollectorError::InvalidArgument {
-            field,
-            reason,
-            resource_name,
-            detail,
-            ..
-        } => {
-            assert_eq!(field, "aggregation.op");
-            assert_eq!(reason, crate::reason::ValidationReason::OpNotAllowedForKind);
-            assert_eq!(resource_name.as_deref(), Some(gts_id.as_ref()));
-            // `detail` is the user-facing 400 message; a broken op→text or
-            // kind→allowed-set branch would otherwise ship silently. Pin the
-            // offending op, the rejecting kind, and that kind's allowed set.
-            assert!(
-                detail.contains("`sum`"),
-                "detail must name the offending op; got {detail:?}"
-            );
-            assert!(
-                detail.contains("gauge"),
-                "detail must name the rejecting kind; got {detail:?}"
-            );
-            assert!(
-                detail.contains("min, max, avg, count"),
-                "detail must name the gauge allowed-op set; got {detail:?}"
-            );
-        }
-        other => panic!("expected InvalidArgument, got {other:?}"),
+fn the_filter_surface_carries_every_fixed_field_design_declares() {
+    // The converse of the three refusals above: DESIGN §3.1's
+    // `UsageRecordFilterField` row makes the admissible `$filter` set
+    // these eight fixed names plus the queried meter's declared metadata
+    // keys, resolved per request. Pinned because the schema struct is the
+    // only place the fixed half is written down, and a name dropped from
+    // it does not fail loudly — it degrades to the same `UnknownField`
+    // refusal `gts_type_id` gets, which reads to a caller like their own
+    // mistake.
+    //
+    // `$filter` only. The DESIGN row names `group_by` too, but the
+    // aggregate path resolves a dimension through `AggregationDimension`,
+    // a separate and currently narrower enum: five of these eight, with
+    // no `entry_type`, `invalidates` or `origin`. This asserts nothing
+    // about it.
+    //
+    // A lower bound, not the whole schema: `id`, `window_start` and
+    // `window_end` are on it too, for the keyset and the plugin's
+    // field-to-column mapping rather than for filtering — see the
+    // file-level comment above `UsageRecordQuery`.
+    for field in [
+        "tenant_id",
+        "resource_id",
+        "resource_type",
+        "subject_id",
+        "subject_type",
+        "entry_type",
+        "origin",
+        "invalidates",
+    ] {
+        assert!(
+            crate::models::UsageRecordFilterField::from_name(field).is_some(),
+            "`{field}` is a fixed filterable field per DESIGN §3.1",
+        );
     }
-}
-
-#[test]
-fn aggregation_op_not_allowed_for_kind_counter_detail_names_op_kind_and_allowed_set() {
-    let gts_id = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
-    ))
-    .expect("valid gts_id");
-
-    // Min on a counter exercises the other kind→allowed-set branch
-    // (counter → {sum, count}) and a distinct op→text mapping (Min → "min").
-    let err = crate::UsageCollectorError::aggregation_op_not_allowed_for_kind(
-        AggregationOp::Min,
-        UsageKind::Counter,
-        &gts_id,
-    );
-
-    let crate::UsageCollectorError::InvalidArgument { detail, .. } = err else {
-        panic!("expected InvalidArgument, got {err:?}");
-    };
-    assert!(
-        detail.contains("`min`"),
-        "detail must name the offending op; got {detail:?}"
-    );
-    assert!(
-        detail.contains("counter"),
-        "detail must name the rejecting kind; got {detail:?}"
-    );
-    assert!(
-        detail.contains("sum, count"),
-        "detail must name the counter allowed-op set; got {detail:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,31 +1761,180 @@ fn aggregation_op_not_allowed_for_kind_counter_detail_names_op_kind_and_allowed_
 // ---------------------------------------------------------------------------
 
 #[test]
-fn keyset_safe_record_fields_are_exactly_the_mandatory_columns() {
-    // The mandatory (never-null) record attributes are sound leading keys for
-    // the plugin's row-value tuple keyset comparison.
-    for field in [
-        "id",
-        "created_at",
-        "tenant_id",
-        "resource_id",
-        "resource_type",
-        "status",
-    ] {
+fn the_keyset_safe_allowlist_is_exactly_the_mandatory_record_attributes() {
+    // The anchor for the exported set. `is_keyset_safe_record_field` reads
+    // `KEYSET_SAFE_RECORD_FIELDS`, and the caller-facing `$orderby`
+    // rejection quotes it verbatim, so the constant IS the wire contract
+    // and a silent addition to it would widen the admissible order surface
+    // with nothing noticing. Spelled out as literals for that reason.
+    assert_eq!(
+        crate::models::KEYSET_SAFE_RECORD_FIELDS,
+        [
+            "id",
+            "window_start",
+            "window_end",
+            "tenant_id",
+            "resource_id",
+            "resource_type",
+            "origin",
+        ],
+    );
+}
+
+#[test]
+fn every_admissible_order_key_resolves_to_a_column() {
+    // Being on the allowlist is necessary but not sufficient: the plugin
+    // resolves an order key through `UsageRecordFilterField`, so a name
+    // admissible here but absent from the filterable schema is an
+    // unmappable order key the gateway happily forwards.
+    //
+    // Two independently maintained spellings of one vocabulary, and this is
+    // the only thing checking they agree in this direction; the converse —
+    // a name on the filterable schema that must never be an order key — is
+    // `derivation_not_presence_separates_entry_type_from_origin` below, and
+    // neither guard catches the other's case.
+    //
+    // This replaces a test that re-asserted the same literals the anchor
+    // above pins, through a predicate that reads that very constant: it
+    // could not fail unless the anchor failed first.
+    for field in crate::models::KEYSET_SAFE_RECORD_FIELDS {
         assert!(
             is_keyset_safe_record_field(field),
-            "`{field}` is a mandatory attribute and must be keyset-safe",
+            "`{field}` is on the allowlist, so the predicate reading it must agree",
+        );
+        assert!(
+            crate::models::UsageRecordFilterField::from_name(field).is_some(),
+            "`{field}` is admissible as an order key but has no \
+             field-to-column mapping on the filterable schema, so a plugin \
+             cannot resolve it",
         );
     }
 }
 
 #[test]
+fn derivation_not_presence_separates_entry_type_from_origin() {
+    // The converse of the guard above, and the half it cannot supply.
+    // Resolving to a column is necessary but not sufficient: `entry_type`
+    // is on the filterable schema (the wire contract's `$filter` parameter
+    // names it) and therefore resolves through `from_name`, while being a
+    // function of the optional `invalidates` that the SDK guarantees no
+    // key for. The guard above passes on it. This one does not.
+    //
+    // `origin` is the positive control, and it is what keeps the ground
+    // honest: it too has a value on every entry, and it too resolves
+    // through `from_name`, so neither presence nor column resolution can
+    // be what refuses `entry_type`. Being a field of the record rather
+    // than a function of one is the whole of the difference.
+    for field in ["entry_type", "origin"] {
+        assert!(
+            crate::models::UsageRecordFilterField::from_name(field).is_some(),
+            "`{field}` is a filterable field per the wire contract",
+        );
+    }
+    assert!(
+        !is_keyset_safe_record_field("entry_type"),
+        "`entry_type` is a function of the optional `invalidates`, so the SDK \
+         promises no keyset key over it however present the value is",
+    );
+    assert!(
+        is_keyset_safe_record_field("origin"),
+        "`origin` is a field of the record itself, so the SDK does promise a \
+         keyset key over it",
+    );
+}
+
+#[test]
+fn the_order_key_refusal_names_the_derived_ground_alongside_the_optional_one() {
+    // The refusal detail is caller-facing and interpolates
+    // `KEYSET_SAFE_RECORD_FIELDS` verbatim, so it is the wire contract for
+    // what may be ordered by. `entry_type` made a third refusal reachable:
+    // a recognised filter field that is neither domain-optional nor
+    // unrecognised, refused because it is derived. A detail naming only
+    // the optional and unknown grounds would misdescribe it, and this is
+    // the only thing pinning that the wording covers the case. Lives here
+    // rather than beside the constructor because it is a claim about the
+    // keyset vocabulary this module owns; `error.rs` carries no sibling
+    // test file.
+    let err = UsageCollectorError::inadmissible_order_key("entry_type");
+    let UsageCollectorError::InvalidArgument {
+        ref field,
+        ref detail,
+        ..
+    } = err
+    else {
+        panic!("expected InvalidArgument, got {err:?}");
+    };
+    assert_eq!(field, "$orderby");
+    assert!(
+        detail.contains("entry_type"),
+        "the refusal must echo the key the caller sent; got {detail}",
+    );
+    assert!(
+        detail.contains("derived"),
+        "a derived key is refused on its own ground, not as an optional or \
+         unrecognised one; got {detail}",
+    );
+    assert!(
+        detail.contains("resource_type"),
+        "the refusal must name the admissible set so the caller is told what \
+         they may order by; got {detail}",
+    );
+}
+
+#[test]
+fn created_at_is_no_longer_a_record_field() {
+    // An entry carries a covered period, not a creation instant, so
+    // `created_at` has to fail closed on both halves of the read surface
+    // rather than resolve to something: it is not an admissible order key,
+    // and it is not on the filterable-field schema at all. A stale
+    // `$orderby=created_at` must be rejected, never silently reinterpreted.
+    assert!(
+        !is_keyset_safe_record_field("created_at"),
+        "`created_at` is not a record attribute and must not be an order key",
+    );
+    let err = toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(
+        "created_at eq 2026-01-01T00:00:00Z",
+    )
+    .expect_err("created_at is no longer on the filterable-field schema");
+    assert!(
+        matches!(
+            &err,
+            toolkit_odata::filter::FilterError::UnknownField(name) if name == "created_at"
+        ),
+        "expected UnknownField(\"created_at\"), got {err:?}",
+    );
+}
+
+#[test]
+fn the_covered_period_bounds_resolve_on_the_filterable_field_schema() {
+    // The bounds are on this schema although a `$filter` may never name
+    // them, because the schema is also the plugin's field-to-column
+    // mapping and the `$orderby` / cursor-token vocabulary: `window_end`
+    // has to resolve to a column for the canonical `(window_end, id)`
+    // keyset to mean anything. Parsing succeeding here is therefore the
+    // intended state, and the host crate's reserved-filter-field guard —
+    // not an `UnknownField` from this schema — is what keeps a predicate
+    // off them.
+    for expr in [
+        "window_start eq 2026-01-01T00:00:00Z",
+        "window_end eq 2026-01-01T00:00:00Z",
+    ] {
+        toolkit_odata::filter::parse_odata_filter::<crate::models::UsageRecordFilterField>(expr)
+            .unwrap_or_else(|e| {
+                panic!("`{expr}` must resolve against the filterable-field schema: {e:?}")
+            });
+    }
+}
+
+#[test]
 fn keyset_unsafe_record_fields_are_the_domain_optional_ones() {
-    // `subject_ref` (→ subject_id, subject_type) and `corrects_id` are
-    // `Option`al on `UsageRecord`, so their columns are nullable. A row-value
-    // tuple comparison with a NULL leading key evaluates to NULL in Postgres,
-    // silently dropping NULL rows from the page — so they are NOT keyset-safe.
-    for field in ["subject_id", "subject_type", "corrects_id"] {
+    // `subject_ref` (→ subject_id, subject_type) is `Option`al on
+    // `UsageRecord`, and the `invalidates` filter field reads a target that
+    // is present only on an invalidation, so all three can be absent and
+    // their columns are nullable. A row-value tuple comparison with a NULL
+    // leading key evaluates to NULL in Postgres, silently dropping NULL
+    // rows from the page — so they are NOT keyset-safe.
+    for field in ["subject_id", "subject_type", "invalidates"] {
         assert!(
             !is_keyset_safe_record_field(field),
             "`{field}` is a domain-optional attribute and must NOT be keyset-safe",
@@ -1453,14 +1949,585 @@ fn keyset_safe_record_field_is_fail_closed_for_unknown_names() {
     assert!(!is_keyset_safe_record_field("value"));
     assert!(!is_keyset_safe_record_field("definitely_not_a_field"));
     assert!(!is_keyset_safe_record_field(""));
+    // Exact match, not a prefix or case-folded one: the allowlist is the
+    // whole gate on the `$orderby` surface.
+    assert!(!is_keyset_safe_record_field("window_en"));
+    assert!(!is_keyset_safe_record_field("window_endd"));
+    assert!(!is_keyset_safe_record_field("WINDOW_END"));
+}
+
+// ---------------------------------------------------------------------------
+// AggregationFold — declared-fold serde/FromStr surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aggregation_fold_serde_round_trips_screaming_case() {
+    for (fold, wire) in [
+        (AggregationFold::Sum, "\"SUM\""),
+        (AggregationFold::Count, "\"COUNT\""),
+        (AggregationFold::Max, "\"MAX\""),
+        (AggregationFold::Min, "\"MIN\""),
+        (AggregationFold::Latest, "\"LATEST\""),
+    ] {
+        assert_eq!(serde_json::to_string(&fold).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<AggregationFold>(wire).unwrap(), fold);
+    }
 }
 
 #[test]
-fn keyset_safe_type_fields_are_the_catalog_not_null_columns() {
-    // Both `usage_type_catalog` columns exposed on the filter surface are
-    // `NOT NULL`, so both are keyset-safe; anything else fails closed.
-    assert!(is_keyset_safe_type_field("gts_id"));
-    assert!(is_keyset_safe_type_field("kind"));
-    assert!(!is_keyset_safe_type_field("metadata_fields"));
-    assert!(!is_keyset_safe_type_field("definitely_not_a_field"));
+fn aggregation_fold_rejects_avg() {
+    // AVG is not a declared fold: a declaration naming it must fail
+    // resolution rather than silently pick another.
+    assert!(serde_json::from_str::<AggregationFold>("\"AVG\"").is_err());
+
+    let err = "AVG"
+        .parse::<AggregationFold>()
+        .expect_err("AVG must be rejected by FromStr");
+    assert!(
+        matches!(err, UsageCollectorError::InvalidArgument { ref field, ref detail, .. } if field == "aggregation_fold" && detail.contains("AVG")),
+        "expected InvalidArgument on field `aggregation_fold` naming AVG, got {err:?}"
+    );
+}
+
+#[test]
+fn aggregation_fold_from_str_matches_the_wire_shape() {
+    assert_eq!(
+        "SUM".parse::<AggregationFold>().unwrap(),
+        AggregationFold::Sum
+    );
+    assert_eq!(
+        "LATEST".parse::<AggregationFold>().unwrap(),
+        AggregationFold::Latest
+    );
+    // Case-sensitive on purpose: the enum in the trait schema is upper case,
+    // and accepting "sum" would admit a declaration the registry rejects.
+    assert!("sum".parse::<AggregationFold>().is_err());
+}
+
+#[test]
+fn aggregation_fold_as_str_matches_the_wire_spelling() {
+    assert_eq!(AggregationFold::Sum.as_str(), "SUM");
+    assert_eq!(AggregationFold::Count.as_str(), "COUNT");
+    assert_eq!(AggregationFold::Max.as_str(), "MAX");
+    assert_eq!(AggregationFold::Min.as_str(), "MIN");
+    assert_eq!(AggregationFold::Latest.as_str(), "LATEST");
+}
+
+#[test]
+fn aggregation_fold_display_matches_as_str() {
+    assert_eq!(AggregationFold::Latest.to_string(), "LATEST");
+}
+
+// ---------------------------------------------------------------------------
+// MeterTypeId — construction validation, serde routing, FromStr, Display
+// ---------------------------------------------------------------------------
+
+const VALID_METER: &str = "gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~";
+
+#[test]
+fn meter_type_id_accepts_a_single_derivation_of_the_base() {
+    let id = MeterTypeId::new(VALID_METER).expect("valid meter type id");
+    assert_eq!(id.as_str(), VALID_METER);
+}
+
+#[test]
+fn meter_type_id_rejects_the_bare_base_type() {
+    // The base is abstract. A meter must add exactly one segment.
+    assert!(MeterTypeId::new("gts.cf.core.uc.usage_record.v1~").is_err());
+}
+
+#[test]
+fn meter_type_id_rejects_a_type_outside_the_base() {
+    assert!(MeterTypeId::new("gts.cf.core.uc.usage_type.v1~foo.bar._.baz.v1~").is_err());
+}
+
+#[test]
+fn meter_type_id_rejects_a_missing_terminator() {
+    // No trailing `~` makes it an instance id, not a type id.
+    assert!(
+        MeterTypeId::new("gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1")
+            .is_err()
+    );
+}
+
+// A meter is a leaf: exactly one derivation segment on top of the base. A
+// second segment (`base~mid.v1~tail.v1~`, a two-level chain) has the right
+// prefix and the right terminator, so only the interior-`~` check inside the
+// stripped segment catches it — this is the case a plain `strip_prefix`
+// check would let through.
+#[test]
+fn meter_type_id_rejects_a_deep_derivation_chain() {
+    let err = MeterTypeId::new("gts.cf.core.uc.usage_record.v1~a.b._.c.v1~d.e._.f.v1~")
+        .expect_err("a meter is a leaf; a second derivation segment must be rejected");
+    assert!(matches!(
+        err,
+        UsageCollectorError::InvalidArgument {
+            reason: ValidationReason::InvalidBaseGtsId,
+            ..
+        }
+    ));
+}
+
+// Empty inner segment (consecutive `~`) must also be rejected: stripping the
+// base prefix leaves the bare terminator `~` with nothing before it, and the
+// `segment.is_empty()` check after stripping that trailing `~` is what
+// catches it.
+#[test]
+fn meter_type_id_rejects_consecutive_tildes() {
+    let err = MeterTypeId::new("gts.cf.core.uc.usage_record.v1~~")
+        .expect_err("consecutive tildes (empty derivation segment) must be rejected");
+    assert!(matches!(
+        err,
+        UsageCollectorError::InvalidArgument {
+            reason: ValidationReason::InvalidBaseGtsId,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn meter_type_id_rejects_control_characters() {
+    // `cpt-cf-usage-collector-adr-record-identity-derivation` concatenates
+    // this value under a 0x1F separator, so a control character would break
+    // the injectivity the identifier derivation needs.
+    let with_us = "gts.cf.core.uc.usage_record.v1~exa\u{1F}mple._.m.v1~";
+    assert!(MeterTypeId::new(with_us).is_err());
+    let with_del = "gts.cf.core.uc.usage_record.v1~exa\u{7F}mple._.m.v1~";
+    assert!(MeterTypeId::new(with_del).is_err());
+}
+
+#[test]
+fn meter_type_id_rejects_an_over_long_identifier() {
+    let long = format!("gts.cf.core.uc.usage_record.v1~{}.v1~", "a".repeat(600));
+    assert!(MeterTypeId::new(long).is_err());
+}
+
+#[test]
+fn meter_type_id_deserialize_routes_through_validation() {
+    let bad = serde_json::json!("gts.cf.core.uc.usage_record.v1~");
+    assert!(serde_json::from_value::<MeterTypeId>(bad).is_err());
+
+    let good = serde_json::json!(VALID_METER);
+    let parsed: MeterTypeId = serde_json::from_value(good).expect("valid");
+    assert_eq!(parsed.as_str(), VALID_METER);
+}
+
+#[test]
+fn meter_type_id_rejects_control_characters_as_validation_error_naming_the_value() {
+    // Pins the concrete variant, the attributed field, and that `detail`
+    // names the offending value rather than a generic GTS parse error —
+    // matching usage_kind_from_str_rejects_unknown_variant_as_validation_error.
+    let with_us = "gts.cf.core.uc.usage_record.v1~exa\u{1F}mple._.m.v1~";
+    let err = MeterTypeId::new(with_us).expect_err("control character must be rejected");
+    assert!(
+        matches!(
+            err,
+            UsageCollectorError::InvalidArgument {
+                ref field,
+                ref reason,
+                ref detail,
+                ..
+            } if field == "gts_type_id"
+                && matches!(reason, ValidationReason::InvalidBaseGtsId)
+                && detail.contains(with_us)
+        ),
+        "expected InvalidArgument[gts_type_id/InvalidBaseGtsId] naming the offending value, got {err:?}"
+    );
+}
+
+#[test]
+fn meter_type_id_as_str_and_display_match_the_wire_string() {
+    let id = MeterTypeId::new(VALID_METER).expect("valid meter type id");
+    assert_eq!(id.as_str(), VALID_METER);
+    assert_eq!(id.to_string(), VALID_METER);
+}
+
+#[test]
+fn meter_type_id_from_str_routes_through_new() {
+    let id: MeterTypeId = VALID_METER
+        .parse()
+        .expect("valid meter type id via FromStr");
+    assert_eq!(id.as_str(), VALID_METER);
+
+    let err = "gts.cf.core.uc.usage_record.v1~"
+        .parse::<MeterTypeId>()
+        .expect_err("bare base must be rejected by FromStr");
+    assert!(matches!(
+        err,
+        UsageCollectorError::InvalidArgument { ref field, .. } if field == "gts_type_id"
+    ));
+}
+
+#[test]
+fn record_origin_wire_spellings_are_the_two_the_contract_declares() {
+    // `RecordOrigin` in usage-collector-v1.yaml is `enum: [live, backfill]`.
+    // These strings are a wire contract and a bounded metric-label
+    // vocabulary at once, so they are asserted against literals rather
+    // than against the enum.
+    assert_eq!(RecordOrigin::Live.as_str(), "live");
+    assert_eq!(RecordOrigin::Backfill.as_str(), "backfill");
+}
+
+#[test]
+fn record_origin_serialises_to_its_wire_spelling() {
+    assert_eq!(
+        serde_json::to_value(RecordOrigin::Live).expect("serializes"),
+        serde_json::json!("live"),
+    );
+    assert_eq!(
+        serde_json::to_value(RecordOrigin::Backfill).expect("serializes"),
+        serde_json::json!("backfill"),
+    );
+}
+
+#[test]
+fn record_origin_deserialises_from_its_wire_spelling_and_refuses_anything_else() {
+    // Both variants, not just one: the read direction is what a consumer
+    // decoding a persisted entry depends on, and a value that only
+    // round-trips in one direction is the shape a `rename` on a single
+    // variant would produce.
+    assert_eq!(
+        serde_json::from_value::<RecordOrigin>(serde_json::json!("live")).expect("declared value"),
+        RecordOrigin::Live,
+    );
+    assert_eq!(
+        serde_json::from_value::<RecordOrigin>(serde_json::json!("backfill"))
+            .expect("declared value"),
+        RecordOrigin::Backfill,
+    );
+    // The marker is closed. A third value is a contract violation, not a
+    // forward-compatible extension: a consumer that cannot tell imported
+    // history from live consumption is the gap the marker exists to close.
+    serde_json::from_value::<RecordOrigin>(serde_json::json!("imported"))
+        .expect_err("RecordOrigin is closed");
+    serde_json::from_value::<RecordOrigin>(serde_json::json!("Live"))
+        .expect_err("the wire spelling is lowercase");
+}
+
+#[test]
+fn the_projection_stamps_the_origin_it_is_handed() {
+    let submission = sample_create_usage_record(None, None);
+    let live = submission
+        .clone()
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("valid submission");
+    let backfilled = submission
+        .try_into_usage_record(RecordOrigin::Backfill, SAMPLE_ACCEPTED_AT)
+        .expect("valid submission");
+
+    assert_eq!(live.origin, RecordOrigin::Live);
+    assert_eq!(backfilled.origin, RecordOrigin::Backfill);
+}
+
+#[test]
+fn origin_is_not_an_input_to_the_derived_identity() {
+    // The dedup identity is the 5-tuple
+    // (tenant, gts_type, key, window_start, window_end) and `origin` is not
+    // one of its five members
+    // (`cpt-cf-usage-collector-adr-record-identity-derivation`). This is
+    // load-bearing rather than incidental: re-importing history that was
+    // once emitted live has to collide with the entry it re-creates so the
+    // store can absorb it as a duplicate, and it can only collide if the
+    // identifier ignores the path.
+    let submission = sample_create_usage_record(None, None);
+    let live = submission
+        .clone()
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("valid submission");
+    let backfilled = submission
+        .try_into_usage_record(RecordOrigin::Backfill, SAMPLE_ACCEPTED_AT)
+        .expect("valid submission");
+
+    assert_eq!(live.id, backfilled.id);
+}
+
+#[test]
+fn a_create_submission_cannot_carry_an_origin() {
+    // `origin` is server-assigned, so the ingestion shape has no such
+    // property and its `deny_unknown_fields` shadow refuses one. A caller
+    // that could name its own path could label imported history as live
+    // consumption, which is the distinction the marker exists to make.
+    let mut json = serde_json::to_value(sample_create_usage_record(None, None))
+        .expect("the submission serializes through its own codec");
+    json.as_object_mut()
+        .expect("object")
+        .insert("origin".to_owned(), json!("live"));
+
+    serde_json::from_value::<CreateUsageRecord>(json)
+        .expect_err("origin is server-assigned and must be refused on the create shape");
+}
+
+#[test]
+fn the_persisted_wire_shape_carries_origin_and_requires_it() {
+    let record = sample_create_usage_record(None, None)
+        .try_into_usage_record(RecordOrigin::Backfill, SAMPLE_ACCEPTED_AT)
+        .expect("valid submission");
+    let json = serde_json::to_value(&record).expect("serializes");
+
+    assert_eq!(
+        json.get("origin"),
+        Some(&json!("backfill")),
+        "every persisted entry carries its origin on the wire",
+    );
+
+    // Required, not defaulted. An entry decoded from a body with no
+    // `origin` has no truthful value to fall back on, and defaulting to
+    // `live` would silently relabel imported history as current
+    // consumption.
+    let mut without = json;
+    without.as_object_mut().expect("object").remove("origin");
+    serde_json::from_value::<UsageRecord>(without)
+        .expect_err("origin is mandatory on the persisted shape");
+}
+
+#[test]
+fn a_backfill_origin_round_trips_through_both_shadows() {
+    // `sample_usage_record` pins `live`, so the general round-trip never
+    // exercises the other variant across the two hand-written halves.
+    let record = sample_create_usage_record(None, None)
+        .try_into_usage_record(RecordOrigin::Backfill, SAMPLE_ACCEPTED_AT)
+        .expect("valid submission");
+    let json = serde_json::to_value(&record).expect("serializes");
+
+    assert_eq!(
+        serde_json::from_value::<UsageRecord>(json).expect("round-trips"),
+        record,
+    );
+}
+
+fn field_of(err: &UsageCollectorError) -> &str {
+    match err {
+        UsageCollectorError::InvalidArgument { field, .. } => field.as_str(),
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+#[test]
+fn attribution_components_are_capped_at_256_characters_not_bytes() {
+    // U+00E9 is two bytes: 256 of them are 512 bytes, still 256 characters.
+    let at_cap = "\u{e9}".repeat(256);
+    let over = "\u{e9}".repeat(257);
+    ResourceRef::new(at_cap.clone(), at_cap.clone()).expect("256 characters is the ceiling");
+    SubjectRef::new(at_cap.clone(), Some(at_cap)).expect("256 characters is the ceiling");
+
+    let err = ResourceRef::new(over.clone(), "t").expect_err("resource_id over the cap");
+    assert_eq!(field_of(&err), "resource_ref.resource_id");
+    let err = ResourceRef::new("r", over.clone()).expect_err("resource_type over the cap");
+    assert_eq!(field_of(&err), "resource_ref.resource_type");
+    let err = SubjectRef::new(over.clone(), None::<String>).expect_err("subject_id over the cap");
+    assert_eq!(field_of(&err), "subject_ref.subject_id");
+    let err = SubjectRef::new("s", Some(over)).expect_err("subject_type over the cap");
+    assert_eq!(field_of(&err), "subject_ref.subject_type");
+}
+
+#[test]
+fn idempotency_key_and_reason_code_count_characters_not_bytes() {
+    IdempotencyKey::new("\u{e9}".repeat(256)).expect("256 characters, 512 bytes");
+    IdempotencyKey::new("\u{e9}".repeat(257)).expect_err("257 characters");
+    ReasonCode::new("\u{e9}".repeat(128)).expect("128 characters, 256 bytes");
+    ReasonCode::new("\u{e9}".repeat(129)).expect_err("129 characters");
+}
+
+mod caller_supplied_eq {
+    use std::collections::BTreeMap;
+
+    use crate::models::{
+        CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId, ReasonCode,
+        RecordOrigin, ResourceRef, SubjectRef, UsageRecord,
+    };
+    use crate::quantity::UsageQuantity;
+
+    const METER: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~";
+    const OTHER_METER: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.gb_hours.v1~";
+
+    fn at(unix: i64) -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(unix).expect("valid timestamp")
+    }
+
+    fn record() -> UsageRecord {
+        CreateUsageRecord {
+            gts_type_id: MeterTypeId::new(METER).expect("valid meter id"),
+            tenant_id: uuid::Uuid::from_u128(0xCA11),
+            resource_ref: ResourceRef::new("res-1", "compute.vm").expect("valid resource ref"),
+            subject_ref: None,
+            metadata: BTreeMap::new(),
+            quantity: UsageQuantity::parse("42.5").expect("valid quantity"),
+            idempotency_key: Some(IdempotencyKey::new("idem-cse").expect("valid key")),
+            invalidation: None,
+            window_start: at(1_700_000_000),
+            window_end: at(1_700_003_600),
+        }
+        .try_into_usage_record(RecordOrigin::Live, at(1_700_003_600))
+        .expect("valid fixture")
+    }
+
+    #[test]
+    fn server_assigned_fields_are_not_compared() {
+        let a = record();
+        let b = UsageRecord {
+            id: uuid::Uuid::from_u128(1),
+            accepted_at: a.accepted_at + time::Duration::minutes(5),
+            origin: RecordOrigin::Backfill,
+            ..a.clone()
+        };
+        assert!(a.caller_supplied_eq(&b));
+    }
+
+    #[test]
+    fn every_caller_supplied_field_is_compared() {
+        let base = record();
+        let subject: SubjectRef =
+            serde_json::from_value(serde_json::json!({ "subject_id": "sub-1" }))
+                .expect("valid subject ref");
+        let variants: Vec<(&str, UsageRecord)> = vec![
+            (
+                "gts_type_id",
+                UsageRecord {
+                    gts_type_id: MeterTypeId::new(OTHER_METER).expect("valid"),
+                    ..base.clone()
+                },
+            ),
+            (
+                "tenant_id",
+                UsageRecord {
+                    tenant_id: uuid::Uuid::from_u128(0xCA12),
+                    ..base.clone()
+                },
+            ),
+            (
+                "resource_ref",
+                UsageRecord {
+                    resource_ref: ResourceRef::new("res-2", "compute.vm").expect("valid"),
+                    ..base.clone()
+                },
+            ),
+            (
+                "subject_ref",
+                UsageRecord {
+                    subject_ref: Some(subject),
+                    ..base.clone()
+                },
+            ),
+            (
+                "metadata",
+                UsageRecord {
+                    metadata: BTreeMap::from([(
+                        MetadataKey::new("region").expect("valid"),
+                        "eu".to_owned(),
+                    )]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "quantity",
+                UsageRecord {
+                    quantity: UsageQuantity::parse("42.500").expect("valid"),
+                    ..base.clone()
+                },
+            ),
+            (
+                "idempotency_key",
+                UsageRecord {
+                    idempotency_key: IdempotencyKey::new("idem-other").expect("valid"),
+                    ..base.clone()
+                },
+            ),
+            (
+                "invalidation",
+                UsageRecord {
+                    invalidation: Some(Invalidation {
+                        target: uuid::Uuid::from_u128(9),
+                        reason: ReasonCode::new("emitter_defect").expect("valid"),
+                    }),
+                    ..base.clone()
+                },
+            ),
+            (
+                "window_start",
+                UsageRecord {
+                    window_start: base.window_start - time::Duration::hours(1),
+                    ..base.clone()
+                },
+            ),
+            (
+                "window_end",
+                UsageRecord {
+                    window_end: base.window_end + time::Duration::hours(1),
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (field, other) in variants {
+            assert!(
+                !base.caller_supplied_eq(&other),
+                "`{field}` must be compared"
+            );
+        }
+    }
+
+    #[test]
+    fn window_bounds_compare_as_instants() {
+        let a = record();
+        let offset = time::UtcOffset::from_hms(2, 0, 0).expect("valid offset");
+        let b = UsageRecord {
+            window_start: a.window_start.to_offset(offset),
+            window_end: a.window_end.to_offset(offset),
+            ..a.clone()
+        };
+        assert!(
+            a.caller_supplied_eq(&b),
+            "one instant under two offsets is one bound"
+        );
+    }
+}
+
+mod explicit_null_idempotency_key {
+    use crate::models::CreateUsageRecord;
+
+    fn body(extra: &serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "gts_type_id": "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~",
+            "tenant_id": "00000000-0000-4000-8000-000000000001",
+            "resource_ref": { "resource_id": "res-1", "resource_type": "compute.vm" },
+            "quantity": "1",
+            "window_start": "2023-11-14T22:13:20Z",
+            "window_end": "2023-11-14T23:13:20Z",
+        });
+        let object = body.as_object_mut().expect("object");
+        for (key, value) in extra.as_object().expect("extra is an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        body
+    }
+
+    #[test]
+    fn an_explicit_null_key_is_refused_on_a_record() {
+        let refused = serde_json::from_value::<CreateUsageRecord>(body(
+            &serde_json::json!({ "idempotency_key": null }),
+        ));
+        assert!(refused.is_err(), "`null` is not a key: {refused:?}");
+    }
+
+    #[test]
+    fn an_explicit_null_key_is_refused_on_an_invalidation() {
+        let refused = serde_json::from_value::<CreateUsageRecord>(body(&serde_json::json!({
+            "idempotency_key": null,
+            "invalidates": "00000000-0000-4000-8000-0000000000aa",
+            "reason_code": "emitter_defect",
+        })));
+        assert!(
+            refused.is_err(),
+            "the property is forbidden on an invalidation: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_key_on_an_invalidation_still_decodes() {
+        let decoded = serde_json::from_value::<CreateUsageRecord>(body(&serde_json::json!({
+            "invalidates": "00000000-0000-4000-8000-0000000000aa",
+            "reason_code": "emitter_defect",
+        })))
+        .expect("an invalidation carries no key");
+        assert!(decoded.idempotency_key.is_none());
+    }
 }

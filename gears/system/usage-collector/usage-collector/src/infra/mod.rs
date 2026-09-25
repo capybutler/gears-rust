@@ -6,3 +6,4 @@
 
 pub mod metrics;
 pub mod sdk_error_mapping;
+pub mod types_registry_source;

@@ -10,6 +10,10 @@
 //!    guard.
 //! 3. `register_rest` invoked before `init` surfaces the
 //!    "Service not initialized" guard.
+//!
+//! The module runs no background lifecycle task (the usage-type catalog's
+//! gauge-refresh loop is gone with the catalog), so there is no `serve`
+//! entry point left to test here.
 
 use std::sync::Arc;
 
@@ -118,38 +122,5 @@ fn register_rest_fails_when_service_not_initialized() {
     assert!(
         msg.contains("usage-collector") && msg.contains("not initialized"),
         "register_rest error should report the missing Service, got: {msg}"
-    );
-}
-
-#[tokio::test]
-async fn serve_returns_when_cancelled() {
-    let hub = Arc::new(ClientHub::new());
-    let resolver: Arc<dyn AuthZResolverApi> = CountingAllowAllResolver::new();
-    hub.register::<dyn AuthZResolverApi>(resolver);
-
-    let ctx = make_ctx(hub);
-    let module = UsageCollectorModule::default();
-    module.init(&ctx).await.expect("init must succeed");
-
-    // A pre-cancelled token: the biased select observes cancellation before the
-    // first tick, so serve returns Ok promptly with no wall-clock wait.
-    let cancel = CancellationToken::new();
-    cancel.cancel();
-    module
-        .serve(cancel)
-        .await
-        .expect("serve must return Ok when cancelled");
-}
-
-#[tokio::test]
-async fn serve_fails_before_init() {
-    let module = UsageCollectorModule::default();
-    let err = module
-        .serve(CancellationToken::new())
-        .await
-        .expect_err("serve must fail when init has not run");
-    assert!(
-        format!("{err}").contains("serve invoked before init"),
-        "unexpected error: {err}"
     );
 }

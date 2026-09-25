@@ -6,14 +6,19 @@
 //! `Problem` lift lives on the REST surface — this module only normalizes
 //! failures.
 //!
-//! The catalog error vocabulary is keyed by `gts_id: UsageTypeGtsId`
-//! end-to-end (no UUID derivation; `gts_id` is the catalog PK).
-//! Validation failures (typed SDK variants — `NegativeCounterValue`,
-//! `InvalidUsageTypeGtsId`, `InvalidResourceRef`, etc.) flow back to the
-//! caller verbatim and are not re-classified through `DomainError`.
+//! There is no catalog error vocabulary any more: every type declaration is
+//! owned by `types-registry` and resolved through the Type Resolver, whose
+//! unresolvable outcome is [`DomainError::DeclarationNotFound`]. Validation
+//! failures (typed SDK `InvalidArgument`s — an invalid `resource_ref`, a
+//! metadata key outside the declared shape, an invalidation that departs
+//! from its target) flow back to the caller verbatim and are not
+//! re-classified through `DomainError`.
 
 use toolkit_macros::domain_model;
-use usage_collector_sdk::{UsageCollectorError, UsageCollectorPluginError, UsageTypeGtsId};
+use usage_collector_sdk::{
+    Invalidation, MeterTypeId, NotFoundReason, ReasonCode, USAGE_RECORD_RESOURCE,
+    UsageCollectorError, UsageCollectorPluginError, ValidationReason,
+};
 use uuid::Uuid;
 
 /// Internal domain errors for the usage-collector host.
@@ -68,31 +73,15 @@ pub enum DomainError {
     #[error("authorization service unavailable: {0}")]
     AuthorizationUnavailable(String),
 
-    /// The referenced `gts_id` is absent from the plugin-owned catalog
-    /// (catalog-admin op, ingestion, or aggregated-query reference) per
-    /// ADR-0012.
-    #[error("usage type not found: {gts_id}")]
-    UsageTypeNotFound { gts_id: UsageTypeGtsId },
-
-    /// `create_usage_type` was called with a `gts_id` whose row is already
-    /// present in `usage_type_catalog` and whose payload differs from the
-    /// stored row.
-    #[error("usage type already exists: {gts_id}")]
-    UsageTypeAlreadyExists { gts_id: UsageTypeGtsId },
-
-    /// `delete_usage_type` rejected because the usage type is still
-    /// referenced by usage samples (ADR-0012 §"Consequences").
-    #[error("usage type {gts_id} is still referenced by {sample_ref_count} samples")]
-    UsageTypeReferenced {
-        gts_id: UsageTypeGtsId,
-        sample_ref_count: u64,
-    },
-
     /// Ingestion supplied a `metadata` map carrying a key that is not a
-    /// member of the referenced usage type's declared `metadata_fields` list
-    /// per ADR-0012 (closed shape, keyed by `gts_id`).
-    #[error("unknown metadata key '{key}' for usage type {gts_id}")]
-    UnknownMetadataKey { gts_id: UsageTypeGtsId, key: String },
+    /// member of the referenced meter's declared `metadata_fields` list
+    /// per `cpt-cf-usage-collector-adr-registry-owned-typing` (closed
+    /// shape, keyed by `gts_type_id`).
+    #[error("unknown metadata key '{key}' for meter {gts_type_id}")]
+    UnknownMetadataKey {
+        gts_type_id: MeterTypeId,
+        key: String,
+    },
 
     /// Idempotency conflict on a usage submission: the supplied
     /// `idempotency_key` is already bound to a different usage submission
@@ -104,18 +93,112 @@ pub enum DomainError {
         existing_id: Uuid,
     },
 
-    /// `deactivate_usage_record` referenced an `id` that does not exist
-    /// within the visible scope.
+    /// A lookup referenced a `UsageRecord.id` that does not exist within
+    /// the visible scope.
     #[error("usage record not found: {id}")]
     UsageRecordNotFound { id: Uuid },
 
-    /// `deactivate_usage_record` referenced an `id` that was already
-    /// `inactive` (one-way latch).
-    #[error("usage record already inactive: {id}")]
-    UsageRecordAlreadyInactive { id: Uuid },
+    /// An invalidation target lookup answered `UsageRecordNotConverged`.
+    /// Raised only at the two target lookups, which read converged-only.
+    #[error("invalidation target {target} has not converged")]
+    TargetNotConverged { target: Uuid },
+
+    /// A dispatched invalidation collided with a stored invalidation of the
+    /// same target under another reason code. Built by
+    /// [`lift_dispatch_error`], never by the context-free `From`.
+    #[error("usage record {target} is already invalidated by {invalidated_by}")]
+    AlreadyInvalidated {
+        target: Uuid,
+        invalidated_by: Uuid,
+        reason_code: ReasonCode,
+    },
+
+    /// The referenced GTS type does not resolve to a usable declaration:
+    /// `types-registry` has no row for it, or the row it has does not carry
+    /// what a meter needs (a required trait is missing, or it names a fold
+    /// this major version does not serve).
+    ///
+    /// Both collapse to the identical wire failure on purpose. DESIGN §3.2
+    /// "Type Resolver" responsibility boundaries say the resolver "does NOT
+    /// substitute a default for any declared attribute" and DESIGN §3.3's
+    /// ingestion sequence sends every "unresolved" outcome to the same
+    /// `NotFound` naming the identifier — so a malformed declaration is
+    /// exactly as unresolvable, from every caller's perspective, as an
+    /// absent one. Use [`Self::declaration_not_found`] and
+    /// [`Self::declaration_incomplete`] to construct this; use
+    /// [`Self::is_declaration_not_found`] to test for it.
+    #[error("GTS type `{gts_type_id}` {reason}")]
+    DeclarationNotFound {
+        /// The unresolvable meter reference.
+        gts_type_id: String,
+        /// Why it does not resolve: `"is not declared"` for a genuine
+        /// not-found answer from the registry, or the specific
+        /// missing/unserved trait otherwise.
+        reason: String,
+    },
+
+    /// A submitted entry's `metadata` falls outside the meter's declared
+    /// closed surface: an undeclared key, or a value violating a declared
+    /// constraint (`CompiledMetadataSchema::validate`). `0` joins every
+    /// violation `jsonschema` reports, not just the first, so a caller
+    /// correcting a payload sees all of them at once.
+    #[error("metadata does not match the declared schema: {0}")]
+    InvalidMetadata(String),
 
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl DomainError {
+    /// `types-registry` has no declaration under this identifier.
+    ///
+    /// Distinct from [`Self::TypesRegistryUnavailable`]: this is a definite
+    /// answer, not a transport failure, so the Type Resolver's cache, built
+    /// on top of this port, can act on it directly rather than riding it out
+    /// on a stale entry. Test for it with [`Self::is_declaration_not_found`].
+    #[must_use]
+    pub fn declaration_not_found(id: &MeterTypeId) -> Self {
+        Self::DeclarationNotFound {
+            gts_type_id: id.as_str().to_owned(),
+            reason: "is not declared".to_owned(),
+        }
+    }
+
+    /// A declaration that resolved but does not carry what a meter needs:
+    /// `why` names the missing required trait, or the fold this major
+    /// version does not serve.
+    ///
+    /// Fails closed exactly like [`Self::declaration_not_found`] — the gear
+    /// never treats an incomplete declaration as more resolvable than an
+    /// absent one, so the two constructors build the same variant.
+    #[must_use]
+    pub fn declaration_incomplete(id: &MeterTypeId, why: &str) -> Self {
+        Self::DeclarationNotFound {
+            gts_type_id: id.as_str().to_owned(),
+            reason: why.to_owned(),
+        }
+    }
+
+    /// True when this is a definite "does not resolve" answer rather than a
+    /// possibly-transient availability failure. The `DeclarationSource` port
+    /// contract (and the Type Resolver's cache) depends on telling the two
+    /// apart: only
+    /// this case is safe to act on immediately rather than served from a
+    /// stale cached entry.
+    #[must_use]
+    pub fn is_declaration_not_found(&self) -> bool {
+        matches!(self, Self::DeclarationNotFound { .. })
+    }
+
+    /// Metadata outside the meter's declared closed surface.
+    ///
+    /// `detail` is the `"; "`-joined text of every violation
+    /// `CompiledMetadataSchema::validate` collected, not just the first —
+    /// see its doc comment for why.
+    #[must_use]
+    pub fn invalid_metadata(detail: impl Into<String>) -> Self {
+        Self::InvalidMetadata(detail.into())
+    }
 }
 
 // NOTE(DE1302): `DomainError::Internal` / `TypesRegistryUnavailable` only carry
@@ -209,8 +292,6 @@ impl From<UsageCollectorPluginError> for DomainError {
     fn from(e: UsageCollectorPluginError) -> Self {
         debug_assert!(is_plugin_error_exhaustive_today(&e));
         match e {
-            // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-catch
-            // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-fail
             UsageCollectorPluginError::Transient {
                 detail,
                 retry_after_seconds,
@@ -219,34 +300,21 @@ impl From<UsageCollectorPluginError> for DomainError {
                 retry_after_seconds,
             },
             UsageCollectorPluginError::Internal(detail) => Self::Internal(detail),
-            // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-cascade:p1:inst-cascade-fail
-            // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-spi-catch
-            UsageCollectorPluginError::UsageTypeNotFound { gts_id } => {
-                Self::UsageTypeNotFound { gts_id }
+            // Which conflict this is depends on the entry that was dispatched,
+            // which this conversion cannot see. `lift_dispatch_error` is the
+            // lift for a dispatch result; reaching here is a host breach.
+            UsageCollectorPluginError::IdempotencyConflict { existing, .. } => {
+                Self::Internal(format!(
+                    "storage plugin conflict on {} was lifted without its dispatched entry",
+                    existing.id
+                ))
             }
-            UsageCollectorPluginError::UsageTypeAlreadyExists { gts_id } => {
-                Self::UsageTypeAlreadyExists { gts_id }
-            }
-            UsageCollectorPluginError::UsageTypeReferenced {
-                gts_id,
-                sample_ref_count,
-            } => Self::UsageTypeReferenced {
-                gts_id,
-                sample_ref_count,
-            },
-            UsageCollectorPluginError::IdempotencyConflict {
-                idempotency_key,
-                existing_id,
-            } => Self::IdempotencyConflict {
-                idempotency_key,
-                existing_id,
-            },
             UsageCollectorPluginError::UsageRecordNotFound { id } => {
                 Self::UsageRecordNotFound { id }
             }
-            UsageCollectorPluginError::UsageRecordAlreadyInactive { id } => {
-                Self::UsageRecordAlreadyInactive { id }
-            }
+            UsageCollectorPluginError::UsageRecordNotConverged { id } => Self::Internal(format!(
+                "storage plugin answered UsageRecordNotConverged for {id} outside a converged-only lookup"
+            )),
             other => Self::Internal(other.to_string()),
         }
     }
@@ -258,12 +326,9 @@ fn is_plugin_error_exhaustive_today(e: &UsageCollectorPluginError) -> bool {
         e,
         UsageCollectorPluginError::Transient { .. }
             | UsageCollectorPluginError::Internal(_)
-            | UsageCollectorPluginError::UsageTypeNotFound { .. }
-            | UsageCollectorPluginError::UsageTypeAlreadyExists { .. }
-            | UsageCollectorPluginError::UsageTypeReferenced { .. }
             | UsageCollectorPluginError::IdempotencyConflict { .. }
             | UsageCollectorPluginError::UsageRecordNotFound { .. }
-            | UsageCollectorPluginError::UsageRecordAlreadyInactive { .. }
+            | UsageCollectorPluginError::UsageRecordNotConverged { .. }
     )
 }
 
@@ -288,29 +353,105 @@ impl From<DomainError> for UsageCollectorError {
             DomainError::AuthorizationUnavailable(reason) => {
                 Self::service_unavailable(reason, None)
             }
-            DomainError::UsageTypeNotFound { gts_id } => Self::usage_type_not_found(&gts_id),
-            DomainError::UsageTypeAlreadyExists { gts_id } => {
-                Self::usage_type_already_exists(&gts_id)
+            DomainError::UnknownMetadataKey { gts_type_id, key } => {
+                Self::unknown_metadata_key(&gts_type_id, &key)
             }
-            DomainError::UnknownMetadataKey { gts_id, key } => {
-                Self::unknown_metadata_key(&gts_id, &key)
-            }
-            DomainError::UsageTypeReferenced {
-                gts_id,
-                sample_ref_count,
-            } => Self::usage_type_referenced(&gts_id, sample_ref_count),
             DomainError::IdempotencyConflict {
                 idempotency_key,
                 existing_id,
             } => Self::idempotency_conflict(&idempotency_key, existing_id),
             DomainError::UsageRecordNotFound { id } => Self::usage_record_not_found(id),
-            DomainError::UsageRecordAlreadyInactive { id } => Self::already_inactive(id),
+            DomainError::TargetNotConverged { target } => Self::target_not_converged(target),
+            DomainError::AlreadyInvalidated {
+                target,
+                invalidated_by,
+                reason_code,
+            } => Self::already_invalidated(target, invalidated_by, reason_code),
+            // DESIGN §3.3: an unresolvable GTS type is a 404 naming the
+            // identifier, whether the registry never declared it or the
+            // Type Resolver rejected an incomplete declaration for it — both
+            // reach this same arm because both build
+            // `DomainError::DeclarationNotFound` (see its doc comment).
+            //
+            // `resource_type` is `USAGE_RECORD_RESOURCE`, not a usage-type
+            // marker: `gts_type_id` is a `usage_record`-derived meter type,
+            // and this gear declares no other GTS resource on its wire
+            // surface now that types-registry owns the catalog.
+            // `reason` is bound as `why` — matching `declaration_incomplete`'s
+            // own parameter — so it does not read as the typed
+            // `NotFoundReason` set four lines below it. The domain field is
+            // prose; the SDK field is a discriminator.
+            DomainError::DeclarationNotFound {
+                gts_type_id,
+                reason: why,
+            } => {
+                let detail = format!("GTS type `{gts_type_id}` {why}");
+                Self::NotFound {
+                    resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+                    name: gts_type_id,
+                    reason: NotFoundReason::DeclarationNotFound,
+                    detail,
+                }
+            }
             DomainError::InvalidPluginInstance { gts_id, reason } => {
                 Self::internal(format!("invalid plugin instance '{gts_id}': {reason}"))
             }
+            // Attributed to the record surface (not a specific `gts_id`):
+            // `CompiledMetadataSchema::validate` has no usage-type identity
+            // in scope, only the entry's own metadata map.
+            DomainError::InvalidMetadata(detail) => Self::InvalidArgument {
+                resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+                resource_name: None,
+                field: "metadata".to_owned(),
+                reason: ValidationReason::MetadataValidation,
+                detail,
+            },
             DomainError::TypesRegistryUnavailable(_) => Self::types_registry_unavailable(),
             DomainError::Internal(reason) => Self::internal(reason),
         }
+    }
+}
+
+/// Lift a `create_usage_record(s)` outcome, knowing what was dispatched.
+///
+/// A store `IdempotencyConflict` is reported by the kind of the **dispatched**
+/// entry (DESIGN §3.3 error lift table):
+/// - on a record, as `IdempotencyConflict` naming the stored entry;
+/// - on an invalidation, as `AlreadyInvalidated` naming the target, the stored
+///   invalidation and its reason code. Every invalidation of one record derives
+///   the same `inv:<target>` key, so a conflict on one can only be against
+///   another invalidation of that target; a stored entry that is not one is a
+///   plugin breach.
+///
+/// Every other error takes the context-free `From`.
+pub(crate) fn lift_dispatch_error(
+    err: UsageCollectorPluginError,
+    dispatched_invalidation: Option<&Invalidation>,
+) -> DomainError {
+    let UsageCollectorPluginError::IdempotencyConflict {
+        idempotency_key,
+        existing,
+    } = err
+    else {
+        return DomainError::from(err);
+    };
+    let existing = *existing;
+    let Some(dispatched) = dispatched_invalidation else {
+        return DomainError::IdempotencyConflict {
+            idempotency_key,
+            existing_id: existing.id,
+        };
+    };
+    match existing.invalidation {
+        Some(stored) => DomainError::AlreadyInvalidated {
+            target: dispatched.target,
+            invalidated_by: existing.id,
+            reason_code: stored.reason,
+        },
+        None => DomainError::Internal(format!(
+            "storage plugin reported entry {} as the stored invalidation of {}, but it carries no invalidation",
+            existing.id, dispatched.target
+        )),
     }
 }
 

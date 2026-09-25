@@ -1,10 +1,12 @@
 //! Configuration for the usage-collector gear.
 //!
-//! Carries only the vendor selector used to bind a storage-plugin
-//! implementation. Read once at `Gear::init` via `ctx.config_or_default()`;
-//! changing the binding requires a gear restart. The usage-type catalog is
-//! plugin-owned (ADR-0012 / foundation.md 0.2.0), so no usage-type
-//! declarations are accepted here.
+//! Carries the storage-plugin vendor selector, the Type Resolver cache
+//! knobs, the metadata size cap, and the three covered-period bounds. Read
+//! once at `Gear::init` via `ctx.config_or_default()`; changing the binding
+//! requires a gear restart. No usage-type declaration is accepted here:
+//! `types-registry` owns every declaration and this gear registers no
+//! usage-type surface at all
+//! (`cpt-cf-usage-collector-adr-registry-owned-typing`).
 
 use serde::Deserialize;
 
@@ -30,6 +32,91 @@ pub struct UsageCollectorConfig {
     /// ToolKit-owned (`[opentelemetry]` block) per
     /// `cpt-cf-usage-collector-principle-otlp-push-emission`.
     pub metrics: MetricsConfig,
+
+    /// How long a resolved GTS type declaration is served before the Type
+    /// Resolver refreshes it, in seconds.
+    ///
+    /// Fold, unit and metadata surface are immutable for a type's life, so
+    /// this is not a correctness window for them. It bounds how long a
+    /// withdrawn declaration keeps resolving, and it is what keeps the cache
+    /// honest once `types-registry` admits mutable major-only identifiers.
+    pub type_cache_ttl_secs: u64,
+
+    /// Ceiling on cached declarations. One entry per meter, not per entry,
+    /// so realistic deployments sit far below the default.
+    pub type_cache_capacity: usize,
+
+    /// Cap on an entry's serialized metadata map, in bytes.
+    ///
+    /// DESIGN 3.1 makes the cap per deployment. It is enforced alongside the
+    /// declared-shape check, not instead of it: a payload can sit inside the
+    /// cap and still carry an undeclared key.
+    ///
+    /// Defaults to
+    /// [`DEFAULT_METADATA_SIZE_CAP_BYTES`](crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES)
+    /// (`8192`) — the same constant `Service::new` hard-codes when it
+    /// delegates to `Service::new_with_metrics` (which takes the cap as a
+    /// plain mandatory `usize`, with no default of its own; every other
+    /// caller, `module.rs` bootstrap included, passes this configured value
+    /// or the constant explicitly) — so wiring this value through to
+    /// `domain::validation::validate_submit_record_metadata` is a
+    /// no-op for the default deployment rather than a silent tightening.
+    pub metadata_size_cap_bytes: usize,
+
+    /// How far into the future a covered period may end, in seconds.
+    ///
+    /// The live path rejects a period ending further ahead than this, and
+    /// **so does the backfill route** — the route lifts the past bound
+    /// only. The bound protects against a defective or clock-skewed emitter
+    /// opening a period that does not yet exist
+    /// (`cpt-cf-usage-collector-adr-backfill-isolation`).
+    ///
+    /// Defaults to `300` (5 minutes), the value DESIGN
+    /// `cpt-cf-usage-collector-fr-live-future-time-bound` publishes.
+    pub live_future_tolerance_secs: u64,
+
+    /// How far into the past a covered period may end on the **live** path,
+    /// in seconds.
+    ///
+    /// A period ending further back is rejected with a message naming the
+    /// backfill route, which is where such an entry belongs. The default
+    /// covers emitter outage and retry lag, which is what genuinely late
+    /// live data is; anything older is history, and history belongs on the
+    /// route that marks it.
+    ///
+    /// The bound belongs to the path, not to the entry kind, so it governs
+    /// an invalidation over the period it copies exactly as it governs a
+    /// measurement. A withdrawal of a closed month therefore travels the
+    /// backfill route.
+    ///
+    /// Defaults to `172_800` (48 hours).
+    pub live_past_tolerance_secs: u64,
+
+    /// How far back the backfill route reaches without elevated
+    /// authorization, in seconds.
+    ///
+    /// The route admits any period the future bound allows. This window
+    /// decides only *which* PDP action each entry is authorized against:
+    /// inside it, `create`; beyond it, the `backfill` action. It bounds the
+    /// recomputation obligation a materialised aggregate carries.
+    ///
+    /// A deployment must not admit a window wider than the raw retention its
+    /// storage profile guarantees for the target GTS type. The retention
+    /// floor is this window plus one replay horizon
+    /// (`cpt-cf-usage-collector-fr-billing-retention-floor`), 125 days at
+    /// the launch defaults — a plugin-readiness condition surfaced at
+    /// review, not a gear-side sweep.
+    ///
+    /// Defaults to `7_776_000` (90 days).
+    pub backfill_window_secs: u64,
+
+    /// Per-request entry cap on both ingestion routes. An empty or over-cap
+    /// submission is rejected whole, before any entry is validated.
+    ///
+    /// Defaults to
+    /// [`DEFAULT_MAX_BATCH_RECORDS`](crate::domain::service::DEFAULT_MAX_BATCH_RECORDS)
+    /// (`100`).
+    pub max_batch_records: usize,
 }
 
 impl Default for UsageCollectorConfig {
@@ -37,6 +124,15 @@ impl Default for UsageCollectorConfig {
         Self {
             vendor: "constructorfabric".to_owned(),
             metrics: MetricsConfig::default(),
+            type_cache_ttl_secs: 300,
+            type_cache_capacity: 10_000,
+            metadata_size_cap_bytes: crate::domain::validation::DEFAULT_METADATA_SIZE_CAP_BYTES,
+            live_future_tolerance_secs:
+                crate::domain::covered_period::DEFAULT_LIVE_FUTURE_TOLERANCE_SECS,
+            live_past_tolerance_secs:
+                crate::domain::covered_period::DEFAULT_LIVE_PAST_TOLERANCE_SECS,
+            backfill_window_secs: crate::domain::covered_period::DEFAULT_BACKFILL_WINDOW_SECS,
+            max_batch_records: crate::domain::service::DEFAULT_MAX_BATCH_RECORDS,
         }
     }
 }
@@ -103,22 +199,136 @@ impl MetricsConfig {
 }
 
 impl UsageCollectorConfig {
+    /// Projects the three configured covered-period bounds into the
+    /// [`CoveredPeriodBounds`] the Ingestion Gateway enforces.
+    ///
+    /// Infallible, and deliberately so: [`Self::validate`] already
+    /// guarantees at bootstrap that each of the three keys is non-zero and
+    /// fits an `i64`, which is exactly what
+    /// [`time::Duration::seconds`] needs. A fallible projection here would
+    /// force every ingestion call site to handle an error that bootstrap has
+    /// already made unreachable — so the `i64` conversions saturate rather
+    /// than panic, and a configuration that could saturate them was refused
+    /// at `Gear::init`.
+    ///
+    /// [`CoveredPeriodBounds`]: crate::domain::covered_period::CoveredPeriodBounds
+    #[must_use]
+    pub fn covered_period_bounds(&self) -> crate::domain::covered_period::CoveredPeriodBounds {
+        use crate::domain::covered_period::seconds;
+        crate::domain::covered_period::CoveredPeriodBounds {
+            future_tolerance: time::Duration::seconds(seconds(self.live_future_tolerance_secs)),
+            live_past_tolerance: time::Duration::seconds(seconds(self.live_past_tolerance_secs)),
+            backfill_window: time::Duration::seconds(seconds(self.backfill_window_secs)),
+        }
+    }
+
     /// Validates the configuration at bootstrap.
     ///
     /// Rejects an empty or whitespace-only `vendor` selector so the failure
     /// surfaces at `Gear::init` rather than lazily on the first dispatch when
-    /// plugin selection finds no match.
+    /// plugin selection finds no match. Also rejects a zero type-cache TTL
+    /// or capacity: a zero TTL turns every ingestion into a types-registry
+    /// round-trip, which is exactly the coupling the cache exists to remove,
+    /// and a zero capacity cannot hold even a single resolved declaration.
+    ///
+    /// The three covered-period bounds are checked here too. Each must be
+    /// non-zero and must fit an `i64`, because a bound is compared as a
+    /// duration of `i64` seconds; a `u64::MAX` tolerance is a configuration
+    /// mistake, not an infinite bound. Those two guarantees are what make
+    /// [`Self::covered_period_bounds`] — the projection the Ingestion
+    /// Gateway enforces — infallible, so this is the one place a bad bound
+    /// can still be refused.
+    ///
+    /// `backfill_window_secs` must not be narrower than
+    /// `live_past_tolerance_secs`. The live path's past-tolerance rejection
+    /// tells an emitter to resubmit on the backfill route, so a narrower
+    /// window would point an ordinary emitter at a route where that same
+    /// period needs elevated authorization. The three bounds are otherwise
+    /// deliberately asymmetric
+    /// (`cpt-cf-usage-collector-adr-backfill-isolation`, "Why the three
+    /// bounds are asymmetric"); this is the one ordering among them that has
+    /// to hold.
     ///
     /// # Errors
     ///
-    /// Returns an error if `vendor` is empty or whitespace-only, or if the
+    /// Returns an error if `vendor` is empty or whitespace-only, if the
     /// metrics prefix is not a valid instrument-name prefix (see
-    /// [`MetricsConfig::validate`]).
+    /// [`MetricsConfig::validate`]), if `type_cache_ttl_secs` /
+    /// `type_cache_capacity` is zero, if any of the three covered-period
+    /// bounds is zero or does not fit an `i64`, if
+    /// `backfill_window_secs` is narrower than `live_past_tolerance_secs`,
+    /// or if `max_batch_records` is zero.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.vendor.trim().is_empty() {
             anyhow::bail!("[usage_collector].vendor must not be empty or whitespace-only");
         }
         self.metrics.validate()?;
+        if self.type_cache_ttl_secs == 0 {
+            anyhow::bail!(
+                "[usage_collector].type_cache_ttl_secs must be greater than 0: \
+                 a zero TTL makes every ingestion a types-registry round-trip"
+            );
+        }
+        if self.type_cache_capacity == 0 {
+            anyhow::bail!("[usage_collector].type_cache_capacity must be greater than 0");
+        }
+        if self.live_future_tolerance_secs == 0 {
+            anyhow::bail!(
+                "[usage_collector].live_future_tolerance_secs must be greater than 0: \
+                 a zero future tolerance refuses a covered period ending a \
+                 microsecond from now, on every ingestion path"
+            );
+        }
+        if self.live_past_tolerance_secs == 0 {
+            anyhow::bail!(
+                "[usage_collector].live_past_tolerance_secs must be greater than 0: \
+                 a zero past tolerance refuses every covered period on the live \
+                 path that does not end in the future"
+            );
+        }
+        if self.backfill_window_secs == 0 {
+            anyhow::bail!(
+                "[usage_collector].backfill_window_secs must be greater than 0: \
+                 a zero window leaves no period the backfill route admits without \
+                 elevated authorization"
+            );
+        }
+        // Before the ordering check: a u64::MAX past tolerance is also "wider
+        // than the window", and reporting the ordering there would point at
+        // the wrong key.
+        for (key, secs) in [
+            (
+                "live_future_tolerance_secs",
+                self.live_future_tolerance_secs,
+            ),
+            ("live_past_tolerance_secs", self.live_past_tolerance_secs),
+            ("backfill_window_secs", self.backfill_window_secs),
+        ] {
+            if i64::try_from(secs).is_err() {
+                anyhow::bail!(
+                    "[usage_collector].{key} ({secs}) must fit in an i64: a bound is \
+                     compared as a duration of i64 seconds, so a value this large is \
+                     a configuration mistake rather than an infinite bound"
+                );
+            }
+        }
+        if self.backfill_window_secs < self.live_past_tolerance_secs {
+            anyhow::bail!(
+                "[usage_collector].backfill_window_secs ({}) must not be narrower than \
+                 live_past_tolerance_secs ({}): the live path's past-tolerance rejection \
+                 tells an emitter to resubmit on the backfill route, so a narrower window \
+                 would point an ordinary emitter at a route where that same period needs \
+                 elevated authorization",
+                self.backfill_window_secs,
+                self.live_past_tolerance_secs
+            );
+        }
+        if self.max_batch_records == 0 {
+            anyhow::bail!(
+                "[usage_collector].max_batch_records must be greater than 0: a zero cap \
+                 refuses every ingestion request"
+            );
+        }
         Ok(())
     }
 }

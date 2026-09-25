@@ -7,7 +7,10 @@
 //! `list_usage_records` and `query_aggregated_usage_records` are both
 //! realized by the `usage-query` feature and delegate to the
 //! same-named methods on [`Service`] (PDP authorization, PDP constraint
-//! composition into the `OData` filter, plugin SPI dispatch).
+//! composition into the `OData` filter, plugin SPI dispatch). The
+//! mandatory `time_range` is forwarded verbatim: an in-process caller
+//! already holds a validated [`TimeRange`], so there is nothing to parse
+//! here and no second place a range could be dropped.
 
 use std::sync::Arc;
 
@@ -16,8 +19,8 @@ use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    AggregationResult, AggregationSpec, CreateUsageRecord, MetadataFilter, UsageCollectorClientV1,
-    UsageCollectorError, UsageRecord, UsageType, UsageTypeGtsId,
+    AggregationDimension, AggregationResult, CreateUsageRecord, MetadataFilter, MeterTypeId,
+    TimeRange, UsageCollectorClientV1, UsageCollectorError, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -54,6 +57,19 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
         self.svc.create_usage_records(ctx, records).await
     }
 
+    // The backfill route is a DIFFERENT service method, not
+    // `create_usage_records` under a flag: the origin marker each entry
+    // carries is decided by which one is called here, and forwarding to the
+    // live batch would stamp `live` on an import and refuse every
+    // correction of closed history.
+    async fn backfill_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        records: Vec<CreateUsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError> {
+        self.svc.backfill_usage_records(ctx, records).await
+    }
+
     async fn get_usage_record(
         &self,
         ctx: &SecurityContext,
@@ -66,13 +82,21 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
     async fn query_aggregated_usage_records(
         &self,
         ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        aggregation: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorError> {
         self.svc
-            .query_aggregated_usage_records(ctx, gts_id, query, metadata_filter, aggregation)
+            .query_aggregated_usage_records(
+                ctx,
+                gts_type_id,
+                time_range,
+                query,
+                metadata_filter,
+                group_by,
+            )
             .await
     }
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
@@ -81,73 +105,16 @@ impl UsageCollectorClientV1 for UsageCollectorLocalClient {
     async fn list_usage_records(
         &self,
         ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorError> {
         self.svc
-            .list_usage_records(ctx, gts_id, query, metadata_filter)
+            .list_usage_records(ctx, gts_type_id, time_range, query, metadata_filter)
             .await
     }
     // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
-
-    async fn deactivate_usage_record(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<(), UsageCollectorError> {
-        self.svc.deactivate_usage_record(ctx, id).await
-    }
-
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-submit
-    async fn create_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        usage_type: UsageType,
-    ) -> Result<UsageType, UsageCollectorError> {
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-service-call
-        self.svc.create_usage_type(ctx, usage_type).await
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-service-call
-    }
-    // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-register-usage-type:p1:inst-register-usage-type-submit
-
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-submit
-    async fn get_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<UsageType, UsageCollectorError> {
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-service-call
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-return
-        self.svc.get_usage_type(ctx, gts_id).await
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-return
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-service-call
-    }
-    // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-get-usage-type:p1:inst-get-usage-type-submit
-
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-submit
-    async fn list_usage_types(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<ODataPage<UsageType>, UsageCollectorError> {
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-service-call
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-return
-        self.svc.list_usage_types(ctx, query).await
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-return
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-service-call
-    }
-    // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-list-usage-types:p1:inst-list-usage-types-submit
-
-    // @cpt-begin:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-pdp-authorize
-    async fn delete_usage_type(
-        &self,
-        ctx: &SecurityContext,
-        gts_id: UsageTypeGtsId,
-    ) -> Result<(), UsageCollectorError> {
-        self.svc.delete_usage_type(ctx, gts_id).await
-    }
-    // @cpt-end:cpt-cf-usage-collector-flow-usage-type-lifecycle-delete-usage-type:p1:inst-delete-usage-type-pdp-authorize
 }
 
 #[cfg(test)]

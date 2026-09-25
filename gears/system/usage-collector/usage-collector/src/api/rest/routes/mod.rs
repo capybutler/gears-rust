@@ -12,7 +12,6 @@ use crate::api::rest::{dto, handlers};
 use crate::domain::Service;
 
 mod usage_records;
-mod usage_types;
 
 /// Compose every per-resource registrar onto `router`.
 ///
@@ -26,7 +25,6 @@ mod usage_types;
 /// added here and missing from the document would compare two incomplete
 /// views and stay green.
 fn register_api_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    router = usage_types::register_usage_type_routes(router, openapi);
     router = usage_records::register_usage_record_routes(router, openapi);
     router
 }
