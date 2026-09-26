@@ -72,16 +72,15 @@ patterns = ["gears/system/oagw/docs/adr-*.md"]
 
 
 [[ignore]]
-reason = "Ignore usage-collector features and code — they still describe the superseded model (counter/gauge usage kinds, event deactivation, signed compensation) and reference identifiers the current specs no longer define, pending their rewrite to aggregation folds and invalidation."
+reason = "Ignore usage-collector code — src/ and tests/ still implement the superseded model (counter/gauge usage kinds, event deactivation, signed compensation) and carry traceability markers for identifiers the current specs no longer define, pending their rewrite to aggregation folds and invalidation. docs/features/ is deliberately not ignored: the FEATURE documents are authored against the current aggregation-fold and invalidation model and must stay under validation."
 patterns = [
-  "gears/system/usage-collector/docs/features/*",
   "gears/system/usage-collector/usage-collector/src/*",
   "gears/system/usage-collector/usage-collector/tests/*",
   "gears/system/usage-collector/usage-collector-sdk/src/*",
 ]
 
 [[ignore]]
-reason = "Ignore the TimescaleDB usage-collector storage plugin's stale documents and its code traceability. docs/PRD.md and docs/DESIGN.md are written docs-first against the gear's target Plugin SPI and stay unignored; DESIGN §4.5 says the crate predates them. docs/DECOMPOSITION.md and docs/features/ still describe the superseded model (usage-type catalog, counter/gauge kinds, compensation rows and deactivation cascade, 4-tuple dedup, AVG, a table-wide retention policy) and cite plugin IDs that PRD.md and DESIGN.md no longer define. src/ and tests/ implement that superseded model: src/gear.rs marks cpt-cf-usage-collector-flow-foundation-plugin-host-binding, defined only in the gear's stale docs/features/foundation.md and usage-type-lifecycle.md that the block above ignores, and src/infra/storage/record_store.rs and catalog_store.rs mark cpt-cf-uc-plugin-seq-deactivate-cascade, cpt-cf-uc-plugin-seq-create-type and cpt-cf-uc-plugin-seq-delete-type-fk, which DESIGN.md no longer defines. Drop the code patterns when the crate is ported to the target SPI and every marker names a defined ID; drop the doc patterns when DECOMPOSITION.md and features/ are rewritten."
+reason = "Ignore the TimescaleDB usage-collector storage plugin's stale documents and its code traceability. docs/PRD.md and docs/DESIGN.md are written docs-first against the gear's target Plugin SPI and stay unignored; DESIGN §4.5 says the crate predates them. docs/DECOMPOSITION.md and docs/features/ still describe the superseded model (usage-type catalog, counter/gauge kinds, compensation rows and deactivation cascade, 4-tuple dedup, AVG, a table-wide retention policy) and cite plugin IDs that PRD.md and DESIGN.md no longer define. src/ and tests/ implement that superseded model: src/gear.rs marks cpt-cf-usage-collector-flow-foundation-plugin-host-binding, defined only in the gear's deleted stale docs/features/foundation.md and usage-type-lifecycle.md, so it now names no defined ID at all, and src/infra/storage/record_store.rs and catalog_store.rs mark cpt-cf-uc-plugin-seq-deactivate-cascade, cpt-cf-uc-plugin-seq-create-type and cpt-cf-uc-plugin-seq-delete-type-fk, which DESIGN.md no longer defines. Drop the code patterns when the crate is ported to the target SPI and every marker names a defined ID; drop the doc patterns when DECOMPOSITION.md and features/ are rewritten."
 patterns = [
   "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/DECOMPOSITION.md",
   "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin/docs/features/*",
