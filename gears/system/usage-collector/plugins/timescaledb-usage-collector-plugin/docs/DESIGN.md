@@ -473,7 +473,7 @@ These flows cover every SPI operation in §3.3 and the plugin's two background p
 
 #### Ingest with idempotency dedup
 
-**ID**: `cpt-cf-uc-plugin-seq-ingest-dedup`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-ingest-dedup`
 
 ```mermaid
 sequenceDiagram
@@ -509,7 +509,7 @@ sequenceDiagram
 
 #### Batch ingest with per-record results
 
-**ID**: `cpt-cf-uc-plugin-seq-ingest-batch`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-ingest-batch`
 
 ```mermaid
 sequenceDiagram
@@ -532,7 +532,7 @@ sequenceDiagram
 
 #### Aggregated query (rollup or exact scan)
 
-**ID**: `cpt-cf-uc-plugin-seq-query-aggregated`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-query-aggregated`
 
 ```mermaid
 sequenceDiagram
@@ -560,7 +560,7 @@ sequenceDiagram
 
 #### Keyset-paginated raw list
 
-**ID**: `cpt-cf-uc-plugin-seq-list-keyset`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-list-keyset`
 
 ```mermaid
 sequenceDiagram
@@ -582,7 +582,7 @@ sequenceDiagram
 
 #### Converged-only lookup
 
-**ID**: `cpt-cf-uc-plugin-seq-converged-lookup`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-converged-lookup`
 
 ```mermaid
 sequenceDiagram
@@ -606,7 +606,7 @@ sequenceDiagram
 
 #### Feed page
 
-**ID**: `cpt-cf-uc-plugin-seq-feed-page`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-feed-page`
 
 ```mermaid
 sequenceDiagram
@@ -664,7 +664,7 @@ sequenceDiagram
 
 #### Reconciliation
 
-**ID**: `cpt-cf-uc-plugin-seq-reconciliation`
+- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-seq-reconciliation`
 
 ```mermaid
 sequenceDiagram
@@ -684,7 +684,7 @@ sequenceDiagram
 
 #### Retention sweep
 
-**ID**: `cpt-cf-uc-plugin-seq-retention-sweep`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-retention-sweep`
 
 ```mermaid
 sequenceDiagram
@@ -723,7 +723,7 @@ sequenceDiagram
 
 #### Rollup refresh
 
-**ID**: `cpt-cf-uc-plugin-seq-rollup-refresh`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-rollup-refresh`
 
 ```mermaid
 sequenceDiagram
@@ -749,7 +749,7 @@ This section is the **target** schema; the migrations on this branch predate it 
 
 #### Table: usage_records (hypertable)
 
-**ID**: `cpt-cf-uc-plugin-dbtable-usage-records`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dbtable-usage-records`
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -779,7 +779,7 @@ This section is the **target** schema; the migrations on this branch predate it 
 
 #### Table: usage_type_key
 
-**ID**: `cpt-cf-uc-plugin-dbtable-usage-type-key`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dbtable-usage-type-key`
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -794,7 +794,7 @@ This section is the **target** schema; the migrations on this branch predate it 
 
 #### Table: usage_feed_retention_marks
 
-**ID**: `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -810,7 +810,7 @@ This section is the **target** schema; the migrations on this branch predate it 
 
 #### Table: usage_rollup_1h
 
-**ID**: `cpt-cf-uc-plugin-dbtable-usage-rollup-1h`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dbtable-usage-rollup-1h`
 
 An hourly TimescaleDB continuous aggregate over `usage_records`, materialised real-time (`timescaledb.materialized_only = false`).
 
