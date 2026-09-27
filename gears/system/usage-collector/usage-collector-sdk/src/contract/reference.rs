@@ -52,13 +52,28 @@
 //!
 //! # A test-only mirror of this file exists
 //!
-//! `contract_mutants::MutantLedger` re-implements this backend's selection,
-//! admission decision, withdrawal exclusion and page order so that two
-//! deliberately non-conforming subjects can break one of them each. It is
-//! test-only, it is not a switch in this file, and nothing here should be
-//! written to accommodate it — but an edit to any of those four behaviours
-//! is an edit that mirror may need too. Its own docs say how far the
-//! contract suite pins it automatically.
+//! `contract_mutants::MutantLedger` re-implements this backend so that two
+//! deliberately non-conforming subjects can break one rule each while the
+//! rest of what they do is this file's. What it mirrors is most of this
+//! file: the selection predicate and the covered-period bound it meets, the
+//! admission decision, the withdrawal exclusion, the ledger page order, the
+//! fold — its grouping, its bucket cap, **and the value each fold reports,
+//! the empty-selection split included** — the feed page with its sequence
+//! stamping, its seek, its scanned-entry cursor and its retention refusal,
+//! and the reconciliation counters and watermarks.
+//!
+//! The fold's *value* is called out because leaving it off this list cost
+//! something. The list once named four behaviours and stopped at the fold's
+//! row filter, so when the empty-`SUM` answer in `fold_value` was corrected
+//! to DESIGN here, nothing said the mirror's copy of it had gone stale; a
+//! reader caught that, not the list. A list that stops short reads as a
+//! complete one.
+//!
+//! It is test-only, it is not a switch in this file, and nothing here should
+//! be written to accommodate it — but an edit to any mirrored behaviour is
+//! an edit that mirror may need too. Its own docs say how far the contract
+//! suite pins it automatically, and which of these behaviours no check pins
+//! yet.
 //!
 //! # Why not the noop plugin
 //!

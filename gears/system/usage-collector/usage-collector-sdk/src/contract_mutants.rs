@@ -39,7 +39,7 @@
 //! (selection column, fold exclusion), because each changes a predicate the
 //! inner backend owns and no interception can reach it: which column a range
 //! meets and which rows a fold walks. It mirrors the
-//! reference where the defect is not, and it is smaller in two stated ways
+//! reference where the defect is not, and it is smaller in one stated way
 //! that no check reaches — see [`MutantLedger`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,8 +57,8 @@ use super::reference::InMemoryReferencePlugin;
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
-    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, MetadataFilter,
-    MeterTypeId, UsageRecord,
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult,
+    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, UsageRecord,
 };
 use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
@@ -515,48 +515,135 @@ fn only_this_row(id: Uuid) -> ast::Expr {
 // The own-ledger shape
 // ---------------------------------------------------------------------------
 
+/// One admitted entry and the sequence the feed orders it by.
+///
+/// The mirror of the reference backend's own entry. A sequence is stamped at
+/// admission, is unique across the ledger's whole life, and ascends in
+/// admission order, so a position issued over it goes on denoting the same
+/// point in the feed's order however the entries around it change.
+#[derive(Debug)]
+struct Entry {
+    /// The sequence stamped when this entry was admitted.
+    sequence: u64,
+    /// The entry as persisted.
+    record: UsageRecord,
+}
+
+/// The ledger, its sequence counter and its retention marks.
+#[derive(Debug, Default)]
+struct Ledger {
+    /// Admitted entries in admission order, so their sequences ascend.
+    entries: Vec<Entry>,
+    /// The highest sequence stamped so far. It only ever rises, and a
+    /// sequence is never reissued.
+    ///
+    /// Held apart from `entries.len()` for the reference's reason: a length
+    /// renumbers every entry after one that is removed, and a position already
+    /// issued has to go on denoting the same point in the feed's order.
+    stamped: u64,
+    /// Per GTS type, the highest sequence retention has removed, keyed by the
+    /// type's wire string because [`MeterTypeId`] implements no `Ord`.
+    ///
+    /// **Nothing raises a mark here yet.** A mark is raised by a sweep, a
+    /// sweep is driven through
+    /// [`ContractRetention`](super::retention::ContractRetention), and this
+    /// type does not implement that trait — the impl lands with the
+    /// retention-driven entry point the matrix does not yet have. Until then
+    /// this map stays empty and the refusal in [`MutantLedger`]'s `read_feed_page`
+    /// never fires, which is exactly the answer the reference gives for a
+    /// backend nobody has driven.
+    retention_marks: BTreeMap<String, u64>,
+}
+
+impl Ledger {
+    /// Stamps one record with the next sequence and appends it.
+    fn push(&mut self, record: UsageRecord) {
+        self.stamped = self.stamped.saturating_add(1);
+        self.entries.push(Entry {
+            sequence: self.stamped,
+            record,
+        });
+    }
+
+    /// The admitted records in admission order.
+    ///
+    /// Every path but the feed reads the ledger through this, as in the
+    /// reference: only the feed has a position to seek to, so only it reads
+    /// the sequences.
+    fn records(&self) -> impl Iterator<Item = &UsageRecord> {
+        self.entries.iter().map(|entry| &entry.record)
+    }
+
+    /// Whether retention has removed an entry of a subscribed type strictly
+    /// after `position`.
+    ///
+    /// Strict, as in the reference: a position naming the highest sequence a
+    /// type has lost has lost nothing *after* itself, and its continuation is
+    /// intact.
+    fn retention_has_passed(&self, subscription: &[MeterTypeId], position: u64) -> bool {
+        subscription.iter().any(|gts_type_id| {
+            self.retention_marks
+                .get(gts_type_id.as_str())
+                .is_some_and(|mark| *mark > position)
+        })
+    }
+}
+
 /// A ledger of this module's own, for the two defects a wrapper cannot
 /// reach.
 ///
 /// Each of those changes a predicate the inner backend owns — which column a
 /// range meets and which rows a fold walks — so there is no method to
 /// intercept. Everything else mirrors [`InMemoryReferencePlugin`]: the same
-/// admission decision (dedup by caller-supplied fields), the same `from <= window_end < to` selection, the same withdrawal
-/// exclusion, the same `(window_end, id)` page order.
+/// admission decision (dedup by caller-supplied fields), the same
+/// `from <= window_end < to` selection, the same withdrawal exclusion, the
+/// same `(window_end, id)` ledger page order, the same sequence-stamped feed
+/// with its seek, its scanned-entry cursor and its retention refusal, the
+/// same grouping and fold values, and the same reconciliation counters and
+/// watermarks.
 ///
-/// **Two stated ways it is smaller than the reference, neither reachable by
-/// a check.** They are named so a reader does not mistake either for a
-/// second defect:
-///
-/// * Its filter evaluator translates exactly the expression shapes the suite
-///   dispatches — `And`, `Or`, and `<identifier> eq <literal>` over
-///   `tenant_id` and `resource_type` — and admits nothing else. Every scope
-///   and every `query.filter` `run_all` sends is one of those, so on every
-///   expression the suite produces this evaluator and the reference's agree.
-///   The reference's richer disposition (a caller filter it cannot translate
-///   refuses the query, a scope it cannot translate excludes the row) has no
-///   input here to differ on.
-/// * It computes the `SUM`, no-grouping fold and refuses every other shape
-///   rather than answering one. That is the only shape `run_all` dispatches.
-///   A check that grows a second one gets a loud refusal naming this
-///   backend, which is the right failure: a mutant quietly wrong about a
-///   fold no row of the matrix accounts for would be wrong in two ways.
+/// **One stated way it is smaller than the reference, and no check reaches
+/// it.** It is named so a reader does not mistake it for a second defect:
+/// its filter evaluator translates exactly the expression shapes the suite
+/// dispatches — `And`, `Or`, and `<identifier> eq <literal>` over `tenant_id`
+/// and `resource_type` — and admits nothing else. Every scope and every
+/// `query.filter` [`run_all`](super::run_all) sends is one of those, so on
+/// every expression the suite produces this evaluator and the reference's
+/// agree. The reference's richer disposition (a caller filter it cannot
+/// translate refuses the query, a scope it cannot translate excludes the row)
+/// has no input here to differ on.
 ///
 /// # The mirror is pinned, and how far
 ///
 /// A hand-written mirror of an exemplar usually rots quietly. This one does
-/// not, and the matrix is what holds it: every check `run_all` runs is
-/// *passed* by at least one subject built on this type. So if the
-/// reference's selection predicate, page order, admission decision or fold
-/// exclusion changed and the checks moved with it, this mirror would keep
-/// the old behaviour, some row would report a violation its expected set
-/// does not name, and `assert_eq!(failed, expected)` would fire. Drift
-/// between the two implementations is a test failure rather than a thing a
-/// reader has to notice.
+/// not, and the matrix is what holds it: every check
+/// [`run_all`](super::run_all) runs is *passed* by at least one subject built
+/// on this type. So if a mirrored behaviour changed in the reference and the
+/// checks moved with it, this mirror would keep the old behaviour, some row
+/// would report a violation its expected set does not name, and
+/// `assert_eq!(failed, expected)` would fire. Drift is a test failure rather
+/// than a thing a reader has to notice.
 ///
+/// **The pin reaches exactly what `run_all` dispatches, and no further**,
+/// which is less than the whole mirror. Pinned today: the covered-period
+/// bound the selection meets, the admission decision, the withdrawal
+/// exclusion, the ungrouped `SUM` the fold check reads, and which rows the
+/// three scope-carrying read paths answer with. Each was measured by breaking
+/// it and watching a row grow, not inferred from the check list.
+///
+/// Everything else here is level with the reference and **unpinned**: the
+/// ledger page's *order* (its membership is pinned, its sort is asserted by
+/// no check), the feed page with its seek, its cursor rule and its retention
+/// refusal, the grouped and non-`SUM` folds, and the reconciliation figures.
+/// They are mirrored because the checks that read them are coming, and each
+/// becomes pinned by the check that first dispatches it. An unpinned
+/// behaviour is where this mirror can still rot in silence, which is the
+/// argument for keeping it level now rather than letting it answer
+/// `Internal` until someone needs it.
 struct MutantLedger {
-    /// The entries admitted so far.
-    entries: Mutex<Vec<UsageRecord>>,
+    /// The entries admitted so far, with the sequences the feed orders them
+    /// by.
+    entries: Mutex<Ledger>,
     /// Which rule this subject breaks.
     defect: Defect,
 }
@@ -565,24 +652,61 @@ impl MutantLedger {
     /// An empty ledger carrying one defect.
     fn new(defect: Defect) -> Self {
         Self {
-            entries: Mutex::new(Vec::new()),
+            entries: Mutex::new(Ledger::default()),
             defect,
         }
     }
 
     /// Borrows the ledger, lifting a poisoned lock the way the reference
     /// does.
-    fn ledger(&self) -> Result<MutexGuard<'_, Vec<UsageRecord>>, UsageCollectorPluginError> {
+    fn ledger(&self) -> Result<MutexGuard<'_, Ledger>, UsageCollectorPluginError> {
         self.entries.lock().map_err(|_| {
             UsageCollectorPluginError::internal("the mutant's ledger lock is poisoned")
         })
     }
 
+    /// Encodes the sequence of the last entry scanned as a feed position:
+    /// eight big-endian bytes, so bytewise ordering matches numeric ordering,
+    /// which is the reference's own encoding.
+    fn encode_position(sequence: u64) -> Result<FeedPosition, UsageCollectorPluginError> {
+        FeedPosition::new(sequence.to_be_bytes().to_vec()).map_err(|err| {
+            UsageCollectorPluginError::internal(format!(
+                "the mutant ledger could not encode its own feed position: {err}"
+            ))
+        })
+    }
+
+    /// Decodes a position this backend issued.
+    fn decode_position(position: &FeedPosition) -> Result<u64, UsageCollectorPluginError> {
+        let bytes: [u8; 8] = position.as_bytes().try_into().map_err(|_| {
+            UsageCollectorPluginError::internal(format!(
+                "the mutant ledger issues eight-byte feed positions and was handed {} bytes",
+                position.len()
+            ))
+        })?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    /// The covered-period bound a range is compared against.
+    ///
+    /// **The one line [`Defect::SelectsOnWindowStart`] changes**, and it is a
+    /// method rather than an expression inside [`Self::selects`] because a
+    /// backend that ported the pre-period point-in-time column meets every
+    /// range on it: the read paths' selection and the reconciliation figures
+    /// alike. A subject honest on one and wrong on the other would be a
+    /// backend nobody writes.
+    fn range_bound(&self, entry: &UsageRecord) -> time::OffsetDateTime {
+        if self.defect == Defect::SelectsOnWindowStart {
+            entry.window_start
+        } else {
+            entry.window_end
+        }
+    }
+
     /// Whether one entry is inside a read path's selection.
     ///
-    /// The one line the [`Defect::SelectsOnWindowStart`] subject changes is
-    /// which bound the range is compared against. Everything else — the
-    /// meter, the filter, the metadata predicates — is the reference's.
+    /// Everything but the bound — the meter, the filter, the metadata
+    /// predicates — is the reference's; the bound is [`Self::range_bound`]'s.
     fn selects(
         &self,
         entry: &UsageRecord,
@@ -591,18 +715,13 @@ impl MutantLedger {
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> bool {
-        let bound = if self.defect == Defect::SelectsOnWindowStart {
-            entry.window_start
-        } else {
-            entry.window_end
-        };
         let filter_admits = match query.filter() {
             Some(filter) => expr_admits(entry, filter),
             None => true,
         };
         filter_admits
             && entry.gts_type_id == *gts_type_id
-            && time_range.contains_window_end(bound)
+            && time_range.contains_window_end(self.range_bound(entry))
             && metadata_admits(entry, metadata_filter)
     }
 }
@@ -643,13 +762,14 @@ impl UsageCollectorPluginV1 for MutantLedger {
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         let ledger = self.ledger()?;
         ledger
-            .iter()
+            .records()
             .find(|entry| entry.id == id && expr_admits(entry, scope))
             .cloned()
             .ok_or(UsageCollectorPluginError::UsageRecordNotFound { id })
     }
 
-    /// The fold over the selected set.
+    /// The fold over the selected set, grouped and folded as the reference
+    /// groups and folds.
     ///
     /// [`Defect::FoldsTheInvalidation`] drops one conjunct: the withdrawn
     /// record is still left out, and the invalidation that withdraws it is
@@ -657,6 +777,12 @@ impl UsageCollectorPluginV1 for MutantLedger {
     /// rather than negating it, the echoed term stays in the sum with
     /// nothing to pair against and the withdrawn measurement is
     /// double-counted.
+    ///
+    /// Everything after the row filter — the grouping, the bucket cap, the
+    /// split an empty selection makes by fold — is [`fold_rows`]'s, which
+    /// mirrors the reference's function of the same name. Answering only one
+    /// fold shape here, as this subject once did, would fail a check widened
+    /// to a second shape for a reason neither defect is about.
     async fn query_aggregated_usage_records(
         &self,
         gts_type_id: MeterTypeId,
@@ -666,33 +792,19 @@ impl UsageCollectorPluginV1 for MutantLedger {
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
-        if !matches!(fold, AggregationFold::Sum) || !group_by.is_empty() {
-            return Err(UsageCollectorPluginError::internal(
-                "this contract-suite mutant models only the SUM fold with no grouping, which is \
-                 the one shape the suite dispatches; a check that dispatches another shape needs \
-                 the mutant extended rather than a wrong answer invented for it",
-            ));
-        }
         let ledger = self.ledger()?;
         let withdrawn = withdrawn_targets(&ledger);
         let counts_invalidations = self.defect == Defect::FoldsTheInvalidation;
-        let mut total = BigDecimal::from(0);
-        let mut rows = 0_usize;
-        for entry in ledger.iter() {
-            let folded = self.selects(entry, &gts_type_id, time_range, query, metadata_filter)
+        let mut rows: Vec<&UsageRecord> = Vec::new();
+        for entry in ledger.records() {
+            if self.selects(entry, &gts_type_id, time_range, query, metadata_filter)
                 && (counts_invalidations || entry.invalidation.is_none())
-                && !withdrawn.contains(&entry.id);
-            if folded {
-                total += widen(entry.quantity.as_decimal())?;
-                rows += 1;
+                && !withdrawn.contains(&entry.id)
+            {
+                rows.push(entry);
             }
         }
-        Ok(AggregationResult {
-            buckets: vec![AggregationBucket {
-                key: Vec::new(),
-                value: if rows == 0 { None } else { Some(total) },
-            }],
-        })
+        fold_rows(fold, &rows, group_by)
     }
 
     async fn list_usage_records(
@@ -704,7 +816,7 @@ impl UsageCollectorPluginV1 for MutantLedger {
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
         let ledger = self.ledger()?;
         let mut items: Vec<UsageRecord> = ledger
-            .iter()
+            .records()
             .filter(|entry| self.selects(entry, &gts_type_id, time_range, query, metadata_filter))
             .cloned()
             .collect();
@@ -727,41 +839,133 @@ impl UsageCollectorPluginV1 for MutantLedger {
         ))
     }
 
-    /// Unmodelled: this mirror reproduces the reference's write and fold
-    /// paths alone, and every defect routed here breaks one of those.
+    /// A page from the ledger's own append order, mirroring the reference's.
     ///
-    /// `Internal` rather than a wrong page, because no check in this slice
-    /// points a feed read at this subject and an invented answer would make a
-    /// future one fail for a reason no matrix row names.
+    /// The three properties a later feed check reads are all here. The
+    /// resumption is a **seek**: `sequence > from` resumes at the first entry
+    /// the position does not already cover, never a count of entries walked
+    /// past, which is what DESIGN §3.3's plugin obligations put on a real
+    /// plugin in stating that *"Offset/limit scans are forbidden on both
+    /// paginated paths"*. The cursor advances past every entry **scanned**
+    /// rather than every entry **admitted**, so a position denotes a prefix of
+    /// the ledger and the same prefix under every grant — the property
+    /// `a_feed_position_denotes_the_same_ledger_prefix_under_every_grant`
+    /// pins for the reference and nothing pins here yet. And a cursor whose
+    /// continuation retention has truncated is refused, which is DESIGN §3.3's
+    /// `feed-retention-refusal`, though no mark can rise until this type is
+    /// drivable.
+    ///
+    /// Neither defect routed here touches the feed. This method is a mirror
+    /// and nothing more: a wrong answer invented for it would fail a future
+    /// check for a reason no matrix row names.
     async fn read_feed_page(
         &self,
-        _subscription: &[MeterTypeId],
-        _scope: &ast::Expr,
-        _start: FeedStart<FeedPosition>,
-        _until: Option<FeedPosition>,
-        _limit: u64,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        start: FeedStart<FeedPosition>,
+        until: Option<FeedPosition>,
+        limit: u64,
     ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::internal(
-            "this contract-suite mutant models the write and fold paths only and serves no feed \
-             page; a check that reads the feed needs the mutant extended rather than a wrong \
-             answer invented for it",
-        ))
+        // A zero-limit page emits nothing and so advances its cursor past
+        // nothing, which makes `next` a fixpoint. The published limit is at
+        // least one, so a zero one is a host-contract breach.
+        if limit == 0 {
+            return Err(UsageCollectorPluginError::internal(
+                "read_feed_page was called with a zero limit (host-contract breach): the \
+                 published page limit is at least one, and a zero-limit page cannot advance its \
+                 own cursor",
+            ));
+        }
+
+        let from = match start {
+            FeedStart::Oldest => 0,
+            FeedStart::After(ref position) => Self::decode_position(position)?,
+        };
+        let upper = match until {
+            Some(ref position) => Self::decode_position(position)?,
+            None => u64::MAX,
+        };
+
+        let ledger = self.ledger()?;
+
+        // `FeedStart::Oldest` is exempt by construction rather than by a mark
+        // that happens not to fire: it begins at the oldest entry still
+        // retained, so nothing it asks for is missing.
+        if matches!(start, FeedStart::After(_)) && ledger.retention_has_passed(subscription, from) {
+            return Err(UsageCollectorPluginError::CursorBeyondRetention);
+        }
+
+        let mut entries = Vec::new();
+        let mut cursor = from;
+        for entry in ledger.entries.iter().filter(|entry| entry.sequence > from) {
+            // `upper` names an entry a bounded replay is still asked to read,
+            // so the replay stops at the first entry beyond it.
+            if entry.sequence > upper || u64::try_from(entries.len()).unwrap_or(u64::MAX) >= limit {
+                break;
+            }
+            // The cursor moves onto this entry's sequence whether or not the
+            // subscription and the scope admit it. Advancing only past
+            // admitted entries would make the position depend on who asked.
+            cursor = entry.sequence;
+            if subscription.contains(&entry.record.gts_type_id) && expr_admits(&entry.record, scope)
+            {
+                entries.push(entry.record.clone());
+            }
+        }
+
+        let next = if until.is_some() && cursor >= upper {
+            None
+        } else {
+            Some(Self::encode_position(cursor)?)
+        };
+        Ok(FeedPage { entries, next })
     }
 
-    /// Unmodelled, for the same reason [`Self::read_feed_page`] is.
+    /// Counters, the declared fold, and watermarks over the ledger, mirroring
+    /// the reference's.
+    ///
+    /// The compiled `scope` applies **before** the tenant and type arguments,
+    /// so a tenant it excludes answers exactly as one holding no entries. The
+    /// two figures over the range disagree on purpose: DESIGN §3.3's plugin
+    /// obligations have `accepted_count` count *"every accepted entry the
+    /// range selects, invalidations included, because it reports ingestion
+    /// activity rather than aggregating the meter; the quantity summary
+    /// excludes withdrawn pairs"*.
+    ///
+    /// The range meets [`MutantLedger::range_bound`] rather than `window_end`
+    /// directly, so [`Defect::SelectsOnWindowStart`] reaches this path as it
+    /// reaches every other range. The four passes are the reference's shape
+    /// too, and its doc says why not to copy them into a real backend.
     async fn get_reconciliation_metadata(
         &self,
-        _tenant_id: Uuid,
-        _gts_type_id: MeterTypeId,
-        _time_range: TimeRange,
-        _fold: AggregationFold,
-        _scope: &ast::Expr,
+        tenant_id: Uuid,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        scope: &ast::Expr,
     ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::internal(
-            "this contract-suite mutant models the write and fold paths only and reports no \
-             reconciliation metadata; a check that reads it needs the mutant extended rather \
-             than a wrong answer invented for it",
-        ))
+        let ledger = self.ledger()?;
+        let withdrawn = withdrawn_targets(&ledger);
+        let in_scope = || {
+            ledger
+                .records()
+                .filter(|entry| expr_admits(entry, scope))
+                .filter(|entry| entry.tenant_id == tenant_id && entry.gts_type_id == gts_type_id)
+        };
+        let in_range =
+            || in_scope().filter(|entry| time_range.contains_window_end(self.range_bound(entry)));
+
+        let accepted_count = in_range().count();
+        let folded: Vec<&UsageRecord> = in_range()
+            .filter(|entry| entry.invalidation.is_none() && !withdrawn.contains(&entry.id))
+            .collect();
+
+        Ok(ReconciliationMetadata {
+            accepted_count: u64::try_from(accepted_count).unwrap_or(u64::MAX),
+            quantity_summary: fold_value(fold, &folded)?,
+            max_accepted_at: in_scope().map(|entry| entry.accepted_at).max(),
+            max_window_end: in_scope().map(|entry| entry.window_end).max(),
+        })
     }
 }
 
@@ -771,10 +975,10 @@ impl UsageCollectorPluginV1 for MutantLedger {
 /// `Ok(None)` is "insert it", `Err` is a refusal. The decision is the
 /// reference's: a collision on `id` resolves by caller-supplied fields.
 fn decide(
-    ledger: &[UsageRecord],
+    ledger: &Ledger,
     record: &UsageRecord,
 ) -> Result<Option<UsageRecord>, UsageCollectorPluginError> {
-    match ledger.iter().find(|entry| entry.id == record.id) {
+    match ledger.records().find(|entry| entry.id == record.id) {
         Some(stored) if stored.caller_supplied_eq(record) => Ok(Some(stored.clone())),
         Some(stored) => Err(UsageCollectorPluginError::idempotency_conflict(
             record.idempotency_key.as_str(),
@@ -784,9 +988,10 @@ fn decide(
     }
 }
 
-/// Decides one entry against the ledger and inserts it if it may be.
+/// Decides one entry against the ledger and inserts it if it may be,
+/// stamping it with the next sequence.
 fn admit(
-    ledger: &mut Vec<UsageRecord>,
+    ledger: &mut Ledger,
     record: UsageRecord,
 ) -> Result<UsageRecord, UsageCollectorPluginError> {
     if let Some(stored) = decide(ledger, &record)? {
@@ -797,9 +1002,9 @@ fn admit(
 }
 
 /// Every `UsageRecord.id` an accepted invalidation names.
-fn withdrawn_targets(ledger: &[UsageRecord]) -> BTreeSet<Uuid> {
+fn withdrawn_targets(ledger: &Ledger) -> BTreeSet<Uuid> {
     ledger
-        .iter()
+        .records()
         .filter_map(|entry| entry.invalidation.as_ref().map(|inv| inv.target))
         .collect()
 }
@@ -847,6 +1052,121 @@ fn field_matches(entry: &UsageRecord, name: &str, value: &ast::Value) -> bool {
         ("resource_type", ast::Value::String(want)) => entry.resource_ref.resource_type() == want,
         _ => false,
     }
+}
+
+/// Groups the selected rows and folds each group, mirroring the reference's
+/// function of the same name.
+///
+/// An empty `group_by` is the no-grouping case: exactly one bucket carrying an
+/// empty key, emitted even over an empty selection, and what that bucket
+/// carries is [`fold_value`]'s to decide. A grouping empties differently: the
+/// groups are keyed from the surviving rows alone, so a group nothing survives
+/// in is never keyed and yields no bucket. DESIGN §3.3's plugin obligations
+/// state both halves — *"A grouped query yields no bucket for a group nothing
+/// survives in."*
+///
+/// The bucket count is capped at [`MAX_AGGREGATION_BUCKETS`] `+ 1`, one past
+/// the cap, which is what lets a gateway tell "at the cap" from "over it".
+fn fold_rows(
+    fold: AggregationFold,
+    rows: &[&UsageRecord],
+    group_by: &[AggregationDimension],
+) -> Result<AggregationResult, UsageCollectorPluginError> {
+    if group_by.is_empty() {
+        return Ok(AggregationResult {
+            buckets: vec![AggregationBucket {
+                key: Vec::new(),
+                value: fold_value(fold, rows)?,
+            }],
+        });
+    }
+
+    let mut groups: BTreeMap<Vec<String>, Vec<&UsageRecord>> = BTreeMap::new();
+    for row in rows {
+        if let Some(key) = bucket_key(row, group_by) {
+            groups.entry(key).or_default().push(row);
+        }
+    }
+
+    let mut buckets = Vec::with_capacity(groups.len().min(MAX_AGGREGATION_BUCKETS + 1));
+    for (key, group) in groups.into_iter().take(MAX_AGGREGATION_BUCKETS + 1) {
+        buckets.push(AggregationBucket {
+            key,
+            value: fold_value(fold, &group)?,
+        });
+    }
+    Ok(AggregationResult { buckets })
+}
+
+/// The key one row contributes, or `None` when a dimension is absent on it.
+///
+/// A row with no subject is excluded from a `subject_id` grouping rather than
+/// bucketed under an empty string, and the same holds for `subject_type` and
+/// for a metadata key the row does not carry. The reference's module docs
+/// argue under "Stated limits" why that stands; this is the mirror of it, not
+/// a second opinion.
+fn bucket_key(row: &UsageRecord, group_by: &[AggregationDimension]) -> Option<Vec<String>> {
+    group_by
+        .iter()
+        .map(|dimension| match dimension {
+            AggregationDimension::TenantId => Some(row.tenant_id.to_string()),
+            AggregationDimension::ResourceId => Some(row.resource_ref.resource_id().to_owned()),
+            AggregationDimension::ResourceType => Some(row.resource_ref.resource_type().to_owned()),
+            AggregationDimension::SubjectId => row
+                .subject_ref
+                .as_ref()
+                .map(|subject| subject.subject_id().to_owned()),
+            AggregationDimension::SubjectType => row
+                .subject_ref
+                .as_ref()
+                .and_then(|subject| subject.subject_type().map(ToOwned::to_owned)),
+            AggregationDimension::Metadata(key) => row.metadata.get(key).cloned(),
+        })
+        .collect()
+}
+
+/// Applies one fold to one bucket's rows.
+///
+/// **An empty bucket splits by fold.** DESIGN §3.3's plugin obligations:
+/// *"`SUM` and `COUNT` are defined over an empty selection and report `0`;
+/// `MAX`, `MIN` and `LATEST` are not and report absent"*. So `SUM` returns its
+/// accumulator, which starts at zero and has nothing added to it, and `COUNT`
+/// returns the row count; the other three have no row to read a quantity off
+/// and answer `None`. This mirror used to answer absent for an empty `SUM`,
+/// which was the reference's own answer before it was brought to DESIGN.
+///
+/// **`LATEST` takes the greatest `(window_end, accepted_at, id)`**, the whole
+/// of DESIGN §3.1's declared order. All three keys are read, and `id` is
+/// compared as bytes by [`Uuid`]'s derived `Ord`, so the order is total and
+/// the answer never depends on ledger insertion order.
+fn fold_value(
+    fold: AggregationFold,
+    rows: &[&UsageRecord],
+) -> Result<Option<BigDecimal>, UsageCollectorPluginError> {
+    if matches!(fold, AggregationFold::Count) {
+        let count = u64::try_from(rows.len()).map_err(|_| {
+            UsageCollectorPluginError::internal("bucket cardinality does not fit a count")
+        })?;
+        return Ok(Some(BigDecimal::from(count)));
+    }
+    let winner = match fold {
+        AggregationFold::Sum => {
+            let mut total = BigDecimal::from(0);
+            for row in rows {
+                total += widen(row.quantity.as_decimal())?;
+            }
+            return Ok(Some(total));
+        }
+        AggregationFold::Max => rows.iter().max_by_key(|row| row.quantity.as_decimal()),
+        AggregationFold::Min => rows.iter().min_by_key(|row| row.quantity.as_decimal()),
+        AggregationFold::Latest => rows
+            .iter()
+            .max_by_key(|row| (row.window_end, row.accepted_at, row.id)),
+        AggregationFold::Count => None,
+    };
+    winner
+        .map(|row| widen(row.quantity.as_decimal()))
+        .transpose()
 }
 
 /// Widens a quantity to the aggregate surface's carrier, through the decimal

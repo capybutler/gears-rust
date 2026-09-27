@@ -2083,9 +2083,13 @@ pub struct AggregationBucket {
     /// exceed [`rust_decimal::Decimal`]'s ~7.9×10²⁸ ceiling — which previously
     /// surfaced as an `Internal` (HTTP 500) on decode. `None`
     /// when no rows matched the bucket (e.g. `MIN` over an empty set).
-    /// `COUNT` is the one exception and answers `Some(0)`: counting an
-    /// empty selection is zero rather than absent, the same split
-    /// `SELECT COUNT(*)` makes against `SELECT MIN(v)` over no rows.
+    /// `SUM` and `COUNT` are the two exceptions and answer `Some(0)`, where
+    /// `MAX`, `MIN` and `LATEST` are absent: folding an empty selection is
+    /// zero for the first two rather than undefined, the same split
+    /// `SELECT COUNT(*)` makes against `SELECT MIN(v)` over no rows. DESIGN
+    /// §3.3's plugin obligations are normative for it: *"`SUM` and `COUNT`
+    /// are defined over an empty selection and report `0`; `MAX`, `MIN` and
+    /// `LATEST` are not and report absent"*.
     /// Wire-encoded as a JSON string (never a float) for the same round-trip
     /// reason as [`UsageRecord::quantity`], via
     /// [`crate::serde_helpers::bigdecimal_str_option`].
