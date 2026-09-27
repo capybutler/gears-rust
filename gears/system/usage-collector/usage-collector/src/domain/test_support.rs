@@ -30,9 +30,9 @@ use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
-    AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord, FeedPage,
-    FeedPosition, FeedStart, MetadataFilter, MeterTypeId, ReconciliationMetadata, RecordOrigin,
-    TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
+    AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord, EntryType,
+    FeedPage, FeedPosition, FeedStart, MetadataFilter, MeterTypeId, ReconciliationMetadata,
+    RecordOrigin, TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -98,13 +98,17 @@ pub fn default_covered_period_bounds() -> crate::domain::covered_period::Covered
 /// Projects a create submission into its persisted shape, for a plugin echo
 /// fixture that must agree with the service on the derived `id`.
 ///
-/// Routing through the real
-/// [`CreateUsageRecord::try_into_usage_record`] rather than hand-building a
+/// Routing through the real SDK projections rather than hand-building a
 /// [`UsageRecord`] is the point: a stub that invented its own `id` would
 /// pass even if the service stopped deriving one. Every fixture in these
 /// tests supplies a valid covered period, so the projection cannot fail —
 /// and if one ever does, the `expect` names the fixture as the defect
 /// rather than letting a bogus record reach the assertion.
+///
+/// The projection is chosen off the submission's declared `entry_type`,
+/// exactly as `Service::project_and_admit` chooses it, and a withdrawal's
+/// target is derived here the same way. A fixture cannot therefore produce
+/// an entry the gateway would not have produced from the same submission.
 ///
 /// Stamped `Live`, because these fixtures stand in for what the live
 /// ingestion path produced; a test about an imported entry reaches for
@@ -126,10 +130,17 @@ pub(crate) fn projected_with_origin(
     submission: &CreateUsageRecord,
     origin: RecordOrigin,
 ) -> UsageRecord {
-    submission
-        .clone()
-        .try_into_usage_record(origin, time::OffsetDateTime::UNIX_EPOCH)
-        .expect("test fixture supplies a valid covered period")
+    let now = time::OffsetDateTime::UNIX_EPOCH;
+    let clone = submission.clone();
+    match submission.entry_type() {
+        EntryType::Record => clone.try_into_usage_record(origin, now),
+        EntryType::Invalidation => {
+            let target = crate::domain::invalidation::derive_invalidation_target(submission)
+                .expect("test fixture withdrawal carries an idempotency key");
+            clone.try_into_invalidation_record(origin, now, target)
+        }
+    }
+    .expect("test fixture supplies a valid covered period")
 }
 
 /// A test quantity. Panics on an invalid literal, which is a test bug.
@@ -1867,9 +1878,7 @@ pub(crate) type RecordingPlugin = HappyPathPlugin;
 
 use bigdecimal::BigDecimal;
 use toolkit_odata::PageInfo;
-use usage_collector_sdk::{
-    AggregationBucket, IdempotencyKey, Invalidation, ReasonCode, derive_usage_record_id,
-};
+use usage_collector_sdk::{AggregationBucket, Invalidation, ReasonCode, derive_usage_record_id};
 
 /// In-memory storage double that actually folds, so the withdrawal
 /// exclusion has something to be demonstrated against.
@@ -1936,10 +1945,12 @@ impl FoldingPlugin {
     ///
     /// Built **from** the target rather than written out beside it, so the
     /// two cannot drift apart: it is a faithful copy departing in exactly
-    /// the three permitted places — its derived `inv:<target>` idempotency
-    /// key, the reference, and the reason. The echoed quantity is what the
-    /// exclusion exists for, so a fixture that let a caller negate it would
-    /// be demonstrating a different model.
+    /// the two permitted places — `entry_type`, which shows here as the
+    /// `invalidation` field the entry carries, and the reason inside it. The
+    /// idempotency key is copied like every other field, which is what makes
+    /// the pair's `id`s differ in the entry-type input alone. The echoed
+    /// quantity is what the exclusion exists for, so a fixture that let a
+    /// caller negate it would be demonstrating a different model.
     ///
     /// `origin` is not a fourth departure — it is not a compared field at
     /// all, which is why it is a parameter rather than a copied one. It is
@@ -1959,20 +1970,19 @@ impl FoldingPlugin {
     /// to store, and a suite driving a real plugin gets its target back
     /// from `create_usage_record` rather than putting one there itself.
     pub(crate) fn withdrawal_of(record: &UsageRecord, origin: RecordOrigin) -> UsageRecord {
-        let idempotency_key = IdempotencyKey::for_invalidation(record.id);
         UsageRecord {
             id: derive_usage_record_id(
                 record.tenant_id,
                 &record.gts_type_id,
-                &idempotency_key,
+                &record.idempotency_key,
                 record.window_start,
                 record.window_end,
+                EntryType::Invalidation,
             ),
             invalidation: Some(Invalidation {
                 target: record.id,
                 reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
             }),
-            idempotency_key,
             origin,
             ..record.clone()
         }

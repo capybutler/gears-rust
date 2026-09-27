@@ -437,10 +437,11 @@ impl From<DomainError> for UsageCollectorError {
 /// entry (DESIGN §3.3 error lift table):
 /// - on a record, as `IdempotencyConflict` naming the stored entry;
 /// - on an invalidation, as `AlreadyInvalidated` naming the target, the stored
-///   invalidation and its reason code. Every invalidation of one record derives
-///   the same `inv:<target>` key, so a conflict on one can only be against
-///   another invalidation of that target; a stored entry that is not one is a
-///   plugin breach.
+///   invalidation and its reason code. Every invalidation of one record repeats
+///   that record's tenant, type, key and period and reads
+///   `entry_type = invalidation`, so all of them reach one dedup identity and a
+///   conflict on one can only be against another invalidation of that target;
+///   a stored entry that is not one is a plugin breach.
 ///
 /// Every other error takes the context-free `From`.
 pub(crate) fn lift_dispatch_error(

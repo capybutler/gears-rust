@@ -420,8 +420,8 @@ mod pdp_dedup_tests {
     use toolkit_gts::gts_id;
 
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef, SubjectRef,
-        UsageCollectorPluginV1, UsageRecord,
+        CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
+        SubjectRef, UsageCollectorPluginV1, UsageRecord,
     };
     use uuid::Uuid;
 
@@ -471,6 +471,7 @@ mod pdp_dedup_tests {
         // attribution tuple; the create surface is identity-free (the id is
         // derived from the dedup identity inside the service).
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(HAPPY_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new(resource_id, "compute.vm").expect("valid resource ref"),
@@ -796,8 +797,9 @@ mod gts_type_id_dedup_tests {
     use toolkit_gts::gts_id;
 
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
-        USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
+        CreateUsageRecord, EntryType, IdempotencyKey, Invalidation, MeterTypeId, RecordOrigin,
+        ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError, UsageCollectorPluginV1,
+        UsageRecord,
     };
     use uuid::Uuid;
 
@@ -816,6 +818,7 @@ mod gts_type_id_dedup_tests {
 
     fn record_for(gts: &str, tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: meter_id_for(gts),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-gts-dedup", "compute.vm")
@@ -845,7 +848,13 @@ mod gts_type_id_dedup_tests {
                 .expect("fixture record carries a key"),
             accepted_at: input.window_end,
             origin: RecordOrigin::Live,
-            invalidation: input.invalidation.clone(),
+            // The submission states the reason alone; the persisted shape
+            // pairs it with the target the gateway would have derived.
+            invalidation: input.invalidation.clone().map(|reason| Invalidation {
+                target: crate::domain::invalidation::derive_invalidation_target(input)
+                    .expect("fixture withdrawal carries a key"),
+                reason,
+            }),
             window_start: input.window_start,
             window_end: input.window_end,
         }
@@ -1008,7 +1017,7 @@ mod invalidation_target_batch_tests {
     use toolkit_gts::gts_id;
 
     use usage_collector_sdk::{
-        ConflictReason, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId,
+        ConflictReason, CreateUsageRecord, EntryType, IdempotencyKey, MetadataKey, MeterTypeId,
         ReasonCode, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
         UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, ValidationReason,
     };
@@ -1035,10 +1044,11 @@ mod invalidation_target_batch_tests {
 
     /// The base measurement every fixture here is shaped from. An
     /// invalidation is a faithful copy of it, so a withdrawal is built by
-    /// changing exactly the two permitted departures — the idempotency key
-    /// and the `invalidation` field itself.
+    /// changing exactly the two permitted departures — `entry_type` and the
+    /// reason code.
     fn ordinary_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-target", "compute.vm").expect("valid resource ref"),
@@ -1052,30 +1062,33 @@ mod invalidation_target_batch_tests {
         }
     }
 
-    fn withdrawal_of(tenant_id: Uuid, target: Uuid, idem: &str) -> CreateUsageRecord {
+    /// The withdrawal of `ordinary_record(tenant_id, idem)`.
+    ///
+    /// It names no target, because the shape has no field for one: it
+    /// repeats every identity input of the entry it withdraws, the
+    /// idempotency key included, and the gateway derives the target from
+    /// those (DESIGN §3.1, "Target resolution"). Passing `idem` therefore
+    /// chooses *which* entry is withdrawn, and [`target_id`] says which one
+    /// that is.
+    fn withdrawal_of(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
-            // An invalidation carries no caller key of its own; the
-            // projection derives `inv:<target>`. `idem` still selects the
-            // rest of the fixture through `ordinary_record`.
-            idempotency_key: None,
-            invalidation: Some(Invalidation {
-                target,
-                reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
-            }),
+            entry_type: EntryType::Invalidation,
+            invalidation: Some(ReasonCode::new("emitter_defect").expect("valid reason code")),
             ..ordinary_record(tenant_id, idem)
         }
     }
 
-    /// The persisted entry a withdrawal built by [`withdrawal_of`] copies
-    /// faithfully: same caller-supplied fields, but its own identity —
-    /// because the withdrawal derives its own `inv:<target>` idempotency
-    /// key rather than copying this one.
-    fn target_row(tenant_id: Uuid, id: Uuid) -> UsageRecord {
-        UsageRecord {
-            id,
-            idempotency_key: IdempotencyKey::new("idem-target").expect("valid idempotency key"),
-            ..projected(&ordinary_record(tenant_id, "idem-target"))
-        }
+    /// The persisted measurement `withdrawal_of(tenant_id, idem)` withdraws:
+    /// the projection of the very submission that withdrawal copies, so the
+    /// pair cannot drift apart and the row carries the identity the gateway
+    /// will derive.
+    fn target_row(tenant_id: Uuid, idem: &str) -> UsageRecord {
+        projected(&ordinary_record(tenant_id, idem))
+    }
+
+    /// The identifier `withdrawal_of(tenant_id, idem)` resolves.
+    fn target_id(tenant_id: Uuid, idem: &str) -> Uuid {
+        target_row(tenant_id, idem).id
     }
 
     /// Five withdrawals of one target MUST collapse to a single
@@ -1090,16 +1103,14 @@ mod invalidation_target_batch_tests {
     async fn withdrawals_of_one_target_share_a_single_lookup() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x501);
-        let target = Uuid::from_u128(0x601);
-        plugin.set_get_record(target_row(tenant_id, target));
+        plugin.set_get_record(target_row(tenant_id, "idem-w"));
 
-        let input: Vec<CreateUsageRecord> = (0..5)
-            .map(|i| withdrawal_of(tenant_id, target, &format!("idem-w-{i}")))
-            .collect();
-        // Every withdrawal here derives the same `inv:<target>` dedup identity
-        // regardless of its own `idem`, so the batch dispatches
-        // just the one representative and the other four resolve against its
-        // stored row; the mock is programmed with a single outcome to match.
+        let input: Vec<CreateUsageRecord> =
+            (0..5).map(|_| withdrawal_of(tenant_id, "idem-w")).collect();
+        // Five withdrawals of one entry repeat that entry's key, so they
+        // reach one dedup identity: the batch dispatches just the one
+        // representative and the other four resolve against its stored row.
+        // The mock is programmed with a single outcome to match.
         let stored = projected(&input[0]);
         plugin.set_create_records(vec![Ok(stored.clone())]);
 
@@ -1145,17 +1156,17 @@ mod invalidation_target_batch_tests {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x502);
 
-        let target_a = Uuid::from_u128(0x602);
-        let target_b = Uuid::from_u128(0x603);
-        let target_c = Uuid::from_u128(0x604);
-        for target in [target_a, target_b, target_c] {
-            plugin.set_get_record_for(target, target_row(tenant_id, target));
+        let target_a = target_id(tenant_id, "idem-A");
+        let target_b = target_id(tenant_id, "idem-B");
+        let target_c = target_id(tenant_id, "idem-C");
+        for idem in ["idem-A", "idem-B", "idem-C"] {
+            plugin.set_get_record_for(target_id(tenant_id, idem), target_row(tenant_id, idem));
         }
 
         let input = vec![
-            withdrawal_of(tenant_id, target_a, "idem-A"),
-            withdrawal_of(tenant_id, target_b, "idem-B"),
-            withdrawal_of(tenant_id, target_c, "idem-C"),
+            withdrawal_of(tenant_id, "idem-A"),
+            withdrawal_of(tenant_id, "idem-B"),
+            withdrawal_of(tenant_id, "idem-C"),
         ];
         plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
@@ -1236,15 +1247,18 @@ mod invalidation_target_batch_tests {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x504);
 
-        let good = Uuid::from_u128(0x605);
-        let missing = Uuid::from_u128(0x606);
-        plugin.set_get_record_for(good, target_row(tenant_id, good));
+        let good = target_id(tenant_id, "idem-good");
+        let missing = target_id(tenant_id, "idem-bad");
+        plugin.set_get_record_for(good, target_row(tenant_id, "idem-good"));
         plugin.set_get_usage_record_not_found(missing);
 
+        // Indices 0 and 2 withdraw the same entry, so they repeat one key and
+        // resolve one identifier — which is what "every entry naming it"
+        // means now that the target is named by the submission's own fields.
         let input = vec![
-            withdrawal_of(tenant_id, missing, "idem-bad-0"),
-            withdrawal_of(tenant_id, good, "idem-good-0"),
-            withdrawal_of(tenant_id, missing, "idem-bad-1"),
+            withdrawal_of(tenant_id, "idem-bad"),
+            withdrawal_of(tenant_id, "idem-good"),
+            withdrawal_of(tenant_id, "idem-bad"),
         ];
 
         // Only the resolvable one reaches the persist SPI; program one
@@ -1304,33 +1318,28 @@ mod invalidation_target_batch_tests {
     /// This is the pairing the comparator cannot check for itself: it is
     /// handed a row and a reference and trusts they belong together, so the
     /// fan-out — keyed by target, projected back by input index — is the
-    /// only place the two can come apart. The rows are deliberately
-    /// different *kinds* of wrong, so a swap of either the key or the index
-    /// changes which reason lands where, not merely which uuid it carries.
+    /// only place the two can come apart. The two entries fail in
+    /// deliberately different *kinds* of way, so a swap of either the key or
+    /// the index changes which reason lands where, not merely which uuid it
+    /// carries.
     #[tokio::test]
     async fn each_rejection_names_the_target_its_own_entry_sent() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x505);
 
-        // Target A is itself a withdrawal — the no-invalidation-of-an-
-        // invalidation rule.
-        let target_a = Uuid::from_u128(0x607);
-        let mut row_a = target_row(tenant_id, target_a);
-        row_a.invalidation = Some(Invalidation {
-            target: Uuid::from_u128(0x60F),
-            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
-        });
-        plugin.set_get_record_for(target_a, row_a);
+        // Target A resolves to nothing at all.
+        let target_a = target_id(tenant_id, "idem-pair-a");
+        plugin.set_get_usage_record_not_found(target_a);
 
-        // Target B is an ordinary entry the submission copies unfaithfully.
-        let target_b = Uuid::from_u128(0x608);
-        let mut row_b = target_row(tenant_id, target_b);
+        // Target B exists, and the submission copies it unfaithfully.
+        let target_b = target_id(tenant_id, "idem-pair-b");
+        let mut row_b = target_row(tenant_id, "idem-pair-b");
         row_b.quantity = crate::domain::test_support::qty("999");
         plugin.set_get_record_for(target_b, row_b);
 
         let input = vec![
-            withdrawal_of(tenant_id, target_a, "idem-pair-a"),
-            withdrawal_of(tenant_id, target_b, "idem-pair-b"),
+            withdrawal_of(tenant_id, "idem-pair-a"),
+            withdrawal_of(tenant_id, "idem-pair-b"),
         ];
 
         let service = service_with_permit(
@@ -1345,16 +1354,12 @@ mod invalidation_target_batch_tests {
         assert_eq!(results.len(), 2);
 
         match results[0].as_ref() {
-            Err(UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::InvalidationTargetNotRecord,
-                resource_name,
-                ..
-            }) => assert_eq!(
-                resource_name.as_deref(),
-                Some(target_a.to_string().as_str()),
-                "index 0 MUST be told about the target IT named",
+            Err(UsageCollectorError::NotFound { name, .. }) => assert_eq!(
+                name,
+                &target_a.to_string(),
+                "index 0 MUST be told about the target IT resolved",
             ),
-            other => panic!("index 0 MUST be refused as a non-record target, got {other:?}"),
+            other => panic!("index 0 MUST be refused as a missing target, got {other:?}"),
         }
         match results[1].as_ref() {
             Err(UsageCollectorError::InvalidArgument {
@@ -1367,7 +1372,7 @@ mod invalidation_target_batch_tests {
                 assert_eq!(
                     resource_name.as_deref(),
                     Some(target_b.to_string().as_str()),
-                    "index 1 MUST be told about the target IT named",
+                    "index 1 MUST be told about the target IT resolved",
                 );
             }
             other => panic!("index 1 MUST be refused as an unfaithful copy, got {other:?}"),
@@ -1385,15 +1390,17 @@ mod invalidation_target_batch_tests {
     async fn a_copy_mismatch_outranks_a_metadata_rejection() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x506);
-        let target = Uuid::from_u128(0x609);
+        let target = target_id(tenant_id, "idem-both-broken");
 
         // The declaration declares `region` and nothing else, so `zone` is
-        // an undeclared key and fails the closed-shape check.
-        let mut row = target_row(tenant_id, target);
+        // an undeclared key and fails the closed-shape check. `metadata` is
+        // no identity input, so adding it below leaves the resolved target
+        // unchanged.
+        let mut row = target_row(tenant_id, "idem-both-broken");
         row.quantity = crate::domain::test_support::qty("999");
         plugin.set_get_record_for(target, row);
 
-        let mut submission = withdrawal_of(tenant_id, target, "idem-both-broken");
+        let mut submission = withdrawal_of(tenant_id, "idem-both-broken");
         submission.metadata.insert(
             MetadataKey::new("zone").expect("valid metadata key"),
             "eu-1".to_owned(),
@@ -1421,20 +1428,23 @@ mod invalidation_target_batch_tests {
         }
     }
 
-    /// A second withdrawal under another reason code collides on the derived
-    /// `inv:<target>` key. The store reports an ordinary conflict carrying the
-    /// stored invalidation, and the gateway reports it as `AlreadyInvalidated`
-    /// because the dispatched entry is an invalidation.
+    /// A second withdrawal under another reason code reaches the same dedup
+    /// identity: `reason_code` is no identity input, so two withdrawals of
+    /// one entry agree on all six. The store reports an ordinary conflict
+    /// carrying the stored invalidation, and the gateway reports it as
+    /// `AlreadyInvalidated` because the dispatched entry is an invalidation.
     #[tokio::test]
     async fn a_store_conflict_on_a_withdrawal_is_lifted_as_already_invalidated() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x507);
-        let target = Uuid::from_u128(0x60A);
-        plugin.set_get_record_for(target, target_row(tenant_id, target));
-        let stored = projected(&withdrawal_of(tenant_id, target, "idem-first"));
+        let target = target_id(tenant_id, "idem-withdrawn");
+        plugin.set_get_record_for(target, target_row(tenant_id, "idem-withdrawn"));
+        let stored = projected(&withdrawal_of(tenant_id, "idem-withdrawn"));
         let stored_id = stored.id;
+        // The conflict carries the key the withdrawal was dispatched under,
+        // which is its target's own: no prefix is reserved.
         plugin.set_create_records(vec![Err(UsageCollectorPluginError::idempotency_conflict(
-            format!("inv:{target}"),
+            "idem-withdrawn",
             stored,
         ))]);
         let service = service_with_permit(
@@ -1442,11 +1452,11 @@ mod invalidation_target_batch_tests {
             "test.target.already_invalidated.records.v1",
         );
 
+        let mut second = withdrawal_of(tenant_id, "idem-withdrawn");
+        second.invalidation = Some(ReasonCode::new("late_correction").expect("valid reason code"));
+
         let results = service
-            .create_usage_records(
-                &authenticated_ctx(),
-                vec![withdrawal_of(tenant_id, target, "idem-second")],
-            )
+            .create_usage_records(&authenticated_ctx(), vec![second])
             .await
             .expect("batch dispatch succeeded");
 
@@ -1513,7 +1523,6 @@ mod invalidation_target_batch_tests {
     async fn a_transient_target_lookup_fails_the_entry_rather_than_rejecting_it() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x508);
-        let target = Uuid::from_u128(0x60C);
         plugin.set_get_usage_record_transient("target store timed out", Some(7));
 
         let service = service_with_permit(
@@ -1524,7 +1533,7 @@ mod invalidation_target_batch_tests {
         let results = service
             .create_usage_records(
                 &authenticated_ctx(),
-                vec![withdrawal_of(tenant_id, target, "idem-transient")],
+                vec![withdrawal_of(tenant_id, "idem-transient")],
             )
             .await
             .expect("batch dispatch succeeded");
@@ -1555,11 +1564,13 @@ mod invalidation_target_batch_tests {
     async fn the_plugin_sees_the_batch_in_submission_order() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x50A);
-        let target = Uuid::from_u128(0x610);
-        plugin.set_get_record_for(target, target_row(tenant_id, target));
+        plugin.set_get_record_for(
+            target_id(tenant_id, "idem-order-withdrawal"),
+            target_row(tenant_id, "idem-order-withdrawal"),
+        );
 
         let input = vec![
-            withdrawal_of(tenant_id, target, "idem-order-withdrawal"),
+            withdrawal_of(tenant_id, "idem-order-withdrawal"),
             ordinary_record(tenant_id, "idem-order-plain"),
         ];
         plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
@@ -1590,12 +1601,12 @@ mod invalidation_target_batch_tests {
             .iter()
             .map(|r| r.idempotency_key.as_str())
             .collect();
-        let expected_withdrawal_key = IdempotencyKey::for_invalidation(target);
         assert_eq!(
             keys,
-            vec![expected_withdrawal_key.as_str(), "idem-order-plain"],
+            vec!["idem-order-withdrawal", "idem-order-plain"],
             "the deferred target pre-check MUST NOT reorder the batch the \
-             plugin is handed",
+             plugin is handed, and a withdrawal is dispatched under its \
+             target's own key",
         );
     }
 
@@ -1611,14 +1622,16 @@ mod invalidation_target_batch_tests {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x50B);
 
-        let unreadable = Uuid::from_u128(0x611);
-        let readable = Uuid::from_u128(0x612);
+        let unreadable = target_id(tenant_id, "idem-iso-unreadable");
         plugin.set_get_usage_record_transient_for(unreadable, "target store timed out", Some(7));
-        plugin.set_get_record_for(readable, target_row(tenant_id, readable));
+        plugin.set_get_record_for(
+            target_id(tenant_id, "idem-iso-readable"),
+            target_row(tenant_id, "idem-iso-readable"),
+        );
 
         let input = vec![
-            withdrawal_of(tenant_id, unreadable, "idem-iso-unreadable"),
-            withdrawal_of(tenant_id, readable, "idem-iso-readable"),
+            withdrawal_of(tenant_id, "idem-iso-unreadable"),
+            withdrawal_of(tenant_id, "idem-iso-readable"),
         ];
         plugin.set_create_records(vec![Ok(projected(&input[1]))]);
 
@@ -1657,12 +1670,14 @@ mod invalidation_target_batch_tests {
     async fn a_batch_labels_each_entry_with_its_own_entry_type() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x50C);
-        let target = Uuid::from_u128(0x613);
-        plugin.set_get_record_for(target, target_row(tenant_id, target));
+        plugin.set_get_record_for(
+            target_id(tenant_id, "idem-label-withdrawal"),
+            target_row(tenant_id, "idem-label-withdrawal"),
+        );
 
         let input = vec![
             ordinary_record(tenant_id, "idem-label-plain"),
-            withdrawal_of(tenant_id, target, "idem-label-withdrawal"),
+            withdrawal_of(tenant_id, "idem-label-withdrawal"),
         ];
         plugin.set_create_records(input.iter().map(|r| Ok(projected(r))).collect());
 
@@ -1715,18 +1730,21 @@ mod invalidation_target_batch_tests {
     async fn a_plugin_answering_with_the_wrong_row_is_refused_not_believed() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x50D);
-        let requested = Uuid::from_u128(0x614);
-        let answered = Uuid::from_u128(0x615);
+        let requested = target_id(tenant_id, "idem-wrong-row");
+        let answered = target_id(tenant_id, "idem-other-row");
 
-        // Asked for `requested`, answered with the row for `answered`.
-        plugin.set_get_record_for(requested, target_row(tenant_id, answered));
+        // Asked for `requested`, answered with the row for `answered`. The
+        // two rows differ in their idempotency key alone, which the copy
+        // comparator does not read — so the submission is a faithful copy of
+        // the row that came back and only the id check can catch this.
+        plugin.set_get_record_for(requested, target_row(tenant_id, "idem-other-row"));
 
         // The persist SPI is programmed to succeed even though a correct
         // gateway never reaches it. Without that, a gateway that admitted
         // the entry would fail on an unprogrammed SPI instead — the test
         // would still fail, but reporting the wrong defect. Programmed, the
         // failure a reader sees is `Ok(..)`: the false accept itself.
-        let submission = withdrawal_of(tenant_id, requested, "idem-wrong-row");
+        let submission = withdrawal_of(tenant_id, "idem-wrong-row");
         plugin.set_create_records(vec![Ok(projected(&submission))]);
 
         let service = service_with_permit(
@@ -1771,17 +1789,18 @@ mod invalidation_target_batch_tests {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x509);
 
-        let good = Uuid::from_u128(0x60D);
-        let bad = Uuid::from_u128(0x60E);
-        plugin.set_get_record_for(good, target_row(tenant_id, good));
-        let mut row_bad = target_row(tenant_id, bad);
+        plugin.set_get_record_for(
+            target_id(tenant_id, "idem-mixed-good"),
+            target_row(tenant_id, "idem-mixed-good"),
+        );
+        let mut row_bad = target_row(tenant_id, "idem-mixed-bad");
         row_bad.quantity = crate::domain::test_support::qty("999");
-        plugin.set_get_record_for(bad, row_bad);
+        plugin.set_get_record_for(target_id(tenant_id, "idem-mixed-bad"), row_bad);
 
         let input = vec![
             ordinary_record(tenant_id, "idem-mixed-plain"),
-            withdrawal_of(tenant_id, good, "idem-mixed-good"),
-            withdrawal_of(tenant_id, bad, "idem-mixed-bad"),
+            withdrawal_of(tenant_id, "idem-mixed-good"),
+            withdrawal_of(tenant_id, "idem-mixed-bad"),
         ];
         plugin.set_create_records(vec![Ok(projected(&input[0])), Ok(projected(&input[1]))]);
 
@@ -1814,7 +1833,7 @@ mod invalidation_target_batch_tests {
     async fn a_target_not_yet_converged_is_a_retryable_conflict() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x5C1);
-        let target = Uuid::from_u128(0x6C1);
+        let target = target_id(tenant_id, "idem-nc");
         plugin.set_get_usage_record_not_converged(target);
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
@@ -1824,7 +1843,7 @@ mod invalidation_target_batch_tests {
         let results = service
             .create_usage_records(
                 &authenticated_ctx(),
-                vec![withdrawal_of(tenant_id, target, "idem-nc")],
+                vec![withdrawal_of(tenant_id, "idem-nc")],
             )
             .await
             .expect("batch dispatch succeeded");
@@ -1853,8 +1872,8 @@ mod invalidation_target_batch_tests {
         let plugin = HappyPathPlugin::new();
         let caller_tenant = Uuid::from_u128(0x5A1);
         let other_tenant = Uuid::from_u128(0x5A2);
-        let target = Uuid::from_u128(0x6A1);
-        plugin.set_get_record_for(target, target_row(other_tenant, target));
+        let target = target_id(caller_tenant, "idem-cross");
+        plugin.set_get_record_for(target, target_row(other_tenant, "idem-cross"));
         let service = service_with_permit(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.target.cross_tenant.records.v1",
@@ -1863,7 +1882,7 @@ mod invalidation_target_batch_tests {
         let results = service
             .create_usage_records(
                 &authenticated_ctx(),
-                vec![withdrawal_of(caller_tenant, target, "idem-cross")],
+                vec![withdrawal_of(caller_tenant, "idem-cross")],
             )
             .await
             .expect("batch dispatch succeeded");
@@ -1894,8 +1913,7 @@ mod invalidation_target_batch_tests {
     async fn a_withdrawal_under_a_permit_scope_that_does_not_compile_is_permission_denied() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x5C1);
-        let target = Uuid::from_u128(0x6C1);
-        plugin.set_get_record(target_row(tenant_id, target));
+        plugin.set_get_record(target_row(tenant_id, "idem-uncompilable-withdrawal"));
         let ordinary = ordinary_record(tenant_id, "idem-uncompilable-plain");
         let stored = projected(&ordinary);
         plugin.set_create_records(vec![Ok(stored.clone())]);
@@ -1911,7 +1929,7 @@ mod invalidation_target_batch_tests {
             .create_usage_records(
                 &authenticated_ctx(),
                 vec![
-                    withdrawal_of(tenant_id, target, "idem-uncompilable-withdrawal"),
+                    withdrawal_of(tenant_id, "idem-uncompilable-withdrawal"),
                     ordinary,
                 ],
             )
@@ -1960,12 +1978,14 @@ mod invalidation_target_batch_tests {
     async fn withdrawals_of_one_target_under_two_permits_each_cost_their_own_lookup() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x5C2);
-        let target = Uuid::from_u128(0x6C2);
-        plugin.set_get_record(target_row(tenant_id, target));
-        let faithful = withdrawal_of(tenant_id, target, "idem-two-permits-faithful");
+        let target = target_id(tenant_id, "idem-two-permits");
+        plugin.set_get_record(target_row(tenant_id, "idem-two-permits"));
+        let faithful = withdrawal_of(tenant_id, "idem-two-permits");
+        // `resource_ref` is no identity input, so the second withdrawal
+        // resolves the same target while landing in another PDP group.
         let other_resource = CreateUsageRecord {
             resource_ref: ResourceRef::new("rsc-other", "compute.vm").expect("valid resource ref"),
-            ..withdrawal_of(tenant_id, target, "idem-two-permits-other")
+            ..withdrawal_of(tenant_id, "idem-two-permits")
         };
         let stored = projected(&faithful);
         plugin.set_create_records(vec![Ok(stored.clone())]);
@@ -2074,14 +2094,11 @@ mod invalidation_target_batch_tests {
     async fn two_withdrawals_of_one_target_in_one_batch_report_already_invalidated() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x5B3);
-        let target = Uuid::from_u128(0x6B3);
-        plugin.set_get_record_for(target, target_row(tenant_id, target));
-        let first = withdrawal_of(tenant_id, target, "idem-w1");
-        let mut second = withdrawal_of(tenant_id, target, "idem-w2");
-        second.invalidation = Some(Invalidation {
-            target,
-            reason: ReasonCode::new("late_correction").expect("valid reason code"),
-        });
+        let target = target_id(tenant_id, "idem-w");
+        plugin.set_get_record_for(target, target_row(tenant_id, "idem-w"));
+        let first = withdrawal_of(tenant_id, "idem-w");
+        let mut second = withdrawal_of(tenant_id, "idem-w");
+        second.invalidation = Some(ReasonCode::new("late_correction").expect("valid reason code"));
         let stored = projected(&first);
         plugin.set_create_records(vec![Ok(stored.clone())]);
         let service = service_with_permit(
@@ -2208,10 +2225,7 @@ mod invalidation_target_batch_tests {
         let results = service
             .create_usage_records(
                 &authenticated_ctx(),
-                vec![
-                    record,
-                    withdrawal_of(tenant_id, record_id, "idem-same-batch"),
-                ],
+                vec![record, withdrawal_of(tenant_id, "idem-same-batch")],
             )
             .await
             .expect("batch dispatch succeeded");
@@ -2695,7 +2709,7 @@ mod create_usage_record_path_tests {
     use toolkit_gts::gts_id;
 
     use usage_collector_sdk::{
-        ConflictReason, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId,
+        ConflictReason, CreateUsageRecord, EntryType, IdempotencyKey, MetadataKey, MeterTypeId,
         ReasonCode, RecordOrigin, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
         UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, ValidationReason,
     };
@@ -2723,6 +2737,7 @@ mod create_usage_record_path_tests {
     /// has to echo it.
     fn counter_record(tenant_id: Uuid, value: i64, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(COUNTER_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-singular", "compute.vm")
@@ -2737,36 +2752,39 @@ mod create_usage_record_path_tests {
         }
     }
 
-    /// A withdrawal of `target`: a faithful copy of
-    /// `counter_record(tenant_id, 10, ..)`, carrying no idempotency key of
-    /// its own (the gateway derives one from `target`) and departing only
-    /// in the withdrawal itself. The quantity is echoed, never negated —
+    /// The withdrawal of `counter_record(tenant_id, 10, idem)`: a faithful
+    /// copy of it, repeating its idempotency key and departing only in
+    /// `entry_type` and the reason. The quantity is echoed, never negated —
     /// an invalidation removes a measurement rather than offsetting it
     /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
-    fn counter_withdrawal(tenant_id: Uuid, target: Uuid, idem: &str) -> CreateUsageRecord {
+    ///
+    /// It names no target: the gateway derives one from the five identity
+    /// inputs this copies, so `idem` chooses which entry is withdrawn and
+    /// [`target_id`] says which one that is.
+    fn counter_withdrawal(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         let mut r = counter_record(tenant_id, 10, idem);
-        r.idempotency_key = None;
-        r.invalidation = Some(Invalidation {
-            target,
-            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
-        });
+        r.entry_type = EntryType::Invalidation;
+        r.invalidation = Some(ReasonCode::new("emitter_defect").expect("valid reason code"));
         r
     }
 
-    /// The persisted entry [`counter_withdrawal`] copies faithfully: same
-    /// caller-supplied fields, but its own identity, its own derived
-    /// `inv:<target>` idempotency key, and its own origin.
-    fn target_row(tenant_id: Uuid, id: Uuid) -> UsageRecord {
+    /// The persisted entry `counter_withdrawal(tenant_id, idem)` withdraws:
+    /// the projection of the very submission it copies, so the two carry the
+    /// same identity inputs and the derivation lands on this row.
+    fn target_row(tenant_id: Uuid, idem: &str) -> UsageRecord {
         UsageRecord {
-            id,
-            idempotency_key: IdempotencyKey::new("idem-target").expect("valid idempotency key"),
             // Deliberately not the origin the live submission will carry: a
             // withdrawal's route is its own, so a mismatch here MUST NOT
             // make the copy unfaithful (`faithful_copy_mismatch` ignores
             // `origin`). This fixture is what pins that.
             origin: RecordOrigin::Backfill,
-            ..projected(&counter_record(tenant_id, 10, "idem-target"))
+            ..projected(&counter_record(tenant_id, 10, idem))
         }
+    }
+
+    /// The identifier `counter_withdrawal(tenant_id, idem)` resolves.
+    fn target_id(tenant_id: Uuid, idem: &str) -> Uuid {
+        target_row(tenant_id, idem).id
     }
 
     /// Build a `Service` wired against a permit-by-default PDP, a working
@@ -2869,10 +2887,9 @@ mod create_usage_record_path_tests {
     async fn create_usage_record_accepts_a_faithful_withdrawal_after_one_target_lookup() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x703);
-        let target = Uuid::from_u128(0x800);
-        plugin.set_get_record(target_row(tenant_id, target));
+        plugin.set_get_record(target_row(tenant_id, "idem-faithful"));
 
-        let submission = counter_withdrawal(tenant_id, target, "idem-faithful");
+        let submission = counter_withdrawal(tenant_id, "idem-faithful");
         plugin.set_create_record(projected(&submission));
 
         let service = service_with_permit(
@@ -2894,17 +2911,18 @@ mod create_usage_record_path_tests {
         assert_translatable_scope(&plugin, "Service::create_usage_record_inner");
     }
 
-    /// The dispatched record's key is not the caller's — an invalidation
-    /// carries none — but the gateway's own derivation:
-    /// `IdempotencyKey::for_invalidation(target)`.
+    /// The dispatched withdrawal keeps the caller's key, which is its
+    /// target's key: no prefix is reserved and nothing is derived in its
+    /// place (DESIGN §3.1, `IdempotencyKey`). Keeping it is what lets the
+    /// gateway resolve the target from the submission alone, and it is what
+    /// makes two withdrawals of one entry collide.
     #[tokio::test]
-    async fn create_usage_record_dispatches_an_invalidation_under_its_derived_key() {
+    async fn create_usage_record_dispatches_an_invalidation_under_its_targets_key() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x704);
-        let target = Uuid::from_u128(0x900);
-        plugin.set_get_record(target_row(tenant_id, target));
+        plugin.set_get_record(target_row(tenant_id, "idem-withdrawn"));
 
-        let submission = counter_withdrawal(tenant_id, target, "idem-unused");
+        let submission = counter_withdrawal(tenant_id, "idem-withdrawn");
         plugin.set_create_record(projected(&submission));
 
         let service = service_with_permit(
@@ -2921,9 +2939,18 @@ mod create_usage_record_path_tests {
             .last_create_record_input()
             .expect("the withdrawal reached the persist SPI");
         assert_eq!(
-            dispatched.idempotency_key,
-            IdempotencyKey::for_invalidation(target),
-            "an invalidation carries no caller key; the gateway derives inv:<target>",
+            dispatched.idempotency_key.as_str(),
+            "idem-withdrawn",
+            "a withdrawal is dispatched under its target's own key",
+        );
+        assert_eq!(
+            dispatched
+                .invalidation
+                .as_ref()
+                .expect("the dispatched entry is a withdrawal")
+                .target,
+            target_id(tenant_id, "idem-withdrawn"),
+            "the gateway stamps the target it derived from the submission",
         );
     }
 
@@ -2936,7 +2963,8 @@ mod create_usage_record_path_tests {
     async fn create_usage_record_unresolvable_target_returns_not_found() {
         let plugin = HappyPathPlugin::new();
 
-        let missing = Uuid::from_u128(0x801);
+        let tenant_id = Uuid::from_u128(0x705);
+        let missing = target_id(tenant_id, "idem-missing-target");
         plugin.set_get_usage_record_not_found(missing);
 
         let service = service_with_permit(
@@ -2944,7 +2972,7 @@ mod create_usage_record_path_tests {
             "test.singular.target_not_found.records.v1",
         );
 
-        let record = counter_withdrawal(Uuid::from_u128(0x705), missing, "idem-missing-target");
+        let record = counter_withdrawal(tenant_id, "idem-missing-target");
 
         let err = service
             .create_usage_record(&authenticated_ctx(), record)
@@ -2959,8 +2987,8 @@ mod create_usage_record_path_tests {
                         && name == &missing.to_string()
                         && detail.contains(&missing.to_string())
             ),
-            "an unresolvable `invalidates` MUST surface as NotFound naming the \
-             caller-supplied target; got {err:?}",
+            "a target that resolves to nothing MUST surface as NotFound naming \
+             the identifier the submission resolved; got {err:?}",
         );
         assert!(
             plugin.last_create_record_input().is_none(),
@@ -2968,53 +2996,38 @@ mod create_usage_record_path_tests {
         );
     }
 
-    /// `invalidates` names an entry that is itself a withdrawal ⇒
-    /// `InvalidationTargetNotRecord`. A correction cannot be reversed: the
-    /// entry that withdrew a measurement is not itself withdrawable.
+    /// Withdrawing a withdrawal resolves the measurement they both copy, not
+    /// the withdrawal — so "no invalidation of an invalidation" needs no
+    /// check on this path either (DESIGN §3.1). The submission built to
+    /// withdraw a withdrawal is, input for input, the submission that
+    /// withdraws the measurement, and the gateway treats it as exactly that.
     #[tokio::test]
-    async fn create_usage_record_target_that_is_an_invalidation_is_refused() {
+    async fn create_usage_record_cannot_express_a_withdrawal_of_a_withdrawal() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x707);
-        let target = Uuid::from_u128(0x802);
-
-        let mut row = target_row(tenant_id, target);
-        row.invalidation = Some(Invalidation {
-            target: Uuid::from_u128(0x80F),
-            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
-        });
-        plugin.set_get_record(row);
+        let measurement = target_row(tenant_id, "idem-withdraw-a-withdrawal");
+        let withdrawal = projected(&counter_withdrawal(tenant_id, "idem-withdraw-a-withdrawal"));
+        assert_ne!(measurement.id, withdrawal.id, "test premise");
+        plugin.set_get_record(measurement.clone());
+        plugin.set_create_record(withdrawal.clone());
 
         let service = service_with_permit(
             Arc::clone(&plugin) as _,
             "test.singular.target_not_record.records.v1",
         );
 
-        let err = service
+        service
             .create_usage_record(
                 &authenticated_ctx(),
-                counter_withdrawal(tenant_id, target, "idem-withdraw-a-withdrawal"),
+                counter_withdrawal(tenant_id, "idem-withdraw-a-withdrawal"),
             )
             .await
-            .expect_err("withdrawing a withdrawal MUST surface as Err");
+            .expect("the submission withdraws the measurement, and is accepted");
 
-        match err {
-            UsageCollectorError::InvalidArgument {
-                reason: ValidationReason::InvalidationTargetNotRecord,
-                field,
-                resource_name,
-                ..
-            } => {
-                assert_eq!(field, "invalidates");
-                assert_eq!(resource_name.as_deref(), Some(target.to_string().as_str()));
-            }
-            other => panic!(
-                "a target that is itself an invalidation MUST surface as \
-                 InvalidationTargetNotRecord; got {other:?}",
-            ),
-        }
-        assert!(
-            plugin.last_create_record_input().is_none(),
-            "a non-record target MUST short-circuit before the persist SPI",
+        assert_eq!(
+            plugin.get_usage_record_inputs(),
+            vec![measurement.id],
+            "the derivation asks for the measurement, never for the withdrawal",
         );
     }
 
@@ -3027,9 +3040,8 @@ mod create_usage_record_path_tests {
     async fn create_usage_record_unfaithful_copy_names_the_field_that_differs() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x708);
-        let target = Uuid::from_u128(0x803);
 
-        let mut row = target_row(tenant_id, target);
+        let mut row = target_row(tenant_id, "idem-unfaithful");
         row.quantity = crate::domain::test_support::qty("999");
         plugin.set_get_record(row);
 
@@ -3041,7 +3053,7 @@ mod create_usage_record_path_tests {
         let err = service
             .create_usage_record(
                 &authenticated_ctx(),
-                counter_withdrawal(tenant_id, target, "idem-unfaithful"),
+                counter_withdrawal(tenant_id, "idem-unfaithful"),
             )
             .await
             .expect_err("an unfaithful copy MUST surface as Err");
@@ -3076,13 +3088,12 @@ mod create_usage_record_path_tests {
     async fn create_usage_record_copy_mismatch_outranks_a_metadata_rejection() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x709);
-        let target = Uuid::from_u128(0x804);
 
-        let mut row = target_row(tenant_id, target);
+        let mut row = target_row(tenant_id, "idem-both-broken");
         row.quantity = crate::domain::test_support::qty("999");
         plugin.set_get_record(row);
 
-        let mut submission = counter_withdrawal(tenant_id, target, "idem-both-broken");
+        let mut submission = counter_withdrawal(tenant_id, "idem-both-broken");
         submission.metadata.insert(
             MetadataKey::new("zone").expect("valid metadata key"),
             "eu-1".to_owned(),
@@ -3116,12 +3127,12 @@ mod create_usage_record_path_tests {
     async fn create_usage_record_store_conflict_on_a_withdrawal_is_already_invalidated() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x70A);
-        let target = Uuid::from_u128(0x805);
-        plugin.set_get_record(target_row(tenant_id, target));
-        let stored = projected(&counter_withdrawal(tenant_id, target, "idem-first"));
+        let target = target_id(tenant_id, "idem-withdrawn");
+        plugin.set_get_record(target_row(tenant_id, "idem-withdrawn"));
+        let stored = projected(&counter_withdrawal(tenant_id, "idem-withdrawn"));
         let stored_id = stored.id;
         plugin.set_create_record_err(UsageCollectorPluginError::idempotency_conflict(
-            format!("inv:{target}"),
+            "idem-withdrawn",
             stored,
         ));
         let service = service_with_permit(
@@ -3129,11 +3140,11 @@ mod create_usage_record_path_tests {
             "test.singular.already_invalidated.records.v1",
         );
 
+        let mut second = counter_withdrawal(tenant_id, "idem-withdrawn");
+        second.invalidation = Some(ReasonCode::new("late_correction").expect("valid reason code"));
+
         let err = service
-            .create_usage_record(
-                &authenticated_ctx(),
-                counter_withdrawal(tenant_id, target, "idem-second-withdrawal"),
-            )
+            .create_usage_record(&authenticated_ctx(), second)
             .await
             .expect_err("a second withdrawal MUST surface as Err");
 
@@ -3171,7 +3182,7 @@ mod create_usage_record_path_tests {
         let err = service
             .create_usage_record(
                 &authenticated_ctx(),
-                counter_withdrawal(Uuid::from_u128(0x70B), Uuid::from_u128(0x807), "idem-t"),
+                counter_withdrawal(Uuid::from_u128(0x70B), "idem-t"),
             )
             .await
             .expect_err("a transient target read MUST surface as Err");
@@ -3197,14 +3208,16 @@ mod create_usage_record_path_tests {
     async fn create_usage_record_refuses_a_plugin_that_answers_with_the_wrong_row() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x70C);
-        let requested = Uuid::from_u128(0x808);
-        let answered = Uuid::from_u128(0x809);
-        plugin.set_get_record(target_row(tenant_id, answered));
+        let requested = target_id(tenant_id, "idem-wrong-row");
+        let answered = target_id(tenant_id, "idem-other-row");
+        plugin.set_get_record(target_row(tenant_id, "idem-other-row"));
 
         // Programmed so a gateway that believed the row would return
         // `Ok(..)` — the false accept — rather than tripping over an
-        // unprogrammed SPI and reporting the wrong defect.
-        let submission = counter_withdrawal(tenant_id, requested, "idem-wrong-row");
+        // unprogrammed SPI and reporting the wrong defect. The two rows
+        // differ in their idempotency key alone, which the copy comparator
+        // does not read, so only the id check can catch this.
+        let submission = counter_withdrawal(tenant_id, "idem-wrong-row");
         plugin.set_create_record(projected(&submission));
 
         let service = service_with_permit(
@@ -3281,7 +3294,7 @@ mod create_usage_record_path_tests {
     async fn create_usage_record_not_converged_target_is_a_retryable_conflict() {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x70C);
-        let target = Uuid::from_u128(0x80C);
+        let target = target_id(tenant_id, "idem-nc");
         plugin.set_get_usage_record_not_converged(target);
         let service = service_with_permit(
             Arc::clone(&plugin) as _,
@@ -3291,7 +3304,7 @@ mod create_usage_record_path_tests {
         let err = service
             .create_usage_record(
                 &authenticated_ctx(),
-                counter_withdrawal(tenant_id, target, "idem-nc"),
+                counter_withdrawal(tenant_id, "idem-nc"),
             )
             .await
             .expect_err("a not-converged target is refused");
@@ -3316,8 +3329,8 @@ mod create_usage_record_path_tests {
         let plugin = HappyPathPlugin::new();
         let caller_tenant = Uuid::from_u128(0x70D);
         let other_tenant = Uuid::from_u128(0x70E);
-        let target = Uuid::from_u128(0x80D);
-        plugin.set_get_record(target_row(other_tenant, target));
+        let target = target_id(caller_tenant, "idem-cross");
+        plugin.set_get_record(target_row(other_tenant, "idem-cross"));
         let service = service_with_permit(
             Arc::clone(&plugin) as _,
             "test.singular.cross_tenant.records.v1",
@@ -3326,7 +3339,7 @@ mod create_usage_record_path_tests {
         let err = service
             .create_usage_record(
                 &authenticated_ctx(),
-                counter_withdrawal(caller_tenant, target, "idem-cross"),
+                counter_withdrawal(caller_tenant, "idem-cross"),
             )
             .await
             .expect_err("an out-of-scope target is refused");
@@ -3364,8 +3377,7 @@ mod create_usage_record_path_tests {
      {
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0x70F);
-        let target = Uuid::from_u128(0x80F);
-        plugin.set_get_record(target_row(tenant_id, target));
+        plugin.set_get_record(target_row(tenant_id, "idem-uncompilable-withdrawal"));
         let ordinary = counter_record(tenant_id, 10, "idem-uncompilable-plain");
         plugin.set_create_record(projected(&ordinary));
         let service = ServiceFixture::default()
@@ -3384,7 +3396,7 @@ mod create_usage_record_path_tests {
         let err = service
             .create_usage_record(
                 &authenticated_ctx(),
-                counter_withdrawal(tenant_id, target, "idem-uncompilable-withdrawal"),
+                counter_withdrawal(tenant_id, "idem-uncompilable-withdrawal"),
             )
             .await
             .expect_err("a permit scope that does not compile is refused");
@@ -3416,8 +3428,8 @@ mod batch_size_cap_tests {
     use toolkit_gts::gts_id;
 
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorError,
-        UsageCollectorPluginV1, ValidationReason,
+        CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, ResourceRef,
+        UsageCollectorError, UsageCollectorPluginV1, ValidationReason,
     };
     use uuid::Uuid;
 
@@ -3433,6 +3445,7 @@ mod batch_size_cap_tests {
 
     fn input_record(idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id: Uuid::from_u128(1),
             resource_ref: ResourceRef::new("rsc-batch-cap", "compute.vm")
@@ -3534,9 +3547,9 @@ mod batch_size_cap_tests {
 //
 // The create surface is identity-free (`CreateUsageRecord`): callers never
 // supply an `id`. The domain `Service` is the single, guaranteed point where a
-// submission acquires its identity — via
-// `CreateUsageRecord::try_into_usage_record`, which validates the covered
-// period and then derives the `id` from the 5-tuple dedup identity. These
+// submission acquires its identity — via the SDK projection its declared
+// `entry_type` selects, which validates the covered period and then derives
+// the `id` from the six-part dedup identity. These
 // tests drive the `Service` create methods directly (NOT through the REST
 // handler) and assert the record the plugin RECEIVED carries the
 // deterministic derivation, pinning that the service stamps the derived id on
@@ -3552,7 +3565,7 @@ mod server_assigned_stamp_tests {
 
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
+        CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
         UsageCollectorPluginV1, derive_usage_record_id,
     };
     use uuid::Uuid;
@@ -3579,6 +3592,7 @@ mod server_assigned_stamp_tests {
     /// derived the dispatched record's id from it.
     fn input_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-derive", "compute.vm").expect("valid resource ref"),
@@ -3609,6 +3623,7 @@ mod server_assigned_stamp_tests {
                 .expect("fixture record carries a key"),
             input.window_start,
             input.window_end,
+            input.entry_type(),
         );
 
         // The plugin echoes back the record it was dispatched, so the persist
@@ -3632,8 +3647,8 @@ mod server_assigned_stamp_tests {
             dispatched.id, expected,
             "the SERVICE MUST stamp the dispatched record's id with \
              derive_usage_record_id(tenant_id, gts_type_id, idempotency_key, \
-             window_start, window_end) - this guards the in-process (non-REST) \
-             caller path independently of the handler",
+             window_start, window_end, entry_type) - this guards the \
+             in-process (non-REST) caller path independently of the handler",
         );
     }
 
@@ -3659,6 +3674,7 @@ mod server_assigned_stamp_tests {
                         .expect("fixture record carries a key"),
                     r.window_start,
                     r.window_end,
+                    r.entry_type(),
                 )
             })
             .collect();
@@ -3754,7 +3770,8 @@ mod acceptance_stamp_tests {
 
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorPluginV1,
+        CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, ResourceRef,
+        UsageCollectorPluginV1,
     };
     use uuid::Uuid;
 
@@ -3767,6 +3784,7 @@ mod acceptance_stamp_tests {
 
     fn submission(idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(GTS_ID).unwrap(),
             tenant_id: Uuid::from_u128(1),
             resource_ref: ResourceRef::new("rsc-stamp", "compute.vm").unwrap(),
@@ -3839,8 +3857,8 @@ mod covered_period_batch_tests {
 
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MeterTypeId, ResourceRef, UsageCollectorError,
-        UsageCollectorPluginV1,
+        CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, ResourceRef,
+        UsageCollectorError, UsageCollectorPluginV1,
     };
     use uuid::Uuid;
 
@@ -3869,6 +3887,7 @@ mod covered_period_batch_tests {
 
     fn submission_for(resource_id: &str, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id: Uuid::from_u128(2),
             resource_ref: ResourceRef::new(resource_id, "compute.vm").expect("valid resource ref"),
@@ -4103,9 +4122,8 @@ mod covered_period_bounds_tests {
 
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
-        BACKFILL_ROUTE_PATH, CreateUsageRecord, IdempotencyKey, Invalidation, MeterTypeId,
-        ReasonCode, ResourceRef, UsageCollectorError, UsageCollectorPluginV1, UsageRecord,
-        ValidationReason,
+        BACKFILL_ROUTE_PATH, CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, ReasonCode,
+        ResourceRef, UsageCollectorError, UsageCollectorPluginV1, ValidationReason,
     };
     use uuid::Uuid;
 
@@ -4131,6 +4149,7 @@ mod covered_period_bounds_tests {
     /// an hour long and closed an hour ago.
     fn fresh_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new("rsc-bounds", "compute.vm").expect("valid resource ref"),
@@ -4159,6 +4178,7 @@ mod covered_period_bounds_tests {
     fn stale_record(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         let window_end = recent_window_end() - time::Duration::days(30);
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             window_start: window_end - time::Duration::hours(1),
             window_end,
             ..fresh_record(tenant_id, idem)
@@ -4217,6 +4237,7 @@ mod covered_period_bounds_tests {
         // `stale_record` documents.
         let window_end = recent_window_end() + time::Duration::hours(2);
         let submission = CreateUsageRecord {
+            entry_type: EntryType::Record,
             window_start: window_end - time::Duration::hours(1),
             window_end,
             ..fresh_record(Uuid::from_u128(0xC5), "idem-future")
@@ -4263,27 +4284,20 @@ mod covered_period_bounds_tests {
         // would be accepted and a correction of closed history would persist
         // reading `origin = live` — the exact gap the past bound closes.
         let tenant_id = Uuid::from_u128(0xC2);
-        let target = Uuid::from_u128(0x6C2);
 
         // The target: a measurement whose period closed a month ago, stored
         // under the identity the gateway would have derived for it.
         let measurement = stale_record(tenant_id, "idem-target");
-        let target_row = UsageRecord {
-            id: target,
-            ..projected(&measurement)
-        };
+        let target_row = projected(&measurement);
         // The withdrawal: a faithful copy of that measurement, departing
-        // only in the two permitted places — it carries no idempotency key
-        // of its own (the gateway derives one from the target) and the
-        // reference itself. Its covered period is the target's, which is
-        // the whole point.
+        // only in the two permitted places — `entry_type` and the reason.
+        // It repeats the target's idempotency key, which is what resolves
+        // the target; its covered period is the target's, which is the whole
+        // point.
         let withdrawal = CreateUsageRecord {
-            idempotency_key: None,
-            invalidation: Some(Invalidation {
-                target,
-                reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
-            }),
-            ..stale_record(tenant_id, "idem-withdrawal")
+            entry_type: EntryType::Invalidation,
+            invalidation: Some(ReasonCode::new("emitter_defect").expect("valid reason code")),
+            ..stale_record(tenant_id, "idem-target")
         };
 
         let plugin = HappyPathPlugin::new();
@@ -4332,6 +4346,7 @@ mod covered_period_bounds_tests {
         let tenant_id = Uuid::from_u128(0xC4);
         let window_end = time::OffsetDateTime::now_utc() - time::Duration::minutes(1);
         let submission = CreateUsageRecord {
+            entry_type: EntryType::Record,
             window_start: window_end - time::Duration::days(30),
             window_end,
             ..fresh_record(tenant_id, "idem-month-long")
@@ -4418,9 +4433,8 @@ mod backfill_route_tests {
     use authz_resolver_sdk::AuthZResolverApi;
     use toolkit_gts::gts_id;
     use usage_collector_sdk::{
-        BACKFILL_ROUTE_PATH, CreateUsageRecord, IdempotencyKey, Invalidation, MeterTypeId,
-        ReasonCode, RecordOrigin, ResourceRef, UsageCollectorError, UsageCollectorPluginV1,
-        UsageRecord, ValidationReason,
+        BACKFILL_ROUTE_PATH, CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, ReasonCode,
+        RecordOrigin, ResourceRef, UsageCollectorError, UsageCollectorPluginV1, ValidationReason,
     };
     use uuid::Uuid;
 
@@ -4443,6 +4457,7 @@ mod backfill_route_tests {
     /// live path admits.
     fn fresh_record(tenant_id: Uuid, resource_id: &str, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: ResourceRef::new(resource_id, "compute.vm").expect("valid resource ref"),
@@ -4467,6 +4482,7 @@ mod backfill_route_tests {
     fn aged_record(tenant_id: Uuid, resource_id: &str, idem: &str, days: i64) -> CreateUsageRecord {
         let window_end = recent_window_end() - time::Duration::days(days);
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             window_start: window_end - time::Duration::hours(1),
             window_end,
             ..fresh_record(tenant_id, resource_id, idem)
@@ -4606,6 +4622,7 @@ mod backfill_route_tests {
         // on a fresh clock read, for the reason `aged_record` documents.
         let window_end = recent_window_end() + time::Duration::hours(2);
         let submission = CreateUsageRecord {
+            entry_type: EntryType::Record,
             window_start: window_end - time::Duration::hours(1),
             window_end,
             ..fresh_record(Uuid::from_u128(0xD5), "rsc-future", "idem-import-future")
@@ -4656,15 +4673,11 @@ mod backfill_route_tests {
     #[tokio::test]
     async fn a_withdrawal_of_closed_history_is_refused_live_and_accepted_on_backfill() {
         let tenant_id = Uuid::from_u128(0xD3);
-        let target = Uuid::from_u128(0x6D3);
 
         // The measurement whose period closed a month ago, persisted as the
         // live path would have left it.
         let measurement = aged_record(tenant_id, "rsc-withdraw", "idem-target", 30);
-        let target_row = UsageRecord {
-            id: target,
-            ..projected_with_origin(&measurement, RecordOrigin::Live)
-        };
+        let target_row = projected_with_origin(&measurement, RecordOrigin::Live);
         assert_eq!(
             target_row.origin,
             RecordOrigin::Live,
@@ -4672,15 +4685,12 @@ mod backfill_route_tests {
              is not the pair it built",
         );
         // A faithful copy of it, departing only in the two permitted
-        // places — no idempotency key of its own (the gateway derives one
-        // from the target), and the reference itself.
+        // places — `entry_type` and the reason — and repeating the target's
+        // idempotency key, which is what resolves the target.
         let withdrawal = CreateUsageRecord {
-            idempotency_key: None,
-            invalidation: Some(Invalidation {
-                target,
-                reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
-            }),
-            ..aged_record(tenant_id, "rsc-withdraw", "idem-withdrawal", 30)
+            entry_type: EntryType::Invalidation,
+            invalidation: Some(ReasonCode::new("emitter_defect").expect("valid reason code")),
+            ..aged_record(tenant_id, "rsc-withdraw", "idem-target", 30)
         };
 
         let plugin = HappyPathPlugin::new();
@@ -5018,7 +5028,7 @@ mod ingestion_declared_type_tests {
     use toolkit_gts::gts_id;
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
-        CreateUsageRecord, IdempotencyKey, MetadataKey, MeterTypeId, ResourceRef,
+        CreateUsageRecord, EntryType, IdempotencyKey, MetadataKey, MeterTypeId, ResourceRef,
         UsageCollectorPluginV1,
     };
     use uuid::Uuid;
@@ -5074,6 +5084,7 @@ mod ingestion_declared_type_tests {
     /// declaration under test.
     fn valid_create_record() -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(GTS_ID).expect("valid gts_type_id"),
             tenant_id: Uuid::from_u128(2),
             resource_ref: ResourceRef::new("rsc-ingestion-declared", "compute.vm")
@@ -6893,8 +6904,8 @@ mod withdrawal_exclusion_tests {
     use toolkit_odata::ODataQuery;
     use toolkit_security::SecurityContext;
     use usage_collector_sdk::{
-        AggregationFold, AggregationResult, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
-        UsageCollectorPluginV1, UsageRecord, derive_usage_record_id,
+        AggregationFold, AggregationResult, EntryType, IdempotencyKey, MeterTypeId, RecordOrigin,
+        ResourceRef, UsageCollectorPluginV1, UsageRecord, derive_usage_record_id,
     };
     use uuid::Uuid;
 
@@ -6939,6 +6950,7 @@ mod withdrawal_exclusion_tests {
                 &idempotency_key,
                 window_start,
                 window_end,
+                EntryType::Record,
             ),
             gts_type_id: meter_id(),
             tenant_id: tenant_id(),

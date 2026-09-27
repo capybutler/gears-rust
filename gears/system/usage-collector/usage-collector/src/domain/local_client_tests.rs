@@ -21,8 +21,8 @@ use std::sync::Arc;
 use toolkit::client_hub::ClientHub;
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    IdempotencyKey, RecordOrigin, ResourceRef, UsageCollectorClientV1, UsageCollectorError,
-    UsageCollectorPluginV1,
+    EntryType, IdempotencyKey, RecordOrigin, ResourceRef, UsageCollectorClientV1,
+    UsageCollectorError, UsageCollectorPluginV1,
 };
 use uuid::Uuid;
 
@@ -168,6 +168,7 @@ const BACKFILL_PLUGIN_SUFFIX: &str = "test.local.backfill.records.v1";
 fn backfill_submission(idem: &str, days_old: i64) -> CreateUsageRecord {
     let age = time::Duration::days(days_old);
     CreateUsageRecord {
+        entry_type: EntryType::Record,
         gts_type_id: fixture_meter_id(),
         tenant_id: Uuid::from_u128(2),
         resource_ref: ResourceRef::new("rsc-import", "compute.vm").expect("valid resource ref"),

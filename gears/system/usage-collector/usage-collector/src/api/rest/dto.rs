@@ -81,17 +81,39 @@ impl TryFrom<SubjectRefDto> for SubjectRef {
     }
 }
 
-/// Per-record create payload. Carries `gts_type_id` as a permissive `String`
-/// so a bad-prefix value surfaces as the per-record `Problem` instead of axum's default
-/// `text/plain` 422 for the entire batch. per-record problem envelopes
-/// still surface for closed-shape membership, size-cap, and key
-/// validation. Intentionally has no identity field: `id` is
-/// gateway-derived via `usage_collector_sdk::derive_usage_record_id`,
+/// Per-record create payload. Carries `gts_type_id` and `entry_type` as
+/// permissive `String`s so a bad value surfaces as the per-record `Problem`
+/// instead of axum's default `text/plain` 422 for the entire batch.
+/// per-record problem envelopes still surface for closed-shape membership,
+/// size-cap, and key validation. Intentionally has no identity field: `id`
+/// is gateway-derived via `usage_collector_sdk::derive_usage_record_id`,
 /// mirroring the `UsageRecord::id` doc.
+///
+/// `deny_unknown_fields` is the schema's `additionalProperties: false`
+/// (`usage-collector-v1.yaml` `CreateUsageRecordRequest`): every
+/// server-owned field — `id`, `accepted_at`, `origin` and `invalidates` —
+/// is rejected here as an unknown field rather than read and overridden.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUsageRecordRequest {
+    /// The kind this submission declares — `record` or `invalidation`.
+    /// Caller-supplied, required, and with no default
+    /// (`usage-collector-v1.yaml` `EntryType`; DESIGN §3.1, "Entry type and
+    /// reason code").
+    ///
+    /// **Never inferred.** An invalidation is a faithful copy of its target
+    /// and repeats its target's idempotency key, so a withdrawal stripped of
+    /// its discriminator would derive its target's own identity and be
+    /// absorbed as a retry of it, withdrawing nothing. It is also the sixth
+    /// input to the derived `id`, which is what keeps a withdrawal's
+    /// identity apart from the identity of the entry it withdraws.
+    ///
+    /// Carried as a permissive `String` for [`Self::gts_type_id`]'s reason:
+    /// an unrecognised value is folded into a per-record `Problem` naming
+    /// `entry_type`, rather than collapsing a whole batch at the codec
+    /// boundary.
+    pub entry_type: String,
     pub gts_type_id: String,
     pub tenant_id: Uuid,
     pub resource_ref: ResourceRefDto,
@@ -104,31 +126,30 @@ pub struct CreateUsageRecordRequest {
     /// domain type, so an out-of-range value rejects its own entry rather
     /// than the whole batch.
     pub quantity: String,
-    /// The caller's key, required on a record and forbidden on an
-    /// invalidation: an invalidation's key is derived by the gateway as
-    /// `inv:` followed by `invalidates`. A record key may not begin with
-    /// `inv:`.
-    /// An explicit `null` is refused.
+    /// The caller's key, **required on both entry kinds**. A withdrawal
+    /// repeats its target's key rather than deriving one of its own: that
+    /// is what lets the gateway find the target from the submission alone
+    /// (DESIGN §3.1, "Target resolution"). No prefix is reserved.
+    ///
+    /// An explicit `null` is refused rather than read as an absent key
+    /// (`explicit_null_idempotency_key`); an absent one is refused by the
+    /// SDK projection, naming `idempotency_key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub idempotency_key: Option<String>,
-    /// The entry this submission withdraws. Supplying it makes the
-    /// submission an invalidation and requires [`Self::reason_code`];
-    /// omitting it makes the submission an ordinary record. There is no
-    /// caller-supplied discriminator on this shape, so a marker cannot
-    /// disagree with the payload it marks
-    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invalidates: Option<Uuid>,
-    /// Why the withdrawal was issued. Both-or-neither with
-    /// [`Self::invalidates`], which the wire contract states as
-    /// `dependentRequired` and `record_request_into_domain` — the create
-    /// handler's fold point — enforces when it folds the pair into the
-    /// domain's one field.
+    /// Why the withdrawal was issued. Required when [`Self::entry_type`] is
+    /// `invalidation` and MUST NOT appear on a `record` (DESIGN §3.1,
+    /// "Entry type and reason code"). The two are caller-supplied halves of
+    /// one statement, and the SDK projection checks them against each other
+    /// before anything else, reporting a disagreement as an
+    /// `InvalidArgument` naming `reason_code`.
     ///
-    /// The pair stays flat here because that is what the OAS declares and
-    /// what `api_dto` emits into the served document; folding it on this
-    /// shape would change the published schema.
+    /// It carries no target. `invalidates` is server-assigned (DESIGN §3.1,
+    /// "Field ownership"): the gateway derives the withdrawn entry's
+    /// identifier from this submission's own tenant, GTS type, idempotency
+    /// key and covered period, and stamps what it resolved. A submitted
+    /// `invalidates` is refused as an unknown field, so an emitter cannot
+    /// name a record it never measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
     /// Inclusive start of the covered period this submission measures (RFC
@@ -158,16 +179,21 @@ pub struct CreateUsageRecordsRequest {
 /// Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_type_id` is
 /// flattened to `String` so the type can derive `utoipa::ToSchema` without
 /// pulling `utoipa` into the SDK crate; both covered-period bounds are
-/// emitted as RFC 3339 to match the SDK wire shape. `entry_type` is
-/// flattened to `String` for the first of those reasons and not the second:
-/// the SDK wire shape carries no `entry_type` at all — the discriminator is
-/// derived from `invalidates` and never stored — so there is no encoding
-/// here to mirror, only a `utoipa::ToSchema` derive to keep out of the SDK
-/// crate. `origin` is the third flattening, and for `gts_type_id`'s reason
-/// rather than `entry_type`'s: the SDK carries it as a closed enum whose
-/// wire form is already the lowercased variant name, so this `String`
-/// mirrors an encoding that does exist, and only the `utoipa::ToSchema`
-/// derive is being kept out of the SDK.
+/// emitted as RFC 3339 to match the SDK wire shape. `entry_type` and
+/// `origin` are flattened for `gts_type_id`'s reason alone: each is a closed
+/// SDK enum whose wire form is already the lowercased variant name, so both
+/// `String`s mirror an encoding that does exist and only the
+/// `utoipa::ToSchema` derive is being kept out of the SDK.
+///
+/// The two differ in where the value comes from rather than in how it is
+/// encoded. [`usage_collector_sdk::UsageRecord`] stores `origin` as a field
+/// and carries no discriminator field at all, so this projection reads
+/// `entry_type` back through `UsageRecord::entry_type()`, which answers from
+/// the [`usage_collector_sdk::Invalidation`] the entry carries. That is a
+/// read-path projection and nothing more: on the ingestion shape the
+/// discriminator is caller-supplied and required
+/// ([`CreateUsageRecordRequest::entry_type`]), never inferred from anything
+/// beside it (DESIGN §3.1, "Entry type and reason code").
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct UsageRecordDto {
@@ -199,6 +225,12 @@ pub struct UsageRecordDto {
     /// The entry this one withdraws, absent on an ordinary measurement.
     /// Both-or-neither with [`Self::reason_code`] — the SDK carries the
     /// pair as one field, so a response can never show half of it.
+    ///
+    /// `readOnly` on the wire, and the one property on these two shapes that
+    /// genuinely is: the gateway derives it from the withdrawal's own
+    /// identity inputs and stamps it (DESIGN §3.1, "Field ownership"), so it
+    /// appears here and nowhere on the ingestion shape, which refuses a
+    /// submitted one as an unknown field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidates: Option<Uuid>,
     /// Why the withdrawal was issued. Absent on an ordinary measurement.
@@ -206,9 +238,15 @@ pub struct UsageRecordDto {
     pub reason_code: Option<String>,
     /// `record` or `invalidation`, **derived** from [`Self::invalidates`]
     /// rather than stored
-    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
-    /// `readOnly` on the wire: it appears on this read shape and on no
-    /// ingestion shape, and it is `required`, so it is never omitted.
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`): the SDK
+    /// record carries the withdrawal and its reason as one field and no
+    /// discriminator beside them, so there is nothing here to copy.
+    /// `required` on the OAS `UsageRecord`, so it is never omitted. It is
+    /// **not** `readOnly` — the ingestion shape declares an `entry_type` of
+    /// its own, caller-supplied and required with no default
+    /// ([`CreateUsageRecordRequest::entry_type`]). Derived here, supplied
+    /// there: two properties on two shapes, and only the first of them is a
+    /// projection.
     pub entry_type: String,
     /// Inclusive start of the covered period the entry measures.
     #[serde(with = "time::serde::rfc3339")]

@@ -175,6 +175,7 @@ fn exactly_the_usage_record_routes_are_registered() {
 /// gateway derives from the wire body below.
 fn backfill_probe_submission() -> usage_collector_sdk::CreateUsageRecord {
     usage_collector_sdk::CreateUsageRecord {
+        entry_type: usage_collector_sdk::EntryType::Record,
         gts_type_id: usage_collector_sdk::MeterTypeId::new(PROBE_GTS_ID)
             .expect("valid gts_type_id"),
         tenant_id: Uuid::from_u128(0x9911),
@@ -213,6 +214,7 @@ fn probe_request_body() -> Body {
     Body::from(
         serde_json::json!({
             "records": [{
+                "entry_type": "record",
                 "gts_type_id": PROBE_GTS_ID,
                 "tenant_id": submission.tenant_id.to_string(),
                 "resource_ref": {

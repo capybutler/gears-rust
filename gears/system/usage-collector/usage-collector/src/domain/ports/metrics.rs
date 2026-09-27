@@ -351,12 +351,15 @@ pub enum RecordErrorCategory {
     /// An invalidation rejected against the entry it withdraws. DESIGN
     /// §3.11.5 gives it "the copy, reference and at-most-one rules alone",
     /// and this carries all three: the copy rule, the at-most-one rule, and
-    /// the reference rule whole — a target that is itself an invalidation,
-    /// a half-shaped reference from the REST fold point, and a reference
-    /// that resolves to nothing. The last of those is a `NotFound` and used
-    /// to fall to [`Self::SemanticsViolation`] for want of a discriminator;
-    /// `usage_collector_sdk::NotFoundReason` supplies one, so the series no
-    /// longer under-counts the reference rule.
+    /// the target rule — a target that resolves to nothing. That last one is
+    /// a `NotFound` and used to fall to [`Self::SemanticsViolation`] for
+    /// want of a discriminator; `usage_collector_sdk::NotFoundReason`
+    /// supplies one, so the series no longer under-counts it.
+    ///
+    /// A target that is itself an invalidation is no longer among them, and
+    /// not because it stopped counting here: the target's identifier is
+    /// derived with `entry_type = record`, so the case cannot arise (DESIGN
+    /// §3.1, "No invalidation of an invalidation").
     ///
     /// A period-bound rejection is not an invalidation rule for either
     /// entry type, because the bound belongs to the path rather than to the

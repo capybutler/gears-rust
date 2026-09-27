@@ -41,7 +41,7 @@ use crate::domain::authz::{self, AttributionTupleKey};
 use crate::domain::covered_period::{
     CoveredPeriodBounds, enforce_covered_period_bounds, ingestion_action,
 };
-use crate::domain::invalidation::verify_invalidation_target;
+use crate::domain::invalidation::{derive_invalidation_target, verify_invalidation_target};
 use crate::domain::ports::declarations::UnavailableDeclarationSource;
 use crate::domain::ports::metrics::{
     IngestRequestErrorCategory, IngestRequestOutcome, NoopMetrics, PdpOp, PluginErrorCategory,
@@ -127,8 +127,8 @@ type LookupScopeSlot = Option<Result<(usize, Arc<ast::Expr>), DomainError>>;
 /// plugin-owned catalog row per `gts_id` instead of a resolved declaration.
 type DeclarationCache = HashMap<MeterTypeId, Result<Arc<ResolvedDeclaration>, DomainError>>;
 
-/// Cached target lookup per distinct `(target, lookup scope id)`, lifted
-/// into [`DomainError`] so the variant identity of
+/// Cached target lookup per distinct `(derived target, lookup scope id)`,
+/// lifted into [`DomainError`] so the variant identity of
 /// `UsageRecordNotFound { id }` survives the cache (and is reclassified
 /// to `UsageCollectorError::NotFound` on the per-record
 /// projection — same lift that the in-loop code path uses). The scope id
@@ -139,7 +139,7 @@ type InvalidationTargetCache = HashMap<(Uuid, usize), Result<UsageRecord, Domain
 
 /// One entry whose target check was deferred to the post-loop pre-pass.
 /// Entries reach it only after passing PDP and the declaration-resolution
-/// pre-pass, and only when they carry an `invalidates` reference.
+/// pre-pass, and only when they declare `entry_type: invalidation`.
 ///
 /// A named struct rather than a tuple, and that is a correctness choice
 /// rather than a stylistic one: two of its four members are record-shaped
@@ -157,11 +157,13 @@ struct PendingInvalidationTarget {
     /// no identity yet, which is the honest reason `id` is not compared,
     /// and destructuring the *submission* shape is what makes a field added
     /// to [`CreateUsageRecord`] alone a compile error there. Kept because
-    /// `CreateUsageRecord::try_into_usage_record` consumes it.
+    /// the projection consumes it.
     submission: CreateUsageRecord,
-    /// The withdrawal `submission` carries, unwrapped once here so the
+    /// The withdrawal the projected `record` carries: the reason the
+    /// submission stated, paired with the target the gateway derived from
+    /// the submission's own identity inputs. Unwrapped once here so the
     /// verification cannot be reached for an entry that has none. Its
-    /// `target` is the fan-out key and the identifier both rejections echo.
+    /// `target` is the fan-out key and the identifier the rejection echoes.
     invalidation: Invalidation,
     /// The projected entry, dispatched to the plugin once verified.
     record: UsageRecord,
@@ -349,23 +351,6 @@ impl Drop for QueryInflightGuard<'_> {
     }
 }
 
-/// `entry_type` label for a submitted entry: `invalidation` iff it names the
-/// entry it withdraws, else `record`.
-///
-/// Reads the submission's own reference for the same reason the domain does
-/// — there is no submitted discriminator that could disagree with it, and
-/// the sign of a quantity carries no structural meaning
-/// (`cpt-cf-usage-collector-adr-append-only-invalidation`). The label type
-/// is [`EntryType`] itself, so the value a dashboard groups by is the value
-/// the wire carries.
-fn entry_type_of(record: &CreateUsageRecord) -> EntryType {
-    if record.invalidation.is_some() {
-        EntryType::Invalidation
-    } else {
-        EntryType::Record
-    }
-}
-
 /// The `operation` label the PDP-helper instruments (`uc_pdp_*`,
 /// `uc_authz_decisions_total`) carry for an entry admitted by `origin`'s
 /// route.
@@ -432,15 +417,21 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
             ValidationReason::UnknownMetadataKey | ValidationReason::MetadataValidation => {
                 RecordErrorCategory::MetadataSize
             }
-            // Three of the gateway's five invalidation rules, the three that
-            // arrive as an `InvalidArgument`: explicit reference (the
-            // half-shape the REST fold point refuses),
-            // no-invalidation-of-an-invalidation, and faithful copy. DESIGN
-            // §3.11.5 gives them a category of their own so a correction
-            // backlog is legible without reading `detail`. Valid reference
-            // is the fourth and joins them from the `NotFound` arm above;
-            // reason code is the fifth and is enforced by the type, so it
-            // raises nothing.
+            // The invalidation rules that arrive as an `InvalidArgument`.
+            // DESIGN §3.11.5 gives them a category of their own so a
+            // correction backlog is legible without reading `detail`. Valid
+            // target joins them from the `NotFound` arm above.
+            //
+            // Only `InvalidationFieldMismatch` is raised inside this crate
+            // today. The two beside it are kept because
+            // `ValidationReason` is another crate's enum and a value it can
+            // still carry must classify somewhere deliberate rather than
+            // falling to `semantics_violation`: an incomplete reference had
+            // one raiser, the REST fold point, and lost it when the flat
+            // pair went; a non-record target had one, and lost it when
+            // target resolution made the property hold by construction
+            // (DESIGN §3.1). Retiring either is an SDK change, not this
+            // arm's.
             ValidationReason::InvalidationReferenceIncomplete
             | ValidationReason::InvalidationTargetNotRecord
             | ValidationReason::InvalidationFieldMismatch => RecordErrorCategory::InvalidationRule,
@@ -616,7 +607,7 @@ fn collapse_deny_to_not_found(
 /// line-count caps.
 fn project_pdp_decisions(
     pdp_decisions: Vec<PdpGroupDecision>,
-    withdrawals: &[Option<(CreateUsageRecord, Invalidation)>],
+    withdrawals: &[Option<CreateUsageRecord>],
     submission_count: usize,
     results: &mut [Option<Result<UsageRecord, UsageCollectorError>>],
     pdp_allowed: &mut [bool],
@@ -686,9 +677,10 @@ fn project_pdp_decisions(
 /// copy of the *returned* row would be **accepted**, withdrawing an entry
 /// nothing ever checked.
 ///
-/// At-most-one-invalidation is not checked here: it follows from the derived
-/// `inv:<target>` key, so a second invalidation collides on the dedup identity
-/// at the store and is lifted at dispatch ([`lift_dispatch_error`]).
+/// At-most-one-invalidation is not checked here: every withdrawal of one
+/// record reaches the same six identity inputs, so a second one collides on
+/// the dedup identity at the store and is lifted at dispatch
+/// ([`lift_dispatch_error`]).
 ///
 /// Extracted from the host body to keep `create_usage_records` under the
 /// cognitive-complexity cap without losing the explicit
@@ -1134,13 +1126,37 @@ impl Service {
     /// finer than the microsecond, or an inverted period) and the path's
     /// tolerances alike surface at one entry, never at the batch.
     ///
+    /// **Choosing the projection is this gateway's job, and the submission's
+    /// declared `entry_type` is what it chooses on.** There are two, and they
+    /// differ in exactly what only a gateway can supply: a withdrawal's
+    /// `invalidates`, derived here from the submission's own identity inputs
+    /// ([`derive_invalidation_target`]) rather than taken from the caller.
+    /// Reading the declared kind is also what keeps the SDK's `Internal`
+    /// guards unreachable in correct operation — they exist to catch a host
+    /// that hands a self-consistent submission to the wrong projection, and
+    /// this match is the reason none does.
+    ///
+    /// The derivation runs first and the projection second, so for a
+    /// withdrawal the target identifier is computed before the covered
+    /// period has been validated. Nothing escapes on that path: the value is
+    /// an argument to the very projection that rejects a bad period, so a
+    /// refused submission discards it unread. See
+    /// [`derive_invalidation_target`], which states the property it rests on.
+    ///
     /// # Errors
     ///
     /// * [`UsageCollectorError::InvalidArgument`] from the projection, on a
-    ///   sub-microsecond or inverted covered period.
+    ///   sub-microsecond or inverted covered period, on a missing
+    ///   idempotency key, or when the submission's `entry_type` and
+    ///   `reason_code` disagree.
     /// * [`UsageCollectorError::InvalidArgument`] with reason
     ///   `FUTURE_WINDOW` / `PAST_WINDOW` when the period ends outside this
     ///   path's tolerances — see [`enforce_covered_period_bounds`].
+    /// * [`UsageCollectorError::Internal`] when a projection refuses a
+    ///   self-consistent submission as not its own. That is a host-contract
+    ///   breach rather than an emitter fault, and the match below is what
+    ///   makes it unreachable; it is listed because the type admits it, not
+    ///   because a caller can provoke it.
     ///
     /// `now` is also the entry's `accepted_at`.
     #[allow(
@@ -1153,7 +1169,13 @@ impl Service {
         origin: RecordOrigin,
         now: OffsetDateTime,
     ) -> Result<UsageRecord, UsageCollectorError> {
-        let record = submission.try_into_usage_record(origin, now)?;
+        let record = match submission.entry_type() {
+            EntryType::Record => submission.try_into_usage_record(origin, now)?,
+            EntryType::Invalidation => {
+                let target = derive_invalidation_target(&submission)?;
+                submission.try_into_invalidation_record(origin, now, target)?
+            }
+        };
         enforce_covered_period_bounds(&self.covered_period_bounds, origin, now, record.window_end)?;
         Ok(record)
     }
@@ -1233,13 +1255,12 @@ impl Service {
         //
         // The projection consumes the submission, and the faithful-copy
         // comparator runs against the submission rather than the projection
-        // — so an entry naming a target keeps what the caller sent. The
-        // clone is confined to that branch: an ordinary measurement, the
-        // common path, clones nothing.
-        let withdrawal = record
-            .invalidation
-            .as_ref()
-            .map(|invalidation| (record.clone(), invalidation.clone()));
+        // — so a withdrawal is compared against what the caller actually
+        // sent. The clone is taken on the declared kind, the same condition
+        // the projection branches on, and is confined to it: an ordinary
+        // measurement, the common path, clones nothing.
+        let withdrawal =
+            matches!(record.entry_type(), EntryType::Invalidation).then(|| record.clone());
         // One clock read for the admission and the action alike: the two
         // read the same `window_end` against bounds that share an origin,
         // and a second `now_utc()` could put them on opposite sides of the
@@ -1280,12 +1301,22 @@ impl Service {
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-check
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-invalid
-        // `invalidates` is the whole decision: its presence is what makes
-        // the entry an invalidation, and there is no submitted
-        // discriminator that could disagree with it. An ordinary
+        // The declared `entry_type` is the whole decision, and it was made
+        // once, above, where the projection was chosen. An ordinary
         // measurement costs no target read at all — asserting that absence
         // is what stops the common path paying for the rare one.
-        if let Some((submission, invalidation)) = withdrawal {
+        if let Some(submission) = withdrawal {
+            // The invalidation projection stamps this on exactly the
+            // submissions the clone above was taken for, so it is `Some`
+            // here. A `None` is a host-invariant breach and is refused as
+            // one: waving the entry through would dispatch a withdrawal
+            // whose target nothing ever checked.
+            let Some(invalidation) = record.invalidation.clone() else {
+                return Err(invariant_breach(
+                    "a submission declaring entry_type=invalidation was projected without one"
+                        .to_owned(),
+                ));
+            };
             // SPEC-DIFF decision S-A1: the target is read under the scope of the
             // `create` permit that authorized this submission, so a row outside
             // the caller's grant answers exactly like an absent one.
@@ -1402,7 +1433,7 @@ impl Service {
         record: CreateUsageRecord,
     ) -> Result<UsageRecord, UsageCollectorError> {
         let start = std::time::Instant::now();
-        let entry_type = entry_type_of(&record);
+        let entry_type = record.entry_type();
         // `Live` comes from the route this wrapper *is*, not from a
         // default: the batch routes stamp their own origin through their
         // own shared body (`create_usage_records_for_origin`), and there is
@@ -1562,7 +1593,8 @@ impl Service {
 
         // `entry_type` is captured per input index before `records` is moved
         // into the inner pipeline (the per-entry counter needs it after).
-        let entry_types: Vec<EntryType> = records.iter().map(entry_type_of).collect();
+        let entry_types: Vec<EntryType> =
+            records.iter().map(CreateUsageRecord::entry_type).collect();
 
         let result = self.create_usage_records_inner(ctx, records, origin).await;
         let seconds = start.elapsed().as_secs_f64();
@@ -1701,21 +1733,20 @@ impl Service {
         // further down.
         let mut pdp_allowed: Vec<bool> = vec![true; submission_count];
 
-        // The withdrawal each submission carries, kept per input index
-        // because `try_into_usage_record` consumes the submission the
+        // The submission each withdrawal was built from, kept per input
+        // index because the projection consumes the submission the
         // faithful-copy comparator runs against. `Some` exactly when the
-        // entry is an invalidation.
+        // entry declares `entry_type: invalidation`.
         //
-        // What this buys is that the trigger is read off the **submission**
-        // rather than off the projection, so the comparator runs against
-        // what the caller actually sent. The `Invalidation` half is
-        // redundant with the one the projected entry carries — it is only
-        // ever built from the same submission, so it is never built
-        // inconsistently; that is a property of this one construction site,
-        // not of the type. The clone is confined to the invalidation branch
-        // — an ordinary measurement clones nothing.
-        let mut withdrawals: Vec<Option<(CreateUsageRecord, Invalidation)>> =
-            Vec::with_capacity(submission_count);
+        // The trigger is the submission's own declared kind, so the
+        // comparator runs against what the caller actually sent. The
+        // withdrawal's other half — the reason paired with the derived
+        // target — is not kept here: only the projection knows the target,
+        // so it is read back off the projected entry where it is stamped,
+        // and there is no second copy to build inconsistently. The clone is
+        // confined to the invalidation branch — an ordinary measurement
+        // clones nothing.
+        let mut withdrawals: Vec<Option<CreateUsageRecord>> = Vec::with_capacity(submission_count);
 
         // The service is the guaranteed choke point for every caller (REST +
         // in-process). The create surface is identity-free
@@ -1739,10 +1770,8 @@ impl Service {
         let mut derived: Vec<(usize, UsageRecord)> = Vec::with_capacity(submission_count);
         for (index, submission) in records.into_iter().enumerate() {
             withdrawals.push(
-                submission
-                    .invalidation
-                    .as_ref()
-                    .map(|invalidation| (submission.clone(), invalidation.clone())),
+                matches!(submission.entry_type(), EntryType::Invalidation)
+                    .then(|| submission.clone()),
             );
             // Per-submission, at its own input index — never a batch-level
             // failure, or one out-of-bounds entry would discard a whole
@@ -1904,16 +1933,26 @@ impl Service {
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics-invalid
-            // `invalidates` is the whole decision: its presence is what makes
-            // the entry an invalidation, and there is no submitted
-            // discriminator that could disagree with it. The target read is
+            // The declared `entry_type` is the whole decision, and it was
+            // made once, in the projection loop above. The target read is
             // deferred to a post-loop dedup + bounded fan-out pre-pass
             // (`inst-algo-semantics-l1-dedup` /
             // `inst-algo-semantics-l1-bounded-fanout`) so a batch withdrawing
             // one target repeatedly reads it once; the metadata check runs
             // after the target check there, so the target→metadata
             // error-priority ordering is preserved end-to-end.
-            if let Some((submission, invalidation)) = withdrawals[index].take() {
+            if let Some(submission) = withdrawals[index].take() {
+                // Stamped by the invalidation projection on exactly the
+                // submissions the clone above was taken for. A `None` is a
+                // host-invariant breach, refused rather than waved through:
+                // this entry would otherwise be dispatched as a withdrawal
+                // whose target nothing ever checked.
+                let Some(invalidation) = record.invalidation.clone() else {
+                    results[index] = Some(Err(invariant_breach(format!(
+                        "the submission at input {index} declared entry_type=invalidation and was projected without one"
+                    ))));
+                    continue;
+                };
                 let (lookup_scope_id, lookup_scope) = match lookup_scopes[index].take() {
                     Some(Ok(scope)) => scope,
                     Some(Err(e)) => {

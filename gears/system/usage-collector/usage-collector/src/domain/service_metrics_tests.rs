@@ -15,7 +15,7 @@ use bigdecimal::BigDecimal;
 use toolkit_gts::gts_id;
 use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo};
 use usage_collector_sdk::{
-    AggregationBucket, AggregationResult, CreateUsageRecord, IdempotencyKey, Invalidation,
+    AggregationBucket, AggregationResult, CreateUsageRecord, EntryType, IdempotencyKey,
     MetadataKey, MeterTypeId, NotFoundReason, ReasonCode, RecordOrigin, ResourceRef,
     USAGE_RECORD_RESOURCE, UsageCollectorError, UsageRecord,
 };
@@ -33,7 +33,7 @@ use crate::domain::test_support::{
     DenyAllResolver, HappyPathPlugin, ServiceFixture, UnreachableResolver, authenticated_ctx,
     counter_sum_with_label, enforcer_for, fake_declaration_source_with_fold,
     fake_declaration_source_with_metadata, gauge_last, histogram_count, histogram_count_with_label,
-    histogram_sum, histogram_sum_with_label, hub_with_plugin, local_metrics, qty,
+    histogram_sum, histogram_sum_with_label, hub_with_plugin, local_metrics, projected, qty,
     recent_window_end, recent_window_start, service_with_metrics_unready_plugin, test_time_range,
 };
 use crate::domain::type_resolver::{TypeResolver, TypeResolverConfig};
@@ -65,6 +65,7 @@ fn sample_record() -> UsageRecord {
 /// `create_usage_record{,s}` entry points which take `CreateUsageRecord`.
 fn sample_create_record() -> CreateUsageRecord {
     CreateUsageRecord {
+        entry_type: EntryType::Record,
         gts_type_id: MeterTypeId::new(SAMPLE_METER_TYPE_ID).expect("valid gts_type_id"),
         tenant_id: Uuid::from_u128(2),
         resource_ref: ResourceRef::new("rsc-1", "compute.vm").expect("valid resource ref"),
@@ -430,41 +431,31 @@ async fn the_pdp_operation_label_follows_the_backfill_route_not_the_verb() {
 // `uc_ingestion_records_total` is the counter carrying the throughput NFR,
 // and `entry_type` is what makes the correction share visible in the
 // ingestion profile at all (DESIGN §3.11.5). Both tests drive the real
-// service so the label comes from the same `entry_type_of` the production
-// path uses.
+// service so the label comes from the submission's own declared
+// `entry_type`, the value the production path reads.
 
-/// The persisted entry a withdrawal of [`sample_create_record`] copies
-/// faithfully: identical caller-supplied fields, but its own identity —
-/// because the withdrawal derives its own `inv:<target>` idempotency key
-/// rather than copying this one.
-fn sample_target_row(id: Uuid) -> UsageRecord {
-    UsageRecord {
-        id,
-        idempotency_key: IdempotencyKey::new("idem-target").expect("valid idempotency key"),
-        ..sample_record()
-    }
+/// The persisted measurement [`sample_withdrawal`] withdraws: the
+/// projection of [`sample_create_record`], so it carries the identity the
+/// gateway derives rather than a hand-picked one.
+fn sample_target_row() -> UsageRecord {
+    projected(&sample_create_record())
 }
 
 /// A faithful withdrawal of [`sample_target_row`]: the create-surface twin
-/// of `sample_create_record`, carrying no idempotency key of its own — the
-/// gateway derives one from the target — and departing only in the
-/// withdrawal it carries.
-fn sample_withdrawal(target: Uuid) -> CreateUsageRecord {
+/// of `sample_create_record`, repeating its idempotency key and departing
+/// only in `entry_type` and the reason.
+fn sample_withdrawal() -> CreateUsageRecord {
     CreateUsageRecord {
-        idempotency_key: None,
-        invalidation: Some(Invalidation {
-            target,
-            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
-        }),
+        entry_type: EntryType::Invalidation,
+        invalidation: Some(ReasonCode::new("emitter_defect").expect("valid reason code")),
         ..sample_create_record()
     }
 }
 
 #[tokio::test]
 async fn an_invalidation_counts_under_its_own_entry_type() {
-    let target = Uuid::from_u128(0x9001);
     let plugin = HappyPathPlugin::new();
-    plugin.set_get_record(sample_target_row(target));
+    plugin.set_get_record(sample_target_row());
     plugin.set_create_record(sample_record());
 
     let (service, provider, exporter) = ServiceFixture::default()
@@ -473,7 +464,7 @@ async fn an_invalidation_counts_under_its_own_entry_type() {
         .build_with_metrics(plugin, "test.metrics.ingest.entry_type.v1");
 
     service
-        .create_usage_record(&authenticated_ctx(), sample_withdrawal(target))
+        .create_usage_record(&authenticated_ctx(), sample_withdrawal())
         .await
         .expect("a faithful withdrawal of a resolvable target is accepted");
     provider.force_flush().unwrap();
@@ -502,11 +493,10 @@ async fn an_invalidation_counts_under_its_own_entry_type() {
 
 #[tokio::test]
 async fn an_invalidation_rule_rejection_carries_its_own_error_category() {
-    let target = Uuid::from_u128(0x9002);
     let plugin = HappyPathPlugin::new();
     // The target departs from the submission in `quantity`, so the copy rule
     // rejects it.
-    let mut row = sample_target_row(target);
+    let mut row = sample_target_row();
     row.quantity = qty("999");
     plugin.set_get_record(row);
 
@@ -516,7 +506,7 @@ async fn an_invalidation_rule_rejection_carries_its_own_error_category() {
         .build_with_metrics(plugin, "test.metrics.ingest.invalidation_rule.v1");
 
     let err = service
-        .create_usage_record(&authenticated_ctx(), sample_withdrawal(target))
+        .create_usage_record(&authenticated_ctx(), sample_withdrawal())
         .await
         .expect_err("an unfaithful copy is rejected");
     assert!(

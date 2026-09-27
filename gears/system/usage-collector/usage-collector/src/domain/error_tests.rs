@@ -8,8 +8,8 @@
 //! tests exercise the plugin->domain and domain->SDK directions only.
 
 use usage_collector_sdk::{
-    ConflictReason, MeterTypeId, NotFoundReason, USAGE_RECORD_RESOURCE, UsageCollectorError,
-    UsageCollectorPluginError, ValidationReason,
+    ConflictReason, EntryType, MeterTypeId, NotFoundReason, USAGE_RECORD_RESOURCE,
+    UsageCollectorError, UsageCollectorPluginError, ValidationReason,
 };
 
 use super::*;
@@ -308,13 +308,23 @@ fn target_not_converged_lifts_to_a_conflict_naming_the_target() {
 
 // ── Lifting a store conflict by the dispatched entry's kind ─────────
 
+/// One persisted entry: a measurement, or the withdrawal `invalidation`
+/// describes.
+///
+/// Both kinds carry the same idempotency key, because a withdrawal repeats
+/// its target's. Which projection runs is decided by the declared
+/// `entry_type`, exactly as the gateway decides it, so the fixture cannot
+/// produce an entry whose kind and payload disagree.
 fn stored_entry(
     invalidation: Option<usage_collector_sdk::Invalidation>,
 ) -> usage_collector_sdk::UsageRecord {
-    let key = invalidation
-        .is_none()
-        .then(|| usage_collector_sdk::IdempotencyKey::new("idem-stored").expect("valid key"));
-    usage_collector_sdk::CreateUsageRecord {
+    let entry_type = if invalidation.is_some() {
+        EntryType::Invalidation
+    } else {
+        EntryType::Record
+    };
+    let submission = usage_collector_sdk::CreateUsageRecord {
+        entry_type,
         gts_type_id: MeterTypeId::new("gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~")
             .expect("valid meter id"),
         tenant_id: uuid::Uuid::from_u128(0x7E57),
@@ -323,15 +333,21 @@ fn stored_entry(
         subject_ref: None,
         metadata: std::collections::BTreeMap::new(),
         quantity: usage_collector_sdk::UsageQuantity::parse("1").expect("valid quantity"),
-        idempotency_key: key,
-        invalidation,
+        idempotency_key: Some(
+            usage_collector_sdk::IdempotencyKey::new("idem-stored").expect("valid key"),
+        ),
+        invalidation: invalidation.as_ref().map(|i| i.reason.clone()),
         window_start: time::OffsetDateTime::UNIX_EPOCH,
         window_end: time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+    };
+    let origin = usage_collector_sdk::RecordOrigin::Live;
+    let now = time::OffsetDateTime::UNIX_EPOCH;
+    match invalidation {
+        Some(invalidation) => {
+            submission.try_into_invalidation_record(origin, now, invalidation.target)
+        }
+        None => submission.try_into_usage_record(origin, now),
     }
-    .try_into_usage_record(
-        usage_collector_sdk::RecordOrigin::Live,
-        time::OffsetDateTime::UNIX_EPOCH,
-    )
     .expect("valid fixture")
 }
 
@@ -378,8 +394,9 @@ fn a_conflict_on_a_dispatched_invalidation_is_already_invalidated() {
         target,
         reason: usage_collector_sdk::ReasonCode::new("late_correction").expect("valid reason code"),
     };
-    let err =
-        UsageCollectorPluginError::idempotency_conflict(format!("inv:{target}"), existing.clone());
+    // The conflict carries the key the entry was dispatched under, which for
+    // a withdrawal is its target's own key — no prefix is reserved.
+    let err = UsageCollectorPluginError::idempotency_conflict("idem-stored", existing.clone());
     match UsageCollectorError::from(super::lift_dispatch_error(err, Some(&dispatched))) {
         UsageCollectorError::Conflict {
             name,
@@ -408,10 +425,7 @@ fn a_stored_entry_that_is_not_an_invalidation_is_an_invariant_breach() {
         target,
         reason: usage_collector_sdk::ReasonCode::new("emitter_defect").expect("valid reason code"),
     };
-    let err = UsageCollectorPluginError::idempotency_conflict(
-        format!("inv:{target}"),
-        stored_entry(None),
-    );
+    let err = UsageCollectorPluginError::idempotency_conflict("idem-stored", stored_entry(None));
     assert!(matches!(
         super::lift_dispatch_error(err, Some(&dispatched)),
         DomainError::Internal(_)

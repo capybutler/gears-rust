@@ -65,6 +65,7 @@ async fn create_with_only_bad_gts_type_id_records_short_circuits_to_207_without_
     // directly rather than via `serde_json::to_value` on a struct literal.
     let req = CreateUsageRecordsRequest {
         records: vec![serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": "not-a-valid-prefix",
             "tenant_id": Uuid::new_v4(),
             "resource_ref": {"resource_id": "rsc-1", "resource_type": "compute.vm"},
@@ -178,6 +179,7 @@ async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_no
 
     let req = CreateUsageRecordsRequest {
         records: vec![serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": over_long_gts_type_id,
             "tenant_id": Uuid::new_v4(),
             "resource_ref": {"resource_id": "rsc-1", "resource_type": "compute.vm"},
@@ -266,8 +268,8 @@ async fn create_with_an_over_long_gts_type_id_is_rejected_as_invalid_argument_no
 
 use std::collections::BTreeMap;
 use usage_collector_sdk::{
-    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, UsageRecord,
-    derive_usage_record_id,
+    EntryType, IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef,
+    UsageRecord, derive_usage_record_id,
 };
 
 const HAPPY_RECORD_GTS_ID: &str =
@@ -420,6 +422,7 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
         &idempotency_key,
         recent_window_start(),
         recent_window_end(),
+        EntryType::Record,
     );
     let persisted_uuid = Uuid::new_v4();
     assert_ne!(derived_id, persisted_uuid, "test premise");
@@ -434,6 +437,7 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
 
     let req = CreateUsageRecordsRequest {
         records: vec![serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": HAPPY_RECORD_GTS_ID,
             "tenant_id": tenant_id,
             "resource_ref": {"resource_id": "rsc-happy", "resource_type": "compute.vm"},
@@ -497,10 +501,10 @@ async fn create_records_happy_path_wire_body_reflects_service_returned_record() 
 
 #[tokio::test]
 async fn create_stamps_derived_id() {
-    // The gateway MUST derive the dispatched record's id from the 5-tuple
+    // The gateway MUST derive the dispatched record's id from the six-part
     // dedup identity
-    // `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
-    // rather than accept a
+    // `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
+    // entry_type)` rather than accept a
     // caller-chosen value — pin both that the dispatched id matches
     // `derive_usage_record_id` AND that a same-key resubmit derives the
     // identical id (determinism).
@@ -514,6 +518,7 @@ async fn create_stamps_derived_id() {
         &idempotency_key,
         recent_window_start(),
         recent_window_end(),
+        EntryType::Record,
     );
 
     let service = ServiceFixture::default()
@@ -525,6 +530,7 @@ async fn create_stamps_derived_id() {
 
     let build_req = || CreateUsageRecordsRequest {
         records: vec![serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": HAPPY_RECORD_GTS_ID,
             "tenant_id": tenant_id,
             "resource_ref": {"resource_id": "rsc-happy", "resource_type": "compute.vm"},
@@ -600,6 +606,7 @@ async fn create_same_key_different_covered_periods_derives_distinct_ids() {
     let build_req =
         |window_start: OffsetDateTime, window_end: OffsetDateTime| CreateUsageRecordsRequest {
             records: vec![serde_json::json!({
+                "entry_type": "record",
                 "gts_type_id": HAPPY_RECORD_GTS_ID,
                 "tenant_id": tenant_id,
                 "resource_ref": {"resource_id": "rsc-happy", "resource_type": "compute.vm"},
@@ -667,6 +674,7 @@ fn rfc3339(at: OffsetDateTime) -> String {
 fn create_request_json(window_start: &str, window_end: &str) -> serde_json::Value {
     serde_json::json!({
         "records": [{
+            "entry_type": "record",
             "gts_type_id": HAPPY_RECORD_GTS_ID,
             "tenant_id": Uuid::from_u128(2).to_string(),
             "resource_ref": { "resource_id": "rsc-happy", "resource_type": "compute.vm" },
@@ -755,13 +763,12 @@ fn rejected_violation_reason(item: &serde_json::Value) -> String {
         .to_owned()
 }
 
-/// A one-record batch body carrying whatever correction fields `extra`
-/// names, so a half-shape is expressible on the wire. It is not
-/// expressible in the domain — `CreateUsageRecord` carries the pair as one
-/// field — which is exactly why the fold point is the only place that can
-/// refuse it.
+/// A one-record measurement batch body, with whatever `extra` names
+/// overlaid — a `reason_code` a `record` must not carry, a null key, a
+/// server-owned field the shape declares no property for.
 fn create_request_json_with(extra: &serde_json::Value) -> serde_json::Value {
     let mut record = serde_json::json!({
+        "entry_type": "record",
         "gts_type_id": HAPPY_RECORD_GTS_ID,
         "tenant_id": Uuid::from_u128(2).to_string(),
         "resource_ref": { "resource_id": "rsc-happy", "resource_type": "compute.vm" },
@@ -777,26 +784,50 @@ fn create_request_json_with(extra: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "records": [record] })
 }
 
-/// [`create_request_json_with`] with the base body's `idempotency_key` removed,
-/// the shape an invalidation is submitted in.
+/// [`create_request_json_with`] switched to the withdrawal shape: the same
+/// payload, declaring `entry_type: invalidation` and keeping the base
+/// body's idempotency key, which is its target's.
+///
+/// Keeping the key is the whole of "Target resolution" on the wire: the
+/// entry it withdraws is [`withdrawal_target_id`], derived from these very
+/// fields.
 fn create_withdrawal_json_with(extra: &serde_json::Value) -> serde_json::Value {
     let mut body = create_request_json_with(extra);
     body["records"][0]
         .as_object_mut()
         .expect("record object")
-        .remove("idempotency_key");
+        .insert("entry_type".to_owned(), serde_json::json!("invalidation"));
     body
 }
 
+/// The identifier a body from [`create_withdrawal_json_with`] resolves: the
+/// `id` of the measurement carrying that body's own tenant, meter, key and
+/// covered period.
+///
+/// Derived here rather than written as a literal, so a fixture cannot name
+/// a target the gateway would never look up.
+fn withdrawal_target_id() -> Uuid {
+    derive_usage_record_id(
+        Uuid::from_u128(2),
+        &MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id"),
+        &IdempotencyKey::new("idem-withdrawal").expect("valid idempotency key"),
+        recent_window_start(),
+        recent_window_end(),
+        EntryType::Record,
+    )
+}
+
 #[tokio::test]
-async fn a_reference_without_a_reason_is_rejected_naming_the_missing_half() {
-    // The wire contract states this as `dependentRequired`, and
-    // `record_request_into_domain` is the only place on this path that can
-    // enforce it: past the fold the pair is one `Invalidation`, so a
-    // half-shape does not exist to be re-checked. The diagnostic names the
-    // half the caller has to add, not the half they sent.
+async fn a_submitted_target_is_refused_at_its_own_index() {
+    // `invalidates` is server-assigned (DESIGN §3.1, "Field ownership") and
+    // the ingestion shape declares no property for it, so a body naming one
+    // is refused as an unknown field — the published schema's
+    // `additionalProperties: false`. Without this an emitter could name a
+    // record it never measured. Asserted at the batch edge, not only on the
+    // DTO, because `decode_record_entry` is what turns a serde refusal into
+    // a per-record `Problem` naming the property.
     let (status, item) = dispatch_one_record_batch(
-        "test.handler.create_records.reference_without_reason.v1",
+        "test.handler.create_records.submitted_target.v1",
         create_request_json_with(&serde_json::json!({
             "invalidates": Uuid::from_u128(77).to_string(),
         })),
@@ -807,36 +838,68 @@ async fn a_reference_without_a_reason_is_rejected_naming_the_missing_half() {
         StatusCode::MULTI_STATUS,
         "an all-rejected batch MUST surface as 207 Multi-Status",
     );
-    assert_eq!(rejected_violation_field(&item), "reason_code");
-    assert_eq!(
-        rejected_violation_reason(&item),
-        "INVALIDATION_REFERENCE_INCOMPLETE",
-    );
+    assert_eq!(rejected_violation_field(&item), "invalidates");
+    assert_eq!(rejected_violation_reason(&item), "VALIDATION");
 }
 
 #[tokio::test]
-async fn a_reason_without_a_reference_is_rejected_naming_the_missing_half() {
-    // The other half of the same rule. Both arms are pinned because the
-    // fold is a four-arm match and an implementation that folded only one
-    // direction would pass the sibling above.
+async fn a_reason_code_on_a_record_is_refused_rather_than_reinterpreted() {
+    // DESIGN §3.1, "Entry type and reason code": `reason_code` MUST NOT
+    // appear on a `record`. The two halves disagree, and the gear refuses
+    // rather than reading the kind off the reason — that inference is what
+    // the caller-supplied discriminator replaced. Dropping the reason
+    // instead would admit a withdrawal as a measurement under
+    // `entry_type = record`, colliding it with the entry it meant to
+    // withdraw.
     let (status, item) = dispatch_one_record_batch(
-        "test.handler.create_records.reason_without_reference.v1",
+        "test.handler.create_records.reason_on_a_record.v1",
         create_request_json_with(&serde_json::json!({ "reason_code": HAPPY_REASON_CODE })),
     )
     .await;
     assert_eq!(status, StatusCode::MULTI_STATUS);
-    assert_eq!(rejected_violation_field(&item), "invalidates");
-    assert_eq!(
-        rejected_violation_reason(&item),
-        "INVALIDATION_REFERENCE_INCOMPLETE",
-    );
+    assert_eq!(rejected_violation_field(&item), "reason_code");
+    assert_eq!(rejected_violation_reason(&item), "VALIDATION");
 }
 
 #[tokio::test]
-async fn neither_correction_field_is_an_ordinary_record() {
-    // The complement the two rejections above need: a submission carrying
-    // neither half folds to `None` and is accepted. Without it, a fold that
-    // rejected every submission would pass both of them.
+async fn an_invalidation_without_a_reason_code_is_refused() {
+    // The mirror rule: `reason_code` is required when `entry_type` is
+    // `invalidation`. It is refused as a caller fault on `reason_code` and
+    // not as the host-contract breach the projections raise when a gateway
+    // picks the wrong projection for a self-consistent submission — the two
+    // are different faults with different audiences.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.invalidation_without_reason.v1",
+        create_withdrawal_json_with(&serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert_eq!(rejected_violation_field(&item), "reason_code");
+    assert_eq!(rejected_violation_reason(&item), "VALIDATION");
+}
+
+#[tokio::test]
+async fn an_unrecognised_entry_type_is_refused_naming_the_discriminator() {
+    // The discriminator is a closed two-value vocabulary. A third spelling
+    // is refused at its own input index, naming `entry_type`, rather than
+    // being read as either of the two — reading it as `record` is precisely
+    // what the schema forbids, because a withdrawal so read is an exact copy
+    // of its target and would be absorbed as a retry.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.bad_entry_type.v1",
+        create_request_json_with(&serde_json::json!({ "entry_type": "correction" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert_eq!(rejected_violation_field(&item), "entry_type");
+    assert_eq!(rejected_violation_reason(&item), "VALIDATION");
+}
+
+#[tokio::test]
+async fn a_record_stating_no_reason_code_is_an_ordinary_measurement() {
+    // The complement the rejections above need: a submission declaring
+    // `record` and stating no reason is accepted. Without it, a fold that
+    // rejected every submission would pass all of them.
     let (status, item) = dispatch_one_record_batch(
         "test.handler.create_records.no_correction_fields.v1",
         create_request_json_with(&serde_json::json!({})),
@@ -846,8 +909,8 @@ async fn neither_correction_field_is_an_ordinary_record() {
     assert_eq!(
         item.get("outcome").and_then(serde_json::Value::as_str),
         Some("accepted"),
-        "a submission carrying neither correction field is an ordinary \
-         record; got {item:?}",
+        "a submission declaring `record` and stating no reason is an \
+         ordinary measurement; got {item:?}",
     );
 }
 
@@ -860,10 +923,7 @@ async fn a_malformed_reason_code_is_rejected_per_record() {
     // and never by the domain, which sees only the validated form.
     let (status, item) = dispatch_one_record_batch(
         "test.handler.create_records.malformed_reason_code.v1",
-        create_request_json_with(&serde_json::json!({
-            "invalidates": Uuid::from_u128(78).to_string(),
-            "reason_code": "",
-        })),
+        create_withdrawal_json_with(&serde_json::json!({ "reason_code": "" })),
     )
     .await;
     assert_eq!(status, StatusCode::MULTI_STATUS);
@@ -871,14 +931,14 @@ async fn a_malformed_reason_code_is_rejected_per_record() {
         rejected_violation_field(&item),
         "reason_code",
         "the rejection MUST attribute to the offending field, not to the \
-         reference beside it",
+         discriminator beside it",
     );
     assert_eq!(
         rejected_violation_reason(&item),
         "VALIDATION",
         "a malformed code is a newtype validation failure, NOT the \
-         both-or-neither rule: the pair is complete here and only its \
-         content is bad",
+         agreement rule: the declared kind and the stated reason agree here \
+         and only the reason's content is bad",
     );
 }
 
@@ -890,7 +950,7 @@ async fn an_unfaithful_copy_is_rejected_naming_the_field_that_differs() {
     // deliverable — a rejection saying only "mismatch" leaves the emitter
     // diffing two payloads by hand.
     let tenant_id = Uuid::from_u128(2);
-    let target_uuid = Uuid::from_u128(0x4242);
+    let target_uuid = withdrawal_target_id();
     let plugin = HappyPathPlugin::new();
     plugin.set_get_record_for(target_uuid, sample_persisted_record(target_uuid, tenant_id));
     plugin.set_create_records(vec![Ok(sample_persisted_record(Uuid::new_v4(), tenant_id))]);
@@ -901,11 +961,11 @@ async fn an_unfaithful_copy_is_rejected_naming_the_field_that_differs() {
             "test.handler.create_records.unfaithful_copy.v1",
         );
 
-    // The fixture target carries `quantity: 1`; this submission says 2. Every
-    // other compared field matches, so the rejection can only be about the
-    // quantity.
+    // The fixture target carries `quantity: 1`; this submission says 2.
+    // `quantity` is no identity input, so the submission still resolves the
+    // same target; every other compared field matches, so the rejection can
+    // only be about the quantity.
     let body = create_withdrawal_json_with(&serde_json::json!({
-        "invalidates": target_uuid.to_string(),
         "reason_code": HAPPY_REASON_CODE,
         "quantity": "2",
     }));
@@ -935,7 +995,7 @@ async fn an_unfaithful_copy_is_rejected_naming_the_field_that_differs() {
     assert_eq!(
         rejected_violation_field(&item),
         "quantity",
-        "the rejection MUST name the field that differs, not the reference",
+        "the rejection MUST name the field that differs, not the target",
     );
     assert_eq!(
         rejected_violation_reason(&item),
@@ -945,13 +1005,13 @@ async fn an_unfaithful_copy_is_rejected_naming_the_field_that_differs() {
 
 #[tokio::test]
 async fn a_faithful_copy_reaches_the_plugin() {
-    // The complement of the mismatch above, and the pin that the fold
-    // actually builds an `Invalidation` rather than dropping the pair: the
-    // record the gateway dispatches carries the caller's target and reason.
-    // A fold that silently discarded both halves would still be accepted
-    // here, and only this assertion catches it.
+    // The complement of the mismatch above, and the pin that the gateway
+    // actually derives and stamps a target: the record it dispatches carries
+    // the reason the caller stated and the target it resolved from the
+    // caller's own fields. A gateway that dropped the withdrawal would be
+    // accepted here too, and only this assertion catches it.
     let tenant_id = Uuid::from_u128(2);
-    let target_uuid = Uuid::from_u128(0x4243);
+    let target_uuid = withdrawal_target_id();
     let plugin = HappyPathPlugin::new();
     plugin.set_get_record_for(target_uuid, sample_persisted_record(target_uuid, tenant_id));
     plugin.set_create_records(vec![Ok(sample_persisted_invalidation(
@@ -967,7 +1027,6 @@ async fn a_faithful_copy_reaches_the_plugin() {
         );
 
     let body = create_withdrawal_json_with(&serde_json::json!({
-        "invalidates": target_uuid.to_string(),
         "reason_code": HAPPY_REASON_CODE,
     }));
     let req: CreateUsageRecordsRequest =
@@ -989,9 +1048,19 @@ async fn a_faithful_copy_reaches_the_plugin() {
     let invalidation = forwarded[0]
         .invalidation
         .as_ref()
-        .expect("the fold MUST carry the correction reference through to the SPI");
-    assert_eq!(invalidation.target, target_uuid);
+        .expect("the gateway MUST carry the withdrawal through to the SPI");
+    assert_eq!(
+        invalidation.target, target_uuid,
+        "the stamped target is the one derived from the submission's own \
+         identity inputs, never a caller-supplied value",
+    );
     assert_eq!(invalidation.reason.as_str(), HAPPY_REASON_CODE);
+    assert_eq!(
+        forwarded[0].idempotency_key.as_str(),
+        "idem-withdrawal",
+        "the withdrawal is persisted under its target's key; no prefix is \
+         reserved and nothing is derived in its place",
+    );
 }
 
 async fn dispatch_null_key_body(suffix: &str, extra: serde_json::Value) -> serde_json::Value {
@@ -1020,18 +1089,48 @@ async fn dispatch_null_key_body(suffix: &str, extra: serde_json::Value) -> serde
 }
 
 #[tokio::test]
-async fn an_explicit_null_key_on_an_invalidation_is_refused_as_key_on_invalidation() {
+async fn an_explicit_null_key_on_an_invalidation_is_refused_as_a_missing_key() {
+    // One answer for both entry kinds. A withdrawal repeats its target's
+    // key, and that repetition is what locates the target, so a withdrawal
+    // stating `null` is told exactly what a measurement stating `null` is
+    // told — there is no longer a rule that forbids a key here.
     let item = dispatch_null_key_body(
         "test.handler.create_records.null_key_invalidation.v1",
         serde_json::json!({
-            "invalidates": Uuid::from_u128(0x4244).to_string(),
+            "entry_type": "invalidation",
             "reason_code": HAPPY_REASON_CODE,
             "idempotency_key": null,
         }),
     )
     .await;
     assert_eq!(rejected_violation_field(&item), "idempotency_key");
-    assert_eq!(rejected_violation_reason(&item), "KEY_ON_INVALIDATION");
+    assert_eq!(rejected_violation_reason(&item), "VALIDATION");
+}
+
+#[tokio::test]
+async fn an_explicit_null_key_outranks_the_entrys_other_faults() {
+    // The pre-check runs before the entry is decoded, and that ordering is
+    // the whole of what it contributes: serde reads `null` into the DTO's
+    // `Option<String>` as an absent key and the projection refuses it with
+    // the same error, so a body wrong about nothing else is answered
+    // identically either way. This body is wrong about two things at once,
+    // which is the only shape that can tell the two apart — without the
+    // pre-check it is told about `gts_type_id`.
+    let item = dispatch_null_key_body(
+        "test.handler.create_records.null_key_precedence.v1",
+        serde_json::json!({
+            "idempotency_key": null,
+            "gts_type_id": "not-a-valid-prefix",
+        }),
+    )
+    .await;
+    assert_eq!(
+        rejected_violation_field(&item),
+        "idempotency_key",
+        "an explicit null key is answered on the key, not on whatever else \
+         the entry is also wrong about",
+    );
+    assert_eq!(rejected_violation_reason(&item), "VALIDATION");
 }
 
 #[tokio::test]
@@ -1171,6 +1270,7 @@ async fn create_records_happy_path_wire_body_projects_the_invalidation_entry_typ
 
     let req = CreateUsageRecordsRequest {
         records: vec![serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": HAPPY_RECORD_GTS_ID,
             "tenant_id": tenant_id,
             "resource_ref": {"resource_id": "rsc-happy", "resource_type": "compute.vm"},
@@ -1244,6 +1344,7 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         &IdempotencyKey::new("idem-mixed-0").expect("valid idempotency key"),
         recent_window_start(),
         recent_window_end(),
+        EntryType::Record,
     );
     let derived_id_2 = derive_usage_record_id(
         tenant_id,
@@ -1251,6 +1352,7 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         &IdempotencyKey::new("idem-mixed-2").expect("valid idempotency key"),
         recent_window_start(),
         recent_window_end(),
+        EntryType::Record,
     );
     let persisted_uuid_0 = Uuid::new_v4();
     let persisted_uuid_2 = Uuid::new_v4();
@@ -1268,6 +1370,7 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
 
     let valid_record = |idem: &str| {
         serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": HAPPY_RECORD_GTS_ID,
             "tenant_id": tenant_id,
             "resource_ref": {"resource_id": "rsc-mixed", "resource_type": "compute.vm"},
@@ -1282,6 +1385,7 @@ async fn create_records_mixed_batch_preserves_input_order_across_accept_and_reje
         records: vec![
             valid_record("idem-mixed-0"),
             serde_json::json!({
+                "entry_type": "record",
                 "gts_type_id": "not-a-valid-prefix",
                 "tenant_id": tenant_id,
                 "resource_ref": {"resource_id": "rsc-mixed", "resource_type": "compute.vm"},
@@ -1605,6 +1709,7 @@ async fn a_quantity_outside_the_published_range_rejects_only_its_entry() {
     let (service, _resolver) = service_with_sentinel_pdp();
     let entry = |quantity: &str, idem: &str| {
         serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": HAPPY_RECORD_GTS_ID,
             "tenant_id": Uuid::from_u128(2),
             "resource_ref": {"resource_id": "rsc-q", "resource_type": "compute.vm"},
@@ -1636,60 +1741,59 @@ async fn a_quantity_outside_the_published_range_rejects_only_its_entry() {
 }
 
 #[tokio::test]
-async fn an_invalidation_with_a_key_and_a_record_without_one_reject_only_their_entries() {
-    // Every entry here is rejected during the service's projection, before
-    // the PDP or the plugin are ever reached — but `resolve_plugin_for`
-    // still runs unconditionally ahead of that check, so
-    // `service_with_sentinel_pdp`'s empty `ClientHub` would turn the whole
-    // batch into a single `ServiceUnavailable` (503) rather than the
-    // per-entry `207` this test is about. The permit-based builder with a
-    // real (here, unprogrammed and unreached) plugin is what the file's
-    // other 207 tests use.
-    let plugin = HappyPathPlugin::new();
-    let service = ServiceFixture::default()
-        .with_source(fake_declaration_source_with_fold("SUM"))
-        .build(
-            Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
-            "test.handler.create_records.key_rules.v1",
-        );
-    let base = |idem: Option<&str>, invalidates: Option<Uuid>| {
-        serde_json::json!({
-            "gts_type_id": HAPPY_RECORD_GTS_ID,
-            "tenant_id": Uuid::from_u128(2),
-            "resource_ref": {"resource_id": "rsc-k", "resource_type": "compute.vm"},
-            "quantity": "1",
-            "idempotency_key": idem,
-            "invalidates": invalidates,
-            "reason_code": invalidates.map(|_| "E2E_CORRECTION"),
-            "window_start": rfc3339(recent_window_start()),
-            "window_end": rfc3339(recent_window_end()),
-        })
-    };
-    let response = handle_create_usage_records(
-        Extension(SecurityContext::anonymous()),
-        Extension(service),
-        Json(CreateUsageRecordsRequest {
-            records: vec![
-                base(Some("caller"), Some(Uuid::from_u128(9))),
-                base(None, None),
-                base(Some("inv:forged"), None),
-            ],
-        }),
+async fn a_missing_idempotency_key_is_refused_on_both_entry_kinds() {
+    // The key is required on a withdrawal exactly as on a measurement: a
+    // withdrawal repeats its target's key, and that repetition is the only
+    // thing that says which entry it withdraws (DESIGN §3.1, "Target
+    // resolution"). Both kinds are driven, because a rule that held for one
+    // of them alone is the rule this slice replaced.
+    for (name, suffix, mut body) in [
+        (
+            "record",
+            "test.handler.create_records.no_key_record.v1",
+            create_request_json_with(&serde_json::json!({})),
+        ),
+        (
+            "invalidation",
+            "test.handler.create_records.no_key_invalidation.v1",
+            create_withdrawal_json_with(&serde_json::json!({
+                "reason_code": HAPPY_REASON_CODE,
+            })),
+        ),
+    ] {
+        body["records"][0]
+            .as_object_mut()
+            .expect("record object")
+            .remove("idempotency_key")
+            .expect("the fixture carries a key to remove");
+        let (status, item) = dispatch_one_record_batch(suffix, body).await;
+        assert_eq!(status, StatusCode::MULTI_STATUS, "{name}");
+        assert_eq!(rejected_violation_field(&item), "idempotency_key", "{name}");
+        assert_eq!(rejected_violation_reason(&item), "VALIDATION", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_key_beginning_with_the_once_reserved_prefix_is_an_ordinary_key() {
+    // `inv:` was a reserved prefix while the gateway derived a withdrawal's
+    // key from its target's id. It derives nothing now, so no prefix is
+    // reserved (DESIGN §3.1, `IdempotencyKey`) and a caller whose own keys
+    // happen to start with it is no longer refused. Asserted as an
+    // acceptance, which is the only shape that can fail if the rule comes
+    // back.
+    let (status, item) = dispatch_one_record_batch(
+        "test.handler.create_records.once_reserved_prefix.v1",
+        create_request_json_with(&serde_json::json!({
+            "idempotency_key": "inv:once-reserved",
+        })),
     )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::MULTI_STATUS);
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let reason =
-        |i: usize| body["results"][i]["error"]["context"]["field_violations"][0]["reason"].clone();
-    assert_eq!(reason(0), "KEY_ON_INVALIDATION");
-    assert_eq!(reason(1), "VALIDATION");
-    assert_eq!(reason(2), "RESERVED_KEY_PREFIX");
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        item.get("outcome").and_then(serde_json::Value::as_str),
+        Some("accepted"),
+        "no idempotency-key prefix is reserved any more; got {item:?}",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2838,6 +2942,7 @@ async fn create_with_batch_above_cap_rejects_without_iterating_records() {
                 serde_json::json!({"bogus": true})
             } else {
                 serde_json::json!({
+                    "entry_type": "record",
                     "gts_type_id": HAPPY_RECORD_GTS_ID,
                     "tenant_id": Uuid::from_u128(2),
                     "resource_ref": {"resource_id": format!("rsc-{i}"), "resource_type": "compute.vm"},
@@ -2917,6 +3022,7 @@ async fn a_malformed_entry_rejects_only_its_own_index() {
             "test.handler.create_records.malformed_entry.v1",
         );
     let good = serde_json::json!({
+        "entry_type": "record",
         "gts_type_id": HAPPY_RECORD_GTS_ID,
         "tenant_id": tenant_id,
         "resource_ref": {"resource_id": "rsc-m", "resource_type": "compute.vm"},
@@ -3935,7 +4041,9 @@ mod handle_backfill_usage_records_tests {
     use axum::extract::Extension;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use usage_collector_sdk::{CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin};
+    use usage_collector_sdk::{
+        CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RecordOrigin,
+    };
     use uuid::Uuid;
 
     use super::super::handle_backfill_usage_records;
@@ -3953,6 +4061,7 @@ mod handle_backfill_usage_records_tests {
     /// `serde_json::to_value` on a struct literal.
     fn wire_record(tenant_id: Uuid, idem: &str) -> serde_json::Value {
         serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": HAPPY_RECORD_GTS_ID,
             "tenant_id": tenant_id,
             "resource_ref": {"resource_id": "rsc-backfill", "resource_type": "compute.vm"},
@@ -3968,6 +4077,7 @@ mod handle_backfill_usage_records_tests {
     /// service will produce.
     fn domain_submission(tenant_id: Uuid, idem: &str) -> CreateUsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(HAPPY_RECORD_GTS_ID).expect("valid gts_type_id"),
             tenant_id,
             resource_ref: usage_collector_sdk::ResourceRef::new("rsc-backfill", "compute.vm")
@@ -4221,6 +4331,7 @@ mod handle_backfill_usage_records_tests {
     fn a_request_body_naming_its_own_origin_is_refused() {
         let record = || {
             serde_json::json!({
+                "entry_type": "record",
                 "gts_type_id": HAPPY_RECORD_GTS_ID,
                 "tenant_id": Uuid::from_u128(9).to_string(),
                 "resource_ref": {

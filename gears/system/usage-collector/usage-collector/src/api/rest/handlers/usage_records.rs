@@ -17,7 +17,7 @@ use toolkit_canonical_errors::Problem;
 use toolkit_odata::{ODataQuery, Page as ODataPage};
 use toolkit_security::SecurityContext;
 use usage_collector_sdk::{
-    AggregationDimension, CreateUsageRecord, IdempotencyKey, Invalidation, MetadataFilter,
+    AggregationDimension, CreateUsageRecord, EntryType, IdempotencyKey, MetadataFilter,
     MetadataKey, MeterTypeId, ReasonCode, ResourceRef, SubjectRef, TimeRange, UsageCollectorError,
     UsageQuantity, UsageRecord,
 };
@@ -899,10 +899,24 @@ fn decode_record_entry(raw: serde_json::Value) -> Result<CreateUsageRecordReques
     })
 }
 
-/// An explicit `"idempotency_key": null` is refused, not read as an absent key:
-/// the published schema types the property `string`. A record answers as a
-/// missing key does; an invalidation answers `KEY_ON_INVALIDATION`, as a
-/// supplied key does, because the property is forbidden there.
+/// An explicit `"idempotency_key": null` is refused as a missing key, ahead
+/// of everything else this entry might also be wrong about.
+///
+/// One answer for both entry kinds, and the `entry_type` this submission
+/// declares is not consulted: a key is required on a withdrawal exactly as
+/// it is on a measurement, because a withdrawal repeats its target's key and
+/// that repetition is what locates the target (DESIGN §3.1, "Target
+/// resolution"). A submission stating `null` is told exactly what a
+/// submission omitting the property is told.
+///
+/// **That sameness is why this runs where it does rather than being a rule
+/// of its own.** The DTO types the property `Option<String>`, so serde reads
+/// `null` as an absent key and the projection refuses it for that with the
+/// very error this raises. What the pre-check buys is the *order*: it runs
+/// before the entry is decoded at all, so a body whose key is `null` is told
+/// about the key rather than about whichever other per-record fault the
+/// decode or the fold happens to reach first. Remove it and such a body is
+/// still refused, but pointed at the wrong property.
 fn explicit_null_idempotency_key(raw: &serde_json::Value) -> Option<Problem> {
     if !raw
         .get("idempotency_key")
@@ -910,13 +924,9 @@ fn explicit_null_idempotency_key(raw: &serde_json::Value) -> Option<Problem> {
     {
         return None;
     }
-    let is_invalidation = raw.get("invalidates").is_some_and(|value| !value.is_null());
-    let err = if is_invalidation {
-        UsageCollectorError::idempotency_key_on_invalidation()
-    } else {
-        UsageCollectorError::missing_idempotency_key()
-    };
-    Some(Problem::from(usage_collector_error_to_canonical(err)))
+    Some(Problem::from(usage_collector_error_to_canonical(
+        UsageCollectorError::missing_idempotency_key(),
+    )))
 }
 
 /// The property a serde error names: the backticked token after
@@ -929,44 +939,64 @@ fn serde_field_name(message: &str) -> Option<&str> {
         .map(|(field, _)| field)
 }
 
+/// Parse the wire `entry_type` into the SDK's closed [`EntryType`].
+///
+/// Decoded through the enum's own `Deserialize` rather than matched against
+/// literals here, so the accepted vocabulary has exactly one definition —
+/// `#[serde(rename_all = "lowercase")]` on [`EntryType`] — and a variant
+/// added there needs no second edit to be parseable. serde's own message
+/// carries both the rejected spelling and the expected set, so the violation
+/// needs no curated text beside it.
+///
+/// The rejection shape is host-private: the transport-agnostic SDK never
+/// sees the wire string and has no error for one. It names `entry_type`, so
+/// a batch entry is rejected at its own index pointing at the property that
+/// is wrong.
+#[allow(clippy::result_large_err)]
+fn entry_type_from_wire(raw: &str) -> Result<EntryType, Problem> {
+    serde_json::from_value::<EntryType>(serde_json::Value::String(raw.to_owned())).map_err(|err| {
+        Problem::from(
+            UsageRecordResource::invalid_argument()
+                .with_field_violation("entry_type", err.to_string(), "VALIDATION")
+                .create(),
+        )
+    })
+}
+
 /// Convert one per-record submission into the identity-free domain create
-/// input, lifting `gts_type_id`-, attribution-, `idempotency_key`-,
-/// `reason_code`- and metadata-shape failures into per-record `Problem`
-/// envelopes. The covered period is caller-supplied and forwarded verbatim;
-/// it is validated — and rejected, never truncated — where it is read,
-/// inside [`usage_collector_sdk::CreateUsageRecord::try_into_usage_record`],
+/// input, lifting `entry_type`-, `gts_type_id`-, attribution-,
+/// `idempotency_key`-, `reason_code`- and metadata-shape failures into
+/// per-record `Problem` envelopes. The covered period is caller-supplied and
+/// forwarded verbatim; it is validated — and rejected, never truncated —
+/// where it is read, inside the SDK projection
+/// ([`usage_collector_sdk::CreateUsageRecord::try_into_usage_record`] or
+/// [`usage_collector_sdk::CreateUsageRecord::try_into_invalidation_record`]),
 /// which is also where the entry's `id` is derived once, authoritatively,
 /// inside [`Service::create_usage_records`]. An accepted entry carries no
 /// lifecycle flag to stamp: it is never rewritten
 /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
 ///
-/// This is also the fold point for the correction reference, and therefore
-/// the one place on the REST path where both-or-neither is enforced. The
-/// wire keeps `invalidates` and `reason_code` as two flat siblings because
-/// the OAS declares them that way; the domain keeps them as one
-/// [`Invalidation`], so a half-shape is unrepresentable past this line and
-/// nothing downstream re-checks it.
+/// **The discriminator is read, not inferred.** `entry_type` is
+/// caller-supplied and required on the wire (DESIGN §3.1, "Entry type and
+/// reason code"), so this fold parses it into
+/// [`usage_collector_sdk::EntryType`] and carries it onto the domain shape
+/// rather than deducing a kind from some other property's presence. An
+/// unrecognised spelling is refused here, naming `entry_type`; the closed
+/// set is the wire's own two values.
 ///
-/// Three boundaries carry that one rule **on a submission path**, and none
-/// of them is redundant, because each is the only one standing on its own
-/// path:
-///
-/// * in-process — the pair is one type, so the shape never exists to be
-///   checked;
-/// * a JSON body deserialized straight into
-///   [`usage_collector_sdk::CreateUsageRecord`] — refused by the SDK's own
-///   shadow struct, untyped because a `Deserialize` erases everything but a
-///   message;
-/// * a REST body — arrives flat through the DTO and is refused here, typed,
-///   naming the missing half.
-///
-/// A fourth applies the same rule off the submission paths: the shadow
-/// behind [`usage_collector_sdk::UsageRecord`] refuses a half-shape when a
-/// persisted entry is rehydrated from a wire body. Counting it among the
-/// three above is what makes the enumeration wrong, not what makes it
-/// long.
+/// **It folds no reference.** `invalidates` is server-assigned (DESIGN §3.1,
+/// "Field ownership") and the request DTO carries no field for it, so there
+/// is no flat pair to rejoin and no half-shape to refuse. The domain's
+/// `invalidation` is the reason code alone; the gateway derives the target
+/// from the submission's own identity inputs and stamps it on projection.
+/// Whether the declared `entry_type` and the stated `reason_code` agree is
+/// the SDK projection's check, not this one's — it is the same check on
+/// every submission path, so spelling a second copy of it here is how the
+/// two would come to disagree.
 #[allow(clippy::result_large_err)]
 fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsageRecord, Problem> {
+    let entry_type = entry_type_from_wire(&req.entry_type)?;
+
     let gts_type_id = MeterTypeId::new(req.gts_type_id)
         .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
 
@@ -991,29 +1021,18 @@ fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsa
     let metadata = metadata_from_wire(req.metadata)
         .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
 
-    let invalidation = match (req.invalidates, req.reason_code) {
-        (Some(target), Some(reason)) => {
-            let reason = ReasonCode::new(reason)
-                .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
-            Some(Invalidation { target, reason })
-        }
-        (None, None) => None,
-        // `field` names the half the caller has to add, not the half they
-        // sent — a rejection naming what is already there is not
-        // actionable.
-        (Some(_), None) => {
-            return Err(Problem::from(usage_collector_error_to_canonical(
-                UsageCollectorError::invalidation_reference_incomplete("reason_code"),
-            )));
-        }
-        (None, Some(_)) => {
-            return Err(Problem::from(usage_collector_error_to_canonical(
-                UsageCollectorError::invalidation_reference_incomplete("invalidates"),
-            )));
-        }
-    };
+    // Carried across as the caller stated it, agreement with `entry_type`
+    // left to the projection. A `reason_code` on a `record` is refused
+    // there rather than dropped here: dropping it would admit a
+    // self-contradicting submission as an ordinary measurement.
+    let invalidation = req
+        .reason_code
+        .map(ReasonCode::new)
+        .transpose()
+        .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
 
     Ok(CreateUsageRecord {
+        entry_type,
         gts_type_id,
         tenant_id: req.tenant_id,
         resource_ref,

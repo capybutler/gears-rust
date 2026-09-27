@@ -1,38 +1,39 @@
-//! The invalidation rules the gateway can decide from the target alone.
+//! Where a withdrawal's target comes from, and the one rule the resolved
+//! target answers.
 //!
 //! An invalidation entry is a **faithful copy** of the entry it withdraws:
 //! every caller-supplied field equals the target's, and the departures are
-//! closed and are exactly three — the derived `inv:<target>` idempotency
-//! key, the `invalidates` reference, and the `reason_code`
-//! (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+//! closed and are exactly two — `entry_type` and `reason_code` (DESIGN §3.1,
+//! "Faithful copy"; `cpt-cf-usage-collector-adr-append-only-invalidation`).
+//! The idempotency key is copied like any other field, not derived: no
+//! prefix is reserved, and repeating the target's key is precisely what lets
+//! the target be found.
 //!
-//! Of the six invalidation rules, this module decides the two a resolved
-//! target answers — the target is itself a record, and the copy is faithful.
-//! The other four are elsewhere, and none of them is a comparison:
+//! This module owns two of the gateway's invalidation rules — deriving the
+//! target's identifier from the submission, and checking that the resolved
+//! row was copied faithfully. The rest are elsewhere, and none of them is a
+//! comparison:
 //!
-//! * **Explicit reference** (both-or-neither) is a rule at three boundaries
-//!   on a submission path, and only one of them is a typed rejection. (A
-//!   fourth applies it off those paths, when a persisted entry is
-//!   rehydrated from a wire body into `usage_collector_sdk::UsageRecord`.)
-//!   In-process it is structural:
-//!   `usage_collector_sdk::Invalidation` groups the reference with its
-//!   reason, so no in-process caller can build a half-shape. A JSON body
-//!   decoded straight into [`usage_collector_sdk::CreateUsageRecord`] is
-//!   refused by that type's own deserialization shadow, inside a
-//!   `Deserialize` that erases everything but a message. A REST body is the
-//!   third and is the only typed rejection: the served schema declares the
-//!   two as flat sibling properties, so the request DTO carries them apart
-//!   and the conversion into the domain type is where the pair is rejoined —
-//!   see [`UsageCollectorError::invalidation_reference_incomplete`], whose
-//!   own documentation states where it is raised from.
-//! * **Reason code** is that same grouping: the reason is mandatory inside
-//!   `usage_collector_sdk::Invalidation`, and the newtype validates itself.
-//! * **Valid reference** is the lookup that produces the `target` argument.
-//!   This module is pure and reads nothing, so resolving the reference — and
-//!   rejecting one that resolves to nothing — belongs to its caller.
-//! * **At-most-one-invalidation** is no check at all. Every invalidation of
-//!   one record derives the same `inv:<target>` key, so a second one collides
-//!   on the dedup identity; the gateway lifts that conflict as
+//! * **Entry type and reason code** are checked against each other inside
+//!   the SDK projection, on every submission path at once. `entry_type` is
+//!   caller-supplied and required; `reason_code` is required with it and
+//!   forbidden without it. Neither half is inferred from the other, so
+//!   nothing here re-derives a kind.
+//! * **Valid target** is the lookup that produces the `target` argument to
+//!   `verify_invalidation_target`, keyed by the identifier
+//!   `derive_invalidation_target` returns. (Both are crate-private, so this
+//!   module doc names them rather than linking them: an intra-doc link to a
+//!   private item resolves nowhere outside the build that defines it.) This
+//!   module is pure and reads nothing, so performing that lookup — and
+//!   rejecting a target that resolves to nothing — belongs to its caller.
+//! * **No invalidation of an invalidation** is no check at all. The target's
+//!   identifier is derived with `entry_type = record`, so no identifier a
+//!   withdrawal resolves can belong to an invalidation: DESIGN §3.1 states
+//!   the property holds by construction and needs no check of its own.
+//! * **At-most-one-invalidation** is likewise no check. Every withdrawal of
+//!   one record repeats that record's tenant, type, key and period and reads
+//!   `entry_type = invalidation`, so all of them reach one dedup identity
+//!   and a second one collides; the gateway lifts that conflict as
 //!   `AlreadyInvalidated` at dispatch (`error::lift_dispatch_error`).
 //!
 //! This module validates a submission against **another entry**, which is
@@ -43,7 +44,67 @@
 
 use usage_collector_sdk::{
     CreateUsageRecord, EntryType, Invalidation, UsageCollectorError, UsageRecord,
+    derive_usage_record_id,
 };
+use uuid::Uuid;
+
+/// The identifier of the entry a withdrawal withdraws, derived from the
+/// withdrawal's own fields.
+///
+/// DESIGN §3.1, "Target resolution": an invalidation names its target
+/// through its own identity inputs rather than by reference. The target's
+/// `id` is [`derive_usage_record_id`] over this submission's `(tenant_id,
+/// gts_type_id, idempotency_key, window_start, window_end)` with
+/// [`EntryType::Record`] — the same five inputs the withdrawal's own
+/// identity rests on, differing in the sixth alone. A faithful copy repeats
+/// all five, so the submission by itself says what it withdraws, and a
+/// caller-supplied target — which would let an emitter name a record it
+/// never measured — is neither needed nor accepted.
+///
+/// What it returns is an identifier, not a target: the entry may not exist.
+/// The caller looks it up converged-only under the PDP permit scope and
+/// rejects a lookup that finds nothing. Because all five inputs feed the
+/// derivation, a typo in any one of them resolves to an identifier the
+/// ledger does not hold, and so surfaces as a missing target rather than as
+/// a field mismatch.
+///
+/// **It runs before the submission's covered period has been validated, and
+/// that is sound rather than a gap in
+/// `cpt-cf-usage-collector-adr-record-identity-derivation`.**
+/// [`usage_collector_sdk::canonical_period_bound`] truncates below the
+/// microsecond, so a bound finer than that would be truncated here instead
+/// of rejected. The projection that follows rejects such a bound before it
+/// stamps anything, and the caller discards this value along with the
+/// submission: no identifier derived from an unvalidated period reaches a
+/// lookup, a response, or the store. The ADR's requirement is that no
+/// *entry* acquire an identity over an unvalidated period, and no entry
+/// does.
+///
+/// # Errors
+///
+/// [`UsageCollectorError::missing_idempotency_key`] when the submission
+/// carries no key. The key is one of the five inputs, so a submission
+/// without one names nothing; both SDK projections refuse the same
+/// submission on the same grounds.
+#[allow(
+    clippy::result_large_err,
+    reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+)]
+pub(crate) fn derive_invalidation_target(
+    entry: &CreateUsageRecord,
+) -> Result<Uuid, UsageCollectorError> {
+    let Some(idempotency_key) = entry.idempotency_key.as_ref() else {
+        return Err(UsageCollectorError::missing_idempotency_key());
+    };
+    Ok(derive_usage_record_id(
+        entry.tenant_id,
+        &entry.gts_type_id,
+        idempotency_key,
+        entry.window_start,
+        entry.window_end,
+        EntryType::Record,
+    ))
+}
 
 /// The caller-supplied fields an invalidation copies, in comparison order.
 ///
@@ -87,10 +148,10 @@ pub(crate) const COMPARED_FIELDS: [&str; 8] = [
 /// order, which is the order a rejection is reported in.
 ///
 /// **The two ignore-counts differ and that is not a bug**: the submission
-/// ignores `idempotency_key` and `invalidation` (two); the target ignores
-/// `id`, `idempotency_key`, `accepted_at`, `origin` and `invalidation`
-/// (five), because the target carries three server-assigned fields the
-/// submission never supplies.
+/// ignores `entry_type`, `idempotency_key` and `invalidation` (three); the
+/// target ignores `id`, `idempotency_key`, `accepted_at`, `origin` and
+/// `invalidation` (five), because the target carries three server-assigned
+/// fields the submission never supplies and no discriminator field at all.
 /// A destructure-audit expecting one number on both sides will come out
 /// short and go looking for a defect that is not there. Every ignored
 /// binding is discarded by name, with the reason it is not compared.
@@ -98,20 +159,37 @@ pub(crate) const COMPARED_FIELDS: [&str; 8] = [
 /// The comparison array is as long as [`COMPARED_FIELDS`], so a comparison
 /// added without its name — or removed while its name stays — is a compile
 /// error rather than a field that quietly stops being compared.
+///
+/// **Four of the eight cannot differ, and are compared anyway.** `tenant_id`,
+/// `gts_type_id` and both covered-period bounds are inputs to the identifier
+/// [`derive_invalidation_target`] resolved the target by, so a row answering
+/// that identifier already agrees on them — DESIGN §3.1's "Faithful copy"
+/// row says exactly that, and routes a typo in any of them to a missing
+/// target instead. They stay in the comparison because the destructure is
+/// what makes a field added to [`CreateUsageRecord`] a compile error here,
+/// and dropping four comparisons to save nothing measurable would trade that
+/// away.
 fn faithful_copy_mismatch(entry: &CreateUsageRecord, target: &UsageRecord) -> Option<&'static str> {
     let CreateUsageRecord {
+        // Permitted departure, and the first of exactly two: the declared
+        // kind. It differs from the target's by definition — a withdrawal is
+        // an `invalidation` and its target is a `record` — so comparing it
+        // would reject every faithful copy there is.
+        entry_type: _,
         gts_type_id,
         tenant_id,
         resource_ref,
         subject_ref,
         metadata,
         quantity,
-        // Not compared: an invalidation carries no caller key; its key is
-        // derived from the target.
+        // Not compared, and not because it may differ: it is one of the five
+        // inputs the target's identifier was derived from, so the row this
+        // runs against already carries this very key. See
+        // `derive_invalidation_target`.
         idempotency_key: _,
-        // Permitted departure: the reference and its reason. One binding,
-        // not two — that is the ADR's "exactly three departures" made
-        // structural.
+        // Permitted departure, the second: the reason code. On the
+        // submission shape it is the reason alone — the reference is
+        // server-assigned and no field here carries it.
         invalidation: _,
         window_start,
         window_end,
@@ -128,8 +206,9 @@ fn faithful_copy_mismatch(entry: &CreateUsageRecord, target: &UsageRecord) -> Op
         subject_ref: target_subject_ref,
         metadata: target_metadata,
         quantity: target_quantity,
-        // Not compared: the target's key is its own; the invalidation's is
-        // derived.
+        // Not compared, for the reason the submission's binding gives: the
+        // withdrawal repeats this key, and the repetition is what located
+        // this row.
         idempotency_key: _,
         // Not a copied field: it is the gateway's own per-request stamp, not
         // an echo of anything on the target. There is nothing on the
@@ -144,9 +223,10 @@ fn faithful_copy_mismatch(entry: &CreateUsageRecord, target: &UsageRecord) -> Op
         // There is nothing on the submission side to compare it against
         // either — `CreateUsageRecord` carries no origin.
         origin: _,
-        // The target carries none — that is the
-        // no-invalidation-of-an-invalidation rule, checked separately by
-        // `verify_invalidation_target` and never inferred from a comparison.
+        // The target carries none, and that is not a rule enforced here or
+        // anywhere: its identifier was derived with `entry_type = record`,
+        // so a row answering it is a measurement by construction (DESIGN
+        // §3.1, "No invalidation of an invalidation").
         invalidation: _,
         window_start: target_window_start,
         window_end: target_window_end,
@@ -214,49 +294,44 @@ fn faithful_copy_mismatch(entry: &CreateUsageRecord, target: &UsageRecord) -> Op
 
 /// Verifies a submitted invalidation against the target the SPI returned.
 ///
-/// `invalidation` is the withdrawal `entry` carries, taken as its own
-/// argument rather than read back off the entry. That encodes the
-/// precondition at the type level — this cannot be invoked for a submission
-/// carrying no withdrawal at all — and it is what both rejections echo. They
-/// name **`invalidation.target`, the reference the caller supplied, never
-/// `target.id`**, so a mis-paired row can never hand the caller an
-/// identifier it did not send. Pairing the two is the caller's obligation;
-/// this function's obligation is to say nothing the caller did not already
-/// know if the pairing is wrong.
+/// One rule, not two: the copy must be faithful. Its sibling —
+/// no-invalidation-of-an-invalidation — used to be checked here against
+/// `target.entry_type()` and is gone, because there is no longer anything
+/// for it to catch. The target's identifier is derived with
+/// `entry_type = record` ([`derive_invalidation_target`]), so a row
+/// answering that identifier is a measurement by construction; DESIGN §3.1
+/// states the property holds that way and "needs no check of its own". Kept,
+/// it would have reported a corrupt store as a caller fault, on a field the
+/// caller no longer supplies.
 ///
-/// Runs the two rules a resolved target answers, in the order a caller can
-/// act on: the target must itself be a record, then the copy must be
-/// faithful. **The order is about actionability, not about outcome for the
-/// common case.** A submission that copies an invalidation faithfully has no
-/// field mismatch at all — `invalidation` is discarded by both destructures,
-/// so the reason code the target carries is never compared — and it is the
-/// kind check alone that rejects it whichever order the two run in. The
-/// order decides what a submission that breaks *both* is told: that its
-/// target is not a record, which is the fault it can act on, rather than a
-/// field it would be chasing while the target itself is wrong. Anyone
-/// testing this ordering must use a submission that departs in a compared
-/// field as well, or the test cannot fail when the two are swapped.
+/// `invalidation` is the withdrawal the **projected entry** carries, taken
+/// as its own argument rather than read back off `entry`: the submission
+/// carries the reason code alone, and the target half was resolved by the
+/// gateway. Its `target` is what the rejection echoes — the identifier the
+/// gateway asked the store for, rather than the `id` the store answered
+/// with. The caller has already refused a row whose `id` differs, so the two
+/// agree here; echoing the asked-for one keeps that true independently of
+/// that check.
 ///
-/// **A rejection names what differs, never what it differs from.** The target
-/// is read under the scope compiled from the submitter's own `create` permit
-/// (SPEC-DIFF decision S-A1), so a row outside that grant answers as absent and
-/// never reaches this function. The rule is kept as defence in depth: a message
-/// carrying the target's value would be an oracle the moment a plugin answered
-/// outside the scope it was handed — submit a faithful copy with one field
-/// wrong, read the real value out of the 400, iterate. The field *name* leaks
-/// nothing (the caller sent that field); the value is the part that must not
-/// cross. `UsageCollectorError::invalidation_field_mismatch` is written that
-/// way deliberately — do not "improve" the diagnostic by echoing the target's
-/// value into it.
+/// **A rejection names what differs, never what it differs from.** The field
+/// *name* leaks nothing — the caller sent that field — and the identifier
+/// beside it is one the caller can derive from its own submission. The
+/// target's *value* for the differing field is the part that must not cross.
+/// The target is read under the scope compiled from the submitter's own
+/// `create` permit (SPEC-DIFF decision S-A1), so a row outside that grant
+/// answers as absent and never reaches this function; the rule is kept as
+/// defence in depth, because a message carrying the target's value would be
+/// an oracle the moment a plugin answered outside the scope it was handed —
+/// submit a faithful copy with one field wrong, read the real value out of
+/// the 400, iterate. `UsageCollectorError::invalidation_field_mismatch` is
+/// written that way deliberately — do not "improve" the diagnostic by
+/// echoing the target's value into it.
 ///
 /// # Errors
 ///
-/// * [`UsageCollectorError::InvalidArgument`] with
-///   [`usage_collector_sdk::ValidationReason::InvalidationTargetNotRecord`]
-///   when the target is itself an invalidation.
-/// * [`UsageCollectorError::InvalidArgument`] with
-///   [`usage_collector_sdk::ValidationReason::InvalidationFieldMismatch`],
-///   naming the field that differs, when the copy is unfaithful.
+/// [`UsageCollectorError::InvalidArgument`] with
+/// [`usage_collector_sdk::ValidationReason::InvalidationFieldMismatch`],
+/// naming the field that differs, when the copy is unfaithful.
 #[allow(
     clippy::result_large_err,
     reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
@@ -266,12 +341,6 @@ pub(crate) fn verify_invalidation_target(
     invalidation: &Invalidation,
     target: &UsageRecord,
 ) -> Result<(), UsageCollectorError> {
-    if target.entry_type() == EntryType::Invalidation {
-        return Err(UsageCollectorError::invalidation_target_not_record(
-            invalidation.target,
-        ));
-    }
-
     if let Some(field) = faithful_copy_mismatch(entry, target) {
         return Err(UsageCollectorError::invalidation_field_mismatch(
             field,

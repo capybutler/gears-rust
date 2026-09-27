@@ -126,6 +126,7 @@ fn record_dto_names_the_type_reference_gts_type_id() {
 
 fn minimal_create_record_json() -> serde_json::Value {
     serde_json::json!({
+        "entry_type": "record",
         "gts_type_id": SAMPLE_METER_TYPE_ID,
         "tenant_id": sample_tenant_uuid().to_string(),
         "resource_ref": {
@@ -277,17 +278,13 @@ fn create_usage_record_request_optional_metadata_defaults_to_empty_map() {
 }
 
 #[test]
-fn create_usage_record_request_optional_correction_fields_default_to_none() {
-    // Pin `#[serde(default)]` on both halves of the correction reference:
-    // an ordinary submission carries neither, so a body omitting both must
-    // deserialize rather than fail as a missing field.
+fn create_usage_record_request_optional_reason_code_defaults_to_none() {
+    // Pin `#[serde(default)]` on `reason_code`: an ordinary measurement
+    // carries none, so a body omitting it must deserialize rather than fail
+    // as a missing field. It is the only half left — `invalidates` is
+    // server-assigned and this shape declares no property for it.
     let req: CreateUsageRecordRequest = serde_json::from_value(minimal_create_record_json())
-        .expect("a body omitting both correction fields must deserialize");
-    assert!(
-        req.invalidates.is_none(),
-        "absent `invalidates` MUST deserialise to None (got {:?})",
-        req.invalidates,
-    );
+        .expect("a body omitting the reason code must deserialize");
     assert!(
         req.reason_code.is_none(),
         "absent `reason_code` MUST deserialise to None (got {:?})",
@@ -296,42 +293,66 @@ fn create_usage_record_request_optional_correction_fields_default_to_none() {
 }
 
 #[test]
-fn create_usage_record_request_carries_the_correction_pair_flat() {
-    // The pair stays two flat sibling properties on this shape because the
-    // OAS declares it that way and `api_dto` emits this struct into the
-    // served document. The domain folds them into one field; folding them
-    // here would change the published schema.
+fn create_usage_record_request_carries_a_withdrawals_two_departures() {
+    // A withdrawal departs from its target in exactly two caller-supplied
+    // fields, and this shape carries both: the declared `entry_type` and the
+    // `reason_code`. Everything else it sends is a copy — the idempotency
+    // key included, which is what locates the target.
     let mut json = minimal_create_record_json();
     let obj = json.as_object_mut().expect("object");
-    obj.insert(
-        "invalidates".to_owned(),
-        serde_json::json!(SAMPLE_TARGET_ID),
-    );
+    obj.insert("entry_type".to_owned(), serde_json::json!("invalidation"));
     obj.insert(
         "reason_code".to_owned(),
         serde_json::json!(SAMPLE_REASON_CODE),
     );
     let req: CreateUsageRecordRequest =
         serde_json::from_value(json).expect("a withdrawal body deserializes");
-    assert_eq!(req.invalidates, Some(sample_target_uuid()));
+    assert_eq!(req.entry_type, "invalidation");
     assert_eq!(req.reason_code.as_deref(), Some(SAMPLE_REASON_CODE));
+    assert_eq!(
+        req.idempotency_key.as_deref(),
+        Some(SAMPLE_IDEMPOTENCY_KEY),
+        "a withdrawal repeats its target's key; no prefix is reserved",
+    );
 }
 
 #[test]
-fn a_submitted_entry_type_is_refused_as_an_unknown_field() {
-    // `entry_type` is `readOnly` on the wire and appears on the read shape
-    // alone. `deny_unknown_fields` already refuses one here; this pins that
-    // the ingestion shape stays discriminator-free, so a marker can never
-    // disagree with the payload it marks.
+fn the_ingestion_shape_requires_its_own_entry_type() {
+    // `entry_type` is caller-supplied on this shape, required, and has no
+    // default (`usage-collector-v1.yaml`: "Required on every ingestion
+    // request, with no default. A request that omits it is rejected rather
+    // than read as a `record`"). A body omitting it fails as a missing
+    // field rather than deserializing into a measurement.
     let mut json = minimal_create_record_json();
     json.as_object_mut()
         .expect("object")
-        .insert("entry_type".to_owned(), serde_json::json!("invalidation"));
+        .remove("entry_type")
+        .expect("fixture carries the discriminator");
     let err = serde_json::from_value::<CreateUsageRecordRequest>(json)
-        .expect_err("the ingestion shape accepts no discriminator");
+        .expect_err("a body omitting entry_type MUST be rejected");
     assert!(
         err.to_string().contains("entry_type"),
-        "the failure MUST name the discriminator it refused (got `{err}`)",
+        "the failure MUST name the missing discriminator (got `{err}`)",
+    );
+}
+
+#[test]
+fn a_submitted_invalidates_is_refused_as_an_unknown_field() {
+    // `invalidates` is server-assigned (DESIGN §3.1, "Field ownership") and
+    // this shape declares no property for it, so `deny_unknown_fields`
+    // refuses one — the published schema's `additionalProperties: false`
+    // says a stray server-owned value "is rejected as an unknown field".
+    // Without this, an emitter could name a record it never measured.
+    let mut json = minimal_create_record_json();
+    json.as_object_mut().expect("object").insert(
+        "invalidates".to_owned(),
+        serde_json::json!(SAMPLE_TARGET_ID),
+    );
+    let err = serde_json::from_value::<CreateUsageRecordRequest>(json)
+        .expect_err("a caller-supplied target MUST be refused");
+    assert!(
+        err.to_string().contains("invalidates"),
+        "the failure MUST name the server-owned field it refused (got `{err}`)",
     );
 }
 
@@ -345,15 +366,12 @@ fn create_usage_record_request_accepts_exactly_the_declared_wire_keys() {
     let mut json = minimal_create_record_json();
     {
         let obj = json.as_object_mut().expect("object");
+        obj.insert("entry_type".to_owned(), serde_json::json!("invalidation"));
         obj.insert(
             "subject_ref".to_owned(),
             serde_json::json!({ "subject_id": "sub-dto", "subject_type": "user" }),
         );
         obj.insert("metadata".to_owned(), serde_json::json!({ "region": "eu" }));
-        obj.insert(
-            "invalidates".to_owned(),
-            serde_json::json!(SAMPLE_TARGET_ID),
-        );
         obj.insert(
             "reason_code".to_owned(),
             serde_json::json!(SAMPLE_REASON_CODE),
@@ -369,9 +387,9 @@ fn create_usage_record_request_accepts_exactly_the_declared_wire_keys() {
     assert_eq!(
         keys,
         vec![
+            "entry_type",
             "gts_type_id",
             "idempotency_key",
-            "invalidates",
             "metadata",
             "quantity",
             "reason_code",
@@ -406,10 +424,12 @@ fn create_usage_record_request_accepts_exactly_the_declared_wire_keys() {
 
 #[test]
 fn the_response_carries_a_derived_entry_type_and_no_status() {
-    // `entry_type` is `readOnly` on the wire and derived in the domain, so
-    // the projection computes it from the record's own reference — there is
-    // nothing on `UsageRecord` to copy it from
-    // (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    // On the read shape `entry_type` is derived, not stored: the projection
+    // computes it from the record's own withdrawal, because there is nothing
+    // on `UsageRecord` to copy it from
+    // (`cpt-cf-usage-collector-adr-append-only-invalidation`). That is a
+    // property of this shape alone — the ingestion shape carries a
+    // caller-supplied one, so the wire property is not `readOnly`.
     let dto = UsageRecordDto::from(sample_persisted_record());
     assert_eq!(dto.entry_type, "record");
     assert_eq!(dto.invalidates, None);
