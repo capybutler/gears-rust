@@ -387,8 +387,8 @@ fn observe_metadata_bytes(
 fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
     match err {
         UsageCollectorError::PermissionDenied { .. } => RecordErrorCategory::Authz,
-        // §3.11.5's `invalidation_rule` covers the copy, reference and
-        // at-most-one rules. The reference rule — an `invalidates` resolving
+        // §3.11.5's `invalidation_rule` covers the target-resolution and
+        // copy rules alone. The target rule — a derived identifier resolving
         // to nothing — is a `NotFound`, and used to be unreachable from
         // here: the variant carried no discriminator, so separating it from
         // an ordinary missing entry meant matching a substring of
@@ -419,8 +419,9 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
             }
             // The invalidation rules that arrive as an `InvalidArgument`.
             // DESIGN §3.11.5 gives them a category of their own so a
-            // correction backlog is legible without reading `detail`. Valid
-            // target joins them from the `NotFound` arm above.
+            // correction backlog is legible without reading `detail`. Target
+            // resolution joins them from the `NotFound` arm above; it and the
+            // copy rule are the two the spec scopes the category to.
             //
             // Only `InvalidationFieldMismatch` is raised inside this crate
             // today. The two beside it are kept because
@@ -783,6 +784,19 @@ async fn resolve_invalidation_targets(
         if target.id != invalidation.target {
             results[index] = Some(Err(invariant_breach(format!(
                 "storage plugin answered get_usage_record({}) with a different entry",
+                invalidation.target,
+            ))));
+            continue;
+        }
+
+        // A row answering an identifier derived with `entry_type = record`
+        // cannot be an invalidation, so DESIGN §3.1 needs no check for it.
+        // One that is anyway contradicts its own identifier: the same class
+        // of store breach as the id mismatch above, refused the same way
+        // rather than accepted into a withdrawal of a withdrawal.
+        if target.entry_type() == EntryType::Invalidation {
+            results[index] = Some(Err(invariant_breach(format!(
+                "storage plugin answered get_usage_record({}) with an invalidation",
                 invalidation.target,
             ))));
             continue;
@@ -1259,7 +1273,11 @@ impl Service {
         // sent. The clone is taken on the declared kind, the same condition
         // the projection branches on, and is confined to it: an ordinary
         // measurement, the common path, clones nothing.
-        let withdrawal =
+        //
+        // What this slot means is "a submission is kept here", and nothing
+        // else. What makes an entry a withdrawal is read off the projected
+        // entry below, never off this — one fact, one place.
+        let kept_submission =
             matches!(record.entry_type(), EntryType::Invalidation).then(|| record.clone());
         // One clock read for the admission and the action alike: the two
         // read the same `window_end` against bounds that share an origin,
@@ -1301,19 +1319,24 @@ impl Service {
 
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-check
         // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-record:p1:inst-emit-record-semantics-invalid
-        // The declared `entry_type` is the whole decision, and it was made
-        // once, above, where the projection was chosen. An ordinary
-        // measurement costs no target read at all — asserting that absence
-        // is what stops the common path paying for the rare one.
-        if let Some(submission) = withdrawal {
-            // The invalidation projection stamps this on exactly the
-            // submissions the clone above was taken for, so it is `Some`
-            // here. A `None` is a host-invariant breach and is refused as
-            // one: waving the entry through would dispatch a withdrawal
-            // whose target nothing ever checked.
-            let Some(invalidation) = record.invalidation.clone() else {
+        // **Keyed on the projected entry, not on the kept submission**, and
+        // the direction is the point. The entry that gets dispatched is this
+        // one: if it carries a withdrawal, it must be verified, and an
+        // absent submission is a host-invariant breach refused as one rather
+        // than a silent fall-through to dispatch. Keyed the other way round,
+        // that fall-through is exactly what a projected withdrawal with no
+        // kept submission would get — dispatched with nothing ever checking
+        // its target. The harmless mirror (a kept submission whose
+        // projection carries no withdrawal) needs no guard at all: the entry
+        // is a measurement and there is nothing to verify.
+        //
+        // An ordinary measurement costs no target read at all — asserting
+        // that absence is what stops the common path paying for the rare one.
+        if let Some(invalidation) = record.invalidation.clone() {
+            let Some(submission) = kept_submission else {
                 return Err(invariant_breach(
-                    "a submission declaring entry_type=invalidation was projected without one"
+                    "a projected invalidation reached the target check with no submission kept \
+                     for it"
                         .to_owned(),
                 ));
             };
@@ -1353,6 +1376,19 @@ impl Service {
             if target.id != invalidation.target {
                 return Err(invariant_breach(format!(
                     "storage plugin answered get_usage_record({}) with a different entry",
+                    invalidation.target,
+                )));
+            }
+            // The identifier above was derived with `entry_type = record`, so
+            // a row answering it is a measurement and DESIGN §3.1 needs no
+            // check for it. A row that answers it and carries a withdrawal
+            // all the same contradicts its own identifier: a store breach of
+            // the same class as the id mismatch above, and refused the same
+            // way. Without it the entry is accepted and a withdrawal of a
+            // withdrawal is persisted.
+            if target.entry_type() == EntryType::Invalidation {
+                return Err(invariant_breach(format!(
+                    "storage plugin answered get_usage_record({}) with an invalidation",
                     invalidation.target,
                 )));
             }
@@ -1933,23 +1969,21 @@ impl Service {
 
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics
             // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-emit-records-batch:p1:inst-emit-batch-record-semantics-invalid
-            // The declared `entry_type` is the whole decision, and it was
-            // made once, in the projection loop above. The target read is
-            // deferred to a post-loop dedup + bounded fan-out pre-pass
-            // (`inst-algo-semantics-l1-dedup` /
+            // **Keyed on the projected entry, not on the kept submission**,
+            // for the reason `create_usage_record_inner` gives: the entry
+            // that gets dispatched is this one, so an absent submission is a
+            // breach refused here rather than a fall-through to
+            // `eligible.push` with nothing having checked the target. The
+            // target read is deferred to a post-loop dedup + bounded fan-out
+            // pre-pass (`inst-algo-semantics-l1-dedup` /
             // `inst-algo-semantics-l1-bounded-fanout`) so a batch withdrawing
             // one target repeatedly reads it once; the metadata check runs
             // after the target check there, so the target→metadata
             // error-priority ordering is preserved end-to-end.
-            if let Some(submission) = withdrawals[index].take() {
-                // Stamped by the invalidation projection on exactly the
-                // submissions the clone above was taken for. A `None` is a
-                // host-invariant breach, refused rather than waved through:
-                // this entry would otherwise be dispatched as a withdrawal
-                // whose target nothing ever checked.
-                let Some(invalidation) = record.invalidation.clone() else {
+            if let Some(invalidation) = record.invalidation.clone() {
+                let Some(submission) = withdrawals[index].take() else {
                     results[index] = Some(Err(invariant_breach(format!(
-                        "the submission at input {index} declared entry_type=invalidation and was projected without one"
+                        "the projected invalidation at input {index} has no submission kept for it"
                     ))));
                     continue;
                 };

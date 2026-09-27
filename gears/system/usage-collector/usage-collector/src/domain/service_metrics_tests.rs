@@ -1303,10 +1303,10 @@ fn classify_record_error_maps_each_arm() {
     }
 }
 
-/// An unresolvable `invalidates` is an invalidation-rule rejection.
+/// A target that resolves to nothing is an invalidation-rule rejection.
 ///
-/// DESIGN §3.11.5 gives `invalidation_rule` "the copy, reference and
-/// at-most-one rules". The reference rule is the one that used to be
+/// DESIGN §3.11.5 scopes `invalidation_rule` to "the target-resolution and
+/// copy rules alone". Target resolution is the half that used to be
 /// unreachable: it surfaces as `NotFound`, which carried no typed reason, so
 /// nothing but `detail` prose separated it from an ordinary
 /// `usage_record_not_found` — and a plugin's own `UsageRecordNotFound`

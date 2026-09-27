@@ -899,24 +899,25 @@ fn decode_record_entry(raw: serde_json::Value) -> Result<CreateUsageRecordReques
     })
 }
 
-/// An explicit `"idempotency_key": null` is refused as a missing key, ahead
-/// of everything else this entry might also be wrong about.
+/// An explicit `"idempotency_key": null` is refused as a missing key, and
+/// this is the only thing that attributes it to the property it came from.
+///
+/// The DTO types the property `String` because the schema requires it, so a
+/// body stating `null` fails to decode as ``invalid type: null, expected a
+/// string``. That message names no property: `serde_field_name` reads only
+/// ``unknown field `…` `` and ``missing field `…` ``, so without this
+/// pre-check the violation lands on `records` and the caller is told an
+/// entry is wrong without being told which half of it. Running before the
+/// decode is what keeps the answer on `idempotency_key`, and it also puts
+/// the answer ahead of any other fault the same entry carries.
 ///
 /// One answer for both entry kinds, and the `entry_type` this submission
 /// declares is not consulted: a key is required on a withdrawal exactly as
 /// it is on a measurement, because a withdrawal repeats its target's key and
 /// that repetition is what locates the target (DESIGN §3.1, "Target
 /// resolution"). A submission stating `null` is told exactly what a
-/// submission omitting the property is told.
-///
-/// **That sameness is why this runs where it does rather than being a rule
-/// of its own.** The DTO types the property `Option<String>`, so serde reads
-/// `null` as an absent key and the projection refuses it for that with the
-/// very error this raises. What the pre-check buys is the *order*: it runs
-/// before the entry is decoded at all, so a body whose key is `null` is told
-/// about the key rather than about whichever other per-record fault the
-/// decode or the fold happens to reach first. Remove it and such a body is
-/// still refused, but pointed at the wrong property.
+/// submission omitting the property is told — the difference is that the
+/// omission names itself and the `null` does not.
 fn explicit_null_idempotency_key(raw: &serde_json::Value) -> Option<Problem> {
     if !raw
         .get("idempotency_key")
@@ -1012,11 +1013,10 @@ fn record_request_into_domain(req: CreateUsageRecordRequest) -> Result<CreateUsa
     let quantity = UsageQuantity::parse(&req.quantity)
         .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
 
-    let idempotency_key = req
-        .idempotency_key
-        .map(IdempotencyKey::new)
-        .transpose()
-        .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;
+    let idempotency_key = Some(
+        IdempotencyKey::new(req.idempotency_key)
+            .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?,
+    );
 
     let metadata = metadata_from_wire(req.metadata)
         .map_err(|err| Problem::from(usage_collector_error_to_canonical(err)))?;

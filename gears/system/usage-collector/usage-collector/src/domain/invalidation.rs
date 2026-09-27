@@ -21,11 +21,13 @@
 //!   nothing here re-derives a kind.
 //! * **Valid target** is the lookup that produces the `target` argument to
 //!   `verify_invalidation_target`, keyed by the identifier
-//!   `derive_invalidation_target` returns. (Both are crate-private, so this
-//!   module doc names them rather than linking them: an intra-doc link to a
-//!   private item resolves nowhere outside the build that defines it.) This
-//!   module is pure and reads nothing, so performing that lookup — and
-//!   rejecting a target that resolves to nothing — belongs to its caller.
+//!   `derive_invalidation_target` returns. (Named, not linked: both are
+//!   `pub(crate)`, and this module doc is public documentation, so a link
+//!   from here is a `rustdoc::private_intra_doc_links` warning — 35 in this
+//!   crate's doc build becomes 37. The same two are linked freely from the
+//!   private items below, which rustdoc does not lint.) This module is pure
+//!   and reads nothing, so performing that lookup — and rejecting a target
+//!   that resolves to nothing — belongs to its caller.
 //! * **No invalidation of an invalidation** is no check at all. The target's
 //!   identifier is derived with `entry_type = record`, so no identifier a
 //!   withdrawal resolves can belong to an invalidation: DESIGN §3.1 states
@@ -76,9 +78,22 @@ use uuid::Uuid;
 /// of rejected. The projection that follows rejects such a bound before it
 /// stamps anything, and the caller discards this value along with the
 /// submission: no identifier derived from an unvalidated period reaches a
-/// lookup, a response, or the store. The ADR's requirement is that no
-/// *entry* acquire an identity over an unvalidated period, and no entry
-/// does.
+/// lookup, a response, a metric label, or the store. The ADR's requirement
+/// is that no *entry* acquire an identity over an unvalidated period, and no
+/// entry does.
+///
+/// **One case is not merely discarded, and it is worth knowing before this
+/// order is copied elsewhere.**
+/// [`usage_collector_sdk::canonical_period_bound`] also carries a
+/// `debug_assert!` on the year being in `0..=9999`. A submission whose
+/// period is both out of that range and finer than the microsecond reaches
+/// the assert here, where the old order reached the projection's precision
+/// check first and returned `InvalidArgument` — so a debug or test build
+/// panics the request thread instead. It is unreachable over REST, because
+/// RFC 3339 cannot express such a year at all, and unreachable in a release
+/// build, which does not run the assert. It is reachable by an in-process
+/// caller constructing the bound directly, and that is the whole of the
+/// exposure.
 ///
 /// # Errors
 ///

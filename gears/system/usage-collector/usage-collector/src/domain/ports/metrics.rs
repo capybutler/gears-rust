@@ -349,17 +349,28 @@ pub enum RecordErrorCategory {
     /// `classify_record_error`.
     SemanticsViolation,
     /// An invalidation rejected against the entry it withdraws. DESIGN
-    /// §3.11.5 gives it "the copy, reference and at-most-one rules alone",
-    /// and this carries all three: the copy rule, the at-most-one rule, and
-    /// the target rule — a target that resolves to nothing. That last one is
-    /// a `NotFound` and used to fall to [`Self::SemanticsViolation`] for
-    /// want of a discriminator; `usage_collector_sdk::NotFoundReason`
-    /// supplies one, so the series no longer under-counts it.
+    /// §3.11.5 scopes it to "the target-resolution and copy rules alone, a
+    /// target not yet converged included" — **two** rules, not three. A
+    /// target that resolves to nothing is the first; it is a `NotFound` and
+    /// used to fall to [`Self::SemanticsViolation`] for want of a
+    /// discriminator, which `usage_collector_sdk::NotFoundReason` supplies,
+    /// so the series no longer under-counts it. An unfaithful copy is the
+    /// second.
     ///
-    /// A target that is itself an invalidation is no longer among them, and
+    /// **At-most-one-invalidation is not among them**, and the same sentence
+    /// says where it goes instead: "a second invalidation rejected as already
+    /// invalidated is `idempotency_conflict`, like any dedup conflict". The
+    /// arm in `crate::domain::service`'s `classify_record_error` still counts
+    /// it here, which contradicts that and is left alone deliberately — it is
+    /// pre-existing behaviour and the metric inventory is a later slice's.
+    /// This doc describes the spec, not that arm.
+    ///
+    /// A target that is itself an invalidation is not among them either, and
     /// not because it stopped counting here: the target's identifier is
-    /// derived with `entry_type = record`, so the case cannot arise (DESIGN
-    /// §3.1, "No invalidation of an invalidation").
+    /// derived with `entry_type = record`, so a caller cannot reach the case
+    /// at all (DESIGN §3.1, "No invalidation of an invalidation"). A store
+    /// that answers one anyway is a host-invariant breach and counts as a
+    /// plugin fault, not as an invalidation rule.
     ///
     /// A period-bound rejection is not an invalidation rule for either
     /// entry type, because the bound belongs to the path rather than to the

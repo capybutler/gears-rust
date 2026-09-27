@@ -1017,8 +1017,8 @@ mod invalidation_target_batch_tests {
     use toolkit_gts::gts_id;
 
     use usage_collector_sdk::{
-        ConflictReason, CreateUsageRecord, EntryType, IdempotencyKey, MetadataKey, MeterTypeId,
-        ReasonCode, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
+        ConflictReason, CreateUsageRecord, EntryType, IdempotencyKey, Invalidation, MetadataKey,
+        MeterTypeId, ReasonCode, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
         UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, ValidationReason,
     };
     use uuid::Uuid;
@@ -1773,6 +1773,64 @@ mod invalidation_target_batch_tests {
                  submission copies it faithfully and would otherwise be \
                  accepted; got {other:?}",
             ),
+        }
+        assert!(
+            plugin.last_create_records_input().is_none(),
+            "the breach MUST short-circuit before the persist SPI",
+        );
+    }
+
+    /// A plugin answering the derived identifier with a row that is itself
+    /// an invalidation MUST be refused, not believed.
+    ///
+    /// The identifier was derived with `entry_type = record`, so DESIGN §3.1
+    /// says the case cannot arise and needs no rule — and it does not arise
+    /// from anything a caller can send. A store that answers one anyway is
+    /// contradicting its own identifier, and the row is programmed to be a
+    /// faithful copy in every compared field so that without this guard the
+    /// entry is **accepted** and a withdrawal of a withdrawal is persisted.
+    /// A host-invariant breach, not a caller fault, so it is `Internal` and
+    /// names only the identifier the gateway asked for.
+    #[tokio::test]
+    async fn a_plugin_answering_with_an_invalidation_row_is_refused_not_believed() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x50E);
+        let target = target_id(tenant_id, "idem-corrupt-row");
+        let mut row = target_row(tenant_id, "idem-corrupt-row");
+        row.invalidation = Some(Invalidation {
+            target: Uuid::from_u128(0x61F),
+            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+        });
+        assert_eq!(
+            row.id, target,
+            "test premise: the row answers the derived id"
+        );
+        plugin.set_get_record_for(target, row);
+
+        // Programmed so a gateway that believed the row returns `Ok(..)` —
+        // the false accept — rather than tripping over an unprogrammed SPI
+        // and reporting the wrong defect.
+        let submission = withdrawal_of(tenant_id, "idem-corrupt-row");
+        plugin.set_create_records(vec![Ok(projected(&submission))]);
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
+            "test.target.invalidation_row.records.v1",
+        );
+
+        let results = service
+            .create_usage_records(&authenticated_ctx(), vec![submission])
+            .await
+            .expect("batch dispatch succeeded");
+
+        match results[0].as_ref() {
+            Err(UsageCollectorError::Internal { detail }) => assert!(
+                detail.contains(&target.to_string()),
+                "the breach MUST name the id the gateway asked for: {detail}",
+            ),
+            other => {
+                panic!("a row contradicting its own identifier MUST NOT be believed; got {other:?}")
+            }
         }
         assert!(
             plugin.last_create_records_input().is_none(),
@@ -2709,9 +2767,10 @@ mod create_usage_record_path_tests {
     use toolkit_gts::gts_id;
 
     use usage_collector_sdk::{
-        ConflictReason, CreateUsageRecord, EntryType, IdempotencyKey, MetadataKey, MeterTypeId,
-        ReasonCode, RecordOrigin, ResourceRef, USAGE_RECORD_RESOURCE, UsageCollectorError,
-        UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord, ValidationReason,
+        ConflictReason, CreateUsageRecord, EntryType, IdempotencyKey, Invalidation, MetadataKey,
+        MeterTypeId, ReasonCode, RecordOrigin, ResourceRef, USAGE_RECORD_RESOURCE,
+        UsageCollectorError, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
+        ValidationReason,
     };
     use uuid::Uuid;
 
@@ -3013,7 +3072,7 @@ mod create_usage_record_path_tests {
 
         let service = service_with_permit(
             Arc::clone(&plugin) as _,
-            "test.singular.target_not_record.records.v1",
+            "test.singular.withdrawal_of_a_withdrawal.records.v1",
         );
 
         service
@@ -3028,6 +3087,55 @@ mod create_usage_record_path_tests {
             plugin.get_usage_record_inputs(),
             vec![measurement.id],
             "the derivation asks for the measurement, never for the withdrawal",
+        );
+    }
+
+    /// The singular path's mirror of the batch pre-pass's row-contradiction
+    /// guard: a plugin answering the derived identifier with a row that is
+    /// itself an invalidation is refused as a host-invariant breach. No
+    /// caller can reach the case — the identifier is derived with
+    /// `entry_type = record` — so the only way here is a store contradicting
+    /// its own identifier, and the submission is a faithful copy of what
+    /// came back, so without the guard it is accepted.
+    #[tokio::test]
+    async fn create_usage_record_refuses_a_plugin_that_answers_with_an_invalidation_row() {
+        let plugin = HappyPathPlugin::new();
+        let tenant_id = Uuid::from_u128(0x70C);
+        let target = target_id(tenant_id, "idem-corrupt-row");
+        let mut row = target_row(tenant_id, "idem-corrupt-row");
+        row.invalidation = Some(Invalidation {
+            target: Uuid::from_u128(0x81F),
+            reason: ReasonCode::new("emitter_defect").expect("valid reason code"),
+        });
+        assert_eq!(
+            row.id, target,
+            "test premise: the row answers the derived id"
+        );
+        plugin.set_get_record(row);
+
+        let submission = counter_withdrawal(tenant_id, "idem-corrupt-row");
+        plugin.set_create_record(projected(&submission));
+
+        let service = service_with_permit(
+            Arc::clone(&plugin) as _,
+            "test.singular.invalidation_row.records.v1",
+        );
+
+        let err = service
+            .create_usage_record(&authenticated_ctx(), submission)
+            .await
+            .expect_err("a row contradicting its own identifier MUST surface as Err");
+
+        match err {
+            UsageCollectorError::Internal { detail } => assert!(
+                detail.contains(&target.to_string()),
+                "the breach MUST name the id the gateway asked for: {detail}"
+            ),
+            other => panic!("expected a host-invariant breach, got {other:?}"),
+        }
+        assert!(
+            plugin.last_create_record_input().is_none(),
+            "the breach MUST short-circuit before the persist SPI",
         );
     }
 

@@ -1108,19 +1108,18 @@ async fn an_explicit_null_key_on_an_invalidation_is_refused_as_a_missing_key() {
 }
 
 #[tokio::test]
-async fn an_explicit_null_key_outranks_the_entrys_other_faults() {
-    // The pre-check runs before the entry is decoded, and that ordering is
-    // the whole of what it contributes: serde reads `null` into the DTO's
-    // `Option<String>` as an absent key and the projection refuses it with
-    // the same error, so a body wrong about nothing else is answered
-    // identically either way. This body is wrong about two things at once,
-    // which is the only shape that can tell the two apart — without the
-    // pre-check it is told about `gts_type_id`.
+async fn an_explicit_null_key_outranks_a_fault_serde_would_have_named() {
+    // Two shapes are at work and both matter. Without the pre-check, `null`
+    // against a `String` property is a serde *type* error naming no property
+    // at all, so the violation lands on `records` — that is what the two
+    // tests above pin. This one pins the ordering on top of it: the entry
+    // also carries an unknown field, which serde does name, so a decode
+    // reached first would answer `bogus`. The key wins.
     let item = dispatch_null_key_body(
         "test.handler.create_records.null_key_precedence.v1",
         serde_json::json!({
             "idempotency_key": null,
-            "gts_type_id": "not-a-valid-prefix",
+            "bogus": true,
         }),
     )
     .await;
@@ -1135,6 +1134,9 @@ async fn an_explicit_null_key_outranks_the_entrys_other_faults() {
 
 #[tokio::test]
 async fn an_explicit_null_key_on_a_record_is_refused_as_validation() {
+    // The property is typed `String`, so a `null` is a serde type error that
+    // names nothing; `explicit_null_idempotency_key` is the only reason this
+    // is answered on `idempotency_key` rather than on `records`.
     let item = dispatch_null_key_body(
         "test.handler.create_records.null_key_record.v1",
         serde_json::json!({ "idempotency_key": null }),

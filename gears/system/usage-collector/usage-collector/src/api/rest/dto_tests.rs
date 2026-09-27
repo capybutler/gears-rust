@@ -278,6 +278,65 @@ fn create_usage_record_request_optional_metadata_defaults_to_empty_map() {
 }
 
 #[test]
+fn the_served_schema_requires_every_property_the_contract_requires() {
+    // Asserted against the **served document**, not against the struct.
+    // `required` is emitted from whether a field is an `Option`, so a field
+    // that decodes strictly can still be published as optional if it is
+    // typed `Option<_>` with a `serde` default — the caller reads the
+    // schema, sees the property is optional, omits it, and is refused. The
+    // only way to catch that is to read what `api_dto` emits.
+    //
+    // The list is `usage-collector-v1.yaml` `CreateUsageRecordRequest`'s own
+    // `required`, sorted. `entry_type` and `idempotency_key` are the two
+    // this slice put there.
+    let schema =
+        serde_json::to_value(<CreateUsageRecordRequest as utoipa::PartialSchema>::schema())
+            .expect("the request schema serializes");
+    let mut required: Vec<&str> = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .expect("the emitted object schema carries a `required` list")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    required.sort_unstable();
+    assert_eq!(
+        required,
+        vec![
+            "entry_type",
+            "gts_type_id",
+            "idempotency_key",
+            "quantity",
+            "resource_ref",
+            "tenant_id",
+            "window_end",
+            "window_start",
+        ],
+    );
+}
+
+#[test]
+fn create_usage_record_request_requires_the_idempotency_key() {
+    // `idempotency_key` is in the schema's `required` list on both branches
+    // (`usage-collector-v1.yaml` `CreateUsageRecordRequest`), and the DTO
+    // types it `String` so the served document says so too. A body omitting
+    // it fails as a missing field rather than decoding to an absent key that
+    // some later layer refuses, and the failure names the property, which is
+    // what lets the batch edge attribute it.
+    let mut json = minimal_create_record_json();
+    json.as_object_mut()
+        .expect("object")
+        .remove("idempotency_key")
+        .expect("fixture carries the key");
+    let err = serde_json::from_value::<CreateUsageRecordRequest>(json)
+        .expect_err("a body omitting idempotency_key MUST be rejected");
+    assert!(
+        err.to_string().contains("idempotency_key"),
+        "the failure MUST name the missing property (got `{err}`)",
+    );
+}
+
+#[test]
 fn create_usage_record_request_optional_reason_code_defaults_to_none() {
     // Pin `#[serde(default)]` on `reason_code`: an ordinary measurement
     // carries none, so a body omitting it must deserialize rather than fail
@@ -310,8 +369,7 @@ fn create_usage_record_request_carries_a_withdrawals_two_departures() {
     assert_eq!(req.entry_type, "invalidation");
     assert_eq!(req.reason_code.as_deref(), Some(SAMPLE_REASON_CODE));
     assert_eq!(
-        req.idempotency_key.as_deref(),
-        Some(SAMPLE_IDEMPOTENCY_KEY),
+        req.idempotency_key, SAMPLE_IDEMPOTENCY_KEY,
         "a withdrawal repeats its target's key; no prefix is reserved",
     );
 }

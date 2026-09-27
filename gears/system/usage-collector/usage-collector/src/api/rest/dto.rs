@@ -82,11 +82,22 @@ impl TryFrom<SubjectRefDto> for SubjectRef {
 }
 
 /// Per-record create payload. Carries `gts_type_id` and `entry_type` as
-/// permissive `String`s so a bad value surfaces as the per-record `Problem`
-/// instead of axum's default `text/plain` 422 for the entire batch.
-/// per-record problem envelopes still surface for closed-shape membership,
-/// size-cap, and key validation. Intentionally has no identity field: `id`
-/// is gateway-derived via `usage_collector_sdk::derive_usage_record_id`,
+/// permissive `String`s so that a bad value is **attributed to the property
+/// it came from**: `decode_record_entry` reads the offending property out of
+/// serde's message, and `serde_field_name` recognises only ``unknown field
+/// `…` `` and ``missing field `…` ``. A typed field's own refusal says
+/// ``unknown variant `correction` ``, which matches neither, so the
+/// violation would land on `records` and leave the caller diffing a whole
+/// entry. Parsed at the fold point instead, the rejection names
+/// `entry_type` or `gts_type_id`.
+///
+/// It is **not** about the batch surviving: `CreateUsageRecordsRequest`
+/// carries its entries as `serde_json::Value` and both ingestion routes are
+/// batch-only, so axum's `Json` extractor never decodes an entry's fields
+/// and a typed field here could not collapse a request either way. Per-record
+/// problem envelopes still surface for closed-shape membership, size-cap,
+/// and key validation. Intentionally has no identity field: `id` is
+/// gateway-derived via `usage_collector_sdk::derive_usage_record_id`,
 /// mirroring the `UsageRecord::id` doc.
 ///
 /// `deny_unknown_fields` is the schema's `additionalProperties: false`
@@ -110,9 +121,10 @@ pub struct CreateUsageRecordRequest {
     /// identity apart from the identity of the entry it withdraws.
     ///
     /// Carried as a permissive `String` for [`Self::gts_type_id`]'s reason:
-    /// an unrecognised value is folded into a per-record `Problem` naming
-    /// `entry_type`, rather than collapsing a whole batch at the codec
-    /// boundary.
+    /// an unrecognised value is parsed and refused at the fold point, where
+    /// the violation can name `entry_type`. Typed here, serde would refuse
+    /// it as an unknown *variant*, which the property-name reader does not
+    /// recognise, and the caller would be told only that `records` is wrong.
     pub entry_type: String,
     pub gts_type_id: String,
     pub tenant_id: Uuid,
@@ -126,17 +138,19 @@ pub struct CreateUsageRecordRequest {
     /// domain type, so an out-of-range value rejects its own entry rather
     /// than the whole batch.
     pub quantity: String,
-    /// The caller's key, **required on both entry kinds**. A withdrawal
-    /// repeats its target's key rather than deriving one of its own: that
-    /// is what lets the gateway find the target from the submission alone
-    /// (DESIGN §3.1, "Target resolution"). No prefix is reserved.
+    /// The caller's key. Not an `Option`, because the schema lists it in
+    /// `required` on **both** branches: a withdrawal repeats its target's key
+    /// rather than deriving one of its own, and that repetition is what lets
+    /// the gateway find the target from the submission alone (DESIGN §3.1,
+    /// "Target resolution"). No prefix is reserved.
     ///
-    /// An explicit `null` is refused rather than read as an absent key
-    /// (`explicit_null_idempotency_key`); an absent one is refused by the
-    /// SDK projection, naming `idempotency_key`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub idempotency_key: Option<String>,
+    /// Typed rather than defaulted so the served schema says so too. A body
+    /// omitting the property fails to decode as ``missing field
+    /// `idempotency_key` ``, which `serde_field_name` recognises, so the
+    /// caller is told which property is absent. An explicit `null` decodes
+    /// to a *type* error naming no property at all, which is why
+    /// `explicit_null_idempotency_key` runs ahead of the decode.
+    pub idempotency_key: String,
     /// Why the withdrawal was issued. Required when [`Self::entry_type`] is
     /// `invalidation` and MUST NOT appear on a `record` (DESIGN §3.1,
     /// "Entry type and reason code"). The two are caller-supplied halves of
