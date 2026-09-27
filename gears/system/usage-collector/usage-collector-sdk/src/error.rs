@@ -1064,7 +1064,11 @@ pub enum UsageCollectorPluginError {
     /// `get_usage_record`, or the target of a submitted invalidation.
     #[error("usage record not found: {id}")]
     UsageRecordNotFound {
-        /// Caller-supplied target `UsageRecord.id`.
+        /// The `UsageRecord.id` the lookup asked for. Caller-supplied on
+        /// `get_usage_record`; on an invalidation's target lookup it is
+        /// derived from the withdrawal's own identity inputs with
+        /// `entry_type = record`, never sent
+        /// (`cpt-cf-usage-collector-adr-record-identity-derivation`).
         id: Uuid,
     },
 
