@@ -108,8 +108,9 @@ pub enum UsageCollectorError {
     /// `ORDER_WITH_CURSOR` to `toolkit_odata`: the gear no longer
     /// originates any of them, because a second declaration is a second
     /// place the same code can be read and disagree. `source` is the
-    /// upstream error and is the only thing that decides the wire `field`
-    /// and `reason`; the host lift obtains both by converting it.
+    /// upstream error and is the sole source of the wire `field` and
+    /// `reason` for a cursor defect `toolkit_odata` detects; the host lift
+    /// obtains both by converting it.
     ///
     /// `detail` is the gear's own, and is why this variant carries two
     /// things rather than one. Upstream's descriptions name the condition
@@ -122,7 +123,13 @@ pub enum UsageCollectorError {
     #[error("cursor rejected [{source}]: {detail}")]
     CursorRejected {
         /// The upstream cursor error. Sole source of the wire `field` and
-        /// `reason`.
+        /// `reason` for a cursor defect `toolkit_odata` detects — a malformed
+        /// token or a changed filter. An order supplied alongside a cursor is
+        /// intercepted upstream before this gear's handler runs and so never
+        /// reaches `source` (see [`crate::reason::ValidationReason`]'s
+        /// documentation for why). A retention refusal is not one of those
+        /// defects either: the plugin raises it and it lifts to
+        /// `InvalidArgument` carrying `ValidationReason::CursorBeyondRetention`.
         source: toolkit_odata::Error,
         /// Gear-authored caller guidance, rendered as the violation
         /// description.
@@ -1000,6 +1007,25 @@ pub enum UsageCollectorPluginError {
         /// The `UsageRecord.id` the lookup named.
         id: Uuid,
     },
+
+    /// A cursor names a position after which retention has already removed an
+    /// entry of a subscribed GTS type, so the continuation cannot be served
+    /// whole.
+    ///
+    /// The plugin decides this from what it still holds, not from the cursor's
+    /// own age — a sweep clamps that age to the retention boundary, so an age
+    /// test would serve a silently truncated range. Refusing is the contract:
+    /// `DESIGN.md` §3.3 lifts it to
+    /// [`UsageCollectorError::InvalidArgument`] carrying
+    /// [`crate::reason::ValidationReason::CursorBeyondRetention`] against the
+    /// `cursor` field.
+    ///
+    /// Carries no detail, matching `DESIGN.md` §3.3's table, which names the
+    /// variant bare. The operator-facing description is the gateway's to
+    /// author, because the refusal is a caller-actionable argument fault
+    /// rather than a backend failure.
+    #[error("the cursor names a position retention has already passed")]
+    CursorBeyondRetention,
 
     /// Non-retryable unclassified plugin-side failure (plugin invariant
     /// broken, uncategorized backend error). Use [`Self::Transient`] for

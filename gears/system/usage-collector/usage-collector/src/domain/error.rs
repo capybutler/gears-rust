@@ -103,6 +103,11 @@ pub enum DomainError {
     #[error("invalidation target {target} has not converged")]
     TargetNotConverged { target: Uuid },
 
+    /// A storage plugin refused a cursor because retention has already removed
+    /// an entry the continuation would have to deliver.
+    #[error("cursor names a position retention has already passed")]
+    CursorBeyondRetention,
+
     /// A dispatched invalidation collided with a stored invalidation of the
     /// same target under another reason code. Built by
     /// [`lift_dispatch_error`], never by the context-free `From`.
@@ -315,6 +320,7 @@ impl From<UsageCollectorPluginError> for DomainError {
             UsageCollectorPluginError::UsageRecordNotConverged { id } => Self::Internal(format!(
                 "storage plugin answered UsageRecordNotConverged for {id} outside a converged-only lookup"
             )),
+            UsageCollectorPluginError::CursorBeyondRetention => Self::CursorBeyondRetention,
             other => Self::Internal(other.to_string()),
         }
     }
@@ -329,6 +335,7 @@ fn is_plugin_error_exhaustive_today(e: &UsageCollectorPluginError) -> bool {
             | UsageCollectorPluginError::IdempotencyConflict { .. }
             | UsageCollectorPluginError::UsageRecordNotFound { .. }
             | UsageCollectorPluginError::UsageRecordNotConverged { .. }
+            | UsageCollectorPluginError::CursorBeyondRetention
     )
 }
 
@@ -405,6 +412,16 @@ impl From<DomainError> for UsageCollectorError {
                 field: "metadata".to_owned(),
                 reason: ValidationReason::MetadataValidation,
                 detail,
+            },
+            DomainError::CursorBeyondRetention => Self::InvalidArgument {
+                resource_type: USAGE_RECORD_RESOURCE.to_owned(),
+                resource_name: None,
+                field: "cursor".to_owned(),
+                reason: ValidationReason::CursorBeyondRetention,
+                detail: "retention has removed an entry after the position this cursor names, so \
+                         the continuation cannot be served whole; restart the subscription from \
+                         its oldest retained position"
+                    .to_owned(),
             },
             DomainError::TypesRegistryUnavailable(_) => Self::types_registry_unavailable(),
             DomainError::Internal(reason) => Self::internal(reason),

@@ -423,3 +423,31 @@ fn a_conflict_reaching_the_context_free_lift_is_internal() {
     let err = UsageCollectorPluginError::idempotency_conflict("idem-stored", stored_entry(None));
     assert!(matches!(DomainError::from(err), DomainError::Internal(_)));
 }
+
+#[test]
+fn a_plugin_cursor_refusal_lifts_to_an_invalid_argument_on_the_cursor_field() {
+    let domain: DomainError = UsageCollectorPluginError::CursorBeyondRetention.into();
+    let public: UsageCollectorError = domain.into();
+
+    match public {
+        UsageCollectorError::InvalidArgument {
+            field,
+            reason,
+            ref detail,
+            ..
+        } => {
+            assert_eq!(field, "cursor");
+            assert_eq!(reason, ValidationReason::CursorBeyondRetention);
+            assert!(
+                !detail.is_empty(),
+                "the reason is typed but the description is the gateway's to author, so it must \
+                 say something actionable"
+            );
+        }
+        other => panic!(
+            "DESIGN section 3.3 lifts CursorBeyondRetention to InvalidArgument(\
+             CursorBeyondRetention); it must not reach CursorRejected, whose reason comes only \
+             from toolkit_odata. Got: {other:?}"
+        ),
+    }
+}

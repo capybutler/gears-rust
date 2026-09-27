@@ -160,6 +160,7 @@ fn every_wire_constant_spells_its_own_identifier() {
         QUANTITY_OUT_OF_RANGE,
         RESERVED_KEY_PREFIX,
         KEY_ON_INVALIDATION,
+        CURSOR_BEYOND_RETENTION,
         IDEMPOTENCY_CONFLICT,
         ALREADY_INVALIDATED,
         TARGET_NOT_CONVERGED,
@@ -206,5 +207,22 @@ fn every_wire_constant_spells_its_own_identifier() {
         "every `pub const` in reason.rs needs a row in this table: reason.rs \
          declares {declared} and this table pins {}",
         pinned.len(),
+    );
+}
+
+#[test]
+fn cursor_beyond_retention_round_trips_through_its_wire_spelling() {
+    use crate::reason::{CURSOR_BEYOND_RETENTION, ValidationReason};
+
+    assert_eq!(CURSOR_BEYOND_RETENTION, "CURSOR_BEYOND_RETENTION");
+    assert_eq!(
+        ValidationReason::from_wire(CURSOR_BEYOND_RETENTION),
+        ValidationReason::CursorBeyondRetention,
+        "usage-collector-v1.yaml publishes CURSOR_BEYOND_RETENTION as a cursor field violation, \
+         so the typed reason must decode from exactly that spelling"
+    );
+    assert_eq!(
+        ValidationReason::CursorBeyondRetention.as_wire(),
+        CURSOR_BEYOND_RETENTION
     );
 }

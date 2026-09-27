@@ -89,6 +89,14 @@ pub const RESERVED_KEY_PREFIX: &str = "RESERVED_KEY_PREFIX";
 /// An invalidation carried an idempotency key. Its key is always derived as
 /// `inv:` followed by the target id, so a supplied one is refused.
 pub const KEY_ON_INVALIDATION: &str = "KEY_ON_INVALIDATION";
+/// A feed cursor names a position after which retention has already
+/// removed an entry the read would have had to deliver.
+///
+/// Published by `usage-collector-v1.yaml` as a `cursor` field violation. The
+/// storage plugin decides it from what it still holds rather than from the
+/// cursor's age, and `DESIGN.md` §3.3 lifts the plugin's
+/// `CursorBeyondRetention` onto an `InvalidArgument` carrying this reason.
+pub const CURSOR_BEYOND_RETENTION: &str = "CURSOR_BEYOND_RETENTION";
 
 /// Typed view of the `field_violations[].reason` codes carried by
 /// [`crate::UsageCollectorError::InvalidArgument`].
@@ -148,6 +156,8 @@ pub enum ValidationReason {
     ReservedKeyPrefix,
     /// See [`KEY_ON_INVALIDATION`].
     KeyOnInvalidation,
+    /// See [`CURSOR_BEYOND_RETENTION`].
+    CursorBeyondRetention,
     /// Unmodeled / future reason — preserves the raw wire string.
     Unknown(String),
 }
@@ -175,6 +185,7 @@ impl ValidationReason {
             QUANTITY_OUT_OF_RANGE => Self::QuantityOutOfRange,
             RESERVED_KEY_PREFIX => Self::ReservedKeyPrefix,
             KEY_ON_INVALIDATION => Self::KeyOnInvalidation,
+            CURSOR_BEYOND_RETENTION => Self::CursorBeyondRetention,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -201,6 +212,7 @@ impl ValidationReason {
             Self::QuantityOutOfRange => QUANTITY_OUT_OF_RANGE,
             Self::ReservedKeyPrefix => RESERVED_KEY_PREFIX,
             Self::KeyOnInvalidation => KEY_ON_INVALIDATION,
+            Self::CursorBeyondRetention => CURSOR_BEYOND_RETENTION,
             Self::Unknown(s) => s.as_str(),
         }
     }
