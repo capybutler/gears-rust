@@ -70,7 +70,7 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 /// lock. Ingest waits on two: the `usage_acceptance_sequence` row for the
 /// entry's `(tenant_id, gts_type_id)` scope, which every write claims from, and
 /// the speculative tuple an `INSERT ... ON CONFLICT ... DO NOTHING` meets when
-/// a not-yet-committed duplicate of the same dedup 5-tuple is in flight. The
+/// a not-yet-committed duplicate of the same dedup 6-tuple is in flight. The
 /// wait then fails fast (`55P03 lock_not_available`) instead of blocking on —
 /// and pinning — a pooled connection.
 ///

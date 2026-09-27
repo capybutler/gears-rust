@@ -105,14 +105,14 @@ fn withdrawal(
     }
 }
 
-// --- The dedup identity (the 5-tuple) ---
+// --- The dedup identity (the 6-tuple) ---
 
 #[test]
-fn the_dedup_key_is_the_five_tuple() {
+fn the_dedup_key_is_the_six_tuple() {
     let tenant = uuid::Uuid::from_u128(2);
     let base = unit_record(tenant, "same", 100);
 
-    // The five components, named rather than re-derived: two entries differing
+    // The six components, named rather than re-derived: two entries differing
     // in any one of them are distinct entries, not retries of each other.
     let mut other_tenant = unit_record(uuid::Uuid::from_u128(3), "same", 100);
     other_tenant.window_start = base.window_start;
@@ -136,7 +136,7 @@ fn the_dedup_key_is_the_five_tuple() {
     assert_ne!(
         dedup_key(&base),
         dedup_key(&shifted_start),
-        "window_start is one of the five dedup-identity inputs, so two entries \
+        "window_start is one of the six dedup-identity inputs, so two entries \
          differing only in it are distinct entries, not a retry"
     );
 
@@ -146,6 +146,16 @@ fn the_dedup_key_is_the_five_tuple() {
         dedup_key(&base),
         dedup_key(&shifted_end),
         "window_end is the fifth dedup-identity input"
+    );
+
+    // The sixth. A withdrawal repeats its target's other five, so a key that
+    // left the entry type out would make every withdrawal a retry of the entry
+    // it withdraws -- which is the whole defect this component exists to stop.
+    assert_ne!(
+        dedup_key(&base),
+        dedup_key(&withdrawal(tenant, "same", 101, base.id)),
+        "entry_type is the sixth dedup-identity input, and a withdrawal shares \
+         the other five with its target"
     );
 
     // ...and nothing else is in the key. `quantity` is a compared canonical
@@ -173,6 +183,7 @@ fn the_dedup_key_names_the_canonical_microsecond_bounds() {
             "k".to_owned(),
             WINDOW_START_CANONICAL.to_owned(),
             WINDOW_END_CANONICAL.to_owned(),
+            0,
         )
     );
 }
@@ -455,7 +466,10 @@ fn record_columns_and_insert_columns_name_the_same_set() {
     );
     assert!(
         !names(RECORD_COLUMNS).contains(&"entry_type"),
-        "entry_type is a generated column; nothing reads or writes it"
+        "entry_type is a generated column: no insert binds it and no select \
+         decodes it. It is named in the dedup arbiter and in the conflict \
+         read-back's predicate, where Postgres evaluates it, never carried on \
+         a row -- the mapper projects the model's entry type from `invalidates`"
     );
     assert_eq!(
         names(INSERT_COLUMNS).last(),
@@ -490,9 +504,9 @@ fn the_single_insert_binds_one_placeholder_per_inserted_column() {
     );
     assert!(
         sql.contains(
-            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key)"
+            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key)"
         ),
-        "the arbiter is the dedup 5-tuple: {sql}"
+        "the arbiter is the dedup 6-tuple: {sql}"
     );
 }
 
@@ -553,9 +567,9 @@ fn the_batch_insert_names_one_column_sequence_in_all_three_places() {
     // but an arbiter hardcoded into this one alone would otherwise pass.
     assert!(
         sql.contains(
-            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key)"
+            "ON CONFLICT (tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key)"
         ),
-        "the batch arbiter is the dedup 5-tuple too: {sql}"
+        "the batch arbiter is the dedup 6-tuple too: {sql}"
     );
 }
 
@@ -609,21 +623,21 @@ fn plan_batch_collapses_and_sorts_distinct_keys() {
     );
 }
 
-/// A withdrawal of `target` under its derived `inv:<target>` key, as the
-/// gateway dispatches it.
+/// A withdrawal carrying its target's idempotency key, as the gateway
+/// dispatches it: the pair departs in the entry type alone.
 fn derived_withdrawal(
     tenant: uuid::Uuid,
     seq: u128,
     target: uuid::Uuid,
+    target_key: &str,
     reason: &str,
 ) -> usage_collector_sdk::UsageRecord {
     usage_collector_sdk::UsageRecord {
-        idempotency_key: usage_collector_sdk::IdempotencyKey::for_invalidation(target),
         invalidation: Some(usage_collector_sdk::Invalidation {
             target,
             reason: usage_collector_sdk::ReasonCode::new(reason).expect("valid reason code"),
         }),
-        ..unit_record(tenant, "placeholder", seq)
+        ..unit_record(tenant, target_key, seq)
     }
 }
 
@@ -632,9 +646,9 @@ fn plan_batch_collapses_two_withdrawals_of_one_target_onto_one_slot() {
     let tenant = uuid::Uuid::from_u128(0xC1);
     let target = uuid::Uuid::from_u128(0xC100);
     let records = vec![
-        derived_withdrawal(tenant, 0xC101, target, "duplicate_submission"),
+        derived_withdrawal(tenant, 0xC101, target, "tgt", "duplicate_submission"),
         unit_record(tenant, "plain", 0xC102),
-        derived_withdrawal(tenant, 0xC101, target, "late_correction"),
+        derived_withdrawal(tenant, 0xC101, target, "tgt", "late_correction"),
     ];
 
     let plan = plan_batch(&records);
@@ -649,6 +663,42 @@ fn plan_batch_collapses_two_withdrawals_of_one_target_onto_one_slot() {
         plan.first_index[&dedup_key(&records[0])],
         0,
         "the earlier withdrawal holds it"
+    );
+}
+
+#[test]
+fn plan_batch_gives_a_record_and_its_withdrawal_two_slots() {
+    // The converse of the test above, and the one the five-component key got
+    // wrong: a withdrawal repeats its target's tenant, meter, idempotency key
+    // and covered period, so a plan that keyed on those alone would collapse
+    // the pair onto one slot, insert the record, and resolve the withdrawal
+    // against it as an idempotency conflict -- without the database ever being
+    // asked.
+    let tenant = uuid::Uuid::from_u128(0xC2);
+    let target = unit_record(tenant, "tgt", 0xC200);
+    let records = vec![
+        target.clone(),
+        derived_withdrawal(tenant, 0xC201, target.id, "tgt", "duplicate_submission"),
+    ];
+
+    let plan = plan_batch(&records);
+
+    assert_ne!(
+        dedup_key(&records[0]),
+        dedup_key(&records[1]),
+        "the pair departs in the entry type, the sixth identity component"
+    );
+    assert_eq!(
+        plan.reps.len(),
+        2,
+        "a record and the withdrawal that names it are two identities, so two \
+         slots -- neither swallows the other"
+    );
+    assert_eq!(
+        plan.reps[0].id, target.id,
+        "and the record sorts first, so the acceptance-sequence block hands it \
+         the lower value: the gear's DESIGN 3.1 Feed order invariant reads \
+         'Correction order: an invalidation follows its target'"
     );
 }
 
@@ -889,11 +939,11 @@ async fn resolve_batch_resolves_a_second_withdrawal_against_the_first() {
     let store = lazy_store();
     let tenant = uuid::Uuid::from_u128(0xB5);
     let target = uuid::Uuid::from_u128(0xB500);
-    let first = derived_withdrawal(tenant, 0xB501, target, "duplicate_submission");
+    let first = derived_withdrawal(tenant, 0xB501, target, "tgt", "duplicate_submission");
     let records = vec![
         first.clone(),
         first.clone(),
-        derived_withdrawal(tenant, 0xB501, target, "late_correction"),
+        derived_withdrawal(tenant, 0xB501, target, "tgt", "late_correction"),
     ];
     let plan = plan_batch(&records);
     let inserted: HashMap<DedupKey, UsageRecordRow> = HashMap::from([(

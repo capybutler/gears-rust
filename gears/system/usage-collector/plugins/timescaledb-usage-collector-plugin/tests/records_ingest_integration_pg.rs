@@ -46,8 +46,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    IdempotencyKey, Invalidation, MetadataKey, ReasonCode, RecordOrigin, ResourceRef, SubjectRef,
-    UsageCollectorPluginError, UsageRecord,
+    EntryType, IdempotencyKey, Invalidation, MetadataKey, ReasonCode, RecordOrigin, ResourceRef,
+    SubjectRef, UsageCollectorPluginError, UsageRecord,
 };
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
@@ -330,11 +330,11 @@ async fn a_divergent_same_key_write_is_an_idempotency_conflict() {
     let first = common::entry(&meter, tenant, "idem-conflict", Decimal::new(1, 0));
     let first = store.create(first).await.expect("first create");
 
-    // Same five dedup inputs, different quantity: canonically unequal.
+    // Same six dedup inputs, different quantity: canonically unequal.
     let divergent = common::entry(&meter, tenant, "idem-conflict", Decimal::new(2, 0));
     assert_eq!(
         divergent.id, first.id,
-        "the two share all five dedup-identity inputs, so they share an identifier"
+        "the two share all six dedup-identity inputs, so they share an identifier"
     );
 
     let err = store
@@ -484,8 +484,9 @@ async fn a_second_withdrawal_with_the_same_reason_is_absorbed() {
     );
 }
 
-/// A second withdrawal under **another** reason code collides on the derived
-/// `inv:<target>` key and conflicts, carrying the accepted withdrawal.
+/// A second withdrawal under **another** reason code repeats the first's six
+/// identity inputs -- the target's five plus `entry_type = invalidation` -- so
+/// it collides and conflicts, carrying the accepted withdrawal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_withdrawal_with_another_reason_conflicts_carrying_the_first() {
     let (h, store, provider, exporter) = setup_metered().await;
@@ -1260,10 +1261,18 @@ async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
             &IdempotencyKey::new("bind-order-target").expect("valid key"),
             window_start,
             window_end,
+            EntryType::Record,
         )
     );
 
-    let withdrawal = UsageRecord {
+    // A faithful withdrawal: it repeats its target's idempotency key and
+    // covered period, so the two rows agree on five of the six identity
+    // components and depart in the entry type alone. `rederive` restamps the
+    // identity over that sixth input, which is what keeps the pair two rows
+    // rather than one. Its attribution and metadata are deliberately left at
+    // the fixture defaults rather than copied from the target, so a `text[]`
+    // bind transposed between the two rows still shows up by value below.
+    let withdrawal = common::rederive(UsageRecord {
         invalidation: Some(Invalidation {
             target: target.id,
             reason: ReasonCode::new("late_correction").expect("valid reason code"),
@@ -1271,12 +1280,16 @@ async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
         ..common::entry_over(
             &meter,
             tenant,
-            "bind-order-withdrawal",
+            "bind-order-target",
             target.quantity.as_decimal(),
             window_start,
             window_end,
         )
-    };
+    });
+    assert_ne!(
+        withdrawal.id, target.id,
+        "the entry type is the sixth identity input, so the pair are two rows"
+    );
 
     let results = store
         .create_batch(vec![target.clone(), withdrawal.clone()])
@@ -1332,8 +1345,8 @@ async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
         "reason_code"
     );
     assert_eq!(
-        w.idempotency_key, "bind-order-withdrawal",
-        "idempotency_key"
+        w.idempotency_key, "bind-order-target",
+        "idempotency_key: a withdrawal repeats its target's"
     );
     assert_eq!(w.origin, "live", "origin");
     assert_eq!(w.subject_id, None, "subject_id");

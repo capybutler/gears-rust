@@ -42,9 +42,9 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, SortDir, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, MetadataFilter,
-    MeterTypeId, TimeRange, UsageCollectorPluginError, UsageRecord, UsageRecordFilterField,
-    canonical_period_bound, is_keyset_safe_record_field,
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, EntryType,
+    MetadataFilter, MeterTypeId, TimeRange, UsageCollectorPluginError, UsageRecord,
+    UsageRecordFilterField, canonical_period_bound, is_keyset_safe_record_field,
 };
 
 use crate::domain::ports::RecordStore;
@@ -135,9 +135,25 @@ const INSERT_COLUMN_ARRAY_TYPES: [&str; 18] = [
     "text",
 ];
 
-/// The dedup 5-tuple plus the partition key the hypertable requires in every UNIQUE, as an `ON CONFLICT` arbiter. Both insert paths spend their one arbiter here.
+/// The dedup 6-tuple plus the partition key the hypertable requires in every UNIQUE, as an `ON CONFLICT` arbiter. Both insert paths spend their one arbiter here.
+///
+/// `entry_type` is one of the six. It is a `GENERATED … STORED` column, so it
+/// is an ordinary column to the index and may be named here; without it a
+/// withdrawal would arbitrate against the very entry it withdraws, which
+/// repeats its tenant, type, idempotency key and covered period.
 const DEDUP_CONFLICT_TARGET: &str =
-    "tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key";
+    "tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key";
+
+/// The dedup 6-tuple as a `WHERE` predicate over `$1..$6`, for the single
+/// path's conflict read-back. It selects the same one row
+/// [`DEDUP_CONFLICT_TARGET`] arbitrates, because `type_key` is a function of
+/// `gts_type_id`.
+///
+/// A read-back on the first five alone would be ambiguous once a record is
+/// withdrawn: the pair shares those five columns, so a record's retry could
+/// read its invalidation back and be answered `IdempotencyConflict`.
+const DEDUP_MATCH_PREDICATE: &str = "tenant_id = $1 AND gts_type_id = $2 AND idempotency_key = $3 \
+     AND window_start = $4 AND window_end = $5 AND entry_type = $6";
 
 /// `$1, $2, …, $n`.
 fn placeholders(n: usize) -> String {
@@ -147,7 +163,7 @@ fn placeholders(n: usize) -> String {
         .join(", ")
 }
 
-/// The single-row `INSERT … ON CONFLICT (5-tuple) DO NOTHING RETURNING`.
+/// The single-row `INSERT … ON CONFLICT (6-tuple) DO NOTHING RETURNING`.
 ///
 /// Built rather than inlined so a test can read the column list, the
 /// placeholder count and the conflict target back out of it — and built
@@ -162,7 +178,7 @@ static SINGLE_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// The multi-row `INSERT … SELECT FROM UNNEST(…) ON CONFLICT (5-tuple) DO
+/// The multi-row `INSERT … SELECT FROM UNNEST(…) ON CONFLICT (6-tuple) DO
 /// NOTHING RETURNING`.
 ///
 /// The column list, the `SELECT` list and the `UNNEST` alias list are all
@@ -352,12 +368,14 @@ impl PgRecordStore {
             }
         };
 
-        // 2. Insert, deduplicated on the 5-tuple UNIQUE. `RETURNING` yields the
+        // 2. Insert, deduplicated on the 6-tuple UNIQUE. `RETURNING` yields the
         //    row only when we won the slot — `DO NOTHING` suppresses it on a
         //    conflict — so `Some` = fresh insert, `None` = a row with this
-        //    5-tuple already exists. Every one of the eighteen [`RECORD_COLUMNS`]
+        //    6-tuple already exists. Every one of the eighteen [`RECORD_COLUMNS`]
         //    is bound here now that `accepted_at` is written rather than
-        //    defaulted; `entry_type` is generated and is not one of them.
+        //    defaulted; `entry_type` is generated, so it is the one identity
+        //    component the insert does not bind — Postgres computes it from
+        //    `invalidates` and the arbiter reads it back off the stored row.
         let subject_id = record
             .subject_ref
             .as_ref()
@@ -412,22 +430,23 @@ impl PgRecordStore {
             return record_row_to_model(row);
         }
 
-        // 3b. Lost the slot — a row with this 5-tuple already exists. Read it
-        //     and resolve absorb-vs-conflict. The read mutates nothing, and the
-        //     rollback that follows releases the sequence value claimed in
-        //     step 1, which is why an absorbed single-row retry leaves no gap
-        //     (a batch's block claim does; see [`claim_acceptance_sequence`]).
-        let select_sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records \
-             WHERE tenant_id = $1 AND gts_type_id = $2 AND idempotency_key = $3 \
-               AND window_start = $4 AND window_end = $5"
-        );
+        // 3b. Lost the slot — a row with this 6-tuple already exists. Read it
+        //     and resolve absorb-vs-conflict. `entry_type` is in the predicate
+        //     for the reason [`DEDUP_MATCH_PREDICATE`] gives: without it, a
+        //     retry of a withdrawn record could read the withdrawal back. The
+        //     read mutates nothing, and the rollback that follows releases the
+        //     sequence value claimed in step 1, which is why an absorbed
+        //     single-row retry leaves no gap (a batch's block claim does; see
+        //     [`claim_acceptance_sequence`]).
+        let select_sql =
+            format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE {DEDUP_MATCH_PREDICATE}");
         let stored = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(record.tenant_id)
             .bind(record.gts_type_id.as_str())
             .bind(record.idempotency_key.as_str())
             .bind(record.window_start)
             .bind(record.window_end)
+            .bind(record.entry_type().as_str())
             .fetch_optional(&mut *tx)
             .await;
         rollback(tx).await;
@@ -479,10 +498,10 @@ impl PgRecordStore {
     }
 
     /// Insert all distinct-key representatives in one multi-row
-    /// `INSERT … ON CONFLICT (5-tuple) DO NOTHING RETURNING`. The returned rows
+    /// `INSERT … ON CONFLICT (6-tuple) DO NOTHING RETURNING`. The returned rows
     /// are exactly the slots we won — `DO NOTHING` suppresses any row whose
-    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
-    /// already exists — so the result maps each won [`DedupKey`] to its stored
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
+    /// entry_type)` already exists — so the result maps each won [`DedupKey`] to its stored
     /// row. `reps` must be sorted by [`DedupKey`] so concurrent batches insert
     /// in one global order (deadlock-free), and `sequences` must be the
     /// acceptance-sequence values claimed for them, in the same order.
@@ -536,8 +555,12 @@ impl PgRecordStore {
     }
 
     /// For the not-won keys, read the existing `usage_records` row by its
-    /// 5-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
-    /// window_end)` — the batch analogue of the single path's conflict branch.
+    /// 6-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
+    /// window_end, entry_type)` — the batch analogue of the single path's
+    /// conflict branch. `entry_type` is in the tuple for the reason
+    /// [`DEDUP_MATCH_PREDICATE`] gives: a withdrawn record and its withdrawal
+    /// share the other five columns, so a read over those alone could resolve
+    /// one against the other.
     /// Maps each key to `Stored` (row found → resolve absorb/conflict) or
     /// `Stale` (the conflicting row's chunk was dropped by retention between
     /// the conflicting insert and this read).
@@ -562,14 +585,19 @@ impl PgRecordStore {
             .collect();
         let starts: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_start).collect();
         let ends: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_end).collect();
+        let entry_types: Vec<String> = not_won
+            .iter()
+            .map(|r| r.entry_type().as_str().to_owned())
+            .collect();
 
         let select_sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records \
-             WHERE (tenant_id, gts_type_id, idempotency_key, window_start, window_end) IN \
-               (SELECT t1, t2, t3, t4, t5 \
+             WHERE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, \
+                    entry_type) IN \
+               (SELECT t1, t2, t3, t4, t5, t6 \
                 FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[], \
-                            $5::timestamptz[]) \
-                  AS t(t1, t2, t3, t4, t5))"
+                            $5::timestamptz[], $6::text[]) \
+                  AS t(t1, t2, t3, t4, t5, t6))"
         );
         let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(&tenants)
@@ -577,6 +605,7 @@ impl PgRecordStore {
             .bind(&keys)
             .bind(&starts)
             .bind(&ends)
+            .bind(&entry_types)
             .fetch_all(&mut **tx)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
@@ -666,7 +695,7 @@ impl PgRecordStore {
     }
 
     /// Orchestrate one batch inside **one transaction**: claim an
-    /// acceptance-sequence block per scope → insert (dedup on the 5-tuple
+    /// acceptance-sequence block per scope → insert (dedup on the 6-tuple
     /// UNIQUE) → read conflicts for the not-won keys → commit → resolve per row
     /// in input order. The insert's `RETURNING` rows are themselves the set of
     /// keys it claimed, so nothing else records that.
@@ -1309,10 +1338,26 @@ fn build_list_page(
 }
 
 /// The dedup identity, mirroring the `usage_records_dedup_uniq` UNIQUE
-/// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)` — the
-/// same five inputs the entry `id` is a `UUIDv5` projection of
-/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so the two can
+/// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
+/// entry_type)` — the same six inputs the entry `id` is a `UUIDv5` projection
+/// of (`cpt-cf-usage-collector-adr-record-identity-derivation`), so the two can
 /// never disagree about what one entry is.
+///
+/// `entry_type` is the sixth component and the last, so the leading components
+/// still order the key by scope — [`scope_runs`] depends on the first two being
+/// the acceptance-sequence scope. It has to be in the key at all because a
+/// withdrawal repeats its target's other five: an in-batch map keyed on those
+/// alone would collapse a record and its withdrawal onto one slot and resolve
+/// the second against the first.
+///
+/// It enters as [`entry_type_rank`] rather than as the wire literal, so a
+/// record sorts before its withdrawal. `reps` are sequenced in this order, and
+/// the gear's DESIGN §3.1 Feed order invariant reads "**Correction order**: an
+/// invalidation follows its target" — the literals would order the pair the
+/// wrong way round, since `invalidation` precedes `record` alphabetically. The
+/// gateway does not dispatch a pair in one batch (it admits an invalidation
+/// only once its target has converged), so this decides nothing the gear
+/// currently asks; it costs one `u8` to not depend on that.
 ///
 /// The two covered-period bounds enter as
 /// [`canonical_period_bound`](usage_collector_sdk::canonical_period_bound)
@@ -1323,7 +1368,16 @@ fn build_list_page(
 /// non-UTC offset do not survive the round trip, and the rendering flattens
 /// both. Using the SDK's function rather than a local truncation means a
 /// precision change in one crate cannot silently diverge them.
-type DedupKey = (Uuid, String, String, String, String);
+type DedupKey = (Uuid, String, String, String, String, u8);
+
+/// A record sorts before an invalidation, per the [`DedupKey`] doc. Not an
+/// ordering on [`EntryType`] itself: nothing outside this key orders the two.
+const fn entry_type_rank(entry_type: EntryType) -> u8 {
+    match entry_type {
+        EntryType::Record => 0,
+        EntryType::Invalidation => 1,
+    }
+}
 
 /// Build the [`DedupKey`] for an incoming record.
 fn dedup_key(record: &UsageRecord) -> DedupKey {
@@ -1333,18 +1387,30 @@ fn dedup_key(record: &UsageRecord) -> DedupKey {
         record.idempotency_key.as_str().to_owned(),
         canonical_period_bound(record.window_start),
         canonical_period_bound(record.window_end),
+        entry_type_rank(record.entry_type()),
     )
 }
 
 /// Build the [`DedupKey`] for a stored row, so an `INSERT … RETURNING` result
 /// and an incoming record map to the same key (both bounds canonicalized).
+///
+/// The entry type is read off `invalidates`, not off the `entry_type` column,
+/// which the row does not carry: the generated column is that same expression,
+/// and [`UsageRecord::entry_type`] projects the model side from the same fact,
+/// so no two of the three can disagree.
 fn row_dedup_key(row: &UsageRecordRow) -> DedupKey {
+    let entry_type = if row.invalidates.is_some() {
+        EntryType::Invalidation
+    } else {
+        EntryType::Record
+    };
     (
         row.tenant_id,
         row.gts_type_id.clone(),
         row.idempotency_key.clone(),
         canonical_period_bound(row.window_start),
         canonical_period_bound(row.window_end),
+        entry_type_rank(entry_type),
     )
 }
 
@@ -1369,7 +1435,7 @@ fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPlu
 ///
 /// `reps` are the first-occurrence representative records, one per distinct
 /// dedup key, **sorted** by [`DedupKey`] so concurrent batches take the
-/// 5-tuple-UNIQUE conflict locks — and the per-scope acceptance-sequence row
+/// 6-tuple-UNIQUE conflict locks — and the per-scope acceptance-sequence row
 /// locks — in one global order (deadlock-free). `first_index` maps each key to
 /// the input index of its first occurrence, the only row that can win the slot.
 /// Later same-key rows resolve against the winner's stored row, exactly as the
@@ -1382,9 +1448,11 @@ struct BatchPlan<'a> {
 /// Collapse a batch to its distinct dedup keys (first occurrence wins), sorted
 /// for a stable lock order. Pure — no DB. `reps` borrow from `records`.
 ///
-/// Two invalidations of one target in one batch share the derived
-/// `inv:<target>` key and so one slot: the later resolves against the earlier
-/// like any other same-key pair.
+/// Two withdrawals of one target in one batch repeat that target's five shared
+/// components under `entry_type = invalidation`, so they share one identity and
+/// one slot: the later resolves against the earlier like any other same-key
+/// pair. A record and its withdrawal differ in the sixth component and take two
+/// slots, which is what keeps a batch carrying both from swallowing one.
 fn plan_batch(records: &[UsageRecord]) -> BatchPlan<'_> {
     let mut first_index: HashMap<DedupKey, usize> = HashMap::new();
     let mut reps: Vec<(DedupKey, &UsageRecord)> = Vec::new();
@@ -1833,16 +1901,19 @@ impl RecordStore for PgRecordStore {
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         // Lookup by the public `id`. This relies on a one-record-per-`id`
         // contract, which the hypertable schema cannot enforce on its own — a
-        // `UNIQUE` there must include the `window_end` partition column, so only
-        // the composite PK `(id, window_end)` is enforced. `fetch_optional`
-        // therefore returns the first matching row.
+        // `UNIQUE` there must include every partition column, so only the
+        // composite PK `(id, window_end, type_key)` is enforced.
+        // `fetch_optional` therefore returns the first matching row.
         //
-        // `id` is a `UUIDv5` over the 5-tuple dedup identity
-        // `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+        // `id` is a `UUIDv5` over the 6-tuple dedup identity
+        // `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
+        // entry_type)`
         // (`cpt-cf-usage-collector-adr-record-identity-derivation`), which is
-        // exactly this plugin's dedup identity — the same five inputs
+        // exactly this plugin's dedup identity — the same six inputs
         // `usage_records_dedup_uniq` is built over — so each stored row carries
-        // a distinct `id` and `WHERE id = $1` matches at most one row.
+        // a distinct `id` and `WHERE id = $1` matches at most one row. A
+        // withdrawn record and the withdrawal that named it are two `id`s, not
+        // one, because they differ in that sixth input.
         //
         // **No `invalidates` predicate belongs in this query, and none ever
         // will.** The asymmetry with the fold is deliberate, not an oversight

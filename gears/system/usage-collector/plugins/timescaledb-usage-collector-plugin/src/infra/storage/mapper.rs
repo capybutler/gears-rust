@@ -8,9 +8,10 @@
 //! bounds move across unchanged. The rest are validated on the way in:
 //! `resource_id` and `resource_type` through [`ResourceRef::new`], `subject_id`
 //! and `subject_type` through [`SubjectRef::new`], `idempotency_key` through
-//! [`IdempotencyKey::from_stored`] — a stored row's key may legitimately carry
-//! the `inv:` prefix an invalidation derives, which [`IdempotencyKey::new`]
-//! alone would reject — `metadata` through [`metadata_jsonb_to_map`],
+//! [`IdempotencyKey::from_stored`] — which applies exactly the checks
+//! [`IdempotencyKey::new`] applies and differs from it only in naming the
+//! rehydration of a persisted entry rather than the admission of a submission
+//! — `metadata` through [`metadata_jsonb_to_map`],
 //! `quantity` through [`UsageQuantity::try_from`], and these through the
 //! helpers below, which take more explaining:
 //!

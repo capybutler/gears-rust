@@ -5,21 +5,21 @@
 //!
 //! The derivation itself is the SDK's, and `id_tests.rs` pins its bytes; what
 //! is asked here is the consequence the ledger has to honour. The id is a
-//! `UUIDv5` over the 5-tuple
-//! `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
-//! (`cpt-cf-usage-collector-adr-record-identity-derivation`), which is the same
-//! five columns `usage_records_dedup_uniq` spans — so "distinct ids" and
-//! "distinct rows" are one fact, and a point lookup addresses exactly one of
-//! them.
+//! `UUIDv5` over the 6-tuple
+//! `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
+//! entry_type)` (`cpt-cf-usage-collector-adr-record-identity-derivation`),
+//! which is the same six columns `usage_records_dedup_uniq` spans — so
+//! "distinct ids" and "distinct rows" are one fact, and a point lookup
+//! addresses exactly one of them.
 //!
-//! `entry_type` is deliberately **not** an input, and the ADR is explicit about
-//! what that buys: an invalidation's key is not caller-chosen — the gateway
-//! derives `inv:<target>` — so every withdrawal of one target shares that
-//! one key and therefore one identifier by construction. A second withdrawal
-//! of one target collides on all five dedup attributes and must surface as a
-//! same-id content mismatch (a different `reason_code`) rather than being
-//! admitted as a second entry. That is the last test here, and it is the
-//! ADR's own confirmation item.
+//! `entry_type` is the sixth input, and the ADR is explicit about what it buys:
+//! "An invalidation repeats its target's idempotency key, so the entry type is
+//! the only input that keeps a measurement and its withdrawal apart." It is
+//! also what gives every withdrawal of one target one identifier — two of them
+//! collide on all six inputs — so a second withdrawal must surface as a same-id
+//! content mismatch (a different `reason_code`) rather than being admitted as a
+//! second entry. That is the last test here, and it is the ADR's own
+//! confirmation item.
 
 mod common;
 
@@ -34,10 +34,10 @@ use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 /// Two entries differing **only** in `window_start` are two entries, not a
 /// retry of one.
 ///
-/// The covered period's start is one of the five inputs, so a stable
+/// The covered period's start is one of the six inputs, so a stable
 /// per-meter idempotency key covers many periods without collapsing them onto
-/// one entry — which is the whole reason the derivation reads five inputs and
-/// not three.
+/// one entry — which is the whole reason the derivation reads the period at
+/// all rather than the scope and the key alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn entries_differing_only_in_window_start_are_distinct_and_separately_addressable() {
     let h = common::bring_up()
@@ -71,7 +71,7 @@ async fn entries_differing_only_in_window_start_are_distinct_and_separately_addr
 
     assert_ne!(
         early.id, late.id,
-        "window_start is one of the five dedup-identity inputs, so two entries \
+        "window_start is one of the six dedup-identity inputs, so two entries \
          differing only in it derive distinct identifiers"
     );
 
@@ -82,7 +82,7 @@ async fn entries_differing_only_in_window_start_are_distinct_and_separately_addr
     store
         .create(late.clone())
         .await
-        .expect("a distinct 5-tuple is a fresh insert, not a dedup hit");
+        .expect("a distinct 6-tuple is a fresh insert, not a dedup hit");
 
     let rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM usage_records WHERE tenant_id = $1 AND idempotency_key = $2",
@@ -156,7 +156,7 @@ async fn entries_differing_only_in_window_end_are_distinct() {
     store
         .create(long)
         .await
-        .expect("a distinct 5-tuple is a fresh insert");
+        .expect("a distinct 6-tuple is a fresh insert");
 
     let rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM usage_records WHERE tenant_id = $1 AND idempotency_key = $2",
@@ -214,27 +214,29 @@ async fn a_point_event_is_a_distinct_entry_from_a_period_sharing_its_end() {
     );
 }
 
-/// `entry_type` is **not** an input to the derivation, and neither is a
-/// caller-chosen key on an invalidation: the gateway derives `inv:<target>`,
-/// so every withdrawal of one target shares that one key.
+/// `entry_type` is the sixth input to the derivation, and a withdrawal repeats
+/// its target's idempotency key, so the entry type is the only input that keeps
+/// the pair apart.
 ///
 /// Two halves, and the second is the one that pays for the first:
 ///
-/// 1. A faithful withdrawal shares four of the five inputs with its target —
-///    tenant, meter, and both period bounds — and derives its own key
-///    (`inv:<target>`), so the two ids differ.
-/// 2. A second withdrawal of the SAME target derives that same key and so the
-///    same id: all five dedup attributes collide, the dedup UNIQUE sees a
-///    hit, and the store resolves absorb-vs-conflict against the row already
-///    there. A byte-for-byte identical resubmission is `Ok` (this crate's
+/// 1. A faithful withdrawal shares five of the six inputs with its target —
+///    tenant, meter, idempotency key and both period bounds — and departs in
+///    the entry type alone, so the two ids differ and the ledger takes two
+///    rows. Keyed on the other five alone, the withdrawal would collide with
+///    the very entry it withdraws, be swallowed by `ON CONFLICT DO NOTHING`,
+///    and come back as an `IdempotencyConflict` against its own target.
+/// 2. A second withdrawal of the SAME target agrees on all six and so derives
+///    the same id: the dedup UNIQUE sees a hit, and the store resolves
+///    absorb-vs-conflict against the row already there. A byte-for-byte
+///    identical resubmission is `Ok` (this crate's
 ///    `an_exact_retry_is_absorbed_and_returns_the_persisted_row` in
 ///    `records_ingest_integration_pg.rs` pins that half); this test gives the
 ///    second withdrawal a distinct `reason_code`, so the store answers
-///    `IdempotencyConflict` against the row already holding the 5-tuple
+///    `IdempotencyConflict` against the row already holding the identity
 ///    rather than admitting a second entry
 ///    (`cpt-cf-usage-collector-adr-record-identity-derivation`, "Entry type is
-///    excluded", and its confirmation list — Slice E rewrites the "reused
-///    key" framing of this test, SPEC-DIFF 8.3).
+///    an input", and its confirmation list).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_withdrawal_of_one_target_derives_the_same_id_and_a_content_mismatch_conflicts() {
     let h = common::bring_up()
@@ -252,7 +254,8 @@ async fn every_withdrawal_of_one_target_derives_the_same_id_and_a_content_mismat
     assert_ne!(
         withdrawal.id, target.id,
         "an invalidation and its target differ in their identifiers through the \
-         reserved `inv:` prefix"
+         entry type, and through nothing else: the withdrawal repeats the \
+         target's idempotency key and covered period"
     );
     let stored = store
         .create(withdrawal)
@@ -264,14 +267,15 @@ async fn every_withdrawal_of_one_target_derives_the_same_id_and_a_content_mismat
         "the withdrawal names the entry it withdraws"
     );
 
-    // (2) A second withdrawal of the same target: same derived key, so one
-    // identifier — `common::withdrawal_of` takes no idempotency-key
-    // argument at all, which is the whole point. Only the reason differs,
-    // so the two are not canonically equal.
+    // (2) A second withdrawal of the same target: the same six inputs, so one
+    // identifier — `common::withdrawal_of` takes no idempotency-key argument at
+    // all, because the key is the target's. Only the reason differs, and it is
+    // no identity input, so the two are not canonically equal.
     let mut collided = common::withdrawal_of(&target);
     assert_eq!(
         collided.id, stored.id,
-        "every withdrawal of one target now derives the same `inv:<target>` id"
+        "every withdrawal of one target agrees on all six inputs, so all of \
+         them derive one identifier"
     );
     collided.invalidation = Some(Invalidation {
         target: target.id,
@@ -280,7 +284,7 @@ async fn every_withdrawal_of_one_target_derives_the_same_id_and_a_content_mismat
     let err = store
         .create(collided)
         .await
-        .expect_err("all five dedup attributes collide, and the two are not canonically equal");
+        .expect_err("all six dedup attributes collide, and the two are not canonically equal");
     match err {
         UsageCollectorPluginError::IdempotencyConflict {
             idempotency_key,
@@ -289,7 +293,7 @@ async fn every_withdrawal_of_one_target_derives_the_same_id_and_a_content_mismat
             assert_eq!(idempotency_key, stored.idempotency_key.as_str());
             assert_eq!(
                 existing.id, stored.id,
-                "the conflict names the entry already holding the 5-tuple"
+                "the conflict names the entry already holding the identity"
             );
         }
         other => panic!("expected IdempotencyConflict, got {other:?}"),

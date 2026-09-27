@@ -2,8 +2,8 @@
 --
 -- One ledger table plus its per-scope sequence counters. There is no
 -- usage-type catalog: declarations live in types-registry and the storage SPI
--- never sees one (the gear's DESIGN §3.7 — not this plugin's, whose §3.7 still
--- describes the retired schema).
+-- never sees one (the gear's DESIGN §3.7; this plugin's own §3.7 states the
+-- target schema, which the migrations on this branch still trail).
 --
 -- This file replaces the pre-slice-4 schema and its rename migration outright
 -- rather than migrating from them. The gear is unreleased, so no deployment
@@ -12,9 +12,10 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 CREATE TABLE IF NOT EXISTS usage_records (
-    -- Deterministic gateway-derived entry identity: UUIDv5 over the 5-tuple
+    -- Deterministic gateway-derived entry identity: UUIDv5 over the 6-tuple
     -- dedup identity (cpt-cf-usage-collector-adr-record-identity-derivation).
-    -- `entry_type` is deliberately not an input to it.
+    -- `entry_type` is its sixth input, and the only one a withdrawal does not
+    -- share with the entry it withdraws.
     id                  uuid        NOT NULL,
     tenant_id           uuid        NOT NULL,
     gts_type_id         text        NOT NULL,
@@ -78,15 +79,22 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- would otherwise join.
     --
     -- This is the same key as the dedup UNIQUE below, since `id` is a UUIDv5
-    -- over that same 5-tuple. It is kept as defense in depth: while the
+    -- over that same 6-tuple. It is kept as defense in depth: while the
     -- derivation is correct the two are redundant, and a defect in it cannot
     -- then produce two rows for one identity.
     PRIMARY KEY (id, window_end, type_key),
 
-    -- The gear's DESIGN §3.7 dedup obligation, over the 5-tuple verbatim, plus
+    -- The gear's DESIGN §3.7 dedup obligation, over the 6-tuple verbatim, plus
     -- the partition key the hypertable requires (see the PRIMARY KEY above).
+    --
+    -- `entry_type` has to be in it. A withdrawal repeats its target's tenant,
+    -- type, idempotency key and covered period, so a constraint over the first
+    -- five alone would make every invalidation a collision with the very entry
+    -- it withdraws. It can be in it because it is GENERATED … STORED: a stored
+    -- generated column is an ordinary column to an index, so it may sit in a
+    -- UNIQUE and be named as an ON CONFLICT arbiter. A VIRTUAL one could not.
     CONSTRAINT usage_records_dedup_uniq
-        UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key),
+        UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key),
 
     -- A point event is window_start == window_end; a period is strictly
     -- ordered. Nothing admits window_end < window_start.
@@ -119,9 +127,11 @@ SELECT add_dimension('usage_records', by_range('type_key', 1), if_not_exists => 
 -- Lookup index for the fold's second withdrawal-exclusion obligation: "is this
 -- entry named by an accepted invalidation?" `invalidates` leads it under
 -- exactly that partial predicate. It is not a rule. At most one invalidation
--- per entry follows from the derived `inv:<target>` idempotency key, which
--- makes a second invalidation an ordinary collision on
--- `usage_records_dedup_uniq` (DESIGN §3.1 "At most one invalidation").
+-- per entry follows from the shared identity: every withdrawal of one entry
+-- repeats that entry's five shared components and carries
+-- `entry_type = invalidation`, so all of them land on one identity and a
+-- second withdrawal is an ordinary collision on `usage_records_dedup_uniq`
+-- (the gear's DESIGN §3.1 "At most one invalidation").
 -- `window_end` and `type_key` are carried because an invalidation copies both
 -- from its target, so a lookup by target can prune chunks on them.
 CREATE INDEX IF NOT EXISTS usage_records_invalidates_idx

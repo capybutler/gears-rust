@@ -28,7 +28,7 @@ use toolkit_odata::ast;
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef,
+    EntryType, IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef,
     UsageQuantity, UsageRecord, derive_usage_record_id,
 };
 
@@ -475,15 +475,20 @@ pub fn meter(id: &str) -> MeterTypeId {
 /// An ordinary measurement over an explicit covered period, with the derived
 /// identity the Ingestion Gateway would stamp on it.
 ///
-/// The `id` is [`derive_usage_record_id`] over the same five inputs the ledger's
+/// The `id` is [`derive_usage_record_id`] over the same six inputs the ledger's
 /// `usage_records_dedup_uniq` is built over — this is the gateway's job, not the
 /// plugin's, so deriving it here is standing in for the gateway rather than
 /// asking the code under test to check itself.
 ///
-/// Every field that is **not** one of those five (quantity, attribution, metadata,
-/// origin, the invalidation pair) can be overwritten with a struct update
-/// afterwards without invalidating the identity. The five that are appear in
-/// this signature for exactly that reason.
+/// The sixth input is the entry type, which is [`EntryType::Record`] here
+/// because this builds a measurement: the invalidation pair is `None` below,
+/// and [`withdrawal_of`] is what builds the other kind.
+///
+/// Every field that is **not** one of those six (quantity, attribution,
+/// metadata, origin) can be overwritten with a struct update afterwards without
+/// invalidating the identity. The five caller-chosen ones appear in this
+/// signature for exactly that reason; setting the invalidation pair afterwards
+/// does move the entry's identity, which is what [`rederive`] is for.
 ///
 /// # Panics
 ///
@@ -500,7 +505,14 @@ pub fn entry_over(
 ) -> UsageRecord {
     let idempotency_key = IdempotencyKey::new(idem).expect("valid idempotency key");
     UsageRecord {
-        id: derive_usage_record_id(tenant, meter_id, &idempotency_key, window_start, window_end),
+        id: derive_usage_record_id(
+            tenant,
+            meter_id,
+            &idempotency_key,
+            window_start,
+            window_end,
+            EntryType::Record,
+        ),
         gts_type_id: meter_id.clone(),
         tenant_id: tenant,
         resource_ref: ResourceRef::new("res-1", "compute.vm").expect("valid resource ref"),
@@ -530,7 +542,7 @@ pub fn entry(meter_id: &MeterTypeId, tenant: Uuid, idem: &str, value: Decimal) -
 }
 
 /// A faithful withdrawal of `target`: a copy of the entry it withdraws, plus the
-/// invalidation pair, under its derived `inv:<target>` idempotency key.
+/// invalidation pair, under the target's own idempotency key.
 ///
 /// "A faithful copy of the entry it withdraws" is the schema's own phrase, and
 /// every field copied below is copied for a reason rather than for tidiness:
@@ -538,25 +550,22 @@ pub fn entry(meter_id: &MeterTypeId, tenant: Uuid, idem: &str, value: Decimal) -
 /// * **The quantity** — an invalidation echoes what it withdraws rather than
 ///   negating it (`cpt-cf-usage-collector-adr-append-only-invalidation`), which
 ///   is why netting the two would now double-count.
-/// * **The covered period** — two of the five dedup-identity inputs, so a
+/// * **The covered period** — two of the six dedup-identity inputs, so a
 ///   withdrawal carrying a different period is a different identity and no
 ///   longer collides with another withdrawal of the same target.
+/// * **The idempotency key** — a third. A withdrawal repeats its target's, so
+///   the pair departs in the entry type alone.
 /// * **The attribution, metadata and origin** — so the only fields separating
-///   the pair are `invalidates`, `reason_code` and the idempotency key. A
-///   withdrawal that quietly differed in, say, `resource_type` would let a
-///   `$filter` test look like it discriminated when it had only found an
-///   asymmetry the fixture put there.
+///   the pair are `invalidates` and `reason_code`. A withdrawal that quietly
+///   differed in, say, `resource_type` would let a `$filter` test look like it
+///   discriminated when it had only found an asymmetry the fixture put there.
 ///
-/// The idempotency key is the one input to the derivation the two do not
-/// share, and is therefore the whole reason their identifiers differ — but it
-/// is no longer caller-chosen: every withdrawal of `target` derives
-/// `inv:<target.id>`
-/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so two
-/// withdrawals of one target now derive one identifier regardless of what a
-/// caller might otherwise have passed as its key. There is no longer a
-/// parameter for it: `entry_over`'s `idem` argument only ever seeded a value
-/// this function immediately overwrites, so the placeholder below stands in
-/// for it instead of every call site carrying a string that is never read.
+/// The entry type is the one input to the derivation the two do not share, and
+/// is therefore the whole reason their identifiers differ
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`). Two withdrawals
+/// of one target agree on all six and derive one identifier. There is no
+/// parameter for the key: it is the target's, so `entry_over`'s `idem` argument
+/// only ever seeds a value this function immediately overwrites.
 ///
 /// # Panics
 ///
@@ -564,7 +573,7 @@ pub fn entry(meter_id: &MeterTypeId, tenant: Uuid, idem: &str, value: Decimal) -
 #[must_use]
 pub fn withdrawal_of(target: &UsageRecord) -> UsageRecord {
     rederive(UsageRecord {
-        idempotency_key: IdempotencyKey::for_invalidation(target.id),
+        idempotency_key: target.idempotency_key.clone(),
         invalidation: Some(Invalidation {
             target: target.id,
             reason: ReasonCode::new("duplicate_submission").expect("valid reason code"),
@@ -587,8 +596,9 @@ pub fn withdrawal_of(target: &UsageRecord) -> UsageRecord {
 /// A withdrawal of `target` carrying `reason` instead of [`withdrawal_of`]'s
 /// fixed `"duplicate_submission"`.
 ///
-/// Every withdrawal of one target now derives the same `inv:<target>` key
-/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so two
+/// Every withdrawal of one target carries the target's own idempotency key and
+/// `entry_type = invalidation`, so all six identity inputs agree
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`) and two
 /// withdrawals of one target built through [`withdrawal_of`] alone would be
 /// byte-for-byte identical and absorbed as an idempotent replay rather than
 /// decided against each other. `reason_code` is the one field that survives
@@ -609,17 +619,23 @@ pub fn withdrawal_of_with_reason(target: &UsageRecord, reason: &str) -> UsageRec
     }
 }
 
-/// Restamp `record`'s derived identity after one of the five dedup-identity
+/// Restamp `record`'s derived identity after one of the six dedup-identity
 /// inputs was changed by a struct update.
 ///
-/// [`entry_over`] takes all five as parameters precisely so this is rarely
-/// needed — every field a caller usually overwrites afterwards (quantity,
-/// attribution, metadata, origin, the invalidation pair) is outside the
-/// derivation. The exception is a test that starts from [`withdrawal_of`] and
-/// then moves the entry into a different scope: `tenant_id` and `gts_type_id`
-/// *are* inputs, so leaving the stamped id alone would store a row whose id no
-/// emitter could reproduce, and the ledger's `id` and its dedup UNIQUE would
-/// disagree about what the entry is.
+/// [`entry_over`] takes five of the six as parameters precisely so this is
+/// rarely needed — every field a caller usually overwrites afterwards
+/// (quantity, attribution, metadata, origin) is outside the derivation. Two
+/// cases are left. Setting the invalidation pair changes the sixth input, the
+/// entry type, which is why [`withdrawal_of`] ends here. And a test that starts
+/// from [`withdrawal_of`] and then moves the entry into a different scope
+/// changes `tenant_id` or `gts_type_id`, which *are* inputs. Leaving the
+/// stamped id alone in either case would store a row whose id no emitter could
+/// reproduce, and the ledger's `id` and its dedup UNIQUE would disagree about
+/// what the entry is.
+///
+/// The entry type is read off the record rather than passed in, so it cannot be
+/// stamped as anything other than what the record's own invalidation pair says
+/// it is.
 ///
 /// # Panics
 ///
@@ -633,6 +649,7 @@ pub fn rederive(record: UsageRecord) -> UsageRecord {
             &record.idempotency_key,
             record.window_start,
             record.window_end,
+            record.entry_type(),
         ),
         ..record
     }

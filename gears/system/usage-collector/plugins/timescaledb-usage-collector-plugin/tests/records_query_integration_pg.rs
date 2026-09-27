@@ -1018,7 +1018,7 @@ async fn an_orphan_invalidation_contributes_nothing() {
 /// below pins that before the fold is asked anything - an inline assertion
 /// rather than a test of its own, because it is a precondition of this fixture
 /// and has no meaning apart from it. The entry `id` is a `UUIDv5` over the
-/// 5-tuple, so which of two keys sorts higher is not something a fixture author
+/// 6-tuple, so which of two keys sorts higher is not something a fixture author
 /// can predict, and without the assertion the discrimination would be luck.
 ///
 /// **What that discrimination now means has inverted, and this test pins an

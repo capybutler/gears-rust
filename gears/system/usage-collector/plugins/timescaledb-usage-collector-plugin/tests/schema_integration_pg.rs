@@ -90,13 +90,16 @@ async fn no_table_wide_retention_policy_is_registered() {
     assert_eq!(jobs, 0, "no table-wide retention policy may be registered");
 }
 
-/// The dedup obligation is the ledger's own UNIQUE, over the 5-tuple verbatim.
+/// The dedup obligation is the ledger's own UNIQUE, over the 6-tuple verbatim.
 ///
 /// The constraint definition is compared as text rather than by name alone: a
 /// constraint keeping its name while losing a column is the failure this exists
-/// to catch, and `usage_records_dedup_uniq` exists either way.
+/// to catch, and `usage_records_dedup_uniq` exists either way. `entry_type` is
+/// the column that failure would most plausibly take: it is generated rather
+/// than bound, and dropping it makes every withdrawal collide with the entry it
+/// withdraws.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_dedup_unique_spans_the_five_tuple() {
+async fn the_dedup_unique_spans_the_six_tuple() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
@@ -110,17 +113,21 @@ async fn the_dedup_unique_spans_the_five_tuple() {
     .expect("usage_records_dedup_uniq must exist");
 
     assert_eq!(
-        def, "UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, type_key)",
-        "the dedup UNIQUE must span the 5-tuple dedup identity, in that order - the same \
-         five inputs the entry id is a UUIDv5 projection of \
+        def,
+        "UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, \
+         type_key)",
+        "the dedup UNIQUE must span the 6-tuple dedup identity, in that order - the same \
+         six inputs the entry id is a UUIDv5 projection of \
          (cpt-cf-usage-collector-adr-record-identity-derivation) - plus the partition key, \
-         which a type determines and so separates no two rows the 5-tuple joins"
+         which a type determines and so separates no two rows the 6-tuple joins"
     );
 }
 
 /// The invalidation lookup index is partial and **not** unique: at most one
-/// invalidation per entry is a dedup outcome of the derived `inv:<target>` key,
-/// not a store-side rule (DESIGN §3.1 "At most one invalidation").
+/// invalidation per entry is a dedup outcome of the shared identity - every
+/// withdrawal of one entry repeats that entry's five other components under
+/// `entry_type = invalidation` - not a store-side rule (the gear's DESIGN §3.1
+/// "At most one invalidation").
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_invalidation_lookup_index_is_partial_and_not_unique() {
     let h = common::bring_up()
