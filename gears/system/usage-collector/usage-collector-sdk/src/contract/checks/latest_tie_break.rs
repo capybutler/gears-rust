@@ -26,8 +26,8 @@ use crate::time_range::TimeRange;
 ///
 /// Three hundred and thirty days past [`FIXTURE_EPOCH`], for the reason
 /// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240, 270
-/// and 300 offsets the other checks take.
+/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240,
+/// 270, 300 and 360 offsets the other checks take.
 ///
 /// It matters here because each of this check's three scenarios folds over a
 /// range of its own and compares the answer against **one** entry's quantity.

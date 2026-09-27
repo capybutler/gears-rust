@@ -23,10 +23,12 @@ use crate::quantity::UsageQuantity;
 /// Two hundred and seventy days past [`FIXTURE_EPOCH`], for the reason
 /// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
 /// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240,
-/// 300 and 330 offsets the other checks take.
+/// 300, 330 and 360 offsets the other checks take.
 ///
-/// It buys less here than anywhere else in the suite, and saying so is the
-/// point: **this check dispatches no range at all.** Every read it makes is
+/// It buys less here than in any check that reads a range, and saying so is
+/// the point: **this check dispatches no range at all.**
+/// [`feed_snapshot_and_replay`](super::feed_snapshot_and_replay()) is the
+/// other check the offset buys little for, and for the same reason. Every read it makes is
 /// a point lookup by `id`, so no other check's entry can be miscounted into
 /// a page of this one's and none can crowd one of this one's off a bounded
 /// page either. The offset is kept because the separation runs the *other*

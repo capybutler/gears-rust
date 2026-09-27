@@ -11,7 +11,7 @@
 //! column against each of them.
 //!
 //! *Behaviourally* is the exact word. Ten subjects wrap a real reference
-//! backend and are that backend plus one interception; the other eight
+//! backend and are that backend plus one interception; the other eleven
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
 //!
@@ -40,16 +40,37 @@
 //! to decide, and two rewrite how a second withdrawal of a record is
 //! answered.
 //!
-//! **A ledger of its own** ([`MutantLedger`]) is needed by the other eight
+//! **A ledger of its own** ([`MutantLedger`]) is needed by the other eleven
 //! (selection column, fold exclusion, missing unique constraint, missing
-//! in-batch dedup map, a divergent write that displaces the survivor, and
-//! the three `LATEST` orders), because each changes something the inner
-//! backend owns and no interception can reach it: which column a range
-//! meets, which rows a fold walks, what admission writes, what a batch's own
-//! rows are decided against, which row a decided collision leaves behind,
-//! and which row a fold ranks highest. It mirrors the reference where the
+//! in-batch dedup map, a divergent write that displaces the survivor, the
+//! three `LATEST` orders, and the three feed defects), because each changes
+//! something the inner backend owns and no interception can reach it: which
+//! column a range meets, which rows a fold walks, what admission writes,
+//! what a batch's own rows are decided against, which row a decided
+//! collision leaves behind, which row a fold ranks highest, which entries a
+//! feed page's cursor moves past, where a page resumes, and whether a
+//! bounded replay says it is finished. It mirrors the reference where the
 //! defect is not, and it is smaller in one stated way that no check reaches
 //! — see [`MutantLedger`].
+//!
+//! # The three feed defects, and the three places a feed page decides
+//! something
+//!
+//! `read_feed_page` is one loop over a ledger, and it makes three decisions
+//! a defect can land in: where the page **resumes**, how far the cursor
+//! **advances**, and whether the page **closes**. There is a subject for
+//! each, all three routed to [`MutantLedger`] and all three one line:
+//!
+//! * **Where it resumes** — [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`],
+//!   the keyset off-by-one.
+//! * **How far the cursor advances** —
+//!   [`Defect::FeedCursorCountsAdmittedEntries`], the scope and
+//!   subscription gate moved above the cursor.
+//! * **Whether it closes** — [`Defect::ABoundedReplayNeverCloses`], the
+//!   second half of [`FeedPage::next`]'s two-element enumeration.
+//!
+//! None of the three is a wrapper, and none could be: the loop is the
+//! method, so an interception would have had to re-implement it anyway.
 //!
 //! # DESIGN's three `LATEST` keys, and the subject for each
 //!
@@ -512,6 +533,84 @@ pub(super) enum Defect {
     /// that reads `accepted_at` first reports the other entry rather than
     /// agreeing by accident.
     LatestIgnoresThePeriodEnd,
+    /// Advances a feed page's cursor past every entry the page **carried**
+    /// rather than past every entry it **scanned** — the scope and the
+    /// subscription gate moved above the cursor assignment.
+    ///
+    /// **It is the one-line change**, which is what makes it plausible: the
+    /// admission decision and the cursor assignment sit in one loop body,
+    /// and writing the cursor inside the `if` that already decides whether
+    /// to carry the row reads as tidier than writing it outside. It still
+    /// compiles, it still reads correctly under every single grant, and it
+    /// passed the whole suite until `feed-snapshot-and-replay` landed.
+    ///
+    /// What it breaks is the position's **meaning**. DESIGN §3.1 fixes a
+    /// position's age by the oldest subsequent entry of a subscribed type
+    /// *"whether or not the reader's authorization scope admits that
+    /// entry"*, and has *"a page reaching the settled head return its cursor
+    /// at the head"*. Under this defect a position means "the last entry
+    /// this grant admitted", so a cursor minted under one grant and resumed
+    /// under a wider one silently skips every entry the narrower grant
+    /// withheld ahead of it, and a walk whose tail is withheld never reaches
+    /// the head at all.
+    ///
+    /// **The suite reaches it from one direction only**, and the direction
+    /// matters because three others do not. Measured by neutering each of
+    /// `feed-snapshot-and-replay`'s assertions in turn, the only one that
+    /// reports is
+    /// `a_wider_grant_resumes_a_narrower_walk_at_the_head`. The reason is in
+    /// the mechanism: this backend's position is an entry's *sequence*
+    /// rather than a count, so a lagging cursor names a coordinate the read
+    /// really stood on. Nothing is re-delivered, no single-grant walk
+    /// observes anything amiss, and two grants admitting the same entries
+    /// are handed the same cursor. The cursor merely stops short — which is
+    /// visible only to a reader whose grant admits something the walk's did
+    /// not. `contract_tests`'
+    /// `a_feed_position_denotes_the_same_ledger_prefix_under_every_grant`
+    /// catches the same defect in the reference by comparing three grants'
+    /// positions against a literal; this subject is what puts it in front of
+    /// a check, where the comparison has to be a behavioural one.
+    FeedCursorCountsAdmittedEntries,
+    /// Resumes a feed page at the entry a position names instead of after
+    /// it — `WHERE sequence >= :cursor` where the contract wants
+    /// `> :cursor`.
+    ///
+    /// **The classic keyset off-by-one**, and the one every paginated read
+    /// path is one character away from. DESIGN §3.3's plugin obligations
+    /// state that *"Offset/limit scans are forbidden on both paginated
+    /// paths"*, so the resumption has to be a key comparison — and a key
+    /// comparison is exactly where the inclusive/exclusive choice is made
+    /// and got wrong.
+    ///
+    /// What it costs is not a hang but a **stall**: every page after the
+    /// first re-delivers the entry its own start position named and, at a
+    /// page limit of one, carries nothing else. The cursor therefore never
+    /// leaves that entry, so a consumer following it is handed one entry
+    /// over and over while the rest of the ledger sits behind it. Two of
+    /// DESIGN's clauses fail at once, which is honest rather than untidy:
+    /// the entry repeats (an entry *appearing* where the scan had already
+    /// been) and the entries after it never arrive (every one of them
+    /// *disappearing*).
+    ///
+    /// `FeedStart::Oldest` is untouched: it resumes from nothing, and
+    /// nothing minus one is still nothing.
+    AFeedPageRedeliversTheEntryAtItsCursor,
+    /// Mints a continuation on every feed page, including the closing page
+    /// of a replay that has reached its `until`.
+    ///
+    /// [`FeedPage::next`] enumerates exactly two dispositions — *"`Some` on
+    /// every page of a live read, short pages included; `None` once a
+    /// bounded replay has reached its `until`"* — and this is the subject
+    /// for the second of them. It is the disposition a backend is likeliest
+    /// to miss, because minting a cursor is what every other page does and
+    /// the closing page is the one exception.
+    ///
+    /// Nothing else about the replay changes: it carries the same entries
+    /// and stops in the same place. What is lost is the **signal**. An
+    /// absent `next` is the only thing that tells a caller a bounded replay
+    /// is finished, so a replay that keeps minting one leaves a consumer
+    /// following a cursor forever over a range it has already read whole.
+    ABoundedReplayNeverCloses,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -541,7 +640,10 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::ADivergentWriteDisplacesTheSurvivor
         | Defect::LatestSkipsTheAcceptanceInstant
         | Defect::LatestStopsAtTheAcceptanceInstant
-        | Defect::LatestIgnoresThePeriodEnd => Box::new(MutantLedger::new(defect)),
+        | Defect::LatestIgnoresThePeriodEnd
+        | Defect::FeedCursorCountsAdmittedEntries
+        | Defect::AFeedPageRedeliversTheEntryAtItsCursor
+        | Defect::ABoundedReplayNeverCloses => Box::new(MutantLedger::new(defect)),
     }
 }
 
@@ -714,7 +816,10 @@ impl WrappedReference {
             | Defect::ADivergentWriteDisplacesTheSurvivor
             | Defect::LatestSkipsTheAcceptanceInstant
             | Defect::LatestStopsAtTheAcceptanceInstant
-            | Defect::LatestIgnoresThePeriodEnd => Ok(record),
+            | Defect::LatestIgnoresThePeriodEnd
+            | Defect::FeedCursorCountsAdmittedEntries
+            | Defect::AFeedPageRedeliversTheEntryAtItsCursor
+            | Defect::ABoundedReplayNeverCloses => Ok(record),
         }
     }
 
@@ -1368,22 +1473,43 @@ impl Ledger {
 /// returning `count + 1`, which took both subjects built on this type out of
 /// their own rows.
 ///
+/// **Three of the feed's four unpinned behaviours are now pinned**, and
+/// `feed-snapshot-and-replay` is what pinned them. Each was measured after
+/// that check landed, the same way the rest were — broken here, then the
+/// matrix run:
+///
+/// * **The scanned-entry cursor rule** is pinned, and it now has a subject
+///   of its own rather than only a measurement:
+///   [`Defect::FeedCursorCountsAdmittedEntries`].
+/// * **The scope gate** is pinned. A feed answering every tenant's entries
+///   under any grant delivers, into that check's walk, entries under a
+///   tenant its walking grant does not name.
+/// * **The subscription gate** is pinned. A feed answering every meter's
+///   entries delivers, into the same walk, entries every other check left on
+///   the suite's shared meter.
+/// * **The seek is still unpinned**, and that is a fact about this ledger
+///   rather than about the check. Replacing `sequence > resumed_at` with a
+///   `skip` of that many rows leaves the matrix green, because this
+///   backend's sequences are dense over one append-ordered ledger: a count
+///   of rows past the start and a seek to the first greater sequence name
+///   the same entry on every input the suite produces. What separates them
+///   is a ledger with **gaps** — a retention drop, a sequence a rolled-back
+///   write burned — and `feed-retention-refusal` is the check that will
+///   build one. The `>` itself is pinned:
+///   [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] is the subject for
+///   getting that comparison wrong.
+///
 /// Everything else here is level with the reference and **unpinned**: the
 /// ledger page's *order* (its membership is pinned, its sort is asserted by
-/// no check), the grouped folds and the three that read a quantity,
-/// the reconciliation figures,
-/// and everything about the feed page but its delivering entries — its seek,
-/// its scanned-entry cursor rule, its subscription and scope gates, and its
-/// retention refusal. Those four were measured too, each by breaking it and
-/// watching the matrix stay green: a feed that advances its cursor only past
-/// the rows it admits, one that answers every tenant's entries under any
-/// grant, one that answers every meter's, and one that skips a count of rows
-/// instead of seeking all pass every check the suite runs today. They are
-/// mirrored because the checks that read them are coming, and each becomes
-/// pinned by the check that first dispatches it. An unpinned behaviour is
-/// where this mirror can still rot in silence, which is the argument for
-/// keeping it level now rather than letting it answer `Internal` until
-/// someone needs it.
+/// no check), the grouped folds and the three that read a quantity, the
+/// reconciliation figures, the feed's seek above, and the feed's retention
+/// refusal, which stays unpinned because no check yet drives a drop —
+/// measured by disabling the refusal outright and watching the matrix stay
+/// green. They are mirrored because the checks that read them are coming,
+/// and each becomes pinned by the check that first dispatches it. An
+/// unpinned behaviour is where this mirror can still rot in silence, which
+/// is the argument for keeping it level now rather than letting it answer
+/// `Internal` until someone needs it.
 struct MutantLedger {
     /// The entries admitted so far, with the sequences the feed orders them
     /// by.
@@ -1640,14 +1766,23 @@ impl UsageCollectorPluginV1 for MutantLedger {
     /// rather than every entry **admitted**, so a position denotes a prefix of
     /// the ledger and the same prefix under every grant — the property
     /// `a_feed_position_denotes_the_same_ledger_prefix_under_every_grant`
-    /// pins for the reference and nothing pins here yet. And a cursor whose
+    /// pins for the reference and
+    /// [`Defect::FeedCursorCountsAdmittedEntries`] is the subject that puts
+    /// it in front of a check here. And a cursor whose
     /// continuation retention has truncated is refused, which is DESIGN §3.3's
     /// `feed-retention-refusal`, though no mark can rise until this type is
     /// drivable.
     ///
-    /// No defect routed here touches the feed. This method is a mirror
-    /// and nothing more: a wrong answer invented for it would fail a future
-    /// check for a reason no matrix row names.
+    /// **Three defects routed here touch the feed**, one per decision this
+    /// method makes and one line each:
+    /// [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] backs the
+    /// resumption up by one,
+    /// [`Defect::FeedCursorCountsAdmittedEntries`] moves the cursor
+    /// assignment inside the admission branch, and
+    /// [`Defect::ABoundedReplayNeverCloses`] keeps minting a continuation
+    /// past the `until`. Everything else in this method is a mirror and
+    /// nothing more — a wrong answer invented for it would fail a check for
+    /// a reason no matrix row names.
     async fn read_feed_page(
         &self,
         subscription: &[MeterTypeId],
@@ -1687,7 +1822,20 @@ impl UsageCollectorPluginV1 for MutantLedger {
 
         let mut entries = Vec::new();
         let mut cursor = from;
-        for entry in ledger.entries.iter().filter(|entry| entry.sequence > from) {
+        // `> resumed_at` is the seek.
+        // [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] backs it up by
+        // one, which is `>= from` spelled so the comparison itself stays a
+        // key comparison rather than becoming an offset.
+        let resumed_at = if self.defect == Defect::AFeedPageRedeliversTheEntryAtItsCursor {
+            from.saturating_sub(1)
+        } else {
+            from
+        };
+        for entry in ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.sequence > resumed_at)
+        {
             // `upper` names an entry a bounded replay is still asked to read,
             // so the replay stops at the first entry beyond it.
             if entry.sequence > upper || u64::try_from(entries.len()).unwrap_or(u64::MAX) >= limit {
@@ -1695,15 +1843,26 @@ impl UsageCollectorPluginV1 for MutantLedger {
             }
             // The cursor moves onto this entry's sequence whether or not the
             // subscription and the scope admit it. Advancing only past
-            // admitted entries would make the position depend on who asked.
-            cursor = entry.sequence;
-            if subscription.contains(&entry.record.gts_type_id) && expr_admits(&entry.record, scope)
-            {
+            // admitted entries would make the position depend on who asked -
+            // which is exactly what
+            // [`Defect::FeedCursorCountsAdmittedEntries`] does, and the one
+            // line of this method any defect changes.
+            let carried = subscription.contains(&entry.record.gts_type_id)
+                && expr_admits(&entry.record, scope);
+            if carried || self.defect != Defect::FeedCursorCountsAdmittedEntries {
+                cursor = entry.sequence;
+            }
+            if carried {
                 entries.push(entry.record.clone());
             }
         }
 
-        let next = if until.is_some() && cursor >= upper {
+        // [`Defect::ABoundedReplayNeverCloses`] is the whole of the second
+        // line: a continuation on every page, the closing page of a bounded
+        // replay included.
+        let closes =
+            until.is_some() && cursor >= upper && self.defect != Defect::ABoundedReplayNeverCloses;
+        let next = if closes {
             None
         } else {
             Some(Self::encode_position(cursor)?)
@@ -2132,7 +2291,10 @@ impl LatestOrder {
             | Defect::AnswersNotConvergedForAnAcknowledgedEntry
             | Defect::LedgerHasNoUniqueConstraint
             | Defect::BatchResolvesAgainstThePreCallLedger
-            | Defect::ADivergentWriteDisplacesTheSurvivor => Self::Declared,
+            | Defect::ADivergentWriteDisplacesTheSurvivor
+            | Defect::FeedCursorCountsAdmittedEntries
+            | Defect::AFeedPageRedeliversTheEntryAtItsCursor
+            | Defect::ABoundedReplayNeverCloses => Self::Declared,
         }
     }
 

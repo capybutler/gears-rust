@@ -42,21 +42,22 @@
 //! previous one left; the fixtures are keyed so that a repeated run
 //! resubmits identical entries rather than colliding with different ones.
 //!
-//! # Eleven of DESIGN's sixteen, twelve checks in all
+//! # Twelve of DESIGN's sixteen, thirteen checks in all
 //!
 //! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
-//! eleven in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
+//! twelve in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
 //! statement about the rest**.
 //!
-//! **Two counts run through this file, and both are right.** Eleven is what
-//! [`run_all`] covers of DESIGN's sixteen; twelve is how many checks it
-//! runs, the twelfth being the one in [`ADDITIONAL_CHECKS`] that DESIGN
-//! does not tabulate. A count about coverage of DESIGN is therefore eleven
-//! and a count about what a run executed is twelve, and neither substitutes
-//! for the other. The other five of the sixteen are named, not omitted:
+//! **Two counts run through this file, and both are right.** Twelve is what
+//! [`run_all`] covers of DESIGN's sixteen; thirteen is how many checks it
+//! runs, the thirteenth being the one in [`ADDITIONAL_CHECKS`] that DESIGN
+//! does not tabulate. A count about coverage of DESIGN is therefore twelve
+//! and a count about what a run executed is thirteen, and neither
+//! substitutes for the other. The other four of the sixteen are named, not
+//! omitted:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
-//!   gear's SPI declares, not yet written. All five.
+//!   gear's SPI declares, not yet written. All four.
 //! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
 //!   it. Now empty: no check DESIGN tabulates is beyond the current trait.
 //!
@@ -66,7 +67,7 @@
 //! stops being accounted for fails it too. A caller reporting coverage
 //! should report all three alongside the violations — which matters
 //! because "run this suite" is the acceptance criterion for porting a
-//! backend, and a suite that runs eleven checks must not read as a suite
+//! backend, and a suite that runs twelve checks must not read as a suite
 //! that ran sixteen.
 //!
 //! # A check DESIGN does not tabulate
@@ -104,8 +105,8 @@
 use crate::plugin_api::UsageCollectorPluginV1;
 use checks::{
     at_most_one_invalidation, converged_target_lookup, dedup_concurrent, dedup_floor,
-    dedup_identity_over_window, invalidation_excluded_from_fold, latest_tie_break,
-    quantity_round_trip, record_and_invalidation_distinct_identity,
+    dedup_identity_over_window, feed_snapshot_and_replay, invalidation_excluded_from_fold,
+    latest_tie_break, quantity_round_trip, record_and_invalidation_distinct_identity,
     scope_is_a_filter_on_every_read_path, server_field_round_trip, window_end_selection,
 };
 
@@ -245,21 +246,33 @@ pub const LATEST_TIE_BREAK: &str = "latest-tie-break";
 /// check against three of them — the point lookup, the list path and the
 /// fold — which are the three that take the compiled scope inside
 /// `query.filter` or as `get_usage_record`'s `scope`. The feed page and
-/// the reconciliation read take a separate `scope: &ast::Expr` and are
-/// covered by no check here: their obligation is stated in their SPI docs
-/// (an entry outside the scope is absent from a feed page; a tenant the
-/// scope excludes answers exactly as one holding no entries) and asserted
-/// nowhere in this suite. A porter reading a green run should not read it
-/// as those two paths being exercised.
+/// the reconciliation read take a separate `scope: &ast::Expr`, and this
+/// check reaches neither.
 ///
-/// Two checks do dispatch a feed read — `server-field-round-trip` always,
-/// and `dedup-concurrent` under an `Eventual` declaration — and neither
-/// narrows anything here: every entry either one stores is inside the scope
-/// it sends, so the reads buy shape coverage on the path — a plugin that
-/// chokes on a compiled scope there meets one — and no scope *enforcement*
-/// whatever, for the reason the suite's shared single-tenant filter buys
-/// none either. A feed that ignored its `scope` argument outright passes
-/// every check this suite runs today.
+/// **The feed page is no longer uncovered, though it is covered by another
+/// check and for another reason.**
+/// [`FEED_SNAPSHOT_AND_REPLAY`] stores entries under two tenants on a meter
+/// of its own and walks them under a grant naming one, so a feed that
+/// ignored its `scope` argument outright now delivers entries that check
+/// reports as never written under the grant it read. That is a consequence
+/// of what that check needs — a withheld entry between every pair of
+/// admitted ones — rather than an assertion about authorization, and it is
+/// reported under that check's name. A porter who wants the enforcement
+/// obligation stated should still read the SPI doc: *"`scope` is the
+/// compiled PDP scope. An entry outside it is absent."*
+///
+/// **The reconciliation read is still reached by nothing.** Its obligation
+/// is in its SPI doc — a tenant the scope excludes answers exactly as one
+/// holding no entries — and asserted nowhere in this suite. A porter
+/// reading a green run should not read it as that path being exercised.
+///
+/// Two further checks dispatch a feed read — `server-field-round-trip`
+/// always, and `dedup-concurrent` under an `Eventual` declaration — and
+/// neither narrows anything: every entry either one stores is inside the
+/// scope it sends, so those reads buy shape coverage on the path — a plugin
+/// that chokes on a compiled scope there meets one — and no scope
+/// *enforcement* whatever, for the reason the suite's shared single-tenant
+/// filter buys none either.
 pub const SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH: &str = "scope-is-a-filter-on-every-read-path";
 
 /// The [`ContractViolation::check`] value a violation carries when the
@@ -294,11 +307,12 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     CONVERGED_TARGET_LOOKUP,
     DEDUP_CONCURRENT,
     LATEST_TIE_BREAK,
+    FEED_SNAPSHOT_AND_REPLAY,
 ];
 
 /// The checks [`run_all`] runs that DESIGN §3.3 does not tabulate.
 ///
-/// A fourth constant rather than a tenth entry in [`IMPLEMENTED_CHECKS`],
+/// A fourth constant rather than one more entry in [`IMPLEMENTED_CHECKS`],
 /// and the choice is what keeps the partition test meaningful. The other
 /// three are asserted to be exactly DESIGN's sixteen, disjoint; folding a
 /// name DESIGN never wrote into one of them would force that assertion to
@@ -316,7 +330,7 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// **Five of DESIGN's sixteen**, which is every check [`run_all`] does
+/// **Four of DESIGN's sixteen**, which is every check [`run_all`] does
 /// not run. Each is expressible against the seven methods this gear's SPI
 /// declares — nothing here waits on the SPI to grow, and
 /// [`BLOCKED_CHECKS`] is empty. Being unwritten is a statement about this
@@ -341,10 +355,9 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// **A caller reporting coverage has to report this constant.**
 /// [`run_all`] returning no violations says nothing whatever about a check
 /// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
-/// reports eleven checks' worth of evidence as sixteen.
+/// reports twelve checks' worth of evidence as sixteen.
 // @cpt-dod:cpt-cf-usage-collector-dod-plugin-conformance-suite:p1
 pub const UNWRITTEN_CHECKS: &[&str] = &[
-    FEED_SNAPSHOT_AND_REPLAY,
     FEED_COMPLETENESS,
     FEED_BOOTSTRAP_POSITION,
     FEED_RETENTION_REFUSAL,
@@ -367,11 +380,10 @@ pub const UNWRITTEN_CHECKS: &[&str] = &[
 ///   greatest `window_end`, then greatest `accepted_at`, then greatest `id`
 ///   in byte order, three fields the record does carry.
 ///
-/// `feed-snapshot-and-replay` is in [`UNWRITTEN_CHECKS`] now and
-/// `latest-tie-break` went further: it is written, it is in
-/// [`IMPLEMENTED_CHECKS`], and [`run_all`] dispatches it. So the second
-/// entry's justification was not merely false but false about a check the
-/// suite now runs. Keeping the constant matters
+/// Both went the whole way: each is written, each is in
+/// [`IMPLEMENTED_CHECKS`], and [`run_all`] dispatches both. So neither
+/// entry's justification was merely false — each was false about a check
+/// the suite now runs. Keeping the constant matters
 /// because it is one of the three the partition test holds against
 /// DESIGN's sixteen: a check a later SPI change puts out of reach needs
 /// somewhere to be named, and the alternative to naming it is a check that
@@ -416,6 +428,7 @@ pub async fn run_all(
     violations.extend(converged_target_lookup(plugin, level).await);
     violations.extend(dedup_concurrent(plugin, level).await);
     violations.extend(latest_tie_break(plugin).await);
+    violations.extend(feed_snapshot_and_replay(plugin).await);
     violations.extend(scope_is_a_filter_on_every_read_path(plugin).await);
     violations
 }

@@ -29,7 +29,7 @@ use crate::time_range::TimeRange;
 /// Three hundred days past [`FIXTURE_EPOCH`], for the reason
 /// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
 /// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240,
-/// 270 and 330 offsets the other checks take. It matters here because the
+/// 270, 330 and 360 offsets the other checks take. It matters here because the
 /// `Eventual` half counts the rows a range returns against the identities
 /// this check raced, so a stray entry inside it would be read as a row no
 /// identity of this check accounts for — which is the shape of the failure

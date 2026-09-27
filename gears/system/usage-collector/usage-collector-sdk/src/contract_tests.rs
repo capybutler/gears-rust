@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds eighteen deliberately
+//! as coverage. [`super::contract_mutants`] holds twenty-one deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -48,11 +48,12 @@ use uuid::Uuid;
 use super::contract_mutants::{Defect, mutant};
 use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, CONVERGED_TARGET_LOOKUP,
-    DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, HARNESS_FAULT,
-    IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD, LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP,
-    RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH,
-    SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS, WINDOW_END_SELECTION,
-    reference::InMemoryReferencePlugin, retention::ContractRetention, run_all,
+    DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel,
+    FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD,
+    LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
+    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS,
+    WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, retention::ContractRetention,
+    run_all,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
@@ -343,13 +344,25 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
         &[LATEST_TIE_BREAK],
     ),
     (Defect::LatestIgnoresThePeriodEnd, &[LATEST_TIE_BREAK]),
+    (
+        Defect::FeedCursorCountsAdmittedEntries,
+        &[FEED_SNAPSHOT_AND_REPLAY],
+    ),
+    (
+        Defect::AFeedPageRedeliversTheEntryAtItsCursor,
+        &[FEED_SNAPSHOT_AND_REPLAY],
+    ),
+    (
+        Defect::ABoundedReplayNeverCloses,
+        &[FEED_SNAPSHOT_AND_REPLAY],
+    ),
 ];
 
 /// Every check fails against a backend that gets its rule wrong, and passes
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all eighteen mutants is not
+/// of sensitivity. A check that fails against all twenty-one mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.
