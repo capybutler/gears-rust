@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use super::ContractViolation;
 use crate::models::{
-    CreateUsageRecord, IdempotencyKey, MeterTypeId, RECORD_ID_FIELD, ReasonCode, RecordOrigin,
-    ResourceRef, UsageRecord, WINDOW_END_FIELD,
+    CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RECORD_ID_FIELD, ReasonCode,
+    RecordOrigin, ResourceRef, UsageRecord, WINDOW_END_FIELD,
 };
 use crate::quantity::UsageQuantity;
 
@@ -221,6 +221,7 @@ pub fn fixture_record_for_tenant(
     window_end: time::OffsetDateTime,
 ) -> Result<UsageRecord, String> {
     CreateUsageRecord {
+        entry_type: EntryType::Record,
         gts_type_id: MeterTypeId::new(CONTRACT_METER_TYPE_ID)
             .map_err(|err| format!("the check's own meter type id is invalid: {err}"))?,
         tenant_id,
@@ -280,10 +281,11 @@ pub fn violation(check: &'static str, detail: String) -> ContractViolation {
 /// field they can differ in, and `at-most-one-invalidation` needs two that do.
 ///
 /// The projection is [`CreateUsageRecord::try_into_invalidation_record`]
-/// rather than `try_into_usage_record`, which refuses a submission carrying a
-/// reason code: `invalidates` is server-assigned, so the target's `id` is
-/// stamped here the way the gateway stamps what it resolved, and the
-/// derivation reads `entry_type = invalidation` instead.
+/// rather than `try_into_usage_record`, which refuses a submission declaring
+/// `entry_type = invalidation`: `invalidates` is server-assigned, so the
+/// target's `id` is stamped here the way the gateway stamps what it
+/// resolved, and the derivation reads the declared `entry_type` instead of
+/// the target's.
 pub fn fixture_invalidation_with_reason(
     target: &UsageRecord,
     reason: &str,
@@ -291,6 +293,7 @@ pub fn fixture_invalidation_with_reason(
     let reason = ReasonCode::new(reason)
         .map_err(|err| format!("the check's own reason code is invalid: {err}"))?;
     CreateUsageRecord {
+        entry_type: EntryType::Invalidation,
         gts_type_id: target.gts_type_id.clone(),
         tenant_id: target.tenant_id,
         resource_ref: target.resource_ref.clone(),

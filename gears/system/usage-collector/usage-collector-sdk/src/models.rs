@@ -805,16 +805,26 @@ pub const BACKFILL_ROUTE_PATH: &str = "/usage-collector/v1/records/backfill";
 
 /// The closed discriminator between a measurement and a withdrawal.
 ///
-/// **Derived, never stored and never submitted.** Each shape projects it
-/// from the withdrawal it carries — [`UsageRecord::entry_type`] from
-/// [`UsageRecord::invalidation`], [`CreateUsageRecord::entry_type`] from
-/// the reason code on [`CreateUsageRecord::invalidation`] — so on neither
-/// is there a second place the kind can be read, and no way for a marker to
-/// disagree with the payload it marks
-/// (`cpt-cf-usage-collector-adr-append-only-invalidation`). An entry is
-/// never identified as a correction by the value or the sign of its
-/// quantity: a zero or negative quantity is an ordinary measurement, and an
-/// invalidation echoes the quantity it withdraws rather than negating it.
+/// **Caller-supplied on the ingestion shape, required on every submission
+/// and with no default** (DESIGN §3.1, `EntryType`). It is a stored field of
+/// [`CreateUsageRecord`], read back by [`CreateUsageRecord::entry_type`] and
+/// never inferred from the reason code or from anything else the submission
+/// carries: an invalidation repeats its target's idempotency key, so a
+/// withdrawal stripped of its discriminator is an exact copy of the entry it
+/// means to withdraw and would be absorbed as a retry, withdrawing nothing.
+/// The two halves a submission states about its kind — this field and
+/// `reason_code` — must agree, and both projections refuse a submission
+/// where they do not.
+///
+/// **Derived on the persisted shape.** [`UsageRecord::entry_type`] reads it
+/// off the [`Invalidation`] the entry carries rather than from a field
+/// beside it, so once an entry is accepted there is one place its kind can
+/// be read and no marker that can disagree with the payload it marks
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+///
+/// An entry is never identified as a correction by the value or the sign of
+/// its quantity: a zero or negative quantity is an ordinary measurement, and
+/// an invalidation echoes the quantity it withdraws rather than negating it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryType {
@@ -1116,7 +1126,9 @@ impl UsageRecord {
 /// ([`crate::UsageCollectorClientV1::create_usage_record`] /
 /// [`crate::UsageCollectorClientV1::create_usage_records`]).
 ///
-/// This mirrors [`UsageRecord`] minus the four fields the server assigns:
+/// This mirrors [`UsageRecord`] with [`Self::entry_type`] added — the
+/// persisted shape derives its kind, this one is told it (see
+/// [`EntryType`]) — and minus the four fields the server assigns:
 /// `id`, a deterministic projection of the 6-tuple dedup identity (see
 /// [`Self::try_into_usage_record`]), `accepted_at`, stamped once per
 /// request, `origin`, stamped from the route the entry arrived on (see
@@ -1127,13 +1139,30 @@ impl UsageRecord {
 /// identity the gateway would only discard. The wire REST surface encodes
 /// the same shape as `CreateUsageRecordRequest`.
 ///
-/// One shape carries both entry kinds, and [`Self::invalidation`] alone
-/// decides which: there is no caller-supplied discriminator to disagree
-/// with the payload it marks
-/// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+/// One shape carries both entry kinds and [`Self::entry_type`] alone decides
+/// which (DESIGN §3.1, `CreateUsageRecord`). It is required and
+/// caller-supplied, so the kind is never inferred from the reason code, and
+/// `reason_code` is the caller's second statement about the same kind rather
+/// than the kind itself: DESIGN §3.1's "Entry type and reason code" row
+/// requires it on an `invalidation` and forbids it on a `record`, and both
+/// projections refuse a submission whose two statements disagree.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(try_from = "CreateUsageRecordWire")]
 pub struct CreateUsageRecord {
+    /// The kind this submission declares — caller-supplied, required, and
+    /// the sixth input to the derived identity.
+    ///
+    /// **Never inferred** (DESIGN §3.1, `EntryType`). It is the one field
+    /// that keeps a withdrawal's identity apart from its target's: the
+    /// faithful copy leaves every other identity input equal to the
+    /// target's, so a submission that omitted this would derive the
+    /// target's own `id` and be absorbed as a retry of it.
+    ///
+    /// It must agree with [`Self::invalidation`], and the projections
+    /// enforce that rather than the type: a reason code is required here
+    /// when this is [`EntryType::Invalidation`] and forbidden when it is
+    /// [`EntryType::Record`].
+    pub entry_type: EntryType,
     /// Meter this record attaches to — the derived GTS type declaration
     /// (`gts.cf.core.uc.usage_record.v1~<segment>~`) resolved through
     /// `types-registry`, not a plugin-owned catalog row.
@@ -1185,18 +1214,53 @@ pub struct CreateUsageRecord {
 }
 
 impl CreateUsageRecord {
-    /// This submission's kind, derived from the reason code it carries.
+    /// The kind this submission declares — [`Self::entry_type`], read back.
     ///
     /// The sixth input to the identity derivation
-    /// (`cpt-cf-usage-collector-adr-record-identity-derivation`), and — like
-    /// [`UsageRecord::entry_type`] — a projection rather than a stored
-    /// field, so no marker can disagree with the payload it marks.
+    /// (`cpt-cf-usage-collector-adr-record-identity-derivation`). Unlike
+    /// [`UsageRecord::entry_type`] this reads a stored field rather than
+    /// projecting one: DESIGN §3.1 requires the discriminator on every
+    /// submission and forbids inferring it, so there is nothing here to
+    /// project it from. An accessor all the same, so a call site that asks
+    /// a submission its kind reads the same way as one asking an accepted
+    /// entry.
     #[must_use]
     pub const fn entry_type(&self) -> EntryType {
-        if self.invalidation.is_some() {
-            EntryType::Invalidation
-        } else {
-            EntryType::Record
+        self.entry_type
+    }
+
+    /// Refuses a submission whose two statements about its own kind
+    /// disagree.
+    ///
+    /// DESIGN §3.1, "Entry type and reason code": `reason_code` is required
+    /// when `entry_type` is `invalidation` and MUST NOT appear on a
+    /// `record`. Both halves are caller-supplied, so a disagreement is an
+    /// emitter error — a caller-facing
+    /// [`UsageCollectorError::InvalidArgument`] naming `reason_code`, not
+    /// the [`UsageCollectorError::Internal`] the two projections raise when
+    /// the submission is consistent and it is the *projection* that is
+    /// wrong for it.
+    ///
+    /// Both projections run this **before** their own guard, and that
+    /// ordering is what keeps the two classifications apart. Run after, a
+    /// disagreeing submission would trip the guard first and be reported as
+    /// a host-contract breach against a gateway that read `entry_type`
+    /// correctly and chose the matching projection. Run first, a guard can
+    /// only be reached by a submission already known to agree with itself —
+    /// which is exactly the claim those guards make.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    fn require_agreeing_kind(&self) -> Result<(), UsageCollectorError> {
+        match (self.entry_type, self.invalidation.is_some()) {
+            (EntryType::Invalidation, false) => {
+                Err(UsageCollectorError::reason_code_required_on_invalidation())
+            }
+            (EntryType::Record, true) => {
+                Err(UsageCollectorError::reason_code_forbidden_on_record())
+            }
+            (EntryType::Record, false) | (EntryType::Invalidation, true) => Ok(()),
         }
     }
 
@@ -1209,8 +1273,9 @@ impl CreateUsageRecord {
     /// period preconditions to be rejected **before** the derivation runs,
     /// so the projection is fallible rather than the caller's obligation.
     ///
-    /// In order: the submission must carry no reason code, both bounds are
-    /// normalized to UTC, each must then carry at most microsecond
+    /// In order: the submission's `entry_type` and `reason_code` must agree
+    /// and the declared kind must be `record`, both bounds are normalized to
+    /// UTC, each must then carry at most microsecond
     /// precision, the period must be ordered
     /// (`window_start <= window_end`, equal bounds being a point event), a
     /// key must be present, and only then is `id` derived over
@@ -1219,13 +1284,25 @@ impl CreateUsageRecord {
     /// are the exceptions: both are server-assigned and stamped from the
     /// arguments, and neither is an input to the derivation.
     ///
-    /// **A submission carrying a reason code is refused here rather than
-    /// projected without it.** It is an invalidation, and an invalidation
-    /// needs a target this projection has no way to resolve;
+    /// **A submission is refused rather than reconciled, and the two
+    /// refusals are addressed to different people.** A submission that
+    /// declares `entry_type: record` and states a reason code all the same
+    /// contradicts itself. That is an emitter error, and both projections
+    /// check the two halves against each other before anything else, so it
+    /// is reported as an
+    /// [`InvalidArgument`](UsageCollectorError::InvalidArgument) on
+    /// `reason_code`. A submission that agrees with itself and declares
+    /// `entry_type: invalidation` is well-formed and simply not this
+    /// projection's: it needs a target only the gateway can resolve, so
     /// [`Self::try_into_invalidation_record`] is the projection that takes
-    /// one. Dropping the reason instead would turn a withdrawal into an
-    /// ordinary measurement — accepted, derived under `entry_type = record`,
-    /// and colliding with the very entry it meant to withdraw.
+    /// one, and arriving here means the gateway chose the wrong one —
+    /// reported as [`Internal`](UsageCollectorError::Internal).
+    ///
+    /// Neither is reconciled by dropping a half. Dropping the reason would
+    /// turn a withdrawal into an ordinary measurement — accepted, derived
+    /// under `entry_type = record`, and colliding with the very entry it
+    /// meant to withdraw. Reading the kind off the reason instead of the
+    /// declared field is the inference DESIGN §3.1 forbids outright.
     ///
     /// `origin` is server-assigned
     /// (`cpt-cf-usage-collector-adr-backfill-isolation`), so it arrives as an
@@ -1255,10 +1332,15 @@ impl CreateUsageRecord {
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorError::InvalidArgument`] when the submission
-    /// carries a reason code, when a bound is finer than microsecond
-    /// precision, when the period is inverted, or when no idempotency key is
-    /// present.
+    /// Returns [`UsageCollectorError::InvalidArgument`] when the
+    /// submission's `entry_type` and `reason_code` disagree, when a bound is
+    /// finer than microsecond precision, when the period is inverted, or
+    /// when no idempotency key is present.
+    ///
+    /// Returns [`UsageCollectorError::Internal`] when a self-consistent
+    /// submission declares `entry_type: invalidation` — a projection this
+    /// crate's caller chose wrongly, not anything the emitter did. See
+    /// [`UsageCollectorError::withdrawal_needs_its_target`].
     #[allow(
         clippy::result_large_err,
         reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
@@ -1268,7 +1350,8 @@ impl CreateUsageRecord {
         origin: RecordOrigin,
         accepted_at: time::OffsetDateTime,
     ) -> Result<UsageRecord, UsageCollectorError> {
-        if self.invalidation.is_some() {
+        self.require_agreeing_kind()?;
+        if matches!(self.entry_type, EntryType::Invalidation) {
             return Err(UsageCollectorError::withdrawal_needs_its_target());
         }
         self.project(origin, accepted_at, None)
@@ -1298,8 +1381,13 @@ impl CreateUsageRecord {
     /// # Errors
     ///
     /// [`UsageCollectorError::InvalidArgument`] on the same grounds as
-    /// [`Self::try_into_usage_record`], and when this submission carries no
-    /// reason code, which is what makes it an invalidation at all.
+    /// [`Self::try_into_usage_record`] — including a submission that
+    /// declares `entry_type: invalidation` and states no reason code, which
+    /// is what makes it an invalidation at all.
+    ///
+    /// [`UsageCollectorError::Internal`] when a self-consistent submission
+    /// declares `entry_type: record`, which is this projection's mirror of
+    /// the misuse above. See [`UsageCollectorError::missing_reason_code`].
     #[allow(
         clippy::result_large_err,
         reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
@@ -1310,6 +1398,7 @@ impl CreateUsageRecord {
         accepted_at: time::OffsetDateTime,
         target: Uuid,
     ) -> Result<UsageRecord, UsageCollectorError> {
+        self.require_agreeing_kind()?;
         let Some(reason) = self.invalidation.take() else {
             return Err(UsageCollectorError::missing_reason_code());
         };
@@ -1320,10 +1409,15 @@ impl CreateUsageRecord {
     /// preconditions, the key rule, and the derivation over the six identity
     /// inputs.
     ///
-    /// `invalidation` is the resolved withdrawal, already paired with its
-    /// target, and it decides the sixth input — so the entry type the digest
-    /// reads and the reference the entry carries come from one value and
-    /// cannot disagree.
+    /// The digest's sixth input is the caller's own [`Self::entry_type`],
+    /// because DESIGN §3.1 forbids inferring the kind from anything else.
+    /// `invalidation` is the resolved withdrawal, already paired with the
+    /// target the gateway found, and it is what the projected entry carries.
+    /// The two cannot disagree: each caller above checks the submission
+    /// against itself with `require_agreeing_kind` and then refuses the kind
+    /// that is not its own, so `invalidation` is `Some` exactly when the
+    /// declared type is [`EntryType::Invalidation`]. A third projection
+    /// added here owes the same two checks before it calls this.
     ///
     /// `self` is destructured rather than read field by field, on
     /// [`UsageRecord::caller_supplied_eq`]'s discipline and for the same
@@ -1341,6 +1435,12 @@ impl CreateUsageRecord {
         invalidation: Option<Invalidation>,
     ) -> Result<UsageRecord, UsageCollectorError> {
         let Self {
+            // Spent before this runs, in two steps: each caller above checks
+            // it against the reason code, then refuses the kind that is not
+            // its own. What survives is re-encoded in the `invalidation`
+            // argument — which is why the sixth identity input below reads
+            // this value while the projected entry carries that one.
+            entry_type,
             gts_type_id,
             tenant_id,
             resource_ref,
@@ -1380,12 +1480,6 @@ impl CreateUsageRecord {
                 window_end,
             ));
         }
-
-        let entry_type = if invalidation.is_some() {
-            EntryType::Invalidation
-        } else {
-            EntryType::Record
-        };
 
         let Some(idempotency_key) = idempotency_key else {
             return Err(UsageCollectorError::missing_idempotency_key());
@@ -1699,9 +1793,18 @@ impl Serialize for UsageRecord {
 /// `CreateUsageRecordRequest` does not publish it and a submitted one is
 /// "rejected as an unknown field" — which `deny_unknown_fields` above is
 /// what delivers here.
+///
+/// It **does** declare `entry_type`, with no `serde(default)`: the published
+/// `CreateUsageRecordRequest` lists it among its required properties and
+/// discriminates its two `oneOf` branches on it, so a body that omits it is
+/// refused here as a missing field rather than read as a `record`. The
+/// agreement between it and `reason_code` is not checked here — the codec
+/// can only raise a plain serde string, and the two projections raise a
+/// typed field violation instead.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateUsageRecordWire {
+    entry_type: EntryType,
     gts_type_id: MeterTypeId,
     tenant_id: Uuid,
     resource_ref: ResourceRef,
@@ -1735,6 +1838,7 @@ impl TryFrom<CreateUsageRecordWire> for CreateUsageRecord {
 
     fn try_from(wire: CreateUsageRecordWire) -> Result<Self, Self::Error> {
         let CreateUsageRecordWire {
+            entry_type,
             gts_type_id,
             tenant_id,
             resource_ref,
@@ -1747,6 +1851,7 @@ impl TryFrom<CreateUsageRecordWire> for CreateUsageRecord {
             window_end,
         } = wire;
         Ok(Self {
+            entry_type,
             gts_type_id,
             tenant_id,
             resource_ref,
@@ -1765,6 +1870,7 @@ impl TryFrom<CreateUsageRecordWire> for CreateUsageRecord {
 /// [`UsageRecordWireRef`] for why it borrows.
 #[derive(Serialize)]
 struct CreateUsageRecordWireRef<'a> {
+    entry_type: EntryType,
     gts_type_id: &'a MeterTypeId,
     tenant_id: Uuid,
     resource_ref: &'a ResourceRef,
@@ -1789,6 +1895,7 @@ impl Serialize for CreateUsageRecord {
         S: serde::Serializer,
     {
         let Self {
+            entry_type,
             gts_type_id,
             tenant_id,
             resource_ref,
@@ -1801,6 +1908,7 @@ impl Serialize for CreateUsageRecord {
             window_end,
         } = self;
         CreateUsageRecordWireRef {
+            entry_type: *entry_type,
             gts_type_id,
             tenant_id: *tenant_id,
             resource_ref,

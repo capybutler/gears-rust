@@ -39,7 +39,8 @@ use super::{
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
-    CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef, UsageRecord,
+    CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
+    UsageRecord,
 };
 use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
@@ -539,6 +540,7 @@ async fn assert_not_found(
 /// The subject-less row every scope above is evaluated against.
 fn scope_probe_record() -> UsageRecord {
     CreateUsageRecord {
+        entry_type: EntryType::Record,
         gts_type_id: MeterTypeId::new(super::fixtures::CONTRACT_METER_TYPE_ID)
             .expect("valid meter type id"),
         tenant_id: super::fixtures::CONTRACT_TENANT_ID,

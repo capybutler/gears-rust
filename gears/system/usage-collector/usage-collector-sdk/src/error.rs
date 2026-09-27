@@ -518,7 +518,7 @@ impl UsageCollectorError {
     }
 
     /// [`crate::CreateUsageRecord::try_into_usage_record`] was handed a
-    /// submission carrying a reason code.
+    /// submission that declares `entry_type: invalidation`.
     ///
     /// The submission is a withdrawal, and a withdrawal has to name the
     /// entry it withdraws — a reference only the gateway can resolve, so
@@ -536,33 +536,95 @@ impl UsageCollectorError {
     /// breach and returns `Internal(detail)`" — and the `detail` here is
     /// addressed to whoever wired the gateway, so it must not travel to a
     /// REST caller as a 400 against a field they may have sent correctly.
+    ///
+    /// **It cannot fire for a self-contradicting submission**, which is what
+    /// keeps that claim honest. The projection checks `entry_type` against
+    /// `reason_code` first, so a `record` that states a reason is already
+    /// gone as a 400 ([`Self::reason_code_forbidden_on_record`]) and every
+    /// submission that gets this far declares a kind its reason code agrees
+    /// with. What is left is a projection chosen wrongly, and nothing else.
     #[must_use]
     pub fn withdrawal_needs_its_target() -> Self {
         Self::internal(
-            "try_into_usage_record was handed a submission carrying a reason_code; a withdrawal \
-             is projected with try_into_invalidation_record and its resolved target",
+            "try_into_usage_record was handed a submission declaring entry_type invalidation; a \
+             withdrawal is projected with try_into_invalidation_record and its resolved target",
         )
     }
 
     /// [`crate::CreateUsageRecord::try_into_invalidation_record`] was handed
-    /// a submission carrying no reason code.
+    /// a submission that declares `entry_type: record`.
     ///
-    /// Carrying one is what makes a submission an invalidation at all, and
-    /// `reason_code` is required on the `invalidation` branch of
-    /// `CreateUsageRecordRequest`.
+    /// Such a submission carries no reason code — the projection has already
+    /// checked the two against each other — and a reason code is what a
+    /// withdrawal states beside its declared kind.
     ///
     /// **[`Self::Internal`] on the same grounds as
-    /// [`Self::withdrawal_needs_its_target`].** A body that declares
-    /// `entry_type: invalidation` and omits `reason_code` is an emitter
-    /// error the gateway owes a 400 — DESIGN §3.3 lists the reason-code
-    /// check among the gateway-side ones — so a submission arriving here
-    /// without one means that check did not run, not that the emitter erred
-    /// in a way this crate should attribute to them.
+    /// [`Self::withdrawal_needs_its_target`], and on the same narrowed
+    /// precondition.** A body that declares `entry_type: invalidation` and
+    /// omits `reason_code` is an emitter error owed a 400, and this crate
+    /// now raises that itself as
+    /// [`Self::reason_code_required_on_invalidation`], before the projection
+    /// can reach this. So the only submission that gets here declares a
+    /// `record` and is consistent in doing so: the gateway picked the
+    /// withdrawal projection for a measurement, which is a host-contract
+    /// breach and not the emitter's to answer for.
     #[must_use]
     pub fn missing_reason_code() -> Self {
         Self::internal(
-            "try_into_invalidation_record was handed a submission carrying no reason_code; the \
-             gateway validates reason_code before it chooses a projection",
+            "try_into_invalidation_record was handed a submission declaring entry_type record; \
+             the gateway reads entry_type before it chooses a projection",
+        )
+    }
+
+    /// A submission declared `entry_type: invalidation` and stated no reason
+    /// code. `field` is `reason_code`.
+    ///
+    /// DESIGN §3.1's "Entry type and reason code" row requires one on that
+    /// branch, and `CreateUsageRecordRequest`'s `invalidation` branch lists
+    /// `reason_code` among its required properties.
+    ///
+    /// **[`Self::InvalidArgument`], not [`Self::Internal`]** — unlike
+    /// [`Self::missing_reason_code`], which reports the same field missing.
+    /// Both halves of the contradiction are caller-supplied (DESIGN §3.1,
+    /// Field ownership), so a submission stating a withdrawal and giving no
+    /// reason is an emitter error whichever projection it is handed to, and
+    /// the emitter is the only one who can fix it. The declared kind is
+    /// taken as what they meant, so the violation is attributed to the half
+    /// they have to add.
+    #[must_use]
+    pub fn reason_code_required_on_invalidation() -> Self {
+        Self::newtype_validation(
+            "reason_code",
+            "reason_code is required when entry_type is invalidation",
+        )
+    }
+
+    /// A submission declared `entry_type: record` and stated a reason code.
+    /// `field` is `reason_code`.
+    ///
+    /// DESIGN §3.1's "Entry type and reason code" row: `reason_code` MUST
+    /// NOT appear on a `record`, which the published schema spells as
+    /// `reason_code: false` on the `record` branch of
+    /// `CreateUsageRecordRequest`.
+    ///
+    /// Refused rather than reconciled, because both ways of reconciling it
+    /// are worse. Dropping the reason admits a withdrawal as an ordinary
+    /// measurement under `entry_type = record`, colliding it with the entry
+    /// it meant to withdraw; reading the kind off the reason instead is the
+    /// inference DESIGN §3.1 forbids outright. The violation is attributed
+    /// to `reason_code` because the declared kind is taken as what the
+    /// emitter meant, so that is the half to remove.
+    ///
+    /// **[`Self::InvalidArgument`], not [`Self::Internal`]** — unlike
+    /// [`Self::withdrawal_needs_its_target`], which reports the same stray
+    /// reason code. See [`Self::reason_code_required_on_invalidation`] for
+    /// the line between the two.
+    #[must_use]
+    pub fn reason_code_forbidden_on_record() -> Self {
+        Self::newtype_validation(
+            "reason_code",
+            "reason_code must not appear when entry_type is record; an entry that withdraws \
+             another declares entry_type invalidation",
         )
     }
 

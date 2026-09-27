@@ -40,10 +40,13 @@ pub const USAGE_RECORD_ID_NAMESPACE: Uuid =
 /// enumeration rendering one of two ASCII literals ([`EntryType::as_str`]),
 /// so it has no way to spell a control character at all — a guarantee of
 /// the type rather than of a validation step, and so stronger than the one
-/// the remaining two get. Those two are caller-supplied, and both newtypes
-/// reject every ASCII control character ([`MeterTypeId::new`],
-/// [`IdempotencyKey::new`]) — which is what keeps two distinct dedup
-/// identities from concatenating to one pre-image.
+/// the remaining two get. That holds even though the entry type is
+/// caller-supplied on the ingestion shape (DESIGN §3.1, Field ownership):
+/// the closed enumeration is what the codec admits, so there is no untyped
+/// spelling of it to carry the byte. The remaining two arrive as
+/// caller-supplied *strings*, and both newtypes reject every ASCII control
+/// character ([`MeterTypeId::new`], [`IdempotencyKey::new`]) — which is what
+/// keeps two distinct dedup identities from concatenating to one pre-image.
 const FIELD_SEPARATOR: u8 = 0x1F;
 
 /// Renders a covered-period bound in the canonical 27-character form

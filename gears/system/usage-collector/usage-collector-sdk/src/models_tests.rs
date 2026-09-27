@@ -108,11 +108,22 @@ fn sample_usage_record(subject_ref: Option<SubjectRef>, invalidates: Option<Uuid
     }
 }
 
+/// A submission whose declared kind agrees with the reason code it states.
+///
+/// `entry_type` is caller-supplied and the two can disagree, which is a
+/// caller error both projections refuse — but a disagreeing submission is
+/// never what a test of something *else* wants, so this helper cannot build
+/// one. The two tests that need one spell the struct out themselves.
 fn sample_create_usage_record(
     subject_ref: Option<SubjectRef>,
     invalidation: Option<ReasonCode>,
 ) -> CreateUsageRecord {
     CreateUsageRecord {
+        entry_type: if invalidation.is_some() {
+            EntryType::Invalidation
+        } else {
+            EntryType::Record
+        },
         gts_type_id: sample_meter_id(),
         tenant_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("tenant uuid"),
         resource_ref: ResourceRef::new("vm-1", "compute.vm").expect("valid resource ref"),
@@ -169,42 +180,44 @@ fn try_into_invalidation_record_stamps_the_derived_id_and_forwards_every_field()
     assert_eq!(record.window_end, input.window_end);
 }
 
-/// The measurement projection refuses a submission carrying a reason code
-/// rather than dropping it.
+/// The measurement projection refuses a submission that declares
+/// `entry_type: invalidation` rather than projecting it as a record.
 ///
-/// Dropping it would admit a withdrawal as an ordinary record — derived
+/// Projecting it would admit a withdrawal as an ordinary record — derived
 /// under `entry_type = record` and so colliding with the very entry it
 /// meant to withdraw. The target is server-assigned, so this projection has
 /// no way to resolve one and
 /// [`CreateUsageRecord::try_into_invalidation_record`] is the one that
 /// takes it.
 ///
-/// The refusal is `Internal`, not `InvalidArgument`: reaching it means the
-/// gateway picked the projection that contradicts the submission it holds,
-/// and the emitter's body may be faultless. A 400 here would blame a caller
-/// for a host-contract breach and put an implementer-facing instruction on
-/// the wire.
+/// The refusal is `Internal`, not `InvalidArgument`: the submission handed
+/// over here agrees with itself, so reaching this means the gateway picked
+/// the projection that contradicts a body that may be faultless. A 400 here
+/// would blame a caller for a host-contract breach and put an
+/// implementer-facing instruction on the wire. The caller-facing half of
+/// the same field is `a_record_that_states_a_reason_code_is_a_caller_error`
+/// below.
 #[test]
-fn try_into_usage_record_refuses_a_submission_that_states_a_reason() {
+fn try_into_usage_record_refuses_a_submission_that_declares_a_withdrawal() {
     let err = sample_create_usage_record(None, Some(sample_reason()))
         .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
-        .expect_err("a reason code makes this an invalidation, not a measurement");
+        .expect_err("a declared invalidation is not a measurement");
     assert!(
         matches!(err, UsageCollectorError::Internal { .. }),
         "calling the wrong projection is a host-contract breach, not caller input; got {err:?}",
     );
 }
 
-/// And the withdrawal projection refuses one carrying none: the reason code
-/// is what makes a submission an invalidation at all. `Internal` on the
-/// same grounds — the gateway validates `reason_code` before it chooses a
-/// projection, so a submission arriving here without one means that check
-/// did not run.
+/// And the withdrawal projection refuses one that declares
+/// `entry_type: record`. `Internal` on the same grounds — the gateway reads
+/// the declared kind before it chooses a projection, so a measurement
+/// arriving here means that reading did not happen. Its caller-facing
+/// mirror is `an_invalidation_with_no_reason_code_is_a_caller_error` below.
 #[test]
-fn try_into_invalidation_record_refuses_a_submission_with_no_reason() {
+fn try_into_invalidation_record_refuses_a_submission_that_declares_a_record() {
     let err = sample_create_usage_record(None, None)
         .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
-        .expect_err("a withdrawal states a reason");
+        .expect_err("a declared measurement is not a withdrawal");
     assert!(
         matches!(err, UsageCollectorError::Internal { .. }),
         "calling the wrong projection is a host-contract breach, not caller input; got {err:?}",
@@ -731,7 +744,8 @@ fn usage_record_serde_round_trip_carries_subject_ref_and_the_withdrawal_pair_whe
 }
 
 // ---------------------------------------------------------------------------
-// EntryType — the derived record/invalidation discriminator
+// EntryType — derived on the persisted entry, caller-supplied on the
+// submission
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -759,18 +773,131 @@ fn an_entry_carries_no_serialized_entry_type() {
 }
 
 #[test]
-fn a_submission_carries_no_entry_type_either() {
-    // The wire contract states the rule on the ingestion shape — "the
-    // ingestion shape accepts no discriminator field" — and this is the
-    // type a request body deserializes into, so it is where a caller could
-    // actually try to send one.
+fn a_submission_declares_its_own_entry_type() {
+    // The opposite of the entry shape above, and the wire contract says so
+    // in both directions: `EntryType` is "Required on every ingestion
+    // request, with no default", and `CreateUsageRecordRequest` lists
+    // `entry_type` among its required properties and discriminates its two
+    // `oneOf` branches on it. A body conforming to the published contract
+    // must therefore round-trip through this type, discriminator and all.
     let json = serde_json::to_value(sample_create_usage_record(None, None)).expect("serializes");
-    assert!(json.get("entry_type").is_none());
+    assert_eq!(json.get("entry_type"), Some(&serde_json::json!("record")));
 
-    let mut with_marker = json.as_object().expect("object").clone();
-    with_marker.insert("entry_type".to_owned(), serde_json::json!("invalidation"));
-    serde_json::from_value::<CreateUsageRecord>(serde_json::Value::Object(with_marker))
-        .expect_err("a submitted entry_type must be refused as an unknown field");
+    let withdrawal = serde_json::to_value(sample_create_usage_record(None, Some(sample_reason())))
+        .expect("serializes");
+    assert_eq!(
+        withdrawal.get("entry_type"),
+        Some(&serde_json::json!("invalidation")),
+    );
+    assert_eq!(
+        serde_json::from_value::<CreateUsageRecord>(withdrawal)
+            .expect("a declared withdrawal decodes")
+            .entry_type(),
+        EntryType::Invalidation,
+    );
+
+    // No default: a body that omits it is refused rather than read as a
+    // `record`. An invalidation stripped of its discriminator is an exact
+    // copy of its target and would be absorbed as a retry, withdrawing
+    // nothing.
+    let mut without = json.as_object().expect("object").clone();
+    without.remove("entry_type");
+    serde_json::from_value::<CreateUsageRecord>(serde_json::Value::Object(without))
+        .expect_err("entry_type is required on every ingestion request, with no default");
+}
+
+#[test]
+fn entry_type_is_read_back_rather_than_inferred_from_the_reason_code() {
+    // DESIGN §3.1: the discriminator is "Never inferred from other fields".
+    // The accessor has to report what the submission declared even when the
+    // reason code would suggest the other kind — otherwise the two
+    // disagreement refusals below could never see a disagreement to refuse.
+    let contradicting = CreateUsageRecord {
+        entry_type: EntryType::Record,
+        ..sample_create_usage_record(None, Some(sample_reason()))
+    };
+    assert_eq!(contradicting.entry_type(), EntryType::Record);
+
+    let bare = CreateUsageRecord {
+        entry_type: EntryType::Invalidation,
+        ..sample_create_usage_record(None, None)
+    };
+    assert_eq!(bare.entry_type(), EntryType::Invalidation);
+}
+
+/// A submission declaring `entry_type: invalidation` and stating no reason
+/// code is refused by **both** projections, as caller input.
+///
+/// DESIGN §3.1, "Entry type and reason code": `reason_code` is required when
+/// `entry_type` is `invalidation`. Both halves are caller-supplied, so this
+/// is an emitter error and the refusal is a 400 naming `reason_code` — not
+/// the `Internal` that `missing_reason_code` raises for the same absent
+/// field, which reports a gateway that chose the withdrawal projection for a
+/// submission declaring a `record`.
+///
+/// Asserting it on both projections is the point: the check runs before
+/// either projection's own guard, so neither choice of projection can turn a
+/// caller's mistake into a host-contract breach.
+#[test]
+fn an_invalidation_with_no_reason_code_is_a_caller_error() {
+    let submission = CreateUsageRecord {
+        entry_type: EntryType::Invalidation,
+        ..sample_create_usage_record(None, None)
+    };
+
+    for err in [
+        submission
+            .clone()
+            .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+            .expect_err("a declared withdrawal states a reason"),
+        submission
+            .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
+            .expect_err("a declared withdrawal states a reason"),
+    ] {
+        assert!(
+            matches!(
+                &err,
+                UsageCollectorError::InvalidArgument { field, .. } if field == "reason_code"
+            ),
+            "the emitter supplied both halves, so this is their 400 on `reason_code`; got {err:?}",
+        );
+    }
+}
+
+/// And its mirror: a submission declaring `entry_type: record` while stating
+/// a reason code, refused by both projections as caller input.
+///
+/// DESIGN §3.1 forbids `reason_code` on a `record`. Neither reconciliation
+/// is available — dropping the reason admits a withdrawal as a measurement
+/// that collides with its own target, and reading the kind off the reason is
+/// the inference DESIGN forbids — so the submission is refused and the
+/// emitter chooses. A 400 rather than the `Internal` of
+/// `withdrawal_needs_its_target`, which reports the same stray field on a
+/// submission that is consistent about being a withdrawal.
+#[test]
+fn a_record_that_states_a_reason_code_is_a_caller_error() {
+    let submission = CreateUsageRecord {
+        entry_type: EntryType::Record,
+        ..sample_create_usage_record(None, Some(sample_reason()))
+    };
+
+    for err in [
+        submission
+            .clone()
+            .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+            .expect_err("a declared measurement states no reason"),
+        submission
+            .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
+            .expect_err("a declared measurement states no reason"),
+    ] {
+        assert!(
+            matches!(
+                &err,
+                UsageCollectorError::InvalidArgument { field, .. } if field == "reason_code"
+            ),
+            "the emitter supplied both halves, so this is their 400 on `reason_code`; got {err:?}",
+        );
+    }
 }
 
 #[test]
@@ -1009,6 +1136,7 @@ fn each_entry_shape_serializes_the_exact_wire_key_set() {
     assert_eq!(
         keys,
         [
+            "entry_type",
             "gts_type_id",
             "idempotency_key",
             "metadata",
@@ -1019,9 +1147,10 @@ fn each_entry_shape_serializes_the_exact_wire_key_set() {
             "window_end",
             "window_start",
         ],
-        "the ingestion shape is the entry shape minus the four the server \
-         assigns - `id`, `accepted_at`, `origin` and `invalidates`; the key \
-         stays, because a withdrawal repeats its target's; got {submission}",
+        "the ingestion shape drops the four the server assigns - `id`, \
+         `accepted_at`, `origin` and `invalidates` - and declares the one the \
+         entry shape derives, `entry_type`; the key stays, because a \
+         withdrawal repeats its target's; got {submission}",
     );
 
     // The quantity is a JSON *string*, never a JSON number, on both shapes.
@@ -2499,8 +2628,8 @@ mod caller_supplied_eq {
     use std::collections::BTreeMap;
 
     use crate::models::{
-        CreateUsageRecord, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId, ReasonCode,
-        RecordOrigin, ResourceRef, SubjectRef, UsageRecord,
+        CreateUsageRecord, EntryType, IdempotencyKey, Invalidation, MetadataKey, MeterTypeId,
+        ReasonCode, RecordOrigin, ResourceRef, SubjectRef, UsageRecord,
     };
     use crate::quantity::UsageQuantity;
 
@@ -2513,6 +2642,7 @@ mod caller_supplied_eq {
 
     fn record() -> UsageRecord {
         CreateUsageRecord {
+            entry_type: EntryType::Record,
             gts_type_id: MeterTypeId::new(METER).expect("valid meter id"),
             tenant_id: uuid::Uuid::from_u128(0xCA11),
             resource_ref: ResourceRef::new("res-1", "compute.vm").expect("valid resource ref"),
@@ -2652,7 +2782,10 @@ mod explicit_null_idempotency_key {
     use crate::models::CreateUsageRecord;
 
     fn body(extra: &serde_json::Value) -> serde_json::Value {
+        // `entry_type` is required with no default, so every body here
+        // declares one; the invalidation cases override it through `extra`.
         let mut body = serde_json::json!({
+            "entry_type": "record",
             "gts_type_id": "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1~",
             "tenant_id": "00000000-0000-4000-8000-000000000001",
             "resource_ref": { "resource_id": "res-1", "resource_type": "compute.vm" },
@@ -2678,6 +2811,7 @@ mod explicit_null_idempotency_key {
     #[test]
     fn an_explicit_null_key_is_refused_on_an_invalidation_too() {
         let refused = serde_json::from_value::<CreateUsageRecord>(body(&serde_json::json!({
+            "entry_type": "invalidation",
             "idempotency_key": null,
             "reason_code": "emitter_defect",
         })));
@@ -2696,6 +2830,7 @@ mod explicit_null_idempotency_key {
         // so the diagnostic is a typed field violation rather than a serde
         // string.
         let decoded = serde_json::from_value::<CreateUsageRecord>(body(&serde_json::json!({
+            "entry_type": "invalidation",
             "idempotency_key": "k-1",
             "reason_code": "emitter_defect",
         })))
