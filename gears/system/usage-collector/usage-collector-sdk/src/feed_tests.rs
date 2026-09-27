@@ -2,7 +2,11 @@
 
 use std::collections::HashSet;
 
-use super::{FeedPosition, FeedPositionInvalid, MAX_FEED_POSITION_BYTES};
+use super::{
+    FeedPage, FeedPosition, FeedPositionInvalid, FeedStart, FeedSubscription,
+    FeedSubscriptionInvalid, MAX_FEED_POSITION_BYTES,
+};
+use crate::models::MeterTypeId;
 
 #[test]
 fn a_position_at_the_byte_bound_is_accepted() {
@@ -59,4 +63,73 @@ fn positions_compare_and_hash_equal_exactly_when_their_bytes_are_equal() {
         "equal positions must hash equally to work as a map key"
     );
     assert!(!positions.contains(&different_bytes));
+}
+
+fn meter(suffix: &str) -> MeterTypeId {
+    MeterTypeId::new(format!("gts.cf.core.uc.usage_record.v1~test.{suffix}._.meter.v1~"))
+        .expect("the fixture meter id is well formed")
+}
+
+#[test]
+fn a_start_is_named_rather_than_inferred_from_an_absent_position() {
+    let oldest: FeedStart<FeedPosition> = FeedStart::Oldest;
+    let resumed = FeedStart::After(FeedPosition::new(vec![1]).expect("one byte is admissible"));
+    let same_resumed = FeedStart::After(FeedPosition::new(vec![1]).expect("one byte is admissible"));
+
+    assert_eq!(oldest, FeedStart::Oldest);
+    assert_eq!(resumed, same_resumed);
+    assert_ne!(oldest, resumed);
+    assert!(matches!(oldest, FeedStart::Oldest));
+    assert!(matches!(resumed, FeedStart::After(ref p) if p.as_bytes() == [1]));
+}
+
+#[test]
+fn a_live_page_carries_a_next_cursor_and_a_completed_replay_does_not() {
+    let live: FeedPage<FeedPosition> = FeedPage {
+        entries: Vec::new(),
+        next: Some(FeedPosition::new(vec![9]).expect("one byte is admissible")),
+    };
+    let finished: FeedPage<FeedPosition> = FeedPage {
+        entries: Vec::new(),
+        next: None,
+    };
+
+    assert!(
+        live.next.is_some(),
+        "DESIGN section 3.2 returns a next cursor with every page of a live read, short pages \
+         included"
+    );
+    assert!(
+        finished.next.is_none(),
+        "DESIGN section 3.2 returns none once a bounded replay reaches `until`"
+    );
+}
+
+#[test]
+fn a_subscription_is_a_set_so_it_dedupes_and_orders() {
+    let subscription = FeedSubscription::new([meter("b"), meter("a"), meter("b")])
+        .expect("two distinct types are a valid subscription");
+    let already_sorted_and_deduped = FeedSubscription::new([meter("a"), meter("b")])
+        .expect("two distinct types are a valid subscription");
+
+    assert_eq!(
+        subscription, already_sorted_and_deduped,
+        "DESIGN section 3.1 calls a subscription a set of GTS types, so a repeat is the same \
+         subscription whatever order or multiplicity the caller listed it in"
+    );
+    assert_eq!(
+        subscription.types(),
+        &[meter("a"), meter("b")],
+        "the order is the SDK's to fix rather than the caller's to choose"
+    );
+}
+
+#[test]
+fn an_empty_subscription_is_refused() {
+    let refused = FeedSubscription::new(Vec::new()).expect_err(
+        "a subscription reading no type has no page to serve, so it is a caller defect rather \
+         than an empty feed",
+    );
+
+    assert_eq!(refused, FeedSubscriptionInvalid::Empty);
 }

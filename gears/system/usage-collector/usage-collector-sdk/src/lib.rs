@@ -46,6 +46,10 @@ pub mod time_range;
 
 pub use api::UsageCollectorClientV1;
 pub use error::{UsageCollectorError, UsageCollectorPluginError};
+pub use feed::{
+    FeedPage, FeedPosition, FeedPositionInvalid, FeedStart, FeedSubscription,
+    FeedSubscriptionInvalid, MAX_FEED_POSITION_BYTES,
+};
 pub use gts::{USAGE_RECORD_RESOURCE, UsageCollectorPluginSpecV1};
 pub use id::{USAGE_RECORD_ID_NAMESPACE, canonical_period_bound, derive_usage_record_id};
 pub use models::{

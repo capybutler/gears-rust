@@ -7,6 +7,8 @@
 
 use thiserror::Error;
 
+use crate::models::{MeterTypeId, UsageRecord};
+
 /// The largest [`FeedPosition`] a plugin may issue, in bytes.
 ///
 /// The gateway carries a position inside a `toolkit_odata::CursorV1`, and
@@ -114,6 +116,113 @@ impl FeedPosition {
 impl AsRef<[u8]> for FeedPosition {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
+    }
+}
+
+/// Where a feed read begins — **named**, never inferred from an absent
+/// position.
+///
+/// DESIGN §3.1: the gateway compiles a request carrying no wire cursor to
+/// [`FeedStart::Oldest`] rather than passing an absent position down, because
+/// "oldest retained" and "no position supplied" are different instructions and
+/// only one of them is a start.
+///
+/// `#[non_exhaustive]` per DESIGN §2.2's additive-evolution constraint: a start
+/// mode admitted later is a variant rather than a further argument, so a plugin
+/// matches this with a wildcard arm and answers
+/// [`crate::error::UsageCollectorPluginError::Internal`] there. Neither v1
+/// variant begins at the head — the feed serves charging consumers, for which
+/// skipping retained history is never a correct start.
+///
+/// Generic over the position each surface speaks: `FeedStart<&CursorV1>` on the
+/// SDK client trait, `FeedStart<FeedPosition>` on the Plugin SPI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FeedStart<P> {
+    /// The oldest entry the subscription still retains. Never the head, and
+    /// never refused on the retention floor.
+    Oldest,
+    /// Continue after a position the feed issued.
+    After(P),
+}
+
+/// Settled entries in feed order, plus the cursor that continues them.
+///
+/// Everything before `next` is delivered and final under the compiled scope the
+/// read ran under (DESIGN §3.1).
+///
+/// Generic over the cursor kind, which is what keeps a plugin's position off the
+/// wire: the SPI returns `FeedPage<FeedPosition>` and the SDK client and REST
+/// return `FeedPage<CursorV1>`, so handing a raw position to a consumer is a
+/// type error rather than a review obligation. DESIGN §3.1 (SPI) and §3.3
+/// (wire) both describe a type named `FeedPage` but require it to carry a
+/// `FeedPosition` and a `CursorV1` respectively; the type parameter is what
+/// lets one Rust type satisfy both descriptions, instantiated differently per
+/// surface — the same resolution [`FeedStart`] uses for its own position
+/// parameter.
+// No `Eq`: a derive bounds type parameters only, so `Eq` here would require
+// `Vec<UsageRecord>: Eq` unconditionally, and `UsageRecord` derives `PartialEq`
+// without `Eq` (`models.rs:944`). `PartialEq` is what the page needs and all it
+// can have.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedPage<C> {
+    /// The page's entries, in feed order.
+    pub entries: Vec<UsageRecord>,
+    /// The continuation. `Some` on every page of a live read, short pages
+    /// included; `None` once a bounded replay has reached its `until`.
+    pub next: Option<C>,
+}
+
+/// The set of GTS types one consumer reads.
+///
+/// It bounds that consumer's pages and its cursor (DESIGN §3.1). Held as a
+/// sorted, deduplicated sequence: a set has no repeats, and fixing the order
+/// here means a plugin keying a position across the whole subscription sees the
+/// same subscription whatever order the caller listed it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedSubscription(Vec<MeterTypeId>);
+
+/// Why a [`FeedSubscription`] could not be built.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FeedSubscriptionInvalid {
+    /// The caller named no GTS type.
+    #[error(
+        "a feed subscription must name at least one GTS type: a subscription reading nothing has \
+         no page to serve"
+    )]
+    Empty,
+}
+
+impl FeedSubscription {
+    /// Builds a subscription, deduplicating and ordering the types.
+    ///
+    /// # Errors
+    ///
+    /// [`FeedSubscriptionInvalid::Empty`] when `types` yields nothing.
+    pub fn new(
+        types: impl IntoIterator<Item = MeterTypeId>,
+    ) -> Result<Self, FeedSubscriptionInvalid> {
+        let mut types: Vec<MeterTypeId> = types.into_iter().collect();
+        // `MeterTypeId` implements neither `Ord` nor `PartialOrd`, deliberately
+        // and with a rustdoc saying so: the `GtsTypeId` it wraps implements
+        // neither, and the note tells a caller needing an order to delegate to
+        // the string form. That is what this does, rather than adding a trait
+        // impl to a shared type for one caller's benefit.
+        types.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        types.dedup_by(|a, b| a.as_str() == b.as_str());
+        if types.is_empty() {
+            return Err(FeedSubscriptionInvalid::Empty);
+        }
+        Ok(Self(types))
+    }
+
+    /// The subscribed types, sorted and deduplicated.
+    ///
+    /// This is the slice the Plugin SPI's `subscription` parameter takes.
+    #[must_use]
+    pub fn types(&self) -> &[MeterTypeId] {
+        &self.0
     }
 }
 
