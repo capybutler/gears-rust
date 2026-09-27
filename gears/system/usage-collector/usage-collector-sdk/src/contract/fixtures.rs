@@ -72,13 +72,26 @@ pub const CONTRACT_METER_TYPE_ID: &str =
 /// otherwise reach a plugin author as a harness fault against a conforming
 /// backend.
 ///
-/// The `dead_code` allow is deliberate and temporary. Nothing in the
-/// non-test build calls this yet: the checks that will are the ones
+/// **The dead-code exemption retires itself.** Nothing in the non-test
+/// build calls this yet: the checks that will are the ones
 /// [`UNWRITTEN_CHECKS`](super::UNWRITTEN_CHECKS) names, and until one lands
-/// the only caller is that unit test. `expect` in place of `allow` would be
-/// the self-removing form and is not usable here — under `cfg(test)` the
-/// function *is* called, so the expectation would go unfulfilled.
-#[allow(dead_code)]
+/// the only caller is that unit test. So the exemption is an `expect` rather
+/// than an `allow`, gated to `not(test)` because under `cfg(test)` the
+/// function *is* called and a bare `expect` would go unfulfilled there. The
+/// moment a check in [`super::checks`] calls it, that call is ordinary
+/// feature-gated library code — `mod checks` is not `cfg(test)` — so
+/// `dead_code` stops firing and `unfulfilled_lint_expectations` fires in its
+/// place. That is a warning by default and an error under the `-D warnings`
+/// this workspace's clippy target passes, so the attribute has to go. Nobody
+/// has to remember it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller until a check in `super::checks` derives its own meter; the \
+                  first one that does leaves this expectation unfulfilled"
+    )
+)]
 pub fn check_meter(check: &str, role: &str) -> Result<MeterTypeId, String> {
     let slug = format!("{check}_{role}").replace('-', "_");
     MeterTypeId::new(format!("{USAGE_RECORD_BASE_TYPE}cf.core.uc.{slug}.v1~"))
@@ -181,9 +194,16 @@ const _: () = {
 /// than a matter of inspection; the comment on that assertion says why an
 /// overlap would be worse than a failing check.
 ///
-/// The `dead_code` allow is deliberate and temporary, for the reason
-/// [`check_meter`]'s docs give.
-#[allow(dead_code)]
+/// The dead-code exemption is the self-retiring form [`check_meter`]'s docs
+/// explain, for the same reason.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no caller until a check in `super::checks` needs a tenant beyond the four \
+                  named above; the first one that does leaves this expectation unfulfilled"
+    )
+)]
 #[must_use]
 pub fn contract_tenant(index: u32) -> Uuid {
     Uuid::from_u128(CONTRACT_TENANT_BLOCK + u128::from(index))
