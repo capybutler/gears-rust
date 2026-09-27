@@ -12,6 +12,7 @@
 
 mod at_most_one_invalidation;
 mod converged_target_lookup;
+mod dedup_concurrent;
 mod dedup_floor;
 mod dedup_identity_over_window;
 mod invalidation_excluded_from_fold;
@@ -23,6 +24,7 @@ mod window_end_selection;
 
 pub use at_most_one_invalidation::at_most_one_invalidation;
 pub use converged_target_lookup::converged_target_lookup;
+pub use dedup_concurrent::dedup_concurrent;
 pub use dedup_floor::dedup_floor;
 pub use dedup_identity_over_window::dedup_identity_over_window;
 pub use invalidation_excluded_from_fold::invalidation_excluded_from_fold;

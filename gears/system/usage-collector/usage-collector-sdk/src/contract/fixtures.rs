@@ -262,8 +262,10 @@ const CONTRACT_FILTER_HASH: &str = "usage-collector-contract-suite";
 /// as a parameter of their own rather than inside `query.filter` — the feed
 /// page and the reconciliation read — so a check reading either takes the
 /// expression from here instead of from [`contract_query`].
-/// [`server_field_round_trip`](super::checks::server_field_round_trip()) is
-/// the first caller, on the feed.
+/// [`server_field_round_trip`](super::checks::server_field_round_trip()) was
+/// the first caller, on the feed;
+/// [`dedup_concurrent`](super::checks::dedup_concurrent()) is the second,
+/// both on the feed and on the point read its `linearizable` half makes.
 pub fn contract_scope() -> ast::Expr {
     ast::Expr::Compare(
         Box::new(ast::Expr::Identifier("tenant_id".to_owned())),
@@ -441,8 +443,8 @@ pub fn fixture_invalidation(target: &UsageRecord) -> Result<UsageRecord, String>
 
 /// A [`ContractViolation`] attributed to one check.
 ///
-/// The check name is a parameter rather than baked in. Ten checks report
-/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is an eleventh
+/// The check name is a parameter rather than baked in. Eleven checks report
+/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a twelfth
 /// caller, and the whole point of [`ContractViolation::check`] is that a
 /// violation says which assertion produced it — a helper that stamped one
 /// name on every report would quietly undo that.

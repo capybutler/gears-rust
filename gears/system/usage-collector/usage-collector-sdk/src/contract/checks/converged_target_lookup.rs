@@ -22,8 +22,8 @@ use crate::quantity::UsageQuantity;
 ///
 /// Two hundred and seventy days past [`FIXTURE_EPOCH`], for the reason
 /// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210 and 240
-/// offsets the other checks take.
+/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240 and
+/// 300 offsets the other checks take.
 ///
 /// It buys less here than anywhere else in the suite, and saying so is the
 /// point: **this check dispatches no range at all.** Every read it makes is

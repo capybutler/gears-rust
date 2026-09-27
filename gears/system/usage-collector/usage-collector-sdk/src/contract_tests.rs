@@ -12,15 +12,18 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds fourteen deliberately
+//! as coverage. [`super::contract_mutants`] holds fifteen deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
 //! column against each of them. That test runs every subject at
 //! [`DedupLevel::Linearizable`];
 //! [`an_undecided_lookup_is_still_a_violation_once_the_bound_has_passed`]
-//! is the one column asserted at the other declaration, because one check
-//! has a path only an `Eventual` declaration reaches.
+//! and
+//! [`a_race_that_left_two_writes_is_a_violation_once_the_bound_has_passed`]
+//! are the
+//! two columns asserted at the other declaration, because two checks have
+//! paths only an `Eventual` declaration reaches.
 //!
 //! The third is that the three coverage constants still partition DESIGN's
 //! sixteen checks, so a passing run cannot read as a complete one.
@@ -45,8 +48,8 @@ use uuid::Uuid;
 use super::contract_mutants::{Defect, mutant};
 use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, CONVERGED_TARGET_LOOKUP,
-    DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, HARNESS_FAULT, IMPLEMENTED_CHECKS,
-    INVALIDATION_EXCLUDED_FROM_FOLD, QUANTITY_ROUND_TRIP,
+    DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, HARNESS_FAULT,
+    IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD, QUANTITY_ROUND_TRIP,
     RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH,
     SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS, WINDOW_END_SELECTION,
     reference::InMemoryReferencePlugin, retention::ContractRetention, run_all,
@@ -302,13 +305,17 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
         Defect::BatchResolvesAgainstThePreCallLedger,
         &[DEDUP_FLOOR, AT_MOST_ONE_INVALIDATION],
     ),
+    (
+        Defect::ADivergentWriteDisplacesTheSurvivor,
+        &[DEDUP_CONCURRENT],
+    ),
 ];
 
 /// Every check fails against a backend that gets its rule wrong, and passes
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all fourteen mutants is not
+/// of sensitivity. A check that fails against all fifteen mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.
@@ -416,6 +423,80 @@ async fn an_undecided_lookup_is_still_a_violation_once_the_bound_has_passed() {
          declared convergence bound before it requires an answer, which is the one path through \
          it no other test in this file takes; the answer is still undecided afterwards, and \
          undecided is admissible only until the plugin can decide."
+    );
+}
+
+/// A race that left two writes on one identity is still a violation once
+/// the declared bound has passed.
+///
+/// **This is the only test that executes `dedup-concurrent`'s `Eventual`
+/// half**, and it exists for that reason. Under a `linearizable`
+/// declaration that check asserts the two outcomes of a divergent race and
+/// reads the survivor's content back; under an `eventual` one it asserts
+/// none of that, because DESIGN admits an acknowledgement there that is
+/// later discarded. What it asserts instead is what the declaration still
+/// owes after the bound: *"only the first write in commit order ever shows
+/// on any read, figure, or feed page"*, over a `list_usage_records` page, a
+/// `COUNT` fold and a feed page.
+///
+/// [`each_check_fails_against_its_own_defect_and_no_other`] runs every
+/// subject at [`DedupLevel::Linearizable`], so without this the three
+/// surfaces would run against the reference backend alone — green, and
+/// establishing only that they do not false-positive.
+/// [`Defect::LedgerHasNoUniqueConstraint`] is the subject that makes them
+/// discriminate: it decides every collision the conforming way and writes
+/// regardless, so both writes of each raced identity land and all three
+/// surfaces show two where one is owed.
+///
+/// The subject built for `dedup-concurrent` itself,
+/// [`Defect::ADivergentWriteDisplacesTheSurvivor`], is deliberately **not**
+/// the one used here: it replaces a row in place, so every surface goes on
+/// showing exactly one write per identity and agreeing on which, and it
+/// fails nothing at all under this declaration. That was measured, and it
+/// is recorded on the defect.
+///
+/// Asserting the whole failing set rather than just that this check is in
+/// it keeps the test honest about the level. An `Eventual` declaration is
+/// also the only one that reaches `at-most-one-invalidation`'s
+/// post-convergence half, which this subject fails too — it stores each
+/// withdrawal twice — and the four checks it fails at `Linearizable` must
+/// go on failing here and no others must join them.
+///
+/// The bound is zero, so the test does not actually wait. What is being
+/// established is that the three surfaces run and still report, not how
+/// long they wait for — no check in this suite times a plugin.
+#[tokio::test]
+async fn a_race_that_left_two_writes_is_a_violation_once_the_bound_has_passed() {
+    let plugin = mutant(Defect::LedgerHasNoUniqueConstraint);
+
+    let failed: BTreeSet<&str> = run_all(
+        plugin.as_ref(),
+        DedupLevel::Eventual {
+            convergence_bound: std::time::Duration::ZERO,
+        },
+    )
+    .await
+    .into_iter()
+    .map(|violation| violation.check)
+    .collect();
+
+    assert_eq!(
+        failed,
+        BTreeSet::from([
+            DEDUP_CONCURRENT,
+            DEDUP_FLOOR,
+            DEDUP_IDENTITY_OVER_WINDOW,
+            RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
+            AT_MOST_ONE_INVALIDATION,
+        ]),
+        "a backend whose dedup identity carries no unique constraint stores both writes of a \
+         raced identity, and after the declared convergence bound `dedup-concurrent` must report \
+         it: a ledger page, a `COUNT` fold and a feed page each show two writes where only the \
+         first in commit order may show. The other four are this subject's `Linearizable` row \
+         plus `at-most-one-invalidation`, whose post-convergence half only an `Eventual` \
+         declaration reaches and which this subject fails by storing each withdrawal twice. A \
+         check joining this set is a subject wrong in a second way; one leaving it is an \
+         assertion that stopped discriminating."
     );
 }
 

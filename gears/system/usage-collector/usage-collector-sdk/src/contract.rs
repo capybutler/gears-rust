@@ -42,21 +42,21 @@
 //! previous one left; the fixtures are keyed so that a repeated run
 //! resubmits identical entries rather than colliding with different ones.
 //!
-//! # Nine of DESIGN's sixteen, ten checks in all
+//! # Ten of DESIGN's sixteen, eleven checks in all
 //!
 //! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
-//! nine in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
+//! ten in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
 //! statement about the rest**.
 //!
-//! **Two counts run through this file, and both are right.** Nine is what
-//! [`run_all`] covers of DESIGN's sixteen; ten is how many checks it
-//! runs, the tenth being the one in [`ADDITIONAL_CHECKS`] that DESIGN
-//! does not tabulate. A count about coverage of DESIGN is therefore nine
-//! and a count about what a run executed is ten, and neither substitutes
-//! for the other. The other seven of the sixteen are named, not omitted:
+//! **Two counts run through this file, and both are right.** Ten is what
+//! [`run_all`] covers of DESIGN's sixteen; eleven is how many checks it
+//! runs, the eleventh being the one in [`ADDITIONAL_CHECKS`] that DESIGN
+//! does not tabulate. A count about coverage of DESIGN is therefore ten
+//! and a count about what a run executed is eleven, and neither substitutes
+//! for the other. The other six of the sixteen are named, not omitted:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
-//!   gear's SPI declares, not yet written. All seven.
+//!   gear's SPI declares, not yet written. All six.
 //! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
 //!   it. Now empty: no check DESIGN tabulates is beyond the current trait.
 //!
@@ -103,8 +103,8 @@
 
 use crate::plugin_api::UsageCollectorPluginV1;
 use checks::{
-    at_most_one_invalidation, converged_target_lookup, dedup_floor, dedup_identity_over_window,
-    invalidation_excluded_from_fold, quantity_round_trip,
+    at_most_one_invalidation, converged_target_lookup, dedup_concurrent, dedup_floor,
+    dedup_identity_over_window, invalidation_excluded_from_fold, quantity_round_trip,
     record_and_invalidation_distinct_identity, scope_is_a_filter_on_every_read_path,
     server_field_round_trip, window_end_selection,
 };
@@ -252,9 +252,10 @@ pub const LATEST_TIE_BREAK: &str = "latest-tie-break";
 /// nowhere in this suite. A porter reading a green run should not read it
 /// as those two paths being exercised.
 ///
-/// `server-field-round-trip` does dispatch a feed read, and it narrows
-/// nothing here: every entry that check stores is inside the scope it
-/// sends, so the read buys shape coverage on the path — a plugin that
+/// Two checks do dispatch a feed read — `server-field-round-trip` always,
+/// and `dedup-concurrent` under an `Eventual` declaration — and neither
+/// narrows anything here: every entry either one stores is inside the scope
+/// it sends, so the reads buy shape coverage on the path — a plugin that
 /// chokes on a compiled scope there meets one — and no scope *enforcement*
 /// whatever, for the reason the suite's shared single-tenant filter buys
 /// none either. A feed that ignored its `scope` argument outright passes
@@ -291,6 +292,7 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     SERVER_FIELD_ROUND_TRIP,
     DEDUP_FLOOR,
     CONVERGED_TARGET_LOOKUP,
+    DEDUP_CONCURRENT,
 ];
 
 /// The checks [`run_all`] runs that DESIGN §3.3 does not tabulate.
@@ -313,7 +315,7 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// **Seven of DESIGN's sixteen**, which is every check [`run_all`] does
+/// **Six of DESIGN's sixteen**, which is every check [`run_all`] does
 /// not run. Each is expressible against the seven methods this gear's SPI
 /// declares — nothing here waits on the SPI to grow, and
 /// [`BLOCKED_CHECKS`] is empty. Being unwritten is a statement about this
@@ -338,10 +340,9 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// **A caller reporting coverage has to report this constant.**
 /// [`run_all`] returning no violations says nothing whatever about a check
 /// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
-/// reports nine checks' worth of evidence as sixteen.
+/// reports ten checks' worth of evidence as sixteen.
 // @cpt-dod:cpt-cf-usage-collector-dod-plugin-conformance-suite:p1
 pub const UNWRITTEN_CHECKS: &[&str] = &[
-    DEDUP_CONCURRENT,
     FEED_SNAPSHOT_AND_REPLAY,
     FEED_COMPLETENESS,
     FEED_BOOTSTRAP_POSITION,
@@ -389,10 +390,13 @@ pub const BLOCKED_CHECKS: &[(&str, &str)] = &[];
 /// own handle — `ClientHub` hands out a `dyn UsageCollectorPluginV1` —
 /// passes straight in.
 ///
-/// `level` is the dedup level the plugin declares. Two checks read it today:
-/// `at-most-one-invalidation`, whose post-convergence half runs only under an
-/// `Eventual` declaration, and `converged-target-lookup`, whose first probe
-/// waits out the declared bound before it requires a decided answer.
+/// `level` is the dedup level the plugin declares. Three checks read it
+/// today: `at-most-one-invalidation`, whose post-convergence half runs only
+/// under an `Eventual` declaration; `converged-target-lookup`, whose first
+/// probe waits out the declared bound before it requires a decided answer;
+/// and `dedup-concurrent`, which asserts a raced divergent pair's outcomes
+/// only under `Linearizable` and the three post-bound read surfaces only
+/// under `Eventual`.
 pub async fn run_all(
     plugin: &dyn UsageCollectorPluginV1,
     level: DedupLevel,
@@ -406,6 +410,7 @@ pub async fn run_all(
     violations.extend(server_field_round_trip(plugin).await);
     violations.extend(dedup_floor(plugin).await);
     violations.extend(converged_target_lookup(plugin, level).await);
+    violations.extend(dedup_concurrent(plugin, level).await);
     violations.extend(scope_is_a_filter_on_every_read_path(plugin).await);
     violations
 }

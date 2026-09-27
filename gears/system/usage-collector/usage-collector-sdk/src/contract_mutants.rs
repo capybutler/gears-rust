@@ -11,7 +11,7 @@
 //! column against each of them.
 //!
 //! *Behaviourally* is the exact word. Ten subjects wrap a real reference
-//! backend and are that backend plus one interception; the other four
+//! backend and are that backend plus one interception; the other five
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
 //!
@@ -40,13 +40,15 @@
 //! to decide, and two rewrite how a second withdrawal of a record is
 //! answered.
 //!
-//! **A ledger of its own** ([`MutantLedger`]) is needed by the other four
+//! **A ledger of its own** ([`MutantLedger`]) is needed by the other five
 //! (selection column, fold exclusion, missing unique constraint, missing
-//! in-batch dedup map), because each changes something the inner backend owns
-//! and no interception can reach it: which column a range meets, which rows a
-//! fold walks, what admission writes, and what a batch's own rows are decided
-//! against. It mirrors the reference where the defect is not, and it is
-//! smaller in one stated way that no check reaches — see [`MutantLedger`].
+//! in-batch dedup map, a divergent write that displaces the survivor),
+//! because each changes something the inner backend owns and no interception
+//! can reach it: which column a range meets, which rows a fold walks, what
+//! admission writes, what a batch's own rows are decided against, and which
+//! row a decided collision leaves behind. It mirrors the reference where the
+//! defect is not, and it is smaller in one stated way that no check reaches
+//! — see [`MutantLedger`].
 //!
 //! # DESIGN's three identity sites, and the subject for each
 //!
@@ -378,6 +380,57 @@ pub(super) enum Defect {
     /// does — and the damage is confined to the outcome the caller is handed:
     /// an acceptance reported for a row that was never written.
     BatchResolvesAgainstThePreCallLedger,
+    /// Answers every collision the conforming way and then writes the
+    /// divergent submission over the row it just refused: last writer wins
+    /// on the store even though the caller was told otherwise.
+    ///
+    /// DESIGN §3.1's "Dedup level" row is what this breaks, in two of its
+    /// sentences at once and in neither of their *answers*: *"The first
+    /// write in commit order is the **survivor**, and every read path, fold,
+    /// reconciliation figure, materialised aggregate, and the feed show it
+    /// and nothing else"*, and *"From then until retention frees the
+    /// identity, no later write displaces the survivor and no outcome
+    /// returned accepts divergent content"*. This subject keeps the second
+    /// half of that last clause — no outcome it returns accepts divergent
+    /// content — and breaks the first.
+    ///
+    /// It is the mistake a backend makes by writing `INSERT … ON CONFLICT
+    /// (the six identity columns) DO UPDATE SET …` where the conforming
+    /// statement is `DO NOTHING`, and then deciding absorb-or-conflict from
+    /// the row `RETURNING` handed back. The decision is right, because the
+    /// comparison is against the row as it stood; the store is wrong,
+    /// because the same statement has already replaced it. A port written
+    /// against an upsert-shaped table — the shape almost every other
+    /// idempotent write in a system has — arrives here naturally.
+    ///
+    /// **Distinct from [`Self::AbsorbsAWithdrawalWithAnotherReason`]**,
+    /// which is the other subject in this module about a divergent
+    /// re-delivery. That one changes the *answer* and no row at all, and
+    /// only for invalidations. This one changes the *row* and no answer at
+    /// all, for any entry.
+    ///
+    /// **What it reaches was measured rather than reasoned: one assertion,
+    /// in one check.** `dedup-concurrent`'s third probe reads a raced
+    /// identity's content back after the race and requires the accepted
+    /// entry, and neutering that probe leaves this subject's row empty.
+    /// Nothing else in the suite reads content back after a divergent
+    /// submission: `dedup-floor` re-reads its divergent identities, but by
+    /// row count and by `COUNT`, both of which read identity and never
+    /// content, and `at-most-one-invalidation` asserts the conflict's shape
+    /// and stops there under a `linearizable` declaration.
+    /// `server-field-round-trip`'s retry diverges only in `accepted_at` and
+    /// `origin`, which [`UsageRecord::caller_supplied_eq`] does not read, so
+    /// this subject absorbs it and writes nothing.
+    ///
+    /// **It is invisible to `dedup-concurrent`'s own `Eventual` half**, and
+    /// that is a property of the displacement rather than an oversight: the
+    /// row is replaced in place, so the ledger page, the `COUNT` and the
+    /// feed all go on showing exactly one write per identity and all three
+    /// show the same one. Under an `eventual` declaration no outcome names
+    /// the survivor either, so nothing there can tell a displaced row from
+    /// the one that was meant to win. The matrix runs every subject at
+    /// `Linearizable`, where the outcomes do name it.
+    ADivergentWriteDisplacesTheSurvivor,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -403,7 +456,8 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         Defect::SelectsOnWindowStart
         | Defect::FoldsTheInvalidation
         | Defect::LedgerHasNoUniqueConstraint
-        | Defect::BatchResolvesAgainstThePreCallLedger => Box::new(MutantLedger::new(defect)),
+        | Defect::BatchResolvesAgainstThePreCallLedger
+        | Defect::ADivergentWriteDisplacesTheSurvivor => Box::new(MutantLedger::new(defect)),
     }
 }
 
@@ -572,7 +626,8 @@ impl WrappedReference {
             | Defect::SelectsOnWindowStart
             | Defect::FoldsTheInvalidation
             | Defect::LedgerHasNoUniqueConstraint
-            | Defect::BatchResolvesAgainstThePreCallLedger => Ok(record),
+            | Defect::BatchResolvesAgainstThePreCallLedger
+            | Defect::ADivergentWriteDisplacesTheSurvivor => Ok(record),
         }
     }
 
@@ -1132,6 +1187,30 @@ impl Ledger {
         self.entries.iter().map(|entry| &entry.record)
     }
 
+    /// Writes `record` over the entry already stored under its `id`,
+    /// **keeping the sequence that entry was admitted with**.
+    ///
+    /// [`Defect::ADivergentWriteDisplacesTheSurvivor`]'s whole effect, and
+    /// the only place this ledger mutates an entry rather than appending
+    /// one. The sequence is kept because the defect is about *which write*
+    /// an identity holds and not about where that identity sits in the
+    /// feed's order: restamping it would move the row on the feed as well,
+    /// which is a second mistake in a subject that must be wrong in exactly
+    /// one.
+    ///
+    /// An `id` no entry carries is a no-op. The one caller reaches this
+    /// only on a collision, which already established that a row under that
+    /// `id` is there.
+    fn replace(&mut self, record: UsageRecord) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.record.id == record.id)
+        {
+            entry.record = record;
+        }
+    }
+
     /// Whether retention has removed an entry of a subscribed type strictly
     /// after `position`.
     ///
@@ -1147,12 +1226,17 @@ impl Ledger {
     }
 }
 
-/// A ledger of this module's own, for the two defects a wrapper cannot
+/// A ledger of this module's own, for the five defects a wrapper cannot
 /// reach.
 ///
-/// Each of those changes a predicate the inner backend owns — which column a
-/// range meets and which rows a fold walks — so there is no method to
-/// intercept. Everything else mirrors [`InMemoryReferencePlugin`]: the same
+/// Two of them change a predicate the inner backend owns — which column a
+/// range meets, and which rows a fold walks — so there is no method to
+/// intercept. The other three change what the inner backend *stores*: a
+/// duplicate row under one identity, a batch decided against a snapshot, and
+/// a row overwritten by the submission that collided with it. A wrapper
+/// cannot make [`InMemoryReferencePlugin`] hold or move a row its own
+/// admission refuses to. Everything else mirrors
+/// [`InMemoryReferencePlugin`]: the same
 /// admission decision (dedup by caller-supplied fields), the same
 /// `from <= window_end < to` selection, the same withdrawal exclusion, the
 /// same `(window_end, id)` ledger page order, the same sequence-stamped feed
@@ -1279,21 +1363,25 @@ impl MutantLedger {
     /// Decides one entry and writes it, under this subject's own admission
     /// rule.
     ///
-    /// Every subject but [`Defect::LedgerHasNoUniqueConstraint`] admits
-    /// through [`admit`], which is the reference's decision: a collision on
-    /// `id` resolves by caller-supplied fields and only a fresh entry is
-    /// written. That one admits through
+    /// Every subject but [`Defect::LedgerHasNoUniqueConstraint`] and
+    /// [`Defect::ADivergentWriteDisplacesTheSurvivor`] admits through
+    /// [`admit`], which is the reference's decision: a collision on `id`
+    /// resolves by caller-supplied fields and only a fresh entry is written.
+    /// The first of those two admits through
     /// [`admit_without_a_unique_constraint`], which decides the same way and
-    /// writes regardless.
+    /// writes regardless; the second through
+    /// [`admit_displacing_the_survivor`], which decides the same way and
+    /// writes the refused submission over the row it was refused against.
     ///
-    /// **This is why that defect carries a ledger of its own rather than
-    /// wrapping the reference.** The other two here change a predicate the
-    /// inner backend owns; this one changes what the inner backend *stores*,
-    /// and a wrapper cannot make [`InMemoryReferencePlugin`] hold a second
-    /// row under one `id` - its own admission refuses to. A wrapper keeping
-    /// the duplicates in a side ledger would then have to re-implement every
-    /// read path's selection, ordering and paging to merge them back in,
-    /// which is this type with extra steps.
+    /// **This is why those two defects carry a ledger of their own rather
+    /// than wrapping the reference.** The two predicate defects routed here
+    /// change something the inner backend decides; these two change what it
+    /// *stores*, and a wrapper cannot make [`InMemoryReferencePlugin`] hold
+    /// a second row under one `id`, nor write one row over another - its own
+    /// admission refuses both. A wrapper keeping the extra or the replaced
+    /// rows in a side ledger would then have to re-implement every read
+    /// path's selection, ordering and paging to merge them back in, which is
+    /// this type with extra steps.
     fn admit_here(
         &self,
         ledger: &mut Ledger,
@@ -1301,6 +1389,9 @@ impl MutantLedger {
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         if self.defect == Defect::LedgerHasNoUniqueConstraint {
             return admit_without_a_unique_constraint(ledger, record);
+        }
+        if self.defect == Defect::ADivergentWriteDisplacesTheSurvivor {
+            return admit_displacing_the_survivor(ledger, record);
         }
         admit(ledger, record)
     }
@@ -1689,6 +1780,40 @@ fn admit_without_a_unique_constraint(
     };
     ledger.push(record);
     answer
+}
+
+/// [`Defect::ADivergentWriteDisplacesTheSurvivor`]: decides one entry against
+/// the ledger exactly as [`admit`] decides it, and writes a submission it
+/// refused over the row it refused it against.
+///
+/// The answer is the conforming one in all three cases - the stored entry for
+/// an exact retry, `IdempotencyConflict` carrying it for a divergent
+/// submission, the entry itself for a fresh one - because it is [`decide`]'s,
+/// the same function [`admit`] consults, and it is taken *before* the write.
+/// Only the store differs: the conflicting submission replaces the row it
+/// collided with instead of being dropped, which is `ON CONFLICT (the six
+/// identity columns) DO UPDATE` where the conforming statement is
+/// `DO NOTHING`.
+///
+/// An identical re-delivery writes nothing, which is what keeps this subject
+/// wrong in one way only. Absorbing writes the same content back and could
+/// not be observed; refusing to write it is the conforming behaviour and the
+/// exemplar's, so the divergent branch is the whole of the defect.
+fn admit_displacing_the_survivor(
+    ledger: &mut Ledger,
+    record: UsageRecord,
+) -> Result<UsageRecord, UsageCollectorPluginError> {
+    match decide(ledger, &record) {
+        Ok(Some(stored)) => Ok(stored),
+        Ok(None) => {
+            ledger.push(record.clone());
+            Ok(record)
+        }
+        Err(err) => {
+            ledger.replace(record);
+            Err(err)
+        }
+    }
 }
 
 /// Every `UsageRecord.id` an accepted invalidation names.
