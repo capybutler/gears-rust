@@ -417,25 +417,21 @@ fn classify_record_error(err: &UsageCollectorError) -> RecordErrorCategory {
             ValidationReason::UnknownMetadataKey | ValidationReason::MetadataValidation => {
                 RecordErrorCategory::MetadataSize
             }
-            // The invalidation rules that arrive as an `InvalidArgument`.
-            // DESIGN §3.11.5 gives them a category of their own so a
-            // correction backlog is legible without reading `detail`. Target
-            // resolution joins them from the `NotFound` arm above; it and the
-            // copy rule are the two the spec scopes the category to.
+            // The copy rule, the one invalidation rule that arrives here as
+            // an `InvalidArgument`. DESIGN §3.11.5 gives the invalidation
+            // rules a category of their own so a correction backlog is
+            // legible without reading `detail`. Target resolution joins it
+            // from the `NotFound` arm above; the two are what the spec
+            // scopes the category to.
             //
-            // Only `InvalidationFieldMismatch` is raised inside this crate
-            // today. The two beside it are kept because
-            // `ValidationReason` is another crate's enum and a value it can
-            // still carry must classify somewhere deliberate rather than
-            // falling to `semantics_violation`: an incomplete reference had
-            // one raiser, the REST fold point, and lost it when the flat
-            // pair went; a non-record target had one, and lost it when
-            // target resolution made the property hold by construction
-            // (DESIGN §3.1). Retiring either is an SDK change, not this
-            // arm's.
-            ValidationReason::InvalidationReferenceIncomplete
-            | ValidationReason::InvalidationTargetNotRecord
-            | ValidationReason::InvalidationFieldMismatch => RecordErrorCategory::InvalidationRule,
+            // Two reasons used to share this arm and are now gone from
+            // `ValidationReason` altogether, each because its cause is gone:
+            // an incomplete reference lost its only raiser, the REST fold
+            // point, when the DTO's flat `invalidates` / `reason_code` pair
+            // went, and a non-record target lost its check when target
+            // resolution made that property hold by construction
+            // (DESIGN §3.1).
+            ValidationReason::InvalidationFieldMismatch => RecordErrorCategory::InvalidationRule,
             _ => RecordErrorCategory::SemanticsViolation,
         },
         UsageCollectorError::Conflict { reason, .. } => match reason {

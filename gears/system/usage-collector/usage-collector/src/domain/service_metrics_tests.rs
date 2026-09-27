@@ -1247,19 +1247,13 @@ fn classify_record_error_maps_each_arm() {
             UsageCollectorError::invalid_batch_size(0, 1, 1000),
             RecordErrorCategory::SemanticsViolation,
         ),
-        // The three typed invalidation rejections carry their own category
-        // (DESIGN §3.11.5), so a correction backlog is legible without
-        // reading `detail`.
+        // The copy rule carries its own category (DESIGN §3.11.5), so a
+        // correction backlog is legible without reading `detail`. It is the
+        // only invalidation rejection that reaches this arm as an
+        // `InvalidArgument`: the incomplete-reference and non-record-target
+        // reasons left `ValidationReason` with their raisers.
         (
             UsageCollectorError::invalidation_field_mismatch("quantity", Uuid::from_u128(11)),
-            RecordErrorCategory::InvalidationRule,
-        ),
-        (
-            UsageCollectorError::invalidation_target_not_record(Uuid::from_u128(12)),
-            RecordErrorCategory::InvalidationRule,
-        ),
-        (
-            UsageCollectorError::invalidation_reference_incomplete("reason_code"),
             RecordErrorCategory::InvalidationRule,
         ),
         // Conflict: idempotency is its own category and at-most-one is the

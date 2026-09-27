@@ -822,63 +822,6 @@ impl UsageCollectorError {
         }
     }
 
-    /// A REST body carried a target reference without a reason code, or the
-    /// reverse. The two are both-or-neither
-    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`): the
-    /// reference names what was withdrawn and the reason carries the
-    /// intent, so half the pair describes nothing. `field` names the
-    /// **missing** half, which is the one the caller has to add.
-    ///
-    /// **Emitted by nothing in this crate**, and no SDK path can reach the
-    /// shape it rejects. [`crate::CreateUsageRecord`] carries the reason
-    /// alone — `invalidates` is server-assigned — so an ingestion shape has
-    /// no target half to omit, and [`crate::UsageRecord`] carries the pair
-    /// as one [`crate::Invalidation`], so no in-process caller can build it
-    /// apart. Decoding a persisted entry is the one place inside this crate
-    /// where a half-shape still arrives, and it is refused with a plain
-    /// serde message rather than this typed error, so it is not a raiser
-    /// either.
-    ///
-    /// **It now has no raiser anywhere.** Its only raisers were in the
-    /// `usage-collector` crate, at the ingestion fold point where the REST
-    /// DTO's flat `invalidates` and `reason_code` became one field. That DTO
-    /// was the last surface carrying a caller-supplied target, and both call
-    /// sites went with it when the gateway began deriving the target from the
-    /// withdrawal's own fields (DESIGN §3.1, Target resolution), so no
-    /// surface can express the half-shape any more. The gear's error-mapping
-    /// and metric tests still construct it; neither emits it. Whether the
-    /// code is therefore retired is not settled here.
-    #[must_use]
-    pub fn invalidation_reference_incomplete(missing_field: &str) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: missing_field.to_owned(),
-            reason: ValidationReason::InvalidationReferenceIncomplete,
-            detail: format!(
-                "an invalidation carries both a target reference and a reason code; \
-                 `{missing_field}` is missing"
-            ),
-        }
-    }
-
-    /// An invalidation's target was itself an invalidation. A correction
-    /// cannot be reversed: withdrawal applies to measurements, so the
-    /// entry that withdrew one is not itself withdrawable. The separate
-    /// cap of one withdrawal per entry follows from the shared dedup
-    /// identity two withdrawals of one target reach
-    /// ([`Self::already_invalidated`]), not from this check.
-    #[must_use]
-    pub fn invalidation_target_not_record(target: Uuid) -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: Some(target.to_string()),
-            field: "invalidates".to_owned(),
-            reason: ValidationReason::InvalidationTargetNotRecord,
-            detail: format!("invalidates {target} references an invalidation, not a record"),
-        }
-    }
-
     /// An invalidation departed from its target in a field it must copy.
     ///
     /// `field` names **the field that differs**, which is the whole point

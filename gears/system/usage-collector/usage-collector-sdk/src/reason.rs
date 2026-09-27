@@ -58,19 +58,6 @@ pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUP
 /// (e.g. a per-record metadata key) over a wide range. Narrow the read-path
 /// time range or drop the high-cardinality dimension.
 pub const AGGREGATION_RESULT_TOO_LARGE: &str = "AGGREGATION_RESULT_TOO_LARGE";
-/// A REST body carried a target reference without a reason code, or a
-/// reason code without a target reference.
-///
-/// Emitted by nothing, here or in the `usage-collector` crate. The SDK's own
-/// half-shape refusal happens inside a `Deserialize` and is a plain serde
-/// message, never a [`ValidationReason`]. The gear's ingestion fold point was
-/// the last raiser, and it went with the REST DTO's caller-supplied
-/// `invalidates`: the gateway now derives the target from the withdrawal's
-/// own fields (DESIGN §3.1, Target resolution), so no surface can express the
-/// half-shape this code names.
-pub const INVALIDATION_REFERENCE_INCOMPLETE: &str = "INVALIDATION_REFERENCE_INCOMPLETE";
-/// An invalidation's target was itself an invalidation.
-pub const INVALIDATION_TARGET_NOT_RECORD: &str = "INVALIDATION_TARGET_NOT_RECORD";
 /// An invalidation departed from its target in a field it must copy.
 pub const INVALIDATION_FIELD_MISMATCH: &str = "INVALIDATION_FIELD_MISMATCH";
 /// The covered period ends further into the future than the ingestion
@@ -139,10 +126,6 @@ pub enum ValidationReason {
     MetadataFieldDuplicate,
     /// See [`AGGREGATION_RESULT_TOO_LARGE`].
     AggregationResultTooLarge,
-    /// See [`INVALIDATION_REFERENCE_INCOMPLETE`].
-    InvalidationReferenceIncomplete,
-    /// See [`INVALIDATION_TARGET_NOT_RECORD`].
-    InvalidationTargetNotRecord,
     /// See [`INVALIDATION_FIELD_MISMATCH`].
     InvalidationFieldMismatch,
     /// See [`FUTURE_WINDOW`].
@@ -172,8 +155,6 @@ impl ValidationReason {
             INVALID_METADATA_FIELDS_INVALID_KEY => Self::MetadataFieldInvalidKey,
             INVALID_METADATA_FIELDS_DUPLICATE => Self::MetadataFieldDuplicate,
             AGGREGATION_RESULT_TOO_LARGE => Self::AggregationResultTooLarge,
-            INVALIDATION_REFERENCE_INCOMPLETE => Self::InvalidationReferenceIncomplete,
-            INVALIDATION_TARGET_NOT_RECORD => Self::InvalidationTargetNotRecord,
             INVALIDATION_FIELD_MISMATCH => Self::InvalidationFieldMismatch,
             FUTURE_WINDOW => Self::FutureWindow,
             PAST_WINDOW => Self::PastWindow,
@@ -197,8 +178,6 @@ impl ValidationReason {
             Self::MetadataFieldInvalidKey => INVALID_METADATA_FIELDS_INVALID_KEY,
             Self::MetadataFieldDuplicate => INVALID_METADATA_FIELDS_DUPLICATE,
             Self::AggregationResultTooLarge => AGGREGATION_RESULT_TOO_LARGE,
-            Self::InvalidationReferenceIncomplete => INVALIDATION_REFERENCE_INCOMPLETE,
-            Self::InvalidationTargetNotRecord => INVALIDATION_TARGET_NOT_RECORD,
             Self::InvalidationFieldMismatch => INVALIDATION_FIELD_MISMATCH,
             Self::FutureWindow => FUTURE_WINDOW,
             Self::PastWindow => PAST_WINDOW,

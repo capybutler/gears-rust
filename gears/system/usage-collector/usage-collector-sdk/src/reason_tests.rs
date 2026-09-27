@@ -27,14 +27,6 @@ fn validation_reason_round_trips_each_constant() {
             ValidationReason::AggregationResultTooLarge,
         ),
         (
-            INVALIDATION_REFERENCE_INCOMPLETE,
-            ValidationReason::InvalidationReferenceIncomplete,
-        ),
-        (
-            INVALIDATION_TARGET_NOT_RECORD,
-            ValidationReason::InvalidationTargetNotRecord,
-        ),
-        (
             INVALIDATION_FIELD_MISMATCH,
             ValidationReason::InvalidationFieldMismatch,
         ),
@@ -107,26 +99,44 @@ fn the_upstream_cursor_reasons_no_longer_model_themselves() {
     }
 }
 
-/// Neither key-rule reason models itself any more.
+/// None of the four invalidation reasons this ADR emptied models itself any
+/// more.
 ///
-/// Both named rules that only existed while an invalidation's key was
+/// Two named key rules that only existed while an invalidation's key was
 /// server-derived under a reserved prefix: `KEY_ON_INVALIDATION` refused a
 /// caller key on an invalidation, and `RESERVED_KEY_PREFIX` refused a caller
 /// key that began `inv:`.
 /// `cpt-cf-usage-collector-adr-record-identity-derivation` makes an
 /// invalidation repeat its target's caller-supplied key and reserves no
-/// prefix, so both rules are gone and nothing in this gear can raise either
-/// code. **They go because their cause is gone**, not because the vocabulary
+/// prefix, so both rules are gone.
+///
+/// The other two lost their raiser to the same ADR.
+/// `INVALIDATION_REFERENCE_INCOMPLETE` refused a REST body carrying a target
+/// reference without a reason code, or the reverse; the fold point that
+/// raised it went with the DTO's flat pair, because the gateway now derives
+/// the target from the withdrawal's own fields rather than reading a
+/// caller-supplied one (`DESIGN.md` §3.1, Target resolution).
+/// `INVALIDATION_TARGET_NOT_RECORD` refused a target that was itself an
+/// invalidation; that property now "holds by construction and needs no check
+/// of its own" (`DESIGN.md` §3.1), so the check that raised it is gone too.
+///
+/// **All four go because their cause is gone**, not because the vocabulary
 /// was tidied: a reason no code path can produce is a reason a consumer
-/// would be modelling for nothing.
+/// would be modelling for nothing. None of the four is published in
+/// `usage-collector-v1.yaml`, so retiring them is not a wire-contract change.
 ///
 /// Because `ValidationReason` is `#[non_exhaustive]`, removing a variant is
 /// silent for a downstream matcher: it falls through rather than failing to
 /// build. Pin that the fall-through happens *and* that it preserves the raw
 /// string.
 #[test]
-fn the_retired_key_rule_reasons_no_longer_model_themselves() {
-    for wire in ["KEY_ON_INVALIDATION", "RESERVED_KEY_PREFIX"] {
+fn the_retired_invalidation_reasons_no_longer_model_themselves() {
+    for wire in [
+        "KEY_ON_INVALIDATION",
+        "RESERVED_KEY_PREFIX",
+        "INVALIDATION_REFERENCE_INCOMPLETE",
+        "INVALIDATION_TARGET_NOT_RECORD",
+    ] {
         assert_eq!(
             ValidationReason::from_wire(wire),
             ValidationReason::Unknown(wire.to_owned()),
@@ -178,8 +188,6 @@ fn every_wire_constant_spells_its_own_identifier() {
         INVALID_METADATA_FIELDS_INVALID_KEY,
         INVALID_METADATA_FIELDS_DUPLICATE,
         AGGREGATION_RESULT_TOO_LARGE,
-        INVALIDATION_REFERENCE_INCOMPLETE,
-        INVALIDATION_TARGET_NOT_RECORD,
         INVALIDATION_FIELD_MISMATCH,
         FUTURE_WINDOW,
         PAST_WINDOW,

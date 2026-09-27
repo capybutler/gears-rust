@@ -225,30 +225,6 @@ fn types_registry_unavailable_per_record_problem_is_503() {
 }
 
 #[test]
-fn invalidation_target_not_record_maps_to_400_attributing_the_reference_field() {
-    let target = Uuid::from_u128(7);
-    let c = lift_record(UsageCollectorError::invalidation_target_not_record(target));
-    assert_eq!(c.status_code(), 400);
-    assert_eq!(c.resource_type(), Some(USAGE_RECORD_RESOURCE));
-    let problem = Problem::from(c);
-    assert_eq!(
-        first_field_violation_string(&problem, "reason").as_deref(),
-        Some("INVALIDATION_TARGET_NOT_RECORD"),
-    );
-    assert_eq!(
-        first_field_violation_string(&problem, "field").as_deref(),
-        Some("invalidates"),
-        "an unwithdrawable target is attributed to the reference that named it",
-    );
-    assert_eq!(
-        lift_record(UsageCollectorError::invalidation_target_not_record(target)).resource_name(),
-        Some(target.to_string().as_str()),
-        "the target uuid is the only identifier a submission-time rejection has \
-         to name: the submitted entry has no id yet",
-    );
-}
-
-#[test]
 fn invalidation_field_mismatch_attributes_the_field_that_differs() {
     // The diagnostic's whole value is naming *which* field departed from
     // the target: an invalidation is a faithful copy in every
@@ -278,26 +254,6 @@ fn invalidation_field_mismatch_attributes_the_field_that_differs() {
         Some(target.to_string().as_str()),
         "the target uuid is the only identifier a submission-time rejection has \
          to name: the submitted entry has no id yet",
-    );
-}
-
-#[test]
-fn invalidation_reference_incomplete_attributes_the_missing_half() {
-    // Both-or-neither is rejected at the REST fold point naming the half
-    // the caller has to add — the domain carries the pair as one
-    // `Invalidation`, so nothing downstream can raise this.
-    let c = lift_record(UsageCollectorError::invalidation_reference_incomplete(
-        "reason_code",
-    ));
-    assert_eq!(c.status_code(), 400);
-    let problem = Problem::from(c);
-    assert_eq!(
-        first_field_violation_string(&problem, "reason").as_deref(),
-        Some("INVALIDATION_REFERENCE_INCOMPLETE"),
-    );
-    assert_eq!(
-        first_field_violation_string(&problem, "field").as_deref(),
-        Some("reason_code"),
     );
 }
 
@@ -390,9 +346,7 @@ fn every_usage_record_surface_variant() -> Vec<UsageCollectorError> {
         UsageCollectorError::cursor_query_mismatch(),
         UsageCollectorError::usage_record_not_found(uuid),
         UsageCollectorError::idempotency_conflict("idem-fence", uuid),
-        UsageCollectorError::invalidation_reference_incomplete("reason_code"),
         UsageCollectorError::invalidation_target_not_found(uuid),
-        UsageCollectorError::invalidation_target_not_record(uuid),
         UsageCollectorError::invalidation_field_mismatch("quantity", uuid),
         UsageCollectorError::already_invalidated(
             uuid,
