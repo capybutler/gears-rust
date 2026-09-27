@@ -8,6 +8,7 @@
 //! returns a well-formed default response. MUST NOT be used in production.
 
 use async_trait::async_trait;
+use bigdecimal::BigDecimal;
 use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
@@ -157,17 +158,45 @@ impl UsageCollectorPluginV1 for NoopBackend {
         })
     }
 
-    /// Zero accepted, no watermarks, no fold — the answer for a scope holding
-    /// no entries, which is every scope here.
+    /// Zero accepted and no watermarks, with whatever answer the declared
+    /// fold has over an empty selection.
+    ///
+    /// This backend stores nothing, so every scope holds no entries and the
+    /// count and both watermarks are the same for every caller. The fold is
+    /// not: DESIGN §3.3 splits the five by whether they are defined over an
+    /// empty selection, and the two halves answer differently because they
+    /// are asking different things. `SUM` and `COUNT` are totals, and the
+    /// total of nothing is zero — a value the caller can charge against and
+    /// reconcile with. `MAX`, `MIN` and `LATEST` select an entry, and there
+    /// is no entry to select, so there is nothing to report rather than a
+    /// zero to report. Collapsing the two onto one answer would make a
+    /// reconciling consumer unable to tell a meter that summed to zero from
+    /// one whose fold could not be taken.
+    ///
+    /// This is why the `fold` argument is read here and nowhere else in this
+    /// backend. [`ReconciliationMetadata::empty()`] supplies the rest: it is
+    /// the base a plugin fills in, and this method is a plugin that knows its
+    /// fold.
     async fn get_reconciliation_metadata(
         &self,
         _tenant_id: Uuid,
         _gts_type_id: MeterTypeId,
         _time_range: TimeRange,
-        _fold: AggregationFold,
+        fold: AggregationFold,
         _scope: &ast::Expr,
     ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
-        Ok(ReconciliationMetadata::empty())
+        // Exhaustive rather than wildcarded: `AggregationFold` declares itself
+        // a closed set, and a fold admitted later needs a deliberate decision
+        // about which half it falls in, which a wildcard arm would make for
+        // it silently.
+        let quantity_summary = match fold {
+            AggregationFold::Sum | AggregationFold::Count => Some(BigDecimal::from(0)),
+            AggregationFold::Max | AggregationFold::Min | AggregationFold::Latest => None,
+        };
+        Ok(ReconciliationMetadata {
+            quantity_summary,
+            ..ReconciliationMetadata::empty()
+        })
     }
 }
 

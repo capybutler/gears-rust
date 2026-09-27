@@ -42,21 +42,34 @@ pub struct ReconciliationMetadata {
 }
 
 impl ReconciliationMetadata {
-    /// The answer for a scope holding no entries.
+    /// The base a backend fills in: zero accepted, no watermarks, and no
+    /// fold.
     ///
-    /// Zero accepted, no watermarks, and no fold. Shared so that every backend
-    /// with nothing to report answers identically, rather than each inventing
-    /// its own spelling of "nothing here".
+    /// Shared so that every backend with nothing to report answers
+    /// identically, rather than each inventing its own spelling of "nothing
+    /// here". A plugin that has a count and watermarks starts from this and
+    /// overrides what differs.
     ///
-    /// It is also the base a backend fills in: a plugin that has a count and
-    /// watermarks starts from this and overrides what differs. It is a
-    /// convention rather than a guarantee, the same as `UsageRecord`'s
+    /// **It is not, on its own, the answer for a scope holding no entries.**
+    /// It cannot be: it is built without the fold, and the fold decides
+    /// `quantity_summary` even over an empty selection — `SUM` and `COUNT`
+    /// report a defined zero there, `MAX`, `MIN` and `LATEST` report absent.
+    /// A caller that knows its fold therefore has to set the field
+    /// accordingly, which is exactly why this constructor leaves it `None`
+    /// rather than guessing: absent is the right answer for three of the five
+    /// folds and the wrong answer for the other two, and a constructor that
+    /// cannot see the fold cannot tell which it is being used under.
+    ///
+    /// The convention is not a guarantee, the same as `UsageRecord`'s
     /// (`models.rs:1192-1197`): fields are public and the type is not
     /// `#[non_exhaustive]`, so nothing stops a field being left at its
     /// `empty()` default by omission. `quantity_summary` is the field where
     /// that is most costly — a backend that fills in a count and both
     /// watermarks but forgets it compiles with no diagnostic and silently
     /// reports an absent fold rather than the defined value it meant to send.
+    /// Under `SUM` that is a wrong answer rather than a missing one: a
+    /// consumer reading it cannot tell a meter that summed to zero from one
+    /// whose fold could not be taken.
     #[must_use]
     pub fn empty() -> Self {
         Self {

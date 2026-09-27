@@ -37,6 +37,13 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# `ReconciliationMetadata.quantity_summary` is a `BigDecimal`, and the
+# reconciliation answer under a fold defined over an empty selection is a
+# defined zero rather than an absent value. The SDK does not re-export the
+# type, so every crate that fills the field declares it directly - the same as
+# the gear and the TimescaleDB plugin.
+bigdecimal = { workspace = true }
+
 # Identifiers
 uuid = { workspace = true }
 

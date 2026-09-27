@@ -2872,6 +2872,7 @@ version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bigdecimal",
  "cf-gears-toolkit",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
