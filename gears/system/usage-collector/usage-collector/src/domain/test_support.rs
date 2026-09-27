@@ -387,14 +387,59 @@ impl AuthZResolverApi for CountingTenantPermitResolver {
 
 /// PDP fake that permits with two OR-ed constraints: the request's own
 /// `OWNER_TENANT_ID` (see [`permit_scoped_to_request_tenant`]) and a sibling
-/// carrying an `InGroup` tree predicate on `OWNER_ID`.
+/// that narrows by `resource_type` only, with no `OWNER_TENANT_ID` predicate
+/// of its own.
 ///
-/// Both constraints compile at the PEP (`OWNER_ID` is a supported property),
-/// and the per-record gate `authz::scope_admits_attribution_tuple` admits the
-/// tuple through the tenant constraint alone. `authz::scope_to_odata_filter`
-/// cannot project the tree predicate onto a flat `usage_records` filter, so
-/// the permit is one the gate admits and the invalidation-target lookup
-/// cannot read under.
+/// This used to push an `InGroup` predicate on `OWNER_ID` instead. Upstream
+/// PR #4744 ("fix/type-native-group-predicates", merged to `main` as
+/// `7bf9615a9` on 2026-09-24) made group predicates type-native:
+/// `compile_constraint` (`authz-resolver-sdk/src/pep/compiler.rs`) now runs
+/// `InGroup` through `require_resource_id_group_property`, and through
+/// `require_negotiated_capabilities`. `OWNER_ID` is neither a resource-id
+/// group property nor backed by a negotiated group capability here, so that
+/// whole sibling constraint silently failed `compile_constraint` and was
+/// dropped before this gear ever saw it — the PDP round-trip left only the
+/// tenant constraint, which compiles and admits everything, so the
+/// withdrawal dispatched instead of being denied.
+///
+/// A plain `Eq` on an unsupported (unknown-to-this-gear) property looks like
+/// the fix, but is not: `compile_constraint`'s
+/// `supported_properties.contains(&property)` check is unconditional — it
+/// runs for every predicate kind, not just group predicates — so an `Eq` on
+/// a property outside `usage_record::RESOURCE`'s attribute set fails to
+/// compile for exactly the same reason the `InGroup` did, and the constraint
+/// is dropped the same way. `compiler_tests.rs`'s
+/// `supported_properties_validation` pins this: an `Eq` on an unsupported
+/// property compiles to `ConstraintCompileError::AllConstraintsFailed`.
+/// Because `usage_record::RESOURCE`'s supported-properties list is exactly
+/// the property set `pep_field` recognizes, there is in fact no property
+/// that passes the SDK compiler's whitelist yet still falls through
+/// `pep_field`'s `_ => None` arm — "property outside the attribute set" as a
+/// *surviving* rejection reason is unreachable via a PDP round-trip fixture
+/// like this one. (It does have direct unit coverage against a hand-built
+/// `AccessScope` that bypasses the SDK compiler entirely: see
+/// `authz_tests.rs`'s
+/// `constraint_carrying_unknown_property_fails_closed_even_with_tenant_match`.)
+///
+/// So this fixture instead drops the missing piece that
+/// `constraint_to_odata_conjunction` (`domain/authz.rs`) itself denies:
+/// tenant narrowing. The sibling constraint's `Eq` is on
+/// `usage_record::PROP_RESOURCE_TYPE`, a *supported* property, so it compiles
+/// fine at the PEP (no group predicate, so `compile_constraint`'s
+/// `has_group_predicate && !has_tenant_scope_predicate` check never fires
+/// either) and survives into the granted `AccessScope` as its own constraint
+/// — genuinely uncompilable only in the sense that matters here:
+/// `scope_to_odata_filter` cannot project it, because it carries no
+/// `OWNER_TENANT_ID` `Eq`/`In` filter. `scope_to_odata_filter`'s
+/// per-constraint loop calls `constraint_to_odata_conjunction` for every
+/// constraint via `?`, so this one un-pinned disjunct fails the whole LIST
+/// projection closed, denying the invalidation-target read. The per-record
+/// gate (`authz::scope_admits_attribution_tuple`, an `.any()` over
+/// constraints) still admits the ordinary record through the tenant
+/// constraint alone — the sibling never admits on its own either, since
+/// `constraint_admits_tuple` also requires tenant pinning — so this
+/// mechanism cannot rot the same way a group predicate did: it depends on
+/// no group machinery at all.
 #[derive(Debug, Default)]
 pub struct UncompilableSiblingPermitResolver;
 
@@ -405,13 +450,20 @@ impl AuthZResolverApi for UncompilableSiblingPermitResolver {
         _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
-        use authz_resolver_sdk::constraints::{InGroupPredicate, Predicate};
+        use authz_resolver_sdk::constraints::{EqPredicate, Predicate};
 
         let mut response = permit_scoped_to_request_tenant(&request);
         response.context.constraints.push(Constraint {
-            predicates: vec![Predicate::InGroup(InGroupPredicate::new(
-                pep_properties::OWNER_ID,
-                [Uuid::from_u128(0x6_0000)],
+            // A synthetic value with no relationship to any fixture's real
+            // `resource_type` ("compute.vm" throughout `service_tests.rs`).
+            // Its only job is to be a well-formed, PEP-supported filter that
+            // carries no `OWNER_TENANT_ID` narrowing — it is never meant to
+            // match a record, and (see doc comment above) it structurally
+            // can't admit one on its own even if it did, since the per-record
+            // gate also requires tenant pinning.
+            predicates: vec![Predicate::Eq(EqPredicate::new(
+                crate::domain::authz::usage_record::PROP_RESOURCE_TYPE,
+                "test.uncompilable-sibling.non-tenant-narrowing",
             ))],
         });
         Ok(response)
