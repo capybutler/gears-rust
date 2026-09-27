@@ -83,21 +83,6 @@ pub const PAST_WINDOW: &str = "PAST_WINDOW";
 /// matching the wire pattern, more than 28 significant digits, or a negative
 /// zero (which no backend can read back digit for digit).
 pub const QUANTITY_OUT_OF_RANGE: &str = "QUANTITY_OUT_OF_RANGE";
-/// Reserved, and emitted by nothing in this crate.
-///
-/// It named a rule that refused a caller idempotency key beginning `inv:`,
-/// the prefix an invalidation's server-derived key used to carry.
-/// `cpt-cf-usage-collector-adr-record-identity-derivation` rejects that
-/// scheme outright — an invalidation repeats its target's caller-supplied
-/// key, and `entry_type` is the sixth identity input that tells the two
-/// apart — so no prefix is reserved and the constructor that raised this is
-/// gone. Nothing replaces it.
-///
-/// Kept rather than removed, on [`SEMANTICS_VIOLATION`]'s grounds:
-/// [`ValidationReason`] is `#[non_exhaustive]`, so dropping a variant is
-/// silent for a downstream matcher rather than a compile error it can act
-/// on.
-pub const RESERVED_KEY_PREFIX: &str = "RESERVED_KEY_PREFIX";
 /// A feed cursor names a position after which retention has already
 /// removed an entry the read would have had to deliver.
 ///
@@ -161,8 +146,6 @@ pub enum ValidationReason {
     PastWindow,
     /// See [`QUANTITY_OUT_OF_RANGE`].
     QuantityOutOfRange,
-    /// See [`RESERVED_KEY_PREFIX`].
-    ReservedKeyPrefix,
     /// See [`CURSOR_BEYOND_RETENTION`].
     CursorBeyondRetention,
     /// Unmodeled / future reason — preserves the raw wire string.
@@ -190,7 +173,6 @@ impl ValidationReason {
             FUTURE_WINDOW => Self::FutureWindow,
             PAST_WINDOW => Self::PastWindow,
             QUANTITY_OUT_OF_RANGE => Self::QuantityOutOfRange,
-            RESERVED_KEY_PREFIX => Self::ReservedKeyPrefix,
             CURSOR_BEYOND_RETENTION => Self::CursorBeyondRetention,
             other => Self::Unknown(other.to_owned()),
         }
@@ -216,7 +198,6 @@ impl ValidationReason {
             Self::FutureWindow => FUTURE_WINDOW,
             Self::PastWindow => PAST_WINDOW,
             Self::QuantityOutOfRange => QUANTITY_OUT_OF_RANGE,
-            Self::ReservedKeyPrefix => RESERVED_KEY_PREFIX,
             Self::CursorBeyondRetention => CURSOR_BEYOND_RETENTION,
             Self::Unknown(s) => s.as_str(),
         }
