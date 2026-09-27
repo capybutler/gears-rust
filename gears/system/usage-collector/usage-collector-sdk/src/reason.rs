@@ -61,13 +61,13 @@ pub const AGGREGATION_RESULT_TOO_LARGE: &str = "AGGREGATION_RESULT_TOO_LARGE";
 /// A REST body carried a target reference without a reason code, or a
 /// reason code without a target reference.
 ///
-/// Emitted by nothing in this crate. The SDK's own half-shape refusal
-/// happens inside a `Deserialize` and is a plain serde message, never a
-/// [`ValidationReason`]. The only live raiser is the `usage-collector`
-/// crate's ingestion fold point, and only while the REST DTO there still
-/// carries a caller-supplied `invalidates` flat beside `reason_code`.
-/// Without that field the half-shape cannot be expressed and the code goes
-/// unraised.
+/// Emitted by nothing, here or in the `usage-collector` crate. The SDK's own
+/// half-shape refusal happens inside a `Deserialize` and is a plain serde
+/// message, never a [`ValidationReason`]. The gear's ingestion fold point was
+/// the last raiser, and it went with the REST DTO's caller-supplied
+/// `invalidates`: the gateway now derives the target from the withdrawal's
+/// own fields (DESIGN §3.1, Target resolution), so no surface can express the
+/// half-shape this code names.
 pub const INVALIDATION_REFERENCE_INCOMPLETE: &str = "INVALIDATION_REFERENCE_INCOMPLETE";
 /// An invalidation's target was itself an invalidation.
 pub const INVALIDATION_TARGET_NOT_RECORD: &str = "INVALIDATION_TARGET_NOT_RECORD";
@@ -302,10 +302,10 @@ impl fmt::Display for ConflictReason {
 /// alone suggests the work is already done; it is not.
 ///
 /// What it exists for is the gear's own classification. §3.11.5's
-/// `invalidation_rule` covers "the copy, reference and at-most-one rules",
-/// and the reference rule — an `invalidates` resolving to nothing — is a
-/// `NotFound`. Without a discriminator the only thing separating it from an
-/// ordinary missing entry is the message string, and classifying a bounded
+/// `invalidation_rule` "covers the target-resolution and copy rules alone, a
+/// target not yet converged included", and target resolution finding nothing
+/// is a `NotFound`. Without a discriminator the only thing separating it from
+/// an ordinary missing entry is the message string, and classifying a bounded
 /// metric label by substring match on caller-facing prose is how a label
 /// stops matching silently when the prose is reworded.
 ///
@@ -348,8 +348,9 @@ pub enum NotFoundReason {
     /// in-process consumer the oracle the collapse exists to deny. Do not
     /// do it.
     UsageRecordNotFound,
-    /// An invalidation's `invalidates` resolved to nothing. The
-    /// valid-reference rule of
+    /// The target an invalidation locates through its own tenant, GTS type,
+    /// idempotency key and covered period resolved to nothing: the Valid
+    /// target rule of
     /// `cpt-cf-usage-collector-adr-append-only-invalidation`. A plugin's
     /// `UsageRecordNotFound` from the target lookup is converted to this
     /// at the ingestion fan-out, so on the ingest path it is this reason,

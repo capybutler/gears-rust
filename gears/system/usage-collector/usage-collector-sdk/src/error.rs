@@ -344,7 +344,7 @@ impl UsageCollectorError {
     ///
     /// The detail names the backfill route on both surfaces, per
     /// `cpt-cf-usage-collector-adr-backfill-isolation`: "The rejection names
-    /// the route, and both surfaces carry it." A REST caller needs the path
+    /// the route and both surfaces carry it". A REST caller needs the path
     /// and an in-process caller needs the method, and a URL tells the
     /// latter nothing.
     ///
@@ -839,12 +839,15 @@ impl UsageCollectorError {
     /// serde message rather than this typed error, so it is not a raiser
     /// either.
     ///
-    /// Its only live callers are in the `usage-collector` crate, at the
-    /// ingestion fold point where the REST DTO's flat `invalidates` and
-    /// `reason_code` become one field. That DTO is the last surface still
-    /// carrying a caller-supplied target, and it is the reason those call
-    /// sites exist: drop the field and nothing calls this at all. Whether
-    /// it is then retired is not settled here.
+    /// **It now has no raiser anywhere.** Its only raisers were in the
+    /// `usage-collector` crate, at the ingestion fold point where the REST
+    /// DTO's flat `invalidates` and `reason_code` became one field. That DTO
+    /// was the last surface carrying a caller-supplied target, and both call
+    /// sites went with it when the gateway began deriving the target from the
+    /// withdrawal's own fields (DESIGN §3.1, Target resolution), so no
+    /// surface can express the half-shape any more. The gear's error-mapping
+    /// and metric tests still construct it; neither emits it. Whether the
+    /// code is therefore retired is not settled here.
     #[must_use]
     pub fn invalidation_reference_incomplete(missing_field: &str) -> Self {
         Self::InvalidArgument {
@@ -910,22 +913,39 @@ impl UsageCollectorError {
         }
     }
 
-    /// An invalidation's `invalidates` resolved to nothing.
+    /// The target an invalidation locates through its own fields resolved to
+    /// nothing.
     ///
-    /// `NotFound` rather than a conflict: the reference names an entry the
-    /// ledger does not hold. `name` carries the target uuid, and
+    /// `NotFound` rather than a conflict: the ledger holds no entry under the
+    /// derived identifier. `name` carries that identifier, and
     /// [`NotFoundReason::InvalidationTargetNotFound`] is what separates this
     /// in-process from the other `NotFound` a submission can raise. That
     /// discriminator does not reach the wire — the 404 envelope has no
     /// `context.reason` slot — so a *client* telling the cases apart still
     /// has only the `detail` text to do it with.
+    ///
+    /// **The detail names the four locating inputs, not a field.** DESIGN
+    /// §3.1's Target resolution row requires a message that "says the target
+    /// is identified by tenant, GTS type, idempotency key, and covered
+    /// period, since a typo in any of them surfaces there rather than as a
+    /// field mismatch", and `cpt-cf-usage-collector-adr-append-only-invalidation`'s
+    /// Valid target rule says the same. Naming `invalidates` instead would
+    /// send the emitter hunting for a field they never sent:
+    /// [`crate::CreateUsageRecord`] has no such property, because the
+    /// gateway derives the target. The derived identifier stays in the text
+    /// for an operator correlating logs against `name`.
     #[must_use]
     pub fn invalidation_target_not_found(target: Uuid) -> Self {
         Self::NotFound {
             resource_type: USAGE_RECORD_RESOURCE.to_owned(),
             name: target.to_string(),
             reason: NotFoundReason::InvalidationTargetNotFound,
-            detail: format!("invalidates {target} does not reference an existing usage record"),
+            detail: format!(
+                "no usage record matches this invalidation's target, derived as {target}: \
+                 the target is identified by tenant, GTS type, idempotency key, and covered \
+                 period, all read from this entry's own fields, so a typo in any of the four \
+                 surfaces here rather than as a field mismatch"
+            ),
         }
     }
 
@@ -986,7 +1006,8 @@ impl UsageCollectorError {
             name: target.to_string(),
             reason: ConflictReason::TargetNotConverged,
             detail: format!(
-                "invalidates {target} names an entry that has not converged yet; retry"
+                "this invalidation's target, derived as {target}, names an entry whose \
+                 dedup identity has not converged yet; retry"
             ),
             invalidated_by: None,
             reason_code: None,
@@ -1186,3 +1207,8 @@ impl UsageCollectorPluginError {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "error_tests.rs"]
+mod error_tests;
