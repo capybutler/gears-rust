@@ -485,8 +485,8 @@ async fn scope_sum(plugin: &dyn UsageCollectorPluginV1) -> Result<Option<BigDeci
 ///
 /// * The two tenants differ. If they did not, the scope would admit both
 ///   entries or neither, and nothing here would be discriminating.
-/// * The two entries derive different ids. `tenant_id` is one of the five
-///   identity attributes and the idempotency key is another, so two entries
+/// * The two entries derive different ids. `tenant_id` is one of the six
+///   identity inputs and the idempotency key is another, so two entries
 ///   over one period still derive two ids - but if they ever did not, the
 ///   second submission would be an idempotent replay of the first and the
 ///   check would be asserting two things about one row. The guard matters

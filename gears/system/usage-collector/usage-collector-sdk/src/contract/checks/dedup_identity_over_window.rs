@@ -75,8 +75,18 @@ struct DedupFixtures {
 /// `(tenant_id, gts_type_id, idempotency_key)` alone — the obvious schema,
 /// and the one the pre-period model had. It answers `IdempotencyConflict`
 /// to the second period's submission and so fails the first half, while
-/// passing the second and every other check in this suite: the bounds are
-/// invisible to it, and nothing else here submits one key over two periods.
+/// passing the second: the bounds are invisible to it, and nothing else
+/// here submits one key over two periods.
+///
+/// Such a backend is blind to the entry type as well, and that is a second
+/// mistake rather than this one. A withdrawal repeats its target's
+/// idempotency key, so a three-element index holds one claim for the pair
+/// and refuses whichever of them arrives second — which fails
+/// `at-most-one-invalidation` and `invalidation-excluded-from-fold` too,
+/// both submitting the record first and so having its withdrawal refused.
+/// The subject this check is measured against therefore keys on the entry
+/// type alongside those three: `contract_mutants`'s
+/// `Defect::DedupIgnoresThePeriod` is wrong in the one way it is named for.
 pub async fn dedup_identity_over_window(
     plugin: &dyn UsageCollectorPluginV1,
 ) -> Vec<ContractViolation> {
