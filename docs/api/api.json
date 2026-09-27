@@ -3743,22 +3743,18 @@
       },
       "CreateUsageRecordRequest": {
         "additionalProperties": false,
-        "description": "Per-record create payload. Carries `gts_type_id` as a permissive `String`\nso a bad-prefix value surfaces as the per-record `Problem` instead of axum's default\n`text/plain` 422 for the entire batch. per-record problem envelopes\nstill surface for closed-shape membership, size-cap, and key\nvalidation. Intentionally has no identity field: `id` is\ngateway-derived via `usage_collector_sdk::derive_usage_record_id`,\nmirroring the `UsageRecord::id` doc.",
+        "description": "Per-record create payload. Carries `gts_type_id` and `entry_type` as\npermissive `String`s so that a bad value is **attributed to the property\nit came from**: `decode_record_entry` reads the offending property out of\nserde's message, and `serde_field_name` recognises only ``unknown field\n`…` `` and ``missing field `…` ``. A typed field's own refusal says\n``unknown variant `correction` ``, which matches neither, so the\nviolation would land on `records` and leave the caller diffing a whole\nentry. Parsed at the fold point instead, the rejection names\n`entry_type` or `gts_type_id`.\n\nIt is **not** about the batch surviving: `CreateUsageRecordsRequest`\ncarries its entries as `serde_json::Value` and both ingestion routes are\nbatch-only, so axum's `Json` extractor never decodes an entry's fields\nand a typed field here could not collapse a request either way. Per-record\nproblem envelopes still surface for closed-shape membership, size-cap,\nand key validation. Intentionally has no identity field: `id` is\ngateway-derived via `usage_collector_sdk::derive_usage_record_id`,\nmirroring the `UsageRecord::id` doc.\n\n`deny_unknown_fields` is the schema's `additionalProperties: false`\n(`usage-collector-v1.yaml` `CreateUsageRecordRequest`): every\nserver-owned field — `id`, `accepted_at`, `origin` and `invalidates` —\nis rejected here as an unknown field rather than read and overridden.",
         "properties": {
+          "entry_type": {
+            "description": "The kind this submission declares — `record` or `invalidation`.\nCaller-supplied, required, and with no default\n(`usage-collector-v1.yaml` `EntryType`; DESIGN §3.1, \"Entry type and\nreason code\").\n\n**Never inferred.** An invalidation is a faithful copy of its target\nand repeats its target's idempotency key, so a withdrawal stripped of\nits discriminator would derive its target's own identity and be\nabsorbed as a retry of it, withdrawing nothing. It is also the sixth\ninput to the derived `id`, which is what keeps a withdrawal's\nidentity apart from the identity of the entry it withdraws.\n\nCarried as a permissive `String` for [`Self::gts_type_id`]'s reason:\nan unrecognised value is parsed and refused at the fold point, where\nthe violation can name `entry_type`. Typed here, serde would refuse\nit as an unknown *variant*, which the property-name reader does not\nrecognise, and the caller would be told only that `records` is wrong.",
+            "type": "string"
+          },
           "gts_type_id": {
             "type": "string"
           },
           "idempotency_key": {
-            "description": "The caller's key, required on a record and forbidden on an\ninvalidation: an invalidation's key is derived by the gateway as\n`inv:` followed by `invalidates`. A record key may not begin with\n`inv:`.\nAn explicit `null` is refused.",
+            "description": "The caller's key. Not an `Option`, because the schema lists it in\n`required` on **both** branches: a withdrawal repeats its target's key\nrather than deriving one of its own, and that repetition is what lets\nthe gateway find the target from the submission alone (DESIGN §3.1,\n\"Target resolution\"). No prefix is reserved.\n\nTyped rather than defaulted so the served schema says so too. A body\nomitting the property fails to decode as ``missing field\n`idempotency_key` ``, which `serde_field_name` recognises, so the\ncaller is told which property is absent. An explicit `null` decodes\nto a *type* error naming no property at all, which is why\n`explicit_null_idempotency_key` runs ahead of the decode.",
             "type": "string"
-          },
-          "invalidates": {
-            "description": "The entry this submission withdraws. Supplying it makes the\nsubmission an invalidation and requires [`Self::reason_code`];\nomitting it makes the submission an ordinary record. There is no\ncaller-supplied discriminator on this shape, so a marker cannot\ndisagree with the payload it marks\n(`cpt-cf-usage-collector-adr-append-only-invalidation`).",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "metadata": {
             "additionalProperties": {
@@ -3774,7 +3770,7 @@
             "type": "string"
           },
           "reason_code": {
-            "description": "Why the withdrawal was issued. Both-or-neither with\n[`Self::invalidates`], which the wire contract states as\n`dependentRequired` and `record_request_into_domain` — the create\nhandler's fold point — enforces when it folds the pair into the\ndomain's one field.\n\nThe pair stays flat here because that is what the OAS declares and\nwhat `api_dto` emits into the served document; folding it on this\nshape would change the published schema.",
+            "description": "Why the withdrawal was issued. Required when [`Self::entry_type`] is\n`invalidation` and MUST NOT appear on a `record` (DESIGN §3.1,\n\"Entry type and reason code\"). The two are caller-supplied halves of\none statement, and the SDK projection checks them against each other\nbefore anything else, reporting a disagreement as an\n`InvalidArgument` naming `reason_code`.\n\nIt carries no target. `invalidates` is server-assigned (DESIGN §3.1,\n\"Field ownership\"): the gateway derives the withdrawn entry's\nidentifier from this submission's own tenant, GTS type, idempotency\nkey and covered period, and stamps what it resolved. A submitted\n`invalidates` is refused as an unknown field, so an emitter cannot\nname a record it never measured.",
             "type": [
               "string",
               "null"
@@ -3809,10 +3805,12 @@
           }
         },
         "required": [
+          "entry_type",
           "gts_type_id",
           "tenant_id",
           "resource_ref",
           "quantity",
+          "idempotency_key",
           "window_start",
           "window_end"
         ],
@@ -19065,7 +19063,7 @@
         "type": "object"
       },
       "UsageRecordDto": {
-        "description": "Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_type_id` is\nflattened to `String` so the type can derive `utoipa::ToSchema` without\npulling `utoipa` into the SDK crate; both covered-period bounds are\nemitted as RFC 3339 to match the SDK wire shape. `entry_type` is\nflattened to `String` for the first of those reasons and not the second:\nthe SDK wire shape carries no `entry_type` at all — the discriminator is\nderived from `invalidates` and never stored — so there is no encoding\nhere to mirror, only a `utoipa::ToSchema` derive to keep out of the SDK\ncrate. `origin` is the third flattening, and for `gts_type_id`'s reason\nrather than `entry_type`'s: the SDK carries it as a closed enum whose\nwire form is already the lowercased variant name, so this `String`\nmirrors an encoding that does exist, and only the `utoipa::ToSchema`\nderive is being kept out of the SDK.",
+        "description": "Wire-projection of [`usage_collector_sdk::UsageRecord`]. `gts_type_id` is\nflattened to `String` so the type can derive `utoipa::ToSchema` without\npulling `utoipa` into the SDK crate; both covered-period bounds are\nemitted as RFC 3339 to match the SDK wire shape. `entry_type` and\n`origin` are flattened for `gts_type_id`'s reason alone: each is a closed\nSDK enum whose wire form is already the lowercased variant name, so both\n`String`s mirror an encoding that does exist and only the\n`utoipa::ToSchema` derive is being kept out of the SDK.\n\nThe two differ in where the value comes from rather than in how it is\nencoded. [`usage_collector_sdk::UsageRecord`] stores `origin` as a field\nand carries no discriminator field at all, so this projection reads\n`entry_type` back through `UsageRecord::entry_type()`, which answers from\nthe [`usage_collector_sdk::Invalidation`] the entry carries. That is a\nread-path projection and nothing more: on the ingestion shape the\ndiscriminator is caller-supplied and required\n([`CreateUsageRecordRequest::entry_type`]), never inferred from anything\nbeside it (DESIGN §3.1, \"Entry type and reason code\").",
         "properties": {
           "accepted_at": {
             "description": "Gear-assigned instant of acceptance (RFC 3339). On an absorbed retry,\nthe stored entry's instant.",
@@ -19073,7 +19071,7 @@
             "type": "string"
           },
           "entry_type": {
-            "description": "`record` or `invalidation`, **derived** from [`Self::invalidates`]\nrather than stored\n(`cpt-cf-usage-collector-adr-append-only-invalidation`).\n`readOnly` on the wire: it appears on this read shape and on no\ningestion shape, and it is `required`, so it is never omitted.",
+            "description": "`record` or `invalidation`, **derived** from [`Self::invalidates`]\nrather than stored\n(`cpt-cf-usage-collector-adr-append-only-invalidation`): the SDK\nrecord carries the withdrawal and its reason as one field and no\ndiscriminator beside them, so there is nothing here to copy.\n`required` on the OAS `UsageRecord`, so it is never omitted. It is\n**not** `readOnly` — the ingestion shape declares an `entry_type` of\nits own, caller-supplied and required with no default\n([`CreateUsageRecordRequest::entry_type`]). Derived here, supplied\nthere: two properties on two shapes, and only the first of them is a\nprojection.",
             "type": "string"
           },
           "gts_type_id": {
@@ -19088,7 +19086,7 @@
             "type": "string"
           },
           "invalidates": {
-            "description": "The entry this one withdraws, absent on an ordinary measurement.\nBoth-or-neither with [`Self::reason_code`] — the SDK carries the\npair as one field, so a response can never show half of it.",
+            "description": "The entry this one withdraws, absent on an ordinary measurement.\nBoth-or-neither with [`Self::reason_code`] — the SDK carries the\npair as one field, so a response can never show half of it.\n\n`readOnly` on the wire, and the one property on these two shapes that\ngenuinely is: the gateway derives it from the withdrawal's own\nidentity inputs and stamps it (DESIGN §3.1, \"Field ownership\"), so it\nappears here and nowhere on the ingestion shape, which refuses a\nsubmitted one as an unknown field.",
             "format": "uuid",
             "type": [
               "string",
