@@ -58,11 +58,11 @@ pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUP
 /// (e.g. a per-record metadata key) over a wide range. Narrow the read-path
 /// time range or drop the high-cardinality dimension.
 pub const AGGREGATION_RESULT_TOO_LARGE: &str = "AGGREGATION_RESULT_TOO_LARGE";
-/// A REST submission carried a target reference without a reason code, or
-/// a reason code without a target reference. Raised at the fold point
-/// where the flat wire pair becomes one `Option<Invalidation>`; no
-/// in-process caller can reach it, because the domain type makes the
-/// half-shape unrepresentable.
+/// A persisted-entry body carried a target reference without a reason code,
+/// or a reason code without a target reference. Raised where the flat wire
+/// pair becomes one `Option<Invalidation>`; no in-process caller can reach
+/// it, because the domain type makes the half-shape unrepresentable, and no
+/// ingestion body can, because a submission carries no target.
 pub const INVALIDATION_REFERENCE_INCOMPLETE: &str = "INVALIDATION_REFERENCE_INCOMPLETE";
 /// An invalidation's target was itself an invalidation.
 pub const INVALIDATION_TARGET_NOT_RECORD: &str = "INVALIDATION_TARGET_NOT_RECORD";
@@ -83,12 +83,21 @@ pub const PAST_WINDOW: &str = "PAST_WINDOW";
 /// matching the wire pattern, more than 28 significant digits, or a negative
 /// zero (which no backend can read back digit for digit).
 pub const QUANTITY_OUT_OF_RANGE: &str = "QUANTITY_OUT_OF_RANGE";
-/// A caller-supplied idempotency key began with `inv:`, the prefix reserved
-/// for keys the gateway derives for invalidations.
+/// Reserved, and emitted by nothing in this crate.
+///
+/// It named a rule that refused a caller idempotency key beginning `inv:`,
+/// the prefix an invalidation's server-derived key used to carry.
+/// `cpt-cf-usage-collector-adr-record-identity-derivation` rejects that
+/// scheme outright — an invalidation repeats its target's caller-supplied
+/// key, and `entry_type` is the sixth identity input that tells the two
+/// apart — so no prefix is reserved and the constructor that raised this is
+/// gone. Nothing replaces it.
+///
+/// Kept rather than removed, on [`SEMANTICS_VIOLATION`]'s grounds:
+/// [`ValidationReason`] is `#[non_exhaustive]`, so dropping a variant is
+/// silent for a downstream matcher rather than a compile error it can act
+/// on.
 pub const RESERVED_KEY_PREFIX: &str = "RESERVED_KEY_PREFIX";
-/// An invalidation carried an idempotency key. Its key is always derived as
-/// `inv:` followed by the target id, so a supplied one is refused.
-pub const KEY_ON_INVALIDATION: &str = "KEY_ON_INVALIDATION";
 /// A feed cursor names a position after which retention has already
 /// removed an entry the read would have had to deliver.
 ///
@@ -154,8 +163,6 @@ pub enum ValidationReason {
     QuantityOutOfRange,
     /// See [`RESERVED_KEY_PREFIX`].
     ReservedKeyPrefix,
-    /// See [`KEY_ON_INVALIDATION`].
-    KeyOnInvalidation,
     /// See [`CURSOR_BEYOND_RETENTION`].
     CursorBeyondRetention,
     /// Unmodeled / future reason — preserves the raw wire string.
@@ -184,7 +191,6 @@ impl ValidationReason {
             PAST_WINDOW => Self::PastWindow,
             QUANTITY_OUT_OF_RANGE => Self::QuantityOutOfRange,
             RESERVED_KEY_PREFIX => Self::ReservedKeyPrefix,
-            KEY_ON_INVALIDATION => Self::KeyOnInvalidation,
             CURSOR_BEYOND_RETENTION => Self::CursorBeyondRetention,
             other => Self::Unknown(other.to_owned()),
         }
@@ -211,7 +217,6 @@ impl ValidationReason {
             Self::PastWindow => PAST_WINDOW,
             Self::QuantityOutOfRange => QUANTITY_OUT_OF_RANGE,
             Self::ReservedKeyPrefix => RESERVED_KEY_PREFIX,
-            Self::KeyOnInvalidation => KEY_ON_INVALIDATION,
             Self::CursorBeyondRetention => CURSOR_BEYOND_RETENTION,
             Self::Unknown(s) => s.as_str(),
         }

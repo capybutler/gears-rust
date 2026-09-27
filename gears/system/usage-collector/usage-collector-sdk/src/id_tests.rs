@@ -3,13 +3,7 @@ use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use crate::id::{USAGE_RECORD_ID_NAMESPACE, canonical_period_bound, derive_usage_record_id};
-use crate::models::{IdempotencyKey, MeterTypeId};
-
-/// Golden vector for the `inv:` key, computed with Python's `uuid.uuid5` over
-/// the pre-image in `derive_matches_golden_vector_for_an_invalidation_key`.
-/// The same computation reproduces the existing `idem-1` vector
-/// (`5b075acb-e2e8-55a8-aedf-4c7d01b60284`).
-const INV_GOLDEN: &str = "55fc111f-59c9-5542-905a-f642a6644b08";
+use crate::models::{EntryType, IdempotencyKey, MeterTypeId};
 
 fn tenant() -> Uuid {
     Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
@@ -24,9 +18,6 @@ fn gts() -> MeterTypeId {
 }
 fn key(s: &str) -> IdempotencyKey {
     IdempotencyKey::new(s).unwrap()
-}
-fn target() -> Uuid {
-    Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()
 }
 /// `2023-11-14T22:13:20.000000Z`
 fn ws() -> OffsetDateTime {
@@ -43,8 +34,22 @@ fn expect(raw: &str) -> Uuid {
 #[test]
 fn derive_is_deterministic() {
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), ws(), we()),
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), ws(), we()),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
     );
 }
 
@@ -54,21 +59,92 @@ fn derive_matches_golden_vector() {
     //            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~" 0x1F
     //            "idem-1" 0x1F
     //            "2023-11-14T22:13:20.000000Z" 0x1F
-    //            "2023-11-14T23:13:20.000000Z")
+    //            "2023-11-14T23:13:20.000000Z" 0x1F
+    //            "record")
     //
     // Computed independently of this crate (RFC 4122 UUIDv5 over the
     // pre-image `cpt-cf-usage-collector-adr-record-identity-derivation`
     // fixes). DO NOT hand-edit: regenerate both sides and reconcile.
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), ws(), we()),
-        expect("5b075acb-e2e8-55a8-aedf-4c7d01b60284"),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        expect("e6a0ee4e-a198-521a-b462-fb839cf01204"),
+    );
+}
+
+/// The pre-image is the six inputs in order, `0x1F`-joined, entry type last.
+///
+/// `cpt-cf-usage-collector-adr-record-identity-derivation` fixes the order
+/// in its formula and the bytes in "The canonical pre-image". This test
+/// rebuilds that byte string by hand and digests it here, so the order, the
+/// separator and each input's canonical rendering are pinned against the
+/// document rather than against the concatenation in `id.rs` — which is the
+/// thing under test. `derive_matches_golden_vector` above pins the same
+/// pre-image from the other side, as a literal computed outside this crate.
+#[test]
+fn the_pre_image_is_the_six_inputs_entry_type_last() {
+    let pre_image = |entry_type: &[u8]| {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"11111111-1111-1111-1111-111111111111");
+        bytes.push(0x1F);
+        bytes.extend_from_slice(
+            b"gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~",
+        );
+        bytes.push(0x1F);
+        bytes.extend_from_slice(b"idem-1");
+        bytes.push(0x1F);
+        bytes.extend_from_slice(b"2023-11-14T22:13:20.000000Z");
+        bytes.push(0x1F);
+        bytes.extend_from_slice(b"2023-11-14T23:13:20.000000Z");
+        bytes.push(0x1F);
+        bytes.extend_from_slice(entry_type);
+        bytes
+    };
+
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        Uuid::new_v5(&USAGE_RECORD_ID_NAMESPACE, &pre_image(b"record")),
+        "a measurement's pre-image ends in the literal `record`",
+    );
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Invalidation
+        ),
+        Uuid::new_v5(&USAGE_RECORD_ID_NAMESPACE, &pre_image(b"invalidation")),
+        "a withdrawal's pre-image ends in the literal `invalidation`",
     );
 }
 
 #[test]
 fn derive_produces_a_v5_uuid() {
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), ws(), we()).get_version_num(),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        )
+        .get_version_num(),
         5,
     );
 }
@@ -85,8 +161,15 @@ fn namespace_is_pinned() {
 #[test]
 fn distinct_keys_yield_distinct_ids() {
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-2"), ws(), we()),
-        expect("f7295cc9-530f-5c93-8020-9f1cd7c78498"),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-2"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        expect("182bbbe4-d829-5755-8bdc-60a16dd7e0e1"),
     );
 }
 
@@ -94,8 +177,8 @@ fn distinct_keys_yield_distinct_ids() {
 fn distinct_tenants_yield_distinct_ids() {
     let other = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
     assert_eq!(
-        derive_usage_record_id(other, &gts(), &key("idem-1"), ws(), we()),
-        expect("560fbb23-4eb6-508c-ab8d-4d2187acb69b"),
+        derive_usage_record_id(other, &gts(), &key("idem-1"), ws(), we(), EntryType::Record),
+        expect("792060aa-d863-5a5e-acf1-dd02f58982df"),
     );
 }
 
@@ -106,8 +189,15 @@ fn distinct_gts_ids_yield_distinct_ids() {
     ))
     .unwrap();
     assert_eq!(
-        derive_usage_record_id(tenant(), &other, &key("idem-1"), ws(), we()),
-        expect("86f9359f-2d26-5fb3-b88a-d256910c6462"),
+        derive_usage_record_id(
+            tenant(),
+            &other,
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        expect("f53b957a-71ee-50d4-b58a-ffa50e3b4acd"),
     );
 }
 
@@ -122,32 +212,48 @@ fn the_tenant_enters_in_its_lowercase_hyphenated_form() {
     let lower = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
     let upper = Uuid::parse_str("AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE").unwrap();
     assert_eq!(
-        derive_usage_record_id(lower, &gts(), &key("idem-1"), ws(), we()),
-        expect("138f9b89-bffa-5550-ab27-98c5b518801a"),
+        derive_usage_record_id(lower, &gts(), &key("idem-1"), ws(), we(), EntryType::Record),
+        expect("dc9774b2-2e7b-5ecc-b52a-96a4fb6b4b36"),
     );
     assert_eq!(
-        derive_usage_record_id(upper, &gts(), &key("idem-1"), ws(), we()),
-        expect("138f9b89-bffa-5550-ab27-98c5b518801a"),
+        derive_usage_record_id(upper, &gts(), &key("idem-1"), ws(), we(), EntryType::Record),
+        expect("dc9774b2-2e7b-5ecc-b52a-96a4fb6b4b36"),
     );
 }
 
 #[test]
 fn a_different_covered_period_yields_a_different_id() {
-    // The point of the 5-tuple: one stable per-meter idempotency key covers
-    // many periods, and two periods are two entries rather than a collision.
+    // The point of carrying both bounds: one stable per-meter idempotency
+    // key covers many periods, and two periods are two entries rather than
+    // a collision.
     let one_micro_later = ws() + time::Duration::microseconds(1);
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), one_micro_later, we()),
-        expect("bf2e9ea3-746e-5521-8145-a99c37b54924"),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            one_micro_later,
+            we(),
+            EntryType::Record
+        ),
+        expect("455e1f38-a4f7-532c-ba16-97c683980e02"),
     );
     assert_ne!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), ws(), we()),
         derive_usage_record_id(
             tenant(),
             &gts(),
             &key("idem-1"),
             ws(),
-            we() + time::Duration::microseconds(1)
+            we(),
+            EntryType::Record
+        ),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we() + time::Duration::microseconds(1),
+            EntryType::Record
         ),
         "window_end is an input too",
     );
@@ -161,8 +267,15 @@ fn the_two_bounds_enter_in_a_fixed_order() {
     // digest would also collapse two legitimate periods that happen to
     // mirror each other around a shared instant.
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), we(), ws()),
-        expect("6a75ef43-2619-58a0-b75c-53b08bd96a78"),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            we(),
+            ws(),
+            EntryType::Record
+        ),
+        expect("e5a1c88e-fe97-54e2-9bf4-d4c13e74bccd"),
     );
 }
 
@@ -173,8 +286,15 @@ fn a_point_event_derives_over_equal_bounds() {
     // is a zero-length period, and the derivation needs no separate case for
     // it.
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), ws(), ws()),
-        expect("64902762-6487-570c-83c3-8975a2e1adb4"),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            ws(),
+            EntryType::Record
+        ),
+        expect("7e376526-129c-50f1-a326-a4e684c8cf92"),
     );
 }
 
@@ -190,12 +310,19 @@ fn equivalent_spellings_of_one_instant_derive_one_id() {
     // vector. (UUID case is pinned separately by
     // `the_tenant_enters_in_its_lowercase_hyphenated_form`, which needs a
     // letter-bearing tenant the base vector does not have.)
-    let base = expect("5b075acb-e2e8-55a8-aedf-4c7d01b60284");
+    let base = expect("e6a0ee4e-a198-521a-b462-fb839cf01204");
     let parse = |raw: &str| {
         OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).unwrap()
     };
     let derive_over = |start: &str, end: &str| {
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), parse(start), parse(end))
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            parse(start),
+            parse(end),
+            EntryType::Record,
+        )
     };
 
     assert_eq!(
@@ -287,55 +414,69 @@ fn canonical_period_bound_truncates_below_the_microsecond() {
     );
 }
 
-// ── The `inv:` invalidation key ─────────────────────────────────────────────
+// ── Entry type, the sixth input ─────────────────────────────────────────────
 
+/// A record and its invalidation differ in exactly one input and derive two
+/// identifiers.
+///
+/// ADR 0007 `:121-124`: an invalidation "copies the tenant, type, idempotency
+/// key and covered period of its target. Its identifier therefore differs
+/// from its target's for one reason only, the entry type."
 #[test]
-fn derive_matches_golden_vector_for_an_invalidation_key() {
-    // UUIDv5(NS, "11111111-1111-1111-1111-111111111111" 0x1F
-    //            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~" 0x1F
-    //            "inv:33333333-3333-3333-3333-333333333333" 0x1F
-    //            "2023-11-14T22:13:20.000000Z" 0x1F
-    //            "2023-11-14T23:13:20.000000Z")
-    //
-    // Computed independently of this crate. DO NOT hand-edit.
-    assert_eq!(
-        derive_usage_record_id(
-            tenant(),
-            &gts(),
-            &IdempotencyKey::for_invalidation(target()),
-            ws(),
-            we()
-        ),
-        expect(INV_GOLDEN),
-    );
-}
-
-#[test]
-fn an_invalidation_differs_from_its_target_only_through_the_key() {
-    let record_id = derive_usage_record_id(tenant(), &gts(), &key("idem-1"), ws(), we());
-    let inv_id = derive_usage_record_id(
+fn a_record_and_its_invalidation_derive_two_ids_from_one_key() {
+    let record = derive_usage_record_id(
         tenant(),
         &gts(),
-        &IdempotencyKey::for_invalidation(record_id),
+        &key("idem-1"),
         ws(),
         we(),
+        EntryType::Record,
     );
-    assert_ne!(record_id, inv_id);
-    // Every invalidation of one entry derives one identifier.
-    assert_eq!(
-        inv_id,
-        derive_usage_record_id(
-            tenant(),
-            &gts(),
-            &IdempotencyKey::for_invalidation(record_id),
-            ws(),
-            we()
-        ),
+    let invalidation = derive_usage_record_id(
+        tenant(),
+        &gts(),
+        &key("idem-1"),
+        ws(),
+        we(),
+        EntryType::Invalidation,
+    );
+
+    assert_ne!(
+        record, invalidation,
+        "the entry type is the sixth input and the only one these two differ in, so a \
+         derivation that reads it gives two identifiers. Equal ids mean the entry type is not \
+         reaching the pre-image"
     );
 }
 
+/// Every invalidation of one record derives one identifier.
+///
+/// ADR 0007 `:181`: "Two withdrawals of the same target collide on all six
+/// inputs", which is what makes at-most-one-invalidation a consequence of the
+/// dedup identity rather than a rule of its own.
 #[test]
-fn an_inv_measurement_key_is_rejected_before_derivation() {
-    IdempotencyKey::new("inv:33333333-3333-3333-3333-333333333333")
-        .expect_err("a measurement key cannot carry the reserved prefix");
+fn every_invalidation_of_one_record_derives_one_id() {
+    let first = derive_usage_record_id(
+        tenant(),
+        &gts(),
+        &key("idem-1"),
+        ws(),
+        we(),
+        EntryType::Invalidation,
+    );
+    let second = derive_usage_record_id(
+        tenant(),
+        &gts(),
+        &key("idem-1"),
+        ws(),
+        we(),
+        EntryType::Invalidation,
+    );
+
+    assert_eq!(
+        first, second,
+        "a withdrawal is a faithful copy departing in `entry_type` and `reason_code`, and \
+         `reason_code` is not an identity input, so two withdrawals of one target are one \
+         identity"
+    );
 }

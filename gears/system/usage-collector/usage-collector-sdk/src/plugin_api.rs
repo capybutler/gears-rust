@@ -32,8 +32,8 @@ use crate::time_range::TimeRange;
 ///   resolves by [`UsageRecord::caller_supplied_eq`]: equal is absorbed and
 ///   returns the stored entry, different is
 ///   [`UsageCollectorPluginError::IdempotencyConflict`] carrying it. A second
-///   invalidation of one record is an ordinary collision on its derived
-///   `inv:<target>` key, with no check of its own.
+///   invalidation of one record is an ordinary collision on the dedup identity
+///   every withdrawal of that record reaches, with no check of its own.
 /// - **Decide converged-only lookups.** See [`Self::get_usage_record`].
 ///
 /// The contract suite in `usage_collector_sdk::contract` (feature `contract`)
@@ -51,9 +51,10 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// included. A different one is
     /// [`UsageCollectorPluginError::IdempotencyConflict`] carrying the stored
     /// entry. The rule covers invalidations too: every invalidation of one
-    /// record derives the same `inv:<target>` key, so a second one with the
-    /// same reason code is absorbed and one with another reason code conflicts.
-    /// There is no separate at-most-one check.
+    /// record repeats that record's tenant, type, key and period and reads
+    /// `entry_type = invalidation`, so all of them share one dedup identity —
+    /// a second one with the same reason code is absorbed and one with another
+    /// reason code conflicts. There is no separate at-most-one check.
     async fn create_usage_record(
         &self,
         record: UsageRecord,

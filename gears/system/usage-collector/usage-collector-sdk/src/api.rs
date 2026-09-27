@@ -48,11 +48,11 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
     /// Create a single usage record.
     ///
     /// Takes the identity-free [`CreateUsageRecord`]: the returned record's
-    /// `id` is derived deterministically from the 5-tuple dedup identity
-    /// (tenant, meter type, idempotency key and both covered-period bounds),
-    /// never supplied by the caller. An exact-equality retry under the same
-    /// dedup identity returns the previously persisted record; a
-    /// canonical-field mismatch surfaces as
+    /// `id` is derived deterministically from the 6-tuple dedup identity
+    /// (tenant, meter type, idempotency key, both covered-period bounds and
+    /// the entry type), never supplied by the caller. An exact-equality
+    /// retry under the same dedup identity returns the previously persisted
+    /// record; a canonical-field mismatch surfaces as
     /// [`UsageCollectorError::Conflict`].
     ///
     /// A covered period that is inverted, or that carries a bound finer

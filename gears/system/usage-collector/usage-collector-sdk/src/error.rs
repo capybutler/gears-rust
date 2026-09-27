@@ -504,40 +504,49 @@ impl UsageCollectorError {
         Self::newtype_validation("reason_code", detail)
     }
 
-    /// A caller key began with the reserved `inv:` prefix. `field` is
-    /// `idempotency_key`.
-    #[must_use]
-    pub fn reserved_idempotency_key_prefix() -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "idempotency_key".to_owned(),
-            reason: ValidationReason::ReservedKeyPrefix,
-            detail: "idempotency_key must not begin with `inv:`, which is reserved for the \
-                     keys the gateway derives for invalidations"
-                .to_owned(),
-        }
-    }
-
-    /// An invalidation carried an idempotency key. `field` is
-    /// `idempotency_key`.
-    #[must_use]
-    pub fn idempotency_key_on_invalidation() -> Self {
-        Self::InvalidArgument {
-            resource_type: USAGE_RECORD_RESOURCE.to_owned(),
-            resource_name: None,
-            field: "idempotency_key".to_owned(),
-            reason: ValidationReason::KeyOnInvalidation,
-            detail: "an invalidation carries no idempotency_key: the gateway derives \
-                     `inv:<invalidates>`, so omit it"
-                .to_owned(),
-        }
-    }
-
-    /// A record carried no idempotency key. `field` is `idempotency_key`.
+    /// An entry carried no idempotency key. `field` is `idempotency_key`.
+    ///
+    /// Both kinds carry one: an invalidation repeats its target's, which is
+    /// how the gateway finds the entry being withdrawn (DESIGN §3.1, Target
+    /// resolution).
     #[must_use]
     pub fn missing_idempotency_key() -> Self {
-        Self::newtype_validation("idempotency_key", "idempotency_key is required on a record")
+        Self::newtype_validation(
+            "idempotency_key",
+            "idempotency_key is required on every entry; an invalidation repeats its target's",
+        )
+    }
+
+    /// [`crate::CreateUsageRecord::try_into_usage_record`] was handed a
+    /// submission carrying a reason code. `field` is `reason_code`.
+    ///
+    /// The submission is a withdrawal, and a withdrawal has to name the
+    /// entry it withdraws — a reference only the gateway can resolve, so
+    /// [`crate::CreateUsageRecord::try_into_invalidation_record`] is the
+    /// projection that takes it. The measurement projection refuses rather
+    /// than dropping the reason, which would admit the submission as an
+    /// ordinary record and collide it with its own target.
+    #[must_use]
+    pub fn withdrawal_needs_its_target() -> Self {
+        Self::newtype_validation(
+            "reason_code",
+            "reason_code marks this submission an invalidation; project it with its resolved \
+             target instead",
+        )
+    }
+
+    /// A submission projected as a withdrawal carried no reason code.
+    /// `field` is `reason_code`.
+    ///
+    /// `reason_code` is required on the `invalidation` branch of
+    /// `CreateUsageRecordRequest`, and carrying it is what makes a
+    /// submission an invalidation at all.
+    #[must_use]
+    pub fn missing_reason_code() -> Self {
+        Self::newtype_validation(
+            "reason_code",
+            "reason_code is required on an invalidation and forbidden on a record",
+        )
     }
 
     /// An attribution component exceeded its character cap. `field` is the
@@ -729,19 +738,20 @@ impl UsageCollectorError {
         }
     }
 
-    /// A REST submission carried a reference without a reason code, or the
-    /// reverse. The two are both-or-neither
+    /// An **entry** body carried a target reference without a reason code,
+    /// or the reverse. The two are both-or-neither
     /// (`cpt-cf-usage-collector-adr-append-only-invalidation`): the
-    /// reference is what makes the entry an invalidation, and the reason
-    /// carries the intent, so half the pair describes nothing. `field`
-    /// names the **missing** half, which is the one the caller has to add.
+    /// reference names what was withdrawn and the reason carries the
+    /// intent, so half the pair describes nothing. `field` names the
+    /// **missing** half.
     ///
-    /// Reachable from the REST fold point alone. The domain carries the
-    /// pair as one [`crate::Invalidation`], so an in-process caller cannot
-    /// construct the shape this rejects, and nothing downstream of the fold
-    /// re-checks it — the host's `record_request_into_domain` is its only
-    /// caller, raising it from two call sites, one per direction of the
-    /// half-shape.
+    /// It does not describe an ingestion body. A submission carries the
+    /// reason alone — `invalidates` is server-assigned, so
+    /// `CreateUsageRecordRequest` publishes no such property and a
+    /// submitted one is refused as an unknown field — which leaves the
+    /// half-shape reachable only where a persisted entry is decoded. The
+    /// domain carries the pair as one [`crate::Invalidation`], so no
+    /// in-process caller can construct the shape this rejects.
     #[must_use]
     pub fn invalidation_reference_incomplete(missing_field: &str) -> Self {
         Self::InvalidArgument {
@@ -759,8 +769,9 @@ impl UsageCollectorError {
     /// An invalidation's target was itself an invalidation. A correction
     /// cannot be reversed: withdrawal applies to measurements, so the
     /// entry that withdrew one is not itself withdrawable. The separate
-    /// cap of one withdrawal per entry follows from the derived
-    /// `inv:<target>` key ([`Self::already_invalidated`]), not from this check.
+    /// cap of one withdrawal per entry follows from the shared dedup
+    /// identity two withdrawals of one target reach
+    /// ([`Self::already_invalidated`]), not from this check.
     #[must_use]
     pub fn invalidation_target_not_record(target: Uuid) -> Self {
         Self::InvalidArgument {
@@ -776,10 +787,9 @@ impl UsageCollectorError {
     ///
     /// `field` names **the field that differs**, which is the whole point
     /// of the diagnostic: the entry is a faithful copy in every
-    /// caller-supplied field, departing only in its derived `inv:<target>`
-    /// idempotency key, `invalidates` and `reason_code`, so a rejection
-    /// that only said "mismatch" would leave the emitter diffing two
-    /// payloads by hand.
+    /// caller-supplied field, departing in exactly two — `entry_type` and
+    /// `reason_code` — so a rejection that only said "mismatch" would leave
+    /// the emitter diffing two payloads by hand.
     #[must_use]
     pub fn invalidation_field_mismatch(field: &str, target: Uuid) -> Self {
         Self::InvalidArgument {
@@ -830,10 +840,12 @@ impl UsageCollectorError {
 
     /// A second invalidation of a record under a reason code other than the
     /// stored one: the dedup conflict of an invalidation. Every invalidation of
-    /// one record shares the derived `inv:<target>` key, so the store reports an
-    /// ordinary `IdempotencyConflict`, and the gateway, knowing the dispatched
-    /// entry is an invalidation, reports it as this. `name` is the target;
-    /// `invalidated_by` and `reason_code` name the invalidation in place.
+    /// one record repeats that record's tenant, type, key and period and reads
+    /// `entry_type = invalidation`, so all of them share one dedup identity and
+    /// the store reports an ordinary `IdempotencyConflict`; the gateway, knowing
+    /// the dispatched entry is an invalidation, reports it as this. `name` is
+    /// the target; `invalidated_by` and `reason_code` name the invalidation in
+    /// place.
     #[must_use]
     pub fn already_invalidated(
         target: Uuid,
@@ -984,7 +996,8 @@ pub enum UsageCollectorPluginError {
     /// `AlreadyInvalidated` naming `existing.id` and its reason code.
     #[error("idempotency conflict: key {idempotency_key} already bound to record {}", .existing.id)]
     IdempotencyConflict {
-        /// The dispatched entry's idempotency key (`inv:<target>` on an invalidation).
+        /// The dispatched entry's idempotency key. Caller-supplied on both
+        /// entry kinds: an invalidation repeats its target's.
         idempotency_key: String,
         /// The stored entry the key is already bound to.
         existing: Box<crate::models::UsageRecord>,

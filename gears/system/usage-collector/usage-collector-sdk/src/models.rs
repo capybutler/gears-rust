@@ -348,18 +348,20 @@ impl<'de> Deserialize<'de> for SubjectRef {
 /// `IdempotencyKey` schema in `docs/usage-collector-v1.yaml`.
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
 
-/// Prefix of every derived invalidation key. A caller key may not begin with
-/// it, so a measurement key and an invalidation key can never coincide.
-pub const INVALIDATION_KEY_PREFIX: &str = "inv:";
-
 /// Validating newtype over the caller-supplied idempotency key string.
 ///
 /// Every [`UsageRecord::idempotency_key`] carries this type rather than a
-/// bare `String`, and the key is declared mandatory on every record — the
+/// bare `String`, and the key is declared mandatory on every entry — the
 /// newtype enforces that "mandatory" at the type level so an SDK consumer
-/// cannot build a record with an empty key. The key is one of the five
+/// cannot build an entry with an empty key. The key is one of the six
 /// inputs to the dedup identity, so a malformed one must not reach the
 /// derivation at all.
+///
+/// **No prefix is reserved** (DESIGN §3.1, `IdempotencyKey`). Both entry
+/// kinds carry a caller-supplied key and an invalidation repeats its
+/// target's, so the whole key space stays the caller's and `entry_type` —
+/// not the key — is what tells the two apart
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`).
 ///
 /// # Validation
 ///
@@ -374,14 +376,13 @@ pub struct IdempotencyKey(String);
 impl IdempotencyKey {
     /// Creates an [`IdempotencyKey`] after validating it against the wire
     /// contract's `IdempotencyKey` schema (`minLength: 1`,
-    /// `maxLength: 256`, `pattern: ^[^\x00-\x1F\x7F]+$`), or begins with the
-    /// reserved `inv:` prefix ([`INVALIDATION_KEY_PREFIX`]).
+    /// `maxLength: 256`, `pattern: ^[^\x00-\x1F\x7F]+$`).
     ///
     /// # Errors
     ///
     /// Returns [`UsageCollectorError::InvalidArgument`] when the input is
-    /// empty, longer than 256 characters, carries an ASCII control character
-    /// (including DEL), or begins with `inv:`.
+    /// empty, longer than 256 characters, or carries an ASCII control
+    /// character (including DEL).
     #[allow(
         clippy::result_large_err,
         reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
@@ -389,28 +390,20 @@ impl IdempotencyKey {
     pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
         let raw = value.into();
         validate_stored_form(&raw)?;
-        if raw.starts_with(INVALIDATION_KEY_PREFIX) {
-            return Err(UsageCollectorError::reserved_idempotency_key_prefix());
-        }
         Ok(Self(raw))
     }
 
-    /// The key an invalidation of `target` is stored under: `inv:` followed
-    /// by the target id, lowercase and hyphenated
-    /// (`cpt-cf-usage-collector-adr-record-identity-derivation`). Every
-    /// invalidation of one entry therefore shares one dedup identity.
-    #[must_use]
-    pub fn for_invalidation(target: Uuid) -> Self {
-        Self(format!("{INVALIDATION_KEY_PREFIX}{}", target.hyphenated()))
-    }
-
-    /// Rebuilds a key read back from storage, where an invalidation's
-    /// derived `inv:` key is legitimate. Applies every check [`Self::new`]
-    /// does except the reserved-prefix rule — meant only for rehydrating a
-    /// stored entry's key, not for building a fresh one. Skipping the rule
-    /// here does not reopen it: a record built from the result still meets
-    /// the reserved prefix at [`CreateUsageRecord::try_into_usage_record`],
-    /// which refuses one regardless of which constructor produced the key.
+    /// Rebuilds a key read back from storage.
+    ///
+    /// Applies exactly the checks [`Self::new`] applies, and delegates to it
+    /// so the two cannot drift. The pair existed because an invalidation's
+    /// key used to be server-derived under a reserved prefix that `new`
+    /// refused and a stored row legitimately carried; with the prefix
+    /// retired (ADR `cpt-cf-usage-collector-adr-record-identity-derivation`
+    /// gives both entry kinds a caller-supplied key) there is nothing left
+    /// for the two to disagree about. What this spelling still carries is
+    /// where the value came from: it names a rehydration of a persisted
+    /// entry rather than the admission of a submission.
     ///
     /// # Errors
     ///
@@ -422,9 +415,7 @@ impl IdempotencyKey {
         reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
     )]
     pub fn from_stored(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
-        let raw = value.into();
-        validate_stored_form(&raw)?;
-        Ok(Self(raw))
+        Self::new(value)
     }
 
     /// Borrows the underlying string.
@@ -440,11 +431,9 @@ impl IdempotencyKey {
     }
 }
 
-/// The checks [`IdempotencyKey::new`] and [`IdempotencyKey::from_stored`]
-/// share: non-empty, at most [`MAX_IDEMPOTENCY_KEY_LEN`] characters, and no
-/// ASCII control character (DEL included). Only [`IdempotencyKey::new`]
-/// additionally rejects the reserved `inv:` prefix — a stored invalidation
-/// key legitimately carries it.
+/// Every check an [`IdempotencyKey`] meets, whichever constructor built it:
+/// non-empty, at most [`MAX_IDEMPOTENCY_KEY_LEN`] characters, and no ASCII
+/// control character (DEL included).
 #[allow(
     clippy::result_large_err,
     reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
@@ -944,12 +933,13 @@ pub struct Invalidation {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(try_from = "UsageRecordWire")]
 pub struct UsageRecord {
-    /// Deterministic gateway-derived entry identity: `UUIDv5` of the 5-tuple
+    /// Deterministic gateway-derived entry identity: `UUIDv5` of the 6-tuple
     /// dedup identity
-    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)`
     /// (see [`crate::derive_usage_record_id`];
     /// `cpt-cf-usage-collector-adr-record-identity-derivation`). Stamped by
-    /// [`CreateUsageRecord::try_into_usage_record`] on create and
+    /// [`CreateUsageRecord::try_into_usage_record`] or
+    /// [`CreateUsageRecord::try_into_invalidation_record`] on create and
     /// authoritative on read / return. The identity cannot be
     /// caller-supplied: the create surface takes the identity-free
     /// [`CreateUsageRecord`], not this type.
@@ -985,10 +975,11 @@ pub struct UsageRecord {
     /// through them.
     pub quantity: UsageQuantity,
     /// Mandatory caller-supplied key for at-least-once-with-dedup
-    /// semantics, or — on an invalidation — the gateway-derived
-    /// [`IdempotencyKey::for_invalidation`] key. One of the five inputs to
-    /// the dedup identity, so a single stable per-meter key covers many
-    /// periods without collapsing them onto one entry.
+    /// semantics, on both entry kinds: an invalidation repeats its target's
+    /// (DESIGN §3.1, `IdempotencyKey`), which is how the gateway finds the
+    /// entry being withdrawn. One of the six inputs to the dedup identity,
+    /// so a single stable per-meter key covers many periods without
+    /// collapsing them onto one entry.
     pub idempotency_key: IdempotencyKey,
     /// Gear-assigned instant of acceptance, stamped once per request by the
     /// Ingestion Gateway at microsecond precision. Never caller-supplied:
@@ -1005,10 +996,13 @@ pub struct UsageRecord {
     /// measurement. Its presence is what makes this entry an invalidation
     /// — hence [`Self::entry_type`], which reads it.
     ///
-    /// [`Invalidation::target`] is not an input to the derived identity
-    /// directly; it enters through the derived key `inv:<target>`, so every
-    /// invalidation of one entry shares one dedup identity and a second one
-    /// collides instead of producing a second withdrawal.
+    /// [`Invalidation::target`] is no input to the derived identity, and
+    /// server-assigned rather than caller-supplied (DESIGN §3.1,
+    /// Field-ownership): the gateway derives it from this entry's own
+    /// identity inputs with `entry_type = record` and stamps it here. Every
+    /// invalidation of one entry therefore reaches the same six inputs and
+    /// so one identity, and a second one collides instead of producing a
+    /// second withdrawal.
     pub invalidation: Option<Invalidation>,
     /// Inclusive start of the emitter-supplied covered period (RFC 3339
     /// on the wire). The covered period is the only emitter-supplied time
@@ -1110,11 +1104,13 @@ impl UsageRecord {
 /// ([`crate::UsageCollectorClientV1::create_usage_record`] /
 /// [`crate::UsageCollectorClientV1::create_usage_records`]).
 ///
-/// This mirrors [`UsageRecord`] minus the two fields the server assigns:
-/// `id`, a deterministic projection of the 5-tuple dedup identity (see
-/// [`Self::try_into_usage_record`]), and `origin`, stamped from the route
-/// the entry arrived on (see [`RecordOrigin`]). Encoding "id is derived, not
-/// supplied" in the type — rather than a doc-comment on a full
+/// This mirrors [`UsageRecord`] minus the fields the server assigns: `id`,
+/// a deterministic projection of the 6-tuple dedup identity (see
+/// [`Self::try_into_usage_record`]), `origin`, stamped from the route the
+/// entry arrived on (see [`RecordOrigin`]), and — on an invalidation — the
+/// target, which the gateway resolves and
+/// [`Self::try_into_invalidation_record`] stamps. Encoding "id is derived,
+/// not supplied" in the type — rather than a doc-comment on a full
 /// [`UsageRecord`] — is what keeps a caller from constructing a meaningless
 /// identity the gateway would only discard. The wire REST surface encodes
 /// the same shape as `CreateUsageRecordRequest`.
@@ -1142,14 +1138,27 @@ pub struct CreateUsageRecord {
     pub metadata: BTreeMap<MetadataKey, String>,
     /// The measured quantity. Same encoding and sign rules as [`UsageRecord::quantity`].
     pub quantity: UsageQuantity,
-    /// The caller's key, required on a record and forbidden on an
-    /// invalidation, whose key the projection derives as
-    /// [`IdempotencyKey::for_invalidation`].
+    /// The caller's key, required on **both** entry kinds: a withdrawal
+    /// repeats its target's, which is what lets the gateway find the target
+    /// from the submission alone (DESIGN §3.1, Target resolution).
+    ///
+    /// `Option` rather than a bare key because the absence is a caller
+    /// mistake a projection has to report, not a shape the type may admit:
+    /// both [`Self::try_into_usage_record`] and
+    /// [`Self::try_into_invalidation_record`] refuse a submission missing
+    /// one.
     pub idempotency_key: Option<IdempotencyKey>,
-    /// The withdrawal this submission carries, absent on an ordinary
-    /// measurement. Its presence is what makes the submission an
-    /// invalidation; there is no caller-supplied discriminator besides it.
-    pub invalidation: Option<Invalidation>,
+    /// The withdrawal's stated reason, present exactly when this submission
+    /// is an invalidation.
+    ///
+    /// **No target.** DESIGN §3.1's Field-ownership table makes
+    /// `invalidates` server-assigned: the gateway derives the target's
+    /// identifier from this submission's own tenant, type, idempotency key
+    /// and covered period with `entry_type = record`, looks it up
+    /// converged-only under the PDP scope, and stamps the result. A
+    /// caller-supplied target would let an emitter name a record it never
+    /// measured.
+    pub invalidation: Option<ReasonCode>,
     /// Inclusive start of the covered period this submission measures (RFC
     /// 3339 on the wire; the codec requires an offset, so an
     /// offset-less timestamp never reaches the projection). Part of the
@@ -1164,25 +1173,47 @@ pub struct CreateUsageRecord {
 }
 
 impl CreateUsageRecord {
-    /// Projects this submission into the persisted [`UsageRecord`] shape,
-    /// validating the submission's own shape first.
+    /// This submission's kind, derived from the reason code it carries.
     ///
-    /// This is the single point at which a submission acquires its identity,
-    /// and the period validation is inseparable from it:
+    /// The sixth input to the identity derivation
+    /// (`cpt-cf-usage-collector-adr-record-identity-derivation`), and — like
+    /// [`UsageRecord::entry_type`] — a projection rather than a stored
+    /// field, so no marker can disagree with the payload it marks.
+    #[must_use]
+    pub const fn entry_type(&self) -> EntryType {
+        if self.invalidation.is_some() {
+            EntryType::Invalidation
+        } else {
+            EntryType::Record
+        }
+    }
+
+    /// Projects an ordinary measurement into the persisted [`UsageRecord`]
+    /// shape, validating the submission's own shape first.
+    ///
+    /// This is the single point at which a measurement acquires its
+    /// identity, and the period validation is inseparable from it:
     /// `cpt-cf-usage-collector-adr-record-identity-derivation` requires both
     /// period preconditions to be rejected **before** the derivation runs,
     /// so the projection is fallible rather than the caller's obligation.
     ///
-    /// In order: both bounds are normalized to UTC, each must then carry at
-    /// most microsecond precision, the period must be ordered
-    /// (`window_start <= window_end`, equal bounds being a point event),
-    /// and only then is `id` derived over
-    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
-    /// Every other field is forwarded verbatim, the invalidation reference
-    /// included — it is not an input to the derivation. `origin` and
-    /// `accepted_at` are the exceptions: both are server-assigned and
-    /// stamped from the arguments, and neither is an input to the
-    /// derivation.
+    /// In order: the submission must carry no reason code, both bounds are
+    /// normalized to UTC, each must then carry at most microsecond
+    /// precision, the period must be ordered
+    /// (`window_start <= window_end`, equal bounds being a point event), a
+    /// key must be present, and only then is `id` derived over
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, record)`.
+    /// Every other field is forwarded verbatim. `origin` and `accepted_at`
+    /// are the exceptions: both are server-assigned and stamped from the
+    /// arguments, and neither is an input to the derivation.
+    ///
+    /// **A submission carrying a reason code is refused here rather than
+    /// projected without it.** It is an invalidation, and an invalidation
+    /// needs a target this projection has no way to resolve;
+    /// [`Self::try_into_invalidation_record`] is the projection that takes
+    /// one. Dropping the reason instead would turn a withdrawal into an
+    /// ordinary measurement — accepted, derived under `entry_type = record`,
+    /// and colliding with the very entry it meant to withdraw.
     ///
     /// `origin` is server-assigned
     /// (`cpt-cf-usage-collector-adr-backfill-isolation`), so it arrives as an
@@ -1202,40 +1233,20 @@ impl CreateUsageRecord {
     /// emitter reproduces the id it submitted, so the two would disagree
     /// about the same entry.
     ///
-    /// The withdrawal's own both-or-neither rule is not checked here and
-    /// has no error: [`Invalidation`] groups the target with its reason, so
-    /// a submission carrying one without the other cannot be built. The
-    /// only place the two can arrive apart is a wire body, and which
-    /// boundary refuses one depends on the body: a JSON body decoded
-    /// straight into [`CreateUsageRecord`] is refused by this type's own
-    /// deserialization shadow, while a REST body reaches the host as a DTO
-    /// carrying the pair flat — as the served schema declares it — and is
-    /// refused where that DTO is folded into this type. The shadow is not
-    /// the only guard, and it is not the one a REST caller meets. Three of the
-    /// rules an invalidation must satisfy against its *target* — that the
-    /// target resolves, is itself a record, and is copied faithfully — need a
-    /// lookup and belong to the ingestion gateway. The fourth does not: at
-    /// most one invalidation per record is the **store's**, because only the
-    /// store can make that check atomic with the entry it admits
+    /// The rules an invalidation must satisfy against its *target* — that
+    /// the target resolves, is itself a record, and is copied faithfully —
+    /// need a lookup and belong to the ingestion gateway. At most one
+    /// invalidation per record needs no rule at all: every withdrawal of
+    /// one record reaches the same six identity inputs, so the store's
+    /// ordinary dedup settles it
     /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
-    ///
-    /// The key rules are checked here, before the derivation: a record must
-    /// carry a key, an invalidation must not (because its key is derived
-    /// from its target), and a record's key must not begin with the
-    /// reserved [`INVALIDATION_KEY_PREFIX`] — otherwise an in-process caller
-    /// could build an ordinary record with [`IdempotencyKey::from_stored`]
-    /// and occupy the dedup slot an invalidation of that target would
-    /// derive, blocking every future correction. [`IdempotencyKey::new`]
-    /// already refuses the prefix, so this is belt-and-suspenders against a
-    /// caller that goes around it with [`IdempotencyKey::from_stored`]; the
-    /// REST wire path only ever reaches [`IdempotencyKey::new`].
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorError::InvalidArgument`] when a bound is
-    /// finer than microsecond precision, when the period is inverted, when
-    /// a record carries no idempotency key, when a record's key begins with
-    /// the reserved `inv:` prefix, or when an invalidation carries a key.
+    /// Returns [`UsageCollectorError::InvalidArgument`] when the submission
+    /// carries a reason code, when a bound is finer than microsecond
+    /// precision, when the period is inverted, or when no idempotency key is
+    /// present.
     #[allow(
         clippy::result_large_err,
         reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
@@ -1244,6 +1255,73 @@ impl CreateUsageRecord {
         self,
         origin: RecordOrigin,
         accepted_at: time::OffsetDateTime,
+    ) -> Result<UsageRecord, UsageCollectorError> {
+        if self.invalidation.is_some() {
+            return Err(UsageCollectorError::withdrawal_needs_its_target());
+        }
+        self.project(origin, accepted_at, None)
+    }
+
+    /// Projects a withdrawal, stamping the target the gateway resolved.
+    ///
+    /// Separate from [`Self::try_into_usage_record`] because the target is
+    /// server-assigned and the gateway is the only thing that knows it: a
+    /// single projection would either take a caller-supplied target, which
+    /// DESIGN forbids, or leave the field unset on an entry whose whole
+    /// purpose is to name it.
+    ///
+    /// `target` is the identifier the gateway resolved for the entry being
+    /// withdrawn — [`crate::derive_usage_record_id`] over this submission's
+    /// own tenant, type, key and period with [`EntryType::Record`], looked
+    /// up converged-only under the PDP scope (DESIGN §3.1, Target
+    /// resolution). It is not re-derived here: this projection stamps what
+    /// the gateway found, so an unresolvable target has already been
+    /// refused by the time it is called.
+    ///
+    /// Validation and the derivation are otherwise exactly
+    /// [`Self::try_into_usage_record`]'s, except that `id` is derived with
+    /// `entry_type = invalidation`, which is the one input that keeps this
+    /// entry's identity apart from its target's.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorError::InvalidArgument`] on the same grounds as
+    /// [`Self::try_into_usage_record`], and when this submission carries no
+    /// reason code, which is what makes it an invalidation at all.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    pub fn try_into_invalidation_record(
+        mut self,
+        origin: RecordOrigin,
+        accepted_at: time::OffsetDateTime,
+        target: Uuid,
+    ) -> Result<UsageRecord, UsageCollectorError> {
+        let Some(reason) = self.invalidation.take() else {
+            return Err(UsageCollectorError::missing_reason_code());
+        };
+        self.project(origin, accepted_at, Some(Invalidation { target, reason }))
+    }
+
+    /// The half both projections share: UTC normalization, the two period
+    /// preconditions, the key rule, and the derivation over the six identity
+    /// inputs.
+    ///
+    /// `invalidation` is the resolved withdrawal, already paired with its
+    /// target, and it decides the sixth input — so the entry type the digest
+    /// reads and the reference the entry carries come from one value and
+    /// cannot disagree. `self.invalidation` is spent by the time this runs
+    /// and is not read here.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    fn project(
+        self,
+        origin: RecordOrigin,
+        accepted_at: time::OffsetDateTime,
+        invalidation: Option<Invalidation>,
     ) -> Result<UsageRecord, UsageCollectorError> {
         // Normalization runs before the preconditions, not after, and that
         // ordering is safe rather than merely convenient: `UtcOffset` holds
@@ -1267,16 +1345,14 @@ impl CreateUsageRecord {
             ));
         }
 
-        let idempotency_key = match (&self.invalidation, self.idempotency_key) {
-            (Some(invalidation), None) => IdempotencyKey::for_invalidation(invalidation.target),
-            (Some(_), Some(_)) => {
-                return Err(UsageCollectorError::idempotency_key_on_invalidation());
-            }
-            (None, Some(key)) if key.as_str().starts_with(INVALIDATION_KEY_PREFIX) => {
-                return Err(UsageCollectorError::reserved_idempotency_key_prefix());
-            }
-            (None, Some(key)) => key,
-            (None, None) => return Err(UsageCollectorError::missing_idempotency_key()),
+        let entry_type = if invalidation.is_some() {
+            EntryType::Invalidation
+        } else {
+            EntryType::Record
+        };
+
+        let Some(idempotency_key) = self.idempotency_key else {
+            return Err(UsageCollectorError::missing_idempotency_key());
         };
 
         let id = crate::id::derive_usage_record_id(
@@ -1285,6 +1361,7 @@ impl CreateUsageRecord {
             &idempotency_key,
             window_start,
             window_end,
+            entry_type,
         );
 
         Ok(UsageRecord {
@@ -1300,7 +1377,7 @@ impl CreateUsageRecord {
             // `clippy::inconsistent_struct_constructor` requires.
             accepted_at,
             origin,
-            invalidation: self.invalidation,
+            invalidation,
             window_start,
             window_end,
         })
@@ -1362,10 +1439,16 @@ fn metadata_is_empty(metadata: &&BTreeMap<MetadataKey, String>) -> bool {
 /// Splits an [`Invalidation`] into the two flat wire properties, or refuses
 /// a half-shape.
 ///
-/// Shared by both entry shapes' shadow structs. The refusal is a plain
-/// message rather than a typed [`UsageCollectorError`]: it can only fire
-/// inside a `Deserialize`, which erases everything but the string, so a
-/// carried reason code would be information the caller never receives.
+/// The persisted shape's shadow alone. The ingestion shape carries the
+/// reason code without a target — `invalidates` is server-assigned, so
+/// `CreateUsageRecordRequest` declares no such property and the ingestion
+/// shadow refuses a submitted one as an unknown field — which leaves it no
+/// half-shape to check for.
+///
+/// The refusal is a plain message rather than a typed
+/// [`UsageCollectorError`]: it can only fire inside a `Deserialize`, which
+/// erases everything but the string, so a carried reason code would be
+/// information the caller never receives.
 fn invalidation_from_wire(
     invalidates: Option<Uuid>,
     reason_code: Option<ReasonCode>,
@@ -1573,8 +1656,13 @@ impl Serialize for UsageRecord {
 /// [`CreateUsageRecord`] from it by struct literal. This shadow is reached
 /// when the SDK type itself is deserialized — an in-process consumer
 /// decoding a submission it stored, queued or received over a transport of
-/// its own. Both paths must agree about the flat pair, and neither can
-/// check the other.
+/// its own. Both paths must agree about the ingestion key set, and neither
+/// can check the other.
+///
+/// It declares no `invalidates`. That field is server-assigned, so
+/// `CreateUsageRecordRequest` does not publish it and a submitted one is
+/// "rejected as an unknown field" — which `deny_unknown_fields` above is
+/// what delivers here.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateUsageRecordWire {
@@ -1589,8 +1677,6 @@ struct CreateUsageRecordWire {
     #[serde(default, deserialize_with = "present_idempotency_key")]
     idempotency_key: Option<IdempotencyKey>,
     #[serde(default)]
-    invalidates: Option<Uuid>,
-    #[serde(default)]
     reason_code: Option<ReasonCode>,
     #[serde(with = "time::serde::rfc3339")]
     window_start: time::OffsetDateTime,
@@ -1599,8 +1685,8 @@ struct CreateUsageRecordWire {
 }
 
 /// Decodes a **present** `idempotency_key`. Absence is `serde(default)`'s
-/// `None`; an explicit `null` is refused, because the published schema types the
-/// property `string` and forbids it outright on an invalidation.
+/// `None`; an explicit `null` is refused, because the published schema types
+/// the property `string` and requires it on both `oneOf` branches.
 fn present_idempotency_key<'de, D>(deserializer: D) -> Result<Option<IdempotencyKey>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1620,7 +1706,6 @@ impl TryFrom<CreateUsageRecordWire> for CreateUsageRecord {
             metadata,
             quantity,
             idempotency_key,
-            invalidates,
             reason_code,
             window_start,
             window_end,
@@ -1633,7 +1718,7 @@ impl TryFrom<CreateUsageRecordWire> for CreateUsageRecord {
             metadata,
             quantity,
             idempotency_key,
-            invalidation: invalidation_from_wire(invalidates, reason_code)?,
+            invalidation: reason_code,
             window_start,
             window_end,
         })
@@ -1654,8 +1739,6 @@ struct CreateUsageRecordWireRef<'a> {
     quantity: UsageQuantity,
     #[serde(skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<&'a IdempotencyKey>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    invalidates: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<&'a ReasonCode>,
     #[serde(with = "time::serde::rfc3339")]
@@ -1689,8 +1772,7 @@ impl Serialize for CreateUsageRecord {
             metadata,
             quantity: *quantity,
             idempotency_key: idempotency_key.as_ref(),
-            invalidates: invalidation.as_ref().map(|i| i.target),
-            reason_code: invalidation.as_ref().map(|i| &i.reason),
+            reason_code: invalidation.as_ref(),
             window_start: *window_start,
             window_end: *window_end,
         }

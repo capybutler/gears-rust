@@ -2,21 +2,23 @@
 //!
 //! The entry `id` is not an independent field: it is a deterministic
 //! projection of the dedup identity
-//! `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
+//! `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)`
 //! (`cpt-cf-usage-collector-adr-record-identity-derivation`). The
 //! Ingestion Gateway derives it at one choke point for every surface, and an
 //! emitter reproduces the same value offline — which is what lets a
 //! correction name its target before submission, with no round-trip.
 //!
-//! The identity and the dedup identity read the same five inputs, so the two
-//! can never disagree about what one entry is. Entry type is deliberately
-//! excluded: the reserved `inv:` key prefix keeps a measurement and an
-//! invalidation apart instead.
+//! The identity and the dedup identity read the same six inputs, so the two
+//! can never disagree about what one entry is. Entry type is the last of
+//! them, and it is the only one that keeps a measurement and its withdrawal
+//! apart: an invalidation repeats its target's idempotency key, so without
+//! it the two would share a dedup identity and the withdrawal would collide
+//! with the entry it withdraws.
 
 use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
-use crate::models::{IdempotencyKey, MeterTypeId};
+use crate::models::{EntryType, IdempotencyKey, MeterTypeId};
 
 /// Fixed namespace for the entry-identity derivation (`UUIDv5`).
 ///
@@ -29,11 +31,15 @@ pub const USAGE_RECORD_ID_NAMESPACE: Uuid =
 /// ASCII unit separator between the dedup-identity fields.
 ///
 /// The concatenation stays injective only while no input carries this byte.
-/// Three inputs cannot carry it by construction: the tenant is a UUID and
-/// both bounds are fixed-width timestamps. The other two are
-/// caller-supplied, and both newtypes reject every ASCII control character
-/// ([`MeterTypeId::new`], [`IdempotencyKey::new`]) — which is what keeps two
-/// distinct dedup identities from concatenating to one pre-image.
+/// Four inputs cannot carry it by construction: the tenant is a UUID, both
+/// bounds are fixed-width timestamps, and the entry type is a closed
+/// enumeration rendering one of two ASCII literals ([`EntryType::as_str`]),
+/// so it has no way to spell a control character at all — a guarantee of
+/// the type rather than of a validation step, and so stronger than the one
+/// the remaining two get. Those two are caller-supplied, and both newtypes
+/// reject every ASCII control character ([`MeterTypeId::new`],
+/// [`IdempotencyKey::new`]) — which is what keeps two distinct dedup
+/// identities from concatenating to one pre-image.
 const FIELD_SEPARATOR: u8 = 0x1F;
 
 /// Renders a covered-period bound in the canonical 27-character form
@@ -101,14 +107,15 @@ pub fn canonical_period_bound(bound: OffsetDateTime) -> String {
     )
 }
 
-/// Derives the entry identity from the 5-tuple dedup identity:
-/// `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_type_id ⟨0x1F⟩ idempotency_key ⟨0x1F⟩ window_start ⟨0x1F⟩ window_end)`.
+/// Derives the entry identity from the 6-tuple dedup identity:
+/// `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_type_id ⟨0x1F⟩ idempotency_key ⟨0x1F⟩ window_start ⟨0x1F⟩ window_end ⟨0x1F⟩ entry_type)`.
 ///
 /// `tenant_id` enters in its lowercase hyphenated 36-character form,
 /// `gts_type_id` and `idempotency_key` byte-exact (terminator `~`
-/// included), and both bounds in the canonical form
-/// [`canonical_period_bound`] renders. `NS` enters as its 16 raw bytes, per
-/// RFC 4122.
+/// included), both bounds in the canonical form
+/// [`canonical_period_bound`] renders, and `entry_type` as its lowercase
+/// ASCII wire literal ([`EntryType::as_str`]), `record` or `invalidation`.
+/// `NS` enters as its 16 raw bytes, per RFC 4122.
 ///
 /// The two bounds enter in start-then-end order, so the digest is not
 /// order-blind: an order-blind one would collapse two legitimate periods
@@ -117,18 +124,19 @@ pub fn canonical_period_bound(bound: OffsetDateTime) -> String {
 /// A point event derives over a zero-length period, where the two bounds
 /// are equal; the derivation needs no separate case for it.
 ///
-/// Entry type is not among the inputs. An invalidation derives over the key
-/// `inv:<target>` ([`IdempotencyKey::for_invalidation`]), so its identifier
-/// is a function of its target, and it departs from the target's only
-/// through that key — a caller can no longer reuse a key across a
-/// record/withdrawal pair, because the key is derived rather than
-/// caller-supplied on an invalidation. Two withdrawals of the same target
-/// over the same covered period still derive the same id, and it is
-/// `invalidates` and `reason_code` compared for full canonical equality
-/// (`cpt-cf-usage-collector-adr-mandatory-idempotency`) that tells an
-/// idempotent retry of one withdrawal apart from a genuine second one,
-/// which is what turns the second case into a loud `IdempotencyConflict`
-/// rather than a silently absorbed duplicate.
+/// Entry type is the last input, and it is what tells a measurement from
+/// its withdrawal. An invalidation copies the tenant, type, idempotency key
+/// and covered period of its target, so the two differ in this input alone
+/// — and the same function over the invalidation's own fields with
+/// `entry_type = record` gives the identifier of the entry it withdraws,
+/// which is how the gateway resolves the target. Two withdrawals of one
+/// target collide on all six inputs, so every invalidation of one entry
+/// derives one identifier. `reason_code` is no input here, which leaves it
+/// the only field full canonical equality
+/// (`cpt-cf-usage-collector-adr-mandatory-idempotency`) can still find
+/// differing between two such withdrawals — and so what turns a genuine
+/// second one into a loud conflict rather than a silently absorbed
+/// duplicate.
 #[must_use]
 pub fn derive_usage_record_id(
     tenant_id: Uuid,
@@ -136,6 +144,7 @@ pub fn derive_usage_record_id(
     idempotency_key: &IdempotencyKey,
     window_start: OffsetDateTime,
     window_end: OffsetDateTime,
+    entry_type: EntryType,
 ) -> Uuid {
     let mut input = Vec::new();
     input.extend_from_slice(tenant_id.to_string().as_bytes());
@@ -147,6 +156,8 @@ pub fn derive_usage_record_id(
     input.extend_from_slice(canonical_period_bound(window_start).as_bytes());
     input.push(FIELD_SEPARATOR);
     input.extend_from_slice(canonical_period_bound(window_end).as_bytes());
+    input.push(FIELD_SEPARATOR);
+    input.extend_from_slice(entry_type.as_str().as_bytes());
     Uuid::new_v5(&USAGE_RECORD_ID_NAMESPACE, &input)
 }
 

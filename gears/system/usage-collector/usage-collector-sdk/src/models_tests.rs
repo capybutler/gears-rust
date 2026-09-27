@@ -62,14 +62,27 @@ fn qty(s: &str) -> crate::UsageQuantity {
     crate::UsageQuantity::parse(s).expect("test quantity")
 }
 
-/// The withdrawal a fixture invalidation carries. Both fixtures take an
-/// `Option<Uuid>` and build the whole [`Invalidation`] from it, because the
-/// type admits no other arrangement: a target without a reason is
-/// unrepresentable in Rust and can only be built as JSON.
+/// The idempotency key both fixtures carry, whichever kind they build.
+/// A withdrawal repeats its target's key (DESIGN §3.1, `IdempotencyKey`),
+/// so the two fixtures agreeing on one value is the contract, not a
+/// shortcut.
+fn sample_key() -> IdempotencyKey {
+    IdempotencyKey::new("k-1").expect("valid idempotency key")
+}
+
+/// The reason code a fixture withdrawal states.
+fn sample_reason() -> ReasonCode {
+    reason_code("emitter_duplicate")
+}
+
+/// The withdrawal a fixture *entry* carries: the target the gateway
+/// resolved, paired with the reason. The persisted shape is the only one
+/// that holds a target — a submission carries the reason alone, because
+/// `invalidates` is server-assigned.
 fn sample_invalidation(target: Uuid) -> Invalidation {
     Invalidation {
         target,
-        reason: reason_code("emitter_duplicate"),
+        reason: sample_reason(),
     }
 }
 
@@ -82,10 +95,7 @@ fn sample_usage_record(subject_ref: Option<SubjectRef>, invalidates: Option<Uuid
         subject_ref,
         metadata: metadata_map([("region", "eu"), ("tier", "gold")]),
         quantity: qty("42"),
-        idempotency_key: match invalidates {
-            Some(t) => IdempotencyKey::for_invalidation(t),
-            None => IdempotencyKey::new("k-1").expect("valid idempotency key"),
-        },
+        idempotency_key: sample_key(),
         accepted_at: SAMPLE_ACCEPTED_AT,
         // `live` by default: no test that builds a record by hand has the
         // admitting path as its subject. The ones that do go through
@@ -100,7 +110,7 @@ fn sample_usage_record(subject_ref: Option<SubjectRef>, invalidates: Option<Uuid
 
 fn sample_create_usage_record(
     subject_ref: Option<SubjectRef>,
-    invalidates: Option<Uuid>,
+    invalidation: Option<ReasonCode>,
 ) -> CreateUsageRecord {
     CreateUsageRecord {
         gts_type_id: sample_meter_id(),
@@ -109,10 +119,8 @@ fn sample_create_usage_record(
         subject_ref,
         metadata: metadata_map([("region", "eu"), ("tier", "gold")]),
         quantity: qty("42"),
-        idempotency_key: invalidates
-            .is_none()
-            .then(|| IdempotencyKey::new("k-1").expect("valid idempotency key")),
-        invalidation: invalidates.map(sample_invalidation),
+        idempotency_key: Some(sample_key()),
+        invalidation,
         window_start: SAMPLE_WINDOW_START,
         window_end: SAMPLE_WINDOW_END,
     }
@@ -123,18 +131,20 @@ fn sample_create_usage_record(
 // identity stamp on create
 // ---------------------------------------------------------------------------
 
-// `try_into_usage_record` is the single point where a submission acquires its
-// identity: it validates the submission's own shape and covered period,
+// The two projections are the single point where a submission acquires its
+// identity: each validates the submission's own shape and covered period,
 // stamps the deterministic derived `id`, and forwards every caller-supplied
-// field verbatim — the invalidation reference and its reason included.
+// field verbatim. On a withdrawal the target is the one field that is not
+// forwarded — it is server-assigned, so the projection takes it as an
+// argument and stamps it beside the caller's reason.
 #[test]
-fn try_into_usage_record_stamps_the_derived_id_and_forwards_every_field() {
+fn try_into_invalidation_record_stamps_the_derived_id_and_forwards_every_field() {
     let subject = SubjectRef::new("sub-1", Some("user".to_owned())).expect("valid subject ref");
-    let input = sample_create_usage_record(Some(subject), Some(target_id()));
+    let input = sample_create_usage_record(Some(subject), Some(sample_reason()));
 
     let record = input
         .clone()
-        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
         .expect("the fixture period is valid");
 
     // Every caller-supplied field is forwarded verbatim.
@@ -144,15 +154,48 @@ fn try_into_usage_record_stamps_the_derived_id_and_forwards_every_field() {
     assert_eq!(record.subject_ref, input.subject_ref);
     assert_eq!(record.metadata, input.metadata);
     assert_eq!(record.quantity, input.quantity);
-    // The one field that is not forwarded: an invalidation carries no
-    // caller key, so its stored key is derived rather than copied.
+    // The key is forwarded too, on a withdrawal as on a measurement: it is
+    // caller-supplied on both, and a withdrawal repeats its target's.
+    assert_eq!(record.idempotency_key, sample_key());
     assert_eq!(
-        record.idempotency_key,
-        IdempotencyKey::for_invalidation(target_id())
+        record.invalidation,
+        Some(Invalidation {
+            target: target_id(),
+            reason: sample_reason(),
+        }),
+        "the reason is the caller's and the target is the one the gateway handed in",
     );
-    assert_eq!(record.invalidation, input.invalidation);
     assert_eq!(record.window_start, input.window_start);
     assert_eq!(record.window_end, input.window_end);
+}
+
+/// The measurement projection refuses a submission carrying a reason code
+/// rather than dropping it.
+///
+/// Dropping it would admit a withdrawal as an ordinary record — derived
+/// under `entry_type = record` and so colliding with the very entry it
+/// meant to withdraw. The target is server-assigned, so this projection has
+/// no way to resolve one and
+/// [`CreateUsageRecord::try_into_invalidation_record`] is the one that
+/// takes it.
+#[test]
+fn try_into_usage_record_refuses_a_submission_that_states_a_reason() {
+    let err = sample_create_usage_record(None, Some(sample_reason()))
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("a reason code makes this an invalidation, not a measurement");
+    assert_eq!(field_of(&err), "reason_code");
+    assert_eq!(reason_of(&err), &ValidationReason::Validation);
+}
+
+/// And the withdrawal projection refuses one carrying none: the reason code
+/// is what makes a submission an invalidation at all.
+#[test]
+fn try_into_invalidation_record_refuses_a_submission_with_no_reason() {
+    let err = sample_create_usage_record(None, None)
+        .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
+        .expect_err("a withdrawal states a reason");
+    assert_eq!(field_of(&err), "reason_code");
+    assert_eq!(reason_of(&err), &ValidationReason::Validation);
 }
 
 #[test]
@@ -174,7 +217,7 @@ fn a_submission_carrying_accepted_at_is_refused() {
 }
 
 #[test]
-fn try_into_usage_record_derives_the_id_over_the_five_tuple() {
+fn try_into_usage_record_derives_the_id_over_the_six_tuple() {
     let submission = sample_create_usage_record(None, None);
     let expected = crate::id::derive_usage_record_id(
         submission.tenant_id,
@@ -185,6 +228,7 @@ fn try_into_usage_record_derives_the_id_over_the_five_tuple() {
             .expect("fixture record carries a key"),
         submission.window_start,
         submission.window_end,
+        EntryType::Record,
     );
     let record = submission
         .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
@@ -192,9 +236,73 @@ fn try_into_usage_record_derives_the_id_over_the_five_tuple() {
     assert_eq!(record.id, expected);
 }
 
+#[test]
+fn try_into_invalidation_record_derives_the_id_with_the_invalidation_entry_type() {
+    let submission = sample_create_usage_record(None, Some(sample_reason()));
+    let expected = crate::id::derive_usage_record_id(
+        submission.tenant_id,
+        &submission.gts_type_id,
+        submission
+            .idempotency_key
+            .as_ref()
+            .expect("a withdrawal repeats its target's key"),
+        submission.window_start,
+        submission.window_end,
+        EntryType::Invalidation,
+    );
+    let record = submission
+        .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
+        .expect("the fixture period is valid");
+    assert_eq!(record.id, expected);
+    assert_eq!(record.entry_type(), EntryType::Invalidation);
+}
+
+/// The target the gateway has to resolve is this submission's own identity
+/// inputs read with `entry_type = record`.
+///
+/// DESIGN §3.1, Target resolution. The withdrawal fixture repeats the
+/// measurement fixture's tenant, type, key and period, so re-deriving over
+/// them as a `record` must name the measurement itself — and the withdrawal
+/// must land on a different identifier than the entry it withdraws.
+#[test]
+fn a_withdrawal_resolves_its_target_from_its_own_inputs() {
+    let measurement = sample_create_usage_record(None, None)
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect("the fixture period is valid");
+
+    let withdrawal_submission = sample_create_usage_record(None, Some(sample_reason()));
+    let resolved_target = crate::derive_usage_record_id(
+        withdrawal_submission.tenant_id,
+        &withdrawal_submission.gts_type_id,
+        withdrawal_submission
+            .idempotency_key
+            .as_ref()
+            .expect("a withdrawal repeats its target's key"),
+        withdrawal_submission.window_start,
+        withdrawal_submission.window_end,
+        EntryType::Record,
+    );
+    assert_eq!(
+        resolved_target, measurement.id,
+        "re-deriving a withdrawal's own inputs as a `record` must name the entry it withdraws",
+    );
+
+    let withdrawal = withdrawal_submission
+        .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, resolved_target)
+        .expect("the fixture period is valid");
+    assert_ne!(
+        withdrawal.id, measurement.id,
+        "the entry type is the only input the two differ in, and it must move the identity",
+    );
+    assert_eq!(
+        withdrawal.invalidation.as_ref().map(|i| i.target),
+        Some(measurement.id),
+    );
+}
+
 // A submission whose dedup identity matches an existing `UsageRecord`
 // projects to the SAME `id` that record carries — the derivation is a pure
-// function of the 5-tuple, so the create input and the persisted shape agree
+// function of the 6-tuple, so the create input and the persisted shape agree
 // on identity without the caller ever supplying it.
 #[test]
 fn try_into_usage_record_id_matches_full_record_with_same_dedup_identity() {
@@ -209,6 +317,7 @@ fn try_into_usage_record_id_matches_full_record_with_same_dedup_identity() {
     );
     assert_eq!(input.window_start, persisted.window_start);
     assert_eq!(input.window_end, persisted.window_end);
+    assert_eq!(input.entry_type(), persisted.entry_type());
 
     assert_eq!(
         input
@@ -221,6 +330,7 @@ fn try_into_usage_record_id_matches_full_record_with_same_dedup_identity() {
             &persisted.idempotency_key,
             persisted.window_start,
             persisted.window_end,
+            persisted.entry_type(),
         ),
         "the create-input identity must equal the derivation of the same dedup identity",
     );
@@ -640,15 +750,15 @@ fn entry_type_serde_agrees_with_as_str_on_both_variants() {
 }
 
 #[test]
-fn a_half_shape_body_is_refused_on_deserialize() {
-    // In Rust the pairing is a property of the type: `Invalidation` holds
-    // both halves, so neither a submission nor an entry can carry one
-    // without the other and there is nothing left for the projection to
+fn a_half_shape_entry_body_is_refused_on_deserialize() {
+    // On the *persisted* shape the pairing is a property of the type:
+    // `Invalidation` holds both halves, so an entry cannot carry one
+    // without the other and there is nothing left for a projection to
     // check. A JSON body is the one place the two can still arrive apart —
     // the wire keeps them flat, per the contract — so the deserialization
-    // shadow is where the rule now lives. Each direction is checked
-    // separately: dropping either key must be refused, and one arm covers
-    // the other's shape in neither direction.
+    // shadow is where the rule lives. Each direction is checked separately:
+    // dropping either key must be refused, and one arm covers the other's
+    // shape in neither direction.
     for (present, missing) in [
         ("invalidates", "reason_code"),
         ("reason_code", "invalidates"),
@@ -667,26 +777,35 @@ fn a_half_shape_body_is_refused_on_deserialize() {
             err.to_string().contains(missing),
             "the refusal must name the missing `{missing}`; got {err}",
         );
-
-        let full = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
-            .expect("serialize");
-        let mut half = full.as_object().expect("object").clone();
-        half.remove(missing).expect("the pair serializes flat");
-        let err = serde_json::from_value::<CreateUsageRecord>(serde_json::Value::Object(half))
-            .expect_err("a half-shape submission body must be refused");
-        assert!(
-            err.to_string().contains(missing),
-            "the refusal must name the missing `{missing}`; got {err}",
-        );
     }
+}
 
-    // Both halves present, and neither present, both decode.
-    sample_create_usage_record(None, None)
-        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
-        .expect("an ordinary record");
-    sample_create_usage_record(None, Some(target_id()))
-        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
-        .expect("an invalidation");
+#[test]
+fn a_submission_naming_its_own_target_is_refused_as_an_unknown_field() {
+    // The ingestion shape has no half-shape to refuse, because it carries
+    // no target at all: `invalidates` is server-assigned, so
+    // `CreateUsageRecordRequest` publishes no such property and a submitted
+    // one "is rejected as an unknown field". A caller that could name its
+    // own target could withdraw a record it never measured.
+    let withdrawal = serde_json::to_value(sample_create_usage_record(None, Some(sample_reason())))
+        .expect("serialize");
+
+    let mut tampered = withdrawal.clone();
+    tampered
+        .as_object_mut()
+        .expect("object")
+        .insert("invalidates".to_owned(), json!(target_id().to_string()));
+    serde_json::from_value::<CreateUsageRecord>(tampered)
+        .expect_err("invalidates is server-assigned and must be refused on the create shape");
+
+    // A reason code alone is the whole withdrawal on the ingestion shape,
+    // and it decodes.
+    assert_eq!(
+        serde_json::from_value::<CreateUsageRecord>(withdrawal)
+            .expect("a submission carrying only a reason code is a well-formed invalidation")
+            .invalidation,
+        Some(sample_reason()),
+    );
 }
 
 #[test]
@@ -711,6 +830,9 @@ fn both_entry_shapes_round_trip_through_their_own_codecs() {
     // default path.
     let subject = SubjectRef::new("principal-1", Some("user")).expect("valid subject ref");
     for invalidates in [None, Some(target_id())] {
+        // The submission half of the same pair: an entry carrying a target
+        // is the projection of a submission carrying the reason alone.
+        let stated_reason = invalidates.map(|_| sample_reason());
         for subject_ref in [None, Some(subject.clone())] {
             for metadata in [metadata_map([("region", "eu")]), BTreeMap::new()] {
                 let mut record = sample_usage_record(subject_ref.clone(), invalidates);
@@ -723,7 +845,8 @@ fn both_entry_shapes_round_trip_through_their_own_codecs() {
                     "UsageRecord round-trip must be lossless; encoded as {encoded}",
                 );
 
-                let mut submission = sample_create_usage_record(subject_ref.clone(), invalidates);
+                let mut submission =
+                    sample_create_usage_record(subject_ref.clone(), stated_reason.clone());
                 submission.metadata = metadata;
                 let encoded =
                     serde_json::to_value(&submission).expect("serialize CreateUsageRecord");
@@ -758,12 +881,16 @@ fn the_withdrawal_pair_stays_flat_on_the_wire() {
         "the Rust grouping must not reach the wire; got {object:?}",
     );
 
-    let submission = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
+    let submission = serde_json::to_value(sample_create_usage_record(None, Some(sample_reason())))
         .expect("serialize an invalidating submission");
     let object = submission.as_object().expect("object");
     assert!(
-        object.contains_key("invalidates") && object.contains_key("reason_code"),
-        "the ingestion shape must carry the same two flat siblings; got {object:?}",
+        object.contains_key("reason_code"),
+        "the ingestion shape carries the reason code flat; got {object:?}",
+    );
+    assert!(
+        !object.contains_key("invalidates"),
+        "the ingestion shape carries no target: `invalidates` is server-assigned; got {object:?}",
     );
     assert!(!object.contains_key("invalidation"));
 
@@ -818,7 +945,7 @@ fn each_entry_shape_serializes_the_exact_wire_key_set() {
         "the entry shape's wire key set is the contract; got {record}",
     );
 
-    let submission = serde_json::to_value(sample_create_usage_record(None, Some(target_id())))
+    let submission = serde_json::to_value(sample_create_usage_record(None, Some(sample_reason())))
         .expect("serialize a submission");
     let mut keys: Vec<&str> = submission
         .as_object()
@@ -831,7 +958,7 @@ fn each_entry_shape_serializes_the_exact_wire_key_set() {
         keys,
         [
             "gts_type_id",
-            "invalidates",
+            "idempotency_key",
             "metadata",
             "quantity",
             "reason_code",
@@ -840,9 +967,9 @@ fn each_entry_shape_serializes_the_exact_wire_key_set() {
             "window_end",
             "window_start",
         ],
-        "the ingestion shape is the entry shape minus the two the server \
-         assigns, `id` and `origin` - and, on an invalidation, minus \
-         `idempotency_key`: its key is derived, not carried; got {submission}",
+        "the ingestion shape is the entry shape minus the four the server \
+         assigns - `id`, `accepted_at`, `origin` and `invalidates`; the key \
+         stays, because a withdrawal repeats its target's; got {submission}",
     );
 
     // The quantity is a JSON *string*, never a JSON number, on both shapes.
@@ -885,14 +1012,13 @@ fn each_entry_shape_serializes_the_exact_wire_key_set() {
 
 #[test]
 fn the_idempotency_key_is_what_moves_the_derived_identity() {
-    // `cpt-cf-usage-collector-adr-record-identity-derivation` excludes the
-    // entry type directly; what an invalidation's reference does is change
-    // which key the five dedup-identity inputs read — derived as
-    // `inv:<target>` rather than caller-supplied
-    // (`an_invalidation_is_stored_under_its_derived_key` and
-    // `id_tests::an_invalidation_differs_from_its_target_only_through_the_key`
-    // pin that side). This test pins the record side: two ordinary records
-    // differing only in their key derive different ids.
+    // The key is one of the six dedup-identity inputs, and the only
+    // caller-supplied one a measurement can vary while holding its
+    // attribution and period fixed. Two ordinary records differing only in
+    // their key must therefore derive different ids. (The entry type, the
+    // sixth input, is pinned by
+    // `a_withdrawal_resolves_its_target_from_its_own_inputs` and
+    // `id_tests::a_record_and_its_invalidation_derive_two_ids_from_one_key`.)
     let target = sample_create_usage_record(None, None);
 
     let mut rekeyed = target.clone();
@@ -1369,93 +1495,82 @@ fn reason_of(err: &UsageCollectorError) -> &ValidationReason {
 }
 
 #[test]
-fn a_caller_key_may_not_use_the_reserved_invalidation_prefix() {
-    let err = IdempotencyKey::new("inv:anything").expect_err("reserved prefix");
-    assert_eq!(field_of(&err), "idempotency_key");
-    assert_eq!(reason_of(&err), &ValidationReason::ReservedKeyPrefix);
-    IdempotencyKey::new("INV:upper-is-not-reserved").expect("the prefix is case-sensitive");
-    serde_json::from_value::<IdempotencyKey>(json!("inv:x"))
-        .expect_err("deserialize routes through new");
-}
-
-#[test]
-fn a_stored_key_may_carry_the_prefix_and_is_otherwise_validated() {
-    let stored = IdempotencyKey::from_stored("inv:33333333-3333-3333-3333-333333333333")
-        .expect("stored invalidation key");
-    assert_eq!(stored.as_str(), "inv:33333333-3333-3333-3333-333333333333");
-    IdempotencyKey::from_stored("").expect_err("still non-empty");
-    IdempotencyKey::from_stored("a\u{1f}b").expect_err("still control-character free");
-}
-
-#[test]
-fn an_invalidation_key_is_the_prefix_and_the_lowercase_hyphenated_target() {
-    let target = Uuid::parse_str("ABCDEF01-2345-6789-ABCD-EF0123456789").unwrap();
+fn no_key_prefix_is_reserved() {
+    // The `inv:` prefix went with the derived invalidation key
+    // (`cpt-cf-usage-collector-adr-record-identity-derivation`: an
+    // invalidation repeats its target's caller-supplied key). Nothing
+    // reserves any part of the key space now, so a key that happens to
+    // begin `inv:` is an ordinary key on every constructor and on the
+    // `Deserialize` that routes through `new`.
     assert_eq!(
-        IdempotencyKey::for_invalidation(target).as_str(),
-        "inv:abcdef01-2345-6789-abcd-ef0123456789",
+        IdempotencyKey::new("inv:anything")
+            .expect("no prefix is reserved")
+            .as_str(),
+        "inv:anything",
+    );
+    assert_eq!(
+        serde_json::from_value::<IdempotencyKey>(json!("inv:x"))
+            .expect("deserialize routes through new, which reserves nothing")
+            .as_str(),
+        "inv:x",
     );
 }
 
 #[test]
-fn a_record_without_a_key_is_refused_at_projection() {
-    let mut s = sample_create_usage_record(None, None);
-    s.idempotency_key = None;
-    let err = s
+fn from_stored_applies_exactly_the_checks_new_does() {
+    // The two diverged only over the reserved prefix, and `from_stored`
+    // now delegates to `new`. What it still carries is intent: it names a
+    // rehydration rather than an admission.
+    assert_eq!(
+        IdempotencyKey::from_stored("k-1")
+            .expect("a stored key")
+            .as_str(),
+        "k-1",
+    );
+    IdempotencyKey::from_stored("").expect_err("still non-empty");
+    IdempotencyKey::from_stored("a\u{1f}b").expect_err("still control-character free");
+    IdempotencyKey::from_stored("x".repeat(257)).expect_err("still capped at 256 characters");
+}
+
+#[test]
+fn an_entry_without_a_key_is_refused_at_projection() {
+    // Both kinds carry a key, so both projections refuse a submission
+    // missing one.
+    let mut measurement = sample_create_usage_record(None, None);
+    measurement.idempotency_key = None;
+    let err = measurement
         .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("missing key");
+    assert_eq!(field_of(&err), "idempotency_key");
+    assert_eq!(reason_of(&err), &ValidationReason::Validation);
+
+    let mut withdrawal = sample_create_usage_record(None, Some(sample_reason()));
+    withdrawal.idempotency_key = None;
+    let err = withdrawal
+        .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
         .expect_err("missing key");
     assert_eq!(field_of(&err), "idempotency_key");
     assert_eq!(reason_of(&err), &ValidationReason::Validation);
 }
 
 #[test]
-fn an_invalidation_carrying_a_key_is_refused_at_projection() {
-    let mut s = sample_create_usage_record(None, Some(target_id()));
-    s.idempotency_key = Some(IdempotencyKey::new("caller-key").unwrap());
-    let err = s
-        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
-        .expect_err("key on invalidation");
-    assert_eq!(field_of(&err), "idempotency_key");
-    assert_eq!(reason_of(&err), &ValidationReason::KeyOnInvalidation);
-}
-
-#[test]
-fn a_record_key_built_with_from_stored_and_the_reserved_prefix_is_refused_at_projection() {
-    // `IdempotencyKey::new` already refuses the `inv:` prefix, so an
-    // in-process caller cannot reach this case through it. `from_stored` is
-    // `pub` and skips that rule to rehydrate a stored invalidation key — an
-    // in-process caller (not REST, which only ever reaches `new`) could
-    // otherwise use it to plant an ordinary record on the dedup slot a
-    // future invalidation of `target` would derive, blocking that
-    // correction forever. The projection must catch it independently of
-    // which constructor produced the key.
-    let mut s = sample_create_usage_record(None, None);
-    let reserved = IdempotencyKey::from_stored(format!("inv:{}", target_id()))
-        .expect("from_stored accepts the reserved prefix");
-    s.idempotency_key = Some(reserved);
-    let err = s
-        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
-        .expect_err("reserved prefix on a record");
-    assert_eq!(field_of(&err), "idempotency_key");
-    assert_eq!(reason_of(&err), &ValidationReason::ReservedKeyPrefix);
-}
-
-#[test]
-fn an_invalidation_is_stored_under_its_derived_key() {
-    let record = sample_create_usage_record(None, Some(target_id()))
-        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+fn an_invalidation_is_stored_under_the_key_it_was_submitted_with() {
+    // The whole of DESIGN §3.1's Target resolution rests on this: the key
+    // reaches the store unchanged, so the identity the gateway derived for
+    // the target is reproducible from the entry that withdrew it.
+    let record = sample_create_usage_record(None, Some(sample_reason()))
+        .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
         .expect("projects");
-    assert_eq!(
-        record.idempotency_key,
-        IdempotencyKey::for_invalidation(target_id())
-    );
+    assert_eq!(record.idempotency_key, sample_key());
     assert_eq!(
         record.id,
         crate::derive_usage_record_id(
             record.tenant_id,
             &record.gts_type_id,
-            &IdempotencyKey::for_invalidation(target_id()),
+            &sample_key(),
             record.window_start,
             record.window_end,
+            EntryType::Invalidation,
         ),
     );
 }
@@ -2221,9 +2336,9 @@ fn the_projection_stamps_the_origin_it_is_handed() {
 
 #[test]
 fn origin_is_not_an_input_to_the_derived_identity() {
-    // The dedup identity is the 5-tuple
-    // (tenant, gts_type, key, window_start, window_end) and `origin` is not
-    // one of its five members
+    // The dedup identity is the 6-tuple
+    // (tenant, gts_type, key, window_start, window_end, entry_type) and
+    // `origin` is not one of its six members
     // (`cpt-cf-usage-collector-adr-record-identity-derivation`). This is
     // load-bearing rather than incidental: re-importing history that was
     // once emitted live has to collide with the entry it re-creates so the
@@ -2509,25 +2624,37 @@ mod explicit_null_idempotency_key {
     }
 
     #[test]
-    fn an_explicit_null_key_is_refused_on_an_invalidation() {
+    fn an_explicit_null_key_is_refused_on_an_invalidation_too() {
         let refused = serde_json::from_value::<CreateUsageRecord>(body(&serde_json::json!({
             "idempotency_key": null,
-            "invalidates": "00000000-0000-4000-8000-0000000000aa",
             "reason_code": "emitter_defect",
         })));
         assert!(
             refused.is_err(),
-            "the property is forbidden on an invalidation: {refused:?}"
+            "the schema types the property `string` on both branches: {refused:?}"
         );
     }
 
     #[test]
-    fn an_absent_key_on_an_invalidation_still_decodes() {
+    fn an_invalidation_carries_its_targets_key() {
+        // The key is required on both `oneOf` branches of
+        // `CreateUsageRecordRequest`, and a withdrawal repeats its target's
+        // — which is how the gateway finds the target. Absence decodes to
+        // `None` here and is refused at the projection, not in the codec,
+        // so the diagnostic is a typed field violation rather than a serde
+        // string.
         let decoded = serde_json::from_value::<CreateUsageRecord>(body(&serde_json::json!({
-            "invalidates": "00000000-0000-4000-8000-0000000000aa",
+            "idempotency_key": "k-1",
             "reason_code": "emitter_defect",
         })))
-        .expect("an invalidation carries no key");
-        assert!(decoded.idempotency_key.is_none());
+        .expect("a withdrawal carrying its target's key decodes");
+        assert_eq!(
+            decoded
+                .idempotency_key
+                .as_ref()
+                .map(crate::models::IdempotencyKey::as_str),
+            Some("k-1"),
+        );
+        assert_eq!(decoded.entry_type(), crate::models::EntryType::Invalidation);
     }
 }

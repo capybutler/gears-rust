@@ -42,7 +42,6 @@ fn validation_reason_round_trips_each_constant() {
         (PAST_WINDOW, ValidationReason::PastWindow),
         (QUANTITY_OUT_OF_RANGE, ValidationReason::QuantityOutOfRange),
         (RESERVED_KEY_PREFIX, ValidationReason::ReservedKeyPrefix),
-        (KEY_ON_INVALIDATION, ValidationReason::KeyOnInvalidation),
     ] {
         assert_eq!(ValidationReason::from_wire(wire), expected);
         assert_eq!(expected.as_wire(), wire);
@@ -109,6 +108,26 @@ fn the_upstream_cursor_reasons_no_longer_model_themselves() {
     }
 }
 
+/// The key-rule reason no longer models itself.
+///
+/// `KEY_ON_INVALIDATION` named the refusal of a caller key on an
+/// invalidation, which only made sense while the gateway derived that key
+/// itself. `cpt-cf-usage-collector-adr-record-identity-derivation` makes an
+/// invalidation repeat its target's caller-supplied key, so the rule and its
+/// reason are gone. Because `ValidationReason` is `#[non_exhaustive]`,
+/// removing a variant is silent for a downstream matcher: it falls through
+/// rather than failing to build. Pin that the fall-through happens *and*
+/// that it preserves the raw string.
+#[test]
+fn the_retired_key_rule_reason_no_longer_models_itself() {
+    let wire = "KEY_ON_INVALIDATION";
+    assert_eq!(
+        ValidationReason::from_wire(wire),
+        ValidationReason::Unknown(wire.to_owned()),
+    );
+    assert_eq!(ValidationReason::from_wire(wire).as_wire(), wire);
+}
+
 #[test]
 fn reasons_preserve_unknown_wire_string() {
     assert_eq!(
@@ -159,7 +178,6 @@ fn every_wire_constant_spells_its_own_identifier() {
         PAST_WINDOW,
         QUANTITY_OUT_OF_RANGE,
         RESERVED_KEY_PREFIX,
-        KEY_ON_INVALIDATION,
         CURSOR_BEYOND_RETENTION,
         IDEMPOTENCY_CONFLICT,
         ALREADY_INVALIDATED,
