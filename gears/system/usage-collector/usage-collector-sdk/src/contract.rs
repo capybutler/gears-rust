@@ -42,30 +42,30 @@
 //! previous one left; the fixtures are keyed so that a repeated run
 //! resubmits identical entries rather than colliding with different ones.
 //!
-//! # Five of seven, and where the other two are
+//! # Five of sixteen, and where the other eleven are
 //!
-//! DESIGN §3.3 tabulates seven checks. [`run_all`] currently runs the ones
-//! in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
-//! statement about the rest**. The other two are named, not omitted:
+//! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
+//! five in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
+//! statement about the rest**. The other eleven are named, not omitted:
 //!
-//! * [`BLOCKED_CHECKS`] — cannot be written against the SPI this gear
-//!   declares, each with what unblocks it.
-//! * [`UNWRITTEN_CHECKS`] — writable today, not yet written. Now empty:
-//!   every check the current SPI can express is written.
+//! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
+//!   gear's SPI declares, not yet written. All eleven.
+//! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
+//!   it. Now empty: no check DESIGN tabulates is beyond the current trait.
 //!
-//! The three constants are asserted to partition DESIGN's seven exactly, so
-//! the split is a fact the test suite keeps rather than a paragraph that
-//! drifts: [`UNWRITTEN_CHECKS`] emptied itself as the work landed, and a
-//! check that half-lands fails the partition. A caller reporting coverage
+//! The three constants are asserted to partition DESIGN's sixteen exactly,
+//! so the split is a fact the test suite keeps rather than a paragraph that
+//! drifts: a check that half-lands fails the partition, and a check that
+//! stops being accounted for fails it too. A caller reporting coverage
 //! should report all three alongside the violations — which matters
 //! because "run this suite" is the acceptance criterion for porting a
-//! backend, and a suite that runs five checks must not read as a suite
-//! that ran seven.
+//! backend, and a suite that runs six checks must not read as a suite
+//! that ran sixteen.
 //!
 //! # A check DESIGN does not tabulate
 //!
 //! [`run_all`] also runs [`SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH`], which is
-//! **not** one of DESIGN §3.3's seven names. Do not look for it there and
+//! **not** one of DESIGN §3.3's sixteen names. Do not look for it there and
 //! do not read its absence as drift in either direction: DESIGN states the
 //! obligation without tabulating a check for it — §3.3 requires a plugin's
 //! `get_usage_record` to withhold a row outside the compiled scope and
@@ -73,17 +73,19 @@
 //! Query Gateway compose the PDP constraints into the collection paths'
 //! filters *"so the result can only narrow"*. Since the point lookup's
 //! in-process per-record attribution check was retired, that guarantee is
-//! the plugin's alone on all three read paths, and a suite that never
-//! stores a row outside the scope it dispatches cannot see it kept or
-//! broken.
+//! the plugin's alone on every one of the SPI's five read paths, and a
+//! suite that never stores a row outside the scope it dispatches cannot
+//! see it kept or broken. The check covers three of the five — see
+//! [`SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH`] for which two it leaves to the
+//! SPI's docs alone.
 //!
 //! It is named in [`ADDITIONAL_CHECKS`] rather than in
-//! [`IMPLEMENTED_CHECKS`], so the three-way partition over DESIGN's seven
-//! keeps meaning exactly what it meant, and a fourth assertion holds this
-//! constant disjoint from all three — a DESIGN check cannot be smuggled in
-//! here to escape the partition. A caller reporting coverage should report
-//! it alongside them: [`IMPLEMENTED_CHECKS`] alone under-reports what
-//! [`run_all`] ran.
+//! [`IMPLEMENTED_CHECKS`], so the three-way partition over DESIGN's
+//! sixteen keeps meaning exactly what it meant, and a fourth assertion
+//! holds this constant disjoint from all three — a DESIGN check cannot be
+//! smuggled in here to escape the partition. A caller reporting coverage
+//! should report it alongside them: [`IMPLEMENTED_CHECKS`] alone
+//! under-reports what [`run_all`] ran.
 //!
 //! # The reference backend
 //!
@@ -144,7 +146,8 @@ pub enum DedupLevel {
 
 /// The DESIGN §3.3 `quantity-round-trip` check, spelled as the table spells
 /// it. Exported so a caller can tell this suite's own check names apart
-/// from the [`BLOCKED_CHECKS`] entries without matching a string literal.
+/// from the [`UNWRITTEN_CHECKS`] and [`BLOCKED_CHECKS`] entries without
+/// matching a string literal.
 pub const QUANTITY_ROUND_TRIP: &str = "quantity-round-trip";
 
 /// The DESIGN §3.3 `window-end-selection` check, spelled as the table
@@ -163,12 +166,58 @@ pub const INVALIDATION_EXCLUDED_FROM_FOLD: &str = "invalidation-excluded-from-fo
 /// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
 pub const AT_MOST_ONE_INVALIDATION: &str = "at-most-one-invalidation";
 
+/// The DESIGN §3.3 `record-and-invalidation-distinct-identity` check,
+/// spelled as the table spells it. Exported for the same reason as
+/// [`QUANTITY_ROUND_TRIP`].
+pub const RECORD_AND_INVALIDATION_DISTINCT_IDENTITY: &str =
+    "record-and-invalidation-distinct-identity";
+
+/// The DESIGN §3.3 `converged-target-lookup` check, spelled as the table
+/// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const CONVERGED_TARGET_LOOKUP: &str = "converged-target-lookup";
+
+/// The DESIGN §3.3 `dedup-floor` check, spelled as the table spells it.
+/// Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const DEDUP_FLOOR: &str = "dedup-floor";
+
+/// The DESIGN §3.3 `dedup-concurrent` check, spelled as the table spells
+/// it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const DEDUP_CONCURRENT: &str = "dedup-concurrent";
+
+/// The DESIGN §3.3 `server-field-round-trip` check, spelled as the table
+/// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const SERVER_FIELD_ROUND_TRIP: &str = "server-field-round-trip";
+
+/// The DESIGN §3.3 `feed-snapshot-and-replay` check, spelled as the table
+/// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const FEED_SNAPSHOT_AND_REPLAY: &str = "feed-snapshot-and-replay";
+
+/// The DESIGN §3.3 `feed-completeness` check, spelled as the table spells
+/// it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const FEED_COMPLETENESS: &str = "feed-completeness";
+
+/// The DESIGN §3.3 `feed-bootstrap-position` check, spelled as the table
+/// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const FEED_BOOTSTRAP_POSITION: &str = "feed-bootstrap-position";
+
+/// The DESIGN §3.3 `feed-retention-refusal` check, spelled as the table
+/// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const FEED_RETENTION_REFUSAL: &str = "feed-retention-refusal";
+
+/// The DESIGN §3.3 `feed-position-bounded` check, spelled as the table
+/// spells it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const FEED_POSITION_BOUNDED: &str = "feed-position-bounded";
+
+/// The DESIGN §3.3 `latest-tie-break` check, spelled as the table spells
+/// it. Exported for the same reason as [`QUANTITY_ROUND_TRIP`].
+pub const LATEST_TIE_BREAK: &str = "latest-tie-break";
+
 /// The `scope-is-a-filter-on-every-read-path` check, which DESIGN §3.3 does
 /// **not** tabulate.
 ///
 /// Spelled in DESIGN's own style so a report reads uniformly, and named in
 /// [`ADDITIONAL_CHECKS`] rather than [`IMPLEMENTED_CHECKS`] so the
-/// three-way partition over DESIGN's seven stays exact.
+/// three-way partition over DESIGN's sixteen stays exact.
 ///
 /// DESIGN states the obligation without giving it a row in the table: §3.3
 /// gives the SPI's `get_usage_record` the doc *"`scope` is the compiled PDP
@@ -179,6 +228,19 @@ pub const AT_MOST_ONE_INVALIDATION: &str = "at-most-one-invalidation";
 /// path carries the scope as a filter and nothing above the SPI re-checks
 /// the rows a plugin answers with, so the whole of "exists but not yours
 /// reads as `NotFound`" is the plugin's to keep.
+///
+/// **The name overstates what the check reaches, and deliberately: it
+/// names the obligation rather than the coverage.** The SPI has five read
+/// paths and the obligation is on all five. [`run_all`] dispatches this
+/// check against three of them — the point lookup, the list path and the
+/// fold — which are the three that take the compiled scope inside
+/// `query.filter` or as `get_usage_record`'s `scope`. The feed page and
+/// the reconciliation read take a separate `scope: &ast::Expr` and are
+/// covered by no check here: their obligation is stated in their SPI docs
+/// (an entry outside the scope is absent from a feed page; a tenant the
+/// scope excludes answers exactly as one holding no entries) and asserted
+/// nowhere in this suite. A porter reading a green run should not read it
+/// as those two paths being exercised.
 pub const SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH: &str = "scope-is-a-filter-on-every-read-path";
 
 /// The [`ContractViolation::check`] value a violation carries when the
@@ -194,9 +256,9 @@ pub const HARNESS_FAULT: &str = "contract-suite-harness-fault";
 /// The DESIGN §3.3 checks [`run_all`] actually runs.
 ///
 /// **Not everything [`run_all`] runs** — see [`ADDITIONAL_CHECKS`] for the
-/// checks that are not among DESIGN's seven. This constant is one of the
-/// three that partition those seven, so a check DESIGN does not name has no
-/// business here.
+/// checks that are not among DESIGN's sixteen. This constant is one of the
+/// three that partition those sixteen, so a check DESIGN does not name has
+/// no business here.
 ///
 /// Adding a DESIGN check means adding it here as well as to [`run_all`] and
 /// removing it from [`UNWRITTEN_CHECKS`]; the partition test refuses a
@@ -213,7 +275,7 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
 ///
 /// A fourth constant rather than a sixth entry in [`IMPLEMENTED_CHECKS`],
 /// and the choice is what keeps the partition test meaningful. The other
-/// three are asserted to be exactly DESIGN's seven, disjoint; folding a
+/// three are asserted to be exactly DESIGN's sixteen, disjoint; folding a
 /// name DESIGN never wrote into one of them would force that assertion to
 /// be relaxed to a subset check, and a subset check cannot catch the thing
 /// the partition exists to catch — a DESIGN check that half-lands, or one
@@ -229,34 +291,57 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// **Empty.** Every check expressible with the five methods this gear
-/// declares is written and run by [`run_all`]; what remains unimplemented
-/// is in [`BLOCKED_CHECKS`], which needs the SPI to grow. The constant
-/// stands rather than being deleted: it is one of the three the partition
-/// test holds against DESIGN's seven, so a check that becomes writable and
-/// is not yet written has a place to be named, and a check that half-lands
-/// still fails the partition.
-pub const UNWRITTEN_CHECKS: &[&str] = &[];
-
-/// The two DESIGN §3.3 checks the current SPI cannot express, and why.
-pub const BLOCKED_CHECKS: &[(&str, &str)] = &[
-    (
-        "feed-snapshot-and-replay",
-        "the gear's SPI declares no feed method: DESIGN section 3.3 gives \
-         `UsageCollectorPluginV1` a `read_feed_page`, and this gear \
-         implements five methods, none of which reads a feed. Unblocked by \
-         the usage feed.",
-    ),
-    (
-        "latest-tie-break",
-        "asserts `greatest window_end, then greatest acceptance_sequence`, \
-         and `UsageRecord` carries no `acceptance_sequence` field. DESIGN \
-         section 1.2 has the plugin assign it strictly monotonic per \
-         `(tenant_id, gts_type_id)`, restated as a storage obligation in \
-         section 3.7; until the field exists there is nothing for a plugin \
-         to assign or a fold to read.",
-    ),
+/// **Eleven of DESIGN's sixteen**, which is every check [`run_all`] does
+/// not run. Each is expressible against the seven methods this gear's SPI
+/// declares — nothing here waits on the SPI to grow, and
+/// [`BLOCKED_CHECKS`] is empty. Being unwritten is a statement about this
+/// crate's progress, not about the SPI's reach, and the two are different
+/// claims: one is closed by writing a check, the other only by changing
+/// the trait.
+///
+/// **A caller reporting coverage has to report this constant.**
+/// [`run_all`] returning no violations says nothing whatever about a check
+/// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
+/// reports five checks' worth of evidence as sixteen.
+pub const UNWRITTEN_CHECKS: &[&str] = &[
+    RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
+    CONVERGED_TARGET_LOOKUP,
+    DEDUP_FLOOR,
+    DEDUP_CONCURRENT,
+    SERVER_FIELD_ROUND_TRIP,
+    FEED_SNAPSHOT_AND_REPLAY,
+    FEED_COMPLETENESS,
+    FEED_BOOTSTRAP_POSITION,
+    FEED_RETENTION_REFUSAL,
+    FEED_POSITION_BOUNDED,
+    LATEST_TIE_BREAK,
 ];
+
+/// The DESIGN §3.3 checks the current SPI cannot express, each paired with
+/// what unblocks it.
+///
+/// **Empty**, and the two entries that used to be here left without being
+/// written — which is why the constant stands rather than being deleted.
+/// Both justifications had become provably false:
+///
+/// * `feed-snapshot-and-replay` was blocked on an SPI with no feed method.
+///   [`UsageCollectorPluginV1`] now declares `read_feed_page`, so the check
+///   is expressible and merely unwritten.
+/// * `latest-tie-break` was blocked on a rule that read an
+///   `acceptance_sequence` field [`UsageRecord`](crate::models::UsageRecord)
+///   does not carry. The rule DESIGN §3.1 settled on does not read it:
+///   greatest `window_end`, then greatest `accepted_at`, then greatest `id`
+///   in byte order, three fields the record does carry.
+///
+/// Both are in [`UNWRITTEN_CHECKS`] now. Keeping the constant matters
+/// because it is one of the three the partition test holds against
+/// DESIGN's sixteen: a check a later SPI change puts out of reach needs
+/// somewhere to be named, and the alternative to naming it is a check that
+/// quietly stops being accounted for. See
+/// `the_blocked_checks_are_the_ones_the_spi_cannot_express` for what a
+/// human must establish before adding an entry, and for why no test can
+/// establish it for them.
+pub const BLOCKED_CHECKS: &[(&str, &str)] = &[];
 
 /// Run every implemented check, returning one entry per violation.
 ///

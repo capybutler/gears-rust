@@ -1,6 +1,6 @@
 //! The `scope-is-a-filter-on-every-read-path` check.
 //!
-//! Not one of DESIGN §3.3's seven; see
+//! Not one of DESIGN §3.3's sixteen; see
 //! [`scope_is_a_filter_on_every_read_path`] for what it asserts and
 //! [`super::super::SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH`] for why it is
 //! named outside them.
@@ -121,9 +121,18 @@ struct ScopeFixtures {
 }
 
 /// `scope-is-a-filter-on-every-read-path` — the compiled PDP scope decides
-/// which stored entries a plugin may answer with, on all three read paths.
+/// which stored entries a plugin may answer with.
 ///
-/// **Not one of DESIGN §3.3's seven checks.** DESIGN states the obligation
+/// The name states the *obligation*, which is on all five of the SPI's read
+/// paths; this check covers three of them.
+/// [`super::super::SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH`] is the single home
+/// for that split — which three are covered, which two are not, and why —
+/// and this doc deliberately does not restate it, because two copies of a
+/// count is how the one here went stale in the first place. The three are
+/// spelled out below as the assertions themselves, which is the one place
+/// the list cannot drift from what the code does.
+///
+/// **Not one of DESIGN §3.3's sixteen checks.** DESIGN states the obligation
 /// rather than tabulating a check for it: §3.3 gives the SPI's
 /// `get_usage_record` the doc *"`scope` is the compiled PDP scope,
 /// projected into a `toolkit_odata` filter. A row outside it is not
@@ -132,10 +141,10 @@ struct ScopeFixtures {
 /// not an existence oracle."* §3.2 puts the same rule on the collection
 /// paths: the Query Gateway composes the PDP constraints with the caller's
 /// filters *"so the result can only narrow"*. With the point lookup's
-/// in-process per-record attribution check retired, all three paths carry
-/// the scope as a filter and nothing above the SPI re-checks the rows that
-/// come back — so the whole guarantee is the plugin's, and until this check
-/// existed nothing asserted it.
+/// in-process per-record attribution check retired, every one of the SPI's
+/// five read paths carries the scope as a filter and nothing above the SPI
+/// re-checks the rows that come back — so the whole guarantee is the
+/// plugin's, and until this check existed nothing asserted it on any path.
 ///
 /// **Every assertion is a pair, and neither half is sufficient alone.** A
 /// scope that admits no row is satisfied by a backend that answers nothing;
@@ -365,7 +374,7 @@ async fn fold_reads_under_the_scope(
     }
 }
 
-/// The compiled PDP scope this check dispatches on all three paths.
+/// The compiled PDP scope this check dispatches on each of its three paths.
 ///
 /// A disjunction of tenant-pinned conjunctions, which is the shape
 /// `authz::scope_to_odata_filter` projects for a grant carrying two

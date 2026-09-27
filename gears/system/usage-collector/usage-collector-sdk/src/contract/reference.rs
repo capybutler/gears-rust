@@ -38,9 +38,15 @@
 //!   `next_cursor`** — it serves the canonical `(window_end, id)` ascending
 //!   order and one page. A real plugin owes both; the SPI's own method doc
 //!   is normative for it.
-//! * **`LATEST` breaks a `window_end` tie on the greatest `id`** — the
-//!   declared tie-break reads `acceptance_sequence`, which `UsageRecord`
-//!   does not carry. See `BLOCKED_CHECKS` in the parent module.
+//! * **`LATEST` breaks a `window_end` tie on the greatest `id`, skipping
+//!   `accepted_at`** — DESIGN §3.1 declares *greatest `window_end`, then
+//!   greatest `accepted_at`, then greatest `id` in byte order*, so this
+//!   backend omits the middle key rather than substituting for an
+//!   inexpressible one: `UsageRecord` carries all three fields and this
+//!   fold could implement the rule exactly. It answers as DESIGN requires
+//!   only when the tied entries share an `accepted_at`, which is when
+//!   DESIGN itself falls through to `id`. `latest-tie-break` is in
+//!   `UNWRITTEN_CHECKS` in the parent module, so no check reports it.
 //! * **`read_feed_page` refuses no cursor** — nothing is ever purged here, so
 //!   `CursorBeyondRetention` is unreachable and this backend exercises the
 //!   retention refusal not at all. The page, the position and the scope gate
@@ -966,12 +972,24 @@ fn bucket_key(row: &UsageRecord, group_by: &[AggregationDimension]) -> Option<Ve
 /// of in-range quantities can exceed `Decimal`'s ~7.9×10²⁸ ceiling, and the
 /// aggregate surface carries `BigDecimal` for exactly that reason.
 ///
-/// `LATEST` breaks a `window_end` tie on the greatest `id`. The declared
-/// tie-break is the greatest `acceptance_sequence`, which `UsageRecord` does
-/// not carry — see `BLOCKED_CHECKS` in the parent module. A total order is
-/// still needed here or the answer would depend on ledger insertion order,
-/// so `id` stands in; it is deterministic and it is not the declared rule,
-/// and no check asserts either way.
+/// `LATEST` breaks a `window_end` tie on the greatest `id`, and **that is
+/// not the declared rule.** DESIGN §3.1 declares greatest `window_end`,
+/// then greatest `accepted_at`, then greatest `id` in byte order. The key
+/// below is `(window_end, id)`, so it skips `accepted_at` and agrees with
+/// DESIGN only where the tied entries share one — the case in which DESIGN
+/// also reaches `id`. Nothing makes this unavoidable: [`UsageRecord`]
+/// carries `accepted_at`, so this is an omission rather than a substitute
+/// for something the type cannot express, and the earlier claim here that
+/// the declared tie-break read an `acceptance_sequence` field described a
+/// rule DESIGN does not carry. What `id` does buy is a total order, without
+/// which the answer would depend on ledger insertion order.
+///
+/// `latest-tie-break` is writable against the current SPI and unwritten, so
+/// it sits in `UNWRITTEN_CHECKS` in the parent module and no check asserts
+/// this either way. Being the suite's reference backend, this fold is not
+/// evidence of what the rule is: a plugin author reads
+/// [`AggregationFold::Latest`](crate::models::AggregationFold::Latest) and
+/// DESIGN §3.1 for that.
 fn fold_value(
     fold: AggregationFold,
     rows: &[&UsageRecord],

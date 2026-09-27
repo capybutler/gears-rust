@@ -27,18 +27,40 @@ use super::translate::SqlCtx;
 
 /// The [`AggregationFold::Latest`] arm of [`fold_select_expr`].
 ///
-/// DESIGN §3.1 declares the rule as *greatest `window_end`, then greatest
+/// This backend orders by *greatest `window_end`, then greatest
 /// `acceptance_sequence`*, terminating because the sequence is monotonic inside
-/// the group's scope — strictly so per `(tenant_id, gts_type_id)` (DESIGN §3.7).
-/// A narrower group inherits that order; a group spanning tenants is outside the
-/// argument, and no cross-tenant total order is claimed.
+/// the group's scope — strictly so per `(tenant_id, gts_type_id)`, which this
+/// plugin assigns itself. A narrower group inherits that order; a group
+/// spanning tenants is outside the argument, and no cross-tenant total order is
+/// claimed.
 ///
-/// This backend implements the declared rule exactly, because it assigns
-/// `acceptance_sequence` itself. **The SDK's reference backend cannot:**
-/// `UsageRecord` has no such field, so `InMemoryReferencePlugin` substitutes the
-/// greatest `id` and `latest-tie-break` sits in the SDK's `BLOCKED_CHECKS`
-/// (`DIVERGENCES.md` entries 10 and 19). **No contract check asserts this
-/// expression either way;** this module's tests are what pin it.
+/// **That is this plugin's rule, and DESIGN's is no longer the same one.**
+/// DESIGN §3.1 states the `LATEST` tie-break as *greatest `window_end`, then
+/// greatest `accepted_at`, then greatest `id` in byte order*, adding that `id`
+/// is unique so the order is total and that all three keys compare across
+/// tenants and types. `acceptance_sequence` appears nowhere in the gear's
+/// DESIGN, so the earlier claim here that §3.1 declared it — and that §3.7
+/// restated it as a storage obligation — was an attribution to a rule DESIGN
+/// does not carry. The two orders agree whenever `accepted_at` separates the
+/// tied entries in the same direction as commit order, which is the ordinary
+/// case, and can disagree in three:
+///
+/// * a group spanning tenants or types, where `acceptance_sequence` is scoped
+///   per `(tenant_id, gts_type_id)` and orders nothing across scopes, while
+///   §3.1 requires a total order there;
+/// * two entries sharing an `accepted_at`, where §3.1 falls to greatest `id`
+///   and this expression falls to the greater sequence;
+/// * an entry whose commit lands after one with a later `accepted_at` — the
+///   case DESIGN §3.3's `dedup-concurrent` row explicitly contemplates — where
+///   the two rules pick opposite entries.
+///
+/// **No contract check asserts this expression either way.** The SDK's
+/// `latest-tie-break` check is writable against the current seven-method SPI
+/// (`UsageRecord` carries `window_end`, `accepted_at` and `id`) and is simply
+/// unwritten, so it sits in the SDK's `UNWRITTEN_CHECKS` rather than its
+/// `BLOCKED_CHECKS`, which is empty. It is therefore expected to **fail here**
+/// when it lands, and the divergence above is what it would report; this
+/// module's tests pin the expression as written, not as DESIGN declares it.
 ///
 /// `LATEST` is an ordered pick, not an aggregate function — but
 /// `ARRAY_AGG(… ORDER BY …)[1]` composes in a grouped SELECT list exactly as

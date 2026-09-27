@@ -1726,7 +1726,12 @@ pub enum AggregationFold {
     /// Least selected quantity.
     Min,
     /// The quantity of the entry with the greatest `window_end`, ties broken
-    /// by the greatest `acceptance_sequence`.
+    /// by the greatest `accepted_at`, then by the greatest `id` in byte
+    /// order (DESIGN §3.1, which is normative for this and is where to
+    /// verify it). `id` is unique, so the order is total, and all three keys
+    /// compare across tenants and types, so it holds for a group spanning
+    /// them. A plugin owes this exact order; a backend-local sequence or
+    /// insertion order is not it.
     Latest,
 }
 

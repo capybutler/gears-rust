@@ -19,7 +19,7 @@
 //! column against each of them.
 //!
 //! The third is that the three coverage constants still partition DESIGN's
-//! seven checks, so a passing run cannot read as a complete one.
+//! sixteen checks, so a passing run cannot read as a complete one.
 //!
 //! The fourth is the reference backend's own fail-closed posture, which is
 //! not a contract check but is the thing a plugin author copies.
@@ -187,32 +187,85 @@ async fn each_check_fails_against_its_own_defect_and_no_other() {
     );
 }
 
-/// The blocked list names checks DESIGN §3.3 actually declares, and does not
-/// name one this suite implements.
+/// Nothing is listed as beyond the SPI's reach that this suite implements,
+/// that it also calls merely unwritten, or that carries a justification
+/// already known to be false — and, today, nothing is listed at all.
 ///
-/// Without this, `BLOCKED_CHECKS` is prose: a typo, or a row left behind
-/// after a check became writable, reads exactly like an honest gap. The
-/// name says *cannot express* rather than *not implemented* because the
-/// distinction outlives the counts: `UNWRITTEN_CHECKS` is empty today, so
-/// the two unimplemented checks are exactly the two blocked ones, and a
-/// row that stayed here after its check became writable would be
-/// indistinguishable from one that is genuinely still blocked.
+/// `BLOCKED_CHECKS` says *cannot express* rather than *not implemented*,
+/// and that is a claim about the shape of [`UsageCollectorPluginV1`] rather
+/// than about this crate's progress. **No test can check it.** A trait's
+/// method set is not reachable at runtime on stable Rust, and the claim is
+/// not even always about a method: of the two entries this constant used to
+/// hold, one was blocked on a missing SPI method (`read_feed_page`, which
+/// the SPI now declares) and the other on a rule in DESIGN's prose that
+/// read an `acceptance_sequence` field the record does not carry — a rule
+/// §3.1 has since settled differently, so the check became writable with
+/// no field ever added. A guard that reflected over the trait would have
+/// caught the first and passed the second.
+///
+/// So this test does three things it can do and names the one it cannot.
+///
+/// The structural assertions come first, and each arms itself the moment an
+/// entry is added: a blocked check must not be in `IMPLEMENTED_CHECKS` (a
+/// check that landed and stayed listed under-reports coverage), must not
+/// also be in `UNWRITTEN_CHECKS` (the two make incompatible claims about
+/// the same name), must carry a reason, and must not carry one of
+/// `RETIRED_JUSTIFICATIONS` — the two this constant was caught holding,
+/// both provably false and both cheap to resurrect from an old commit.
+///
+/// The emptiness assertion comes last, deliberately, so an entry that is
+/// structurally wrong is diagnosed as wrong rather than merely as new. It
+/// is a stop sign, not a snapshot. The previous version of this test
+/// asserted `BTreeSet::from(["feed-snapshot-and-replay",
+/// "latest-tie-break"])` and its own doc claimed to catch "a row that
+/// stayed here after its check became writable" — yet both rows went
+/// stale underneath it and it passed, because it pinned the *names* while
+/// the rot was in the *reasons*. Emptiness makes no claim that can rot
+/// that way. Its whole job is to stop the next author, who must then
+/// establish by hand, and record in the entry, that:
+///
+/// 1. no method on [`UsageCollectorPluginV1`] lets the check be written,
+///    naming the method that would;
+/// 2. the DESIGN rule the check asserts still needs the thing the SPI
+///    lacks — the trap the `latest-tie-break` row fell into;
+/// 3. `UNWRITTEN_CHECKS` is not the honest home for it instead.
+///
+/// A limitation named beats a guard that cannot fire, which is exactly what
+/// the hardcoded set was.
 #[test]
 fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
+    /// Justifications this constant has already been caught holding after
+    /// they stopped being true. Matched as substrings of a reason, so a
+    /// reworded revival is caught with the original.
+    ///
+    /// **Substring matching on prose over-rejects, and that is the accepted
+    /// trade.** A future entry that mentions `acceptance_sequence` for some
+    /// unrelated and entirely legitimate reason fails this assertion too.
+    /// The cost is bounded to a reword because of where the guard sits: it
+    /// can only fire after someone has deliberately pushed past the
+    /// emptiness stop sign below, so a false positive lands on an author who
+    /// is already editing this test and reading this doc, not on a passer-by
+    /// — and the failure is loud rather than a silently corrupted claim. If
+    /// you are that author: say the same thing without the retired phrase,
+    /// or drop the phrase from this list with a note saying why it can no
+    /// longer mislead.
+    const RETIRED_JUSTIFICATIONS: [&str; 2] = ["no feed method", "acceptance_sequence"];
+
     let blocked: BTreeSet<&str> = BLOCKED_CHECKS.iter().map(|(check, _)| *check).collect();
 
-    assert_eq!(
-        blocked,
-        BTreeSet::from(["feed-snapshot-and-replay", "latest-tie-break"]),
-        "the blocked set must be exactly the two DESIGN section 3.3 checks the current SPI cannot \
-         express; a name that is not in DESIGN's table, or one whose check has since become \
-         writable, reads as an honest gap and is not one"
-    );
     for check in IMPLEMENTED_CHECKS {
         assert!(
             !blocked.contains(check),
             "`{check}` is implemented and run by `run_all`, so listing it as blocked would \
              under-report the suite's coverage"
+        );
+    }
+    for check in UNWRITTEN_CHECKS {
+        assert!(
+            !blocked.contains(check),
+            "`{check}` is named as blocked and as unwritten, which are incompatible claims: one \
+             says the SPI cannot express the check, the other that it can and nobody has written \
+             it. A reader cannot tell which is meant, and the partition test cannot tell either"
         );
     }
     for (check, reason) in BLOCKED_CHECKS {
@@ -221,7 +274,28 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
             "`{check}` is listed as blocked with no reason: the entry exists to say what \
              unblocks it, and an empty one only hides the check"
         );
+        for retired in RETIRED_JUSTIFICATIONS {
+            assert!(
+                !reason.contains(retired),
+                "`{check}` is blocked on `{retired}`, which was true once and is not now. The \
+                 SPI declares `read_feed_page`, and the DESIGN section 3.1 order reads \
+                 `window_end`, `accepted_at` and `id` rather than an `acceptance_sequence` the \
+                 record never carried. Both of these justifications were held here after they \
+                 became false; neither is a blocker again without the SPI changing back"
+            );
+        }
     }
+
+    assert!(
+        blocked.is_empty(),
+        "`BLOCKED_CHECKS` names {blocked:?}, and this assertion exists to stop you here. Nothing \
+         automated can confirm that a check is beyond the SPI's reach: the trait's method set is \
+         not visible at runtime, and the last two entries here went stale without a single test \
+         failing. Before changing this assertion, establish by hand that no method on \
+         `UsageCollectorPluginV1` lets the check be written, that the DESIGN rule it asserts \
+         still needs what the SPI lacks, and that `UNWRITTEN_CHECKS` is not the honest home for \
+         it. Then say which of those you checked, in the entry"
+    );
 }
 
 /// Every check DESIGN §3.3 declares is implemented, blocked, or named as
@@ -230,11 +304,12 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 /// This is what makes the module's coverage claim structural instead of
 /// narrative. `run_all` returning no violations says nothing about a check
 /// it never ran, and "run this suite" is the acceptance criterion for
-/// porting a storage backend, so a suite that runs five checks must not
-/// read as a suite that ran seven. Asserting the partition means a check cannot
-/// half-land — implemented but still listed unwritten, or written and
-/// listed nowhere — without this failing, and `UNWRITTEN_CHECKS` emptied
-/// itself as the work landed rather than needing someone to remember.
+/// porting a storage backend, so a suite that runs six checks must not
+/// read as a suite that ran sixteen. Asserting the partition means a check
+/// cannot half-land — implemented but still listed unwritten, or written
+/// and listed nowhere — without this failing, and `UNWRITTEN_CHECKS`
+/// empties itself as the work lands rather than needing someone to
+/// remember.
 ///
 /// `ADDITIONAL_CHECKS` is deliberately outside the partition and asserted
 /// against it rather than folded into it. `run_all` runs a check DESIGN
@@ -245,14 +320,23 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 /// place to park a DESIGN name to escape the accounting.
 #[test]
 fn the_three_coverage_constants_partition_the_design_checks() {
-    /// The seven names in DESIGN §3.3's "Plugin contract tests" table.
-    const DESIGN_CHECKS: [&str; 7] = [
+    /// The sixteen names in DESIGN §3.3's "Plugin contract tests" table.
+    const DESIGN_CHECKS: [&str; 16] = [
         "window-end-selection",
         "invalidation-excluded-from-fold",
         "at-most-one-invalidation",
+        "record-and-invalidation-distinct-identity",
+        "converged-target-lookup",
         "dedup-identity-over-window",
+        "dedup-floor",
+        "dedup-concurrent",
         "quantity-round-trip",
+        "server-field-round-trip",
         "feed-snapshot-and-replay",
+        "feed-completeness",
+        "feed-bootstrap-position",
+        "feed-retention-refusal",
+        "feed-position-bounded",
         "latest-tie-break",
     ];
 
@@ -271,7 +355,7 @@ fn the_three_coverage_constants_partition_the_design_checks() {
         unique,
         BTreeSet::from(DESIGN_CHECKS),
         "the implemented, unwritten and blocked constants must together be exactly DESIGN \
-         section 3.3's seven checks: no invented name, and nothing left unaccounted for"
+         section 3.3's sixteen checks: no invented name, and nothing left unaccounted for"
     );
     assert!(
         !unique.contains(HARNESS_FAULT),
@@ -284,7 +368,7 @@ fn the_three_coverage_constants_partition_the_design_checks() {
             !unique.contains(check),
             "`{check}` is named in `ADDITIONAL_CHECKS`, which is for the checks DESIGN section \
              3.3 does not tabulate, and it also appears in the three constants that partition \
-             DESIGN's seven. One of the two is wrong: either the name belongs in the partition \
+             DESIGN's sixteen. One of the two is wrong: either the name belongs in the partition \
              and not here, or the partition has grown a name DESIGN never wrote"
         );
     }

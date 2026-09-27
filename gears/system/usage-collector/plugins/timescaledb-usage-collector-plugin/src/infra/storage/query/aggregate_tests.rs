@@ -52,12 +52,17 @@ fn every_fold_casts_to_numeric() {
 
 #[test]
 fn latest_picks_the_greatest_window_end_then_acceptance_sequence() {
-    // DESIGN 3.1 declares the tie-break as greatest `window_end`, then
-    // greatest `acceptance_sequence`. Both keys are DESC and in that order;
-    // `[1]` takes the head of the ordered array. A backend substituting
-    // another tie-break (the SDK reference plugin substitutes greatest `id`)
-    // answers differently on the same ledger, and no contract check catches
-    // it: `latest-tie-break` is in the SDK's `BLOCKED_CHECKS`.
+    // This plugin's tie-break is greatest `window_end`, then greatest
+    // `acceptance_sequence`. Both keys are DESC and in that order; `[1]` takes
+    // the head of the ordered array. This pins what the expression *is*, not
+    // that it conforms: DESIGN 3.1's rule is greatest `window_end`, then
+    // greatest `accepted_at`, then greatest `id` in byte order, and
+    // `acceptance_sequence` is this plugin's own column rather than anything
+    // DESIGN names. `fold_select_expr`'s docs carry the three cases where the
+    // two orders disagree. No contract check catches it either way yet:
+    // `latest-tie-break` is writable against the current SPI and unwritten, so
+    // it is in the SDK's `UNWRITTEN_CHECKS` and not in `BLOCKED_CHECKS`, which
+    // is empty.
     assert_eq!(
         fold_select_expr(AggregationFold::Latest),
         "(ARRAY_AGG(r.quantity ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric"
