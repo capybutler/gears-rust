@@ -23,11 +23,12 @@ use crate::time_range::TimeRange;
 ///
 /// Two hundred and forty days past [`FIXTURE_EPOCH`], for the reason
 /// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180 and 210 offsets
-/// the other checks take. It matters here because this check counts the rows
-/// a range returns against the identities it seeded, so a stray entry inside
-/// it would be read as a row no identity of this check accounts for — which
-/// is exactly the shape of the failure the check exists to report.
+/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210 and 270
+/// offsets the other checks take. It matters here because this check counts
+/// the rows a range returns against the identities it seeded, so a stray
+/// entry inside it would be read as a row no identity of this check accounts
+/// for — which is exactly the shape of the failure the check exists to
+/// report.
 ///
 /// The offset is the second of two separations rather than the only one:
 /// this check also reads over a meter of its own (see

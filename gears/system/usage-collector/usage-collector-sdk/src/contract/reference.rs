@@ -81,8 +81,12 @@
 //! serve here: it persists nothing. `create_usage_record` echoes its input,
 //! `get_usage_record` always answers `UsageRecordNotFound`,
 //! `list_usage_records` always answers an empty page, and every fold
-//! returns no buckets. It therefore fails all seven behavioural checks by
-//! construction — not by defect. A null backend exists so the plugin-host
+//! returns no buckets. It therefore fails every behavioural check
+//! [`super::run_all`] runs, by construction rather than by defect: each of
+//! them either reads an entry back or requires a collision outcome, and a
+//! store that persists nothing gives neither. That is deliberately not
+//! phrased as a count — it was ("all seven"), and it went stale twice as
+//! checks landed. A null backend exists so the plugin-host
 //! binding resolves end-to-end in development, and answering a well-formed
 //! default to every call is exactly the right behaviour for that job.
 //! Nothing about the contract suite is a reason to change it; a suite whose

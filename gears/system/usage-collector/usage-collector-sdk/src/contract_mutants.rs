@@ -10,7 +10,7 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Nine subjects wrap a real reference
+//! *Behaviourally* is the exact word. Ten subjects wrap a real reference
 //! backend and are that backend plus one interception; the other four
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
@@ -29,14 +29,16 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Nine defects fit (quantity, the
+//! strongest form the subject can take. Ten defects fit (quantity, the
 //! store's own acceptance instant, a defaulted origin, period-blind dedup,
 //! entry-type-blind dedup, the entry-type-blind conflict read-back,
-//! point-read scope, and the two withdrawal defects): three rewrite a field
-//! on the way in, three keep an index beside the ledger — two to refuse an
-//! admission, one only to decide which stored entry a collision is answered
-//! with — one substitutes the scope on the point read, and two rewrite how a
-//! second withdrawal of a record is answered.
+//! point-read scope, the undecided converged-only lookup, and the two
+//! withdrawal defects): three rewrite a field on the way in, three keep an
+//! index beside the ledger — two to refuse an admission, one only to decide
+//! which stored entry a collision is answered with — two change what the
+//! point read answers, one by substituting the scope and one by declining
+//! to decide, and two rewrite how a second withdrawal of a record is
+//! answered.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other four
 //! (selection column, fold exclusion, missing unique constraint, missing
@@ -221,6 +223,52 @@ pub(super) enum Defect {
     /// Honours the scope on the list and aggregate paths and ignores it on
     /// the point read.
     IgnoresScopeOnThePointRead,
+    /// Answers [`UsageCollectorPluginError::UsageRecordNotConverged`] for an
+    /// entry it has already acknowledged, whenever the lookup asks for a
+    /// converged one — a store whose point read goes to a replica it has not
+    /// waited for.
+    ///
+    /// DESIGN §3.3's "Decide converged-only lookups" obligation names the
+    /// failure: a lookup with `converged_only` *"returns the survivor once
+    /// converged, never reports an acknowledged, retained entry missing, and
+    /// answers `UsageRecordNotConverged` only until it can decide"*. A
+    /// perpetual undecided answer is the second way to fail a caller that
+    /// holds an acknowledgement, and the less visible one — reporting the
+    /// entry missing at least ends the exchange, while this answer tells the
+    /// caller to come back, and the gateway lifts the variant to a
+    /// *retryable* conflict, so it does.
+    ///
+    /// It is the mistake a backend makes by reading `converged_only` as "say
+    /// so when you are not sure" rather than as a question it is obliged to
+    /// answer: a port that routes point reads to a replica pool, has no way
+    /// to establish that the pool has caught up, and declines to decide
+    /// rather than declining to lag.
+    ///
+    /// **Applied only where the inner backend answered `Ok`**, and that is
+    /// what keeps it wrong in one place rather than two. A subject that also
+    /// rewrote the refusals would answer undecided for an identifier that
+    /// was never stored and for a row the scope withheld, failing
+    /// `converged-target-lookup`'s other two probes for a mistake about
+    /// *absence* rather than about convergence.
+    ///
+    /// **What it reaches was measured rather than reasoned: that check's
+    /// first probe, and nothing else.** No other check in the suite
+    /// dispatches a lookup with `converged_only = true`, and the probe is
+    /// individually load-bearing — neutering it leaves this subject's row
+    /// empty. Of the check's other three, two report against
+    /// [`Self::IgnoresScopeOnThePointRead`] and the third against nothing at
+    /// all; that check's own docs carry the measurement and why the gap is
+    /// recorded rather than closed.
+    ///
+    /// **It is also the only backend that drives the `Eventual` half of that
+    /// probe.** The matrix runs every subject at
+    /// [`DedupLevel`](super::DedupLevel)`::Linearizable`, where an undecided
+    /// answer is a violation outright; under an `Eventual` declaration the
+    /// check sleeps the declared bound and reads again, and a subject that
+    /// never decides is what makes that second read happen. The test is
+    /// `an_undecided_lookup_is_still_a_violation_once_the_bound_has_passed`,
+    /// and neutering the post-bound assertion fails it and nothing else.
+    AnswersNotConvergedForAnAcknowledgedEntry,
     /// Decides every collision by reading the ledger and then writes anyway:
     /// the dedup identity carries no unique constraint, so the outcome a
     /// caller reads is right and a second row lands beside the first.
@@ -349,6 +397,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::DedupIgnoresTheEntryType
         | Defect::ConflictReadBackIgnoresTheEntryType
         | Defect::IgnoresScopeOnThePointRead
+        | Defect::AnswersNotConvergedForAnAcknowledgedEntry
         | Defect::AbsorbsAWithdrawalWithAnotherReason
         | Defect::RefusesAWithdrawalWithTheSameReason => Box::new(WrappedReference::new(defect)),
         Defect::SelectsOnWindowStart
@@ -368,7 +417,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
 ///
-/// One qualification, and it holds for all nine wrapped defects:
+/// One qualification, and it holds for all ten wrapped defects:
 /// [`Self::create_usage_records`] is not pure delegation. The inner backend
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
@@ -380,7 +429,7 @@ struct WrappedReference {
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
     /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
-    /// entry that claimed it. Unused by the other eight defects.
+    /// entry that claimed it. Unused by the other nine defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -395,7 +444,7 @@ struct WrappedReference {
     period_blind_keys: Mutex<BTreeMap<PeriodBlindKey, UsageRecord>>,
     /// The entry-type-blind dedup index [`Defect::DedupIgnoresTheEntryType`]
     /// keys on: `(tenant_id, gts_type_id, idempotency_key, window_start,
-    /// window_end)` to the entry that claimed it. Unused by the other eight
+    /// window_end)` to the entry that claimed it. Unused by the other nine
     /// defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
@@ -414,7 +463,7 @@ struct WrappedReference {
     entry_type_blind_keys: Mutex<BTreeMap<EntryTypeBlindKey, UsageRecord>>,
     /// The rows [`Defect::ConflictReadBackIgnoresTheEntryType`] reads a
     /// colliding entry back from: the same five components, to **every**
-    /// entry accepted under them, in arrival order. Unused by the other eight
+    /// entry accepted under them, in arrival order. Unused by the other nine
     /// defects.
     ///
     /// A `Vec` rather than one entry, because two rows under one five-tuple
@@ -516,6 +565,7 @@ impl WrappedReference {
             // two never reach this type at all — `mutant` routes them to
             // `MutantLedger` — but exhaustiveness is the whole point.
             Defect::IgnoresScopeOnThePointRead
+            | Defect::AnswersNotConvergedForAnAcknowledgedEntry
             | Defect::AbsorbsAWithdrawalWithAnotherReason
             | Defect::RefusesAWithdrawalWithTheSameReason
             | Defect::ConflictReadBackIgnoresTheEntryType
@@ -838,13 +888,26 @@ impl UsageCollectorPluginV1 for WrappedReference {
             .collect())
     }
 
-    /// The point read, under the dispatched scope or under a scope that
-    /// names only the row asked for.
+    /// The point read, and the two defects that change what it answers.
     ///
-    /// `id eq <the id asked for>` is what `SELECT * FROM usage_records WHERE
-    /// id = $1` compiles to: the scope argument is dropped and nothing else
+    /// [`Defect::IgnoresScopeOnThePointRead`] substitutes the scope. `id eq
+    /// <the id asked for>` is what `SELECT * FROM usage_records WHERE id =
+    /// $1` compiles to: the scope argument is dropped and nothing else
     /// changes, which is the mistake as a backend makes it rather than a
     /// caricature of it.
+    ///
+    /// [`Defect::AnswersNotConvergedForAnAcknowledgedEntry`] leaves the
+    /// query alone and rewrites one answer: a converged-only lookup that
+    /// found the entry reports it undecided instead. **Only that answer**,
+    /// which is what confines the subject to one mistake — a refusal is
+    /// passed through, so an identifier that was never stored and a row the
+    /// scope withheld both still read as absent, and this subject is wrong
+    /// about convergence rather than about absence. See the defect for what
+    /// it reaches.
+    ///
+    /// The two are exclusive branches rather than one composed path. Each
+    /// subject carries exactly one defect, so composing them would be dead
+    /// code dressed as generality.
     async fn get_usage_record(
         &self,
         id: Uuid,
@@ -857,7 +920,14 @@ impl UsageCollectorPluginV1 for WrappedReference {
                 .get_usage_record(id, &only_this_row(id), converged_only)
                 .await;
         }
-        self.inner.get_usage_record(id, scope, converged_only).await
+        let answer = self.inner.get_usage_record(id, scope, converged_only).await;
+        if converged_only
+            && answer.is_ok()
+            && self.defect == Defect::AnswersNotConvergedForAnAcknowledgedEntry
+        {
+            return Err(UsageCollectorPluginError::UsageRecordNotConverged { id });
+        }
+        answer
     }
 
     async fn query_aggregated_usage_records(

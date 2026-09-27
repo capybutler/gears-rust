@@ -145,8 +145,8 @@ struct ScopeFixtures {
 /// **Not one of DESIGN §3.3's sixteen checks.** DESIGN states the obligation
 /// rather than tabulating a check for it: §3.3 gives the SPI's
 /// `get_usage_record` the doc *"`scope` is the compiled PDP scope,
-/// projected into a `toolkit_odata` filter. A row outside it is not
-/// returned"*, and its consumer-surface twin *"The read runs under the
+/// projected into a `toolkit_odata` filter. A row outside it is absent"*,
+/// and its consumer-surface twin *"The read runs under the
 /// compiled scope, so an entry outside it is `NotFound`. This surface is
 /// not an existence oracle."* §3.2 puts the same rule on the collection
 /// paths: the Query Gateway composes the PDP constraints with the caller's

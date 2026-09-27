@@ -21,12 +21,12 @@ use crate::time_range::TimeRange;
 ///
 /// Two hundred and ten days past [`FIXTURE_EPOCH`], for the reason
 /// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150 and 180 offsets the
-/// other checks take. It buys something narrower here than elsewhere: this
-/// check looks its entries up by `id` and never counts the rows a range
-/// returns, so a stray entry is not miscounted — but it would take a slot on
-/// a bounded page, and enough of them would truncate one of this check's own
-/// entries away and have it reported absent
+/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 240 and 270
+/// offsets the other checks take. It buys something narrower here than
+/// elsewhere: this check looks its entries up by `id` and never counts the
+/// rows a range returns, so a stray entry is not miscounted — but it would
+/// take a slot on a bounded page, and enough of them would truncate one of
+/// this check's own entries away and have it reported absent
 /// ([`SERVER_FIELD_PAGE_LIMIT`] carries the other half of that argument).
 const SERVER_FIELD_WINDOW_FROM: time::OffsetDateTime =
     FIXTURE_EPOCH.saturating_add(time::Duration::days(210));

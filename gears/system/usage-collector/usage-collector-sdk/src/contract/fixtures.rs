@@ -98,9 +98,17 @@ pub fn check_meter(check: &str, role: &str) -> Result<MeterTypeId, String> {
 /// the assertion under [`FEED_OTHER_TENANT_ID`] says why.
 pub const CONTRACT_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0001);
 
-/// The tenant the dispatched scope does **not** admit, read by
-/// [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path()).
-/// That check's own module says what it is for.
+/// The tenant the dispatched scope does **not** admit, read by two checks:
+/// [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path())
+/// and
+/// [`converged_target_lookup`](super::checks::converged_target_lookup()).
+/// Each module says what it is for. Two readers are safe here where two
+/// would not be under [`SCOPE_UNUSED_TENANT_ID`] below, and the difference
+/// is what each asserts: nothing here turns on how many entries this tenant
+/// owns, because both readers name an entry of their own and require that
+/// one withheld. So a second reader adds an entry rather than dissolving a
+/// premise. Each names its own by `id` on the point read and keeps its
+/// entries off the other's collection reads through [`check_meter`].
 pub const SCOPE_EXCLUDED_TENANT_ID: Uuid =
     Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0002);
 
@@ -433,8 +441,8 @@ pub fn fixture_invalidation(target: &UsageRecord) -> Result<UsageRecord, String>
 
 /// A [`ContractViolation`] attributed to one check.
 ///
-/// The check name is a parameter rather than baked in. Nine checks report
-/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a tenth
+/// The check name is a parameter rather than baked in. Ten checks report
+/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is an eleventh
 /// caller, and the whole point of [`ContractViolation::check`] is that a
 /// violation says which assertion produced it — a helper that stamped one
 /// name on every report would quietly undo that.

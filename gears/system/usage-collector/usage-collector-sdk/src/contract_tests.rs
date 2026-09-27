@@ -12,11 +12,15 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds thirteen deliberately
+//! as coverage. [`super::contract_mutants`] holds fourteen deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
-//! column against each of them.
+//! column against each of them. That test runs every subject at
+//! [`DedupLevel::Linearizable`];
+//! [`an_undecided_lookup_is_still_a_violation_once_the_bound_has_passed`]
+//! is the one column asserted at the other declaration, because one check
+//! has a path only an `Eventual` declaration reaches.
 //!
 //! The third is that the three coverage constants still partition DESIGN's
 //! sixteen checks, so a passing run cannot read as a complete one.
@@ -40,8 +44,8 @@ use uuid::Uuid;
 
 use super::contract_mutants::{Defect, mutant};
 use super::{
-    ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, DEDUP_FLOOR,
-    DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, HARNESS_FAULT, IMPLEMENTED_CHECKS,
+    ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, CONVERGED_TARGET_LOOKUP,
+    DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, HARNESS_FAULT, IMPLEMENTED_CHECKS,
     INVALIDATION_EXCLUDED_FROM_FOLD, QUANTITY_ROUND_TRIP,
     RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH,
     SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS, WINDOW_END_SELECTION,
@@ -134,7 +138,7 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
 /// A literal here would go on matching a constant that had been respelled,
 /// and the row would then assert nothing about the check it names.
 ///
-/// **Four rows name more than one check**, and none is a mutant wrong
+/// **Five rows name more than one check**, and none is a mutant wrong
 /// twice: each is a real overlap between checks, which is what the matrix
 /// has to be able to say without loosening into a subset assertion.
 ///
@@ -213,6 +217,34 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
 /// records or withdrawals, so a subject missing the in-batch dedup map meets
 /// it wherever it is asserted. There is no fixture arrangement that would
 /// separate them: the coupling is the rule's, not the subject's.
+///
+/// [`Defect::IgnoresScopeOnThePointRead`] is the fifth, and DESIGN puts both
+/// its checks on the point read itself. `scope-is-a-filter-on-every-read-path`
+/// exists for the obligation the SPI states on `get_usage_record` — *"`scope`
+/// is the compiled PDP scope … A row outside it is absent"* — and
+/// `converged-target-lookup` is obliged to read an out-of-scope entry too:
+/// its DESIGN row names *"an out-of-scope entry, which answers as an absent
+/// one"*, and the obligation behind that row opens *"A lookup with
+/// `converged_only` applies `scope` first"*. A subject that drops the scope
+/// argument on this method therefore meets both, and it meets the second
+/// twice over — the converged-only read and the caller-facing one, which is
+/// the probe that establishes the flag governs convergence and never
+/// authorization. One mistake meeting two checks, not two mistakes: the
+/// coupling is DESIGN's, which states the scope rule for this method once and
+/// then obliges the converged-only lookup to apply it first.
+///
+/// What the wider row costs is what the others cost: it establishes that the
+/// two checks together notice a point read that drops its scope, not which of
+/// them noticed. Neither is separable by any fixture arrangement — both have
+/// to store a row outside the scope they dispatch and ask for it by `id`, and
+/// there is one method to ask.
+///
+/// Inside `converged-target-lookup` the row rests on **two** assertions and
+/// on neither alone, measured by neutering each: that subject answers the
+/// withheld row under both flags, so the converged-only probe and the
+/// caller-facing one each report on their own and taking either away leaves
+/// the row unchanged. Taking both away removes this check from the row and
+/// changes nothing else.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (Defect::StampsItsOwnAcceptedAt, &[SERVER_FIELD_ROUND_TRIP]),
@@ -249,7 +281,14 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     ),
     (
         Defect::IgnoresScopeOnThePointRead,
-        &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH],
+        &[
+            SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH,
+            CONVERGED_TARGET_LOOKUP,
+        ],
+    ),
+    (
+        Defect::AnswersNotConvergedForAnAcknowledgedEntry,
+        &[CONVERGED_TARGET_LOOKUP],
     ),
     (
         Defect::LedgerHasNoUniqueConstraint,
@@ -269,7 +308,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all thirteen mutants is not
+/// of sensitivity. A check that fails against all fourteen mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.
@@ -325,6 +364,58 @@ async fn each_check_fails_against_its_own_defect_and_no_other() {
          anything about. This is a statement about the coverage constants, not about `run_all`'s \
          call list: a check added to `run_all` and to neither constant escapes this assertion, \
          and see this test's doc for why that gap is not this test's to close."
+    );
+}
+
+/// An undecided converged-only lookup is still a violation once the declared
+/// bound has passed.
+///
+/// **This is the only test that executes `converged-target-lookup`'s second
+/// read**, and it exists for that reason. That check's first probe admits
+/// `UsageRecordNotConverged` under [`DedupLevel::Eventual`], sleeps the
+/// declared convergence bound and reads again; nothing else here takes the
+/// branch, because the reference backend answers the survivor straight away
+/// under either declaration and
+/// [`each_check_fails_against_its_own_defect_and_no_other`] runs every
+/// subject at [`DedupLevel::Linearizable`].
+///
+/// [`Defect::AnswersNotConvergedForAnAcknowledgedEntry`] is a backend that
+/// never decides, so the sleep runs and the second read answers undecided
+/// again. The check must still report: DESIGN §3.3 admits the answer *"only
+/// until it can decide"*, and a lookup that never leaves it is a caller
+/// retrying forever. Asserting the whole failing set rather than just that
+/// this check is in it keeps the test honest about the level, too — an
+/// `Eventual` declaration is also the only one that reaches
+/// `at-most-one-invalidation`'s post-convergence half, and this subject must
+/// pass that.
+///
+/// The bound is zero, so the test does not actually wait. What is being
+/// established is that the branch runs and still reports, not how long it
+/// waits for — no check in this suite times a plugin.
+#[tokio::test]
+async fn an_undecided_lookup_is_still_a_violation_once_the_bound_has_passed() {
+    let plugin = mutant(Defect::AnswersNotConvergedForAnAcknowledgedEntry);
+
+    let failed: BTreeSet<&str> = run_all(
+        plugin.as_ref(),
+        DedupLevel::Eventual {
+            convergence_bound: std::time::Duration::ZERO,
+        },
+    )
+    .await
+    .into_iter()
+    .map(|violation| violation.check)
+    .collect();
+
+    assert_eq!(
+        failed,
+        BTreeSet::from([CONVERGED_TARGET_LOOKUP]),
+        "a backend that answers `UsageRecordNotConverged` for an entry it has already \
+         acknowledged must fail `converged-target-lookup` under an `Eventual` declaration too, \
+         and fail nothing else. Under that declaration the check waits out the whole of the \
+         declared convergence bound before it requires an answer, which is the one path through \
+         it no other test in this file takes; the answer is still undecided afterwards, and \
+         undecided is admissible only until the plugin can decide."
     );
 }
 
@@ -445,7 +536,7 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 /// This is what makes the module's coverage claim structural instead of
 /// narrative. `run_all` returning no violations says nothing about a check
 /// it never ran, and "run this suite" is the acceptance criterion for
-/// porting a storage backend, so a suite that runs eight checks must not
+/// porting a storage backend, so a suite that runs ten checks must not
 /// read as a suite that ran sixteen. Asserting the partition means a check
 /// cannot half-land — implemented but still listed unwritten, or written
 /// and listed nowhere — without this failing, and `UNWRITTEN_CHECKS`
