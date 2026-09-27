@@ -41,6 +41,7 @@ pub mod models;
 pub mod plugin_api;
 pub mod quantity;
 pub mod reason;
+pub mod reconciliation;
 pub mod serde_helpers;
 pub mod time_range;
 
@@ -63,4 +64,5 @@ pub use models::{
 pub use plugin_api::UsageCollectorPluginV1;
 pub use quantity::{MAX_QUANTITY_SIGNIFICANT_DIGITS, UsageQuantity};
 pub use reason::{ConflictReason, NotFoundReason, ValidationReason};
+pub use reconciliation::{ReconciliationMetadata, ReconciliationScope};
 pub use time_range::TimeRange;

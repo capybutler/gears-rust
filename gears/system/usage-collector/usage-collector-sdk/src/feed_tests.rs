@@ -66,15 +66,18 @@ fn positions_compare_and_hash_equal_exactly_when_their_bytes_are_equal() {
 }
 
 fn meter(suffix: &str) -> MeterTypeId {
-    MeterTypeId::new(format!("gts.cf.core.uc.usage_record.v1~test.{suffix}._.meter.v1~"))
-        .expect("the fixture meter id is well formed")
+    MeterTypeId::new(format!(
+        "gts.cf.core.uc.usage_record.v1~test.{suffix}._.meter.v1~"
+    ))
+    .expect("the fixture meter id is well formed")
 }
 
 #[test]
 fn a_start_is_named_rather_than_inferred_from_an_absent_position() {
     let oldest: FeedStart<FeedPosition> = FeedStart::Oldest;
     let resumed = FeedStart::After(FeedPosition::new(vec![1]).expect("one byte is admissible"));
-    let same_resumed = FeedStart::After(FeedPosition::new(vec![1]).expect("one byte is admissible"));
+    let same_resumed =
+        FeedStart::After(FeedPosition::new(vec![1]).expect("one byte is admissible"));
 
     assert_eq!(oldest, FeedStart::Oldest);
     assert_eq!(resumed, same_resumed);
