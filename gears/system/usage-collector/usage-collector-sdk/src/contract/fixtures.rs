@@ -8,6 +8,14 @@
 //! [`crate::models::UsageRecord`] is projected, so two entries differ
 //! exactly where the check that asked for them meant them to.
 //!
+//! A check the sharing does not suit derives its own vocabulary from the
+//! same place: [`check_meter`] mints a meter for one check's exclusive use,
+//! and [`contract_tenant`] a tenant from a block no named id falls in. A
+//! feed read is what needs them: its subscription selects by meter, so
+//! whatever another check left on [`CONTRACT_METER_TYPE_ID`] under the
+//! grant it dispatches lands on the same page, and what the check observed
+//! would turn on the order `super::run_all` happened to dispatch in.
+//!
 //! [`violation`] lives here for the same reason: every check in
 //! [`super::checks`] reports through it, and so does
 //! [`super::HARNESS_FAULT`].
@@ -19,15 +27,63 @@ use uuid::Uuid;
 use super::ContractViolation;
 use crate::models::{
     CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RECORD_ID_FIELD, ReasonCode,
-    RecordOrigin, ResourceRef, UsageRecord, WINDOW_END_FIELD,
+    RecordOrigin, ResourceRef, USAGE_RECORD_BASE_TYPE, UsageRecord, WINDOW_END_FIELD,
 };
 use crate::quantity::UsageQuantity;
 
-/// The meter every fixture entry attaches to. A single derived type is
-/// enough: no implemented check reads a declaration, and the SPI never sees
-/// one — the fold arrives as a parameter.
+/// The meter the shared builders below attach an entry to. A single derived
+/// type is enough for them: no implemented check reads a declaration, and
+/// the SPI never sees one — the fold arrives as a parameter.
+///
+/// A check that cannot share it derives one of its own through
+/// [`check_meter`].
 pub const CONTRACT_METER_TYPE_ID: &str =
     gts_id!("cf.core.uc.usage_record.v1~cf.core.uc.contract_suite.v1~");
+
+/// Derives a meter for one check's exclusive use.
+///
+/// [`CONTRACT_METER_TYPE_ID`] is shared by the whole suite, and a check that
+/// selects entries by meter — a feed read, whose subscription is a list of
+/// meters — cannot live with that. `super::run_all` dispatches every check
+/// against one persistent backend that writes entries and never removes
+/// them, so a page read over the shared meter carries whatever the other
+/// checks left on it, and what the check observes turns on the order the
+/// suite happened to run in. A meter derived here is written and read by
+/// one check alone.
+///
+/// `role` separates the meters one check needs from each other — a check
+/// that subscribes to one meter and deliberately writes to a second, say.
+///
+/// **Collision-freedom is structural rather than asserted.** Check names are
+/// unique, and `the_three_coverage_constants_partition_the_design_checks` is
+/// what holds them so: a name appearing in two coverage constants fails that
+/// partition. Two derivations therefore collide only when one check passes
+/// one `role` twice, which is that check's own doing and visible in it.
+///
+/// Every `-` in the pair becomes `_`. The `gts-id` grammar admits only
+/// `[a-z0-9_]` inside a token and every DESIGN §3.3 check name is
+/// hyphenated; a segment needs five dot-separated tokens
+/// (`vendor.package.namespace.type.vMAJOR`), which `cf.core.uc.<slug>.v1`
+/// satisfies.
+///
+/// `Err` carries a ready-to-report detail. That every check name derives at
+/// all is asserted by `every_check_name_derives_a_distinct_valid_meter`
+/// rather than left to the check that calls this, because the failure would
+/// otherwise reach a plugin author as a harness fault against a conforming
+/// backend.
+///
+/// The `dead_code` allow is deliberate and temporary. Nothing in the
+/// non-test build calls this yet: the checks that will are the ones
+/// [`UNWRITTEN_CHECKS`](super::UNWRITTEN_CHECKS) names, and until one lands
+/// the only caller is that unit test. `expect` in place of `allow` would be
+/// the self-removing form and is not usable here — under `cfg(test)` the
+/// function *is* called, so the expectation would go unfulfilled.
+#[allow(dead_code)]
+pub fn check_meter(check: &str, role: &str) -> Result<MeterTypeId, String> {
+    let slug = format!("{check}_{role}").replace('-', "_");
+    MeterTypeId::new(format!("{USAGE_RECORD_BASE_TYPE}cf.core.uc.{slug}.v1~"))
+        .map_err(|err| format!("the check's own derived meter id `{slug}` is invalid: {err}"))
+}
 
 /// The tenant every fixture entry is attributed to, and the one value the
 /// scope filter the suite dispatches pins.
@@ -51,7 +107,15 @@ pub const SCOPE_UNUSED_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8
 /// hand to another. `super::contract_tests` says what it is for.
 pub const FEED_OTHER_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0004);
 
-// Every tenant id above is distinct, established when the crate compiles.
+/// The floor of the block [`contract_tenant`] mints from, and the id it
+/// mints at index zero.
+///
+/// Above all four named ids, established when the crate compiles by the
+/// second assertion in the block below.
+const CONTRACT_TENANT_BLOCK: u128 = 0xc047_c047_0000_4000_8000_0001_0000_0000;
+
+// Every tenant id above is distinct, and every one of them is below
+// `CONTRACT_TENANT_BLOCK`. Both are established when the crate compiles.
 //
 // The ids are minted here rather than in each module that reads them, and
 // this is the whole reason. `super::run_all` dispatches every check against
@@ -62,6 +126,14 @@ pub const FEED_OTHER_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_800
 // and it has happened: `FEED_OTHER_TENANT_ID` was a second `...0003` literal
 // in `contract_tests.rs`, under a doc comment claiming it was distinct from
 // `SCOPE_UNUSED_TENANT_ID`. A doc comment cannot hold that; this can.
+//
+// `contract_tenant` reaches that same premise, and by the same route: it is
+// a factory rather than a literal, so nothing about its call sites says
+// which ids it hands out. The second assertion is what keeps its block clear
+// of the four named ids. Were it not, the factory could hand a check
+// `SCOPE_UNUSED_TENANT_ID`, and whether the scope check's claim that that id
+// owns no entry still held would depend on which of the two `run_all`
+// dispatched first.
 const _: () = {
     let ids = [
         CONTRACT_TENANT_ID.as_u128(),
@@ -83,7 +155,39 @@ const _: () = {
         }
         first += 1;
     }
+    let mut named = 0;
+    while named < ids.len() {
+        assert!(
+            ids[named] < CONTRACT_TENANT_BLOCK,
+            "a named tenant id falls inside the block `contract_tenant` mints from: the factory \
+             would then hand some check an id another check already owns entries under, and \
+             `SCOPE_UNUSED_TENANT_ID`'s assertion that it owns none would turn on which check \
+             `run_all` dispatched first"
+        );
+        named += 1;
+    }
 };
+
+/// Mints the `index`-th tenant of a block disjoint from every named id.
+///
+/// [`FEED_POSITION_BOUNDED`](super::FEED_POSITION_BOUNDED)'s rule is about a
+/// subscription spanning **many** tenants — DESIGN §3.3 gives it as *"A
+/// position issued for a subscription spanning many tenants encodes to the
+/// same size as one spanning few, so the wire cursor holding it stays inside
+/// its bound"* — so a check asserting it needs more tenants than the four
+/// named above, and needs them without colliding with those four.
+///
+/// That the block is clear of those four is a compile-time assertion rather
+/// than a matter of inspection; the comment on that assertion says why an
+/// overlap would be worse than a failing check.
+///
+/// The `dead_code` allow is deliberate and temporary, for the reason
+/// [`check_meter`]'s docs give.
+#[allow(dead_code)]
+#[must_use]
+pub fn contract_tenant(index: u32) -> Uuid {
+    Uuid::from_u128(CONTRACT_TENANT_BLOCK + u128::from(index))
+}
 
 /// `2020-01-01T00:00:00Z`, the base every fixture covered period is offset
 /// from.
@@ -213,6 +317,10 @@ pub fn fixture_record(
 /// `tenant_id` is one of the six inputs the derived identity reads, so two
 /// entries differing only here are two entries rather than an idempotent
 /// replay of one.
+///
+/// The meter is [`CONTRACT_METER_TYPE_ID`] and the acceptance instant
+/// [`CONTRACT_ACCEPTED_AT`]. A check that has to vary either goes to
+/// [`fixture_record_on`], which this delegates to.
 pub fn fixture_record_for_tenant(
     tenant_id: Uuid,
     idempotency_key: &IdempotencyKey,
@@ -220,10 +328,51 @@ pub fn fixture_record_for_tenant(
     window_start: time::OffsetDateTime,
     window_end: time::OffsetDateTime,
 ) -> Result<UsageRecord, String> {
+    fixture_record_on(
+        MeterTypeId::new(CONTRACT_METER_TYPE_ID)
+            .map_err(|err| format!("the check's own meter type id is invalid: {err}"))?,
+        tenant_id,
+        idempotency_key,
+        quantity,
+        CONTRACT_ACCEPTED_AT,
+        window_start,
+        window_end,
+    )
+}
+
+/// Builds one fixture entry on a caller-chosen meter, tenant and acceptance
+/// instant — the general builder the two above delegate to.
+///
+/// **`accepted_at` is a parameter here and [`CONTRACT_ACCEPTED_AT`] in both
+/// of them.** `latest-tie-break` reads it as the middle key of DESIGN §3.1's
+/// three-key order — *"Greatest `window_end`, then greatest `accepted_at`,
+/// then greatest `id` in byte order"* — and two entries stamped from one
+/// constant agree on it, so they cannot discriminate on it.
+///
+/// `gts_type_id` is a parameter for the reason [`check_meter`] gives: a
+/// check that selects entries by meter needs a meter no other check writes
+/// to.
+///
+/// The resource, the subject and the metadata stay the shared vocabulary.
+/// No check varies them, and holding them fixed is what makes two entries
+/// differ exactly where the check that asked for them meant them to.
+///
+/// The projection derives the entry's `id` and validates the period, so a
+/// fixture with an inverted period or a bound finer than a microsecond is
+/// refused here rather than reaching a plugin. `Err` carries a
+/// ready-to-report detail.
+pub fn fixture_record_on(
+    gts_type_id: MeterTypeId,
+    tenant_id: Uuid,
+    idempotency_key: &IdempotencyKey,
+    quantity: UsageQuantity,
+    accepted_at: time::OffsetDateTime,
+    window_start: time::OffsetDateTime,
+    window_end: time::OffsetDateTime,
+) -> Result<UsageRecord, String> {
     CreateUsageRecord {
         entry_type: EntryType::Record,
-        gts_type_id: MeterTypeId::new(CONTRACT_METER_TYPE_ID)
-            .map_err(|err| format!("the check's own meter type id is invalid: {err}"))?,
+        gts_type_id,
         tenant_id,
         resource_ref: ResourceRef::new(CONTRACT_RESOURCE_ID, CONTRACT_RESOURCE_TYPE)
             .map_err(|err| format!("the check's own resource reference is invalid: {err}"))?,
@@ -235,7 +384,7 @@ pub fn fixture_record_for_tenant(
         window_start,
         window_end,
     }
-    .try_into_usage_record(RecordOrigin::Live, CONTRACT_ACCEPTED_AT)
+    .try_into_usage_record(RecordOrigin::Live, accepted_at)
     .map_err(|err| format!("the check's own submission is not projectable: {err}"))
 }
 
@@ -273,12 +422,29 @@ pub fn violation(check: &'static str, detail: String) -> ContractViolation {
     ContractViolation { check, detail }
 }
 
-/// A faithful invalidation of `target` stating `reason`.
+/// A faithful invalidation of `target` stating `reason`, stamped
+/// [`CONTRACT_ACCEPTED_AT`].
 ///
 /// Every invalidation of one target repeats that target's idempotency key and
 /// carries `entry_type = invalidation`, so two withdrawals of one target agree
 /// on all six identity inputs and derive one id. The reason code is the one
 /// field they can differ in, and `at-most-one-invalidation` needs two that do.
+///
+/// [`fixture_invalidation_on`] is the same builder with the acceptance
+/// instant left open, and carries the note on the projection.
+pub fn fixture_invalidation_with_reason(
+    target: &UsageRecord,
+    reason: &str,
+) -> Result<UsageRecord, String> {
+    fixture_invalidation_on(target, reason, CONTRACT_ACCEPTED_AT)
+}
+
+/// The same withdrawal stamped a caller-chosen acceptance instant — the
+/// general form [`fixture_invalidation_with_reason`] delegates to.
+///
+/// `accepted_at` is a parameter for the reason it is one on
+/// [`fixture_record_on`]: it is the middle key of DESIGN §3.1's `LATEST`
+/// tie-break, and two entries stamped from one constant agree on it.
 ///
 /// The projection is [`CreateUsageRecord::try_into_invalidation_record`]
 /// rather than `try_into_usage_record`, which refuses a submission declaring
@@ -286,9 +452,10 @@ pub fn violation(check: &'static str, detail: String) -> ContractViolation {
 /// target's `id` is stamped here the way the gateway stamps what it
 /// resolved, and the derivation reads the declared `entry_type` instead of
 /// the target's.
-pub fn fixture_invalidation_with_reason(
+pub fn fixture_invalidation_on(
     target: &UsageRecord,
     reason: &str,
+    accepted_at: time::OffsetDateTime,
 ) -> Result<UsageRecord, String> {
     let reason = ReasonCode::new(reason)
         .map_err(|err| format!("the check's own reason code is invalid: {err}"))?;
@@ -305,6 +472,6 @@ pub fn fixture_invalidation_with_reason(
         window_start: target.window_start,
         window_end: target.window_end,
     }
-    .try_into_invalidation_record(RecordOrigin::Live, CONTRACT_ACCEPTED_AT, target.id)
+    .try_into_invalidation_record(RecordOrigin::Live, accepted_at, target.id)
     .map_err(|err| format!("the check's own submission is not projectable: {err}"))
 }

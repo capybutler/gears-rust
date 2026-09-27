@@ -1,6 +1,6 @@
 //! Tests for the contract suite itself.
 //!
-//! Four different things are asserted here, in the order the file puts
+//! Five different things are asserted here, in the order the file puts
 //! them, and none is a plugin's conformance.
 //!
 //! The first is that the suite runs and passes against a backend built to
@@ -21,10 +21,17 @@
 //! The third is that the three coverage constants still partition DESIGN's
 //! sixteen checks, so a passing run cannot read as a complete one.
 //!
-//! The fourth is the reference backend's own fail-closed posture, which is
+//! The fourth is the fixture vocabulary's own two guards: that every check
+//! name derives a valid, distinct meter, and that the tenant factory cannot
+//! mint one of the four named tenant ids. Both keep one check's entries out
+//! of another's reads on the single shared backend `run_all` dispatches
+//! against — a premise no check can assert for itself, because breaking it
+//! decides a check on dispatch order rather than on the plugin.
+//!
+//! The fifth is the reference backend's own fail-closed posture, which is
 //! not a contract check but is the thing a plugin author copies.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use toolkit_odata::{ODataQuery, ast};
 use uuid::Uuid;
@@ -378,6 +385,100 @@ fn the_three_coverage_constants_partition_the_design_checks() {
         "`run_all` runs the scope check, so leaving it out of `ADDITIONAL_CHECKS` would make a \
          caller reporting coverage under-report what the run actually covered"
     );
+}
+
+/// Every check name derives a valid meter, and no two derivations collide.
+///
+/// The union of the three constants iterated below is invariant as a check
+/// moves from `UNWRITTEN_CHECKS` to `IMPLEMENTED_CHECKS`, which is the only
+/// move being made — `the_three_coverage_constants_partition_the_design_checks`
+/// holds `IMPLEMENTED_CHECKS`, `UNWRITTEN_CHECKS` and `BLOCKED_CHECKS` to
+/// DESIGN's sixteen, and `ADDITIONAL_CHECKS` carries the one name DESIGN
+/// does not tabulate. So this keeps covering all seventeen names as checks
+/// land and `UNWRITTEN_CHECKS` empties. `BLOCKED_CHECKS` is left out of the
+/// iteration because it is empty and a blocked check has no fixtures to
+/// keep apart; a name moved into it would leave this test, which that
+/// constant's own stop-sign assertion makes a deliberate act.
+///
+/// **`MeterTypeId::new` fails at runtime, inside whichever fixture called
+/// `check_meter`.** Without this test, a check name the `gts-id` grammar
+/// rejects reaches a plugin author as a harness fault reported against a
+/// conforming backend; with it, it is a unit failure naming the check.
+///
+/// The distinctness half is the property `check_meter`'s docs call
+/// structural. It is asserted here rather than left to the argument because
+/// the argument rests on the partition test, and a reader of one has no way
+/// to see the other.
+#[test]
+fn every_check_name_derives_a_distinct_valid_meter() {
+    let mut derived: BTreeMap<String, (&str, &str)> = BTreeMap::new();
+
+    for &check in IMPLEMENTED_CHECKS
+        .iter()
+        .chain(ADDITIONAL_CHECKS)
+        .chain(UNWRITTEN_CHECKS)
+    {
+        for role in ["main", "quiet", "other"] {
+            let meter = super::fixtures::check_meter(check, role).unwrap_or_else(|err| {
+                panic!(
+                    "`{check}` under role `{role}` must derive a valid meter, and a failure here \
+                     is the `gts-id` grammar rather than the call site: {err}"
+                )
+            });
+            if let Some((earlier, earlier_role)) =
+                derived.insert(meter.as_str().to_owned(), (check, role))
+            {
+                panic!(
+                    "`{check}`/`{role}` and `{earlier}`/`{earlier_role}` derive the one meter \
+                     `{meter}`: `run_all` dispatches every check against one backend that never \
+                     removes an entry, so two checks on one meter read each other's entries and \
+                     what either observes turns on dispatch order"
+                );
+            }
+        }
+    }
+}
+
+/// The tenant factory cannot mint one of the four named tenant ids.
+///
+/// `fixtures`' second compile-time assertion already holds
+/// `CONTRACT_TENANT_BLOCK` above all four, and this reads the property off
+/// the factory rather than off the constant. The two are not one claim: the
+/// assertion says where the block starts, and this says that what
+/// `contract_tenant` actually hands out stays clear of the named ids, which
+/// is what fails when the factory stops deriving from that block at all.
+///
+/// The sharpest case either guard protects is `SCOPE_UNUSED_TENANT_ID`,
+/// whose entire assertion value is that it owns no entry on a shared
+/// backend that never removes one.
+#[test]
+fn the_tenant_factory_cannot_mint_a_named_tenant() {
+    let named = [
+        ("CONTRACT_TENANT_ID", super::fixtures::CONTRACT_TENANT_ID),
+        (
+            "SCOPE_EXCLUDED_TENANT_ID",
+            super::fixtures::SCOPE_EXCLUDED_TENANT_ID,
+        ),
+        (
+            "SCOPE_UNUSED_TENANT_ID",
+            super::fixtures::SCOPE_UNUSED_TENANT_ID,
+        ),
+        (
+            "FEED_OTHER_TENANT_ID",
+            super::fixtures::FEED_OTHER_TENANT_ID,
+        ),
+    ];
+
+    for index in 0..64_u32 {
+        let minted = super::fixtures::contract_tenant(index);
+        for (name, named_id) in named {
+            assert_ne!(
+                minted, named_id,
+                "`contract_tenant({index})` minted `{name}`, so a check handed that tenant would \
+                 share entries with the check that owns the named id"
+            );
+        }
+    }
 }
 
 /// An uninterpretable comparison never admits a row, under `eq` or `ne`.
