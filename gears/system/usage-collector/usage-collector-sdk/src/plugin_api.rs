@@ -14,7 +14,9 @@ use crate::reconciliation::ReconciliationMetadata;
 use crate::time_range::TimeRange;
 
 /// Backend storage adapter trait implemented by
-/// `usage-collector-plugin-<backend>` crates.
+/// `usage-collector-plugin-<backend>` crates. DESIGN §3.3 names this trait
+/// `cpt-cf-usage-collector-interface-plugin` and its contract
+/// `cpt-cf-usage-collector-contract-storage-plugin`.
 ///
 /// # Obligations (DESIGN §3.3)
 ///
@@ -36,10 +38,8 @@ use crate::time_range::TimeRange;
 ///
 /// The contract suite in `usage_collector_sdk::contract` (feature `contract`)
 /// is what binds an implementation to these.
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-contract-storage-plugin:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-nfr-plugin-contract-stability:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-principle-contract-stability:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-foundation-adr-contract-stability:p1
+// @cpt-dod:cpt-cf-usage-collector-dod-plugin-spi-sole-seam:p1
+// @cpt-dod:cpt-cf-usage-collector-dod-plugin-spi-compat-rule:p1
 #[async_trait]
 pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// Persist a single usage record.

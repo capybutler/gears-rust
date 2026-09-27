@@ -303,6 +303,7 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// [`run_all`] returning no violations says nothing whatever about a check
 /// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
 /// reports five checks' worth of evidence as sixteen.
+// @cpt-dod:cpt-cf-usage-collector-dod-plugin-conformance-suite:p1
 pub const UNWRITTEN_CHECKS: &[&str] = &[
     RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
     CONVERGED_TARGET_LOOKUP,

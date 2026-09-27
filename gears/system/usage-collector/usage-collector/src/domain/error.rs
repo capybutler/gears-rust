@@ -292,6 +292,8 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
 // `UsageCollectorPluginError` is `#[non_exhaustive]`. The catch-all arm exists
 // only for future variant growth; the `is_*_exhaustive_today` debug_assert
 // fires in tests if a new variant is added without extending the match.
+// @cpt-dod:cpt-cf-usage-collector-dod-plugin-error-mapping:p1
+// @cpt-algo:cpt-cf-usage-collector-algo-plugin-error-classification:p1
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<UsageCollectorPluginError> for DomainError {
     fn from(e: UsageCollectorPluginError) -> Self {
