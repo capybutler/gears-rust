@@ -83,8 +83,9 @@ pub(super) enum Defect {
     /// Selects on `window_start` instead of `window_end` — the mistake a
     /// backend makes by porting the pre-period point-in-time column.
     SelectsOnWindowStart,
-    /// Keys dedup on `(tenant, type, idempotency_key)`, omitting the period
-    /// bounds. The pre-period identity.
+    /// Keys dedup on `(tenant, type, idempotency_key, entry_type)`, omitting
+    /// the two covered-period bounds — the derived identity with the period
+    /// struck out.
     DedupIgnoresThePeriod,
     /// Excludes the withdrawn record from the fold but folds the
     /// invalidation. DESIGN names this one: it double-counts the withdrawn
@@ -143,8 +144,8 @@ struct WrappedReference {
     /// Which rule this subject breaks.
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
-    /// on: `(tenant_id, gts_type_id, idempotency_key)` to the entry that
-    /// claimed it. Unused by the other four defects.
+    /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
+    /// entry that claimed it. Unused by the other four defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -159,13 +160,15 @@ struct WrappedReference {
     period_blind_keys: Mutex<BTreeMap<PeriodBlindKey, UsageRecord>>,
 }
 
-/// The three attributes the pre-period dedup identity keyed on:
-/// `(tenant_id, gts_type_id, idempotency_key)`.
+/// The four inputs a period-blind dedup identity keys on:
+/// `(tenant_id, gts_type_id, idempotency_key, entry_type)`, the entry type as
+/// the lowercase wire literal the derivation itself reads
+/// ([`crate::models::EntryType::as_str`]).
 ///
-/// Named for what it leaves out. The derived identity reads five attributes,
-/// and the two missing here are the covered-period bounds — which is the
-/// whole of [`Defect::DedupIgnoresThePeriod`].
-type PeriodBlindKey = (Uuid, String, String);
+/// Named for what it leaves out. The derived identity reads six inputs, and
+/// the two missing here are the covered-period bounds — which is the whole of
+/// [`Defect::DedupIgnoresThePeriod`].
+type PeriodBlindKey = (Uuid, String, String, &'static str);
 
 impl WrappedReference {
     /// Wraps a fresh reference backend.
@@ -213,13 +216,18 @@ impl WrappedReference {
     }
 
     /// Admits an entry only if no other entry already holds its
-    /// `(tenant, type, idempotency_key)`.
+    /// `(tenant, type, idempotency_key, entry_type)`.
     ///
-    /// This is a unique index over the three attributes the pre-period model
-    /// keyed on, and it is the whole of the defect: the two covered-period
-    /// bounds are part of the derived identity and invisible to this index,
-    /// so one key over two periods collides here and is one entry rather
-    /// than two.
+    /// This is a unique index over the derived identity with the covered
+    /// period struck out, and that omission is the whole of the defect: the
+    /// two bounds are inputs to the derived identity and invisible to this
+    /// index, so one key over two periods collides here and is one entry
+    /// rather than two.
+    ///
+    /// The entry type is in the index for the opposite reason. A withdrawal
+    /// repeats its target's idempotency key, so an index blind to it would
+    /// collide every withdrawal with the record it withdraws — a second
+    /// mistake, in a subject that must be wrong in exactly one way.
     ///
     /// A resubmission of an entry that already claimed the key carries the
     /// same derived `id`, so an idempotent replay still reaches the inner
@@ -232,6 +240,7 @@ impl WrappedReference {
             record.tenant_id,
             record.gts_type_id.as_str().to_owned(),
             record.idempotency_key.as_str().to_owned(),
+            record.entry_type().as_str(),
         );
         let mut claimed = self.period_blind_keys.lock().map_err(|_| {
             UsageCollectorPluginError::internal("the mutant's dedup index lock is poisoned")
@@ -346,11 +355,12 @@ impl UsageCollectorPluginV1 for WrappedReference {
         // under the suite as written: two defects refuse entries here,
         // `DedupIgnoresThePeriod` and `RefusesAWithdrawalWithTheSameReason`,
         // and the one batch the suite sends carries two withdrawals of a
-        // target that has none stored yet, under one derived key and one
-        // `id` — so the period-blind index admits both and the same-reason
-        // refusal finds nothing stored to refuse them against. That is also
-        // why the emptiness guard above is repeated rather than left to the
-        // inner backend to raise.
+        // target that has none stored yet, both repeating that target's
+        // idempotency key and so deriving one `id` — the period-blind index
+        // admits the second under the claim the first left, and the
+        // same-reason refusal finds nothing stored to refuse either against.
+        // That is also why the emptiness guard above is repeated rather than
+        // left to the inner backend to raise.
         let inner = if survivors.is_empty() {
             Vec::new()
         } else {

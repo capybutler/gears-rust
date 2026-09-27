@@ -516,13 +516,14 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
 
 /// Decides one entry against the ledger it is being admitted to.
 ///
-/// A collision on `id` — the `UUIDv5` of the five dedup-identity attributes, so
-/// a collision already means those five agree — is decided by the rest of what
+/// A collision on `id` — the `UUIDv5` of the six dedup-identity inputs, so a
+/// collision already means those six agree — is decided by the rest of what
 /// the caller supplied ([`UsageRecord::caller_supplied_eq`]): equal is an
 /// idempotent replay answering with the stored entry, different is
 /// [`UsageCollectorPluginError::IdempotencyConflict`] carrying it. A second
 /// invalidation of one record is this same branch: every invalidation of one
-/// record derives the same `inv:<target>` key.
+/// record repeats that record's idempotency key under
+/// `entry_type = invalidation`, so all of them reach those same six inputs.
 fn admit(
     ledger: &mut Vec<UsageRecord>,
     record: UsageRecord,

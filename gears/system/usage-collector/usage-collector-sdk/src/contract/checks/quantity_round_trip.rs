@@ -196,10 +196,10 @@ pub fn quantity_fixture(index: usize, literal: &'static str) -> Result<QuantityF
 
     // Keyed on the **literal**, never on its position. The entry `id`
     // derives from `(tenant, gts_type, idempotency_key, window_start,
-    // window_end)` and the quantity is not an input, so an index-keyed
-    // fixture would give a changed corner the id of the corner that used to
-    // sit at that index — and the ledger is append-only with no delete
-    // path, so every backend that ever ran the older suite would answer
+    // window_end, entry_type)` and the quantity is not an input, so an
+    // index-keyed fixture would give a changed corner the id of the corner
+    // that used to sit at that index — and the ledger is append-only with no
+    // delete path, so every backend that ever ran the older suite would answer
     // `IdempotencyConflict` for ever, and this check would report it as the
     // plugin refusing a published quantity. Keying on the literal gives a
     // changed, reordered or inserted corner a fresh identity instead.

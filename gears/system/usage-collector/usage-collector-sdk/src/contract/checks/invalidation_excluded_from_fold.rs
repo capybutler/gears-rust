@@ -382,8 +382,9 @@ fn fold_fixtures() -> Result<FoldFixtures, String> {
     // entries carry one covered period, so no `time_range` selects one of
     // the pair without the other and no placement of the invalidation
     // changes a result. It carries the target's quantity too, echoed
-    // rather than negated.
-    let invalidation = fixture_invalidation(withdrawn_value, live_end, pair_end, withdrawn.id)?;
+    // rather than negated, and the target's idempotency key, which is why
+    // the builder takes the entry rather than its id.
+    let invalidation = fixture_invalidation(&withdrawn)?;
 
     let ids = BTreeSet::from([live.id, withdrawn.id, invalidation.id]);
     if ids.len() != 3 {

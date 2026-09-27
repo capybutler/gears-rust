@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use super::ContractViolation;
 use crate::models::{
-    CreateUsageRecord, IdempotencyKey, Invalidation, MeterTypeId, RECORD_ID_FIELD, ReasonCode,
-    RecordOrigin, ResourceRef, UsageRecord, WINDOW_END_FIELD,
+    CreateUsageRecord, IdempotencyKey, MeterTypeId, RECORD_ID_FIELD, ReasonCode, RecordOrigin,
+    ResourceRef, UsageRecord, WINDOW_END_FIELD,
 };
 use crate::quantity::UsageQuantity;
 
@@ -210,9 +210,9 @@ pub fn fixture_record(
 /// alternates the two tenants so that every page of a feed read carries some
 /// entries and withholds others.
 ///
-/// `tenant_id` is one of the five attributes the derived identity reads, so
-/// two entries differing only here are two entries rather than an
-/// idempotent replay of one.
+/// `tenant_id` is one of the six inputs the derived identity reads, so two
+/// entries differing only here are two entries rather than an idempotent
+/// replay of one.
 pub fn fixture_record_for_tenant(
     tenant_id: Uuid,
     idempotency_key: &IdempotencyKey,
@@ -245,32 +245,20 @@ pub fn fixture_record_for_tenant(
 /// serves and no check reads this one.
 const CONTRACT_REASON_CODE: &str = "contract-suite-withdrawal";
 
-/// Builds one invalidation of `target`. Its key is derived as `inv:<target>`,
-/// so every invalidation of one target shares one identity.
-pub fn fixture_invalidation(
-    quantity: UsageQuantity,
-    window_start: time::OffsetDateTime,
-    window_end: time::OffsetDateTime,
-    target: Uuid,
-) -> Result<UsageRecord, String> {
-    let reason = ReasonCode::new(CONTRACT_REASON_CODE)
-        .map_err(|err| format!("the check's own reason code is invalid: {err}"))?;
-    CreateUsageRecord {
-        gts_type_id: MeterTypeId::new(CONTRACT_METER_TYPE_ID)
-            .map_err(|err| format!("the check's own meter type id is invalid: {err}"))?,
-        tenant_id: CONTRACT_TENANT_ID,
-        resource_ref: ResourceRef::new(CONTRACT_RESOURCE_ID, CONTRACT_RESOURCE_TYPE)
-            .map_err(|err| format!("the check's own resource reference is invalid: {err}"))?,
-        subject_ref: None,
-        metadata: std::collections::BTreeMap::new(),
-        quantity,
-        idempotency_key: None,
-        invalidation: Some(Invalidation { target, reason }),
-        window_start,
-        window_end,
-    }
-    .try_into_usage_record(RecordOrigin::Live, CONTRACT_ACCEPTED_AT)
-    .map_err(|err| format!("the check's own submission is not projectable: {err}"))
+/// Builds one faithful invalidation of `target`, under the reason code
+/// `CONTRACT_REASON_CODE` names.
+///
+/// The target is the whole input. A withdrawal repeats every caller-supplied
+/// field of its target and departs from it in `entry_type` and the reason
+/// code alone (DESIGN §3.1, Faithful copy), so there is nothing left for a
+/// caller to supply — and a builder taking loose parts could be handed parts
+/// that copy no stored entry.
+///
+/// Every invalidation of one target therefore repeats that target's
+/// idempotency key and carries `entry_type = invalidation`, so all of them
+/// share one identity and none shares the target's.
+pub fn fixture_invalidation(target: &UsageRecord) -> Result<UsageRecord, String> {
+    fixture_invalidation_with_reason(target, CONTRACT_REASON_CODE)
 }
 
 /// A [`ContractViolation`] attributed to one check.
@@ -286,9 +274,16 @@ pub fn violation(check: &'static str, detail: String) -> ContractViolation {
 
 /// A faithful invalidation of `target` stating `reason`.
 ///
-/// Every invalidation of one target derives the same `inv:<target>` key, so
-/// the reason code is the one field two withdrawals of one target can differ
-/// in, and `at-most-one-invalidation` needs two that do.
+/// Every invalidation of one target repeats that target's idempotency key and
+/// carries `entry_type = invalidation`, so two withdrawals of one target agree
+/// on all six identity inputs and derive one id. The reason code is the one
+/// field they can differ in, and `at-most-one-invalidation` needs two that do.
+///
+/// The projection is [`CreateUsageRecord::try_into_invalidation_record`]
+/// rather than `try_into_usage_record`, which refuses a submission carrying a
+/// reason code: `invalidates` is server-assigned, so the target's `id` is
+/// stamped here the way the gateway stamps what it resolved, and the
+/// derivation reads `entry_type = invalidation` instead.
 pub fn fixture_invalidation_with_reason(
     target: &UsageRecord,
     reason: &str,
@@ -302,14 +297,11 @@ pub fn fixture_invalidation_with_reason(
         subject_ref: target.subject_ref.clone(),
         metadata: target.metadata.clone(),
         quantity: target.quantity,
-        idempotency_key: None,
-        invalidation: Some(Invalidation {
-            target: target.id,
-            reason,
-        }),
+        idempotency_key: Some(target.idempotency_key.clone()),
+        invalidation: Some(reason),
         window_start: target.window_start,
         window_end: target.window_end,
     }
-    .try_into_usage_record(RecordOrigin::Live, CONTRACT_ACCEPTED_AT)
+    .try_into_invalidation_record(RecordOrigin::Live, CONTRACT_ACCEPTED_AT, target.id)
     .map_err(|err| format!("the check's own submission is not projectable: {err}"))
 }

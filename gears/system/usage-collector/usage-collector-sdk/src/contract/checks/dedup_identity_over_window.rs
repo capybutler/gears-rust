@@ -11,7 +11,7 @@ use crate::contract::fixtures::{
 };
 use crate::contract::{ContractViolation, DEDUP_IDENTITY_OVER_WINDOW, HARNESS_FAULT};
 use crate::derive_usage_record_id;
-use crate::models::{IdempotencyKey, MeterTypeId, UsageRecord};
+use crate::models::{EntryType, IdempotencyKey, MeterTypeId, UsageRecord};
 use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
 use crate::time_range::TimeRange;
@@ -46,8 +46,8 @@ struct DedupFixtures {
     first: UsageRecord,
     /// The entry over the later one, submitted under the same key.
     second: UsageRecord,
-    /// [`derive_usage_record_id`] over the earlier period's five identity
-    /// attributes — derived here rather than read off [`Self::first`], so
+    /// [`derive_usage_record_id`] over the earlier period's six identity
+    /// inputs — derived here rather than read off [`Self::first`], so
     /// the check names the entry the way the gear does.
     first_id: Uuid,
     /// The same derivation over the later period's.
@@ -63,7 +63,7 @@ struct DedupFixtures {
 /// The first half is the rule as DESIGN states it: one idempotency key over
 /// two different periods is two entries, both admitted and both readable,
 /// under the two distinct ids [`derive_usage_record_id`] produces from the
-/// five identity attributes. That half on its own is satisfied by a backend
+/// six identity inputs. That half on its own is satisfied by a backend
 /// that dedups nothing whatsoever — two submissions produced two rows is
 /// exactly what no deduplication looks like.
 ///
@@ -198,8 +198,8 @@ pub async fn dedup_identity_over_window(
 /// Builds the two submissions, deriving each entry's id the way the gear
 /// does.
 ///
-/// The ids come from [`derive_usage_record_id`] over the five identity
-/// attributes rather than being hardcoded or read back off the projected
+/// The ids come from [`derive_usage_record_id`] over the six identity
+/// inputs rather than being hardcoded or read back off the projected
 /// record, and the two guards below are what keep the check honest rather
 /// than vacuous:
 ///
@@ -233,6 +233,9 @@ fn dedup_fixtures() -> Result<DedupFixtures, String> {
             &idempotency_key,
             window_start,
             window_end,
+            // Both fixtures are ordinary measurements: this check varies the
+            // covered period and nothing else, so the sixth input is fixed.
+            EntryType::Record,
         );
         let record = fixture_record(&idempotency_key, quantity, window_start, window_end)?;
         if record.id != derived {

@@ -51,9 +51,11 @@ struct AtMostOneFixtures {
 /// declared dedup level."*
 ///
 /// There is no store-side at-most-one rule to test. Every invalidation of one
-/// record derives the same `inv:<target>` key, so a second one is an ordinary
-/// collision on the dedup identity, and this check holds a plugin to the dedup
-/// outcomes on it:
+/// record repeats that record's idempotency key and carries
+/// `entry_type = invalidation`, so all of them agree on the six identity
+/// inputs and share one identity — and none shares the record's. A second one
+/// is therefore an ordinary collision on the dedup identity, and this check
+/// holds a plugin to the dedup outcomes on it:
 ///
 /// * **Separate calls.** Resubmitting the accepted withdrawal answers with the
 ///   stored invalidation; submitting one under another reason code is
@@ -96,7 +98,10 @@ pub async fn at_most_one_invalidation(
 
 /// Whether `existing` is the accepted withdrawal of `pair`, reason code included.
 fn names_the_first(existing: &UsageRecord, pair: &Pair) -> bool {
-    // Both withdrawals derive `inv:<target>`, so the fixture already makes the ids equal; the reason code is what tells the accepted one from the divergent one.
+    // Both withdrawals repeat the target's key under `entry_type =
+    // invalidation`, so they agree on all six identity inputs and the fixture
+    // already makes the ids equal; the reason code is what tells the accepted
+    // one from the divergent one.
     existing.id == pair.first.id
         && existing
             .invalidation
@@ -161,8 +166,9 @@ async fn separate_calls(
             AT_MOST_ONE_INVALIDATION,
             format!(
                 "a second withdrawal of record {target} under another reason code answered \
-                 {outcome:?}; it collides on the derived `inv:{target}` key and must be \
-                 `IdempotencyConflict` whose `existing` is the accepted withdrawal {first}"
+                 {outcome:?}; it repeats that record's idempotency key under `entry_type = \
+                 invalidation`, so it derives the accepted withdrawal's own id {first} and must \
+                 be `IdempotencyConflict` whose `existing` is that withdrawal"
             ),
         )),
     }
@@ -361,7 +367,8 @@ fn pair(
     if first.id != second.id {
         return Err(format!(
             "the two withdrawals of record {} derive different ids ({} vs {}); every withdrawal \
-             of one target derives `inv:<target>`, so this pair would not collide",
+             of one target repeats that target's idempotency key under `entry_type = \
+             invalidation`, so this pair would not collide",
             target.id, first.id, second.id
         ));
     }

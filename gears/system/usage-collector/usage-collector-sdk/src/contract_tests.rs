@@ -711,9 +711,9 @@ async fn feed_ledger() -> (InMemoryReferencePlugin, Vec<Uuid>) {
 
     let mut ids = Vec::new();
     for (index, tenant_id) in tenants.into_iter().enumerate() {
-        // The idempotency key is one of the five attributes the derived
-        // identity reads, so varying it alone makes four entries rather than
-        // one entry replayed four times.
+        // The idempotency key is one of the six inputs the derived identity
+        // reads, so varying it alone makes four entries rather than one
+        // entry replayed four times.
         let key = IdempotencyKey::new(format!("feed-position-{index}"))
             .expect("the feed fixture key is well formed");
         let offset = time::Duration::hours(i64::try_from(index).unwrap_or(0) + 1);
