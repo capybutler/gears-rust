@@ -309,8 +309,9 @@ impl PgRecordStore {
     }
 
     /// Core single-row insert path: dedup on the `usage_records`
-    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`
-    /// UNIQUE (`usage_records_dedup_uniq`) via `INSERT … ON CONFLICT … DO
+    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
+    /// entry_type)` UNIQUE (`usage_records_dedup_uniq`, plus the partition key
+    /// every hypertable UNIQUE carries) via `INSERT … ON CONFLICT … DO
     /// NOTHING`, then lost-the-race absorb-vs-conflict resolution.
     ///
     /// **One backend transaction.** The entry's `acceptance_sequence` is
@@ -374,8 +375,9 @@ impl PgRecordStore {
         //    6-tuple already exists. Every one of the eighteen [`RECORD_COLUMNS`]
         //    is bound here now that `accepted_at` is written rather than
         //    defaulted; `entry_type` is generated, so it is the one identity
-        //    component the insert does not bind — Postgres computes it from
-        //    `invalidates` and the arbiter reads it back off the stored row.
+        //    component the insert does not bind — Postgres computes it for the
+        //    proposed row and the arbiter probes `usage_records_dedup_uniq`
+        //    with it.
         let subject_id = record
             .subject_ref
             .as_ref()
@@ -585,10 +587,10 @@ impl PgRecordStore {
             .collect();
         let starts: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_start).collect();
         let ends: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_end).collect();
-        let entry_types: Vec<String> = not_won
-            .iter()
-            .map(|r| r.entry_type().as_str().to_owned())
-            .collect();
+        // Borrowed, unlike the owning vectors above: `EntryType::as_str`
+        // hands back a `&'static str`, so there is nothing to clone.
+        let entry_types: Vec<&'static str> =
+            not_won.iter().map(|r| r.entry_type().as_str()).collect();
 
         let select_sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records \
@@ -1351,13 +1353,26 @@ fn build_list_page(
 /// the second against the first.
 ///
 /// It enters as [`entry_type_rank`] rather than as the wire literal, so a
-/// record sorts before its withdrawal. `reps` are sequenced in this order, and
-/// the gear's DESIGN §3.1 Feed order invariant reads "**Correction order**: an
-/// invalidation follows its target" — the literals would order the pair the
-/// wrong way round, since `invalidation` precedes `record` alphabetically. The
-/// gateway does not dispatch a pair in one batch (it admits an invalidation
-/// only once its target has converged), so this decides nothing the gear
-/// currently asks; it costs one `u8` to not depend on that.
+/// record sorts before its withdrawal; the literals would run the pair the
+/// other way round, since `invalidation` precedes `record` alphabetically.
+/// `reps` are sequenced in this order, so within one batch a record's
+/// `acceptance_sequence` is lower than its withdrawal's — which
+/// `records_ingest_integration_pg`'s bind-order test reads back off the two
+/// stored rows.
+///
+/// **That is a plugin-local order, and no gear rule rests on it.** The gear's
+/// DESIGN §3.1 Feed order invariant does read "**Correction order**: an
+/// invalidation follows its target", but `acceptance_sequence` is not this
+/// plugin's `FeedPosition` and naming that invariant here would attribute the
+/// rank to a rule it does not satisfy — the same mis-attribution
+/// [`super::query::aggregate`] repudiated for the `LATEST` tie-break. This
+/// plugin's own DESIGN §3.6 (`cpt-cf-uc-plugin-seq-feed-page`) realizes feed
+/// order as `(xact_id, id)`, and `read_feed_page` is unimplemented
+/// (`domain::adapter`, which says why this column cannot serve as a position).
+/// A pair written in one batch shares one transaction, so `xact_id` ties there
+/// and `id` decides it; the rank reaches none of that. The gateway does not
+/// dispatch such a pair in any case — it admits an invalidation only once its
+/// target has converged (this plugin's DESIGN §3.6, Correction order).
 ///
 /// The two covered-period bounds enter as
 /// [`canonical_period_bound`](usage_collector_sdk::canonical_period_bound)

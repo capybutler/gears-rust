@@ -1357,6 +1357,11 @@ async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
         "metadata"
     );
     assert_eq!(w.entry_type, "invalidation", "entry_type");
+    // Incidental to the bind sequence this test is about, and it holds for one
+    // reason only: `DedupKey`'s `entry_type_rank` sorts a record before its
+    // withdrawal, and a batch claims its acceptance-sequence block in that
+    // order. The pair used to be separated by their idempotency keys, which no
+    // longer differ. Change the rank and this assertion is what reddens.
     assert!(
         w.acceptance_sequence > row.acceptance_sequence,
         "the withdrawal was accepted after its target"

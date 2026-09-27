@@ -49,6 +49,14 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- Materialized so `$filter=entry_type eq 'invalidation'` resolves to a
     -- column. The SDK spells out exactly this expression and notes that the
     -- value hook cannot carry the field instead (models.rs, UsageRecordQuery).
+    --
+    -- Generated, and this migration trails the design on that (this plugin's
+    -- DESIGN §4.5): §3.7's target schema makes it a `usage_entry_type` enum
+    -- "written from the dispatched entry's declared kind and never derived
+    -- from another column". When that lands it takes two things with it — the
+    -- STORED rationale on the dedup UNIQUE below, which is what lets a
+    -- generated column sit in one, and `row_dedup_key`'s reading of an entry's
+    -- kind off `invalidates` (`record_store.rs`).
     entry_type          text        GENERATED ALWAYS AS
         (CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END) STORED,
     -- Strictly monotonic per (tenant_id, gts_type_id); assigned by this plugin,
@@ -84,7 +92,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- then produce two rows for one identity.
     PRIMARY KEY (id, window_end, type_key),
 
-    -- The gear's DESIGN §3.7 dedup obligation, over the 6-tuple verbatim, plus
+    -- The gear's DESIGN §3.7 dedup obligation, over the §3.1 6-tuple verbatim, plus
     -- the partition key the hypertable requires (see the PRIMARY KEY above).
     --
     -- `entry_type` has to be in it. A withdrawal repeats its target's tenant,

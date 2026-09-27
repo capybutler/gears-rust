@@ -466,10 +466,13 @@ fn record_columns_and_insert_columns_name_the_same_set() {
     );
     assert!(
         !names(RECORD_COLUMNS).contains(&"entry_type"),
-        "entry_type is a generated column: no insert binds it and no select \
-         decodes it. It is named in the dedup arbiter and in the conflict \
-         read-back's predicate, where Postgres evaluates it, never carried on \
-         a row -- the mapper projects the model's entry type from `invalidates`"
+        "entry_type is a generated column: no insert binds it, and no \
+         production select decodes it -- it is absent from RECORD_COLUMNS, so \
+         no row carries it and the mapper projects the model's entry type from \
+         `invalidates`. It is named in the dedup arbiter and in the conflict \
+         read-back's predicate, where Postgres evaluates it rather than \
+         handing it back. A pg test may still select it to assert the \
+         generation expression"
     );
     assert_eq!(
         names(INSERT_COLUMNS).last(),
@@ -697,8 +700,9 @@ fn plan_batch_gives_a_record_and_its_withdrawal_two_slots() {
     assert_eq!(
         plan.reps[0].id, target.id,
         "and the record sorts first, so the acceptance-sequence block hands it \
-         the lower value: the gear's DESIGN 3.1 Feed order invariant reads \
-         'Correction order: an invalidation follows its target'"
+         the lower value. That order is plugin-local and satisfies no gear \
+         rule -- see the DedupKey doc, which says why the Feed order \
+         invariant is not what it pins"
     );
 }
 
