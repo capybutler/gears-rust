@@ -3,8 +3,9 @@
 //! See [`feed_snapshot_and_replay`] for what it asserts. The module holds
 //! the eight entries it writes — four before the scan begins and two at each
 //! of the two moments a clause of the row needs something to have settled
-//! since — the three grants it reads them under, and the walk that follows a
-//! cursor instead of assuming a page carries everything.
+//! since — and the three grants it reads them under. The walk itself is
+//! [`super::super::feed_walk`]'s: it was written here, for this check, and
+//! moved out when `feed-completeness` became its second caller.
 //!
 //! **This is the first check in the suite to read the feed as a paginated
 //! walk**, and the first whose fixtures are written *during* a read rather
@@ -18,12 +19,15 @@
 use toolkit_odata::ast;
 use uuid::Uuid;
 
+use crate::contract::feed_walk::{
+    FeedWalk, WalkStop, bounded_replay, feed_walk, first_divergence, ids,
+};
 use crate::contract::fixtures::{
     CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, SCOPE_EXCLUDED_TENANT_ID,
     SCOPE_UNUSED_TENANT_ID, check_meter, contract_tenant, fixture_record_on, violation,
 };
 use crate::contract::{ContractViolation, FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT};
-use crate::feed::{FeedPosition, FeedStart};
+use crate::feed::FeedStart;
 use crate::models::{IdempotencyKey, MeterTypeId, UsageRecord};
 use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
@@ -89,20 +93,6 @@ const FEED_SNAPSHOT_WALK_LIMIT: u64 = 1;
 /// truncated exactly where a comparison would then report the missing
 /// entries as a plugin losing them.
 const FEED_SNAPSHOT_PAGE_LIMIT: u64 = 16;
-
-/// How many feed pages any one walk here will follow before it gives up.
-///
-/// The feed is **followed** rather than read once, because a short page is
-/// conforming: `limit` bounds what a page carries and promises nothing about
-/// everything settled fitting on one, and DESIGN's `feed-retention-refusal`
-/// row speaks of a cursor *"refused rather than served as a short page"*, so
-/// short pages are a shape the contract knows.
-///
-/// A walk's real exit is the cursor standing still: a page whose `next`
-/// repeats the position the read began at has delivered everything after it.
-/// This budget bounds the **loop**, not the read, and it is why a backend
-/// whose cursor never advances is reported here rather than left to spin.
-const FEED_SNAPSHOT_PAGES: usize = 256;
 
 /// The first of the two tenants this check names in a grant and writes
 /// nothing under.
@@ -224,9 +214,10 @@ impl FeedSnapshotFixtures {
 /// `a_bounded_page_limit_hands_two_grants_two_positions_that_each_resume`
 /// is the read where they differ, and it differs by design. Nothing here
 /// compares two grants' positions for equality. Probe 4 compares
-/// [`FeedPosition::len`] — which is what DESIGN's `feed-position-bounded`
-/// row is about — and then compares what each position *does*, which is the
-/// property that holds whatever the limit.
+/// [`FeedPosition::len`](crate::feed::FeedPosition::len) — which is what
+/// DESIGN's `feed-position-bounded` row is about — and then compares what
+/// each position *does*, which is the property that holds whatever the
+/// limit.
 ///
 /// # The ledger alternates its two tenants
 ///
@@ -414,10 +405,11 @@ async fn a_scan_observes_no_change_but_arrivals_ahead_of_the_cursor(
     plugin: &dyn UsageCollectorPluginV1,
     fixtures: &FeedSnapshotFixtures,
 ) -> Vec<ContractViolation> {
+    let subscription = [fixtures.meter.clone()];
     let narrow = admitted_grant();
     let prefix = feed_walk(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &narrow,
         FeedStart::Oldest,
         FEED_SNAPSHOT_WALK_LIMIT,
@@ -444,7 +436,7 @@ async fn a_scan_observes_no_change_but_arrivals_ahead_of_the_cursor(
     };
     let rest = match feed_walk(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &narrow,
         FeedStart::After(prefix.stopped_at.clone()),
         FEED_SNAPSHOT_WALK_LIMIT,
@@ -557,9 +549,10 @@ async fn a_fresh_read_of_the_span_agrees(
     fixtures: &FeedSnapshotFixtures,
     scanned: &[UsageRecord],
 ) -> Vec<ContractViolation> {
+    let subscription = [fixtures.meter.clone()];
     let fresh = match feed_walk(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &admitted_grant(),
         FeedStart::Oldest,
         FEED_SNAPSHOT_PAGE_LIMIT,
@@ -615,12 +608,13 @@ async fn a_replay_from_one_cursor_repeats_and_only_extends(
     plugin: &dyn UsageCollectorPluginV1,
     fixtures: &FeedSnapshotFixtures,
 ) -> Vec<ContractViolation> {
+    let subscription = [fixtures.meter.clone()];
     let narrow = admitted_grant();
     let mut violations = Vec::new();
 
     let replayed_from = match feed_walk(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &narrow,
         FeedStart::Oldest,
         FEED_SNAPSHOT_WALK_LIMIT,
@@ -639,7 +633,7 @@ async fn a_replay_from_one_cursor_repeats_and_only_extends(
         Some(position) => Some(
             feed_walk(
                 plugin,
-                &fixtures.meter,
+                &subscription,
                 &narrow,
                 FeedStart::After(position.clone()),
                 FEED_SNAPSHOT_PAGE_LIMIT,
@@ -679,7 +673,7 @@ async fn a_replay_from_one_cursor_repeats_and_only_extends(
 
     let second = match feed_walk(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &narrow,
         FeedStart::After(position),
         FEED_SNAPSHOT_PAGE_LIMIT,
@@ -787,10 +781,11 @@ async fn a_bounded_replay_is_identical(
     plugin: &dyn UsageCollectorPluginV1,
     fixtures: &FeedSnapshotFixtures,
 ) -> Vec<ContractViolation> {
+    let subscription = [fixtures.meter.clone()];
     let narrow = admitted_grant();
     let live = match feed_walk(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &narrow,
         FeedStart::Oldest,
         FEED_SNAPSHOT_PAGE_LIMIT,
@@ -803,7 +798,7 @@ async fn a_bounded_replay_is_identical(
     };
     let bounded = match bounded_replay(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &narrow,
         live.stopped_at.clone(),
         FEED_SNAPSHOT_PAGE_LIMIT,
@@ -881,13 +876,14 @@ async fn a_grant_that_names_more_tenants_changes_nothing(
     plugin: &dyn UsageCollectorPluginV1,
     fixtures: &FeedSnapshotFixtures,
 ) -> Vec<ContractViolation> {
+    let subscription = [fixtures.meter.clone()];
     let written = both_written_tenants_grant();
     let spanning = many_tenants_grant();
 
     let (narrow, wide) = match (
         feed_walk(
             plugin,
-            &fixtures.meter,
+            &subscription,
             &written,
             FeedStart::Oldest,
             FEED_SNAPSHOT_PAGE_LIMIT,
@@ -896,7 +892,7 @@ async fn a_grant_that_names_more_tenants_changes_nothing(
         .await,
         feed_walk(
             plugin,
-            &fixtures.meter,
+            &subscription,
             &spanning,
             FeedStart::Oldest,
             FEED_SNAPSHOT_PAGE_LIMIT,
@@ -964,6 +960,7 @@ async fn the_two_grants_resume_each_other(
     narrow: (&ast::Expr, &FeedWalk),
     wide: (&ast::Expr, &FeedWalk),
 ) -> Vec<ContractViolation> {
+    let subscription = [fixtures.meter.clone()];
     let mut violations = Vec::new();
     for (resuming, minted_by, scope, position) in [
         (
@@ -981,7 +978,7 @@ async fn the_two_grants_resume_each_other(
     ] {
         match feed_walk(
             plugin,
-            &fixtures.meter,
+            &subscription,
             scope,
             FeedStart::After(position.clone()),
             FEED_SNAPSHOT_PAGE_LIMIT,
@@ -1042,9 +1039,10 @@ async fn a_wider_grant_resumes_a_narrower_walk_at_the_head(
     plugin: &dyn UsageCollectorPluginV1,
     fixtures: &FeedSnapshotFixtures,
 ) -> Vec<ContractViolation> {
+    let subscription = [fixtures.meter.clone()];
     let narrow = match feed_walk(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &admitted_grant(),
         FeedStart::Oldest,
         FEED_SNAPSHOT_PAGE_LIMIT,
@@ -1058,7 +1056,7 @@ async fn a_wider_grant_resumes_a_narrower_walk_at_the_head(
 
     match feed_walk(
         plugin,
-        &fixtures.meter,
+        &subscription,
         &both_written_tenants_grant(),
         FeedStart::After(narrow.stopped_at),
         FEED_SNAPSHOT_PAGE_LIMIT,
@@ -1088,183 +1086,6 @@ async fn a_wider_grant_resumes_a_narrower_walk_at_the_head(
     }
 }
 
-/// What one live, unbounded walk over the feed observed.
-struct FeedWalk {
-    /// Every entry the walk was handed, in the order the pages carried them.
-    delivered: Vec<UsageRecord>,
-    /// The position the walk stopped at.
-    ///
-    /// **Not an `Option`, and that is the point.** A live read carries a
-    /// continuation on every page, short and empty pages included; an absent
-    /// one is reserved for a bounded replay reaching its `until`. [`follow`]
-    /// reports a live page carrying none as a failed walk, so by the time a
-    /// probe holds a `FeedWalk` there is a position. Three probes here used
-    /// to guard for its absence and the guards were measured as unreachable:
-    /// no backend outcome could make them fire, so they were reports that
-    /// could never be read. This type is where that argument now lives.
-    stopped_at: FeedPosition,
-    /// How many pages the walk read. Reported in a detail so a plugin author
-    /// can see where a scan was paused; asserted nowhere, because how a
-    /// conforming backend divides a span into pages is its own business.
-    pages: usize,
-}
-
-/// What one replay bounded by an `until` observed.
-struct BoundedReplay {
-    /// Every entry the replay was handed, in the order the pages carried
-    /// them.
-    delivered: Vec<UsageRecord>,
-    /// Whether the last page carried no continuation, which is the one thing
-    /// that says a bounded replay reached its `until`.
-    closed: bool,
-}
-
-/// When [`follow`] stops following the cursor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalkStop {
-    /// At the head: the walk follows the cursor until it stands still.
-    AtTheHead,
-    /// As soon as a page has delivered anything, or at the head if none
-    /// ever does. This is what pauses a scan mid-way without predicting how
-    /// a backend pages: at [`FEED_SNAPSHOT_WALK_LIMIT`] a page carries at
-    /// most one entry, so the walk stops on the first one it is handed.
-    FirstDelivery,
-}
-
-/// Follows a live, unbounded feed read to [`WalkStop`].
-///
-/// `Err` carries a ready-to-report detail, including for the one shape this
-/// return type rules out: a live page with no continuation.
-async fn feed_walk(
-    plugin: &dyn UsageCollectorPluginV1,
-    meter: &MeterTypeId,
-    scope: &ast::Expr,
-    start: FeedStart<FeedPosition>,
-    limit: u64,
-    stop: WalkStop,
-) -> Result<FeedWalk, String> {
-    let (delivered, next, pages) = follow(plugin, meter, scope, start, None, limit, stop).await?;
-    let stopped_at = next.ok_or_else(|| {
-        "a live, unbounded feed read ended with no continuation to resume from. A live read \
-         carries one on every page, short and empty pages included; an absent one is reserved \
-         for a bounded replay reaching its `until`, and this read sent none."
-            .to_owned()
-    })?;
-    Ok(FeedWalk {
-        delivered,
-        stopped_at,
-        pages,
-    })
-}
-
-/// Follows a replay bounded by `until` until it closes or its cursor stands
-/// still.
-///
-/// `Err` carries a ready-to-report detail.
-async fn bounded_replay(
-    plugin: &dyn UsageCollectorPluginV1,
-    meter: &MeterTypeId,
-    scope: &ast::Expr,
-    until: FeedPosition,
-    limit: u64,
-) -> Result<BoundedReplay, String> {
-    let (delivered, next, _pages) = follow(
-        plugin,
-        meter,
-        scope,
-        FeedStart::Oldest,
-        Some(until),
-        limit,
-        WalkStop::AtTheHead,
-    )
-    .await?;
-    Ok(BoundedReplay {
-        delivered,
-        closed: next.is_none(),
-    })
-}
-
-/// The loop both of the two above are built on, over a subscription naming
-/// this check's own meter alone.
-///
-/// The subscription is one meter for the reason [`check_meter`] exists: a
-/// feed read selects by meter, so a subscription naming the suite's shared
-/// meter would carry whatever the other checks left on it and what this
-/// check observed would turn on the order `super::super::run_all` happened
-/// to dispatch in.
-///
-/// The loop's exit is the cursor standing still rather than a page coming
-/// back short, because **a short page is conforming**: `limit` bounds what a
-/// page carries and promises nothing about everything settled fitting on
-/// one. [`FEED_SNAPSHOT_PAGES`] bounds the loop so a backend whose cursor
-/// never advances is reported rather than followed forever.
-///
-/// Returns what the pages carried, the continuation the last of them
-/// carried, and how many pages were read. `Err` carries a ready-to-report
-/// detail.
-async fn follow(
-    plugin: &dyn UsageCollectorPluginV1,
-    meter: &MeterTypeId,
-    scope: &ast::Expr,
-    start: FeedStart<FeedPosition>,
-    until: Option<FeedPosition>,
-    limit: u64,
-    stop: WalkStop,
-) -> Result<(Vec<UsageRecord>, Option<FeedPosition>, usize), String> {
-    let subscription = [meter.clone()];
-    let mut delivered: Vec<UsageRecord> = Vec::new();
-    let mut start = start;
-    let mut reached: Option<FeedPosition> = None;
-
-    for page_number in 1..=FEED_SNAPSHOT_PAGES {
-        let page = plugin
-            .read_feed_page(&subscription, scope, start.clone(), until.clone(), limit)
-            .await
-            .map_err(|err| {
-                format!(
-                    "`read_feed_page` failed on page {page_number} of a walk over a \
-                     subscription naming this check's own meter, at a limit of {limit} and \
-                     {bound}, so what a paginated scan observes could not be decided: {err}",
-                    bound = match until {
-                        Some(_) => "bounded by a position this backend had just issued",
-                        None => "unbounded",
-                    },
-                )
-            })?;
-        delivered.extend(page.entries);
-
-        let Some(next) = page.next else {
-            if until.is_none() {
-                return Err(format!(
-                    "page {page_number} of a live, unbounded feed read carried no \
-                     continuation. A live read carries one on every page, short and empty \
-                     pages included; an absent one is reserved for a bounded replay reaching \
-                     its `until`, and this read sent none, so a caller has nothing to resume \
-                     from and the walk cannot go on."
-                ));
-            }
-            return Ok((delivered, None, page_number));
-        };
-        if reached.as_ref() == Some(&next) {
-            return Ok((delivered, Some(next), page_number));
-        }
-        if stop == WalkStop::FirstDelivery && !delivered.is_empty() {
-            return Ok((delivered, Some(next), page_number));
-        }
-        reached = Some(next.clone());
-        start = FeedStart::After(next);
-    }
-
-    Err(format!(
-        "a feed walk at a limit of {limit} followed its cursor for {FEED_SNAPSHOT_PAGES} pages \
-         over a subscription holding {written} entries without the cursor ever standing still. \
-         The walk's exit is a page whose continuation repeats the position it was read from, \
-         which is how a consumer learns it has reached the head; a cursor that keeps moving \
-         past a ledger this size is one a real gateway would follow forever.",
-        written = FEED_SNAPSHOT_SEEDS + 4,
-    ))
-}
-
 /// Submits entries that must all be accepted, reporting the first refusal.
 ///
 /// Every probe here is a statement about a scan over entries that are there.
@@ -1291,50 +1112,6 @@ async fn submit(
         }
     }
     Vec::new()
-}
-
-/// The entry ids a slice carries, in the order it carries them.
-fn ids(entries: &[UsageRecord]) -> Vec<Uuid> {
-    entries.iter().map(|entry| entry.id).collect()
-}
-
-/// Where two deliveries first disagree, rendered for a report, or `None`
-/// when they agree entry for entry.
-///
-/// The three disagreements are told apart because they are three different
-/// things to tell a plugin author: a different entry at one place, the same
-/// entry with different fields, and one delivery running out before the
-/// other.
-fn first_divergence(left: &[UsageRecord], right: &[UsageRecord]) -> Option<String> {
-    for (index, (left_entry, right_entry)) in left.iter().zip(right.iter()).enumerate() {
-        if left_entry == right_entry {
-            continue;
-        }
-        if left_entry.id == right_entry.id {
-            return Some(format!(
-                "at position {index} both carried record {id} and its fields differ between the \
-                 two readings",
-                id = left_entry.id,
-            ));
-        }
-        return Some(format!(
-            "at position {index} one carried record {left_id} and the other record {right_id}; \
-             the first read {left_ids:?} and the second {right_ids:?}",
-            left_id = left_entry.id,
-            right_id = right_entry.id,
-            left_ids = ids(left),
-            right_ids = ids(right),
-        ));
-    }
-    if left.len() == right.len() {
-        return None;
-    }
-    Some(format!(
-        "they agree as far as either goes and then one stops: the first carried {left_ids:?} and \
-         the second {right_ids:?}",
-        left_ids = ids(left),
-        right_ids = ids(right),
-    ))
 }
 
 /// The grant the paginated walk dispatches: `tenant_id eq <suite tenant>`.

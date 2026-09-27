@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds twenty-one deliberately
+//! as coverage. [`super::contract_mutants`] holds twenty-three deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -48,7 +48,7 @@ use uuid::Uuid;
 use super::contract_mutants::{Defect, mutant};
 use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, CONVERGED_TARGET_LOOKUP,
-    DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel,
+    DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, FEED_COMPLETENESS,
     FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD,
     LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
     SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS,
@@ -142,7 +142,7 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
 /// A literal here would go on matching a constant that had been respelled,
 /// and the row would then assert nothing about the check it names.
 ///
-/// **Six rows name more than one check**, and none is a mutant wrong
+/// **Seven rows name more than one check**, and none is a mutant wrong
 /// twice: each is a real overlap between checks, which is what the matrix
 /// has to be able to say without loosening into a subset assertion.
 ///
@@ -159,22 +159,29 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
 /// module says of a dedup blind to the entry type that it *"fails
 /// `at-most-one-invalidation` and `invalidation-excluded-from-fold` too,
 /// both submitting the record first and so having its withdrawal refused"*.
-/// Four checks submit a record and then an invalidation repeating its key,
+/// Five checks submit a record and then an invalidation repeating its key,
 /// and an index blind to the sixth identity input refuses the second of
 /// every such pair: `invalidation-excluded-from-fold` loses the withdrawal
 /// that makes its withdrawn pair, `at-most-one-invalidation` loses the
-/// withdrawals of both its targets, and `server-field-round-trip` loses the
+/// withdrawals of both its targets, `server-field-round-trip` loses the
 /// only entry in its fixture set that carries an `invalidates` to read back
-/// at all — so none of them reaches the property it exists for. That is one
-/// mistake meeting four checks, not four mistakes, so the row names all
-/// four.
+/// at all, and `feed-completeness` loses the whole of its second ingestion
+/// round — so none of them reaches the property it exists for. That is one
+/// mistake meeting five checks, not five mistakes, so the row names all
+/// five.
 ///
-/// That fourth check is coupled unavoidably rather than incidentally, which
-/// is why this is an overlap and not a subject wrong twice.
+/// The fourth and fifth are coupled unavoidably rather than incidentally,
+/// which is why this is an overlap and not a subject wrong twice.
 /// `server-field-round-trip` has to read `invalidates`, a plain record
 /// carries none, and an invalidation repeats its target's idempotency key by
 /// construction (DESIGN §3.1, Faithful copy) — so every fixture set able to
 /// assert that field at all hands an entry-type-blind index a collision.
+/// `feed-completeness` is the same argument for a different field: DESIGN's
+/// row for it is the Feed order invariant *"under concurrent ingestion of
+/// records **and invalidations**"*, and its correction-order assertion is
+/// about a withdrawal and the record it withdraws, so a fixture set without
+/// one asserts nothing. There is no arrangement that separates either from
+/// this subject.
 ///
 /// What the wider row costs is worth saying plainly: it establishes that
 /// these four checks together notice an entry-type-blind plugin, not which
@@ -274,6 +281,25 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
 /// for that check: one per key of DESIGN's three-key order, each naming
 /// `latest-tie-break` alone. `super::contract_mutants`'s header says why the
 /// set of three is complete.
+///
+/// [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] is the seventh and the
+/// last, and it joined a second check when `feed-completeness` landed. A
+/// page that resumes *at* the entry its start position names rather than
+/// after it re-delivers that entry on every page but the first, and the two
+/// checks see the one mistake from two directions: the paginated scan in
+/// `feed-snapshot-and-replay` reports an entry it had already passed
+/// appearing again, and `feed-completeness` reports a delivery that carries
+/// an entry more than once. Neither is separable by any fixture
+/// arrangement — "each settled entry is handed to a consumer once" and "a
+/// scan observes no entry appearing" are two readings of one deterministic
+/// order, and a check able to assert either over a paginated walk is a check
+/// this subject fails.
+///
+/// The two rows after it are the isolating ones for `feed-completeness`:
+/// [`Defect::AFeedPageDropsTheEntryAtItsLimit`] for completeness and
+/// [`Defect::FeedOrdersByTheAcceptanceInstant`] for correction order, each
+/// naming that check alone. `super::contract_mutants`'s header says which
+/// decision of a feed page each of the five feed subjects lands in.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (
@@ -293,6 +319,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
             INVALIDATION_EXCLUDED_FROM_FOLD,
             AT_MOST_ONE_INVALIDATION,
             SERVER_FIELD_ROUND_TRIP,
+            FEED_COMPLETENESS,
         ],
     ),
     (
@@ -350,11 +377,19 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     ),
     (
         Defect::AFeedPageRedeliversTheEntryAtItsCursor,
-        &[FEED_SNAPSHOT_AND_REPLAY],
+        &[FEED_SNAPSHOT_AND_REPLAY, FEED_COMPLETENESS],
     ),
     (
         Defect::ABoundedReplayNeverCloses,
         &[FEED_SNAPSHOT_AND_REPLAY],
+    ),
+    (
+        Defect::AFeedPageDropsTheEntryAtItsLimit,
+        &[FEED_COMPLETENESS],
+    ),
+    (
+        Defect::FeedOrdersByTheAcceptanceInstant,
+        &[FEED_COMPLETENESS],
     ),
 ];
 
@@ -362,7 +397,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all twenty-one mutants is not
+/// of sensitivity. A check that fails against all twenty-three mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.
@@ -770,7 +805,7 @@ fn every_check_name_derives_a_distinct_valid_meter() {
         .chain(ADDITIONAL_CHECKS)
         .chain(UNWRITTEN_CHECKS)
     {
-        for role in ["main", "quiet", "other"] {
+        for role in ["main", "busy", "quiet", "other"] {
             let meter = super::fixtures::check_meter(check, role).unwrap_or_else(|err| {
                 panic!(
                     "`{check}` under role `{role}` must derive a valid meter, and a failure here \

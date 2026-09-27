@@ -1,9 +1,12 @@
 //! One module per check.
 //!
-//! Each check owns its window offsets, its page limit, its fixtures and its
-//! readers, and shares only [`super::fixtures`] with the others. The entry
-//! point of each is re-exported below under the check's own name, so
-//! [`super::run_all`] reads as the list of checks it runs.
+//! Each check owns its window offsets, its page limit and its fixtures, and
+//! shares [`super::fixtures`] with the others. The checks that page the feed
+//! share [`super::feed_walk`] as well: a walk re-implemented per check is
+//! one chance per check for two of them to disagree about what reaching the
+//! head means. The entry point of each is re-exported below under the
+//! check's own name, so [`super::run_all`] reads as the list of checks it
+//! runs.
 //!
 //! All but one are named by DESIGN §3.3;
 //! [`scope_is_a_filter_on_every_read_path`](scope_is_a_filter_on_every_read_path())
@@ -15,6 +18,7 @@ mod converged_target_lookup;
 mod dedup_concurrent;
 mod dedup_floor;
 mod dedup_identity_over_window;
+mod feed_completeness;
 mod feed_snapshot_and_replay;
 mod invalidation_excluded_from_fold;
 mod latest_tie_break;
@@ -29,6 +33,7 @@ pub use converged_target_lookup::converged_target_lookup;
 pub use dedup_concurrent::dedup_concurrent;
 pub use dedup_floor::dedup_floor;
 pub use dedup_identity_over_window::dedup_identity_over_window;
+pub use feed_completeness::feed_completeness;
 pub use feed_snapshot_and_replay::feed_snapshot_and_replay;
 pub use invalidation_excluded_from_fold::invalidation_excluded_from_fold;
 pub use latest_tie_break::latest_tie_break;

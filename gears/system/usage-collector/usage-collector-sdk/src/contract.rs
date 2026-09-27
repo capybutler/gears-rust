@@ -42,22 +42,22 @@
 //! previous one left; the fixtures are keyed so that a repeated run
 //! resubmits identical entries rather than colliding with different ones.
 //!
-//! # Twelve of DESIGN's sixteen, thirteen checks in all
+//! # Thirteen of DESIGN's sixteen, fourteen checks in all
 //!
 //! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
-//! twelve in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
-//! statement about the rest**.
+//! thirteen in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not
+//! a statement about the rest**.
 //!
-//! **Two counts run through this file, and both are right.** Twelve is what
-//! [`run_all`] covers of DESIGN's sixteen; thirteen is how many checks it
-//! runs, the thirteenth being the one in [`ADDITIONAL_CHECKS`] that DESIGN
-//! does not tabulate. A count about coverage of DESIGN is therefore twelve
-//! and a count about what a run executed is thirteen, and neither
-//! substitutes for the other. The other four of the sixteen are named, not
+//! **Two counts run through this file, and both are right.** Thirteen is
+//! what [`run_all`] covers of DESIGN's sixteen; fourteen is how many checks
+//! it runs, the fourteenth being the one in [`ADDITIONAL_CHECKS`] that
+//! DESIGN does not tabulate. A count about coverage of DESIGN is therefore
+//! thirteen and a count about what a run executed is fourteen, and neither
+//! substitutes for the other. The other three of the sixteen are named, not
 //! omitted:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
-//!   gear's SPI declares, not yet written. All four.
+//!   gear's SPI declares, not yet written. All three.
 //! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
 //!   it. Now empty: no check DESIGN tabulates is beyond the current trait.
 //!
@@ -105,12 +105,14 @@
 use crate::plugin_api::UsageCollectorPluginV1;
 use checks::{
     at_most_one_invalidation, converged_target_lookup, dedup_concurrent, dedup_floor,
-    dedup_identity_over_window, feed_snapshot_and_replay, invalidation_excluded_from_fold,
-    latest_tie_break, quantity_round_trip, record_and_invalidation_distinct_identity,
-    scope_is_a_filter_on_every_read_path, server_field_round_trip, window_end_selection,
+    dedup_identity_over_window, feed_completeness, feed_snapshot_and_replay,
+    invalidation_excluded_from_fold, latest_tie_break, quantity_round_trip,
+    record_and_invalidation_distinct_identity, scope_is_a_filter_on_every_read_path,
+    server_field_round_trip, window_end_selection,
 };
 
 mod checks;
+mod feed_walk;
 mod fixtures;
 pub mod reference;
 pub mod retention;
@@ -308,6 +310,7 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     DEDUP_CONCURRENT,
     LATEST_TIE_BREAK,
     FEED_SNAPSHOT_AND_REPLAY,
+    FEED_COMPLETENESS,
 ];
 
 /// The checks [`run_all`] runs that DESIGN §3.3 does not tabulate.
@@ -330,7 +333,7 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// **Four of DESIGN's sixteen**, which is every check [`run_all`] does
+/// **Three of DESIGN's sixteen**, which is every check [`run_all`] does
 /// not run. Each is expressible against the seven methods this gear's SPI
 /// declares — nothing here waits on the SPI to grow, and
 /// [`BLOCKED_CHECKS`] is empty. Being unwritten is a statement about this
@@ -355,10 +358,9 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// **A caller reporting coverage has to report this constant.**
 /// [`run_all`] returning no violations says nothing whatever about a check
 /// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
-/// reports twelve checks' worth of evidence as sixteen.
+/// reports thirteen checks' worth of evidence as sixteen.
 // @cpt-dod:cpt-cf-usage-collector-dod-plugin-conformance-suite:p1
 pub const UNWRITTEN_CHECKS: &[&str] = &[
-    FEED_COMPLETENESS,
     FEED_BOOTSTRAP_POSITION,
     FEED_RETENTION_REFUSAL,
     FEED_POSITION_BOUNDED,
@@ -429,6 +431,7 @@ pub async fn run_all(
     violations.extend(dedup_concurrent(plugin, level).await);
     violations.extend(latest_tie_break(plugin).await);
     violations.extend(feed_snapshot_and_replay(plugin).await);
+    violations.extend(feed_completeness(plugin).await);
     violations.extend(scope_is_a_filter_on_every_read_path(plugin).await);
     violations
 }

@@ -11,7 +11,7 @@
 //! column against each of them.
 //!
 //! *Behaviourally* is the exact word. Ten subjects wrap a real reference
-//! backend and are that backend plus one interception; the other eleven
+//! backend and are that backend plus one interception; the other thirteen
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
 //!
@@ -40,36 +40,48 @@
 //! to decide, and two rewrite how a second withdrawal of a record is
 //! answered.
 //!
-//! **A ledger of its own** ([`MutantLedger`]) is needed by the other eleven
-//! (selection column, fold exclusion, missing unique constraint, missing
-//! in-batch dedup map, a divergent write that displaces the survivor, the
-//! three `LATEST` orders, and the three feed defects), because each changes
-//! something the inner backend owns and no interception can reach it: which
-//! column a range meets, which rows a fold walks, what admission writes,
-//! what a batch's own rows are decided against, which row a decided
-//! collision leaves behind, which row a fold ranks highest, which entries a
-//! feed page's cursor moves past, where a page resumes, and whether a
-//! bounded replay says it is finished. It mirrors the reference where the
-//! defect is not, and it is smaller in one stated way that no check reaches
-//! — see [`MutantLedger`].
+//! **A ledger of its own** ([`MutantLedger`]) is needed by the other
+//! thirteen (selection column, fold exclusion, missing unique constraint,
+//! missing in-batch dedup map, a divergent write that displaces the
+//! survivor, the three `LATEST` orders, and the five feed defects), because
+//! each changes something the inner backend owns and no interception can
+//! reach it: which column a range meets, which rows a fold walks, what
+//! admission writes, what a batch's own rows are decided against, which row
+//! a decided collision leaves behind, which row a fold ranks highest, in
+//! what order a feed page walks, which entries its cursor moves past, where
+//! a page resumes, and whether a bounded replay says it is finished. It
+//! mirrors the reference where the defect is not, and it is smaller in one
+//! stated way that no check reaches — see [`MutantLedger`].
 //!
-//! # The three feed defects, and the three places a feed page decides
+//! # The five feed defects, and the four places a feed page decides
 //! something
 //!
-//! `read_feed_page` is one loop over a ledger, and it makes three decisions
-//! a defect can land in: where the page **resumes**, how far the cursor
-//! **advances**, and whether the page **closes**. There is a subject for
-//! each, all three routed to [`MutantLedger`] and all three one line:
+//! `read_feed_page` is one loop over a ledger, and it makes four decisions a
+//! defect can land in: what **order** it walks the ledger in, where the page
+//! **resumes**, how far the cursor **advances**, and whether the page
+//! **closes**. There is a subject for each, and two for the third, because a
+//! cursor can stop short of where it belongs or run past it. All five are
+//! routed to [`MutantLedger`]:
 //!
+//! * **What order it walks in** —
+//!   [`Defect::FeedOrdersByTheAcceptanceInstant`], the one ordering §3.1
+//!   says is not claimed.
 //! * **Where it resumes** — [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`],
 //!   the keyset off-by-one.
 //! * **How far the cursor advances** —
 //!   [`Defect::FeedCursorCountsAdmittedEntries`], the scope and
-//!   subscription gate moved above the cursor.
+//!   subscription gate moved above the cursor, which stops it short; and
+//!   [`Defect::AFeedPageDropsTheEntryAtItsLimit`], the limit checked after
+//!   the cursor has moved, which runs it one entry past.
 //! * **Whether it closes** — [`Defect::ABoundedReplayNeverCloses`], the
 //!   second half of [`FeedPage::next`]'s two-element enumeration.
 //!
-//! None of the three is a wrapper, and none could be: the loop is the
+//! Four of the five are one line. The order is the exception, because an
+//! order is not a line: that subject sorts the ledger by the key it orders
+//! on and reads positions off that key, which is what a backend with no
+//! feed-order column of its own actually does.
+//!
+//! None of the five is a wrapper, and none could be: the loop is the
 //! method, so an interception would have had to re-implement it anyway.
 //!
 //! # DESIGN's three `LATEST` keys, and the subject for each
@@ -611,6 +623,75 @@ pub(super) enum Defect {
     /// is finished, so a replay that keeps minting one leaves a consumer
     /// following a cursor forever over a range it has already read whole.
     ABoundedReplayNeverCloses,
+    /// Advances a feed page's cursor onto the entry the page stopped at, so
+    /// that entry ends up **behind** the cursor instead of in front of it —
+    /// the page limit checked one statement too late.
+    ///
+    /// **The classic short-page off-by-one, and the only feed defect here
+    /// that loses an entry outright.** A backend that wants to tell a caller
+    /// whether a next page exists fetches `limit + 1` rows and returns
+    /// `limit` of them; the cursor it then mints has to come from the last
+    /// row it **returned**, never from the last row it **fetched**. Taking
+    /// it from the last row fetched is one subscript, it compiles, and it
+    /// reads correctly under every limit the ledger never reaches — which is
+    /// every test a porter writes with a page limit wider than the fixture
+    /// set. Spelled as a loop, as it is here, it is the `break` moved below
+    /// the cursor assignment rather than above it.
+    ///
+    /// What it breaks is the clause of DESIGN §3.1's Feed order invariant
+    /// the other feed subjects leave alone: *"a page carries only settled
+    /// entries — converged, with nothing more able to become visible before
+    /// them — so no entry the read's compiled scope admits ever becomes
+    /// visible behind a returned cursor, whatever the concurrency or commit
+    /// order."* The entry it skips is settled, inside the subscription and
+    /// inside the scope, and is now behind a cursor its consumer has already
+    /// been handed: nothing delivers it again, and the usage it records is
+    /// charged to nobody.
+    ///
+    /// **It reaches `feed-completeness` alone**, measured rather than
+    /// reasoned, and the reason it does not also reach
+    /// `feed-snapshot-and-replay` is that check's fixtures rather than its
+    /// assertions. That check walks at a limit of one over a ledger that
+    /// alternates an admitted tenant with a withheld one, so the entry every
+    /// page of that walk skips is one the walking grant was never going to
+    /// carry; its wider reads run at a limit its ledger never reaches. That
+    /// is an immunity by construction, and worth knowing before either
+    /// check's ledger is edited: a row growing here would not be evidence of
+    /// a second mistake.
+    AFeedPageDropsTheEntryAtItsLimit,
+    /// Orders the feed by the gateway-stamped `accepted_at`, with the
+    /// admission sequence beneath it so the key stays unique.
+    ///
+    /// DESIGN rules it out twice. §3.1's Feed order invariant opens *"One
+    /// deterministic order over a subscription, realised by the plugin
+    /// through `FeedPosition`. No other ordering is claimed,
+    /// acceptance-instant order included"*, and §3.10's deployment-guide
+    /// item 3 says what goes wrong: *"Feed order MUST NOT rest on
+    /// gateway-stamped `accepted_at` alone: replica clock skew can stamp an
+    /// invalidation earlier than its target."*
+    ///
+    /// It is the mistake a backend makes by having no feed-order column at
+    /// all. `accepted_at` is already stored, already indexed for the
+    /// reconciliation watermarks, already monotonic in every single-writer
+    /// test, and it is the only field on a [`UsageRecord`] that looks like
+    /// an arrival. A port that reaches for it is wrong only when two writers
+    /// disagree about the clock — which is exactly when a correction can be
+    /// stamped before the thing it corrects.
+    ///
+    /// **The key stays unique and the order stays total**, so nothing about
+    /// this subject looks unreliable: a position still names one entry, a
+    /// page still resumes where it left off, a replay still repeats itself,
+    /// and a walk still reaches the head. What moves is where an
+    /// invalidation sits relative to its target.
+    ///
+    /// **It reaches `feed-completeness`'s correction-order assertion
+    /// alone**, and that assertion is the only one in the suite it could
+    /// reach. Every other feed read in the suite is over entries that share
+    /// one acceptance instant, or finds what it wants by `id` rather than by
+    /// position - `server-field-round-trip` delivers a record and its
+    /// invalidation off a feed page and looks each up by identifier, so a
+    /// reordered page changes nothing it reads.
+    FeedOrdersByTheAcceptanceInstant,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -643,7 +724,9 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::LatestIgnoresThePeriodEnd
         | Defect::FeedCursorCountsAdmittedEntries
         | Defect::AFeedPageRedeliversTheEntryAtItsCursor
-        | Defect::ABoundedReplayNeverCloses => Box::new(MutantLedger::new(defect)),
+        | Defect::ABoundedReplayNeverCloses
+        | Defect::AFeedPageDropsTheEntryAtItsLimit
+        | Defect::FeedOrdersByTheAcceptanceInstant => Box::new(MutantLedger::new(defect)),
     }
 }
 
@@ -802,7 +885,7 @@ impl WrappedReference {
             // of a matrix row whose subject does nothing. The point read's
             // defect is applied on the read path, the two withdrawal defects
             // and the conflict read-back around the inner call, and the last
-            // five never reach this type at all — `mutant` routes them to
+            // seven never reach this type at all — `mutant` routes them to
             // `MutantLedger` — but exhaustiveness is the whole point.
             Defect::IgnoresScopeOnThePointRead
             | Defect::AnswersNotConvergedForAnAcknowledgedEntry
@@ -819,7 +902,9 @@ impl WrappedReference {
             | Defect::LatestIgnoresThePeriodEnd
             | Defect::FeedCursorCountsAdmittedEntries
             | Defect::AFeedPageRedeliversTheEntryAtItsCursor
-            | Defect::ABoundedReplayNeverCloses => Ok(record),
+            | Defect::ABoundedReplayNeverCloses
+            | Defect::AFeedPageDropsTheEntryAtItsLimit
+            | Defect::FeedOrdersByTheAcceptanceInstant => Ok(record),
         }
     }
 
@@ -1320,6 +1405,16 @@ fn only_this_row(id: Uuid) -> ast::Expr {
 // The own-ledger shape
 // ---------------------------------------------------------------------------
 
+/// How many admission sequences [`MutantLedger::feed_key`] reserves under
+/// each whole second of a gateway-stamped acceptance instant.
+///
+/// Used by one subject alone, [`Defect::FeedOrdersByTheAcceptanceInstant`],
+/// to keep a composite key unique. A power of two rather than a round
+/// decimal because nothing reads it back — it is headroom, not a unit — and
+/// a million sequences inside one second is headroom this suite exceeds by
+/// no imaginable margin.
+const SEQUENCES_PER_SECOND: u64 = 1 << 20;
+
 /// One admitted entry and the sequence the feed orders it by.
 ///
 /// The mirror of the reference backend's own entry. A sequence is stamped at
@@ -1499,6 +1594,18 @@ impl Ledger {
 ///   [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] is the subject for
 ///   getting that comparison wrong.
 ///
+/// **Two more of the feed's decisions were pinned when `feed-completeness`
+/// landed**, and each got a subject rather than only a measurement. The
+/// **order** this type walks its ledger in is pinned by
+/// [`Defect::FeedOrdersByTheAcceptanceInstant`], and **where the cursor
+/// stops relative to the page limit** by
+/// [`Defect::AFeedPageDropsTheEntryAtItsLimit`]. The second is worth a note
+/// for whoever edits a feed check's ledger next: it is invisible to
+/// `feed-snapshot-and-replay` because that check's walk runs at a limit of
+/// one over a ledger alternating an admitted tenant with a withheld one, so
+/// the entry each of its pages steps over is one its grant withheld anyway.
+/// That immunity is a property of those fixtures, not of those assertions.
+///
 /// Everything else here is level with the reference and **unpinned**: the
 /// ledger page's *order* (its membership is pinned, its sort is asserted by
 /// no check), the grouped folds and the three that read a quantity, the
@@ -1571,6 +1678,59 @@ impl MutantLedger {
         } else {
             entry.window_end
         }
+    }
+
+    /// The ledger in the order this subject's feed walks it, each entry
+    /// beside the key its positions encode.
+    ///
+    /// For every subject but one that is the admission sequence, ascending,
+    /// which is the `Vec`'s own order and so needs no sort: a sequence is
+    /// stamped at admission and only ever rises.
+    /// [`Defect::FeedOrdersByTheAcceptanceInstant`] is the exception and the
+    /// only reason this method exists — an order is not a line of code, so
+    /// that subject could not be a branch inside the page loop the way the
+    /// other four feed subjects are.
+    fn feed_order<'ledger>(&self, ledger: &'ledger Ledger) -> Vec<(u64, &'ledger Entry)> {
+        let mut ordered: Vec<(u64, &Entry)> = ledger
+            .entries
+            .iter()
+            .map(|entry| (self.feed_key(entry), entry))
+            .collect();
+        if self.defect == Defect::FeedOrdersByTheAcceptanceInstant {
+            ordered.sort_by_key(|(key, _)| *key);
+        }
+        ordered
+    }
+
+    /// The key one entry takes in this subject's feed order, which is also
+    /// the value its [`FeedPosition`] encodes.
+    ///
+    /// [`Defect::FeedOrdersByTheAcceptanceInstant`] keys on the
+    /// gateway-stamped instant with the admission sequence beneath it. The
+    /// sequence is there so the key stays **unique**: a defect that made two
+    /// entries share a position would make this backend unwalkable rather
+    /// than mis-ordered, and this subject is meant to be wrong about order
+    /// alone.
+    ///
+    /// [`SEQUENCES_PER_SECOND`] is the room the low half reserves. The suite
+    /// writes a few hundred entries in all, so a second's worth of sequences
+    /// is never exhausted; `saturating_mul` stops a clock outside the fixture
+    /// vocabulary from wrapping rather than making this subject correct for
+    /// such a clock.
+    ///
+    /// One consequence is worth naming: under this subject a position is a
+    /// composite key rather than a sequence, while [`Ledger`]'s retention
+    /// marks are sequences. Comparing the two would mean nothing, and it
+    /// never happens — no check drives a retention sweep against this type,
+    /// so the marks are empty and the refusal never fires.
+    fn feed_key(&self, entry: &Entry) -> u64 {
+        if self.defect != Defect::FeedOrdersByTheAcceptanceInstant {
+            return entry.sequence;
+        }
+        u64::try_from(entry.record.accepted_at.unix_timestamp())
+            .unwrap_or(0)
+            .saturating_mul(SEQUENCES_PER_SECOND)
+            .saturating_add(entry.sequence)
     }
 
     /// Decides one entry and writes it, under this subject's own admission
@@ -1773,12 +1933,17 @@ impl UsageCollectorPluginV1 for MutantLedger {
     /// `feed-retention-refusal`, though no mark can rise until this type is
     /// drivable.
     ///
-    /// **Three defects routed here touch the feed**, one per decision this
-    /// method makes and one line each:
+    /// **Five defects routed here touch the feed**, between them covering
+    /// the four decisions this method makes:
+    /// [`Defect::FeedOrdersByTheAcceptanceInstant`] walks the ledger in
+    /// another order (through [`MutantLedger::feed_order`], which is the
+    /// whole reason that method exists),
     /// [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] backs the
     /// resumption up by one,
     /// [`Defect::FeedCursorCountsAdmittedEntries`] moves the cursor
-    /// assignment inside the admission branch, and
+    /// assignment inside the admission branch so the cursor stops short,
+    /// [`Defect::AFeedPageDropsTheEntryAtItsLimit`] checks the limit after
+    /// the cursor has moved so it runs one entry past, and
     /// [`Defect::ABoundedReplayNeverCloses`] keeps minting a continuation
     /// past the `until`. Everything else in this method is a mirror and
     /// nothing more — a wrong answer invented for it would fail a check for
@@ -1831,26 +1996,38 @@ impl UsageCollectorPluginV1 for MutantLedger {
         } else {
             from
         };
-        for entry in ledger
-            .entries
-            .iter()
-            .filter(|entry| entry.sequence > resumed_at)
+        for (key, entry) in self
+            .feed_order(&ledger)
+            .into_iter()
+            .filter(|(key, _)| *key > resumed_at)
         {
             // `upper` names an entry a bounded replay is still asked to read,
             // so the replay stops at the first entry beyond it.
-            if entry.sequence > upper || u64::try_from(entries.len()).unwrap_or(u64::MAX) >= limit {
+            if key > upper {
                 break;
             }
-            // The cursor moves onto this entry's sequence whether or not the
+            // A full page stops *before* its cursor moves onto the entry it
+            // stopped at, which is what leaves that entry in front of the
+            // cursor rather than behind it.
+            // [`Defect::AFeedPageDropsTheEntryAtItsLimit`] stops after
+            // instead - the row a backend fetched to learn whether a next
+            // page exists is the row its cursor ends up naming.
+            let full = u64::try_from(entries.len()).unwrap_or(u64::MAX) >= limit;
+            if full && self.defect != Defect::AFeedPageDropsTheEntryAtItsLimit {
+                break;
+            }
+            // The cursor moves onto this entry's key whether or not the
             // subscription and the scope admit it. Advancing only past
             // admitted entries would make the position depend on who asked -
             // which is exactly what
-            // [`Defect::FeedCursorCountsAdmittedEntries`] does, and the one
-            // line of this method any defect changes.
+            // [`Defect::FeedCursorCountsAdmittedEntries`] does.
             let carried = subscription.contains(&entry.record.gts_type_id)
                 && expr_admits(&entry.record, scope);
             if carried || self.defect != Defect::FeedCursorCountsAdmittedEntries {
-                cursor = entry.sequence;
+                cursor = key;
+            }
+            if full {
+                break;
             }
             if carried {
                 entries.push(entry.record.clone());
@@ -2294,7 +2471,9 @@ impl LatestOrder {
             | Defect::ADivergentWriteDisplacesTheSurvivor
             | Defect::FeedCursorCountsAdmittedEntries
             | Defect::AFeedPageRedeliversTheEntryAtItsCursor
-            | Defect::ABoundedReplayNeverCloses => Self::Declared,
+            | Defect::ABoundedReplayNeverCloses
+            | Defect::AFeedPageDropsTheEntryAtItsLimit
+            | Defect::FeedOrdersByTheAcceptanceInstant => Self::Declared,
         }
     }
 
