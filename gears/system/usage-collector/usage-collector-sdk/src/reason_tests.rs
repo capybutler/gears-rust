@@ -99,8 +99,8 @@ fn the_upstream_cursor_reasons_no_longer_model_themselves() {
     }
 }
 
-/// None of the four invalidation reasons this ADR emptied models itself any
-/// more.
+/// None of the four invalidation reasons the identity ADR emptied models
+/// itself any more.
 ///
 /// Two named key rules that only existed while an invalidation's key was
 /// server-derived under a reserved prefix: `KEY_ON_INVALIDATION` refused a
