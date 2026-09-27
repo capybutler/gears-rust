@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds eleven deliberately
+//! as coverage. [`super::contract_mutants`] holds twelve deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -40,12 +40,12 @@ use uuid::Uuid;
 
 use super::contract_mutants::{Defect, mutant};
 use super::{
-    ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, DEDUP_IDENTITY_OVER_WINDOW,
-    DedupLevel, HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD,
-    QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
-    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS,
-    WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, retention::ContractRetention,
-    run_all,
+    ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, DEDUP_FLOOR,
+    DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, HARNESS_FAULT, IMPLEMENTED_CHECKS,
+    INVALIDATION_EXCLUDED_FROM_FOLD, QUANTITY_ROUND_TRIP,
+    RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH,
+    SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS, WINDOW_END_SELECTION,
+    reference::InMemoryReferencePlugin, retention::ContractRetention, run_all,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
@@ -100,7 +100,7 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 /// A literal here would go on matching a constant that had been respelled,
 /// and the row would then assert nothing about the check it names.
 ///
-/// **Two rows name more than one check**, and neither is a mutant wrong
+/// **Three rows name more than one check**, and none is a mutant wrong
 /// twice: each is a real overlap between checks, which is what the matrix
 /// has to be able to say without loosening into a subset assertion.
 ///
@@ -147,6 +147,27 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 /// assertion in it that no other check makes — that a retry of a withdrawn
 /// record is absorbed against the record rather than against the
 /// invalidation sharing its five caller-supplied components.
+///
+/// [`Defect::LedgerHasNoUniqueConstraint`] is the third. It decides every
+/// collision by reading the ledger and then writes regardless, so every
+/// outcome it returns is the conforming one and a second row lands beside
+/// the first under every identity that is submitted twice. Three checks
+/// re-deliver an entry and then count what a range comes back with:
+/// `dedup-identity-over-window`'s second half counts the rows carrying one
+/// id, `record-and-invalidation-distinct-identity` counts a record and its
+/// withdrawal after a retry of the record, and `dedup-floor` counts one row
+/// per identity on the ledger page and one term per identity in a `COUNT`
+/// fold. One mistake meeting three checks, not three mistakes.
+///
+/// The overlap is unavoidable rather than incidental, which is what makes it
+/// an overlap. "One identity reads at most once" is a property of the store
+/// and not of any answer, so the only way to assert it is to submit an
+/// identity twice and count the rows — and every check that does that is a
+/// check this subject fails. What the wider row costs is the same thing the
+/// row above costs: it establishes that these three together notice a ledger
+/// with no unique constraint, not which of them noticed. What `dedup-floor`
+/// adds over the other two, and what this row leaves untouched, is stated on
+/// the defect itself and was measured rather than claimed.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (Defect::StampsItsOwnAcceptedAt, &[SERVER_FIELD_ROUND_TRIP]),
@@ -185,13 +206,21 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
         Defect::IgnoresScopeOnThePointRead,
         &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH],
     ),
+    (
+        Defect::LedgerHasNoUniqueConstraint,
+        &[
+            DEDUP_FLOOR,
+            DEDUP_IDENTITY_OVER_WINDOW,
+            RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
+        ],
+    ),
 ];
 
 /// Every check fails against a backend that gets its rule wrong, and passes
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all eleven mutants is not
+/// of sensitivity. A check that fails against all twelve mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.

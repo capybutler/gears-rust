@@ -42,21 +42,21 @@
 //! previous one left; the fixtures are keyed so that a repeated run
 //! resubmits identical entries rather than colliding with different ones.
 //!
-//! # Seven of DESIGN's sixteen, eight checks in all
+//! # Eight of DESIGN's sixteen, nine checks in all
 //!
 //! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
-//! seven in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
+//! eight in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
 //! statement about the rest**.
 //!
-//! **Two counts run through this file, and both are right.** Seven is what
-//! [`run_all`] covers of DESIGN's sixteen; eight is how many checks it
-//! runs, the eighth being the one in [`ADDITIONAL_CHECKS`] that DESIGN
-//! does not tabulate. A count about coverage of DESIGN is therefore seven
-//! and a count about what a run executed is eight, and neither substitutes
-//! for the other. The other nine of the sixteen are named, not omitted:
+//! **Two counts run through this file, and both are right.** Eight is what
+//! [`run_all`] covers of DESIGN's sixteen; nine is how many checks it
+//! runs, the ninth being the one in [`ADDITIONAL_CHECKS`] that DESIGN
+//! does not tabulate. A count about coverage of DESIGN is therefore eight
+//! and a count about what a run executed is nine, and neither substitutes
+//! for the other. The other eight of the sixteen are named, not omitted:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
-//!   gear's SPI declares, not yet written. All nine.
+//!   gear's SPI declares, not yet written. All eight.
 //! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
 //!   it. Now empty: no check DESIGN tabulates is beyond the current trait.
 //!
@@ -66,7 +66,7 @@
 //! stops being accounted for fails it too. A caller reporting coverage
 //! should report all three alongside the violations — which matters
 //! because "run this suite" is the acceptance criterion for porting a
-//! backend, and a suite that runs eight checks must not read as a suite
+//! backend, and a suite that runs nine checks must not read as a suite
 //! that ran sixteen.
 //!
 //! # A check DESIGN does not tabulate
@@ -103,9 +103,10 @@
 
 use crate::plugin_api::UsageCollectorPluginV1;
 use checks::{
-    at_most_one_invalidation, dedup_identity_over_window, invalidation_excluded_from_fold,
-    quantity_round_trip, record_and_invalidation_distinct_identity,
-    scope_is_a_filter_on_every_read_path, server_field_round_trip, window_end_selection,
+    at_most_one_invalidation, dedup_floor, dedup_identity_over_window,
+    invalidation_excluded_from_fold, quantity_round_trip,
+    record_and_invalidation_distinct_identity, scope_is_a_filter_on_every_read_path,
+    server_field_round_trip, window_end_selection,
 };
 
 mod checks;
@@ -288,6 +289,7 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     AT_MOST_ONE_INVALIDATION,
     RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
     SERVER_FIELD_ROUND_TRIP,
+    DEDUP_FLOOR,
 ];
 
 /// The checks [`run_all`] runs that DESIGN §3.3 does not tabulate.
@@ -310,7 +312,7 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// **Nine of DESIGN's sixteen**, which is every check [`run_all`] does
+/// **Eight of DESIGN's sixteen**, which is every check [`run_all`] does
 /// not run. Each is expressible against the seven methods this gear's SPI
 /// declares — nothing here waits on the SPI to grow, and
 /// [`BLOCKED_CHECKS`] is empty. Being unwritten is a statement about this
@@ -335,11 +337,10 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// **A caller reporting coverage has to report this constant.**
 /// [`run_all`] returning no violations says nothing whatever about a check
 /// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
-/// reports seven checks' worth of evidence as sixteen.
+/// reports eight checks' worth of evidence as sixteen.
 // @cpt-dod:cpt-cf-usage-collector-dod-plugin-conformance-suite:p1
 pub const UNWRITTEN_CHECKS: &[&str] = &[
     CONVERGED_TARGET_LOOKUP,
-    DEDUP_FLOOR,
     DEDUP_CONCURRENT,
     FEED_SNAPSHOT_AND_REPLAY,
     FEED_COMPLETENESS,
@@ -400,6 +401,7 @@ pub async fn run_all(
     violations.extend(at_most_one_invalidation(plugin, level).await);
     violations.extend(record_and_invalidation_distinct_identity(plugin).await);
     violations.extend(server_field_round_trip(plugin).await);
+    violations.extend(dedup_floor(plugin).await);
     violations.extend(scope_is_a_filter_on_every_read_path(plugin).await);
     violations
 }

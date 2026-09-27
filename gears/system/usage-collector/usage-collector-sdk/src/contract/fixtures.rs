@@ -433,8 +433,8 @@ pub fn fixture_invalidation(target: &UsageRecord) -> Result<UsageRecord, String>
 
 /// A [`ContractViolation`] attributed to one check.
 ///
-/// The check name is a parameter rather than baked in. Eight checks report
-/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a ninth
+/// The check name is a parameter rather than baked in. Nine checks report
+/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a tenth
 /// caller, and the whole point of [`ContractViolation::check`] is that a
 /// violation says which assertion produced it — a helper that stamped one
 /// name on every report would quietly undo that.

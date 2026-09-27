@@ -11,7 +11,7 @@
 //! column against each of them.
 //!
 //! *Behaviourally* is the exact word. Nine subjects wrap a real reference
-//! backend and are that backend plus one interception; the other two
+//! backend and are that backend plus one interception; the other three
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
 //!
@@ -38,12 +38,13 @@
 //! with — one substitutes the scope on the point read, and two rewrite how a
 //! second withdrawal of a record is answered.
 //!
-//! **A ledger of its own** ([`MutantLedger`]) is needed by the other two
-//! (selection column, fold exclusion), because each changes a predicate the
-//! inner backend owns and no interception can reach it: which column a range
-//! meets and which rows a fold walks. It mirrors the
-//! reference where the defect is not, and it is smaller in one stated way
-//! that no check reaches — see [`MutantLedger`].
+//! **A ledger of its own** ([`MutantLedger`]) is needed by the other three
+//! (selection column, fold exclusion, missing unique constraint), because
+//! each changes something the inner backend owns and no interception can
+//! reach it: which column a range meets, which rows a fold walks, and what
+//! admission writes. It mirrors the reference where the defect is not, and it
+//! is smaller in one stated way that no check reaches — see
+//! [`MutantLedger`].
 //!
 //! # The four server-assigned fields, and which two have a subject
 //!
@@ -198,6 +199,54 @@ pub(super) enum Defect {
     /// Honours the scope on the list and aggregate paths and ignores it on
     /// the point read.
     IgnoresScopeOnThePointRead,
+    /// Decides every collision by reading the ledger and then writes anyway:
+    /// the dedup identity carries no unique constraint, so the outcome a
+    /// caller reads is right and a second row lands beside the first.
+    ///
+    /// This is the mistake a backend makes by leaving the dedup logic in the
+    /// application and the constraint out of the schema - the `SELECT` that
+    /// decides absorb-or-conflict is written, the `INSERT` after it is
+    /// unconditional, and nothing in the table refuses the duplicate. It is
+    /// the defect DESIGN §3.1's "Dedup identity" row states the floor
+    /// against: *"One identity yields at most one entry on every read path,
+    /// fold, reconciliation figure, and materialised aggregate."*
+    ///
+    /// **A subject that answered differently instead would be the wrong
+    /// shape.** Every collision outcome this subject returns is the
+    /// conforming one, so it passes every assertion about an absorb, a
+    /// conflict and an in-batch resolution; what it fails is the read-back.
+    /// A subject wrong in its answers would fail those assertions and leave
+    /// the floor itself untested, which is the half `dedup-floor` adds.
+    ///
+    /// **What the row this subject anchors does and does not establish**,
+    /// measured by neutering each of `dedup-floor`'s nine assertions in turn
+    /// rather than inferred. It is the only subject that reaches that check
+    /// at all, and it reaches exactly the two assertions that read the
+    /// ledger back: the row count on `list_usage_records`, and the `COUNT`
+    /// fold over the same range. **Neither is individually necessary** — a
+    /// duplicate row shows on both paths, so neutering either leaves the
+    /// other reporting and the row unchanged; neutering both together takes
+    /// `dedup-floor` out of the row, and nothing else changes. Isolating one
+    /// from the other needs a subject whose fold disagrees with its own
+    /// ledger page: a `COUNT` served from a materialised aggregate refreshed
+    /// once per submission would count a duplicate this subject's ledger page
+    /// also shows, and is the honest shape of that second defect.
+    ///
+    /// The other seven assertions — the retry, the divergent submission, and
+    /// the earlier and later entry of each batch pair — are reached by **no
+    /// subject in this module**, and each was confirmed to execute and to be
+    /// satisfied by the reference by inverting it. No other subject submits
+    /// one identity twice on that check's own meter, and every outcome this
+    /// one returns is the conforming one. Two further subjects would close
+    /// most of the gap and both are writable against this SPI: one that
+    /// absorbs a divergent re-delivery of a *record* (the withdrawal-only
+    /// [`Defect::AbsorbsAWithdrawalWithAnotherReason`] never reaches a
+    /// record), and one whose batch path carries no in-batch dedup map. The
+    /// two "the earlier entry of a batch is accepted" assertions are
+    /// structurally out of reach: a subject refusing the first entry of an
+    /// identity fails most of the suite and is a caricature rather than a
+    /// mistake anyone makes.
+    LedgerHasNoUniqueConstraint,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -219,9 +268,9 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::IgnoresScopeOnThePointRead
         | Defect::AbsorbsAWithdrawalWithAnotherReason
         | Defect::RefusesAWithdrawalWithTheSameReason => Box::new(WrappedReference::new(defect)),
-        Defect::SelectsOnWindowStart | Defect::FoldsTheInvalidation => {
-            Box::new(MutantLedger::new(defect))
-        }
+        Defect::SelectsOnWindowStart
+        | Defect::FoldsTheInvalidation
+        | Defect::LedgerHasNoUniqueConstraint => Box::new(MutantLedger::new(defect)),
     }
 }
 
@@ -387,7 +436,8 @@ impl WrappedReference {
             | Defect::RefusesAWithdrawalWithTheSameReason
             | Defect::ConflictReadBackIgnoresTheEntryType
             | Defect::SelectsOnWindowStart
-            | Defect::FoldsTheInvalidation => Ok(record),
+            | Defect::FoldsTheInvalidation
+            | Defect::LedgerHasNoUniqueConstraint => Ok(record),
         }
     }
 
@@ -968,14 +1018,21 @@ impl Ledger {
 /// which is less than the whole mirror. Pinned today: the covered-period
 /// bound the selection meets, the admission decision, the withdrawal
 /// exclusion, the ungrouped `SUM` the fold check reads, which rows the three
-/// scope-carrying read paths answer with, and — since
-/// `server-field-round-trip` landed — that the feed **delivers** the entries
-/// of a subscribed meter at all. Each was measured by breaking it and
-/// watching a row grow, not inferred from the check list.
+/// scope-carrying read paths answer with, since `server-field-round-trip`
+/// landed that the feed **delivers** the entries of a subscribed meter at
+/// all, and — since `dedup-floor` landed — the ungrouped `COUNT`, which is
+/// the only fold shape besides `SUM` that `run_all` dispatches at
+/// `DedupLevel::Linearizable` (`at-most-one-invalidation` sends one too, but
+/// only under an `Eventual` declaration, which the matrix does not run).
+/// Each was measured by breaking it and watching a row grow, not inferred
+/// from the check list: the `COUNT` arm of [`fold_value`] was measured by
+/// returning `count + 1`, which took both subjects built on this type out of
+/// their own rows.
 ///
 /// Everything else here is level with the reference and **unpinned**: the
 /// ledger page's *order* (its membership is pinned, its sort is asserted by
-/// no check), the grouped and non-`SUM` folds, the reconciliation figures,
+/// no check), the grouped folds and the three that read a quantity,
+/// the reconciliation figures,
 /// and everything about the feed page but its delivering entries — its seek,
 /// its scanned-entry cursor rule, its subscription and scope gates, and its
 /// retention refusal. Those four were measured too, each by breaking it and
@@ -1051,6 +1108,35 @@ impl MutantLedger {
         }
     }
 
+    /// Decides one entry and writes it, under this subject's own admission
+    /// rule.
+    ///
+    /// Every subject but [`Defect::LedgerHasNoUniqueConstraint`] admits
+    /// through [`admit`], which is the reference's decision: a collision on
+    /// `id` resolves by caller-supplied fields and only a fresh entry is
+    /// written. That one admits through
+    /// [`admit_without_a_unique_constraint`], which decides the same way and
+    /// writes regardless.
+    ///
+    /// **This is why that defect carries a ledger of its own rather than
+    /// wrapping the reference.** The other two here change a predicate the
+    /// inner backend owns; this one changes what the inner backend *stores*,
+    /// and a wrapper cannot make [`InMemoryReferencePlugin`] hold a second
+    /// row under one `id` - its own admission refuses to. A wrapper keeping
+    /// the duplicates in a side ledger would then have to re-implement every
+    /// read path's selection, ordering and paging to merge them back in,
+    /// which is this type with extra steps.
+    fn admit_here(
+        &self,
+        ledger: &mut Ledger,
+        record: UsageRecord,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        if self.defect == Defect::LedgerHasNoUniqueConstraint {
+            return admit_without_a_unique_constraint(ledger, record);
+        }
+        admit(ledger, record)
+    }
+
     /// Whether one entry is inside a read path's selection.
     ///
     /// Everything but the bound — the meter, the filter, the metadata
@@ -1081,7 +1167,7 @@ impl UsageCollectorPluginV1 for MutantLedger {
         record: UsageRecord,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         let mut ledger = self.ledger()?;
-        admit(&mut ledger, record)
+        self.admit_here(&mut ledger, record)
     }
 
     /// The batch, decided under one lock in input order.
@@ -1098,7 +1184,7 @@ impl UsageCollectorPluginV1 for MutantLedger {
         let mut ledger = self.ledger()?;
         Ok(records
             .into_iter()
-            .map(|record| admit(&mut ledger, record))
+            .map(|record| self.admit_here(&mut ledger, record))
             .collect())
     }
 
@@ -1347,6 +1433,36 @@ fn admit(
     }
     ledger.push(record.clone());
     Ok(record)
+}
+
+/// [`Defect::LedgerHasNoUniqueConstraint`]: decides one entry against the
+/// ledger exactly as [`admit`] decides it, and writes it whatever the
+/// decision was.
+///
+/// The answer is the conforming one in all three cases - the stored entry for
+/// an exact retry, `IdempotencyConflict` carrying it for a divergent
+/// submission, the entry itself for a fresh one - because it is
+/// [`decide`]'s, the same function [`admit`] consults. Only the write differs,
+/// and it differs by not consulting anything: the schema this models has no
+/// unique constraint on the dedup identity, so the insert after the lookup
+/// cannot be refused.
+///
+/// [`decide`] finds a row by `id` with `Iterator::find`, so it goes on
+/// answering with the **first** row written under an identity however many
+/// duplicates pile up behind it. That is what keeps this subject wrong in one
+/// way only: a caller reads the same outcomes a conforming backend would give,
+/// and the ledger holds rows a conforming backend would not.
+fn admit_without_a_unique_constraint(
+    ledger: &mut Ledger,
+    record: UsageRecord,
+) -> Result<UsageRecord, UsageCollectorPluginError> {
+    let answer = match decide(ledger, &record) {
+        Ok(Some(stored)) => Ok(stored),
+        Ok(None) => Ok(record.clone()),
+        Err(err) => Err(err),
+    };
+    ledger.push(record);
+    answer
 }
 
 /// Every `UsageRecord.id` an accepted invalidation names.
