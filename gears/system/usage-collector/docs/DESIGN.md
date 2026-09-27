@@ -536,7 +536,7 @@ a vendor-specific dependency requires a Plugin SPI major-version revision.
 | `FeedStart` | Where a feed read begins, **named** rather than inferred from an absent position: `Oldest` is the oldest entry the subscription retains, `After(position)` continues from a position the feed issued. Both Rust surfaces take it, over the position each speaks — the wire cursor on the SDK trait, `FeedPosition` on the SPI. It is `#[non_exhaustive]`, so a start mode admitted later is a variant rather than a further argument. v1 admits these two, and neither begins at the head ([§3.2](#32-component-model)). |
 | `AggregationResult` | Grouped buckets. Each carries the dimension values in `group_by` order and the folded quantity as `bigdecimal::BigDecimal` — unbounded, and deliberately not the per-entry `rust_decimal::Decimal`, because a fold is not bounded by the per-entry ceiling. `null` where no entry matched. Neither the fold nor the queried type rides the result: both are inputs to the call. |
 | `FeedSubscription` | The set of GTS types one consumer reads. It bounds that consumer's pages and cursor. |
-| `FeedPage` | Settled entries in feed order and an opaque cursor holding a `FeedPosition`. Everything before the cursor is delivered and final under the compiled scope the read ran under; the scope-change contract is in [§3.3](#33-api-contracts), Cursor & Pagination. |
+| `FeedPage<C>` | Settled entries in feed order and an opaque cursor. Everything before the cursor is delivered and final under the compiled scope the read ran under; the scope-change contract is in [§3.3](#33-api-contracts), Cursor & Pagination. Generic over the cursor kind, since the SPI and the wire carry different ones: the SPI returns `FeedPage<FeedPosition>` and the SDK trait and REST return `FeedPage<CursorV1>`, so a plugin's position cannot reach a consumer. `FeedStart` is parameterised for the same reason. |
 | `ReconciliationMetadata` | Accepted count, a fold-appropriate quantity summary, and two watermarks — acceptance instant and covered-period end — for one `(tenant, gts_type)` scope. Both watermarks are optional: absent when the scope holds no entries. |
 | `ReconciliationScope` | The reporting granularity, a REST-level concept only. v1 admits `(tenant, gts_type)` alone, carried as the required `tenant_id` and `gts_type_id` query parameters, so no SPI type corresponds to it. The two caller scopes are reserved — see [§4](#4-additional-context). |
 | *(GTS type declaration)* | **Not an entity of this gear**, and given no shape here. A meter *is* a derived GTS type of `gts.cf.core.uc.usage_record.v1~`, whose trait schema is the only normative statement of what a declaration carries. The gear resolves a declaration. It never owns, mints, or stores one. |
@@ -1139,7 +1139,7 @@ pub trait UsageCollectorClientV1: Send + Sync + 'static {
         start: FeedStart<&CursorV1>,
         until: Option<&CursorV1>,
         limit: Option<u64>,
-    ) -> Result<FeedPage, UsageCollectorError>;
+    ) -> Result<FeedPage<CursorV1>, UsageCollectorError>;
 }
 ```
 
@@ -1228,7 +1228,7 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
         start: FeedStart<FeedPosition>,
         until: Option<FeedPosition>,
         limit: u64,
-    ) -> Result<FeedPage, UsageCollectorPluginError>;
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError>;
 
     /// Per-scope ingestion counters and watermarks.
     ///
