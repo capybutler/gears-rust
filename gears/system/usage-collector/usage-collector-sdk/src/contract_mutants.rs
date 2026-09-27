@@ -10,7 +10,7 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Eight subjects wrap a real reference
+//! *Behaviourally* is the exact word. Nine subjects wrap a real reference
 //! backend and are that backend plus one interception; the other two
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
@@ -29,14 +29,14 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Eight defects fit (quantity, the
-//! store's own acceptance instant, period-blind dedup, entry-type-blind
-//! dedup, the entry-type-blind conflict read-back, point-read scope, and the
-//! two withdrawal defects): two rewrite a field on the way in, three keep an
-//! index beside the ledger — two to refuse an admission, one only to decide
-//! which stored entry a collision is answered with — one substitutes the
-//! scope on the point read, and two rewrite how a second withdrawal of a
-//! record is answered.
+//! strongest form the subject can take. Nine defects fit (quantity, the
+//! store's own acceptance instant, a defaulted origin, period-blind dedup,
+//! entry-type-blind dedup, the entry-type-blind conflict read-back,
+//! point-read scope, and the two withdrawal defects): three rewrite a field
+//! on the way in, three keep an index beside the ledger — two to refuse an
+//! admission, one only to decide which stored entry a collision is answered
+//! with — one substitutes the scope on the point read, and two rewrite how a
+//! second withdrawal of a record is answered.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other two
 //! (selection column, fold exclusion), because each changes a predicate the
@@ -44,6 +44,35 @@
 //! meets and which rows a fold walks. It mirrors the
 //! reference where the defect is not, and it is smaller in one stated way
 //! that no check reaches — see [`MutantLedger`].
+//!
+//! # The four server-assigned fields, and which two have a subject
+//!
+//! `server-field-round-trip` asserts `id`, `accepted_at`, `origin` and an
+//! invalidation's `invalidates`. Two of the four have a subject here and two
+//! do not, which bounds what that check's matrix row establishes. The split
+//! is deliberate rather than unfinished:
+//!
+//! * **`accepted_at`** — [`Defect::StampsItsOwnAcceptedAt`]. DESIGN names the
+//!   defect outright.
+//! * **`origin`** — [`Defect::DefaultsOriginToLive`]. DESIGN's fidelity row
+//!   names defaulting outright, and the check's fixtures hand the plugin both
+//!   origins precisely so a backend that answers one of them always is caught.
+//! * **`id`** — **no subject, and none is wanted.** DESIGN's rule forbids
+//!   re-deriving, and re-deriving `id` is a no-op: the derivation is a `UUIDv5`
+//!   over the six identity inputs, deterministic, so a backend that recomputes
+//!   it from the row it stored arrives at the same value. A subject would have
+//!   to assign a *surrogate* identity instead — a `bigserial`, a fresh v4 —
+//!   which is a different mistake from the one this row states and a caricature
+//!   of it besides, since such a backend loses the dedup identity and fails
+//!   most of the suite. The reasoning is the artefact; the subject would not be.
+//! * **`invalidates`** — **no subject yet, and it cannot be confined to one
+//!   check.** A backend that dropped the reference on read also breaks the
+//!   withdrawal exclusion: [`withdrawn_targets`] and the reference's function
+//!   of the same name read exactly that field to decide which records a fold
+//!   leaves out, so the defect lands as another multi-check row rather than an
+//!   isolating one. It is a known gap, recorded here rather than closed:
+//!   whoever closes it decides first whether a wider row buys more than it
+//!   costs, the way `Defect::DedupIgnoresTheEntryType`'s four-check row does.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -61,7 +90,7 @@ use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult,
-    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, UsageRecord,
+    MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, RecordOrigin, UsageRecord,
 };
 use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
@@ -98,6 +127,22 @@ pub(super) enum Defect {
     /// instant and so does the absorbed retry. What that costs the matrix is
     /// stated where it is spent: see [`MUTANT_INSERT_INSTANT`].
     StampsItsOwnAcceptedAt,
+    /// Writes `live` into `origin` whatever it was handed — the mistake a
+    /// backend makes by declaring the column `DEFAULT 'live'` and leaving it
+    /// out of the insert, or by hard-coding the live route in a port written
+    /// before the backfill one existed.
+    ///
+    /// DESIGN §3.1's "Server-assigned field fidelity" names this one too: a
+    /// plugin *"does not re-derive, default, or refresh one"*. `origin` is
+    /// the field of the four a default is most natural on, because one of its
+    /// two values is overwhelmingly the common case and a column that
+    /// defaults to it looks right in every test a porter writes from live
+    /// traffic.
+    ///
+    /// Applied on admission, like [`Self::StampsItsOwnAcceptedAt`] and for
+    /// the same reason: a defaulted column is written once, on the way in,
+    /// and every read path afterwards answers what was written.
+    DefaultsOriginToLive,
     /// Selects on `window_start` instead of `window_end` — the mistake a
     /// backend makes by porting the pre-period point-in-time column.
     SelectsOnWindowStart,
@@ -167,6 +212,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
     match defect {
         Defect::QuantityThroughFloat
         | Defect::StampsItsOwnAcceptedAt
+        | Defect::DefaultsOriginToLive
         | Defect::DedupIgnoresThePeriod
         | Defect::DedupIgnoresTheEntryType
         | Defect::ConflictReadBackIgnoresTheEntryType
@@ -189,7 +235,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
 ///
-/// One qualification, and it holds for all eight wrapped defects:
+/// One qualification, and it holds for all nine wrapped defects:
 /// [`Self::create_usage_records`] is not pure delegation. The inner backend
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
@@ -201,7 +247,7 @@ struct WrappedReference {
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
     /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
-    /// entry that claimed it. Unused by the other seven defects.
+    /// entry that claimed it. Unused by the other eight defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -216,7 +262,7 @@ struct WrappedReference {
     period_blind_keys: Mutex<BTreeMap<PeriodBlindKey, UsageRecord>>,
     /// The entry-type-blind dedup index [`Defect::DedupIgnoresTheEntryType`]
     /// keys on: `(tenant_id, gts_type_id, idempotency_key, window_start,
-    /// window_end)` to the entry that claimed it. Unused by the other seven
+    /// window_end)` to the entry that claimed it. Unused by the other eight
     /// defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
@@ -235,7 +281,7 @@ struct WrappedReference {
     entry_type_blind_keys: Mutex<BTreeMap<EntryTypeBlindKey, UsageRecord>>,
     /// The rows [`Defect::ConflictReadBackIgnoresTheEntryType`] reads a
     /// colliding entry back from: the same five components, to **every**
-    /// entry accepted under them, in arrival order. Unused by the other seven
+    /// entry accepted under them, in arrival order. Unused by the other eight
     /// defects.
     ///
     /// A `Vec` rather than one entry, because two rows under one five-tuple
@@ -317,6 +363,12 @@ impl WrappedReference {
             // place.
             Defect::StampsItsOwnAcceptedAt => Ok(UsageRecord {
                 accepted_at: MUTANT_INSERT_INSTANT,
+                ..record
+            }),
+            // A `DEFAULT 'live'` column the insert never names: whichever
+            // route the gateway stamped, the row records the common one.
+            Defect::DefaultsOriginToLive => Ok(UsageRecord {
+                origin: RecordOrigin::Live,
                 ..record
             }),
             Defect::DedupIgnoresThePeriod => self.claim_period_blind_key(record),
@@ -771,11 +823,13 @@ fn through_f64(value: Decimal) -> Decimal {
 /// *necessary* for the row, because the other four still report without it.
 /// The row establishes that the check as a whole notices a backend stamping
 /// its own instant, not that any one path's assertion is load-bearing.
+/// [`Defect::DefaultsOriginToLive`] is the same shape and carries the same
+/// caveat.
 ///
-/// It also reaches `accepted_at` alone. `id`, `origin` and an invalidation's
-/// `invalidates` are asserted by that check and by no subject here; a backend
-/// defaulting one of those would need a second defect, and until one exists
-/// the matrix says nothing about those three.
+/// It reaches `accepted_at` alone, and which of the check's four fields has a
+/// subject at all is stated once in this module's header rather than on each
+/// defect: see "The four server-assigned fields, and which two have a
+/// subject".
 const MUTANT_INSERT_INSTANT: time::OffsetDateTime =
     time::OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::days(21_000));
 

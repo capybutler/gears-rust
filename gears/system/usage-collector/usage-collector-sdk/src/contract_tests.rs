@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds ten deliberately
+//! as coverage. [`super::contract_mutants`] holds eleven deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -150,6 +150,7 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (Defect::StampsItsOwnAcceptedAt, &[SERVER_FIELD_ROUND_TRIP]),
+    (Defect::DefaultsOriginToLive, &[SERVER_FIELD_ROUND_TRIP]),
     (
         Defect::SelectsOnWindowStart,
         &[WINDOW_END_SELECTION, QUANTITY_ROUND_TRIP],
@@ -190,7 +191,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all ten mutants is not
+/// of sensitivity. A check that fails against all eleven mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.

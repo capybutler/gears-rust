@@ -93,6 +93,21 @@ const NOT_YET_CONFORMING: &[(&str, &str)] = &[
          2 adds, which does not grow with a subscription's breadth",
     ),
     (
+        contract::SERVER_FIELD_ROUND_TRIP,
+        "slice 3, plugin feed page and retention interlock: the feed half \
+         alone. `read_feed_page` is stubbed `Internal` in \
+         `src/domain/adapter.rs`, so the one of this check's five properties \
+         that reads an entry back off the feed cannot be answered at all. \
+         **Unlike the five feed rows above, this names a check that is \
+         four-fifths passing**: the point lookup, the ledger page, the \
+         absorbed retry and the re-read after it all hold, because \
+         `INSERT_COLUMNS` binds `id`, `invalidates`, `origin` and \
+         `accepted_at` from the record rather than defaulting them and \
+         `RECORD_COLUMNS` returns them on every path that answers an entry. \
+         Whoever pays this row off in slice 3 is removing it for one \
+         property, not for a check this backend fails outright",
+    ),
+    (
         contract::LATEST_TIE_BREAK,
         "slice 7, query rules: `LATEST_SELECT_EXPR` in \
          `src/infra/storage/query/aggregate.rs` orders by \
