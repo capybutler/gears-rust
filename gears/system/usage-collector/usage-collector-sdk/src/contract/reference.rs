@@ -38,15 +38,6 @@
 //!   `next_cursor`** — it serves the canonical `(window_end, id)` ascending
 //!   order and one page. A real plugin owes both; the SPI's own method doc
 //!   is normative for it.
-//! * **`LATEST` breaks a `window_end` tie on the greatest `id`, skipping
-//!   `accepted_at`** — DESIGN §3.1 declares *greatest `window_end`, then
-//!   greatest `accepted_at`, then greatest `id` in byte order*, so this
-//!   backend omits the middle key rather than substituting for an
-//!   inexpressible one: `UsageRecord` carries all three fields and this
-//!   fold could implement the rule exactly. It answers as DESIGN requires
-//!   only when the tied entries share an `accepted_at`, which is when
-//!   DESIGN itself falls through to `id`. `latest-tie-break` is in
-//!   `UNWRITTEN_CHECKS` in the parent module, so no check reports it.
 //! * **Retention never runs of its own accord** — this backend holds no
 //!   declared retention and no sweep timer, so it removes an entry only when
 //!   a caller drives it through [`ContractRetention`]. A real plugin reads
@@ -58,22 +49,6 @@
 //!   `read_feed_page` refuses a cursor on. `CursorBeyondRetention` is
 //!   therefore reachable here — it was not before this backend could be
 //!   driven — but only after a caller has driven a drop.
-//! * **`SUM` over an empty selection answers absent where DESIGN requires
-//!   `0`** — `fold_value` returns `None` for every fold over a bucket with no
-//!   rows, and DESIGN §3.3 divides them: `SUM` and `COUNT` *"are defined over
-//!   an empty selection and report `0`"* while `MAX`, `MIN` and `LATEST`
-//!   report absent. `COUNT` is answered correctly here and `SUM` is not. It
-//!   predates the feed and no implemented check reads it, deliberately:
-//!   `invalidation-excluded-from-fold` asserts its `SUM` against the
-//!   surviving entry's quantity rather than against zero, because an empty
-//!   `SUM` is what a backend computing no fold at all also answers. Listing
-//!   it here is the point of this section — it is a place the backend answers
-//!   less than the SPI asks for.
-//! * **`get_reconciliation_metadata` never reports a `quantity_summary`** —
-//!   the count and both watermarks are computed and the fold is always
-//!   absent. `SUM` and `COUNT` are defined over an empty selection, so
-//!   absent is the wrong answer under those two rather than a narrower one.
-//!   No implemented check reads the field.
 //!
 //! # A test-only mirror of this file exists
 //!
@@ -621,28 +596,45 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
         Ok(FeedPage { entries, next })
     }
 
-    /// Counters and watermarks over the ledger.
+    /// Counters, the declared fold, and watermarks over the ledger.
     ///
     /// The compiled `scope` applies **before** the tenant and type arguments,
     /// so a tenant it excludes answers exactly as one holding no entries
     /// rather than as an error. An untranslatable grant admits nothing, the
     /// same disposition as the point lookup's.
     ///
-    /// **Do not copy the three passes.** `in_scope` re-walks the ledger once
+    /// **The two figures over the range disagree on purpose.** DESIGN §3.3's
+    /// plugin obligations: `accepted_count` *"counts every accepted entry the
+    /// range selects, invalidations included, because it reports ingestion
+    /// activity rather than aggregating the meter; the quantity summary
+    /// excludes withdrawn pairs"*. So the summary is the fold path's
+    /// selection rather than this method's: `fold` arrives as a parameter and
+    /// is applied through the same `withdrawn_targets` and `fold_value`
+    /// that `query_aggregated_usage_records` uses, which is also what carries
+    /// the empty-selection split — `SUM` and `COUNT` report a defined zero
+    /// over a range holding nothing but a withdrawn pair, the other three
+    /// report absent. The withdrawn set is collected from the whole ledger
+    /// rather than from the range or the scope, because an invalidation
+    /// either of them leaves out has still been accepted and still withdraws
+    /// its target.
+    ///
+    /// **Do not copy the four passes.** `in_scope` re-walks the ledger once
     /// per figure, which is free enough here under one held lock and in line
     /// with a backend that scans linearly anyway. A real backend computes all
-    /// three in one pass — `SELECT COUNT(*) FILTER (...), MAX(accepted_at),
-    /// MAX(window_end)` — and three separate round trips would be this
-    /// exemplar's shape mistaken for its obligation.
+    /// four in one pass — `SELECT COUNT(*) FILTER (...), SUM(quantity)
+    /// FILTER (...), MAX(accepted_at), MAX(window_end)` — and four separate
+    /// round trips would be this exemplar's shape mistaken for its
+    /// obligation.
     async fn get_reconciliation_metadata(
         &self,
         tenant_id: Uuid,
         gts_type_id: MeterTypeId,
         time_range: TimeRange,
-        _fold: AggregationFold,
+        fold: AggregationFold,
         scope: &ast::Expr,
     ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
         let ledger = self.ledger()?;
+        let withdrawn = withdrawn_targets(&ledger);
         let in_scope = || {
             ledger
                 .records()
@@ -659,13 +651,20 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
             .filter(|e| time_range.contains_window_end(e.window_end))
             .count();
 
+        // The fold's own selection: the same range, then both halves of every
+        // withdrawn pair removed. The count above keeps them, which is the
+        // whole of the disagreement between the two figures.
+        let folded: Vec<&UsageRecord> = in_scope()
+            .filter(|e| time_range.contains_window_end(e.window_end))
+            .filter(|e| e.invalidation.is_none() && !withdrawn.contains(&e.id))
+            .collect();
+
         // Every field is given, so no `..ReconciliationMetadata::empty()` tail:
         // `clippy::needless_update` fires on a struct update that updates
-        // nothing. The fold stays `None` until a later slice, which is when a
-        // check first reads it.
+        // nothing.
         Ok(ReconciliationMetadata {
             accepted_count: u64::try_from(accepted_count).unwrap_or(u64::MAX),
-            quantity_summary: None,
+            quantity_summary: fold_value(fold, &folded)?,
             max_accepted_at: in_scope().map(|e| e.accepted_at).max(),
             max_window_end: in_scope().map(|e| e.window_end).max(),
         })
@@ -1131,9 +1130,20 @@ fn value_matches(field: FieldValue<'_>, value: &ast::Value) -> Option<bool> {
 /// Groups the selected rows and folds each group.
 ///
 /// An empty `group_by` is the no-grouping case: exactly one bucket carrying
-/// an empty key, emitted even over an empty selection — `COUNT` answers
-/// zero there and every other fold answers absent, the split
-/// `SELECT COUNT(*)` makes against `SELECT MIN(v)` over no rows.
+/// an empty key, emitted even over an empty selection. What that bucket
+/// carries is [`fold_value`]'s to decide, and it splits by fold — `SUM` and
+/// `COUNT` answer zero there, `MAX`, `MIN` and `LATEST` answer absent.
+///
+/// **A grouping empties differently, and deliberately so.** The groups below
+/// are keyed from the surviving rows alone, so a group nothing survives in
+/// is never keyed and no bucket is emitted for it — the emptiness lands in
+/// the grouping rather than in a fold over an empty group, which is why the
+/// split above is not reachable through this branch. DESIGN §3.3's plugin
+/// obligations state the two halves together: *"This reaches the ungrouped
+/// bucket of a query matching no entry, and the ungrouped bucket of a range
+/// whose every entry is a withdrawn pair — the fold excludes the pair, which
+/// empties the selection rather than removing the bucket. A grouped query
+/// yields no bucket for a group nothing survives in."*
 ///
 /// The bucket count is capped at [`MAX_AGGREGATION_BUCKETS`] `+ 1`. The SDK
 /// puts that bound on the plugin rather than on the gateway so an
@@ -1206,24 +1216,24 @@ fn bucket_key(row: &UsageRecord, group_by: &[AggregationDimension]) -> Option<Ve
 /// of in-range quantities can exceed `Decimal`'s ~7.9×10²⁸ ceiling, and the
 /// aggregate surface carries `BigDecimal` for exactly that reason.
 ///
-/// `LATEST` breaks a `window_end` tie on the greatest `id`, and **that is
-/// not the declared rule.** DESIGN §3.1 declares greatest `window_end`,
-/// then greatest `accepted_at`, then greatest `id` in byte order. The key
-/// below is `(window_end, id)`, so it skips `accepted_at` and agrees with
-/// DESIGN only where the tied entries share one — the case in which DESIGN
-/// also reaches `id`. Nothing makes this unavoidable: [`UsageRecord`]
-/// carries `accepted_at`, so this is an omission rather than a substitute
-/// for something the type cannot express, and the earlier claim here that
-/// the declared tie-break read an `acceptance_sequence` field described a
-/// rule DESIGN does not carry. What `id` does buy is a total order, without
-/// which the answer would depend on ledger insertion order.
+/// **An empty bucket splits by fold.** DESIGN §3.3's plugin obligations:
+/// *"`SUM` and `COUNT` are defined over an empty selection and report `0`;
+/// `MAX`, `MIN` and `LATEST` are not and report absent"*. So `SUM` returns
+/// its accumulator, which starts at zero and has nothing added to it, and
+/// `COUNT` returns the row count; the other three have no row to read a
+/// quantity off and answer `None`.
 ///
-/// `latest-tie-break` is writable against the current SPI and unwritten, so
-/// it sits in `UNWRITTEN_CHECKS` in the parent module and no check asserts
-/// this either way. Being the suite's reference backend, this fold is not
-/// evidence of what the rule is: a plugin author reads
-/// [`AggregationFold::Latest`](crate::models::AggregationFold::Latest) and
-/// DESIGN §3.1 for that.
+/// **`LATEST` takes the greatest `(window_end, accepted_at, id)`**, which is
+/// the whole of DESIGN §3.1's declared order: *"Greatest `window_end`, then
+/// greatest `accepted_at`, then greatest `id` in byte order"*. The third key
+/// is a byte comparison as declared, and by construction rather than by
+/// coincidence: [`Uuid`] is a `#[repr(transparent)]` newtype over
+/// `[u8; 16]` carrying a derived `Ord`, so comparing two of them compares
+/// those sixteen bytes lexicographically. It is also what makes the order
+/// total — `id` is unique, so no two rows tie on all three keys and the
+/// answer never depends on ledger insertion order. All three keys compare
+/// across tenants and types, so the rule holds unchanged for a group
+/// spanning either.
 fn fold_value(
     fold: AggregationFold,
     rows: &[&UsageRecord],
@@ -1240,11 +1250,13 @@ fn fold_value(
             for row in rows {
                 total += to_big_decimal(row.quantity.as_decimal())?;
             }
-            return Ok(if rows.is_empty() { None } else { Some(total) });
+            return Ok(Some(total));
         }
         AggregationFold::Max => rows.iter().max_by_key(|row| row.quantity.as_decimal()),
         AggregationFold::Min => rows.iter().min_by_key(|row| row.quantity.as_decimal()),
-        AggregationFold::Latest => rows.iter().max_by_key(|row| (row.window_end, row.id)),
+        AggregationFold::Latest => rows
+            .iter()
+            .max_by_key(|row| (row.window_end, row.accepted_at, row.id)),
         AggregationFold::Count => None,
     };
     winner

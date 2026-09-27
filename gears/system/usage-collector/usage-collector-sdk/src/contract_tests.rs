@@ -32,7 +32,9 @@
 //! not a contract check but is the thing a plugin author copies.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 
+use bigdecimal::BigDecimal;
 use toolkit_odata::{ODataQuery, ast};
 use uuid::Uuid;
 
@@ -47,8 +49,8 @@ use super::{
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
-    CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef,
-    UsageRecord,
+    AggregationFold, CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RecordOrigin,
+    ResourceRef, UsageRecord,
 };
 use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
@@ -1846,5 +1848,421 @@ async fn the_retention_refusal_does_not_consult_the_callers_scope() {
          would serve this page and be right about this caller's entries and wrong about the \
          contract: DESIGN refuses whatever the scope admitted, and the wire refusal is \
          published on the same terms. Got: {refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+//
+// The reference backend's fold and its reconciliation figures. Unit tests of
+// the reference implementation rather than contract checks: DESIGN section
+// 3.3's `latest-tie-break` is written against the SPI for any backend and is
+// in `UNWRITTEN_CHECKS`, and no check of the sixteen reads a reconciliation
+// quantity summary at all. What the tests below hold is the suite's own
+// subject to the rules a check will later assert against every plugin, so
+// that when one lands it is validated against a backend already answering
+// them.
+
+/// The meter the tests below write to.
+///
+/// The suite's shared one, which `run_all`'s constraint on sharing does not
+/// reach: every test here drives a backend of its own, so no other check's
+/// entries are in the ledger it reads.
+fn fold_meter() -> MeterTypeId {
+    MeterTypeId::new(super::fixtures::CONTRACT_METER_TYPE_ID)
+        .expect("the suite's own meter type id is valid")
+}
+
+/// The single bucket a no-grouping fold over `range` reports.
+///
+/// `group_by` is empty, which the aggregate surface fixes as the no-grouping
+/// case: one bucket carrying an empty key. Any other bucket count is a
+/// failure here rather than something to pick a value out of.
+async fn ungrouped_fold(
+    plugin: &InMemoryReferencePlugin,
+    range: TimeRange,
+    fold: AggregationFold,
+) -> Option<BigDecimal> {
+    let result = plugin
+        .query_aggregated_usage_records(
+            fold_meter(),
+            range,
+            fold,
+            &super::fixtures::contract_query(16),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!("the reference backend folds {fold:?} without failing: {err:?}")
+        });
+    let count = result.buckets.len();
+    let mut buckets = result.buckets.into_iter();
+    match (buckets.next(), buckets.next()) {
+        (Some(bucket), None) => {
+            assert!(
+                bucket.key.is_empty(),
+                "the no-grouping case is one bucket carrying an empty key; {fold:?} reported \
+                 the key {:?}",
+                bucket.key
+            );
+            bucket.value
+        }
+        _ => {
+            panic!("the no-grouping case is exactly one bucket; {fold:?} reported {count} of them")
+        }
+    }
+}
+
+/// The covered period both entries of the `LATEST` tie share.
+const LATEST_TIE_WINDOW_START: time::OffsetDateTime =
+    super::fixtures::FIXTURE_EPOCH.saturating_add(time::Duration::days(180));
+/// The end of that period, and the first of DESIGN section 3.1's three keys.
+/// Shared, so the tie-break has to reach the second.
+const LATEST_TIE_WINDOW_END: time::OffsetDateTime =
+    LATEST_TIE_WINDOW_START.saturating_add(time::Duration::hours(1));
+
+/// The acceptance instant the later-accepted entry carries: an hour past
+/// [`CONTRACT_ACCEPTED_AT`](super::fixtures::CONTRACT_ACCEPTED_AT), which the
+/// earlier one keeps.
+const LATEST_TIE_LATER_ACCEPTED_AT: time::OffsetDateTime =
+    super::fixtures::CONTRACT_ACCEPTED_AT.saturating_add(time::Duration::hours(1));
+
+/// The earlier-accepted entry's quantity, and what a fold reading
+/// `(window_end, id)` alone reports.
+const LATEST_TIE_EARLIER_QUANTITY: &str = "11";
+/// The later-accepted entry's quantity, and what DESIGN section 3.1's order
+/// reports. Distinct from the one above, which is the whole assertion.
+const LATEST_TIE_LATER_QUANTITY: &str = "22";
+
+/// How many indexed key pairs [`latest_tie_break_pair`] tries.
+///
+/// Each attempt inverts with probability one half and the attempts are
+/// independent, so sixty-four of them miss with probability 2^-64. The bound
+/// is there so a derivation that stopped producing an inversion at all fails
+/// loudly instead of looping.
+const LATEST_TIE_BREAK_ATTEMPTS: u32 = 64;
+
+/// One entry of the tie, on the shared meter and tenant.
+fn latest_tie_break_entry(
+    role: &str,
+    attempt: u32,
+    quantity: &str,
+    accepted_at: time::OffsetDateTime,
+) -> UsageRecord {
+    let key = IdempotencyKey::new(format!("latest-tie-break-{role}-{attempt}"))
+        .expect("the fixture key is well formed");
+    super::fixtures::fixture_record_on(
+        fold_meter(),
+        super::fixtures::CONTRACT_TENANT_ID,
+        &key,
+        UsageQuantity::parse(quantity).expect("fixture quantity"),
+        accepted_at,
+        LATEST_TIE_WINDOW_START,
+        LATEST_TIE_WINDOW_END,
+    )
+    .expect("the tie-break fixture is projectable")
+}
+
+/// Two entries sharing a covered period, differing in `accepted_at`, where
+/// the later-accepted one carries the **smaller** `id`.
+///
+/// **The inversion is what makes the test able to fail.** A fold keyed on
+/// `(window_end, id)` and one keyed on `(window_end, accepted_at, id)` pick
+/// the same winner unless the two keys disagree, so a fixture whose
+/// later-accepted entry also carries the greater `id` would pass under either
+/// and prove nothing.
+///
+/// It cannot simply be chosen. An `id` is the `UUIDv5` over the six identity
+/// inputs, so which of two entries carries the greater one is a property of
+/// the derived values; the loop varies the one input that is free here, the
+/// idempotency key, and stops at the first index that inverts. Returns the
+/// two entries and the index they were found at.
+fn latest_tie_break_pair() -> (UsageRecord, UsageRecord, u32) {
+    for attempt in 0..LATEST_TIE_BREAK_ATTEMPTS {
+        let earlier = latest_tie_break_entry(
+            "earlier",
+            attempt,
+            LATEST_TIE_EARLIER_QUANTITY,
+            super::fixtures::CONTRACT_ACCEPTED_AT,
+        );
+        let later = latest_tie_break_entry(
+            "later",
+            attempt,
+            LATEST_TIE_LATER_QUANTITY,
+            LATEST_TIE_LATER_ACCEPTED_AT,
+        );
+        if later.id < earlier.id {
+            return (earlier, later, attempt);
+        }
+    }
+    panic!(
+        "no pair of indexed idempotency keys inverted the id order within \
+         {LATEST_TIE_BREAK_ATTEMPTS} attempts. The pair this test needs is one whose \
+         later-accepted entry carries the smaller `id`, and an `id` is the UUIDv5 over the six \
+         identity inputs, so the loop searches for it rather than choosing it. Without the \
+         inversion a fold keyed on `(window_end, id)` alone picks the same winner as one keyed \
+         on `(window_end, accepted_at, id)`, and this test would pass while asserting nothing"
+    );
+}
+
+/// `LATEST` breaks a `window_end` tie on the greater `accepted_at`, the
+/// middle key of DESIGN section 3.1's three.
+///
+/// The declared order is *"Greatest `window_end`, then greatest
+/// `accepted_at`, then greatest `id` in byte order"*, and the two entries
+/// here share the first key and disagree on the second and the third in
+/// opposite directions. So the fold reports the later-accepted entry's
+/// quantity if it reads `accepted_at` and the earlier one's if it falls
+/// straight through to `id`.
+///
+/// It is also the first caller to pass
+/// [`fixture_record_on`](super::fixtures::fixture_record_on) an
+/// `accepted_at` other than
+/// [`CONTRACT_ACCEPTED_AT`](super::fixtures::CONTRACT_ACCEPTED_AT), so it is
+/// what establishes that the parameter reaches the projection at all. A
+/// builder that dropped it would stamp both entries with one instant, and
+/// the second guard below - which is there for this and not as a restatement
+/// of the fixture - reports that rather than letting the fold be asserted
+/// over a tie the two entries do not actually have.
+#[tokio::test]
+async fn latest_breaks_a_window_end_tie_on_the_greater_accepted_at() {
+    let plugin = InMemoryReferencePlugin::new();
+    let (earlier, later, attempt) = latest_tie_break_pair();
+    assert_eq!(
+        earlier.window_end, later.window_end,
+        "the two entries MUST share the first key for the tie-break to reach the second"
+    );
+    assert!(
+        earlier.accepted_at < later.accepted_at,
+        "the entry named `later` MUST carry the greater acceptance instant"
+    );
+    for record in [earlier.clone(), later.clone()] {
+        plugin
+            .create_usage_record(record)
+            .await
+            .expect("the reference backend admits a well-formed entry");
+    }
+    let range = TimeRange::new(
+        LATEST_TIE_WINDOW_START,
+        LATEST_TIE_WINDOW_END.saturating_add(time::Duration::hours(1)),
+    )
+    .expect("the tie-break read range is ordered");
+
+    let latest = ungrouped_fold(&plugin, range, AggregationFold::Latest).await;
+
+    assert_eq!(
+        latest,
+        Some(
+            BigDecimal::from_str(LATEST_TIE_LATER_QUANTITY)
+                .expect("the fixture quantity is a decimal")
+        ),
+        "DESIGN section 3.1 declares the `LATEST` order as greatest `window_end`, then greatest \
+         `accepted_at`, then greatest `id` in byte order. These two entries share a \
+         `window_end`, and the one accepted an hour later carries the smaller `id` (the pair \
+         found at attempt {attempt}: later `{later_id}` below earlier `{earlier_id}`), so a \
+         fold that skipped the middle key would report the earlier entry's \
+         `{LATEST_TIE_EARLIER_QUANTITY}` instead of the later entry's \
+         `{LATEST_TIE_LATER_QUANTITY}`",
+        later_id = later.id,
+        earlier_id = earlier.id,
+    );
+}
+
+/// The lower bound of the range the empty-selection test folds over.
+const EMPTY_FOLD_FROM: time::OffsetDateTime =
+    super::fixtures::FIXTURE_EPOCH.saturating_add(time::Duration::days(270));
+/// Its exclusive upper bound.
+const EMPTY_FOLD_TO: time::OffsetDateTime =
+    EMPTY_FOLD_FROM.saturating_add(time::Duration::hours(1));
+
+/// An empty selection answers `0` under `SUM` and `COUNT` and absent under
+/// `MAX`, `MIN` and `LATEST`.
+///
+/// DESIGN section 3.3's plugin obligations: *"`SUM` and `COUNT` are defined
+/// over an empty selection and report `0`; `MAX`, `MIN` and `LATEST` are not
+/// and report absent"*.
+///
+/// **The split is the assertion**, and neither half carries it alone. A
+/// backend that answers absent to every fold - which is also what a backend
+/// computing no fold at all answers - satisfies the last three and fails the
+/// first two; one that answers zero to every fold satisfies the first two
+/// and fails the last three. Only a backend that divides them the way DESIGN
+/// does passes both halves.
+///
+/// The ledger is not empty. One entry sits an hour below the range's lower
+/// bound, so the emptiness is the range's doing rather than the backend's
+/// having nothing to read - which is what a real plugin's `WHERE` clause
+/// would be answering too.
+#[tokio::test]
+async fn an_empty_selection_splits_zero_from_absent_by_fold() {
+    let plugin = InMemoryReferencePlugin::new();
+    let key = IdempotencyKey::new("empty-fold-bystander").expect("the fixture key is well formed");
+    let bystander = super::fixtures::fixture_record_on(
+        fold_meter(),
+        super::fixtures::CONTRACT_TENANT_ID,
+        &key,
+        UsageQuantity::parse("500").expect("fixture quantity"),
+        super::fixtures::CONTRACT_ACCEPTED_AT,
+        EMPTY_FOLD_FROM.saturating_sub(time::Duration::hours(2)),
+        EMPTY_FOLD_FROM.saturating_sub(time::Duration::hours(1)),
+    )
+    .expect("the bystander fixture is projectable");
+    plugin
+        .create_usage_record(bystander)
+        .await
+        .expect("the reference backend admits a well-formed entry");
+    let range = TimeRange::new(EMPTY_FOLD_FROM, EMPTY_FOLD_TO)
+        .expect("the empty-selection read range is ordered");
+
+    for (fold, defined) in [
+        (AggregationFold::Sum, true),
+        (AggregationFold::Count, true),
+        (AggregationFold::Max, false),
+        (AggregationFold::Min, false),
+        (AggregationFold::Latest, false),
+    ] {
+        let value = ungrouped_fold(&plugin, range, fold).await;
+        if defined {
+            assert_eq!(
+                value,
+                Some(BigDecimal::from(0)),
+                "DESIGN section 3.3 defines {fold:?} over an empty selection and has it report \
+                 `0`. The range holds no entry - the one entry stored ends an hour below its \
+                 lower bound - and the no-grouping bucket is still emitted, so the fold has an \
+                 empty selection to answer over"
+            );
+        } else {
+            assert!(
+                value.is_none(),
+                "DESIGN section 3.3 does not define {fold:?} over an empty selection and has it \
+                 report absent: there is no row to read a quantity off, and zero is a quantity \
+                 rather than the absence of one. Got {value:?}"
+            );
+        }
+    }
+}
+
+/// The lower bound of the range the reconciliation test reports over.
+const RECONCILIATION_FROM: time::OffsetDateTime =
+    super::fixtures::FIXTURE_EPOCH.saturating_add(time::Duration::days(360));
+/// Its exclusive upper bound, past the end of every entry written below.
+const RECONCILIATION_TO: time::OffsetDateTime =
+    RECONCILIATION_FROM.saturating_add(time::Duration::hours(3));
+
+/// The surviving entry's quantity, and the whole of the summary under `SUM`.
+const RECONCILIATION_LIVE_QUANTITY: &str = "7.25";
+/// The withdrawn entry's quantity, echoed by the invalidation that withdraws
+/// it. Distinct from the one above and large beside it, so a summary that
+/// kept either half of the pair is a different number rather than a near one.
+const RECONCILIATION_WITHDRAWN_QUANTITY: &str = "1000";
+
+/// Reconciliation reports the declared fold over the range, with withdrawn
+/// pairs left out, while the count keeps them.
+///
+/// The two figures answer different questions, and DESIGN section 3.3's
+/// plugin obligations say so: `accepted_count` *"counts every accepted entry
+/// the range selects, invalidations included, because it reports ingestion
+/// activity rather than aggregating the meter; the quantity summary excludes
+/// withdrawn pairs"*.
+///
+/// Three entries are written: one live, one withdrawn, and the invalidation
+/// withdrawing it. So the count is three and the `SUM` summary is the live
+/// entry's quantity alone - a summary that kept the withdrawn record adds
+/// that record's quantity on top of it, and one that kept the echoing
+/// invalidation too adds it twice.
+///
+/// The second dispatch is the same range under `COUNT`, which reports one.
+/// It is what holds the summary to reading the `fold` parameter: one
+/// hard-wired to `SUM` answers the live entry's quantity there, and one
+/// hard-wired to absent answers nothing under either fold.
+#[tokio::test]
+async fn reconciliation_folds_the_range_and_leaves_out_withdrawn_pairs() {
+    let plugin = InMemoryReferencePlugin::new();
+    let live_key =
+        IdempotencyKey::new("reconciliation-live").expect("the fixture key is well formed");
+    let withdrawn_key =
+        IdempotencyKey::new("reconciliation-withdrawn").expect("the fixture key is well formed");
+    let live = super::fixtures::fixture_record_on(
+        fold_meter(),
+        super::fixtures::CONTRACT_TENANT_ID,
+        &live_key,
+        UsageQuantity::parse(RECONCILIATION_LIVE_QUANTITY).expect("fixture quantity"),
+        super::fixtures::CONTRACT_ACCEPTED_AT,
+        RECONCILIATION_FROM,
+        RECONCILIATION_FROM.saturating_add(time::Duration::hours(1)),
+    )
+    .expect("the live fixture is projectable");
+    let withdrawn = super::fixtures::fixture_record_on(
+        fold_meter(),
+        super::fixtures::CONTRACT_TENANT_ID,
+        &withdrawn_key,
+        UsageQuantity::parse(RECONCILIATION_WITHDRAWN_QUANTITY).expect("fixture quantity"),
+        super::fixtures::CONTRACT_ACCEPTED_AT,
+        RECONCILIATION_FROM.saturating_add(time::Duration::hours(1)),
+        RECONCILIATION_FROM.saturating_add(time::Duration::hours(2)),
+    )
+    .expect("the withdrawn fixture is projectable");
+    let invalidation = super::fixtures::fixture_invalidation(&withdrawn)
+        .expect("the withdrawal fixture is projectable");
+    for record in [live, withdrawn, invalidation] {
+        plugin
+            .create_usage_record(record)
+            .await
+            .expect("the reference backend admits a well-formed entry");
+    }
+    let range = TimeRange::new(RECONCILIATION_FROM, RECONCILIATION_TO)
+        .expect("the reconciliation range is ordered");
+    let scope = tenant_scope(super::fixtures::CONTRACT_TENANT_ID);
+
+    let summed = plugin
+        .get_reconciliation_metadata(
+            super::fixtures::CONTRACT_TENANT_ID,
+            fold_meter(),
+            range,
+            AggregationFold::Sum,
+            &scope,
+        )
+        .await
+        .expect("the reference backend reports reconciliation metadata without failing");
+
+    assert_eq!(
+        summed.accepted_count, 3,
+        "`accepted_count` reports ingestion activity, so it counts the invalidation and the \
+         record it withdraws alongside the surviving entry"
+    );
+    assert_eq!(
+        summed.quantity_summary,
+        Some(
+            BigDecimal::from_str(RECONCILIATION_LIVE_QUANTITY)
+                .expect("the fixture quantity is a decimal")
+        ),
+        "the quantity summary is the declared fold over the range with withdrawn pairs left \
+         out, so it is the live entry's `{RECONCILIATION_LIVE_QUANTITY}` alone. A summary \
+         keeping only the record would report `{RECONCILIATION_WITHDRAWN_QUANTITY}` more, and \
+         one keeping the echoing invalidation too would report twice that; an absent summary is \
+         a backend that filled in the count and the watermarks and forgot the field"
+    );
+
+    let counted = plugin
+        .get_reconciliation_metadata(
+            super::fixtures::CONTRACT_TENANT_ID,
+            fold_meter(),
+            range,
+            AggregationFold::Count,
+            &scope,
+        )
+        .await
+        .expect("the reference backend reports reconciliation metadata without failing");
+
+    assert_eq!(
+        counted.accepted_count, 3,
+        "`accepted_count` does not read the fold: it is the same three entries"
+    );
+    assert_eq!(
+        counted.quantity_summary,
+        Some(BigDecimal::from(1)),
+        "`COUNT` counts the records in range that no accepted invalidation withdraws, which is \
+         the one surviving entry. This dispatch is what holds the summary to reading the `fold` \
+         parameter rather than hard-wiring one"
     );
 }
