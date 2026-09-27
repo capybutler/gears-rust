@@ -34,6 +34,7 @@ pub mod api;
 #[cfg(feature = "contract")]
 pub mod contract;
 pub mod error;
+pub mod feed;
 pub mod gts;
 pub mod id;
 pub mod models;
