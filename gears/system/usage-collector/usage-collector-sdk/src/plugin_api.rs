@@ -5,10 +5,12 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use crate::error::UsageCollectorPluginError;
+use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
     AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
     UsageRecord,
 };
+use crate::reconciliation::ReconciliationMetadata;
 use crate::time_range::TimeRange;
 
 /// Backend storage adapter trait implemented by
@@ -272,4 +274,46 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;
+
+    /// Snapshot-consistent feed page in feed order (§3.1).
+    ///
+    /// `start` names where the page begins. `FeedStart::After(position)` and
+    /// `until` carry back positions this plugin issued; `FeedStart::Oldest`
+    /// means the oldest position this plugin still serves for `subscription`
+    /// under `scope` — never the head. `FeedStart` is open, so a plugin
+    /// matches it with a wildcard arm and returns `Internal(detail)` there.
+    /// `scope` is the compiled PDP scope. An entry outside it is absent.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::CursorBeyondRetention`] when retention has
+    /// removed an entry of a subscribed type after `start`'s position, decided
+    /// from what this plugin still holds rather than from the position's age.
+    async fn read_feed_page(
+        &self,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        start: FeedStart<FeedPosition>,
+        until: Option<FeedPosition>,
+        limit: u64,
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError>;
+
+    /// Per-scope ingestion counters and watermarks.
+    ///
+    /// The counters cover the range; the watermarks do not.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::Transient`] on a retryable backend
+    /// failure, [`UsageCollectorPluginError::Internal`] otherwise. A tenant
+    /// the compiled `scope` excludes answers exactly as one holding no
+    /// entries, never as an error.
+    async fn get_reconciliation_metadata(
+        &self,
+        tenant_id: Uuid,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError>;
 }

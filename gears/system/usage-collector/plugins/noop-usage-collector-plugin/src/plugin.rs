@@ -12,8 +12,9 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use uuid::Uuid;
 
 use usage_collector_sdk::{
-    AggregationDimension, AggregationFold, AggregationResult, MetadataFilter, MeterTypeId,
-    TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
+    AggregationDimension, AggregationFold, AggregationResult, FeedPage, FeedPosition, FeedStart,
+    MetadataFilter, MeterTypeId, ReconciliationMetadata, TimeRange, UsageCollectorPluginError,
+    UsageCollectorPluginV1, UsageRecord,
 };
 
 #[derive(Debug, Default)]
@@ -23,6 +24,25 @@ impl NoopBackend {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self
+    }
+
+    /// The single position this backend ever issues.
+    ///
+    /// A `FeedPosition` may not be empty and this backend has no ordering to
+    /// encode, so it issues one constant byte, at the head by construction:
+    /// nothing is ever stored behind it.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::Internal`] if the byte fails to encode,
+    /// which it cannot. Returned rather than asserted because this crate
+    /// denies `expect`.
+    fn head_position() -> Result<FeedPosition, UsageCollectorPluginError> {
+        FeedPosition::new(vec![0]).map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "the noop backend could not encode its constant feed position: {e}"
+            ))
+        })
     }
 }
 
@@ -92,6 +112,62 @@ impl UsageCollectorPluginV1 for NoopBackend {
         _metadata_filter: &[MetadataFilter],
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
         Ok(ODataPage::empty(0))
+    }
+
+    /// An empty page, carrying a head cursor on a live read and none once a
+    /// bounded replay has reached its `until`.
+    ///
+    /// This backend stores nothing, so it retains nothing, so every read is at
+    /// the head. DESIGN §3.3's `feed-bootstrap-position` requires exactly that
+    /// of a subscription retaining no entries: an empty page carrying a head
+    /// cursor, never an absent one. That check is a bootstrap read, which
+    /// carries no `until`.
+    ///
+    /// A bounded replay is the other case and answers `None`, because an
+    /// absent cursor is what says a bounded replay has reached its `until`
+    /// ([`FeedPage::next`]). Here that is **any** `until` at all: the only
+    /// position this backend issues is the head, so a replay bounded by one
+    /// has already reached it. A head cursor there would be a page a caller
+    /// keeps following, which is a hang rather than a wrong value.
+    ///
+    /// `start` is ignored deliberately, and not merely unimplemented: this
+    /// backend retains nothing, so `FeedStart::Oldest` and
+    /// `FeedStart::After(head)` name the same position.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::Internal`] only if the constant position
+    /// fails to encode, which it cannot.
+    async fn read_feed_page(
+        &self,
+        _subscription: &[MeterTypeId],
+        _scope: &ast::Expr,
+        _start: FeedStart<FeedPosition>,
+        until: Option<FeedPosition>,
+        _limit: u64,
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
+        let next = if until.is_some() {
+            None
+        } else {
+            Some(Self::head_position()?)
+        };
+        Ok(FeedPage {
+            entries: Vec::new(),
+            next,
+        })
+    }
+
+    /// Zero accepted, no watermarks, no fold — the answer for a scope holding
+    /// no entries, which is every scope here.
+    async fn get_reconciliation_metadata(
+        &self,
+        _tenant_id: Uuid,
+        _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
+        _fold: AggregationFold,
+        _scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
+        Ok(ReconciliationMetadata::empty())
     }
 }
 

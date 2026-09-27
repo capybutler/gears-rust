@@ -55,12 +55,14 @@ use uuid::Uuid;
 
 use super::reference::InMemoryReferencePlugin;
 use crate::error::UsageCollectorPluginError;
+use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, MetadataFilter,
     MeterTypeId, UsageRecord,
 };
 use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
+use crate::reconciliation::ReconciliationMetadata;
 use crate::time_range::TimeRange;
 
 /// A backend that is the reference backend with one rule broken.
@@ -425,6 +427,35 @@ impl UsageCollectorPluginV1 for WrappedReference {
             .list_usage_records(gts_type_id, time_range, query, metadata_filter)
             .await
     }
+
+    /// Delegated whole. No defect routed to this wrapper touches the feed.
+    async fn read_feed_page(
+        &self,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        start: FeedStart<FeedPosition>,
+        until: Option<FeedPosition>,
+        limit: u64,
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
+        self.inner
+            .read_feed_page(subscription, scope, start, until, limit)
+            .await
+    }
+
+    /// Delegated whole. No defect routed to this wrapper touches
+    /// reconciliation.
+    async fn get_reconciliation_metadata(
+        &self,
+        tenant_id: Uuid,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
+        self.inner
+            .get_reconciliation_metadata(tenant_id, gts_type_id, time_range, fold, scope)
+            .await
+    }
 }
 
 /// One round trip of a quantity through a binary float.
@@ -683,6 +714,43 @@ impl UsageCollectorPluginV1 for MutantLedger {
                 prev_cursor: None,
                 limit,
             },
+        ))
+    }
+
+    /// Unmodelled: this mirror reproduces the reference's write and fold
+    /// paths alone, and every defect routed here breaks one of those.
+    ///
+    /// `Internal` rather than a wrong page, because no check in this slice
+    /// points a feed read at this subject and an invented answer would make a
+    /// future one fail for a reason no matrix row names.
+    async fn read_feed_page(
+        &self,
+        _subscription: &[MeterTypeId],
+        _scope: &ast::Expr,
+        _start: FeedStart<FeedPosition>,
+        _until: Option<FeedPosition>,
+        _limit: u64,
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
+        Err(UsageCollectorPluginError::internal(
+            "this contract-suite mutant models the write and fold paths only and serves no feed \
+             page; a check that reads the feed needs the mutant extended rather than a wrong \
+             answer invented for it",
+        ))
+    }
+
+    /// Unmodelled, for the same reason [`Self::read_feed_page`] is.
+    async fn get_reconciliation_metadata(
+        &self,
+        _tenant_id: Uuid,
+        _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
+        _fold: AggregationFold,
+        _scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
+        Err(UsageCollectorPluginError::internal(
+            "this contract-suite mutant models the write and fold paths only and reports no \
+             reconciliation metadata; a check that reads it needs the mutant extended rather \
+             than a wrong answer invented for it",
         ))
     }
 }

@@ -10,7 +10,7 @@
 //!
 //! **It is not a production backend, and it is not an example of how to
 //! write one.** It holds everything in process memory, it scans linearly,
-//! it mints no pagination cursor, and it loses every entry when the process
+//! it mints no `next_cursor`, and it loses every entry when the process
 //! exits. What it is for is the suite's own subject: a backend known to
 //! conform, so that a check reporting a violation against it is a bug in
 //! the check rather than an open question about the backend. A real plugin
@@ -41,6 +41,15 @@
 //! * **`LATEST` breaks a `window_end` tie on the greatest `id`** — the
 //!   declared tie-break reads `acceptance_sequence`, which `UsageRecord`
 //!   does not carry. See `BLOCKED_CHECKS` in the parent module.
+//! * **`read_feed_page` refuses no cursor** — nothing is ever purged here, so
+//!   `CursorBeyondRetention` is unreachable and this backend exercises the
+//!   retention refusal not at all. The page, the position and the scope gate
+//!   are correct; the refusal has nothing to fire on.
+//! * **`get_reconciliation_metadata` never reports a `quantity_summary`** —
+//!   the count and both watermarks are computed and the fold is always
+//!   absent. `SUM` and `COUNT` are defined over an empty selection, so
+//!   absent is the wrong answer under those two rather than a narrower one.
+//!   No implemented check reads the field.
 //!
 //! # A test-only mirror of this file exists
 //!
@@ -77,11 +86,13 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, ast};
 use uuid::Uuid;
 
 use crate::error::UsageCollectorPluginError;
+use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
     AggregationBucket, AggregationDimension, AggregationFold, AggregationResult,
     MAX_AGGREGATION_BUCKETS, MetadataFilter, MeterTypeId, UsageRecord,
 };
 use crate::plugin_api::UsageCollectorPluginV1;
+use crate::reconciliation::ReconciliationMetadata;
 use crate::time_range::TimeRange;
 
 /// An in-memory storage backend that satisfies the Plugin SPI's stated
@@ -112,6 +123,39 @@ impl InMemoryReferencePlugin {
                  holding it",
             )
         })
+    }
+
+    /// Encodes a scanned-entry count as a feed position.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::Internal`] if the encoding is rejected. It
+    /// cannot be — eight bytes is well inside the published bound — but this
+    /// crate denies `expect`, and a plugin that cannot encode its own position
+    /// has broken an invariant, which is what `Internal` is for.
+    fn encode_position(scanned: u64) -> Result<FeedPosition, UsageCollectorPluginError> {
+        FeedPosition::new(scanned.to_be_bytes().to_vec()).map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "the reference backend could not encode its own feed position: {e}"
+            ))
+        })
+    }
+
+    /// Decodes a position this backend issued.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::Internal`] for a position this backend did
+    /// not issue: a plugin owns its own position encoding, so a foreign one is
+    /// a host-contract breach rather than a caller fault.
+    fn decode_position(position: &FeedPosition) -> Result<u64, UsageCollectorPluginError> {
+        let bytes: [u8; 8] = position.as_bytes().try_into().map_err(|_| {
+            UsageCollectorPluginError::internal(format!(
+                "the reference backend issues eight-byte feed positions and was handed {} bytes",
+                position.len()
+            ))
+        })?;
+        Ok(u64::from_be_bytes(bytes))
     }
 }
 
@@ -283,6 +327,143 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
                 limit,
             },
         ))
+    }
+
+    /// A page from the ledger's own append order.
+    ///
+    /// A position is the count of entries already scanned, encoded as eight
+    /// big-endian bytes so its bytewise ordering matches its numeric one. The
+    /// ledger only ever grows by appending, so that count is a faithful point
+    /// in the feed's order, and it does not widen with the subscription's
+    /// breadth.
+    ///
+    /// The compiled `scope` gates what the page **carries**, not what the
+    /// position **counts**: an entry outside it is absent from `entries` while
+    /// still advancing the cursor past itself. That split is what keeps a
+    /// position independent of the scope and the subscription it was issued
+    /// under, so the same position resumes correctly for a caller whose grant
+    /// differs — DESIGN's "an entry outside it is absent" is about the page,
+    /// and its size bound is about the ordering. An untranslatable grant
+    /// admits nothing, the same disposition as the point lookup's.
+    ///
+    /// A later slice brings this to conformance with every feed check; what is
+    /// here now is a correct page and a correct cursor, not the whole
+    /// obligation.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::Internal`] for a zero `limit` and for a
+    /// position this backend did not issue. Both are host-contract breaches
+    /// rather than caller faults: the published page limit is at least one,
+    /// and a plugin owns its own position encoding.
+    async fn read_feed_page(
+        &self,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        start: FeedStart<FeedPosition>,
+        until: Option<FeedPosition>,
+        limit: u64,
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
+        // A zero limit emits nothing and so advances the cursor past nothing,
+        // which makes `next` a fixpoint: under an `until` the caller never
+        // reaches it and follows the same page forever. The published limit is
+        // at least one, so a zero one is a malformed call, and DESIGN answers a
+        // host-contract breach that reaches the SPI with `Internal` rather
+        // than with a well-formed page that cannot advance.
+        if limit == 0 {
+            return Err(UsageCollectorPluginError::internal(
+                "read_feed_page was called with a zero limit (host-contract breach): the \
+                 published page limit is at least one, and a zero-limit page cannot advance its \
+                 own cursor, so a caller following it would never finish a bounded replay",
+            ));
+        }
+
+        let from = match start {
+            FeedStart::Oldest => 0,
+            FeedStart::After(ref position) => Self::decode_position(position)?,
+        };
+        let upper = match until {
+            Some(ref position) => Self::decode_position(position)?,
+            None => u64::MAX,
+        };
+
+        let ledger = self.ledger()?;
+        let mut entries = Vec::new();
+        let mut cursor = from;
+        for entry in ledger
+            .iter()
+            .skip(usize::try_from(from).unwrap_or(usize::MAX))
+        {
+            if cursor >= upper || u64::try_from(entries.len()).unwrap_or(u64::MAX) >= limit {
+                break;
+            }
+            // `cursor` has already moved past this entry, whether or not the
+            // subscription and the scope admit it. Counting only admitted
+            // entries would make the position depend on who asked.
+            cursor += 1;
+            if subscription.contains(&entry.gts_type_id)
+                && expr_admits(entry, scope).unwrap_or(false)
+            {
+                entries.push(entry.clone());
+            }
+        }
+
+        let next = if until.is_some() && cursor >= upper {
+            None
+        } else {
+            Some(Self::encode_position(cursor)?)
+        };
+        Ok(FeedPage { entries, next })
+    }
+
+    /// Counters and watermarks over the ledger.
+    ///
+    /// The compiled `scope` applies **before** the tenant and type arguments,
+    /// so a tenant it excludes answers exactly as one holding no entries
+    /// rather than as an error. An untranslatable grant admits nothing, the
+    /// same disposition as the point lookup's.
+    ///
+    /// **Do not copy the three passes.** `in_scope` re-walks the ledger once
+    /// per figure, which is free enough here under one held lock and in line
+    /// with a backend that scans linearly anyway. A real backend computes all
+    /// three in one pass — `SELECT COUNT(*) FILTER (...), MAX(accepted_at),
+    /// MAX(window_end)` — and three separate round trips would be this
+    /// exemplar's shape mistaken for its obligation.
+    async fn get_reconciliation_metadata(
+        &self,
+        tenant_id: Uuid,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        _fold: AggregationFold,
+        scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
+        let ledger = self.ledger()?;
+        let in_scope = || {
+            ledger
+                .iter()
+                .filter(|e| expr_admits(e, scope).unwrap_or(false))
+                .filter(|e| e.tenant_id == tenant_id && e.gts_type_id == gts_type_id)
+        };
+
+        // `contains_window_end` rather than the inlined `from <= window_end <
+        // to`: its own doc says every in-process implementation calls it
+        // rather than re-deriving the boundary, and `select` above already
+        // does. Re-spelling it here would be a second site to move if the
+        // boundary ever did.
+        let accepted_count = in_scope()
+            .filter(|e| time_range.contains_window_end(e.window_end))
+            .count();
+
+        // Every field is given, so no `..ReconciliationMetadata::empty()` tail:
+        // `clippy::needless_update` fires on a struct update that updates
+        // nothing. The fold stays `None` until a later slice, which is when a
+        // check first reads it.
+        Ok(ReconciliationMetadata {
+            accepted_count: u64::try_from(accepted_count).unwrap_or(u64::MAX),
+            quantity_summary: None,
+            max_accepted_at: in_scope().map(|e| e.accepted_at).max(),
+            max_window_end: in_scope().map(|e| e.window_end).max(),
+        })
     }
 }
 

@@ -30,9 +30,9 @@ use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_odata::{ODataQuery, Page as ODataPage, ast};
 use toolkit_security::{PlatformSecurityContext, pep_properties};
 use usage_collector_sdk::{
-    AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord, MetadataFilter,
-    MeterTypeId, RecordOrigin, TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1,
-    UsageRecord,
+    AggregationDimension, AggregationFold, AggregationResult, CreateUsageRecord, FeedPage,
+    FeedPosition, FeedStart, MetadataFilter, MeterTypeId, ReconciliationMetadata, RecordOrigin,
+    TimeRange, UsageCollectorPluginError, UsageCollectorPluginV1, UsageRecord,
 };
 use uuid::Uuid;
 
@@ -153,7 +153,7 @@ pub(crate) fn test_time_range() -> TimeRange {
 
 /// Minimal mock storage-plugin client.
 ///
-/// The `UsageCollectorPluginV1` SPI surface carries five methods. The mock
+/// The `UsageCollectorPluginV1` SPI surface carries seven methods. The mock
 /// here exists purely so the Plugin Host can resolve a concrete
 /// `Arc<dyn UsageCollectorPluginV1>` from `ClientHub` and so cache tests can
 /// assert `Arc::ptr_eq` on the resolved handle. Every method returns a
@@ -225,6 +225,32 @@ impl UsageCollectorPluginV1 for MockPlugin {
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::internal(
             "test_fake: MockPlugin::get_usage_record not implemented",
+        ))
+    }
+
+    async fn read_feed_page(
+        &self,
+        _subscription: &[MeterTypeId],
+        _scope: &ast::Expr,
+        _start: FeedStart<FeedPosition>,
+        _until: Option<FeedPosition>,
+        _limit: u64,
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
+        Err(UsageCollectorPluginError::internal(
+            "test_fake: MockPlugin::read_feed_page not implemented",
+        ))
+    }
+
+    async fn get_reconciliation_metadata(
+        &self,
+        _tenant_id: Uuid,
+        _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
+        _fold: AggregationFold,
+        _scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
+        Err(UsageCollectorPluginError::internal(
+            "test_fake: MockPlugin::get_reconciliation_metadata not implemented",
         ))
     }
 }
@@ -1804,6 +1830,30 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         self.target_lookup.lookup(id, scope, converged_only)
     }
+
+    /// Unprogrammed: no test points this double at the feed.
+    async fn read_feed_page(
+        &self,
+        _subscription: &[MeterTypeId],
+        _scope: &ast::Expr,
+        _start: FeedStart<FeedPosition>,
+        _until: Option<FeedPosition>,
+        _limit: u64,
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
+        Err(not_programmed("read_feed_page"))
+    }
+
+    /// Unprogrammed: no test points this double at reconciliation.
+    async fn get_reconciliation_metadata(
+        &self,
+        _tenant_id: Uuid,
+        _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
+        _fold: AggregationFold,
+        _scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
+        Err(not_programmed("get_reconciliation_metadata"))
+    }
 }
 
 /// Spy alias over [`HappyPathPlugin`] for the declared-fold aggregate
@@ -2076,6 +2126,37 @@ impl UsageCollectorPluginV1 for FoldingPlugin {
                 limit: 1000,
             },
         })
+    }
+
+    /// This double exists for the withdrawal exclusion inside a fold; no
+    /// test points it at the feed.
+    async fn read_feed_page(
+        &self,
+        _subscription: &[MeterTypeId],
+        _scope: &ast::Expr,
+        _start: FeedStart<FeedPosition>,
+        _until: Option<FeedPosition>,
+        _limit: u64,
+    ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
+        Err(UsageCollectorPluginError::internal(
+            "FoldingPlugin serves no feed page: it exists for the withdrawal exclusion inside a \
+             fold",
+        ))
+    }
+
+    /// Likewise unmodelled: no test points this double at reconciliation.
+    async fn get_reconciliation_metadata(
+        &self,
+        _tenant_id: Uuid,
+        _gts_type_id: MeterTypeId,
+        _time_range: TimeRange,
+        _fold: AggregationFold,
+        _scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
+        Err(UsageCollectorPluginError::internal(
+            "FoldingPlugin reports no reconciliation metadata: it exists for the withdrawal \
+             exclusion inside a fold",
+        ))
     }
 }
 

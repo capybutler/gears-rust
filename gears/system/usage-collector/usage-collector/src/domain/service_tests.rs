@@ -2547,6 +2547,34 @@ mod get_usage_record_tests {
                     "test_fake: TransientGetPlugin: simulated prefetch transient",
                 ))
             }
+            async fn read_feed_page(
+                &self,
+                _subscription: &[usage_collector_sdk::MeterTypeId],
+                _scope: &toolkit_odata::ast::Expr,
+                _start: usage_collector_sdk::FeedStart<usage_collector_sdk::FeedPosition>,
+                _until: Option<usage_collector_sdk::FeedPosition>,
+                _limit: u64,
+            ) -> Result<
+                usage_collector_sdk::FeedPage<usage_collector_sdk::FeedPosition>,
+                UsageCollectorPluginError,
+            > {
+                Err(UsageCollectorPluginError::internal(
+                    "test_fake: TransientGetPlugin: read_feed_page must not be called",
+                ))
+            }
+            async fn get_reconciliation_metadata(
+                &self,
+                _tenant_id: Uuid,
+                _gts_type_id: usage_collector_sdk::MeterTypeId,
+                _time_range: usage_collector_sdk::TimeRange,
+                _fold: usage_collector_sdk::AggregationFold,
+                _scope: &toolkit_odata::ast::Expr,
+            ) -> Result<usage_collector_sdk::ReconciliationMetadata, UsageCollectorPluginError>
+            {
+                Err(UsageCollectorPluginError::internal(
+                    "test_fake: TransientGetPlugin: get_reconciliation_metadata must not be called",
+                ))
+            }
         }
 
         let plugin: Arc<dyn UsageCollectorPluginV1> = Arc::new(TransientGetPlugin);
