@@ -297,8 +297,12 @@ impl FeedSnapshotFixtures {
 ///   determinism and the settledness in that invariant, and DESIGN gives
 ///   that check the concurrency this one deliberately does not drive. A
 ///   subject built here would be built for the wrong row and would fail two
-///   checks once the other lands. **A recorded gap, deliberately left to
-///   the check that owns the rule.**
+///   checks. **A recorded gap, deliberately left to the check that owns the
+///   rule** — and still open now that check has landed. Neither subject
+///   built for it reaches these three, and the matrix is where that was
+///   measured: both are deterministic, so two reads of one position still
+///   agree, and what each gets wrong is which entries a page carries or the
+///   order it carries them in.
 /// * **The entry comparison in [`a_bounded_replay_is_identical`]** — every
 ///   way of getting `until` wrong that was tried reaches the closure
 ///   assertion beside it as well, because a replay that stops in the wrong
@@ -327,7 +331,9 @@ impl FeedSnapshotFixtures {
 /// invalidation follows its target"* — is asserted nowhere here. It drives
 /// no concurrency, so completeness *"whatever the concurrency or commit
 /// order"* is asserted nowhere either. Both belong to DESIGN's
-/// `feed-completeness` row, and a green run here says nothing about them.
+/// `feed-completeness` row and are asserted by
+/// [`feed_completeness`](super::feed_completeness()); a green run **here**
+/// still says nothing about either.
 ///
 /// It never compares two grants' position **values**, so a backend that
 /// minted a different position per grant over one ledger passes everything

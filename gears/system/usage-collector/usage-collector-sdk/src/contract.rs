@@ -67,8 +67,10 @@
 //! stops being accounted for fails it too. A caller reporting coverage
 //! should report all three alongside the violations — which matters
 //! because "run this suite" is the acceptance criterion for porting a
-//! backend, and a suite that runs twelve checks must not read as a suite
-//! that ran sixteen.
+//! backend, and a suite that runs some of the sixteen must not read as a
+//! suite that ran all of them. The count is deliberately not repeated here:
+//! it is stated once above and asserted by the partition test, and a second
+//! copy is a number the next author has to remember.
 //!
 //! # A check DESIGN does not tabulate
 //!
