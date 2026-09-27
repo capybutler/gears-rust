@@ -37,6 +37,7 @@ use super::{
     WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, run_all,
 };
 use crate::error::UsageCollectorPluginError;
+use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
     CreateUsageRecord, IdempotencyKey, MeterTypeId, RecordOrigin, ResourceRef, UsageRecord,
 };
@@ -564,5 +565,477 @@ async fn an_untranslatable_node_refuses_a_caller_filter_and_excludes_a_scope() {
         1,
         "the probe row matches the translatable filter, so refusing it would mean the fix had \
          over-reached from the untranslatable node to every filter"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The reference backend's feed page
+// ---------------------------------------------------------------------------
+//
+// Unit tests of the reference implementation, not contract checks. DESIGN
+// section 3.3's `feed-snapshot-and-replay` check is written against the SPI
+// for any backend and belongs to a later slice; nothing below is added to
+// `run_all` or to a coverage constant, because none of it is an obligation
+// this suite puts on a plugin. What it is for is the suite's own subject:
+// the reference backend's feed answers are what a plugin author reads as an
+// exemplar, and they must not rot in the interval before the check that
+// covers them arrives.
+
+/// The tenant the feed reads below withhold.
+///
+/// Distinct from [`super::fixtures::CONTRACT_TENANT_ID`] and from the scope
+/// check's unused tenant: entries attributed to it are admitted by one grant
+/// below and withheld by another, which is the only way a read can show that
+/// the position does not depend on the grant.
+const FEED_OTHER_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0003);
+
+/// The ledger's length, and so the position at its end.
+const FEED_LEDGER_LEN: u64 = 4;
+
+/// Four entries in the ledger's append order, alternating the tenant the
+/// grants below pin: A, B, A, B.
+///
+/// Interleaving is load-bearing rather than decorative. A backend that
+/// counted admitted entries instead of scanned ones would still walk a
+/// ledger whose entries were all admitted, and would still finish one whose
+/// withheld entries were all at the end. Alternating them means a page's
+/// cursor has to jump past an entry the page did not carry, every page.
+///
+/// Returns the backend and the entry ids in append order, so an assertion
+/// names which entries a grant should have been handed rather than
+/// re-deriving an identity.
+async fn feed_ledger() -> (InMemoryReferencePlugin, Vec<Uuid>) {
+    let plugin = InMemoryReferencePlugin::new();
+    let tenants = [
+        super::fixtures::CONTRACT_TENANT_ID,
+        FEED_OTHER_TENANT_ID,
+        super::fixtures::CONTRACT_TENANT_ID,
+        FEED_OTHER_TENANT_ID,
+    ];
+    assert_eq!(
+        u64::try_from(tenants.len()).unwrap_or(u64::MAX),
+        FEED_LEDGER_LEN,
+        "`FEED_LEDGER_LEN` is the position at this ledger's end and every assertion below reads \
+         it, so it must be this ledger's own length"
+    );
+
+    let mut ids = Vec::new();
+    for (index, tenant_id) in tenants.into_iter().enumerate() {
+        // The idempotency key is one of the five attributes the derived
+        // identity reads, so varying it alone makes four entries rather than
+        // one entry replayed four times.
+        let key = IdempotencyKey::new(format!("feed-position-{index}"))
+            .expect("the feed fixture key is well formed");
+        let offset = time::Duration::hours(i64::try_from(index).unwrap_or(0) + 1);
+        let record = super::fixtures::fixture_record_for_tenant(
+            tenant_id,
+            &key,
+            UsageQuantity::parse("1").expect("fixture quantity"),
+            super::fixtures::FIXTURE_EPOCH,
+            super::fixtures::FIXTURE_EPOCH.saturating_add(offset),
+        )
+        .expect("the feed fixture is projectable");
+        ids.push(record.id);
+        plugin
+            .create_usage_record(record)
+            .await
+            .expect("the reference backend admits a well-formed entry");
+    }
+    (plugin, ids)
+}
+
+/// The subscription every feed read below dispatches: the one meter the
+/// fixture vocabulary attaches every entry to.
+fn feed_subscription() -> Vec<MeterTypeId> {
+    vec![
+        MeterTypeId::new(super::fixtures::CONTRACT_METER_TYPE_ID)
+            .expect("the suite's own meter type id is valid"),
+    ]
+}
+
+/// A compiled single-tenant grant: `tenant_id eq <tenant>`.
+fn tenant_scope(tenant_id: Uuid) -> ast::Expr {
+    compare(
+        "tenant_id",
+        ast::CompareOperator::Eq,
+        ast::Value::Uuid(tenant_id),
+    )
+}
+
+/// A grant this backend cannot translate at all.
+///
+/// A function node, the same shape
+/// [`an_untranslatable_node_refuses_a_caller_filter_and_excludes_a_scope`]
+/// dispatches. As a scope it admits nothing — a grant that cannot be read
+/// grants nothing — which is the third, widest-apart admission the position
+/// has to survive.
+fn untranslatable_scope() -> ast::Expr {
+    ast::Expr::Function(
+        "contains".to_owned(),
+        vec![
+            ast::Expr::Identifier("resource_id".to_owned()),
+            ast::Expr::Value(ast::Value::String("contract".to_owned())),
+        ],
+    )
+}
+
+/// A position as this backend spells one: a scanned-entry count in eight
+/// big-endian bytes.
+///
+/// Spelled here rather than read back from the backend's private encoder, so
+/// the expected value is a statement rather than an agreement with whatever
+/// the subject produced.
+fn feed_position(scanned: u64) -> FeedPosition {
+    FeedPosition::new(scanned.to_be_bytes().to_vec())
+        .expect("eight bytes is well inside the published position bound")
+}
+
+/// The entry ids a page carries, in the order it carried them.
+fn entry_ids(entries: &[UsageRecord]) -> Vec<Uuid> {
+    entries.iter().map(|entry| entry.id).collect()
+}
+
+/// One feed read that must succeed.
+async fn feed_page(
+    plugin: &InMemoryReferencePlugin,
+    scope: &ast::Expr,
+    start: FeedStart<FeedPosition>,
+    until: Option<FeedPosition>,
+    limit: u64,
+) -> FeedPage<FeedPosition> {
+    plugin
+        .read_feed_page(&feed_subscription(), scope, start, until, limit)
+        .await
+        .expect("the reference backend serves a well-formed feed read")
+}
+
+/// One ledger, three grants, one position.
+///
+/// This is the most valuable assertion in the file and the easiest to lose.
+/// A feed position counts the entries a read **scanned**, not the ones it
+/// **admitted**, so three callers whose compiled scopes differ are handed
+/// the same position over one ledger and can each resume from any of them.
+/// Moving the scope filter above `cursor += 1` in `read_feed_page` still
+/// compiles, still passes the entire contract suite, and still reads
+/// correctly under every single grant — it would simply hand three callers
+/// three mutually incompatible cursors over one ledger, and a cursor minted
+/// under a grant that has since widened would then silently skip entries.
+///
+/// A single-grant test cannot catch that; only comparing positions across
+/// grants can, which is why the three reads are compared to each other
+/// before any of them is compared to a literal.
+///
+/// The three grants are as far apart as this backend admits: one that
+/// admits half the ledger, one that admits the other half, and one that
+/// cannot be read and so admits none of it.
+#[tokio::test]
+async fn a_feed_position_is_the_same_under_every_grant_over_one_ledger() {
+    let (plugin, ids) = feed_ledger().await;
+
+    let pinned = feed_page(
+        &plugin,
+        &tenant_scope(super::fixtures::CONTRACT_TENANT_ID),
+        FeedStart::Oldest,
+        None,
+        16,
+    )
+    .await;
+    let other = feed_page(
+        &plugin,
+        &tenant_scope(FEED_OTHER_TENANT_ID),
+        FeedStart::Oldest,
+        None,
+        16,
+    )
+    .await;
+    let unreadable = feed_page(
+        &plugin,
+        &untranslatable_scope(),
+        FeedStart::Oldest,
+        None,
+        16,
+    )
+    .await;
+
+    // The three grants admit three different things. Without this the
+    // position comparison below would be satisfied by a backend that
+    // ignored the scope entirely, or by one that admitted nothing at all.
+    assert_eq!(
+        entry_ids(&pinned.entries),
+        vec![ids[0], ids[2]],
+        "the grant pinning the suite's tenant must carry that tenant's two entries, in the \
+         ledger's append order, and neither of the other tenant's"
+    );
+    assert_eq!(
+        entry_ids(&other.entries),
+        vec![ids[1], ids[3]],
+        "the grant pinning the other tenant must carry the complementary two entries: the scope \
+         gates what the page carries"
+    );
+    assert!(
+        unreadable.entries.is_empty(),
+        "a grant this backend cannot translate admits nothing, the same fail-closed \
+         disposition as the point lookup's, so its page carries no entry; it got: {:?}",
+        entry_ids(&unreadable.entries)
+    );
+
+    // And they are all handed the same position.
+    assert_eq!(
+        pinned.next, other.next,
+        "two callers whose grants admit disjoint halves of one ledger MUST be handed the same \
+         position. The position counts entries scanned, not entries admitted, which is what \
+         makes it independent of who asked; a position that moved with the grant could not be \
+         resumed by a caller whose grant had since widened without silently skipping every \
+         entry the narrower grant withheld"
+    );
+    assert_eq!(
+        other.next, unreadable.next,
+        "a grant that cannot be read admits nothing and still scans everything, so it too MUST \
+         be handed the position at the ledger's end. A cursor that stalled here would pin a \
+         caller at the oldest position forever the moment one conjunct of its grant became \
+         untranslatable"
+    );
+    assert_eq!(
+        pinned.next,
+        Some(feed_position(FEED_LEDGER_LEN)),
+        "the shared position is the count of entries scanned ({FEED_LEDGER_LEN}), not the count \
+         any one grant admitted (2, 2 and 0)"
+    );
+}
+
+/// A `limit`-bounded walk ends, and delivers each admitted entry once.
+///
+/// `limit` bounds the entries a page *carries*, so over a ledger whose
+/// admitted and withheld entries alternate a page's cursor advances further
+/// than the page is long. The walk below follows the cursor from `Oldest`
+/// until it stops moving, which is the fixpoint at the ledger's end: an
+/// empty page whose continuation is the position it was read from.
+///
+/// Delivering each entry exactly once is the whole point of the cursor
+/// counting scanned entries. A backend that counted admitted ones would
+/// re-scan every withheld entry on the following page — harmless here,
+/// because a withheld entry is withheld again, and not harmless at all for
+/// a caller whose grant widens between two pages.
+#[tokio::test]
+async fn a_limit_bounded_feed_walk_reaches_a_fixpoint_at_the_ledger_end() {
+    let (plugin, ids) = feed_ledger().await;
+    let scope = tenant_scope(super::fixtures::CONTRACT_TENANT_ID);
+
+    let mut start = FeedStart::Oldest;
+    let mut delivered: Vec<Uuid> = Vec::new();
+    let mut previous: Option<FeedPosition> = None;
+    let mut reads = 0_u32;
+    let fixpoint = loop {
+        reads += 1;
+        assert!(
+            reads <= 16,
+            "a walk with a page limit of one over a ledger of {FEED_LEDGER_LEN} entries must \
+             reach its fixpoint in a handful of reads; {reads} says the cursor is not advancing \
+             and a real gateway would be spinning here"
+        );
+
+        let FeedPage { entries, next } = feed_page(&plugin, &scope, start, None, 1).await;
+        let next = next.expect(
+            "a live read carries a continuation on every page, short and empty pages included: \
+             an absent cursor is reserved for a bounded replay reaching its `until`",
+        );
+        if previous.as_ref() == Some(&next) {
+            assert!(
+                entries.is_empty(),
+                "a page that did not move the cursor cannot have delivered anything: it would \
+                 be delivering entries it is about to deliver again"
+            );
+            break next;
+        }
+        delivered.extend(entry_ids(&entries));
+        previous = Some(next.clone());
+        start = FeedStart::After(next);
+    };
+
+    assert_eq!(
+        delivered,
+        vec![ids[0], ids[2]],
+        "the walk must deliver every admitted entry exactly once, in the ledger's append order. \
+         A repeat means a page re-scanned what the previous page had already counted; a gap \
+         means a page's cursor moved past an entry the page never carried"
+    );
+    assert_eq!(
+        fixpoint,
+        feed_position(FEED_LEDGER_LEN),
+        "the fixpoint is the ledger's end, which is the number of entries scanned \
+         ({FEED_LEDGER_LEN}) rather than the number delivered (2)"
+    );
+}
+
+/// A bounded replay closes at the ledger's end, and only there.
+///
+/// An absent `next` is the one thing that says a bounded replay has reached
+/// its `until` ([`crate::feed::FeedPage::next`]), so it has to be absent
+/// exactly when the replay has. Bounded *past* the ledger's end the replay
+/// has not reached anything yet: it keeps its cursor, and the caller resumes
+/// there once the ledger has grown into the range it asked for.
+#[tokio::test]
+async fn a_bounded_feed_replay_closes_at_its_until_and_not_before() {
+    let (plugin, ids) = feed_ledger().await;
+    let scope = tenant_scope(super::fixtures::CONTRACT_TENANT_ID);
+
+    let at_the_end = feed_page(
+        &plugin,
+        &scope,
+        FeedStart::Oldest,
+        Some(feed_position(FEED_LEDGER_LEN)),
+        16,
+    )
+    .await;
+    assert_eq!(
+        entry_ids(&at_the_end.entries),
+        vec![ids[0], ids[2]],
+        "a replay bounded at the ledger's end still carries everything the grant admits: the \
+         bound is on the position, not on the page"
+    );
+    assert!(
+        at_the_end.next.is_none(),
+        "a replay whose cursor has reached its `until` is finished, and an absent `next` is \
+         what says so. A position here is a page whose continuation the caller keeps \
+         following, which is a hang rather than a wrong value. Got: {:?}",
+        at_the_end.next
+    );
+
+    let past_the_end = feed_page(
+        &plugin,
+        &scope,
+        FeedStart::Oldest,
+        Some(feed_position(FEED_LEDGER_LEN + 5)),
+        16,
+    )
+    .await;
+    assert_eq!(
+        past_the_end.next,
+        Some(feed_position(FEED_LEDGER_LEN)),
+        "a replay bounded past the ledger's end has not reached its `until`, so it keeps the \
+         position it actually scanned to. Answering an absent cursor here would tell the caller \
+         a range it never read was complete"
+    );
+}
+
+/// A subscription no ledger entry answers to withholds every entry and still
+/// scans the whole ledger.
+///
+/// The subscription is the other half of `read_feed_page`'s admission
+/// decision, and the split it is on is the same one: it gates what the page
+/// **carries**, never what the position **counts**. Two consumers reading
+/// one backend under subscriptions of different breadth are handed
+/// comparable positions for the same reason two grants are.
+#[tokio::test]
+async fn a_subscription_the_ledger_does_not_answer_still_advances_the_cursor() {
+    let (plugin, _ids) = feed_ledger().await;
+    let unsubscribed = MeterTypeId::new("gts.cf.core.uc.usage_record.v1~cf.core.uc.not_here.v1~")
+        .expect("the fixture meter id is well formed");
+
+    let page = plugin
+        .read_feed_page(
+            &[unsubscribed],
+            &tenant_scope(super::fixtures::CONTRACT_TENANT_ID),
+            FeedStart::Oldest,
+            None,
+            16,
+        )
+        .await
+        .expect("a subscription naming an absent meter is a well-formed read, not a failure");
+
+    assert!(
+        page.entries.is_empty(),
+        "every ledger entry carries the suite's meter, so a subscription naming another one \
+         admits none of them; it got: {:?}",
+        entry_ids(&page.entries)
+    );
+    assert_eq!(
+        page.next,
+        Some(feed_position(FEED_LEDGER_LEN)),
+        "the position counts the {FEED_LEDGER_LEN} entries scanned even though the subscription \
+         admitted none of them, exactly as it does for a grant that admits none of them"
+    );
+}
+
+/// A position this backend did not issue is refused, on both paths that
+/// decode one.
+///
+/// A plugin owns its own position encoding, so a foreign one is a
+/// host-contract breach rather than a caller fault: `Internal`, never a
+/// well-formed page read from a position that was guessed at. Both `start`
+/// and `until` decode, so both refuse.
+#[tokio::test]
+async fn a_foreign_feed_position_is_refused_as_internal() {
+    let (plugin, _ids) = feed_ledger().await;
+    let scope = tenant_scope(super::fixtures::CONTRACT_TENANT_ID);
+    let foreign = FeedPosition::new(vec![1, 2, 3])
+        .expect("three bytes is an admissible position, just not one this backend issues");
+
+    let as_a_start = plugin
+        .read_feed_page(
+            &feed_subscription(),
+            &scope,
+            FeedStart::After(foreign.clone()),
+            None,
+            16,
+        )
+        .await
+        .expect_err(
+            "a position of the wrong width cannot be decoded, and guessing at it would resume a \
+             feed from a point nobody named",
+        );
+    assert!(
+        matches!(
+            as_a_start,
+            UsageCollectorPluginError::Internal(ref detail) if detail.contains("3 bytes")
+        ),
+        "a foreign `start` position MUST refuse as `Internal`, and the detail must name the \
+         width it was handed so an operator can see which caller minted it; got: {as_a_start:?}"
+    );
+
+    let as_an_until = plugin
+        .read_feed_page(
+            &feed_subscription(),
+            &scope,
+            FeedStart::Oldest,
+            Some(foreign),
+            16,
+        )
+        .await
+        .expect_err("the `until` bound decodes through the same encoding and refuses the same way");
+    assert!(
+        matches!(as_an_until, UsageCollectorPluginError::Internal(_)),
+        "a foreign `until` position MUST refuse as `Internal` rather than be treated as an \
+         unbounded replay, which would turn a bounded read into one that never closes; got: \
+         {as_an_until:?}"
+    );
+}
+
+/// A zero page limit is refused.
+///
+/// REST enforces `minimum: 1`, so a zero limit reaching the SPI is a
+/// host-contract breach. It is refused rather than answered with an empty
+/// page because a zero-limit page carries nothing and so advances the cursor
+/// past nothing: `next` is the position it was read from, and a caller
+/// following it under an `until` never reaches it.
+#[tokio::test]
+async fn a_zero_limit_feed_read_is_refused_as_internal() {
+    let (plugin, _ids) = feed_ledger().await;
+
+    let refused = plugin
+        .read_feed_page(
+            &feed_subscription(),
+            &tenant_scope(super::fixtures::CONTRACT_TENANT_ID),
+            FeedStart::Oldest,
+            None,
+            0,
+        )
+        .await
+        .expect_err("the published page limit is at least one, so a zero limit is malformed");
+
+    assert!(
+        matches!(refused, UsageCollectorPluginError::Internal(_)),
+        "a zero limit MUST refuse as a non-retryable host-contract breach rather than be served \
+         as a well-formed page that cannot advance its own cursor; got: {refused:?}"
     );
 }
