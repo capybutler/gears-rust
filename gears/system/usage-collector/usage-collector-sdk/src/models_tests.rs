@@ -807,6 +807,38 @@ fn a_submission_declares_its_own_entry_type() {
 }
 
 #[test]
+fn the_codec_admits_a_disagreeing_body_and_leaves_the_refusal_to_the_projection() {
+    // `CreateUsageRecordWire`'s doc claims the agreement between
+    // `entry_type` and `reason_code` is deliberately not checked in the
+    // codec: a `Deserialize` can only raise a plain string, and the emitter
+    // is owed a typed field violation naming the field. Nothing pinned that
+    // claim — every disagreement test below builds the struct directly and
+    // never reaches the codec at all.
+    let mut body = serde_json::to_value(sample_create_usage_record(None, Some(sample_reason())))
+        .expect("serializes")
+        .as_object()
+        .expect("object")
+        .clone();
+    body.insert("entry_type".to_owned(), json!("record"));
+
+    let decoded = serde_json::from_value::<CreateUsageRecord>(serde_json::Value::Object(body))
+        .expect("the codec admits the disagreement rather than raising a serde string");
+    assert_eq!(decoded.entry_type(), EntryType::Record);
+    assert_eq!(decoded.invalidation, Some(sample_reason()));
+
+    let err = decoded
+        .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
+        .expect_err("the projection is where a decoded disagreement is refused");
+    assert!(
+        matches!(
+            &err,
+            UsageCollectorError::InvalidArgument { field, .. } if field == "reason_code"
+        ),
+        "a typed field violation is the whole point of not checking in the codec; got {err:?}",
+    );
+}
+
+#[test]
 fn entry_type_is_read_back_rather_than_inferred_from_the_reason_code() {
     // DESIGN §3.1: the discriminator is "Never inferred from other fields".
     // The accessor has to report what the submission declared even when the
@@ -872,8 +904,8 @@ fn an_invalidation_with_no_reason_code_is_a_caller_error() {
 /// that collides with its own target, and reading the kind off the reason is
 /// the inference DESIGN forbids — so the submission is refused and the
 /// emitter chooses. A 400 rather than the `Internal` of
-/// `withdrawal_needs_its_target`, which reports the same stray field on a
-/// submission that is consistent about being a withdrawal.
+/// `withdrawal_needs_its_target`, which fires on the declared `entry_type`
+/// and attributes no field at all.
 #[test]
 fn a_record_that_states_a_reason_code_is_a_caller_error() {
     let submission = CreateUsageRecord {
@@ -977,14 +1009,14 @@ fn a_submission_naming_its_own_target_is_refused_as_an_unknown_field() {
     serde_json::from_value::<CreateUsageRecord>(tampered)
         .expect_err("invalidates is server-assigned and must be refused on the create shape");
 
-    // A reason code alone is the whole withdrawal on the ingestion shape,
-    // and it decodes.
-    assert_eq!(
-        serde_json::from_value::<CreateUsageRecord>(withdrawal)
-            .expect("a submission carrying only a reason code is a well-formed invalidation")
-            .invalidation,
-        Some(sample_reason()),
-    );
+    // The untampered withdrawal decodes. On the ingestion shape a
+    // withdrawal is its declared `entry_type` plus the reason code it
+    // states; `invalidates` is the one half it has no way to supply, which
+    // is what the tampering above proves.
+    let decoded = serde_json::from_value::<CreateUsageRecord>(withdrawal)
+        .expect("a withdrawal declaring its kind and stating its reason is well-formed");
+    assert_eq!(decoded.entry_type(), EntryType::Invalidation);
+    assert_eq!(decoded.invalidation, Some(sample_reason()));
 }
 
 #[test]

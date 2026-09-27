@@ -1241,16 +1241,25 @@ impl CreateUsageRecord {
     /// the submission is consistent and it is the *projection* that is
     /// wrong for it.
     ///
-    /// Both projections run this **before** their own guard, and that
-    /// ordering is what keeps the two classifications apart. Run after, a
-    /// disagreeing submission would trip the guard first and be reported as
-    /// a host-contract breach against a gateway that read `entry_type`
-    /// correctly and chose the matching projection. Run first, a guard can
-    /// only be reached by a submission already known to agree with itself —
-    /// which is exactly the claim those guards make.
+    /// Both projections run this **before** their own guard, and for one of
+    /// the two disagreements that ordering decides the classification. A
+    /// submission declaring `entry_type: invalidation` and stating no reason
+    /// code satisfies either guard — [`Self::try_into_usage_record`]'s keys
+    /// on the declared type, [`Self::try_into_invalidation_record`]'s on the
+    /// reason code's absence — so run second, it would be reported as a
+    /// host-contract breach against a gateway that read `entry_type`
+    /// correctly and chose the matching projection.
+    ///
+    /// The mirror disagreement is order-independent, and that is a property
+    /// worth naming rather than luck: a `record` stating a reason code
+    /// satisfies **neither** guard, because each keys on something that half
+    /// does not have. It reaches this check whichever order the two run in.
+    /// That holds only because `try_into_usage_record`'s guard keys on the
+    /// declared `entry_type` rather than on `invalidation.is_some()`; see the
+    /// comment there.
     #[allow(
         clippy::result_large_err,
-        reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+        reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2)"
     )]
     fn require_agreeing_kind(&self) -> Result<(), UsageCollectorError> {
         match (self.entry_type, self.invalidation.is_some()) {
@@ -1351,6 +1360,13 @@ impl CreateUsageRecord {
         accepted_at: time::OffsetDateTime,
     ) -> Result<UsageRecord, UsageCollectorError> {
         self.require_agreeing_kind()?;
+        // Keyed on the declared `entry_type`, not on `invalidation.is_some()`,
+        // and that is load-bearing rather than cosmetic. Keyed on the reason
+        // code, a `record` that states one would satisfy this guard, and
+        // whether the emitter got a 400 or the gateway got an `Internal`
+        // would depend on the check above running first. Keyed here, that
+        // submission satisfies no guard at all and reaches the agreement
+        // check in either order.
         if matches!(self.entry_type, EntryType::Invalidation) {
             return Err(UsageCollectorError::withdrawal_needs_its_target());
         }
@@ -1382,8 +1398,7 @@ impl CreateUsageRecord {
     ///
     /// [`UsageCollectorError::InvalidArgument`] on the same grounds as
     /// [`Self::try_into_usage_record`] — including a submission that
-    /// declares `entry_type: invalidation` and states no reason code, which
-    /// is what makes it an invalidation at all.
+    /// declares `entry_type: invalidation` and states no reason code.
     ///
     /// [`UsageCollectorError::Internal`] when a self-consistent submission
     /// declares `entry_type: record`, which is this projection's mirror of
@@ -1434,6 +1449,19 @@ impl CreateUsageRecord {
         accepted_at: time::OffsetDateTime,
         invalidation: Option<Invalidation>,
     ) -> Result<UsageRecord, UsageCollectorError> {
+        // The pairing both callers above are responsible for, made checkable
+        // rather than only stated: the declared kind and the resolved
+        // withdrawal say the same thing, so the digest's sixth input and the
+        // reference the projected entry carries cannot disagree. A third
+        // projection that skipped either check trips this in every debug and
+        // test build instead of minting an identifier under the wrong type.
+        debug_assert_eq!(
+            matches!(self.entry_type, EntryType::Invalidation),
+            invalidation.is_some(),
+            "project() requires the declared entry_type and the resolved withdrawal to agree; \
+             its caller owes require_agreeing_kind and its own kind guard",
+        );
+
         let Self {
             // Spent before this runs, in two steps: each caller above checks
             // it against the reason code, then refuses the kind that is not
@@ -1449,11 +1477,11 @@ impl CreateUsageRecord {
             quantity,
             idempotency_key,
             // Spent before this runs: `try_into_usage_record` refuses a
-            // submission carrying one, and `try_into_invalidation_record`
-            // takes it out and hands it back as the `invalidation`
-            // argument, already paired with its resolved target. Reading
-            // the field here would be reading a value that is always
-            // `None`.
+            // submission declaring `entry_type: invalidation`, and
+            // `try_into_invalidation_record` takes the reason out and hands
+            // it back as the `invalidation` argument, already paired with
+            // its resolved target. Reading the field here would be reading
+            // a value that is always `None`.
             invalidation: _,
             window_start: submitted_start,
             window_end: submitted_end,

@@ -539,10 +539,14 @@ impl UsageCollectorError {
     ///
     /// **It cannot fire for a self-contradicting submission**, which is what
     /// keeps that claim honest. The projection checks `entry_type` against
-    /// `reason_code` first, so a `record` that states a reason is already
-    /// gone as a 400 ([`Self::reason_code_forbidden_on_record`]) and every
-    /// submission that gets this far declares a kind its reason code agrees
-    /// with. What is left is a projection chosen wrongly, and nothing else.
+    /// `reason_code` first, so the one contradiction whose declared kind
+    /// would satisfy this guard — an `invalidation` stating no reason — is
+    /// already gone as a 400
+    /// ([`Self::reason_code_required_on_invalidation`]). The mirror
+    /// contradiction cannot reach here in any order: this guard keys on the
+    /// declared `entry_type`, and a `record` does not satisfy it whatever
+    /// reason code it carries. What is left is a projection chosen wrongly,
+    /// and nothing else.
     #[must_use]
     pub fn withdrawal_needs_its_target() -> Self {
         Self::internal(
@@ -616,9 +620,10 @@ impl UsageCollectorError {
     /// emitter meant, so that is the half to remove.
     ///
     /// **[`Self::InvalidArgument`], not [`Self::Internal`]** — unlike
-    /// [`Self::withdrawal_needs_its_target`], which reports the same stray
-    /// reason code. See [`Self::reason_code_required_on_invalidation`] for
-    /// the line between the two.
+    /// [`Self::withdrawal_needs_its_target`], which fires on the declared
+    /// `entry_type` and attributes no field at all. See
+    /// [`Self::reason_code_required_on_invalidation`] for the line between
+    /// the two.
     #[must_use]
     pub fn reason_code_forbidden_on_record() -> Self {
         Self::newtype_validation(
