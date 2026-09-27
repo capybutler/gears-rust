@@ -222,11 +222,18 @@ struct Scenario {
 ///
 /// What is this check's own is the **fold** half and the two identities a
 /// batch call resolved: neither of the other two reads a fold at all, and
-/// neither submits one identity twice inside a single call. What that
-/// subject does **not** reach is stated on the defect itself and was
-/// measured by neutering each assertion here in turn: it reaches the two
-/// read-back assertions and none of the seven that read an outcome, because
-/// every outcome it returns is the conforming one.
+/// neither submits one identity twice inside a single call. The in-batch half
+/// is also the only assertion here with a subject of its own —
+/// `Defect::BatchResolvesAgainstThePreCallLedger`, which decides every row of
+/// a batch against the ledger as it stood before the call and so is DESIGN
+/// §3.3's third identity site with nothing enforcing it. That subject's row
+/// names this check and `at-most-one-invalidation`, which sends a
+/// same-identity pair of its own in one batch.
+///
+/// Which of these nine assertions any subject reaches was measured by
+/// neutering each in turn, and the answer is recorded on the two defects
+/// rather than here: three of the nine report against a subject today, and
+/// the six that do not are accounted for one by one.
 pub async fn dedup_floor(plugin: &dyn UsageCollectorPluginV1) -> Vec<ContractViolation> {
     let fixtures = match dedup_floor_fixtures() {
         Ok(fixtures) => fixtures,
@@ -337,10 +344,20 @@ async fn the_converged_identity_resolves_both_ways(
 /// Sentence three, first half: two identical entries of one identity in a
 /// single `create_usage_records` call.
 ///
-/// The later is **absorbed**, not refused. Nothing here can tell which of the
-/// two copies the backend answered with, and nothing needs to: they carry the
-/// same content by construction. What discriminates is the shape of the
-/// outcome, and the row count the read half takes afterwards.
+/// The later is **absorbed**, not refused, and the assertion is the shape of
+/// the outcome alone: nothing here can tell which of the two copies the
+/// backend answered with, because they carry the same content by
+/// construction.
+///
+/// That bounds it, and the bound was measured rather than guessed. An absorb
+/// and a second *acceptance* are indistinguishable on an identical pair —
+/// both answer `Ok` carrying an entry equal in every caller-supplied field —
+/// so `contract_mutants`'s `Defect::BatchResolvesAgainstThePreCallLedger`,
+/// which has no in-batch dedup map at all, passes this assertion and is
+/// caught by the divergent pair instead. What this assertion does catch is a
+/// backend that **refuses** the later entry, reporting a conflict between a
+/// caller and itself over content the two agree on; no subject in the module
+/// does that today.
 async fn one_batch_call_absorbs_an_identical_later_entry(
     plugin: &dyn UsageCollectorPluginV1,
     fixtures: &DedupFloorFixtures,

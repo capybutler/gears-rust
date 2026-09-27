@@ -11,7 +11,7 @@
 //! column against each of them.
 //!
 //! *Behaviourally* is the exact word. Nine subjects wrap a real reference
-//! backend and are that backend plus one interception; the other three
+//! backend and are that backend plus one interception; the other four
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
 //!
@@ -38,13 +38,35 @@
 //! with — one substitutes the scope on the point read, and two rewrite how a
 //! second withdrawal of a record is answered.
 //!
-//! **A ledger of its own** ([`MutantLedger`]) is needed by the other three
-//! (selection column, fold exclusion, missing unique constraint), because
-//! each changes something the inner backend owns and no interception can
-//! reach it: which column a range meets, which rows a fold walks, and what
-//! admission writes. It mirrors the reference where the defect is not, and it
-//! is smaller in one stated way that no check reaches — see
-//! [`MutantLedger`].
+//! **A ledger of its own** ([`MutantLedger`]) is needed by the other four
+//! (selection column, fold exclusion, missing unique constraint, missing
+//! in-batch dedup map), because each changes something the inner backend owns
+//! and no interception can reach it: which column a range meets, which rows a
+//! fold walks, what admission writes, and what a batch's own rows are decided
+//! against. It mirrors the reference where the defect is not, and it is
+//! smaller in one stated way that no check reaches — see [`MutantLedger`].
+//!
+//! # DESIGN's three identity sites, and the subject for each
+//!
+//! §3.3's six-part-identity obligation names three places identity has to be
+//! enforced: *"Everything keyed on identity — a unique constraint or conflict
+//! target, the read-back of a conflicting entry, an in-batch dedup map —
+//! includes `entry_type` or keys on `id`, which covers all six inputs."* All
+//! three now have a subject, which is worth stating because it is the reason
+//! two of them exist:
+//!
+//! * **The unique constraint** — [`Defect::DedupIgnoresTheEntryType`] keys it
+//!   on five of the six inputs, and [`Defect::LedgerHasNoUniqueConstraint`]
+//!   leaves it out altogether.
+//! * **The read-back of a conflicting entry** —
+//!   [`Defect::ConflictReadBackIgnoresTheEntryType`].
+//! * **The in-batch dedup map** —
+//!   [`Defect::BatchResolvesAgainstThePreCallLedger`], which has none at all.
+//!
+//! A further subject for a site that already has one buys less than one for a
+//! site that has none, and the gap recorded on
+//! [`Defect::LedgerHasNoUniqueConstraint`] is left open on exactly that
+//! reasoning.
 //!
 //! # The four server-assigned fields, and which two have a subject
 //!
@@ -220,33 +242,94 @@ pub(super) enum Defect {
     ///
     /// **What the row this subject anchors does and does not establish**,
     /// measured by neutering each of `dedup-floor`'s nine assertions in turn
-    /// rather than inferred. It is the only subject that reaches that check
-    /// at all, and it reaches exactly the two assertions that read the
-    /// ledger back: the row count on `list_usage_records`, and the `COUNT`
-    /// fold over the same range. **Neither is individually necessary** — a
-    /// duplicate row shows on both paths, so neutering either leaves the
-    /// other reporting and the row unchanged; neutering both together takes
-    /// `dedup-floor` out of the row, and nothing else changes. Isolating one
-    /// from the other needs a subject whose fold disagrees with its own
-    /// ledger page: a `COUNT` served from a materialised aggregate refreshed
-    /// once per submission would count a duplicate this subject's ledger page
-    /// also shows, and is the honest shape of that second defect.
+    /// rather than inferred. It reaches exactly the two assertions that read
+    /// the ledger back: the row count on `list_usage_records`, and the
+    /// `COUNT` fold over the same range. **Neither is individually
+    /// necessary** — a duplicate row shows on both paths, so neutering either
+    /// leaves the other reporting and the row unchanged; neutering both
+    /// together takes `dedup-floor` out of this subject's row, and nothing
+    /// else changes. Isolating one from the other needs a subject whose fold
+    /// disagrees with its own ledger page: a `COUNT` served from a
+    /// materialised aggregate refreshed once per submission would count a
+    /// duplicate the ledger page also shows, and is the honest shape of that
+    /// second defect.
     ///
-    /// The other seven assertions — the retry, the divergent submission, and
-    /// the earlier and later entry of each batch pair — are reached by **no
-    /// subject in this module**, and each was confirmed to execute and to be
-    /// satisfied by the reference by inverting it. No other subject submits
-    /// one identity twice on that check's own meter, and every outcome this
-    /// one returns is the conforming one. Two further subjects would close
-    /// most of the gap and both are writable against this SPI: one that
-    /// absorbs a divergent re-delivery of a *record* (the withdrawal-only
-    /// [`Defect::AbsorbsAWithdrawalWithAnotherReason`] never reaches a
-    /// record), and one whose batch path carries no in-batch dedup map. The
-    /// two "the earlier entry of a batch is accepted" assertions are
-    /// structurally out of reach: a subject refusing the first entry of an
-    /// identity fails most of the suite and is a caricature rather than a
-    /// mistake anyone makes.
+    /// **`server-field-round-trip` passes this subject on two orderings
+    /// rather than on anything structural**, and the next author to touch
+    /// that check should know it. That check retries an entry, so this
+    /// subject stores a duplicate of it carrying the retry's own
+    /// `accepted_at` and `origin` — which the check asserts are *not* what a
+    /// read answers with. It passes because the duplicate does not exist
+    /// until the fourth of its five properties has run, so the three reads
+    /// before that meet one row; and because the fifth looks its entry up by
+    /// `id` through `get_usage_record`, which answers the first match while
+    /// [`Ledger::records`] is in admission order. Measured, not reasoned: a
+    /// row count added among the first four properties leaves this subject's
+    /// row unchanged, and the same count added after the retry puts
+    /// `server-field-round-trip` into it. A point read answering the later
+    /// row would do the same.
+    ///
+    /// Six of `dedup-floor`'s nine assertions are reached by **no** subject
+    /// in this module, each confirmed to execute and to be satisfied by the
+    /// reference by inverting it: the retry, the divergent submission, both
+    /// "the earlier entry of a batch is accepted" assertions, and the
+    /// identical in-batch pair's absorb. The seventh,
+    /// [`Defect::BatchResolvesAgainstThePreCallLedger`], closed the divergent
+    /// in-batch conflict and is individually load-bearing.
+    ///
+    /// Of the six, two are **structurally** out of reach and one is nearly
+    /// so. A subject refusing the first entry of an identity fails most of
+    /// the suite and is a caricature rather than a mistake anyone makes,
+    /// which accounts for both "earlier entry accepted" assertions. The
+    /// identical in-batch absorb is the third: an absorb and a second
+    /// acceptance both answer `Ok` carrying an entry equal in every
+    /// caller-supplied field, so no outcome tells them apart and only the row
+    /// count can — which is the floor half, not that assertion.
+    ///
+    /// **The retry and the divergent submission are a deliberate gap**,
+    /// recorded here rather than closed. The subject that would close them is
+    /// a backend absorbing a divergent re-delivery of a *record*: the
+    /// withdrawal-only [`Defect::AbsorbsAWithdrawalWithAnotherReason`] never
+    /// reaches one. It is writable against this SPI and it would isolate, but
+    /// it is a **second** subject for the site
+    /// [`Defect::ConflictReadBackIgnoresTheEntryType`] already covers — the
+    /// read-back of a conflicting entry, the second of DESIGN §3.3's three —
+    /// whereas the in-batch map that was built was a named site with no
+    /// subject at all. Whoever closes it should weigh that first: a module of
+    /// subjects is worth more per subject when each names a site nothing else
+    /// names.
     LedgerHasNoUniqueConstraint,
+    /// Resolves every entry of a batch against the ledger **as it stood
+    /// before the call**, so two same-identity entries in one
+    /// `create_usage_records` are both reported accepted instead of the later
+    /// resolving against the earlier.
+    ///
+    /// **The third of DESIGN §3.3's three identity sites**, and the one that
+    /// had no subject at all until this one: see this module's header for the
+    /// obligation and for which subject covers which site.
+    /// [`Self::DedupIgnoresTheEntryType`] and
+    /// [`Self::ConflictReadBackIgnoresTheEntryType`] take the first two, and
+    /// neither touches a batch.
+    ///
+    /// Strictly it is the site **missing** rather than mis-keyed, which is
+    /// the stronger form of the same mistake and the one the SPI states
+    /// outright in
+    /// [`create_usage_records`](crate::plugin_api::UsageCollectorPluginV1::create_usage_records):
+    /// *"Two same-identity entries in one call resolve later against earlier:
+    /// the later is absorbed when its caller-supplied fields equal the
+    /// earlier accepted entry's, and conflicts otherwise."* A backend that
+    /// reads once, decides every row against that read, and then writes them
+    /// all makes exactly this mistake.
+    ///
+    /// **The write still dedups**, and that is what keeps this subject wrong
+    /// in one place rather than two. The unique constraint is DESIGN's first
+    /// site and [`Self::LedgerHasNoUniqueConstraint`] already strikes it out;
+    /// a subject missing both would be wrong in two of the three named places
+    /// and could isolate neither. So the duplicate row is refused by the
+    /// ledger and silently dropped — which is what `ON CONFLICT … DO NOTHING`
+    /// does — and the damage is confined to the outcome the caller is handed:
+    /// an acceptance reported for a row that was never written.
+    BatchResolvesAgainstThePreCallLedger,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -270,7 +353,8 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::RefusesAWithdrawalWithTheSameReason => Box::new(WrappedReference::new(defect)),
         Defect::SelectsOnWindowStart
         | Defect::FoldsTheInvalidation
-        | Defect::LedgerHasNoUniqueConstraint => Box::new(MutantLedger::new(defect)),
+        | Defect::LedgerHasNoUniqueConstraint
+        | Defect::BatchResolvesAgainstThePreCallLedger => Box::new(MutantLedger::new(defect)),
     }
 }
 
@@ -437,7 +521,8 @@ impl WrappedReference {
             | Defect::ConflictReadBackIgnoresTheEntryType
             | Defect::SelectsOnWindowStart
             | Defect::FoldsTheInvalidation
-            | Defect::LedgerHasNoUniqueConstraint => Ok(record),
+            | Defect::LedgerHasNoUniqueConstraint
+            | Defect::BatchResolvesAgainstThePreCallLedger => Ok(record),
         }
     }
 
@@ -700,20 +785,33 @@ impl UsageCollectorPluginV1 for WrappedReference {
         // reporting the per-entry refusals it already has.
         //
         // **Reached by exactly one subject today, `DedupIgnoresTheEntryType`,
-        // and that count is part of the claim.** The one batch the suite
-        // sends is `at-most-one-invalidation`'s two withdrawals of a target
-        // already stored, and both repeat that target's idempotency key over
-        // its covered period, so the entry-type-blind index refuses each of
-        // them against the claim the target left and no survivor is handed
-        // on. Of the other two defects that can refuse an entry here,
+        // and that count is part of the claim.** The suite sends three
+        // batches, and only one of them can empty this list.
+        //
+        // `at-most-one-invalidation`'s is two withdrawals of a target already
+        // stored. Both repeat that target's idempotency key over its covered
+        // period, so the entry-type-blind index refuses each of them against
+        // the claim the target left and no survivor is handed on. Of the
+        // other two defects that can refuse an entry here,
         // `DedupIgnoresThePeriod` admits the second withdrawal under the
         // claim the first left, both deriving one `id`, and
         // `RefusesAWithdrawalWithTheSameReason` finds no withdrawal stored to
-        // refuse either against. A later defect that reaches this branch a
-        // second way must say so here rather than inherit a paragraph
-        // written about one subject: the reasoning above is per subject, not
-        // a general argument, and it was established by instrumenting this
-        // line rather than by reading it.
+        // refuse either against.
+        //
+        // `dedup-floor`'s two are pairs of **records** sharing all six
+        // identity inputs, so each pair derives one `id` and neither index
+        // above ever holds a claim under a different one - the second entry
+        // of each pair passes on the claim the first left. That check submits
+        // no invalidation at all, so the third defect never fires either.
+        // Both pairs therefore reach the inner backend whole, which is the
+        // point: the in-call resolution stays the exemplar's.
+        //
+        // A later defect that reaches this branch a second way must say so
+        // here rather than inherit a paragraph written about one subject: the
+        // reasoning above is per subject, not a general argument. It was
+        // established by instrumenting this line rather than by reading it,
+        // and re-established the same way when `dedup-floor` added its two
+        // batches.
         //
         // So the guard is a live path rather than a precaution, which is also
         // why it is repeated here rather than left to the inner backend to
@@ -1182,6 +1280,9 @@ impl UsageCollectorPluginV1 for MutantLedger {
             ));
         }
         let mut ledger = self.ledger()?;
+        if self.defect == Defect::BatchResolvesAgainstThePreCallLedger {
+            return Ok(resolve_against_the_pre_call_ledger(&mut ledger, records));
+        }
         Ok(records
             .into_iter()
             .map(|record| self.admit_here(&mut ledger, record))
@@ -1412,7 +1513,21 @@ fn decide(
     ledger: &Ledger,
     record: &UsageRecord,
 ) -> Result<Option<UsageRecord>, UsageCollectorPluginError> {
-    match ledger.records().find(|entry| entry.id == record.id) {
+    decide_against(ledger.records(), record)
+}
+
+/// The same decision over an arbitrary set of rows.
+///
+/// Split out for [`resolve_against_the_pre_call_ledger`], which decides a
+/// whole batch against a snapshot rather than against the live ledger. The
+/// decision itself stays in one function: a second copy of it is how a mirror
+/// of the exemplar starts disagreeing with the exemplar in a place no defect
+/// names.
+fn decide_against<'a>(
+    rows: impl IntoIterator<Item = &'a UsageRecord>,
+    record: &UsageRecord,
+) -> Result<Option<UsageRecord>, UsageCollectorPluginError> {
+    match rows.into_iter().find(|entry| entry.id == record.id) {
         Some(stored) if stored.caller_supplied_eq(record) => Ok(Some(stored.clone())),
         Some(stored) => Err(UsageCollectorPluginError::idempotency_conflict(
             record.idempotency_key.as_str(),
@@ -1420,6 +1535,47 @@ fn decide(
         )),
         None => Ok(None),
     }
+}
+
+/// [`Defect::BatchResolvesAgainstThePreCallLedger`]: every entry of one batch
+/// decided against the rows the ledger held **before** the call.
+///
+/// The snapshot is taken once, up front, and no entry admitted by this call
+/// is added to it. That is the whole of the defect: a backend that reads its
+/// dedup state once for the batch has no in-batch dedup map, so the second
+/// entry of a same-identity pair inside the call is decided as though the
+/// first had never arrived.
+///
+/// **The write is the ordinary one.** [`admit`] still refuses a duplicate
+/// `id`, because the unique constraint is DESIGN §3.3's *first* named site
+/// and [`Defect::LedgerHasNoUniqueConstraint`] is the subject that strikes
+/// that one out. So the row the constraint refuses is dropped without a
+/// word — an `ON CONFLICT … DO NOTHING` — and the outcome the caller reads
+/// comes from the snapshot instead. The caller is told a row was accepted
+/// that the store never wrote, which is the shape of this mistake in a
+/// backend that is otherwise conforming.
+///
+/// A same-identity pair that is **identical** is indistinguishable here from
+/// a conforming absorb, and necessarily so: both answer `Ok` carrying an
+/// entry equal in every caller-supplied field, and only the row count could
+/// tell them apart — which the surviving constraint keeps at one. The
+/// divergent pair is where this subject shows.
+fn resolve_against_the_pre_call_ledger(
+    ledger: &mut Ledger,
+    records: Vec<UsageRecord>,
+) -> Vec<Result<UsageRecord, UsageCollectorPluginError>> {
+    let before: Vec<UsageRecord> = ledger.records().cloned().collect();
+    let mut outcomes = Vec::with_capacity(records.len());
+    for record in records {
+        let answer = match decide_against(before.iter(), &record) {
+            Ok(Some(stored)) => Ok(stored),
+            Ok(None) => Ok(record.clone()),
+            Err(err) => Err(err),
+        };
+        let _written = admit(ledger, record);
+        outcomes.push(answer);
+    }
+    outcomes
 }
 
 /// Decides one entry against the ledger and inserts it if it may be,

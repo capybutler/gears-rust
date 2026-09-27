@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds twelve deliberately
+//! as coverage. [`super::contract_mutants`] holds thirteen deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -93,6 +93,40 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
     );
 }
 
+/// The suite run three times against **one** backend, which is the shape a
+/// real porter's second `cargo test` takes.
+///
+/// This module's header states the premise — *"The suite writes entries and
+/// never removes them, so a backend under test starts each run from whatever
+/// state the previous one left; the fixtures are keyed so that a repeated run
+/// resubmits identical entries rather than colliding with different ones"* —
+/// and until this test nothing held it. Every check depends on it, and each
+/// depends on it differently: one that counts rows needs its own re-delivery
+/// to be absorbed rather than stored, and one that asserts an entry is
+/// *accepted* needs that assertion to admit an absorb, because on the second
+/// run the entry is already there.
+///
+/// The failure it catches is a check written against a first run alone —
+/// "this is the first entry of its identity, so it is accepted" — which is
+/// true once and false afterwards. Three runs rather than two, because the
+/// first repeat is the one a fixture keyed on a run counter would survive.
+#[tokio::test]
+async fn the_reference_backend_conforms_to_a_repeated_run() {
+    let plugin = InMemoryReferencePlugin::new();
+
+    for run in 1..=3 {
+        let violations = run_all(&plugin, DedupLevel::Linearizable).await;
+        assert!(
+            violations.is_empty(),
+            "run {run} of the suite against one backend that kept the previous runs' entries \
+             reported: {violations:#?}. The suite removes nothing, so every check has to be \
+             written for a store that already holds its fixtures: a re-delivery is absorbed \
+             rather than stored, and an assertion that an entry is accepted has to admit that \
+             absorb."
+        );
+    }
+}
+
 /// One row per defect: the subject, and the checks `run_all` must report
 /// against it.
 ///
@@ -100,7 +134,7 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 /// A literal here would go on matching a constant that had been respelled,
 /// and the row would then assert nothing about the check it names.
 ///
-/// **Three rows name more than one check**, and none is a mutant wrong
+/// **Four rows name more than one check**, and none is a mutant wrong
 /// twice: each is a real overlap between checks, which is what the matrix
 /// has to be able to say without loosening into a subset assertion.
 ///
@@ -168,6 +202,17 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 /// with no unique constraint, not which of them noticed. What `dedup-floor`
 /// adds over the other two, and what this row leaves untouched, is stated on
 /// the defect itself and was measured rather than claimed.
+///
+/// [`Defect::BatchResolvesAgainstThePreCallLedger`] is the fourth, and its
+/// two checks assert one rule for two kinds of entry. A batch whose rows are
+/// all decided against the ledger as it stood before the call reports an
+/// acceptance for the later of any same-identity pair inside it, and two
+/// checks send such a pair: `dedup-floor`'s divergent in-batch pair of
+/// records, and `at-most-one-invalidation`'s one-batch pair of withdrawals of
+/// one target. DESIGN states the rule once, for entries rather than for
+/// records or withdrawals, so a subject missing the in-batch dedup map meets
+/// it wherever it is asserted. There is no fixture arrangement that would
+/// separate them: the coupling is the rule's, not the subject's.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (Defect::StampsItsOwnAcceptedAt, &[SERVER_FIELD_ROUND_TRIP]),
@@ -214,13 +259,17 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
             RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
         ],
     ),
+    (
+        Defect::BatchResolvesAgainstThePreCallLedger,
+        &[DEDUP_FLOOR, AT_MOST_ONE_INVALIDATION],
+    ),
 ];
 
 /// Every check fails against a backend that gets its rule wrong, and passes
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all twelve mutants is not
+/// of sensitivity. A check that fails against all thirteen mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.

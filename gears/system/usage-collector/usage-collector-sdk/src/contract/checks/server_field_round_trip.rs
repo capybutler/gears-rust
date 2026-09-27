@@ -152,6 +152,32 @@ struct ServerFieldFixtures {
     /// The re-delivery of [`Self::record`]: the same six identity inputs and
     /// the same caller-supplied fields, carrying a different `accepted_at`
     /// and a different `origin`.
+    ///
+    /// **This check never counts the rows its meter holds, and where an
+    /// assertion that did were placed would decide which subjects it fails.**
+    /// This submission is a re-delivery, so a backend with no unique
+    /// constraint on the dedup identity — `contract_mutants`'s
+    /// `Defect::LedgerHasNoUniqueConstraint` — stores it as a second row,
+    /// carrying this entry's `accepted_at` and `origin`, which is exactly
+    /// what the assertions below require a read *not* to answer with.
+    ///
+    /// Two facts keep this check out of that subject's matrix row, and both
+    /// were measured by adding a row count and reading what the matrix
+    /// reported. The first is **ordering in time**: the duplicate does not
+    /// exist until [`the_absorbed_retry_answers_with_the_stored_values`]
+    /// runs, and only one of this check's five properties runs after it. A
+    /// count placed among the first four reports nothing; the same count
+    /// placed after the retry puts this check into that subject's row.
+    ///
+    /// The second is **ordering in the answer**, and it holds only for that
+    /// fifth property: it looks its entry up by `id` through
+    /// `get_usage_record`, which answers the first matching row, and the
+    /// reference ledger is in admission order, so the original answers and
+    /// the duplicate behind it is never seen. That is an ordering dependency
+    /// rather than a structural one. An assertion added there that counted
+    /// rows, or a backend whose point read answered the later row, would join
+    /// that subject's row — and either would look like an accident unless
+    /// this note is read first.
     retry: UsageRecord,
 }
 
