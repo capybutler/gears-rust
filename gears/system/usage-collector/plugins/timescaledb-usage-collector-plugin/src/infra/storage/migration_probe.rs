@@ -27,7 +27,7 @@
 //! see [`ledger_columns`].
 //!
 //! Gated on `any(test, feature = "postgres")` rather than `test` alone so the
-//! five `tests/*.rs` integration crates can call it too. `postgres` is a
+//! nine `tests/*.rs` integration crates can call it too. `postgres` is a
 //! test-only feature, so nothing ships with this compiled in — and the point of
 //! the wider gate is that "one independent oracle" stays literally true instead
 //! of becoming one parser per compilation unit.

@@ -378,9 +378,9 @@ fn create_usage_record_request_carries_a_withdrawals_two_departures() {
 fn the_ingestion_shape_requires_its_own_entry_type() {
     // `entry_type` is caller-supplied on this shape, required, and has no
     // default (`usage-collector-v1.yaml`: "Required on every ingestion
-    // request, with no default. A request that omits it is rejected rather
-    // than read as a `record`"). A body omitting it fails as a missing
-    // field rather than deserializing into a measurement.
+    // request, with no default, […] A request that omits it is rejected
+    // rather than read as a `record`:"). A body omitting it fails as a
+    // missing field rather than deserializing into a measurement.
     let mut json = minimal_create_record_json();
     json.as_object_mut()
         .expect("object")
