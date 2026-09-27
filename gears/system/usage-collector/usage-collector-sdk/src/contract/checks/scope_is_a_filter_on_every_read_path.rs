@@ -67,7 +67,11 @@ const SCOPE_WINDOW_TO: time::OffsetDateTime =
 /// [`quantity_fixture`](super::quantity_round_trip::quantity_fixture)
 /// spells out. Neither is visible to the scope, and neither is visible to
 /// the range under test.
-const SCOPE_EXCLUDED_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0002);
+///
+/// Minted in [`crate::contract::fixtures`] with every other tenant id the
+/// suite attributes an entry to, where one compile-time assertion keeps them
+/// all distinct rather than four doc comments that have to agree.
+const SCOPE_EXCLUDED_TENANT_ID: Uuid = crate::contract::fixtures::SCOPE_EXCLUDED_TENANT_ID;
 
 /// A tenant the scope under test admits and that owns no entry.
 ///
@@ -85,7 +89,13 @@ const SCOPE_EXCLUDED_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_800
 /// to it — this fixture does not catch that one. Nor does it catch a
 /// backend admitting whatever any disjunct mentions, which is
 /// indistinguishable from correct handling while this tenant owns no row.
-const SCOPE_UNUSED_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0003);
+///
+/// **That it owns no row is the suite's own fact and not this module's
+/// alone.** `run_all` dispatches every check against one backend, so the
+/// premise holds only while no other check attributes an entry to it. It is
+/// minted in [`crate::contract::fixtures`] for that reason, beside the
+/// assertion that keeps the suite's tenant ids distinct.
+const SCOPE_UNUSED_TENANT_ID: Uuid = crate::contract::fixtures::SCOPE_UNUSED_TENANT_ID;
 
 /// The admitted entry's quantity, and the whole of the total the fold must
 /// report.

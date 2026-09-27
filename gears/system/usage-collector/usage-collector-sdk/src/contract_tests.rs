@@ -667,11 +667,17 @@ async fn an_untranslatable_node_refuses_a_caller_filter_and_excludes_a_scope() {
 
 /// The tenant the feed reads below withhold.
 ///
-/// Distinct from [`super::fixtures::CONTRACT_TENANT_ID`] and from the scope
-/// check's unused tenant: entries attributed to it are admitted by one grant
-/// below and withheld by another, which is the only way a read can show that
-/// the position does not depend on the grant.
-const FEED_OTHER_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0003);
+/// Entries attributed to it are admitted by one grant below and withheld by
+/// another, which is the only way a read can show that a position means the
+/// same thing under either.
+///
+/// Minted in [`super::fixtures`] with the suite's other tenant ids, where one
+/// compile-time assertion keeps them distinct. This constant was a second
+/// `...0003` literal — the scope check's unused tenant — under a doc comment
+/// claiming it was distinct from it, which is harmless only while no feed
+/// check is in `run_all`: that suite shares one persistent backend across
+/// every check, and the scope check's unused tenant asserts it owns no entry.
+const FEED_OTHER_TENANT_ID: Uuid = super::fixtures::FEED_OTHER_TENANT_ID;
 
 /// The ledger's length, and so the position at its end.
 const FEED_LEDGER_LEN: u64 = 4;
@@ -793,27 +799,64 @@ async fn feed_page(
         .expect("the reference backend serves a well-formed feed read")
 }
 
-/// One ledger, three grants, one position.
+/// One ledger, three grants, one meaning for a position.
 ///
 /// This is the most valuable assertion in the file and the easiest to lose.
 /// A feed position counts the entries a read **scanned**, not the ones it
-/// **admitted**, so three callers whose compiled scopes differ are handed
-/// the same position over one ledger and can each resume from any of them.
+/// **admitted**, so a position denotes a prefix of the ledger and denotes
+/// the same prefix whoever reads it. The grant and the subscription decide
+/// what a page *carries*, never what its cursor *counts* — which is what
+/// DESIGN §3.1's `FeedPosition` row requires, fixing a position's age by the
+/// oldest subsequent entry of a subscribed type *"whether or not the
+/// reader's authorization scope admits that entry"*. That is what lets any
+/// position be resumed under any grant without skipping an entry that grant
+/// admits.
+///
+/// **The property is resumability, not identity.** Two reads under different
+/// grants are not in general handed the same position: `limit` bounds the
+/// entries a page admits while the scan is unbounded, so a page that stops
+/// on the limit stops where its own grant's entries run out. Over this
+/// ledger at `limit = 1` the two grants are handed 1 and 2 —
+/// [`a_bounded_page_limit_hands_two_grants_two_positions_that_each_resume`]
+/// is that read, and it is where the limit interaction is visible rather
+/// than hidden. The three reads below all exhaust the ledger, which is the
+/// case in which the positions do coincide; the coincidence is a
+/// consequence of the exhausting limit and the property is what holds
+/// without one.
+///
 /// Moving the scope filter above `cursor += 1` in `read_feed_page` still
 /// compiles, still passes the entire contract suite, and still reads
-/// correctly under every single grant — it would simply hand three callers
-/// three mutually incompatible cursors over one ledger, and a cursor minted
-/// under a grant that has since widened would then silently skip entries.
+/// correctly under every single grant — it would simply make a position mean
+/// "the entries this grant admitted", so a cursor minted under one grant and
+/// resumed under a wider one would silently skip every entry the narrower
+/// grant withheld.
 ///
-/// A single-grant test cannot catch that; only comparing positions across
-/// grants can, which is why the three reads are compared to each other
-/// before any of them is compared to a literal.
+/// **What catches that is a position compared against a literal, not two
+/// positions compared with each other.** `assert_eq!(pinned.next,
+/// other.next)` *passes* under the defect: this ledger alternates the two
+/// tenants, so both grants admit two of the four and both would be handed 2.
+/// The guards that fire are the ones naming a literal — the ledger's end
+/// below, the delivery and fixpoint of
+/// [`a_limit_bounded_feed_walk_reaches_a_fixpoint_at_the_ledger_end`], the
+/// literal in the single-grant
+/// [`a_subscription_the_ledger_does_not_answer_still_advances_the_cursor`],
+/// the two positions of
+/// [`a_bounded_page_limit_hands_two_grants_two_positions_that_each_resume`]
+/// (both grants are handed 1 under the defect), and the absent cursor
+/// [`a_bounded_feed_replay_closes_at_its_until_and_not_before`] requires —
+/// plus the untranslatable grant's comparison below, which under the defect
+/// is handed 0 rather than the ledger's end. Applied to `read_feed_page`, the
+/// defect fails those five tests and no other. The cross-grant comparisons are
+/// kept for what they say when they fail: over three reads that all exhaust
+/// this ledger a position equal to the literal is a position equal to the
+/// others, so they catch nothing the literal misses, and they name two
+/// callers and one ledger, which is the form the defect takes in a gateway.
 ///
 /// The three grants are as far apart as this backend admits: one that
 /// admits half the ledger, one that admits the other half, and one that
 /// cannot be read and so admits none of it.
 #[tokio::test]
-async fn a_feed_position_is_the_same_under_every_grant_over_one_ledger() {
+async fn a_feed_position_denotes_the_same_ledger_prefix_under_every_grant() {
     let (plugin, ids) = feed_ledger().await;
 
     let pinned = feed_page(
@@ -863,14 +906,17 @@ async fn a_feed_position_is_the_same_under_every_grant_over_one_ledger() {
         entry_ids(&unreadable.entries)
     );
 
-    // And they are all handed the same position.
+    // All three reads exhausted the ledger, so all three scanned it whole and
+    // are handed its end. Under a bounded limit the positions differ and what
+    // holds instead is that each resumes correctly.
     assert_eq!(
         pinned.next, other.next,
-        "two callers whose grants admit disjoint halves of one ledger MUST be handed the same \
-         position. The position counts entries scanned, not entries admitted, which is what \
-         makes it independent of who asked; a position that moved with the grant could not be \
-         resumed by a caller whose grant had since widened without silently skipping every \
-         entry the narrower grant withheld"
+        "two callers whose grants admit disjoint halves of one ledger, both reading it to the \
+         end, MUST be handed the same position: the position counts entries scanned, not \
+         entries admitted. This equality is the exhausting case of the property that always \
+         holds: a position denotes a ledger prefix, so it resumes correctly under any grant. \
+         A position that moved with the grant could not be resumed by a caller whose grant had \
+         since widened without silently skipping every entry the narrower grant withheld"
     );
     assert_eq!(
         other.next, unreadable.next,
@@ -882,9 +928,116 @@ async fn a_feed_position_is_the_same_under_every_grant_over_one_ledger() {
     assert_eq!(
         pinned.next,
         Some(feed_position(FEED_LEDGER_LEN)),
-        "the shared position is the count of entries scanned ({FEED_LEDGER_LEN}), not the count \
-         any one grant admitted (2, 2 and 0)"
+        "the position these reads reached is the count of entries scanned ({FEED_LEDGER_LEN}), \
+         not the count any one grant admitted (2, 2 and 0). This is the assertion a backend \
+         counting admitted entries fails; the two equalities above pass under that defect, \
+         because this ledger hands both grants the same admitted count"
     );
+}
+
+/// A bounded `limit` hands two grants two positions, and each one resumes.
+///
+/// `limit` bounds the entries a page **admits** while the scan is unbounded,
+/// so a page that stops on the limit stops where its own grant's entries run
+/// out rather than where the ledger does. Over the A, B, A, B ledger at
+/// `limit = 1` the grant pinning the suite's tenant is handed **1** and the
+/// grant pinning the other tenant **2**: one scanned entry against two.
+///
+/// That is the read
+/// [`a_feed_position_denotes_the_same_ledger_prefix_under_every_grant`]
+/// cannot show, because its limit exhausts the ledger and every position it
+/// compares is the ledger's end. Both tests assert one property and it is
+/// resumability rather than identity: a position denotes a ledger prefix, the
+/// same prefix under any grant, so resuming from it delivers every later
+/// entry the resuming grant admits and skips none — asserted below in all
+/// four combinations of the grant that minted a position and the grant that
+/// resumes from it.
+#[tokio::test]
+async fn a_bounded_page_limit_hands_two_grants_two_positions_that_each_resume() {
+    let (plugin, ids) = feed_ledger().await;
+    let pinned_scope = tenant_scope(super::fixtures::CONTRACT_TENANT_ID);
+    let other_scope = tenant_scope(FEED_OTHER_TENANT_ID);
+
+    let pinned = feed_page(&plugin, &pinned_scope, FeedStart::Oldest, None, 1).await;
+    let other = feed_page(&plugin, &other_scope, FeedStart::Oldest, None, 1).await;
+
+    assert_eq!(
+        entry_ids(&pinned.entries),
+        vec![ids[0]],
+        "a limit of one admits one entry, and the first entry this grant admits is the ledger's \
+         first"
+    );
+    assert_eq!(
+        entry_ids(&other.entries),
+        vec![ids[1]],
+        "the first entry the other grant admits is the ledger's second, which is why its page \
+         costs one more scanned entry than the page above"
+    );
+    assert_eq!(
+        pinned.next,
+        Some(feed_position(1)),
+        "one entry scanned to admit one entry"
+    );
+    assert_eq!(
+        other.next,
+        Some(feed_position(2)),
+        "two entries scanned to admit one entry: the withheld first entry still advances the \
+         cursor past itself"
+    );
+    assert_ne!(
+        pinned.next, other.next,
+        "a bounded limit is exactly where two grants are handed two positions, so a test \
+         asserting that two grants always agree on a position would be asserting something \
+         this backend does not provide"
+    );
+
+    let from_pinned = pinned
+        .next
+        .expect("a live read carries a continuation on every page");
+    let from_other = other
+        .next
+        .expect("a live read carries a continuation on every page");
+
+    assert_eq!(
+        feed_resume(&plugin, &pinned_scope, &from_pinned).await,
+        vec![ids[2]],
+        "the minting grant resumes after its own position and is handed the rest of what it \
+         admits, once each"
+    );
+    assert_eq!(
+        feed_resume(&plugin, &other_scope, &from_pinned).await,
+        vec![ids[1], ids[3]],
+        "the other grant resumes from a position it did not mint and is handed every entry it \
+         admits after that prefix. Nothing it admits is skipped, which is the whole of what a \
+         position promises across grants"
+    );
+    assert_eq!(
+        feed_resume(&plugin, &pinned_scope, &from_other).await,
+        vec![ids[2]],
+        "resuming from the wider position skips nothing either: the entries it passed over are \
+         the ledger's first two, and this grant's first entry is among them rather than beyond \
+         them"
+    );
+    assert_eq!(
+        feed_resume(&plugin, &other_scope, &from_other).await,
+        vec![ids[3]],
+        "and the grant that minted the wider position is handed the rest of what it admits"
+    );
+}
+
+/// Resumes after `position` under `scope`, over a limit that exhausts the
+/// ledger, and reports the entry ids the page carried.
+///
+/// The limit is the exhausting one deliberately: what a resumption assertion
+/// is about is the whole of what follows a position, so a page bounded short
+/// of it would report the limit rather than the position's meaning.
+async fn feed_resume(
+    plugin: &InMemoryReferencePlugin,
+    scope: &ast::Expr,
+    position: &FeedPosition,
+) -> Vec<Uuid> {
+    let page = feed_page(plugin, scope, FeedStart::After(position.clone()), None, 16).await;
+    entry_ids(&page.entries)
 }
 
 /// A `limit`-bounded walk ends, and delivers each admitted entry once.

@@ -1,4 +1,33 @@
 //! Consumer-facing SDK trait for the Usage Collector.
+//!
+//! # The feed and reconciliation methods are not here yet
+//!
+//! [`UsageCollectorClientV1`] declares six methods and none of them reads
+//! the usage feed or reports reconciliation metadata, while the Plugin SPI
+//! ([`crate::plugin_api::UsageCollectorPluginV1`]) declares both. That
+//! asymmetry is deliberate and it is recorded here because this is the file
+//! a reader checks: `read_usage_feed` and the reconciliation read land with
+//! the **Feed Gateway** slice, which is what builds the gateway half — the
+//! wire cursor a `FeedPosition` is carried inside, the retention refusal, and
+//! the consumer's subscription — and none of that is reachable from this
+//! trait's signature alone.
+//!
+//! **A declared-but-unbuilt method could not fail honestly.** A plugin-side
+//! stub answers
+//! [`UsageCollectorPluginError::Internal`](crate::error::UsageCollectorPluginError::Internal),
+//! which lifts to a `500`, because DESIGN gives the consumer taxonomy no
+//! "not ready yet" variant to return instead: a consumer would read
+//! infrastructure failure where the truth is an unbuilt surface. Declaring
+//! the method later is additive for every implementor of this trait — the
+//! gear's own client and the in-process one — so deferring costs a consumer
+//! nothing it would not also pay today.
+//!
+//! The feed types themselves are built and public ([`crate::feed`]), which is
+//! why that module's docs speak of this trait in the future tense. One of
+//! them cannot be instantiated over the wire cursor without a further change:
+//! `FeedPage`'s `PartialEq` is bounded on its cursor kind, and
+//! `toolkit_odata::CursorV1` derives none, so `FeedPage<CursorV1>` gains one
+//! only when `CursorV1` does.
 
 use async_trait::async_trait;
 use toolkit_odata::{ODataQuery, Page as ODataPage};

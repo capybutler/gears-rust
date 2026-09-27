@@ -41,9 +41,14 @@ described), **§A** (`api.json` regenerated and committed) and **§G**
 (`group-by-absent-dimension`, resolved by owner decision and implemented as a
 presence guard). The invalidation-dedup slice (SPEC-DIFF slice B, commits
 `759f836be..97297c2e2`) struck **entry 22**: the index that aborted a batch is
-gone, and a second withdrawal is an ordinary per-row dedup collision. Not all are
-*wholly* closed, and each says at its strike what is left and where the remainder
-lives.
+gone, and a second withdrawal is an ordinary per-row dedup collision. The
+feed-and-reconciliation SPI slice (the nine commits `2c6d8c85b..f23ec0b72`)
+struck **entry 18** (the sixth plugin-error variant ships, and its lift is
+asserted) and **entry 19** wholly (the SPI declares `read_feed_page`,
+`BLOCKED_CHECKS` is empty, and `latest-tie-break` was never blocked on the field
+it named), and amended **entry 10**'s `LATEST` paragraph, which argued from the
+same false premise. Not all are *wholly* closed, and each says at its strike
+what is left and where the remainder lives.
 
 In **fourteen of the twenty-five the code is the correct side** and the document
 is imprecise or stale. Eleven are not that shape, and saying so matters more
@@ -68,15 +73,21 @@ than a tidy summary:
   the model no longer had and was missing five the gear needed. The plugin was
   the deficient side. **Resolved by slice 7**, which is the port that entry
   asked for, and struck in place.
-- **Entry 18** — the document is right and the code is deliberately one variant
-  short. `UsageCollectorPluginError` ships five of DESIGN §3.3's six, and the
-  sixth signals a replay refusal on a feed the SPI does not declare. Landing it
-  with the feed was a spec-owner decision, not an oversight.
-- **Entry 19** — two of DESIGN §3.3's seven contract checks cannot be written at
-  all. Neither side is wrong about behaviour; the SPI and the record model are
-  missing the method and the field a check would have to read. Slice 7 made it
-  concrete rather than conditional: two conforming backends now answer a
+- **Entry 18** — the document is right and the code was deliberately one
+  variant short. `UsageCollectorPluginError` shipped five of DESIGN §3.3's six,
+  and the sixth signals a replay refusal on a feed the SPI did not declare.
+  Landing it with the feed was a spec-owner decision, not an oversight.
+  **Resolved by the feed-and-reconciliation SPI slice**, which is the slice
+  that landed the feed, and struck in place.
+- **Entry 19** — two of DESIGN §3.3's seven contract checks could not be
+  written at all. Neither side was wrong about behaviour; the SPI and the record
+  model were missing the method and the field a check would have to read. Slice
+  7 made it concrete rather than conditional: two conforming backends answer a
   `LATEST` tie differently, on the rule the blocked check would have pinned.
+  **Wholly closed by the feed-and-reconciliation SPI slice**, which declared the
+  feed method and established that the second check was never blocked on the
+  field it named, and struck in place — the differing `LATEST` answers are a
+  Stated limit and an unwritten check, not a blocked one.
 - **Entry 20** — no document is wrong. The `LATEST` fold has a bound nobody
   stated, driven by an input the caller chooses. It belongs to the plugin's
   §3.10 deployment guide by kind and **not** by that section's enumeration,
@@ -715,17 +726,25 @@ oversight:
 
 - The `value` → `quantity` rename was out of slice 3's list and out of slice
   4's. It is a wire break on the ingestion path and deserves its own commit.
-- `accepted_at` and `acceptance_sequence` are claimed by **no slice**, and
-  slice 5 is where that stopped being a scheduling detail. DESIGN §3.1 has the
-  gear stamp `accepted_at` and the plugin assign `acceptance_sequence`
-  monotonically per `(tenant_id, gts_type_id)`, and says the `LATEST` fold
-  breaks ties on it; `usage-collector-sdk/src/models.rs` documents that
-  tie-break against a field the record does not carry. **This blocks a
-  conformant storage plugin**: there is no field for it to assign and no field
-  for the fold to read. `origin` was their sibling in the server-assigned
-  group and shipped in slice 5; these two did not, and nothing on the roadmap
-  picks them up. Re-flagged here rather than filled: inventing either field is
-  a contract decision, not a sweep's.
+- `acceptance_sequence` is claimed by **no slice**, and it is the yaml's
+  `required` list that keeps this live: the published `UsageRecord` demands the
+  field and nothing at the SDK or DTO level assigns or emits one, so the body
+  is a non-instance whatever else is fixed. Inventing the field is a contract
+  decision, not a sweep's.
+
+  **The `LATEST` argument this bullet used to carry was false in both halves,
+  and is struck by the feed-and-reconciliation SPI slice.** DESIGN §3.1 does
+  *not* break a `LATEST` tie on `acceptance_sequence` — the rule it states is
+  greatest `window_end`, then greatest `accepted_at`, then greatest `id` in
+  byte order, and `acceptance_sequence` appears nowhere in `DESIGN.md` — and
+  `usage-collector-sdk/src/models.rs` documents that rule rather than one
+  reading an absent field. So the fold is **not** blocked for want of a field:
+  all three keys are on the record, `accepted_at` included, which is also the
+  half of the response-side paragraph above that has gone stale — it is on the
+  SDK's `UsageRecord` and on `UsageRecordDto`, and `acceptance_sequence` is on
+  neither. What the reference backend does instead is skip the middle key by
+  choice, which is its own Stated limit and `latest-tie-break`'s to pin; entry
+  19's strike says the rest.
 
 **Pinned in both directions.** `api/rest/dto_tests.rs` asserts the literal wire
 key set the gear accepts (`create_usage_record_request_accepts_exactly_the_declared_wire_keys`)
@@ -1210,7 +1229,23 @@ a-key / AND-across-keys semantics the registration already publishes.
 
 ---
 
-## 18. `UsageCollectorPluginError` ships five of DESIGN §3.3's six variants
+## 18. ~~`UsageCollectorPluginError` ships five of DESIGN §3.3's six variants~~
+
+**Resolved in code by the feed-and-reconciliation SPI slice (the nine commits
+`2c6d8c85b..f23ec0b72`), and kept rather than deleted.** The enum declares
+six. `CursorBeyondRetention` landed with the SPI's `read_feed_page` and is
+declared bare, carrying no `oldest_available`, which is how DESIGN §3.3's table
+names it; `domain/error.rs` lifts it to `InvalidArgument(CursorBeyondRetention)`
+and `domain/error_tests.rs` asserts that lift, so the "nothing lifts it, and no
+test can exercise it" below is closed too. What no backend does yet is *raise*
+it: the reference backend purges nothing, and the TimescaleDB adapter refuses
+the whole feed read.
+
+**Read the count, not the roster.** The five variants this entry lists are no
+longer the five that ship: `AlreadyInvalidated` left with the invalidation-dedup
+change, and `UsageRecordNotConverged` arrived with the converged-only lookup.
+The original entry follows unchanged as the record of what was wrong.
+
 
 `gears/system/usage-collector/docs/DESIGN.md:1217`-`:1224` tabulates the SPI
 taxonomy and the envelope each variant lifts to, then states the count outright
@@ -1256,7 +1291,38 @@ obligation in writing.
 
 ---
 
-## 19. Two DESIGN §3.3 contract checks cannot be written against the SPI this gear declares
+## 19. ~~Two DESIGN §3.3 contract checks cannot be written against the SPI this gear declares~~
+
+**Wholly closed by the feed-and-reconciliation SPI slice (the nine commits
+`2c6d8c85b..f23ec0b72`), and kept rather than deleted.** Neither blocker
+survives, and one of them was never the blocker this entry described.
+`UsageCollectorPluginV1` declares `read_feed_page`, so
+`feed-snapshot-and-replay` is expressible and merely unwritten.
+`latest-tie-break` was blocked on an `acceptance_sequence` the rule does not
+read: DESIGN §3.1's tie-break is greatest `window_end`, then greatest
+`accepted_at`, then greatest `id` in byte order — three fields `UsageRecord`
+carries, and `acceptance_sequence` appears nowhere in `DESIGN.md`. `BLOCKED_CHECKS`
+is empty, `UNWRITTEN_CHECKS` holds eleven of the sixteen checks DESIGN now
+tabulates, and every count in this entry — seven tabulated, five written, two
+blocked — is superseded.
+
+**Do not copy the two justifications below forward.** The suite keeps both
+strings in a `RETIRED_JUSTIFICATIONS` constant
+(`contract_tests.rs`, `the_blocked_checks_are_the_ones_the_spi_cannot_express`)
+for exactly that reason, and this entry reproduces them verbatim: "no feed
+method" and the `acceptance_sequence` rule. They are history here and refused
+in the code.
+
+**What survives is not a blocked check.** The reference backend still breaks a
+`LATEST` tie on the greatest `id` and the TimescaleDB backend on its own
+`acceptance_sequence` column, so two conforming backends still answer a tie
+differently. That is a Stated limit of the reference backend and it is
+`latest-tie-break`'s to pin — a check now writable against the SPI as it
+stands, which is why it sits in `UNWRITTEN_CHECKS`. `feed-retention-refusal`
+is the one check that needs more than an author: reaching a purged state needs
+a retention input `run_all` does not take, which `UNWRITTEN_CHECKS`'s own doc
+records. The original entry follows unchanged as the record of what was wrong.
+
 
 `gears/system/usage-collector/docs/DESIGN.md:1105`-`:1116` tabulates seven
 plugin contract tests and says every conforming plugin MUST pass the suite in

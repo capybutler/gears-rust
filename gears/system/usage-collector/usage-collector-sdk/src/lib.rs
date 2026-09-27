@@ -19,6 +19,20 @@
 //!   which is exactly the distinction its accessor names
 //!   (`lower_inclusive` / `upper_exclusive`, not `window_start` /
 //!   `window_end`) keep separate from a record's covered period.
+//! - [`feed`] — the usage feed's [`FeedPosition`], [`FeedStart`],
+//!   [`FeedPage`] and [`FeedSubscription`], plus the
+//!   [`MAX_FEED_POSITION_BYTES`] bound a plugin's position has to fit. The
+//!   feed is the replay-safe read path a charging consumer uses instead of
+//!   [`UsageCollectorClientV1::list_usage_records`]. [`FeedStart`] and
+//!   [`FeedPage`] are generic over the position each surface speaks, which is
+//!   what keeps a plugin's own position off the wire; the Plugin SPI reads a
+//!   page today and the consumer trait grows its feed method with the Feed
+//!   Gateway (see [`api`]).
+//! - [`reconciliation`] — [`ReconciliationMetadata`], the accepted count, fold
+//!   summary and two watermarks one `(tenant, GTS type)` scope reports, and
+//!   [`ReconciliationScope`], the REST-level spelling of that pair. An
+//!   operator surface: it says whether a consumer has a gap without folding
+//!   the meter.
 //! - `contract` (feature-gated, off by default) — the DESIGN §3.3 plugin
 //!   contract suite every conforming storage plugin MUST pass, plus the
 //!   in-memory reference backend it is validated against. A plugin crate

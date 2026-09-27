@@ -31,7 +31,59 @@ pub const CONTRACT_METER_TYPE_ID: &str =
 
 /// The tenant every fixture entry is attributed to, and the one value the
 /// scope filter the suite dispatches pins.
+///
+/// First of the suite's tenant ids. They are all minted in this module, and
+/// the assertion under [`FEED_OTHER_TENANT_ID`] says why.
 pub const CONTRACT_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0001);
+
+/// The tenant the dispatched scope does **not** admit, read by
+/// [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path()).
+/// That check's own module says what it is for.
+pub const SCOPE_EXCLUDED_TENANT_ID: Uuid =
+    Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0002);
+
+/// The tenant the dispatched scope's second disjunct names and no entry
+/// carries, read by the same check. Its module says what it is for, and what
+/// it buys depends on its owning no entry.
+pub const SCOPE_UNUSED_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0003);
+
+/// The tenant the reference backend's feed reads withhold from one grant and
+/// hand to another. `super::contract_tests` says what it is for.
+pub const FEED_OTHER_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0004);
+
+// Every tenant id above is distinct, established when the crate compiles.
+//
+// The ids are minted here rather than in each module that reads them, and
+// this is the whole reason. `super::run_all` dispatches every check against
+// one shared, persistent backend that writes entries and never removes them,
+// so one check's fixtures are visible to the next; `SCOPE_UNUSED_TENANT_ID`'s
+// entire assertion value is that it owns no entry. Two checks minting one id
+// therefore dissolves that premise silently rather than failing anything —
+// and it has happened: `FEED_OTHER_TENANT_ID` was a second `...0003` literal
+// in `contract_tests.rs`, under a doc comment claiming it was distinct from
+// `SCOPE_UNUSED_TENANT_ID`. A doc comment cannot hold that; this can.
+const _: () = {
+    let ids = [
+        CONTRACT_TENANT_ID.as_u128(),
+        SCOPE_EXCLUDED_TENANT_ID.as_u128(),
+        SCOPE_UNUSED_TENANT_ID.as_u128(),
+        FEED_OTHER_TENANT_ID.as_u128(),
+    ];
+    let mut first = 0;
+    while first < ids.len() {
+        let mut second = first + 1;
+        while second < ids.len() {
+            assert!(
+                ids[first] != ids[second],
+                "two of the contract suite's tenant ids are one value: the suite runs every \
+                 check against one shared backend that never removes an entry, so an id a \
+                 second check mints is an id already carrying entries that check did not write"
+            );
+            second += 1;
+        }
+        first += 1;
+    }
+};
 
 /// `2020-01-01T00:00:00Z`, the base every fixture covered period is offset
 /// from.
@@ -150,9 +202,14 @@ pub fn fixture_record(
 
 /// The same entry attributed to a caller-chosen tenant.
 ///
-/// Only [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path()) needs it,
-/// and it needs it because a scope check has nothing to assert unless two
-/// stored entries fall on opposite sides of the scope it dispatches.
+/// Two callers need it, and both for the same reason: a read that gates on
+/// the scope has nothing to assert unless two stored entries fall on
+/// opposite sides of the scope it dispatches.
+/// [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path())
+/// is the check; `super::contract_tests`'s `feed_ledger` is the other, and it
+/// alternates the two tenants so that every page of a feed read carries some
+/// entries and withholds others.
+///
 /// `tenant_id` is one of the five attributes the derived identity reads, so
 /// two entries differing only here are two entries rather than an
 /// idempotent replay of one.

@@ -51,6 +51,30 @@
 //!   `CursorBeyondRetention` is unreachable and this backend exercises the
 //!   retention refusal not at all. The page, the position and the scope gate
 //!   are correct; the refusal has nothing to fire on.
+//! * **A feed position is an offset, which is the one mechanism DESIGN
+//!   forbids** — `read_feed_page` resumes with `.skip(from)`, so its position
+//!   is a count of entries to walk past rather than a key to seek to. The
+//!   *property* is DESIGN-backed and load-bearing — a position counts what a
+//!   read scanned, not what it admitted, which is what makes it mean the same
+//!   thing under every grant — but the *mechanism* is not: DESIGN §3.3's
+//!   plugin obligations say outright that *"Offset/limit scans are forbidden
+//!   on both paginated paths."* A porter copying "position = count of scanned
+//!   entries" into SQL writes `OFFSET n` and inherits its cost and its
+//!   skew. What a real plugin owes instead is a monotonic key it can seek on
+//!   that is comparable across a whole subscription — the same key the
+//!   `TimescaleDB` adapter's `read_feed_page` tells its implementer to design,
+//!   its own `acceptance_sequence` being monotonic per `(tenant, meter)` only.
+//! * **`SUM` over an empty selection answers absent where DESIGN requires
+//!   `0`** — `fold_value` returns `None` for every fold over a bucket with no
+//!   rows, and DESIGN §3.3 divides them: `SUM` and `COUNT` *"are defined over
+//!   an empty selection and report `0`"* while `MAX`, `MIN` and `LATEST`
+//!   report absent. `COUNT` is answered correctly here and `SUM` is not. It
+//!   predates the feed and no implemented check reads it, deliberately:
+//!   `invalidation-excluded-from-fold` asserts its `SUM` against the
+//!   surviving entry's quantity rather than against zero, because an empty
+//!   `SUM` is what a backend computing no fold at all also answers. Listing
+//!   it here is the point of this section — it is a place the backend answers
+//!   less than the SPI asks for.
 //! * **`get_reconciliation_metadata` never reports a `quantity_summary`** —
 //!   the count and both watermarks are computed and the fold is always
 //!   absent. `SUM` and `COUNT` are defined over an empty selection, so
@@ -345,12 +369,25 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
     ///
     /// The compiled `scope` gates what the page **carries**, not what the
     /// position **counts**: an entry outside it is absent from `entries` while
-    /// still advancing the cursor past itself. That split is what keeps a
-    /// position independent of the scope and the subscription it was issued
-    /// under, so the same position resumes correctly for a caller whose grant
-    /// differs — DESIGN's "an entry outside it is absent" is about the page,
-    /// and its size bound is about the ordering. An untranslatable grant
+    /// still advancing the cursor past itself. That split is what fixes a
+    /// position's **meaning** independently of the scope and the subscription
+    /// it was issued under — a position denotes a prefix of the ledger, and
+    /// the same prefix under every grant — so any position resumes correctly
+    /// for a caller whose grant differs, delivering every later entry that
+    /// grant admits and skipping none of them. It is what DESIGN §3.1 asks
+    /// for, fixing a position's age by the oldest subsequent entry of a
+    /// subscribed type "whether or not the reader's authorization scope admits
+    /// that entry". DESIGN's "an entry outside it is absent" is about the
+    /// page, and its size bound is about the ordering. An untranslatable grant
     /// admits nothing, the same disposition as the point lookup's.
+    ///
+    /// **Two grants are not in general handed the same position.** `limit`
+    /// bounds the entries a page *admits* while the scan is unbounded, so a
+    /// page that stops on the limit stops where its own grant's entries run
+    /// out rather than where the ledger does: over a ledger alternating two
+    /// tenants, `limit = 1` from `Oldest` hands one grant the position 1 and
+    /// the other the position 2. Resumability is the property; two positions
+    /// coincide only where both reads exhausted the ledger.
     ///
     /// A later slice brings this to conformance with every feed check; what is
     /// here now is a correct page and a correct cursor, not the whole

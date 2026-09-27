@@ -1,10 +1,21 @@
 //! Unit tests for the feed types.
+//!
+//! Every assertion here is about a constructor's own decision — what
+//! [`super::FeedPosition::new`] and [`super::FeedSubscription::new`] admit,
+//! refuse and normalise. Nothing about [`super::FeedPage`] is asserted,
+//! deliberately: it is a plain struct with two public fields, so a test
+//! building one and reading its own arguments back would pin the fields'
+//! types and visibility at compile time and nothing at all at run time. What
+//! discriminates a live page's cursor from a finished replay's is a backend's
+//! answer, and that is asserted where a backend answers —
+//! `contract_tests::a_bounded_feed_replay_closes_at_its_until_and_not_before`
+//! over the reference backend, and the noop plugin's own `plugin_tests`.
 
 use std::collections::HashSet;
 
 use super::{
-    FeedPage, FeedPosition, FeedPositionInvalid, FeedStart, FeedSubscription,
-    FeedSubscriptionInvalid, MAX_FEED_POSITION_BYTES,
+    FeedPosition, FeedPositionInvalid, FeedStart, FeedSubscription, FeedSubscriptionInvalid,
+    MAX_FEED_POSITION_BYTES,
 };
 use crate::models::MeterTypeId;
 
@@ -84,28 +95,6 @@ fn a_start_is_named_rather_than_inferred_from_an_absent_position() {
     assert_ne!(oldest, resumed);
     assert!(matches!(oldest, FeedStart::Oldest));
     assert!(matches!(resumed, FeedStart::After(ref p) if p.as_bytes() == [1]));
-}
-
-#[test]
-fn a_live_page_carries_a_next_cursor_and_a_completed_replay_does_not() {
-    let live: FeedPage<FeedPosition> = FeedPage {
-        entries: Vec::new(),
-        next: Some(FeedPosition::new(vec![9]).expect("one byte is admissible")),
-    };
-    let finished: FeedPage<FeedPosition> = FeedPage {
-        entries: Vec::new(),
-        next: None,
-    };
-
-    assert!(
-        live.next.is_some(),
-        "DESIGN section 3.2 returns a next cursor with every page of a live read, short pages \
-         included"
-    );
-    assert!(
-        finished.next.is_none(),
-        "DESIGN section 3.2 returns none once a bounded replay reaches `until`"
-    );
 }
 
 #[test]

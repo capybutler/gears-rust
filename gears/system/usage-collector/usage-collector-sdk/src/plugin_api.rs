@@ -289,6 +289,11 @@ pub trait UsageCollectorPluginV1: Send + Sync + 'static {
     /// [`UsageCollectorPluginError::CursorBeyondRetention`] when retention has
     /// removed an entry of a subscribed type after `start`'s position, decided
     /// from what this plugin still holds rather than from the position's age.
+    /// [`UsageCollectorPluginError::Transient`] on a retryable backend
+    /// failure, and [`UsageCollectorPluginError::Internal`] otherwise — which
+    /// is where a host-contract breach lands: a `start` mode this plugin does
+    /// not know (the wildcard arm above), a position it did not issue, or a
+    /// `limit` outside the published bound.
     async fn read_feed_page(
         &self,
         subscription: &[MeterTypeId],

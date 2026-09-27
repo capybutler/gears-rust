@@ -2,8 +2,11 @@
 //!
 //! DESIGN §3.1 defines all four. The feed is the replay-safe read path a
 //! charging consumer uses instead of `list_usage_records`, and these are the
-//! types its two Rust surfaces speak: the SDK client trait over the wire
-//! cursor, and the Plugin SPI over the plugin's own [`FeedPosition`].
+//! types its two Rust surfaces speak — one of them today and one of them
+//! later: the Plugin SPI already reads a page over the plugin's own
+//! [`FeedPosition`], and the SDK client trait will speak them over the wire
+//! cursor once it gains a feed method. It declares none yet, deliberately;
+//! [`crate::api`] records why the method lands with the Feed Gateway.
 
 use thiserror::Error;
 
@@ -134,8 +137,9 @@ impl AsRef<[u8]> for FeedPosition {
 /// variant begins at the head — the feed serves charging consumers, for which
 /// skipping retained history is never a correct start.
 ///
-/// Generic over the position each surface speaks: `FeedStart<&CursorV1>` on the
-/// SDK client trait, `FeedStart<FeedPosition>` on the Plugin SPI.
+/// Generic over the position each surface speaks: `FeedStart<FeedPosition>` on
+/// the Plugin SPI today, and `FeedStart<&CursorV1>` on the SDK client trait
+/// once that trait declares a feed method ([`crate::api`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FeedStart<P> {
@@ -152,18 +156,23 @@ pub enum FeedStart<P> {
 /// read ran under (DESIGN §3.1).
 ///
 /// Generic over the cursor kind, which is what keeps a plugin's position off the
-/// wire: the SPI returns `FeedPage<FeedPosition>` and the SDK client and REST
-/// return `FeedPage<CursorV1>`, so handing a raw position to a consumer is a
-/// type error rather than a review obligation. DESIGN §3.1 (SPI) and §3.3
-/// (wire) both describe a type named `FeedPage` but require it to carry a
-/// `FeedPosition` and a `CursorV1` respectively; the type parameter is what
-/// lets one Rust type satisfy both descriptions, instantiated differently per
-/// surface — the same resolution [`FeedStart`] uses for its own position
-/// parameter.
+/// wire: the SPI returns `FeedPage<FeedPosition>`, and the SDK client and REST
+/// will return `FeedPage<CursorV1>` when they grow a feed method
+/// ([`crate::api`]), so handing a raw position to a consumer is a type error
+/// rather than a review obligation. DESIGN §3.1 (SPI) and §3.3 (wire) both
+/// describe a type named `FeedPage` but require it to carry a `FeedPosition`
+/// and a `CursorV1` respectively; the type parameter is what lets one Rust
+/// type satisfy both descriptions, instantiated differently per surface — the
+/// same resolution [`FeedStart`] uses for its own position parameter.
 // No `Eq`: a derive bounds type parameters only, so `Eq` here would require
 // `Vec<UsageRecord>: Eq` unconditionally, and `UsageRecord` derives `PartialEq`
 // without `Eq` (`models.rs:944`). `PartialEq` is what the page needs and all it
-// can have.
+// can have — and it is conditional on the cursor kind for the same reason:
+// `toolkit_odata::CursorV1` derives `Clone` and `Debug` only, so the derive
+// gives `FeedPage<FeedPosition>` a `PartialEq` and `FeedPage<CursorV1>` none
+// until that type gains one. A test over the wire-side page therefore cannot
+// reach for `assert_eq!` yet, which is a second reason the docs above speak of
+// that surface in the future tense.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedPage<C> {
     /// The page's entries, in feed order.

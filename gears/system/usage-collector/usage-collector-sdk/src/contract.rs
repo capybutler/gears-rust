@@ -42,11 +42,18 @@
 //! previous one left; the fixtures are keyed so that a repeated run
 //! resubmits identical entries rather than colliding with different ones.
 //!
-//! # Five of sixteen, and where the other eleven are
+//! # Five of DESIGN's sixteen, six checks in all
 //!
 //! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
 //! five in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not a
-//! statement about the rest**. The other eleven are named, not omitted:
+//! statement about the rest**.
+//!
+//! **Two counts run through this file, and both are right.** Five is what
+//! [`run_all`] covers of DESIGN's sixteen; six is how many checks it runs,
+//! the sixth being the one in [`ADDITIONAL_CHECKS`] that DESIGN does not
+//! tabulate. A count about coverage of DESIGN is therefore five and a count
+//! about what a run executed is six, and neither substitutes for the other.
+//! The other eleven of the sixteen are named, not omitted:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
 //!   gear's SPI declares, not yet written. All eleven.
@@ -298,6 +305,20 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// crate's progress, not about the SPI's reach, and the two are different
 /// claims: one is closed by writing a check, the other only by changing
 /// the trait.
+///
+/// **[`FEED_RETENTION_REFUSAL`] needs one thing more than an author: a
+/// suite input.** Its refusal half asserts that a cursor past the retention
+/// floor is refused, and a backend only reaches that state once retention
+/// has purged an entry. No SPI method purges; [`run_all`] takes a plugin
+/// handle and a dedup level and nothing else; and
+/// [`reference::InMemoryReferencePlugin`] never removes an entry, so its own
+/// docs record `CursorBeyondRetention` as unreachable there. Writing that
+/// half therefore needs a retention knob on [`run_all`], or a porter
+/// arranging the purge out of band between two dispatches. The check's other
+/// half — a cursor whose continuation is intact is served whole — is
+/// writable today against any backend. This is a gap in the harness rather
+/// than in the SPI, which is why the name stays here and does **not** go
+/// back into [`BLOCKED_CHECKS`].
 ///
 /// **A caller reporting coverage has to report this constant.**
 /// [`run_all`] returning no violations says nothing whatever about a check
