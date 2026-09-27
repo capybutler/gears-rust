@@ -2,8 +2,8 @@
 //! against.
 //!
 //! [`InMemoryReferencePlugin`] implements every method of
-//! [`UsageCollectorPluginV1`] against a `Vec<UsageRecord>` behind a mutex,
-//! honouring the DESIGN §3.1 invariants the SPI puts on the plugin:
+//! [`UsageCollectorPluginV1`] against a sequence-stamped ledger behind a
+//! mutex, honouring the DESIGN §3.1 invariants the SPI puts on the plugin:
 //! dedup by caller-supplied fields (which is also at most one invalidation per record),
 //! scope-gated point lookup, period-end selection, and the withdrawal
 //! exclusion inside a fold.
@@ -51,19 +51,6 @@
 //!   `CursorBeyondRetention` is unreachable and this backend exercises the
 //!   retention refusal not at all. The page, the position and the scope gate
 //!   are correct; the refusal has nothing to fire on.
-//! * **A feed position is an offset, which is the one mechanism DESIGN
-//!   forbids** — `read_feed_page` resumes with `.skip(from)`, so its position
-//!   is a count of entries to walk past rather than a key to seek to. The
-//!   *property* is DESIGN-backed and load-bearing — a position counts what a
-//!   read scanned, not what it admitted, which is what makes it mean the same
-//!   thing under every grant — but the *mechanism* is not: DESIGN §3.3's
-//!   plugin obligations say outright that *"Offset/limit scans are forbidden
-//!   on both paginated paths."* A porter copying "position = count of scanned
-//!   entries" into SQL writes `OFFSET n` and inherits its cost and its
-//!   skew. What a real plugin owes instead is a monotonic key it can seek on
-//!   that is comparable across a whole subscription — the same key the
-//!   `TimescaleDB` adapter's `read_feed_page` tells its implementer to design,
-//!   its own `acceptance_sequence` being monotonic per `(tenant, meter)` only.
 //! * **`SUM` over an empty selection answers absent where DESIGN requires
 //!   `0`** — `fold_value` returns `None` for every fold over a bucket with no
 //!   rows, and DESIGN §3.3 divides them: `SUM` and `COUNT` *"are defined over
@@ -125,11 +112,58 @@ use crate::plugin_api::UsageCollectorPluginV1;
 use crate::reconciliation::ReconciliationMetadata;
 use crate::time_range::TimeRange;
 
+/// One admitted entry and the sequence the feed orders it by.
+#[derive(Debug)]
+struct Entry {
+    /// The sequence stamped when this entry was admitted. Unique across the
+    /// ledger's whole life, and ascending in admission order.
+    sequence: u64,
+    /// The entry as persisted.
+    record: UsageRecord,
+}
+
+/// The ledger and its sequence counter.
+#[derive(Debug, Default)]
+struct Ledger {
+    /// Admitted entries in admission order, so their sequences ascend.
+    entries: Vec<Entry>,
+    /// The highest sequence stamped so far. It only ever rises, and a
+    /// sequence is never reissued.
+    ///
+    /// Held apart from `entries.len()` deliberately: a length renumbers every
+    /// entry after one that is removed, and a position this backend has
+    /// already issued has to go on denoting the same point in the feed's
+    /// order however the entries around it change.
+    stamped: u64,
+}
+
+impl Ledger {
+    /// Stamps one record with the next sequence and appends it.
+    fn push(&mut self, record: UsageRecord) {
+        self.stamped = self.stamped.saturating_add(1);
+        self.entries.push(Entry {
+            sequence: self.stamped,
+            record,
+        });
+    }
+
+    /// The admitted records in admission order.
+    ///
+    /// Everything but `read_feed_page` reads the ledger through this: the
+    /// admission decision, the point lookup, the fold, the ledger page and
+    /// the reconciliation counters all answer over the records alone. Only
+    /// the feed reads the sequences, because only it has a position to seek
+    /// to.
+    fn records(&self) -> impl Iterator<Item = &UsageRecord> {
+        self.entries.iter().map(|entry| &entry.record)
+    }
+}
+
 /// An in-memory storage backend that satisfies the Plugin SPI's stated
 /// obligations. See the module docs for what it is and is not for.
 #[derive(Debug, Default)]
 pub struct InMemoryReferencePlugin {
-    entries: Mutex<Vec<UsageRecord>>,
+    entries: Mutex<Ledger>,
 }
 
 impl InMemoryReferencePlugin {
@@ -146,7 +180,7 @@ impl InMemoryReferencePlugin {
     /// [`UsageCollectorPluginError::Internal`] rather than
     /// [`UsageCollectorPluginError::Transient`]: retrying cannot unpoison
     /// it.
-    fn ledger(&self) -> Result<MutexGuard<'_, Vec<UsageRecord>>, UsageCollectorPluginError> {
+    fn ledger(&self) -> Result<MutexGuard<'_, Ledger>, UsageCollectorPluginError> {
         self.entries.lock().map_err(|_| {
             UsageCollectorPluginError::internal(
                 "the reference backend's ledger lock is poisoned: an earlier call panicked while \
@@ -155,7 +189,7 @@ impl InMemoryReferencePlugin {
         })
     }
 
-    /// Encodes a scanned-entry count as a feed position.
+    /// Encodes the sequence of the last entry scanned as a feed position.
     ///
     /// # Errors
     ///
@@ -163,8 +197,8 @@ impl InMemoryReferencePlugin {
     /// cannot be — eight bytes is well inside the published bound — but this
     /// crate denies `expect`, and a plugin that cannot encode its own position
     /// has broken an invariant, which is what `Internal` is for.
-    fn encode_position(scanned: u64) -> Result<FeedPosition, UsageCollectorPluginError> {
-        FeedPosition::new(scanned.to_be_bytes().to_vec()).map_err(|e| {
+    fn encode_position(sequence: u64) -> Result<FeedPosition, UsageCollectorPluginError> {
+        FeedPosition::new(sequence.to_be_bytes().to_vec()).map_err(|e| {
             UsageCollectorPluginError::internal(format!(
                 "the reference backend could not encode its own feed position: {e}"
             ))
@@ -251,7 +285,7 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         let ledger = self.ledger()?;
         ledger
-            .iter()
+            .records()
             // A scope this backend cannot translate excludes the row rather
             // than refusing the lookup: an uninterpretable grant admits
             // nothing. That is the opposite disposition from the caller
@@ -290,7 +324,7 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
         let ledger = self.ledger()?;
         let withdrawn = withdrawn_targets(&ledger);
         let mut rows: Vec<&UsageRecord> = Vec::new();
-        for entry in ledger.iter() {
+        for entry in ledger.records() {
             let selected = select(entry, &gts_type_id, time_range, query, metadata_filter)
                 .map_err(Untranslatable::into_plugin_error)?;
             if selected && entry.invalidation.is_none() && !withdrawn.contains(&entry.id) {
@@ -327,7 +361,7 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
     ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
         let ledger = self.ledger()?;
         let mut items: Vec<UsageRecord> = Vec::new();
-        for entry in ledger.iter() {
+        for entry in ledger.records() {
             if select(entry, &gts_type_id, time_range, query, metadata_filter)
                 .map_err(Untranslatable::into_plugin_error)?
             {
@@ -361,11 +395,19 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
 
     /// A page from the ledger's own append order.
     ///
-    /// A position is the count of entries already scanned, encoded as eight
-    /// big-endian bytes so its bytewise ordering matches its numeric one. The
-    /// ledger only ever grows by appending, so that count is a faithful point
-    /// in the feed's order, and it does not widen with the subscription's
-    /// breadth.
+    /// Every entry is stamped with a monotonic sequence when it is admitted,
+    /// and a position is the sequence of the last entry the read scanned,
+    /// encoded as eight big-endian bytes so its bytewise ordering matches its
+    /// numeric one. A page therefore **seeks** to a position rather than
+    /// skipping to it: it resumes at the first entry whose sequence is greater
+    /// than the one it was handed, never by walking a count of entries past
+    /// the start. That is what DESIGN §3.3's plugin obligations put on a real
+    /// plugin too, stating that *"Offset/limit scans are forbidden on both
+    /// paginated paths"* — so a porter copying this resumption into SQL
+    /// carries over a key comparison rather than an `OFFSET n`. Sequences are
+    /// stamped in admission order and never reissued, so a position stays a
+    /// faithful point in the feed's order, and it does not widen with the
+    /// subscription's breadth.
     ///
     /// The compiled `scope` gates what the page **carries**, not what the
     /// position **counts**: an entry outside it is absent from `entries` while
@@ -433,21 +475,25 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
         let ledger = self.ledger()?;
         let mut entries = Vec::new();
         let mut cursor = from;
-        for entry in ledger
-            .iter()
-            .skip(usize::try_from(from).unwrap_or(usize::MAX))
-        {
-            if cursor >= upper || u64::try_from(entries.len()).unwrap_or(u64::MAX) >= limit {
+        // The seek: `sequence > from` resumes at the first entry the position
+        // does not already cover, which is what makes the resumption a key
+        // comparison rather than a count of rows to walk past.
+        for entry in ledger.entries.iter().filter(|entry| entry.sequence > from) {
+            // `upper` is a position, so it names an entry a bounded replay is
+            // still asked to read; the replay stops at the first entry beyond
+            // the one it names, which is `sequence > upper`.
+            if entry.sequence > upper || u64::try_from(entries.len()).unwrap_or(u64::MAX) >= limit {
                 break;
             }
-            // `cursor` has already moved past this entry, whether or not the
-            // subscription and the scope admit it. Counting only admitted
-            // entries would make the position depend on who asked.
-            cursor += 1;
-            if subscription.contains(&entry.gts_type_id)
-                && expr_admits(entry, scope).unwrap_or(false)
+            // `cursor` has already moved onto this entry's sequence, whether
+            // or not the subscription and the scope admit it. Advancing only
+            // past admitted entries would make the position depend on who
+            // asked.
+            cursor = entry.sequence;
+            if subscription.contains(&entry.record.gts_type_id)
+                && expr_admits(&entry.record, scope).unwrap_or(false)
             {
-                entries.push(entry.clone());
+                entries.push(entry.record.clone());
             }
         }
 
@@ -483,7 +529,7 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
         let ledger = self.ledger()?;
         let in_scope = || {
             ledger
-                .iter()
+                .records()
                 .filter(|e| expr_admits(e, scope).unwrap_or(false))
                 .filter(|e| e.tenant_id == tenant_id && e.gts_type_id == gts_type_id)
         };
@@ -525,10 +571,10 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
 /// record repeats that record's idempotency key under
 /// `entry_type = invalidation`, so all of them reach those same six inputs.
 fn admit(
-    ledger: &mut Vec<UsageRecord>,
+    ledger: &mut Ledger,
     record: UsageRecord,
 ) -> Result<UsageRecord, UsageCollectorPluginError> {
-    if let Some(stored) = ledger.iter().find(|entry| entry.id == record.id) {
+    if let Some(stored) = ledger.records().find(|entry| entry.id == record.id) {
         if stored.caller_supplied_eq(&record) {
             return Ok(stored.clone());
         }
@@ -542,9 +588,9 @@ fn admit(
 }
 
 /// Every `UsageRecord.id` an accepted invalidation names.
-fn withdrawn_targets(ledger: &[UsageRecord]) -> std::collections::BTreeSet<Uuid> {
+fn withdrawn_targets(ledger: &Ledger) -> std::collections::BTreeSet<Uuid> {
     ledger
-        .iter()
+        .records()
         .filter_map(|entry| entry.invalidation.as_ref().map(|inv| inv.target))
         .collect()
 }
