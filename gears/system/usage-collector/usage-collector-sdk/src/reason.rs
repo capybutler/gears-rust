@@ -58,11 +58,15 @@ pub const INVALID_METADATA_FIELDS_DUPLICATE: &str = "INVALID_METADATA_FIELDS_DUP
 /// (e.g. a per-record metadata key) over a wide range. Narrow the read-path
 /// time range or drop the high-cardinality dimension.
 pub const AGGREGATION_RESULT_TOO_LARGE: &str = "AGGREGATION_RESULT_TOO_LARGE";
-/// A persisted-entry body carried a target reference without a reason code,
-/// or a reason code without a target reference. Raised where the flat wire
-/// pair becomes one `Option<Invalidation>`; no in-process caller can reach
-/// it, because the domain type makes the half-shape unrepresentable, and no
-/// ingestion body can, because a submission carries no target.
+/// A REST body carried a target reference without a reason code, or a
+/// reason code without a target reference.
+///
+/// Emitted by nothing in this crate. The SDK's own half-shape refusal
+/// happens inside a `Deserialize` and is a plain serde message, never a
+/// [`ValidationReason`]. The only live raiser is the `usage-collector`
+/// crate's ingestion fold point, over a REST DTO that still carries a
+/// caller-supplied `invalidates` flat beside `reason_code`; slice 1b-0's
+/// Task 4 is expected to drop that field, leaving this code unraised.
 pub const INVALIDATION_REFERENCE_INCOMPLETE: &str = "INVALIDATION_REFERENCE_INCOMPLETE";
 /// An invalidation's target was itself an invalidation.
 pub const INVALIDATION_TARGET_NOT_RECORD: &str = "INVALIDATION_TARGET_NOT_RECORD";

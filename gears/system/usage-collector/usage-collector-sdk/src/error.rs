@@ -738,20 +738,30 @@ impl UsageCollectorError {
         }
     }
 
-    /// An **entry** body carried a target reference without a reason code,
-    /// or the reverse. The two are both-or-neither
+    /// A REST body carried a target reference without a reason code, or the
+    /// reverse. The two are both-or-neither
     /// (`cpt-cf-usage-collector-adr-append-only-invalidation`): the
     /// reference names what was withdrawn and the reason carries the
     /// intent, so half the pair describes nothing. `field` names the
-    /// **missing** half.
+    /// **missing** half, which is the one the caller has to add.
     ///
-    /// It does not describe an ingestion body. A submission carries the
-    /// reason alone — `invalidates` is server-assigned, so
-    /// `CreateUsageRecordRequest` publishes no such property and a
-    /// submitted one is refused as an unknown field — which leaves the
-    /// half-shape reachable only where a persisted entry is decoded. The
-    /// domain carries the pair as one [`crate::Invalidation`], so no
-    /// in-process caller can construct the shape this rejects.
+    /// **Emitted by nothing in this crate**, and no SDK path can reach the
+    /// shape it rejects. [`crate::CreateUsageRecord`] carries the reason
+    /// alone — `invalidates` is server-assigned — so an ingestion shape has
+    /// no target half to omit, and [`crate::UsageRecord`] carries the pair
+    /// as one [`crate::Invalidation`], so no in-process caller can build it
+    /// apart. Decoding a persisted entry is the one place inside this crate
+    /// where a half-shape still arrives, and it is refused with a plain
+    /// serde message rather than this typed error, so it is not a raiser
+    /// either.
+    ///
+    /// Its only live callers are in the `usage-collector` crate, at the
+    /// ingestion fold point where the REST DTO's flat `invalidates` and
+    /// `reason_code` become one field. That DTO is the last surface still
+    /// carrying a caller-supplied target; slice 1b-0's Task 4 is expected
+    /// to drop the field and with it those two call sites, after which
+    /// nothing calls this at all. Whether it is then retired is not settled
+    /// here.
     #[must_use]
     pub fn invalidation_reference_incomplete(missing_field: &str) -> Self {
         Self::InvalidArgument {
