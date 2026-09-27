@@ -72,26 +72,19 @@ pub const CONTRACT_METER_TYPE_ID: &str =
 /// otherwise reach a plugin author as a harness fault against a conforming
 /// backend.
 ///
-/// **The dead-code exemption retires itself.** Nothing in the non-test
-/// build calls this yet: the checks that will are the ones
-/// [`UNWRITTEN_CHECKS`](super::UNWRITTEN_CHECKS) names, and until one lands
-/// the only caller is that unit test. So the exemption is an `expect` rather
-/// than an `allow`, gated to `not(test)` because under `cfg(test)` the
-/// function *is* called and a bare `expect` would go unfulfilled there. The
-/// moment a check in [`super::checks`] calls it, that call is ordinary
+/// **The dead-code exemption retired itself, exactly as it was built to.**
+/// Nothing in the non-test build used to call this, so the exemption was an
+/// `expect` rather than an `allow`, gated to `not(test)` because under
+/// `cfg(test)` the function *was* called and a bare `expect` would have gone
+/// unfulfilled there.
+/// [`record_and_invalidation_distinct_identity`](super::checks::record_and_invalidation_distinct_identity())
+/// is the check that landed and called it, and that call is ordinary
 /// feature-gated library code — `mod checks` is not `cfg(test)` — so
-/// `dead_code` stops firing and `unfulfilled_lint_expectations` fires in its
-/// place. That is a warning by default and an error under the `-D warnings`
-/// this workspace's clippy target passes, so the attribute has to go. Nobody
-/// has to remember it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until a check in `super::checks` derives its own meter; the \
-                  first one that does leaves this expectation unfulfilled"
-    )
-)]
+/// `dead_code` stopped firing and `unfulfilled_lint_expectations` fired in
+/// its place. That is a warning by default and an error under the
+/// `-D warnings` this workspace's clippy target passes, so the attribute had
+/// to go, and it went without anyone having to remember it. The same shape
+/// still guards [`contract_tenant`] below, which has no caller yet.
 pub fn check_meter(check: &str, role: &str) -> Result<MeterTypeId, String> {
     let slug = format!("{check}_{role}").replace('-', "_");
     MeterTypeId::new(format!("{USAGE_RECORD_BASE_TYPE}cf.core.uc.{slug}.v1~"))
@@ -433,8 +426,8 @@ pub fn fixture_invalidation(target: &UsageRecord) -> Result<UsageRecord, String>
 
 /// A [`ContractViolation`] attributed to one check.
 ///
-/// The check name is a parameter rather than baked in. Six checks report
-/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a seventh
+/// The check name is a parameter rather than baked in. Seven checks report
+/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is an eighth
 /// caller, and the whole point of [`ContractViolation::check`] is that a
 /// violation says which assertion produced it — a helper that stamped one
 /// name on every report would quietly undo that.

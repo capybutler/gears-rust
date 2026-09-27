@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds seven deliberately
+//! as coverage. [`super::contract_mutants`] holds eight deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -42,9 +42,9 @@ use super::contract_mutants::{Defect, mutant};
 use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, DEDUP_IDENTITY_OVER_WINDOW,
     DedupLevel, HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD,
-    QUANTITY_ROUND_TRIP, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, UNWRITTEN_CHECKS,
-    WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, retention::ContractRetention,
-    run_all,
+    QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
+    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, UNWRITTEN_CHECKS, WINDOW_END_SELECTION,
+    reference::InMemoryReferencePlugin, retention::ContractRetention, run_all,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
@@ -99,17 +99,38 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 /// A literal here would go on matching a constant that had been respelled,
 /// and the row would then assert nothing about the check it names.
 ///
-/// **Every row but one names a single check**, which is what makes the
-/// matrix a statement about discrimination. The exception is
-/// [`Defect::SelectsOnWindowStart`], and it is a real overlap between two
-/// checks rather than a mutant wrong twice: `quantity-round-trip` reads its
-/// entries back over a range around each entry's `window_end`, and its
-/// fixtures start an hour earlier, so a backend selecting on `window_start`
-/// returns none of them and the check reports that it could not compare a
-/// quantity at all. The dependency is the suite's, not the subject's — the
-/// quantity check cannot be answered by a backend that fails period-end
-/// selection — so the row names both rather than the assertion being
-/// loosened to admit one.
+/// **Two rows name more than one check**, and neither is a mutant wrong
+/// twice: each is a real overlap between checks, which is what the matrix
+/// has to be able to say without loosening into a subset assertion.
+///
+/// [`Defect::SelectsOnWindowStart`] is the first. `quantity-round-trip`
+/// reads its entries back over a range around each entry's `window_end`,
+/// and its fixtures start an hour earlier, so a backend selecting on
+/// `window_start` returns none of them and the check reports that it could
+/// not compare a quantity at all. The dependency is the suite's, not the
+/// subject's — the quantity check cannot be answered by a backend that
+/// fails period-end selection — so the row names both.
+///
+/// [`Defect::DedupIgnoresTheEntryType`] is the second, and the suite
+/// predicted it before the subject existed: `dedup-identity-over-window`'s
+/// module says of a dedup blind to the entry type that it *"fails
+/// `at-most-one-invalidation` and `invalidation-excluded-from-fold` too,
+/// both submitting the record first and so having its withdrawal refused"*.
+/// Three checks submit a record and then an invalidation repeating its key,
+/// and an index blind to the sixth identity input refuses the second of
+/// every such pair: `invalidation-excluded-from-fold` loses the withdrawal
+/// that makes its withdrawn pair, and `at-most-one-invalidation` loses the
+/// withdrawals of both its targets, so neither reaches the property it
+/// exists for. That is one mistake meeting three checks, not three
+/// mistakes, so the row names all three.
+///
+/// What the wider row costs is worth saying plainly. It establishes that
+/// these three checks together notice an entry-type-blind plugin; it does
+/// not establish that `record-and-invalidation-distinct-identity` is the
+/// one that noticed. The other two report the refusal as a fixture they
+/// could not build, and only this one asserts the rule the refusal breaks
+/// — but that is a fact about the checks' own docs rather than something
+/// this matrix measures.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (
@@ -117,6 +138,14 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
         &[WINDOW_END_SELECTION, QUANTITY_ROUND_TRIP],
     ),
     (Defect::DedupIgnoresThePeriod, &[DEDUP_IDENTITY_OVER_WINDOW]),
+    (
+        Defect::DedupIgnoresTheEntryType,
+        &[
+            RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
+            INVALIDATION_EXCLUDED_FROM_FOLD,
+            AT_MOST_ONE_INVALIDATION,
+        ],
+    ),
     (
         Defect::FoldsTheInvalidation,
         &[INVALIDATION_EXCLUDED_FROM_FOLD],
@@ -139,7 +168,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all seven mutants is not
+/// of sensitivity. A check that fails against all eight mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.
@@ -315,7 +344,7 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 /// This is what makes the module's coverage claim structural instead of
 /// narrative. `run_all` returning no violations says nothing about a check
 /// it never ran, and "run this suite" is the acceptance criterion for
-/// porting a storage backend, so a suite that runs six checks must not
+/// porting a storage backend, so a suite that runs seven checks must not
 /// read as a suite that ran sixteen. Asserting the partition means a check
 /// cannot half-land — implemented but still listed unwritten, or written
 /// and listed nowhere — without this failing, and `UNWRITTEN_CHECKS`

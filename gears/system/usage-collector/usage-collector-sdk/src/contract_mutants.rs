@@ -10,7 +10,7 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Five subjects wrap a real reference
+//! *Behaviourally* is the exact word. Six subjects wrap a real reference
 //! backend and are that backend plus one interception; the other two
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
@@ -29,11 +29,11 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Five defects fit (quantity,
-//! period-blind dedup, point-read scope, and the two withdrawal defects): one
-//! rewrites the quantity on the way in, one keeps a dedup index beside the
-//! ledger, one substitutes the scope on the point read, and two rewrite how a
-//! second withdrawal of a record is answered.
+//! strongest form the subject can take. Six defects fit (quantity,
+//! period-blind dedup, entry-type-blind dedup, point-read scope, and the two
+//! withdrawal defects): one rewrites the quantity on the way in, two keep a
+//! dedup index beside the ledger, one substitutes the scope on the point
+//! read, and two rewrite how a second withdrawal of a record is answered.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other two
 //! (selection column, fold exclusion), because each changes a predicate the
@@ -87,6 +87,17 @@ pub(super) enum Defect {
     /// the two covered-period bounds — the derived identity with the period
     /// struck out.
     DedupIgnoresThePeriod,
+    /// Keys dedup on `(tenant, type, idempotency_key, window_start,
+    /// window_end)`, omitting `entry_type` — the derived identity with its
+    /// sixth input struck out.
+    ///
+    /// DESIGN §3.3 names this one in the plugin obligation *"Enforce the
+    /// six-part identity, `entry_type` included"*: *"A plugin that
+    /// deduplicates on the other five components alone treats every
+    /// invalidation as a collision with its target."* It is the mistake a
+    /// backend makes by carrying the pre-invalidation unique constraint
+    /// forward, or by naming five of the six columns in a conflict target.
+    DedupIgnoresTheEntryType,
     /// Excludes the withdrawn record from the fold but folds the
     /// invalidation. DESIGN names this one: it double-counts the withdrawn
     /// measurement.
@@ -114,6 +125,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
     match defect {
         Defect::QuantityThroughFloat
         | Defect::DedupIgnoresThePeriod
+        | Defect::DedupIgnoresTheEntryType
         | Defect::IgnoresScopeOnThePointRead
         | Defect::AbsorbsAWithdrawalWithAnotherReason
         | Defect::RefusesAWithdrawalWithTheSameReason => Box::new(WrappedReference::new(defect)),
@@ -133,7 +145,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
 ///
-/// One qualification, and it holds for all five wrapped defects:
+/// One qualification, and it holds for all six wrapped defects:
 /// [`Self::create_usage_records`] is not pure delegation. The inner backend
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
@@ -145,7 +157,7 @@ struct WrappedReference {
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
     /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
-    /// entry that claimed it. Unused by the other four defects.
+    /// entry that claimed it. Unused by the other five defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -158,6 +170,25 @@ struct WrappedReference {
     /// identity, and neither key is resubmitted over a second period — the
     /// only question this index is ever asked.
     period_blind_keys: Mutex<BTreeMap<PeriodBlindKey, UsageRecord>>,
+    /// The entry-type-blind dedup index [`Defect::DedupIgnoresTheEntryType`]
+    /// keys on: `(tenant_id, gts_type_id, idempotency_key, window_start,
+    /// window_end)` to the entry that claimed it. Unused by the other five
+    /// defects.
+    ///
+    /// A claim is recorded when the entry is admitted rather than after the
+    /// inner backend stores it, which is a unique index written inside the
+    /// same transaction, and it therefore leaves a claim behind for an entry
+    /// the inner backend then refuses. That case is unreachable here, and
+    /// the reason is an invariant of this index rather than a fact about any
+    /// one check. An entry that gets past this index either found no claim
+    /// on its five components or found one carrying its own derived `id`, so
+    /// every entry the inner backend ever stored under a given five-tuple
+    /// carries the one `id` that tuple's claim names. The inner backend
+    /// refuses only a divergent retry of a stored `id`, so an entry it
+    /// refuses had to pass a claim of that same `id` on the way in - and the
+    /// claim left behind names that same identity, which is the only thing
+    /// this index is ever asked about.
+    entry_type_blind_keys: Mutex<BTreeMap<EntryTypeBlindKey, UsageRecord>>,
 }
 
 /// The four inputs a period-blind dedup identity keys on:
@@ -170,6 +201,21 @@ struct WrappedReference {
 /// [`Defect::DedupIgnoresThePeriod`].
 type PeriodBlindKey = (Uuid, String, String, &'static str);
 
+/// The five inputs an entry-type-blind dedup identity keys on:
+/// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
+///
+/// Named for what it leaves out. The derived identity reads six inputs, and
+/// the one missing here is `entry_type` — which is the whole of
+/// [`Defect::DedupIgnoresTheEntryType`], because a record and its
+/// invalidation agree on the other five.
+type EntryTypeBlindKey = (
+    Uuid,
+    String,
+    String,
+    time::OffsetDateTime,
+    time::OffsetDateTime,
+);
+
 impl WrappedReference {
     /// Wraps a fresh reference backend.
     fn new(defect: Defect) -> Self {
@@ -177,6 +223,7 @@ impl WrappedReference {
             inner: InMemoryReferencePlugin::new(),
             defect,
             period_blind_keys: Mutex::new(BTreeMap::new()),
+            entry_type_blind_keys: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -198,6 +245,7 @@ impl WrappedReference {
                 ..record
             }),
             Defect::DedupIgnoresThePeriod => self.claim_period_blind_key(record),
+            Defect::DedupIgnoresTheEntryType => self.claim_entry_type_blind_key(record),
             // Enumerated rather than caught by a wildcard. A new defect
             // routed here and forgotten would otherwise pass its
             // entries through untouched and report no violation at all;
@@ -243,6 +291,52 @@ impl WrappedReference {
             record.entry_type().as_str(),
         );
         let mut claimed = self.period_blind_keys.lock().map_err(|_| {
+            UsageCollectorPluginError::internal("the mutant's dedup index lock is poisoned")
+        })?;
+        if let Some(existing) = claimed.get(&key)
+            && existing.id != record.id
+        {
+            return Err(UsageCollectorPluginError::idempotency_conflict(
+                record.idempotency_key.as_str(),
+                existing.clone(),
+            ));
+        }
+        claimed.insert(key, record.clone());
+        Ok(record)
+    }
+
+    /// Admits an entry only if no other entry already holds its
+    /// `(tenant, type, idempotency_key, window_start, window_end)`.
+    ///
+    /// This is a unique index over the derived identity with `entry_type`
+    /// struck out, and that omission is the whole of the defect. An
+    /// invalidation repeats every caller-supplied field of its target but
+    /// the reason code, its idempotency key and covered period included, so
+    /// this index sees the record's own five components arrive a second time
+    /// and answers the collision DESIGN names: *"A plugin that deduplicates
+    /// on the other five components alone treats every invalidation as a
+    /// collision with its target."*
+    ///
+    /// The covered period is in the index for the same reason the entry type
+    /// is in [`Self::claim_period_blind_key`]'s: one key over two periods is
+    /// two entries, and an index blind to the bounds as well would be wrong
+    /// in a second way, in a subject that must be wrong in exactly one.
+    ///
+    /// A resubmission of an entry that already claimed the key carries the
+    /// same derived `id`, so an idempotent replay still reaches the inner
+    /// backend and is answered by it.
+    fn claim_entry_type_blind_key(
+        &self,
+        record: UsageRecord,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        let key = (
+            record.tenant_id,
+            record.gts_type_id.as_str().to_owned(),
+            record.idempotency_key.as_str().to_owned(),
+            record.window_start,
+            record.window_end,
+        );
+        let mut claimed = self.entry_type_blind_keys.lock().map_err(|_| {
             UsageCollectorPluginError::internal("the mutant's dedup index lock is poisoned")
         })?;
         if let Some(existing) = claimed.get(&key)
@@ -351,16 +445,19 @@ impl UsageCollectorPluginV1 for WrappedReference {
         // A batch every entry of which this wrapper refused must not reach
         // the inner backend: the reference answers an empty batch with
         // `Internal`, and this call would then fail outright rather than
-        // reporting the per-entry refusals it already has. Unreachable
-        // under the suite as written: two defects refuse entries here,
-        // `DedupIgnoresThePeriod` and `RefusesAWithdrawalWithTheSameReason`,
-        // and the one batch the suite sends carries two withdrawals of a
-        // target that has none stored yet, both repeating that target's
-        // idempotency key and so deriving one `id` — the period-blind index
-        // admits the second under the claim the first left, and the
-        // same-reason refusal finds nothing stored to refuse either against.
-        // That is also why the emptiness guard above is repeated rather than
-        // left to the inner backend to raise.
+        // reporting the per-entry refusals it already has. Three defects
+        // refuse entries here, and `DedupIgnoresTheEntryType` reaches this
+        // branch: the one batch the suite sends is
+        // `at-most-one-invalidation`'s two withdrawals of a target already
+        // stored, and both repeat that target's idempotency key over its
+        // covered period, so the entry-type-blind index refuses each of them
+        // against the claim the target left and no survivor is handed on.
+        // The other two do not. `DedupIgnoresThePeriod` admits the second
+        // withdrawal under the claim the first left, both deriving one `id`;
+        // `RefusesAWithdrawalWithTheSameReason` finds no withdrawal stored to
+        // refuse either against. So the guard is a live path rather than a
+        // precaution, which is also why it is repeated here rather than left
+        // to the inner backend to raise.
         let inner = if survivors.is_empty() {
             Vec::new()
         } else {
