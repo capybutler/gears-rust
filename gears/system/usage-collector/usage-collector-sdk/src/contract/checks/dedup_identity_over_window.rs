@@ -155,16 +155,34 @@ pub async fn dedup_identity_over_window(
     }
 
     // Half two: the same key over the *same* period is one entry, not two.
+    //
+    // The comparison is the id together with every caller-supplied field
+    // ([`UsageRecord::caller_supplied_eq`]) rather than whole-record
+    // equality. Whole-record equality also reads `accepted_at` and `origin`,
+    // which are server-assigned and no part of this check's rule: a backend
+    // stamping its own acceptance instant would be reported here, under a
+    // message about the entry a replay answered with, while the check built
+    // for that rule - `server-field-round-trip` - reported it too. Two checks
+    // naming one mistake tells a reader neither which noticed nor what to fix.
     match plugin.create_usage_record(fixtures.first.clone()).await {
-        Ok(stored) if stored == fixtures.first => {}
+        Ok(stored)
+            if stored.id == fixtures.first_id && stored.caller_supplied_eq(&fixtures.first) => {}
         Ok(stored) => violations.push(violation(
             DEDUP_IDENTITY_OVER_WINDOW,
             format!(
-                "resubmitting record {expected} verbatim answered a different entry ({observed}). \
-                 A re-delivery of an accepted entry is an idempotent replay: the stored row comes \
-                 back unchanged.",
+                "resubmitting record {expected} verbatim answered {observed}, which is not the \
+                 entry that was stored under that identity. A re-delivery of an accepted entry \
+                 is an idempotent replay: the stored row comes back, under its own id and \
+                 carrying the fields the caller supplied on it.",
                 expected = fixtures.first_id,
-                observed = stored.id,
+                observed = if stored.id == fixtures.first_id {
+                    format!(
+                        "record {id} with different caller-supplied content",
+                        id = stored.id
+                    )
+                } else {
+                    format!("a different entry ({id})", id = stored.id)
+                },
             ),
         )),
         Err(err) => violations.push(violation(

@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds nine deliberately
+//! as coverage. [`super::contract_mutants`] holds ten deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -43,8 +43,9 @@ use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, DEDUP_IDENTITY_OVER_WINDOW,
     DedupLevel, HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD,
     QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
-    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, UNWRITTEN_CHECKS, WINDOW_END_SELECTION,
-    reference::InMemoryReferencePlugin, retention::ContractRetention, run_all,
+    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS,
+    WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, retention::ContractRetention,
+    run_all,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
@@ -116,16 +117,25 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 /// module says of a dedup blind to the entry type that it *"fails
 /// `at-most-one-invalidation` and `invalidation-excluded-from-fold` too,
 /// both submitting the record first and so having its withdrawal refused"*.
-/// Three checks submit a record and then an invalidation repeating its key,
+/// Four checks submit a record and then an invalidation repeating its key,
 /// and an index blind to the sixth identity input refuses the second of
 /// every such pair: `invalidation-excluded-from-fold` loses the withdrawal
-/// that makes its withdrawn pair, and `at-most-one-invalidation` loses the
-/// withdrawals of both its targets, so neither reaches the property it
-/// exists for. That is one mistake meeting three checks, not three
-/// mistakes, so the row names all three.
+/// that makes its withdrawn pair, `at-most-one-invalidation` loses the
+/// withdrawals of both its targets, and `server-field-round-trip` loses the
+/// only entry in its fixture set that carries an `invalidates` to read back
+/// at all — so none of them reaches the property it exists for. That is one
+/// mistake meeting four checks, not four mistakes, so the row names all
+/// four.
+///
+/// That fourth check is coupled unavoidably rather than incidentally, which
+/// is why this is an overlap and not a subject wrong twice.
+/// `server-field-round-trip` has to read `invalidates`, a plain record
+/// carries none, and an invalidation repeats its target's idempotency key by
+/// construction (DESIGN §3.1, Faithful copy) — so every fixture set able to
+/// assert that field at all hands an entry-type-blind index a collision.
 ///
 /// What the wider row costs is worth saying plainly: it establishes that
-/// these three checks together notice an entry-type-blind plugin, not which
+/// these four checks together notice an entry-type-blind plugin, not which
 /// of them noticed. [`Defect::ConflictReadBackIgnoresTheEntryType`] is the
 /// row that answers that, and it is why the two sit beside each other.
 /// DESIGN's obligation names three places `entry_type` has to appear, and
@@ -139,6 +149,7 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 /// invalidation sharing its five caller-supplied components.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
+    (Defect::StampsItsOwnAcceptedAt, &[SERVER_FIELD_ROUND_TRIP]),
     (
         Defect::SelectsOnWindowStart,
         &[WINDOW_END_SELECTION, QUANTITY_ROUND_TRIP],
@@ -150,6 +161,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
             RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
             INVALIDATION_EXCLUDED_FROM_FOLD,
             AT_MOST_ONE_INVALIDATION,
+            SERVER_FIELD_ROUND_TRIP,
         ],
     ),
     (
@@ -178,7 +190,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all nine mutants is not
+/// of sensitivity. A check that fails against all ten mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.
@@ -354,7 +366,7 @@ fn the_blocked_checks_are_the_ones_the_spi_cannot_express() {
 /// This is what makes the module's coverage claim structural instead of
 /// narrative. `run_all` returning no violations says nothing about a check
 /// it never ran, and "run this suite" is the acceptance criterion for
-/// porting a storage backend, so a suite that runs seven checks must not
+/// porting a storage backend, so a suite that runs eight checks must not
 /// read as a suite that ran sixteen. Asserting the partition means a check
 /// cannot half-land — implemented but still listed unwritten, or written
 /// and listed nowhere — without this failing, and `UNWRITTEN_CHECKS`

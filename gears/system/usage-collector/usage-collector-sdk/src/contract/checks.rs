@@ -16,6 +16,7 @@ mod invalidation_excluded_from_fold;
 mod quantity_round_trip;
 mod record_and_invalidation_distinct_identity;
 mod scope_is_a_filter_on_every_read_path;
+mod server_field_round_trip;
 mod window_end_selection;
 
 pub use at_most_one_invalidation::at_most_one_invalidation;
@@ -24,4 +25,5 @@ pub use invalidation_excluded_from_fold::invalidation_excluded_from_fold;
 pub use quantity_round_trip::quantity_round_trip;
 pub use record_and_invalidation_distinct_identity::record_and_invalidation_distinct_identity;
 pub use scope_is_a_filter_on_every_read_path::scope_is_a_filter_on_every_read_path;
+pub use server_field_round_trip::server_field_round_trip;
 pub use window_end_selection::window_end_selection;

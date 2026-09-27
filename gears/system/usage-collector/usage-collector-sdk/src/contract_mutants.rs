@@ -10,7 +10,7 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Seven subjects wrap a real reference
+//! *Behaviourally* is the exact word. Eight subjects wrap a real reference
 //! backend and are that backend plus one interception; the other two
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
@@ -29,14 +29,14 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Seven defects fit (quantity,
-//! period-blind dedup, entry-type-blind dedup, the entry-type-blind conflict
-//! read-back, point-read scope, and the two withdrawal defects): one
-//! rewrites the quantity on the way in, three keep an index beside the
-//! ledger — two to refuse an admission, one only to decide which stored
-//! entry a collision is answered with — one substitutes the scope on the
-//! point read, and two rewrite how a second withdrawal of a record is
-//! answered.
+//! strongest form the subject can take. Eight defects fit (quantity, the
+//! store's own acceptance instant, period-blind dedup, entry-type-blind
+//! dedup, the entry-type-blind conflict read-back, point-read scope, and the
+//! two withdrawal defects): two rewrite a field on the way in, three keep an
+//! index beside the ledger — two to refuse an admission, one only to decide
+//! which stored entry a collision is answered with — one substitutes the
+//! scope on the point read, and two rewrite how a second withdrawal of a
+//! record is answered.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other two
 //! (selection column, fold exclusion), because each changes a predicate the
@@ -83,6 +83,21 @@ pub(super) enum Defect {
     /// Stores the quantity through an `f64` — the mistake a backend makes by
     /// choosing a `double precision` column.
     QuantityThroughFloat,
+    /// Stamps its own insert time into `accepted_at`, discarding the instant
+    /// it was handed — the mistake a backend makes by declaring the column
+    /// `DEFAULT now()` and leaving it out of the insert, or by writing
+    /// `now()` into it outright.
+    ///
+    /// DESIGN §3.1's "Server-assigned field fidelity" names this one
+    /// outright. A plugin *"persists the values it was handed on the entry it
+    /// stores, and every read path returns those. It does not re-derive,
+    /// default, or refresh one — `accepted_at` in particular is not the
+    /// store's own insert time."*
+    ///
+    /// It is applied on admission, so every read path answers the substituted
+    /// instant and so does the absorbed retry. What that costs the matrix is
+    /// stated where it is spent: see [`MUTANT_INSERT_INSTANT`].
+    StampsItsOwnAcceptedAt,
     /// Selects on `window_start` instead of `window_end` — the mistake a
     /// backend makes by porting the pre-period point-in-time column.
     SelectsOnWindowStart,
@@ -151,6 +166,7 @@ pub(super) enum Defect {
 pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
     match defect {
         Defect::QuantityThroughFloat
+        | Defect::StampsItsOwnAcceptedAt
         | Defect::DedupIgnoresThePeriod
         | Defect::DedupIgnoresTheEntryType
         | Defect::ConflictReadBackIgnoresTheEntryType
@@ -173,7 +189,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
 ///
-/// One qualification, and it holds for all seven wrapped defects:
+/// One qualification, and it holds for all eight wrapped defects:
 /// [`Self::create_usage_records`] is not pure delegation. The inner backend
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
@@ -185,7 +201,7 @@ struct WrappedReference {
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
     /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
-    /// entry that claimed it. Unused by the other six defects.
+    /// entry that claimed it. Unused by the other seven defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -200,7 +216,7 @@ struct WrappedReference {
     period_blind_keys: Mutex<BTreeMap<PeriodBlindKey, UsageRecord>>,
     /// The entry-type-blind dedup index [`Defect::DedupIgnoresTheEntryType`]
     /// keys on: `(tenant_id, gts_type_id, idempotency_key, window_start,
-    /// window_end)` to the entry that claimed it. Unused by the other six
+    /// window_end)` to the entry that claimed it. Unused by the other seven
     /// defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
@@ -219,7 +235,7 @@ struct WrappedReference {
     entry_type_blind_keys: Mutex<BTreeMap<EntryTypeBlindKey, UsageRecord>>,
     /// The rows [`Defect::ConflictReadBackIgnoresTheEntryType`] reads a
     /// colliding entry back from: the same five components, to **every**
-    /// entry accepted under them, in arrival order. Unused by the other six
+    /// entry accepted under them, in arrival order. Unused by the other seven
     /// defects.
     ///
     /// A `Vec` rather than one entry, because two rows under one five-tuple
@@ -294,6 +310,13 @@ impl WrappedReference {
                         "this mutant's float round-trip stays within the published quantity \
                          range for every corner the suite submits",
                     ),
+                ..record
+            }),
+            // A `DEFAULT now()` column the insert never names: the instant
+            // the gateway stamped is discarded and the store's own takes its
+            // place.
+            Defect::StampsItsOwnAcceptedAt => Ok(UsageRecord {
+                accepted_at: MUTANT_INSERT_INSTANT,
                 ..record
             }),
             Defect::DedupIgnoresThePeriod => self.claim_period_blind_key(record),
@@ -725,6 +748,37 @@ fn through_f64(value: Decimal) -> Decimal {
     value.to_f64().and_then(Decimal::from_f64).unwrap_or(value)
 }
 
+/// The instant [`Defect::StampsItsOwnAcceptedAt`] writes in place of the one
+/// it was handed.
+///
+/// **A fixed instant of this subject's own, never `OffsetDateTime::now_utc()`
+/// — which is what the `DEFAULT now()` column it models would really write.**
+/// A subject whose answer moves between runs makes a failure unreproducible,
+/// and nothing here needs to be "now" in order to be wrong: the check
+/// compares what a read answered against what it submitted, never against
+/// this value.
+///
+/// Later than every acceptance instant the suite submits, which is the
+/// direction a real insert time lies in. `CONTRACT_ACCEPTED_AT` is the UNIX
+/// epoch plus `20_454` days and `server-field-round-trip` offsets its own
+/// four from that by hours; this is `21_000` days, clear of all of them, and
+/// that distinctness is what makes the substitution observable at all.
+///
+/// **This subject reaches every assertion `server-field-round-trip` makes**,
+/// which bounds what the matrix row proves. Admission is upstream of all four
+/// read paths and of the absorb, so each of them answers the substituted
+/// instant and each reports on its own — and no single one of them is
+/// *necessary* for the row, because the other four still report without it.
+/// The row establishes that the check as a whole notices a backend stamping
+/// its own instant, not that any one path's assertion is load-bearing.
+///
+/// It also reaches `accepted_at` alone. `id`, `origin` and an invalidation's
+/// `invalidates` are asserted by that check and by no subject here; a backend
+/// defaulting one of those would need a second defect, and until one exists
+/// the matrix says nothing about those three.
+const MUTANT_INSERT_INSTANT: time::OffsetDateTime =
+    time::OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::days(21_000));
+
 /// `tenant_id eq <tenant>`: the scope a mutant reads its own ledger under.
 fn tenant_scope(tenant: Uuid) -> ast::Expr {
     ast::Expr::Compare(
@@ -859,19 +913,27 @@ impl Ledger {
 /// **The pin reaches exactly what `run_all` dispatches, and no further**,
 /// which is less than the whole mirror. Pinned today: the covered-period
 /// bound the selection meets, the admission decision, the withdrawal
-/// exclusion, the ungrouped `SUM` the fold check reads, and which rows the
-/// three scope-carrying read paths answer with. Each was measured by breaking
-/// it and watching a row grow, not inferred from the check list.
+/// exclusion, the ungrouped `SUM` the fold check reads, which rows the three
+/// scope-carrying read paths answer with, and — since
+/// `server-field-round-trip` landed — that the feed **delivers** the entries
+/// of a subscribed meter at all. Each was measured by breaking it and
+/// watching a row grow, not inferred from the check list.
 ///
 /// Everything else here is level with the reference and **unpinned**: the
 /// ledger page's *order* (its membership is pinned, its sort is asserted by
-/// no check), the feed page with its seek, its cursor rule and its retention
-/// refusal, the grouped and non-`SUM` folds, and the reconciliation figures.
-/// They are mirrored because the checks that read them are coming, and each
-/// becomes pinned by the check that first dispatches it. An unpinned
-/// behaviour is where this mirror can still rot in silence, which is the
-/// argument for keeping it level now rather than letting it answer
-/// `Internal` until someone needs it.
+/// no check), the grouped and non-`SUM` folds, the reconciliation figures,
+/// and everything about the feed page but its delivering entries — its seek,
+/// its scanned-entry cursor rule, its subscription and scope gates, and its
+/// retention refusal. Those four were measured too, each by breaking it and
+/// watching the matrix stay green: a feed that advances its cursor only past
+/// the rows it admits, one that answers every tenant's entries under any
+/// grant, one that answers every meter's, and one that skips a count of rows
+/// instead of seeking all pass every check the suite runs today. They are
+/// mirrored because the checks that read them are coming, and each becomes
+/// pinned by the check that first dispatches it. An unpinned behaviour is
+/// where this mirror can still rot in silence, which is the argument for
+/// keeping it level now rather than letting it answer `Internal` until
+/// someone needs it.
 struct MutantLedger {
     /// The entries admitted so far, with the sequences the feed orders them
     /// by.
