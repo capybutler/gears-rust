@@ -64,9 +64,10 @@ pub const AGGREGATION_RESULT_TOO_LARGE: &str = "AGGREGATION_RESULT_TOO_LARGE";
 /// Emitted by nothing in this crate. The SDK's own half-shape refusal
 /// happens inside a `Deserialize` and is a plain serde message, never a
 /// [`ValidationReason`]. The only live raiser is the `usage-collector`
-/// crate's ingestion fold point, over a REST DTO that still carries a
-/// caller-supplied `invalidates` flat beside `reason_code`; slice 1b-0's
-/// Task 4 is expected to drop that field, leaving this code unraised.
+/// crate's ingestion fold point, and only while the REST DTO there still
+/// carries a caller-supplied `invalidates` flat beside `reason_code`.
+/// Without that field the half-shape cannot be expressed and the code goes
+/// unraised.
 pub const INVALIDATION_REFERENCE_INCOMPLETE: &str = "INVALIDATION_REFERENCE_INCOMPLETE";
 /// An invalidation's target was itself an invalidation.
 pub const INVALIDATION_TARGET_NOT_RECORD: &str = "INVALIDATION_TARGET_NOT_RECORD";

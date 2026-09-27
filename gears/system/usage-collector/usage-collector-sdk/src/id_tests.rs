@@ -78,6 +78,35 @@ fn derive_matches_golden_vector() {
     );
 }
 
+#[test]
+fn derive_matches_golden_vector_for_an_invalidation() {
+    // The same five inputs as `derive_matches_golden_vector`, with the
+    // sixth reading `invalidation`:
+    //
+    // UUIDv5(NS, "11111111-1111-1111-1111-111111111111" 0x1F
+    //            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~" 0x1F
+    //            "idem-1" 0x1F
+    //            "2023-11-14T22:13:20.000000Z" 0x1F
+    //            "2023-11-14T23:13:20.000000Z" 0x1F
+    //            "invalidation")
+    //
+    // Computed independently of this crate, like its `record` twin. Both
+    // literals are needed: one vector alone pins the pre-image for one
+    // entry type and would survive a derivation that ignored the sixth
+    // input on the other. DO NOT hand-edit.
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Invalidation
+        ),
+        expect("cdf725ce-9fc0-5155-9739-3d8001a7432e"),
+    );
+}
+
 /// The pre-image is the six inputs in order, `0x1F`-joined, entry type last.
 ///
 /// `cpt-cf-usage-collector-adr-record-identity-derivation` fixes the order
@@ -419,9 +448,10 @@ fn canonical_period_bound_truncates_below_the_microsecond() {
 /// A record and its invalidation differ in exactly one input and derive two
 /// identifiers.
 ///
-/// ADR 0007 `:121-124`: an invalidation "copies the tenant, type, idempotency
-/// key and covered period of its target. Its identifier therefore differs
-/// from its target's for one reason only, the entry type."
+/// `cpt-cf-usage-collector-adr-record-identity-derivation`, "Decision
+/// Outcome": an invalidation "copies the tenant, type, idempotency key and
+/// covered period of its target. Its identifier therefore differs from its
+/// target's for one reason only, the entry type."
 #[test]
 fn a_record_and_its_invalidation_derive_two_ids_from_one_key() {
     let record = derive_usage_record_id(
@@ -446,37 +476,5 @@ fn a_record_and_its_invalidation_derive_two_ids_from_one_key() {
         "the entry type is the sixth input and the only one these two differ in, so a \
          derivation that reads it gives two identifiers. Equal ids mean the entry type is not \
          reaching the pre-image"
-    );
-}
-
-/// Every invalidation of one record derives one identifier.
-///
-/// ADR 0007 `:181`: "Two withdrawals of the same target collide on all six
-/// inputs", which is what makes at-most-one-invalidation a consequence of the
-/// dedup identity rather than a rule of its own.
-#[test]
-fn every_invalidation_of_one_record_derives_one_id() {
-    let first = derive_usage_record_id(
-        tenant(),
-        &gts(),
-        &key("idem-1"),
-        ws(),
-        we(),
-        EntryType::Invalidation,
-    );
-    let second = derive_usage_record_id(
-        tenant(),
-        &gts(),
-        &key("idem-1"),
-        ws(),
-        we(),
-        EntryType::Invalidation,
-    );
-
-    assert_eq!(
-        first, second,
-        "a withdrawal is a faithful copy departing in `entry_type` and `reason_code`, and \
-         `reason_code` is not an identity input, so two withdrawals of one target are one \
-         identity"
     );
 }

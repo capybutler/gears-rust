@@ -518,7 +518,7 @@ impl UsageCollectorError {
     }
 
     /// [`crate::CreateUsageRecord::try_into_usage_record`] was handed a
-    /// submission carrying a reason code. `field` is `reason_code`.
+    /// submission carrying a reason code.
     ///
     /// The submission is a withdrawal, and a withdrawal has to name the
     /// entry it withdraws — a reference only the gateway can resolve, so
@@ -526,26 +526,43 @@ impl UsageCollectorError {
     /// projection that takes it. The measurement projection refuses rather
     /// than dropping the reason, which would admit the submission as an
     /// ordinary record and collide it with its own target.
+    ///
+    /// **[`Self::Internal`], not [`Self::InvalidArgument`].** Reaching this
+    /// means the gateway chose the projection that contradicts the
+    /// submission it holds, which is a host-contract breach rather than
+    /// anything the emitter did: the body that produced this submission may
+    /// be perfectly well-formed. DESIGN §3.3 draws the same line for the
+    /// SPI — "a malformed call that reaches the SPI is a host-contract
+    /// breach and returns `Internal(detail)`" — and the `detail` here is
+    /// addressed to whoever wired the gateway, so it must not travel to a
+    /// REST caller as a 400 against a field they may have sent correctly.
     #[must_use]
     pub fn withdrawal_needs_its_target() -> Self {
-        Self::newtype_validation(
-            "reason_code",
-            "reason_code marks this submission an invalidation; project it with its resolved \
-             target instead",
+        Self::internal(
+            "try_into_usage_record was handed a submission carrying a reason_code; a withdrawal \
+             is projected with try_into_invalidation_record and its resolved target",
         )
     }
 
-    /// A submission projected as a withdrawal carried no reason code.
-    /// `field` is `reason_code`.
+    /// [`crate::CreateUsageRecord::try_into_invalidation_record`] was handed
+    /// a submission carrying no reason code.
     ///
+    /// Carrying one is what makes a submission an invalidation at all, and
     /// `reason_code` is required on the `invalidation` branch of
-    /// `CreateUsageRecordRequest`, and carrying it is what makes a
-    /// submission an invalidation at all.
+    /// `CreateUsageRecordRequest`.
+    ///
+    /// **[`Self::Internal`] on the same grounds as
+    /// [`Self::withdrawal_needs_its_target`].** A body that declares
+    /// `entry_type: invalidation` and omits `reason_code` is an emitter
+    /// error the gateway owes a 400 — DESIGN §3.3 lists the reason-code
+    /// check among the gateway-side ones — so a submission arriving here
+    /// without one means that check did not run, not that the emitter erred
+    /// in a way this crate should attribute to them.
     #[must_use]
     pub fn missing_reason_code() -> Self {
-        Self::newtype_validation(
-            "reason_code",
-            "reason_code is required on an invalidation and forbidden on a record",
+        Self::internal(
+            "try_into_invalidation_record was handed a submission carrying no reason_code; the \
+             gateway validates reason_code before it chooses a projection",
         )
     }
 
@@ -758,10 +775,9 @@ impl UsageCollectorError {
     /// Its only live callers are in the `usage-collector` crate, at the
     /// ingestion fold point where the REST DTO's flat `invalidates` and
     /// `reason_code` become one field. That DTO is the last surface still
-    /// carrying a caller-supplied target; slice 1b-0's Task 4 is expected
-    /// to drop the field and with it those two call sites, after which
-    /// nothing calls this at all. Whether it is then retired is not settled
-    /// here.
+    /// carrying a caller-supplied target, and it is the reason those call
+    /// sites exist: drop the field and nothing calls this at all. Whether
+    /// it is then retired is not settled here.
     #[must_use]
     pub fn invalidation_reference_incomplete(missing_field: &str) -> Self {
         Self::InvalidArgument {

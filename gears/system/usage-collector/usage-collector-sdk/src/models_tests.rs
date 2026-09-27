@@ -178,24 +178,76 @@ fn try_into_invalidation_record_stamps_the_derived_id_and_forwards_every_field()
 /// no way to resolve one and
 /// [`CreateUsageRecord::try_into_invalidation_record`] is the one that
 /// takes it.
+///
+/// The refusal is `Internal`, not `InvalidArgument`: reaching it means the
+/// gateway picked the projection that contradicts the submission it holds,
+/// and the emitter's body may be faultless. A 400 here would blame a caller
+/// for a host-contract breach and put an implementer-facing instruction on
+/// the wire.
 #[test]
 fn try_into_usage_record_refuses_a_submission_that_states_a_reason() {
     let err = sample_create_usage_record(None, Some(sample_reason()))
         .try_into_usage_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT)
         .expect_err("a reason code makes this an invalidation, not a measurement");
-    assert_eq!(field_of(&err), "reason_code");
-    assert_eq!(reason_of(&err), &ValidationReason::Validation);
+    assert!(
+        matches!(err, UsageCollectorError::Internal { .. }),
+        "calling the wrong projection is a host-contract breach, not caller input; got {err:?}",
+    );
 }
 
 /// And the withdrawal projection refuses one carrying none: the reason code
-/// is what makes a submission an invalidation at all.
+/// is what makes a submission an invalidation at all. `Internal` on the
+/// same grounds — the gateway validates `reason_code` before it chooses a
+/// projection, so a submission arriving here without one means that check
+/// did not run.
 #[test]
 fn try_into_invalidation_record_refuses_a_submission_with_no_reason() {
     let err = sample_create_usage_record(None, None)
         .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
         .expect_err("a withdrawal states a reason");
-    assert_eq!(field_of(&err), "reason_code");
-    assert_eq!(reason_of(&err), &ValidationReason::Validation);
+    assert!(
+        matches!(err, UsageCollectorError::Internal { .. }),
+        "calling the wrong projection is a host-contract breach, not caller input; got {err:?}",
+    );
+}
+
+/// Two withdrawals of one record differing **only** in their reason code are
+/// one dedup identity and a conflicting pair.
+///
+/// This is the property at-most-one-invalidation rests on
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`, "Entry type is
+/// an input": "Two withdrawals of the same target collide on all six
+/// inputs"), and it needs both halves to hold at once. `reason_code` is not
+/// one of the six, so both derive one `id`; it *is* caller-supplied, so
+/// `caller_supplied_eq` is false and the store answers the second with
+/// `IdempotencyConflict` rather than absorbing it — which the gateway
+/// reports as `AlreadyInvalidated`. Either half alone is the wrong
+/// behaviour: equal ids with equal content would silently swallow a second
+/// withdrawal under a different reason, and distinct ids would let one
+/// record carry two.
+#[test]
+fn two_withdrawals_differing_only_in_reason_are_one_identity_and_a_conflict() {
+    let first = sample_create_usage_record(None, Some(reason_code("emitter_duplicate")))
+        .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
+        .expect("the fixture period is valid");
+    let second = sample_create_usage_record(None, Some(reason_code("meter_defect")))
+        .try_into_invalidation_record(RecordOrigin::Live, SAMPLE_ACCEPTED_AT, target_id())
+        .expect("the fixture period is valid");
+
+    assert_ne!(
+        first.invalidation, second.invalidation,
+        "the two fixtures must really differ in their reason, or the rest proves nothing",
+    );
+    assert_eq!(
+        first.id, second.id,
+        "`reason_code` is not one of the six identity inputs, so two withdrawals of one record \
+         reach one identity however they differ in it",
+    );
+    assert!(
+        !first.caller_supplied_eq(&second),
+        "`reason_code` IS caller-supplied, so that shared identity resolves as a conflict \
+         rather than an absorbed retry",
+    );
 }
 
 #[test]

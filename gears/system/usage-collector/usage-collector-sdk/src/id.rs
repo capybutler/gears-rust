@@ -5,8 +5,12 @@
 //! `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)`
 //! (`cpt-cf-usage-collector-adr-record-identity-derivation`). The
 //! Ingestion Gateway derives it at one choke point for every surface, and an
-//! emitter reproduces the same value offline — which is what lets a
-//! correction name its target before submission, with no round-trip.
+//! emitter reproduces the same value offline. From the measurement it sent
+//! it reproduces two identifiers: that measurement's, and the one a
+//! withdrawal of it would carry. The gateway resolves a withdrawal's target
+//! by the same function over the withdrawal's own inputs, which is why no
+//! caller-supplied reference is needed — or accepted: a submission naming
+//! its own target is refused.
 //!
 //! The identity and the dedup identity read the same six inputs, so the two
 //! can never disagree about what one entry is. Entry type is the last of
@@ -54,13 +58,15 @@ const FIELD_SEPARATOR: u8 = 0x1F;
 ///
 /// This function **truncates** anything below the microsecond, and callers
 /// MUST NOT hand it a finer value: the ingestion path rejects one before the
-/// derivation runs ([`crate::CreateUsageRecord::try_into_usage_record`]), so
+/// derivation runs — both
+/// [`crate::CreateUsageRecord::try_into_usage_record`] and
+/// [`crate::CreateUsageRecord::try_into_invalidation_record`] check it — so
 /// inside the gear the two can never disagree. Truncating an unvalidated
 /// bound would make a read-back entry derive an identifier different from
 /// the one it carries.
 ///
 /// That obligation is stated rather than enforceable: the precision check
-/// is private to the projection named above, so an **external** caller of
+/// is private to the projections named above, so an **external** caller of
 /// this function has no exported way to honour it and gets silent
 /// truncation. Deliberately left that way rather than narrowed, because
 /// `cpt-cf-usage-collector-adr-record-identity-derivation` requires an
@@ -131,12 +137,18 @@ pub fn canonical_period_bound(bound: OffsetDateTime) -> String {
 /// `entry_type = record` gives the identifier of the entry it withdraws,
 /// which is how the gateway resolves the target. Two withdrawals of one
 /// target collide on all six inputs, so every invalidation of one entry
-/// derives one identifier. `reason_code` is no input here, which leaves it
-/// the only field full canonical equality
-/// (`cpt-cf-usage-collector-adr-mandatory-idempotency`) can still find
-/// differing between two such withdrawals — and so what turns a genuine
-/// second one into a loud conflict rather than a silently absorbed
-/// duplicate.
+/// derives one identifier. `reason_code` is no input here, so two
+/// withdrawals departing only in it reach one identity and meet at full
+/// canonical equality (`cpt-cf-usage-collector-adr-mandatory-idempotency`),
+/// which is what turns a genuine second withdrawal into a loud conflict
+/// rather than a silently absorbed duplicate.
+///
+/// It is not the only field that comparison can find differing:
+/// [`crate::UsageRecord::caller_supplied_eq`] also compares `resource_ref`,
+/// `subject_ref`, `quantity` and `metadata`, none of which is an identity
+/// input either. `reason_code` is the only departure left once the
+/// gateway's faithful-copy check has matched those four against the target
+/// — and that check is the gateway's, not this function's.
 #[must_use]
 pub fn derive_usage_record_id(
     tenant_id: Uuid,

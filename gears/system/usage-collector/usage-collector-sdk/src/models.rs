@@ -389,7 +389,7 @@ impl IdempotencyKey {
     )]
     pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
         let raw = value.into();
-        validate_stored_form(&raw)?;
+        validate_idempotency_key(&raw)?;
         Ok(Self(raw))
     }
 
@@ -438,7 +438,7 @@ impl IdempotencyKey {
     clippy::result_large_err,
     reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
 )]
-fn validate_stored_form(raw: &str) -> Result<(), UsageCollectorError> {
+fn validate_idempotency_key(raw: &str) -> Result<(), UsageCollectorError> {
     if raw.is_empty() {
         return Err(UsageCollectorError::invalid_idempotency_key(
             "idempotency_key must not be empty",
@@ -805,9 +805,12 @@ pub const BACKFILL_ROUTE_PATH: &str = "/usage-collector/v1/records/backfill";
 
 /// The closed discriminator between a measurement and a withdrawal.
 ///
-/// **Derived, never stored and never submitted.** It is a projection of
-/// [`UsageRecord::invalidation`], so there is no second place the kind can be
-/// read and no way for a marker to disagree with the payload it marks
+/// **Derived, never stored and never submitted.** Each shape projects it
+/// from the withdrawal it carries — [`UsageRecord::entry_type`] from
+/// [`UsageRecord::invalidation`], [`CreateUsageRecord::entry_type`] from
+/// the reason code on [`CreateUsageRecord::invalidation`] — so on neither
+/// is there a second place the kind can be read, and no way for a marker to
+/// disagree with the payload it marks
 /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). An entry is
 /// never identified as a correction by the value or the sign of its
 /// quantity: a zero or negative quantity is an ordinary measurement, and an
@@ -1047,10 +1050,19 @@ impl UsageRecord {
     ///
     /// This is the dedup comparison (DESIGN §3.1 "Collision resolution"): two
     /// entries on one dedup identity are one entry when every field the caller
-    /// supplied is equal, and a conflict otherwise. The three server-assigned
-    /// fields are not compared: `id` (derived from the identity both sides
-    /// already share), `accepted_at` (stamped afresh per request) and `origin`
-    /// (the route, which a retry may change).
+    /// supplied is equal, and a conflict otherwise. Three of the four
+    /// server-assigned fields are not compared: `id` (derived from the identity
+    /// both sides already share), `accepted_at` (stamped afresh per request)
+    /// and `origin` (the route, which a retry may change).
+    ///
+    /// The fourth, an invalidation's [`Invalidation::target`], **is**
+    /// compared, because it travels grouped with the caller's `reason_code`
+    /// in one field. That is harmless rather than a departure from DESIGN,
+    /// which says `invalidates` "is derived from the identity and is not
+    /// compared": the gateway derives it from identity inputs both sides
+    /// already share, so two entries reaching this comparison always carry
+    /// the same target, and including it can change no outcome. What the
+    /// grouped field really decides here is `reason_code`.
     ///
     /// `quantity` compares digit for digit, and the covered-period bounds as
     /// instants. Both sides are destructured, so a field added to
@@ -1104,12 +1116,12 @@ impl UsageRecord {
 /// ([`crate::UsageCollectorClientV1::create_usage_record`] /
 /// [`crate::UsageCollectorClientV1::create_usage_records`]).
 ///
-/// This mirrors [`UsageRecord`] minus the fields the server assigns: `id`,
-/// a deterministic projection of the 6-tuple dedup identity (see
-/// [`Self::try_into_usage_record`]), `origin`, stamped from the route the
-/// entry arrived on (see [`RecordOrigin`]), and — on an invalidation — the
-/// target, which the gateway resolves and
-/// [`Self::try_into_invalidation_record`] stamps. Encoding "id is derived,
+/// This mirrors [`UsageRecord`] minus the four fields the server assigns:
+/// `id`, a deterministic projection of the 6-tuple dedup identity (see
+/// [`Self::try_into_usage_record`]), `accepted_at`, stamped once per
+/// request, `origin`, stamped from the route the entry arrived on (see
+/// [`RecordOrigin`]), and — on an invalidation — the target, which the
+/// gateway resolves and [`Self::try_into_invalidation_record`] stamps. Encoding "id is derived,
 /// not supplied" in the type — rather than a doc-comment on a full
 /// [`UsageRecord`] — is what keeps a caller from constructing a meaningless
 /// identity the gateway would only discard. The wire REST surface encodes
@@ -1311,8 +1323,13 @@ impl CreateUsageRecord {
     /// `invalidation` is the resolved withdrawal, already paired with its
     /// target, and it decides the sixth input — so the entry type the digest
     /// reads and the reference the entry carries come from one value and
-    /// cannot disagree. `self.invalidation` is spent by the time this runs
-    /// and is not read here.
+    /// cannot disagree.
+    ///
+    /// `self` is destructured rather than read field by field, on
+    /// [`UsageRecord::caller_supplied_eq`]'s discipline and for the same
+    /// reason: a field added to [`CreateUsageRecord`] fails to compile here
+    /// until it is carried onto the projected entry, instead of being
+    /// silently dropped from every record the gear accepts.
     #[allow(
         clippy::result_large_err,
         reason = "UsageCollectorError is 144 bytes because Conflict carries invalidated_by/reason_code (SPEC-DIFF 2.2); callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
@@ -1323,6 +1340,25 @@ impl CreateUsageRecord {
         accepted_at: time::OffsetDateTime,
         invalidation: Option<Invalidation>,
     ) -> Result<UsageRecord, UsageCollectorError> {
+        let Self {
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            // Spent before this runs: `try_into_usage_record` refuses a
+            // submission carrying one, and `try_into_invalidation_record`
+            // takes it out and hands it back as the `invalidation`
+            // argument, already paired with its resolved target. Reading
+            // the field here would be reading a value that is always
+            // `None`.
+            invalidation: _,
+            window_start: submitted_start,
+            window_end: submitted_end,
+        } = self;
+
         // Normalization runs before the preconditions, not after, and that
         // ordering is safe rather than merely convenient: `UtcOffset` holds
         // whole seconds, so the nanosecond component is invariant under the
@@ -1332,8 +1368,8 @@ impl CreateUsageRecord {
         // one echoing the caller's offset and the other UTC — and it keeps
         // an offset carrying non-zero seconds out of the RFC 3339 formatter
         // in `crate::error`, which cannot render one.
-        let window_start = self.window_start.to_offset(time::UtcOffset::UTC);
-        let window_end = self.window_end.to_offset(time::UtcOffset::UTC);
+        let window_start = submitted_start.to_offset(time::UtcOffset::UTC);
+        let window_end = submitted_end.to_offset(time::UtcOffset::UTC);
 
         require_microsecond_precision(WINDOW_START_FIELD, window_start)?;
         require_microsecond_precision(WINDOW_END_FIELD, window_end)?;
@@ -1351,13 +1387,13 @@ impl CreateUsageRecord {
             EntryType::Record
         };
 
-        let Some(idempotency_key) = self.idempotency_key else {
+        let Some(idempotency_key) = idempotency_key else {
             return Err(UsageCollectorError::missing_idempotency_key());
         };
 
         let id = crate::id::derive_usage_record_id(
-            self.tenant_id,
-            &self.gts_type_id,
+            tenant_id,
+            &gts_type_id,
             &idempotency_key,
             window_start,
             window_end,
@@ -1366,12 +1402,12 @@ impl CreateUsageRecord {
 
         Ok(UsageRecord {
             id,
-            gts_type_id: self.gts_type_id,
-            tenant_id: self.tenant_id,
-            resource_ref: self.resource_ref,
-            subject_ref: self.subject_ref,
-            metadata: self.metadata,
-            quantity: self.quantity,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
             idempotency_key,
             // Declaration order, which
             // `clippy::inconsistent_struct_constructor` requires.
