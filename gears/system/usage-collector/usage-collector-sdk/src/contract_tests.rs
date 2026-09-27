@@ -927,33 +927,56 @@ async fn feed_page(
 /// consequence of the exhausting limit and the property is what holds
 /// without one.
 ///
-/// Moving the scope filter above `cursor += 1` in `read_feed_page` still
-/// compiles, still passes the entire contract suite, and still reads
-/// correctly under every single grant — it would simply make a position mean
-/// "the entries this grant admitted", so a cursor minted under one grant and
-/// resumed under a wider one would silently skip every entry the narrower
-/// grant withheld.
+/// Moving the scope gate above `cursor = entry.sequence` in `read_feed_page`
+/// still compiles, still passes the entire contract suite — every feed check
+/// is in `UNWRITTEN_CHECKS`, so `run_all` has nothing to say here — and still
+/// reads correctly under every single grant. It would simply make a position
+/// mean "the last entry this grant admitted", so a cursor minted under one
+/// grant and resumed under a wider one silently skips every entry the
+/// narrower grant withheld ahead of it.
 ///
-/// **What catches that is a position compared against a literal, not two
-/// positions compared with each other.** `assert_eq!(pinned.next,
-/// other.next)` *passes* under the defect: this ledger alternates the two
-/// tenants, so both grants admit two of the four and both would be handed 2.
-/// The guards that fire are the ones naming a literal — the ledger's end
-/// below, the delivery and fixpoint of
-/// [`a_limit_bounded_feed_walk_reaches_a_fixpoint_at_the_ledger_end`], the
-/// literal in the single-grant
+/// **Measured, that defect fails four tests and no other.** It fails this one
+/// at the first cross-grant equality below, where the two grants are handed 3
+/// and 4; the fixpoint of
+/// [`a_limit_bounded_feed_walk_reaches_a_fixpoint_at_the_ledger_end`], which
+/// lands on 3 rather than the ledger's end; the absent cursor
+/// [`a_bounded_feed_replay_closes_at_its_until_and_not_before`] requires,
+/// which arrives as `Some(3)` so a bounded replay never reports completion;
+/// and the literal in the single-grant
 /// [`a_subscription_the_ledger_does_not_answer_still_advances_the_cursor`],
-/// the two positions of
+/// which is handed 0 rather than 4. Inside this test all three position
+/// assertions fire, in order: 3 against 4, then 4 against the untranslatable
+/// grant's 0, then 3 against the ledger's end.
+///
+/// The fifth guard is gone.
 /// [`a_bounded_page_limit_hands_two_grants_two_positions_that_each_resume`]
-/// (both grants are handed 1 under the defect), and the absent cursor
-/// [`a_bounded_feed_replay_closes_at_its_until_and_not_before`] requires —
-/// plus the untranslatable grant's comparison below, which under the defect
-/// is handed 0 rather than the ledger's end. Applied to `read_feed_page`, the
-/// defect fails those five tests and no other. The cross-grant comparisons are
-/// kept for what they say when they fail: over three reads that all exhaust
-/// this ledger a position equal to the literal is a position equal to the
-/// others, so they catch nothing the literal misses, and they name two
-/// callers and one ledger, which is the form the defect takes in a gateway.
+/// caught this defect while a position was an offset and no longer does; its
+/// own docs record why, and why it still earns its place.
+///
+/// **A position compared against a literal is still what pins the meaning,
+/// though the cross-grant equalities now fire first.** They fire because a
+/// sequence records *which* entry was counted last where an offset recorded
+/// only *how many* were: two disjoint grants cannot share a last admitted
+/// entry, so once each has admitted one their positions part company. Under
+/// an offset both grants admit two of the four and both were handed 2, and
+/// the equality passed. That makes the comparison sharper than it was and
+/// still weaker than a literal, because it reports only that two positions
+/// disagree and never which of them is right — a defect displacing every
+/// grant's cursor alike would pass all three comparisons and be caught by the
+/// literal alone. The cross-grant comparisons are kept for what they say when
+/// they fail: they name two callers and one ledger, which is the form the
+/// defect takes in a gateway.
+///
+/// **A sequence does not make the defect safer, only differently shaped.**
+/// Under either mechanism a widened grant resuming from the cursor skips
+/// every entry the narrow grant withheld ahead of its last admitted one —
+/// here the ledger's second — and that silent loss is what this property
+/// exists to prevent. What the offset added was a second fault: a cursor
+/// counting admissions names a prefix by *length*, so a resumption lands
+/// where the read never stood, and in the `limit = 1` walk the minting grant
+/// was handed the ledger's third entry twice. A sequence names a coordinate
+/// the read did stand on, so nothing is re-delivered; the cursor lags
+/// instead, and where the tail is withheld it stops advancing at all.
 ///
 /// The three grants are as far apart as this backend admits: one that
 /// admits half the ledger, one that admits the other half, and one that
@@ -1031,10 +1054,11 @@ async fn a_feed_position_denotes_the_same_ledger_prefix_under_every_grant() {
     assert_eq!(
         pinned.next,
         Some(feed_position(FEED_LEDGER_LEN)),
-        "the position these reads reached is the count of entries scanned ({FEED_LEDGER_LEN}), \
-         not the count any one grant admitted (2, 2 and 0). This is the assertion a backend \
-         counting admitted entries fails; the two equalities above pass under that defect, \
-         because this ledger hands both grants the same admitted count"
+        "the position these reads reached is the ledger's end ({FEED_LEDGER_LEN}), which is \
+         where scanning stopped rather than where any one grant's admissions did (2, 2 and \
+         0). This literal is what pins a position's meaning: the two equalities above do fire \
+         under a backend counting admitted entries, but they report only that the three \
+         positions disagree and never which of them is right"
     );
 }
 
@@ -1055,6 +1079,23 @@ async fn a_feed_position_denotes_the_same_ledger_prefix_under_every_grant() {
 /// entry the resuming grant admits and skips none — asserted below in all
 /// four combinations of the grant that minted a position and the grant that
 /// resumes from it.
+///
+/// **This test no longer catches the admitted-count defect
+/// [`a_feed_position_denotes_the_same_ledger_prefix_under_every_grant`]
+/// describes, and it used to.** While a position was an offset, a cursor
+/// counting admitted entries handed the other grant 1 rather than 2 and the
+/// second literal below fired. A sequence is an entry's coordinate rather
+/// than a count of entries, and the entry this grant admits *is* the ledger's
+/// second, so the defect now satisfies both literals here and all four
+/// resumptions. Measured, not derived: under that mutation this test passes
+/// whole.
+///
+/// It keeps its place for what its name claims rather than for that
+/// coverage — a bounded limit hands two grants two positions, which the
+/// exhausting read in
+/// [`a_feed_position_denotes_the_same_ledger_prefix_under_every_grant`]
+/// cannot show — and for the four resumption assertions, which no other test
+/// makes.
 #[tokio::test]
 async fn a_bounded_page_limit_hands_two_grants_two_positions_that_each_resume() {
     let (plugin, ids) = feed_ledger().await;
