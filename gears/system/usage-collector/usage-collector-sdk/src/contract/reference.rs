@@ -47,10 +47,17 @@
 //!   only when the tied entries share an `accepted_at`, which is when
 //!   DESIGN itself falls through to `id`. `latest-tie-break` is in
 //!   `UNWRITTEN_CHECKS` in the parent module, so no check reports it.
-//! * **`read_feed_page` refuses no cursor** — nothing is ever purged here, so
-//!   `CursorBeyondRetention` is unreachable and this backend exercises the
-//!   retention refusal not at all. The page, the position and the scope gate
-//!   are correct; the refusal has nothing to fire on.
+//! * **Retention never runs of its own accord** — this backend holds no
+//!   declared retention and no sweep timer, so it removes an entry only when
+//!   a caller drives it through [`ContractRetention`]. A real plugin reads
+//!   the retention it enforces from `types-registry` itself,
+//!   which DESIGN §3.3 makes *"the one permitted registry read, because the
+//!   plugin applies it"*, and sweeps on its own schedule. What is faithful
+//!   here is what a sweep leaves behind rather than what triggers one: a
+//!   mark per GTS type recording the highest sequence removed, which is what
+//!   `read_feed_page` refuses a cursor on. `CursorBeyondRetention` is
+//!   therefore reachable here — it was not before this backend could be
+//!   driven — but only after a caller has driven a drop.
 //! * **`SUM` over an empty selection answers absent where DESIGN requires
 //!   `0`** — `fold_value` returns `None` for every fold over a bucket with no
 //!   rows, and DESIGN §3.3 divides them: `SUM` and `COUNT` *"are defined over
@@ -112,6 +119,8 @@ use crate::plugin_api::UsageCollectorPluginV1;
 use crate::reconciliation::ReconciliationMetadata;
 use crate::time_range::TimeRange;
 
+use super::retention::ContractRetention;
+
 /// One admitted entry and the sequence the feed orders it by.
 #[derive(Debug)]
 struct Entry {
@@ -135,6 +144,20 @@ struct Ledger {
     /// already issued has to go on denoting the same point in the feed's
     /// order however the entries around it change.
     stamped: u64,
+    /// Per GTS type, the highest sequence retention has removed.
+    ///
+    /// The analogue of the `TimescaleDB` plugin's `usage_feed_retention_marks`,
+    /// which its own DESIGN §3.7 describes as one row per GTS type carrying
+    /// *"the highest feed position among the entries of this type that
+    /// retention has deleted"*. A mark only ever rises, and a type that has
+    /// lost nothing has no mark.
+    ///
+    /// Keyed by the type's wire string rather than by [`MeterTypeId`], which
+    /// implements neither `Ord` nor `PartialOrd` and whose own rustdoc sends
+    /// a caller needing a `BTreeMap` key to *"manual impls delegating to the
+    /// string form"*. This is that delegation, spelled at the one call site
+    /// that needs it rather than added to the public type.
+    retention_marks: BTreeMap<String, u64>,
 }
 
 impl Ledger {
@@ -156,6 +179,58 @@ impl Ledger {
     /// to.
     fn records(&self) -> impl Iterator<Item = &UsageRecord> {
         self.entries.iter().map(|entry| &entry.record)
+    }
+
+    /// Removes every entry of `gts_type_id` whose covered period ends before
+    /// `floor`, raising that type's retention mark to the highest sequence
+    /// removed.
+    ///
+    /// The bound is exclusive: an entry whose period ends exactly at the
+    /// floor is inside the retention the floor expresses and stays.
+    ///
+    /// Sequences are stamped in admission order and never reissued, so the
+    /// mark goes on meaning the same thing against a position issued before
+    /// the drop — which is why a position here is a sequence rather than an
+    /// offset. A mark is raised rather than assigned, so a later drop at a
+    /// lower floor cannot lower it.
+    fn drop_before(&mut self, gts_type_id: &MeterTypeId, floor: time::OffsetDateTime) {
+        let mut highest_removed: Option<u64> = None;
+        self.entries.retain(|entry| {
+            let removed =
+                entry.record.gts_type_id == *gts_type_id && entry.record.window_end < floor;
+            if removed {
+                highest_removed =
+                    Some(highest_removed.map_or(entry.sequence, |seen| seen.max(entry.sequence)));
+            }
+            !removed
+        });
+
+        if let Some(highest_removed) = highest_removed {
+            let mark = self
+                .retention_marks
+                .entry(gts_type_id.as_str().to_owned())
+                .or_default();
+            *mark = (*mark).max(highest_removed);
+        }
+    }
+
+    /// Whether retention has removed an entry of a subscribed type strictly
+    /// after `position`.
+    ///
+    /// The comparison is strict. A position naming the highest sequence a
+    /// type has lost has lost nothing *after* itself, and its continuation is
+    /// intact; refusing it would refuse a cursor DESIGN §3.3 requires to be
+    /// served.
+    ///
+    /// Neither the caller's scope nor the position's age is an input. The
+    /// mark records what was removed, not what a grant would have delivered
+    /// or how old the cursor is.
+    fn retention_has_passed(&self, subscription: &[MeterTypeId], position: u64) -> bool {
+        subscription.iter().any(|gts_type_id| {
+            self.retention_marks
+                .get(gts_type_id.as_str())
+                .is_some_and(|mark| *mark > position)
+        })
     }
 }
 
@@ -431,11 +506,43 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
     /// the other the position 2. Resumability is the property; two positions
     /// coincide only where both reads exhausted the ledger.
     ///
+    /// **A cursor whose continuation retention has truncated is refused.**
+    /// `FeedStart::After(position)` answers
+    /// [`UsageCollectorPluginError::CursorBeyondRetention`] when some
+    /// subscribed type's retention mark is greater than `position` — DESIGN
+    /// §3.3's `feed-retention-refusal`: *"A cursor after which retention has
+    /// removed an entry of a subscribed GTS type is refused rather than
+    /// served as a short page, whatever that cursor's own age and whether or
+    /// not the caller's scope admitted that entry"*. Three things are
+    /// therefore not inputs to it. **The scope is not**, because the mark
+    /// records what a sweep removed rather than what a grant would have
+    /// delivered; `usage-collector-v1.yaml` draws the same conclusion, that
+    /// removal *"is read per subscribed GTS type, so a cursor can be refused
+    /// for an entry the caller's own scope excluded"*. **The position's age
+    /// is not**, DESIGN §3.1 making a position's age *"a progress measure,
+    /// not the retention refusal's input"* and §3.2 having the plugin decide
+    /// the refusal *"from what it still holds rather than from the cursor's
+    /// age"*. **And `FeedStart::Oldest` never consults a mark at all**: it
+    /// begins at the oldest entry still retained, which is why DESIGN §3.3's
+    /// `feed-bootstrap-position` has it *"never refused on the retention
+    /// floor"*.
+    ///
+    /// The converse is the same rule read forwards: a mark records what was
+    /// actually removed rather than what a floor would permit removing, so a
+    /// cursor older than the floor is served whole wherever this backend was
+    /// never driven to drop past it. That is DESIGN's *"A cursor whose
+    /// continuation is intact is served, including one older than the floor
+    /// where the plugin retains longer than it"*.
+    ///
     /// A later slice brings this to conformance with every feed check; what is
-    /// here now is a correct page and a correct cursor, not the whole
-    /// obligation.
+    /// here now is a correct page, a correct cursor and a correct refusal, not
+    /// the whole obligation.
     ///
     /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::CursorBeyondRetention`] for a `start`
+    /// cursor whose continuation a drop has truncated, which is the one
+    /// caller-actionable refusal on this path.
     ///
     /// [`UsageCollectorPluginError::Internal`] for a zero `limit` and for a
     /// position this backend did not issue. Both are host-contract breaches
@@ -473,6 +580,15 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
         };
 
         let ledger = self.ledger()?;
+
+        // The retention refusal. `FeedStart::Oldest` is exempt by
+        // construction rather than by a mark that happens not to fire: it
+        // begins at the oldest entry still retained, so nothing it asks for
+        // is missing.
+        if matches!(start, FeedStart::After(_)) && ledger.retention_has_passed(subscription, from) {
+            return Err(UsageCollectorPluginError::CursorBeyondRetention);
+        }
+
         let mut entries = Vec::new();
         let mut cursor = from;
         // The seek: `sequence > from` resumes at the first entry the position
@@ -553,6 +669,40 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
             max_accepted_at: in_scope().map(|e| e.accepted_at).max(),
             max_window_end: in_scope().map(|e| e.window_end).max(),
         })
+    }
+}
+
+#[async_trait]
+impl ContractRetention for InMemoryReferencePlugin {
+    /// Runs this backend's retention over one GTS type, to one floor.
+    ///
+    /// Removes every entry of `gts_type_id` whose covered period ends before
+    /// `floor` and raises that type's mark to the highest sequence removed,
+    /// which is what a later `read_feed_page` refuses a cursor on. Both
+    /// happen under one lock acquisition, as a real sweep drops a chunk and
+    /// raises its marks in one transaction.
+    ///
+    /// A type this backend has never written, and a floor no entry of the
+    /// type falls before, both leave the ledger and the marks exactly as
+    /// they were. Nothing here is a no-op that hides a failure: the trait
+    /// asks for the state after the sweep, and that state is already it.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the poisoned ledger lock, the one way this can fail.
+    /// It is the harness's fault rather than the plugin's, which is why the
+    /// trait reports it as a `String` rather than as a
+    /// [`UsageCollectorPluginError`].
+    async fn drop_before(
+        &self,
+        gts_type_id: &MeterTypeId,
+        floor: time::OffsetDateTime,
+    ) -> Result<(), String> {
+        let mut ledger = self
+            .ledger()
+            .map_err(|err| format!("the reference backend could not run retention: {err}"))?;
+        ledger.drop_before(gts_type_id, floor);
+        Ok(())
     }
 }
 

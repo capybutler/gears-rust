@@ -1,0 +1,101 @@
+//! The retention drive the suite needs, beside the SPI rather than on it.
+//!
+//! DESIGN §3.3's `feed-retention-refusal` row asserts that *"A cursor after
+//! which retention has removed an entry of a subscribed GTS type is refused
+//! rather than served as a short page, whatever that cursor's own age and
+//! whether or not the caller's scope admitted that entry"*. A backend only
+//! reaches that state once retention has actually removed something, and
+//! nothing in this suite's reach removes anything:
+//! [`UsageCollectorPluginV1`](crate::plugin_api::UsageCollectorPluginV1)
+//! declares seven methods and none of them purges, while
+//! [`run_all`](super::run_all) takes a plugin handle and a dedup level and
+//! nothing else.
+//!
+//! So the drive arrives beside the SPI. [`ContractRetention`] is an optional
+//! capability a backend under test exposes, rather than an eighth SPI method
+//! or an out-of-band step no type describes and no run performs.
+//!
+//! # This is a conforming capability, not a test hook
+//!
+//! Every real backend already runs retention. DESIGN §3.1's "Plugin-owned
+//! lifecycle" row says *"Retention, backup, archival, purging, and query
+//! acceleration are plugin-owned"*, and §3.10 item 6 obliges a plugin to
+//! publish *"the retention it enforces per GTS type, and how it decides that
+//! retention has truncated a cursor's continuation, which is the condition it
+//! refuses a cursor on"*. What this trait adds is not the sweep; it is a way
+//! to ask for one at a moment a check chooses, instead of waiting for the
+//! backend's own timer to reach a fixture's covered period.
+//!
+//! That distinction is worth stating because
+//! [`reference::InMemoryReferencePlugin`](super::reference::InMemoryReferencePlugin)
+//! is the exemplar a plugin author reads, and its implementation of this
+//! trait is production-shaped: a mark per GTS type recording what a sweep
+//! removed, which is the same shape the `TimescaleDB` plugin's own DESIGN
+//! gives `usage_feed_retention_marks`. The reference backend carries no
+//! defect switches for the same reason — `contract_mutants` holds its
+//! deliberately non-conforming subjects in a separate, test-only mirror so
+//! that nothing in the exemplar exists to be copied by mistake.
+//!
+//! # What a porter implements
+//!
+//! A plugin under test implements this against whatever its storage engine
+//! already does on a timer: a chunk drop, a partition detach, a `DELETE`.
+//! It is not asked for a new capability, only for that one on demand. A
+//! backend that cannot be driven is simply not handed to the checks that
+//! need a drive, and its conformance is reported as covering less.
+
+use crate::models::MeterTypeId;
+
+/// A backend under test whose retention the suite can drive.
+///
+/// Implemented beside
+/// [`UsageCollectorPluginV1`](crate::plugin_api::UsageCollectorPluginV1)
+/// rather than on it: DESIGN declares no retention method on the SPI, the
+/// SPI's seven methods are the whole of it, and a check that needs a purge
+/// needs it from the backend rather than from the gear. See the module docs
+/// for why this is a capability every conforming backend has rather than a
+/// hook written for the suite.
+#[async_trait::async_trait]
+pub trait ContractRetention: Send + Sync {
+    /// Removes every entry of `gts_type_id` whose covered period ends before
+    /// `floor`, as this backend's own retention sweep would.
+    ///
+    /// # The key is the covered-period end, not the acceptance instant
+    ///
+    /// DESIGN §3.1's "Idempotency horizon" row measures retention from the
+    /// covered period: *"A dedup identity stays visible for at least the
+    /// declared retention of its type, measured from the entry's
+    /// `window_end`"*. A drive keyed on `accepted_at` would therefore ask a
+    /// backend to remove a different set of entries than its own retention
+    /// removes, and a check built on it would assert against a sweep no
+    /// deployment runs.
+    ///
+    /// # The key is one GTS type
+    ///
+    /// `usage-collector-v1.yaml` states the refusal per type: *"Removal is
+    /// read per subscribed GTS type, so a cursor can be refused for an entry
+    /// the caller's own scope excluded"*. Retention is declared per type and
+    /// read per type, so a drive that named no type would be driving
+    /// something the contract does not describe.
+    ///
+    /// It is also what lets this suite purge at all. [`run_all`](super::run_all)
+    /// dispatches every check against one backend that removes nothing of its
+    /// own accord, so the checks share a ledger; a drop keyed on an instant
+    /// alone would take every other check's fixtures with it. A check that
+    /// drives retention writes its own meter and drops on that meter, and the
+    /// rest of the ledger is untouched.
+    ///
+    /// # Errors
+    ///
+    /// A `String`, deliberately, rather than
+    /// [`UsageCollectorPluginError`](crate::error::UsageCollectorPluginError):
+    /// a failure here is the harness failing to set a scenario up, not a
+    /// plugin answering an SPI call. Reporting it as a plugin error would put
+    /// a backend's name on a fault it was never asked to have an opinion
+    /// about. The detail is free text for a human reading a failed run.
+    async fn drop_before(
+        &self,
+        gts_type_id: &MeterTypeId,
+        floor: time::OffsetDateTime,
+    ) -> Result<(), String>;
+}

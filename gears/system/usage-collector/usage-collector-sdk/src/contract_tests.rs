@@ -41,7 +41,8 @@ use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, DEDUP_IDENTITY_OVER_WINDOW,
     DedupLevel, HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD,
     QUANTITY_ROUND_TRIP, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, UNWRITTEN_CHECKS,
-    WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, run_all,
+    WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, retention::ContractRetention,
+    run_all,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
@@ -837,13 +838,17 @@ async fn feed_ledger() -> (InMemoryReferencePlugin, Vec<Uuid>) {
     (plugin, ids)
 }
 
+/// The meter [`feed_ledger`] writes every entry on, and the one a retention
+/// drive below names.
+fn feed_meter() -> MeterTypeId {
+    MeterTypeId::new(super::fixtures::CONTRACT_METER_TYPE_ID)
+        .expect("the suite's own meter type id is valid")
+}
+
 /// The subscription every feed read below dispatches: the one meter the
 /// fixture vocabulary attaches every entry to.
 fn feed_subscription() -> Vec<MeterTypeId> {
-    vec![
-        MeterTypeId::new(super::fixtures::CONTRACT_METER_TYPE_ID)
-            .expect("the suite's own meter type id is valid"),
-    ]
+    vec![feed_meter()]
 }
 
 /// A compiled single-tenant grant: `tenant_id eq <tenant>`.
@@ -1418,5 +1423,428 @@ async fn a_zero_limit_feed_read_is_refused_as_internal() {
         matches!(refused, UsageCollectorPluginError::Internal(_)),
         "a zero limit MUST refuse as a non-retryable host-contract breach rather than be served \
          as a well-formed page that cannot advance its own cursor; got: {refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+//
+// The reference backend's retention, and the feed refusal it drives. Still
+// unit tests of the reference implementation rather than contract checks:
+// DESIGN section 3.3's `feed-retention-refusal` is written against the SPI
+// for any backend, is in `UNWRITTEN_CHECKS`, and lands with the entry point
+// that hands `run_all` a driver. What the tests below establish is that the
+// capability the check will be built on works, and works for the reasons
+// DESIGN gives rather than by coincidence.
+
+/// A covered-period floor `hours` past `FIXTURE_EPOCH`.
+///
+/// [`feed_ledger`]'s four entries end one, two, three and four hours past
+/// that epoch, so a floor named in the same units reads as a count of the
+/// entries it is above.
+fn feed_floor(hours: i64) -> time::OffsetDateTime {
+    super::fixtures::FIXTURE_EPOCH.saturating_add(time::Duration::hours(hours))
+}
+
+/// Drives the reference backend's retention over [`feed_ledger`]'s meter, to
+/// a floor `hours` past `FIXTURE_EPOCH`.
+async fn drop_feed_entries_before(plugin: &InMemoryReferencePlugin, hours: i64) {
+    plugin
+        .drop_before(&feed_meter(), feed_floor(hours))
+        .await
+        .expect("the reference backend drives its own retention without failing");
+}
+
+/// The meter of the entry a drop below must leave alone.
+///
+/// A second meter, written by no other test here and by no check: the drop
+/// keys on a GTS type, and an entry on another type is how that half of the
+/// key is observable at all.
+const RETENTION_BYSTANDER_METER_ID: &str =
+    "gts.cf.core.uc.usage_record.v1~cf.core.uc.retention_bystander.v1~";
+
+/// Writes one entry on [`RETENTION_BYSTANDER_METER_ID`], covering the
+/// earliest period any test here uses.
+///
+/// Its period ends an hour past `FIXTURE_EPOCH`, which is below every floor
+/// driven below, so it survives a drop only because the drop named another
+/// type. Returns the meter and the entry's id.
+async fn write_the_retention_bystander(plugin: &InMemoryReferencePlugin) -> (MeterTypeId, Uuid) {
+    let meter = MeterTypeId::new(RETENTION_BYSTANDER_METER_ID)
+        .expect("the bystander meter id derives one segment from the published base type");
+    let key = IdempotencyKey::new("retention-bystander").expect("the fixture key is well formed");
+    let record = super::fixtures::fixture_record_on(
+        meter.clone(),
+        super::fixtures::CONTRACT_TENANT_ID,
+        &key,
+        UsageQuantity::parse("1").expect("fixture quantity"),
+        super::fixtures::CONTRACT_ACCEPTED_AT,
+        super::fixtures::FIXTURE_EPOCH,
+        feed_floor(1),
+    )
+    .expect("the bystander fixture is projectable");
+    let id = record.id;
+    plugin
+        .create_usage_record(record)
+        .await
+        .expect("the reference backend admits a well-formed entry");
+    (meter, id)
+}
+
+/// Asserts one entry is still stored, under a grant that admits it.
+///
+/// The point lookup rather than a feed read, deliberately: what these tests
+/// need to establish is whether an entry was **removed**, and the feed's own
+/// answer is entangled with the refusal under test. `get_usage_record`
+/// carries no retention refusal at all, so it reports storage and nothing
+/// else.
+async fn assert_still_stored(
+    plugin: &InMemoryReferencePlugin,
+    id: Uuid,
+    scope: &ast::Expr,
+    why: &str,
+) {
+    let found = plugin
+        .get_usage_record(id, scope, false)
+        .await
+        .unwrap_or_else(|err| panic!("{why}; the lookup failed instead: {err:?}"));
+    assert_eq!(found.id, id, "{why}");
+}
+
+/// A drop removes the entries of the type it names that end before its
+/// floor, and no others.
+///
+/// Both halves of the key are load-bearing and both are read here. The
+/// **floor** is a covered-period end, which is how DESIGN §3.1's
+/// "Idempotency horizon" row measures retention — *"measured from the
+/// entry's `window_end`"* — so a floor three hours past the fixture epoch
+/// takes the two entries ending one and two hours past it and leaves the
+/// two ending three and four. The **type** is why the drop can be driven
+/// inside a shared ledger at all: `run_all` dispatches every check against
+/// one backend that removes nothing of its own accord, and a drop keyed on
+/// an instant alone would take every other check's fixtures with it. The
+/// bystander entry ends an hour past the epoch, well below the floor, and
+/// survives because it is metered on another type.
+///
+/// Every assertion is a point lookup rather than a feed read. Removal is
+/// what this test is about; the refusal the removal enables is the next
+/// three tests', and reading it here through the feed would leave a failure
+/// unable to say which of the two broke.
+#[tokio::test]
+async fn a_retention_drop_removes_what_it_names_and_nothing_else() {
+    let (plugin, ids) = feed_ledger().await;
+    let (bystander_meter, bystander_id) = write_the_retention_bystander(&plugin).await;
+    let pinned_scope = tenant_scope(super::fixtures::CONTRACT_TENANT_ID);
+    let other_scope = tenant_scope(FEED_OTHER_TENANT_ID);
+
+    drop_feed_entries_before(&plugin, 3).await;
+
+    assert_not_found(
+        &plugin,
+        ids[0],
+        &pinned_scope,
+        "the ledger's first entry ends one hour past the fixture epoch, below a floor three \
+         hours past it, so the drop MUST have removed it. This lookup dispatches the grant that \
+         admits that entry, so a `NotFound` here is removal rather than a scope gate",
+    )
+    .await;
+    assert_not_found(
+        &plugin,
+        ids[1],
+        &other_scope,
+        "the ledger's second entry ends two hours past the fixture epoch and belongs to the \
+         other tenant. The drop keys on the covered period and the type, never on the tenant, \
+         so it MUST have removed this one too",
+    )
+    .await;
+    assert_still_stored(
+        &plugin,
+        ids[2],
+        &pinned_scope,
+        "the ledger's third entry ends exactly at the floor, and the bound is exclusive: an \
+         entry whose period ends at the floor is inside the retention the floor expresses. A \
+         drop that took it would be removing an entry the floor still covers",
+    )
+    .await;
+    assert_still_stored(
+        &plugin,
+        ids[3],
+        &other_scope,
+        "the ledger's fourth entry ends past the floor and MUST survive: a drop removes what \
+         its floor names and stops there",
+    )
+    .await;
+    assert_still_stored(
+        &plugin,
+        bystander_id,
+        &pinned_scope,
+        "the bystander entry ends an hour past the fixture epoch, further below the floor than \
+         either removed entry, and is metered on another type. It MUST survive: a drop keyed on \
+         an instant alone would take one check's fixtures out of another check's ledger, which \
+         is exactly what `run_all` dispatching every check against one backend cannot afford",
+    )
+    .await;
+
+    let bystander_page = plugin
+        .read_feed_page(
+            &[bystander_meter],
+            &pinned_scope,
+            FeedStart::Oldest,
+            None,
+            16,
+        )
+        .await
+        .expect("a subscription to the untouched meter is a well-formed read");
+    assert_eq!(
+        entry_ids(&bystander_page.entries),
+        vec![bystander_id],
+        "and the untouched type's own subscription still serves it, so the drop left the entry \
+         readable through the feed and not only through the point lookup"
+    );
+}
+
+/// A cursor after which a drop removed an entry is refused.
+///
+/// DESIGN §3.3's `feed-retention-refusal`: *"A cursor after which retention
+/// has removed an entry of a subscribed GTS type is refused rather than
+/// served as a short page"*. The floor four hours past the fixture epoch
+/// removes the ledger's first three entries and raises the meter's mark to
+/// the third of them, so the cursor below, which sits at the second, has
+/// lost the entry that followed it.
+///
+/// **The lost entry is one this grant admits, deliberately.** That is what
+/// separates the plain refusal from the scope-independence
+/// [`the_retention_refusal_does_not_consult_the_callers_scope`] measures,
+/// which reads the same drop from the same cursor under the other grant. A
+/// backend deciding the refusal from what the grant would have delivered
+/// still refuses here, and a backend that refused nothing at all does not.
+///
+/// The alternative this refuses is worse than an error and quieter: an
+/// empty page, indistinguishable from a feed with nothing new on it, in
+/// place of the entry this consumer was about to bill for.
+#[tokio::test]
+async fn a_cursor_a_retention_drop_passed_is_refused() {
+    let (plugin, _ids) = feed_ledger().await;
+    drop_feed_entries_before(&plugin, 4).await;
+
+    let refused = plugin
+        .read_feed_page(
+            &feed_subscription(),
+            &tenant_scope(super::fixtures::CONTRACT_TENANT_ID),
+            FeedStart::After(feed_position(2)),
+            None,
+            16,
+        )
+        .await
+        .expect_err(
+            "a cursor at the ledger's second entry, after which the drop removed the third, has \
+             lost its continuation",
+        );
+
+    assert!(
+        matches!(refused, UsageCollectorPluginError::CursorBeyondRetention),
+        "the refusal MUST be `CursorBeyondRetention`, which is the caller-actionable one DESIGN \
+         §3.3 names: a consumer told its cursor is past retention rebootstraps, and one handed \
+         a short page silently under-bills. Got: {refused:?}"
+    );
+}
+
+/// `FeedStart::Oldest` is never refused on the retention floor.
+///
+/// DESIGN §3.3's `feed-bootstrap-position`: it *"begins at the oldest entry
+/// the subscription retains, never at the head, and is never refused on the
+/// retention floor"*. It cannot have lost a continuation, because it asks
+/// for no particular one: it asks for whatever is still retained.
+///
+/// The marks are therefore not consulted at all here, rather than consulted
+/// and found not to fire. The drop below raises a mark that would refuse a
+/// cursor at the ledger's first entry — the previous test is that read — and
+/// this one is served whole.
+#[tokio::test]
+async fn the_oldest_start_is_never_refused_on_the_retention_floor() {
+    let (plugin, ids) = feed_ledger().await;
+    drop_feed_entries_before(&plugin, 3).await;
+
+    let page = feed_page(
+        &plugin,
+        &tenant_scope(super::fixtures::CONTRACT_TENANT_ID),
+        FeedStart::Oldest,
+        None,
+        16,
+    )
+    .await;
+
+    assert_eq!(
+        entry_ids(&page.entries),
+        vec![ids[2]],
+        "a bootstrap after a drop begins at the oldest entry still retained, which is the \
+         ledger's third, and this grant admits it"
+    );
+    assert_eq!(
+        page.next,
+        Some(feed_position(FEED_LEDGER_LEN)),
+        "and its cursor still counts the entries it scanned, which are the two the drop left"
+    );
+}
+
+/// A cursor whose continuation is intact is served, at the mark itself.
+///
+/// DESIGN §3.3: *"A cursor whose continuation is intact is served"*. The
+/// comparison against the mark is therefore strict. A cursor sitting exactly
+/// at the highest sequence a drop removed has lost nothing **after** itself:
+/// every entry the drop took is at or before it, and it was never going to
+/// be delivered them again.
+///
+/// The floor three hours past the fixture epoch raises the mark to 2, and
+/// the read below resumes from 2. Comparing `>=` instead of `>` refuses it,
+/// which is a consumer rebootstrapping a whole feed because retention caught
+/// up with the last page it had already processed.
+#[tokio::test]
+async fn a_cursor_at_the_retention_mark_is_still_served() {
+    let (plugin, ids) = feed_ledger().await;
+    drop_feed_entries_before(&plugin, 3).await;
+
+    let page = feed_page(
+        &plugin,
+        &tenant_scope(super::fixtures::CONTRACT_TENANT_ID),
+        FeedStart::After(feed_position(2)),
+        None,
+        16,
+    )
+    .await;
+
+    assert_eq!(
+        entry_ids(&page.entries),
+        vec![ids[2]],
+        "the continuation after the mark is intact, so it is served: the ledger's third entry \
+         is the one this grant admits there"
+    );
+    assert_eq!(
+        page.next,
+        Some(feed_position(FEED_LEDGER_LEN)),
+        "and the page reaches the ledger's end, the two entries the drop left having been \
+         scanned"
+    );
+}
+
+/// A drive that removes nothing refuses nothing, however old the cursor.
+///
+/// The mark records what a sweep **actually removed**, never what a floor
+/// would have permitted it to remove, which is what DESIGN §3.3 means by *"A
+/// cursor whose continuation is intact is served, including one older than
+/// the floor where the plugin retains longer than it"*. The floor driven
+/// here is one hour past the fixture epoch and the ledger's earliest entry
+/// ends exactly there, so the exclusive bound leaves it and no mark is
+/// raised at all — and the cursor below, which sits on an entry at that same
+/// floor, is served rather than refused.
+///
+/// What this pins is that a mark is raised by a removal rather than by a
+/// drive. A drive that took nothing leaves the marks empty, and an empty
+/// mark refuses nothing, however old the cursor compared against it.
+#[tokio::test]
+async fn a_floor_that_removed_nothing_refuses_no_cursor() {
+    let (plugin, ids) = feed_ledger().await;
+    drop_feed_entries_before(&plugin, 1).await;
+
+    assert_still_stored(
+        &plugin,
+        ids[0],
+        &tenant_scope(super::fixtures::CONTRACT_TENANT_ID),
+        "the ledger's earliest entry ends exactly at this floor, and the bound is exclusive, so \
+         the drive removed nothing",
+    )
+    .await;
+
+    let page = feed_page(
+        &plugin,
+        &tenant_scope(super::fixtures::CONTRACT_TENANT_ID),
+        FeedStart::After(feed_position(1)),
+        None,
+        16,
+    )
+    .await;
+    assert_eq!(
+        entry_ids(&page.entries),
+        vec![ids[2]],
+        "a drive that removed nothing raises no mark, so a cursor at the floor's own entry is \
+         served the rest of what this grant admits"
+    );
+}
+
+/// The refusal does not consult the caller's scope.
+///
+/// DESIGN §3.3 refuses *"whether or not the caller's scope admitted that
+/// entry"*, and `usage-collector-v1.yaml` states the mechanism it follows
+/// from: removal *"is read per subscribed GTS type, so a cursor can be
+/// refused for an entry the caller's own scope excluded"*.
+///
+/// The read below is exactly that case. The grant pins the other tenant, and
+/// it mints its own cursor: over the ledger's alternating tenants a page
+/// limited to one entry admits the ledger's second and scans two, so the
+/// cursor is 2. The floor four hours past the fixture epoch then removes the
+/// ledger's first three entries, and **the only one of them after that
+/// cursor is the third, which belongs to the tenant this grant never
+/// admitted**. Everything this grant can still read after its cursor — the
+/// ledger's fourth entry — is intact, asserted below through the point
+/// lookup so that the feed's own refusal is not the thing reporting it.
+///
+/// So a backend deciding the refusal from what the grant would have
+/// delivered serves this page, and a backend reading the mark refuses it.
+/// That is the whole distance between the two implementations, and this is
+/// the read that measures it.
+#[tokio::test]
+async fn the_retention_refusal_does_not_consult_the_callers_scope() {
+    let (plugin, ids) = feed_ledger().await;
+    let other_scope = tenant_scope(FEED_OTHER_TENANT_ID);
+
+    let minted = feed_page(&plugin, &other_scope, FeedStart::Oldest, None, 1).await;
+    assert_eq!(
+        entry_ids(&minted.entries),
+        vec![ids[1]],
+        "the first entry this grant admits is the ledger's second"
+    );
+    let cursor = minted
+        .next
+        .expect("a live read carries a continuation on every page");
+    assert_eq!(
+        cursor,
+        feed_position(2),
+        "two entries scanned to admit one, so the cursor this grant minted for itself sits at \
+         the ledger's second entry"
+    );
+
+    drop_feed_entries_before(&plugin, 4).await;
+
+    assert_still_stored(
+        &plugin,
+        ids[3],
+        &other_scope,
+        "the ledger's fourth entry is the only one after this cursor that this grant admits, \
+         and the drop left it. Without this the refusal below would be satisfied by a backend \
+         that had removed the grant's own continuation",
+    )
+    .await;
+
+    let refused = plugin
+        .read_feed_page(
+            &feed_subscription(),
+            &other_scope,
+            FeedStart::After(cursor),
+            None,
+            16,
+        )
+        .await
+        .expect_err(
+            "retention removed the ledger's third entry, which is after this cursor and of a \
+             subscribed type, so the cursor is refused even though this grant would never have \
+             been handed that entry",
+        );
+
+    assert!(
+        matches!(refused, UsageCollectorPluginError::CursorBeyondRetention),
+        "the refusal MUST be decided from what the sweep removed, not from what this grant \
+         would have delivered. A backend that intersected the removed entries with the scope \
+         would serve this page and be right about this caller's entries and wrong about the \
+         contract: DESIGN refuses whatever the scope admitted, and the wire refusal is \
+         published on the same terms. Got: {refused:?}"
     );
 }

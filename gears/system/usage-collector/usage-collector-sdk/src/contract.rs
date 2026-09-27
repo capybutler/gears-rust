@@ -110,6 +110,7 @@ use checks::{
 mod checks;
 mod fixtures;
 pub mod reference;
+pub mod retention;
 
 /// A check that failed, naming the check and what was observed.
 ///
@@ -306,19 +307,19 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// claims: one is closed by writing a check, the other only by changing
 /// the trait.
 ///
-/// **[`FEED_RETENTION_REFUSAL`] needs one thing more than an author: a
-/// suite input.** Its refusal half asserts that a cursor past the retention
-/// floor is refused, and a backend only reaches that state once retention
-/// has purged an entry. No SPI method purges; [`run_all`] takes a plugin
-/// handle and a dedup level and nothing else; and
-/// [`reference::InMemoryReferencePlugin`] never removes an entry, so its own
-/// docs record `CursorBeyondRetention` as unreachable there. Writing that
-/// half therefore needs a retention knob on [`run_all`], or a porter
-/// arranging the purge out of band between two dispatches. The check's other
-/// half — a cursor whose continuation is intact is served whole — is
-/// writable today against any backend. This is a gap in the harness rather
-/// than in the SPI, which is why the name stays here and does **not** go
-/// back into [`BLOCKED_CHECKS`].
+/// **[`FEED_RETENTION_REFUSAL`] needed one thing more than an author, and
+/// it now has it.** Its refusal half asserts that a cursor whose
+/// continuation retention has truncated is refused, and a backend only
+/// reaches that state once retention has purged an entry. No SPI method
+/// purges, which is why the drive sits beside the SPI:
+/// [`retention::ContractRetention`] is the optional capability a backend
+/// under test exposes, and [`reference::InMemoryReferencePlugin`]
+/// implements it, so `CursorBeyondRetention` is reachable there. The check
+/// itself is still unwritten, and so is the entry point that would hand
+/// [`run_all`] a driver — both land together, because an entry point taking
+/// a driver it cannot yet use would be a claim about a check that does not
+/// exist. This was a gap in the harness rather than in the SPI, which is
+/// why the name stayed here and never went back into [`BLOCKED_CHECKS`].
 ///
 /// **A caller reporting coverage has to report this constant.**
 /// [`run_all`] returning no violations says nothing whatever about a check
