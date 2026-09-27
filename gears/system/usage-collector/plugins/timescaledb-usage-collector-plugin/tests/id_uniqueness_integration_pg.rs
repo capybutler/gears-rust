@@ -8,9 +8,11 @@
 //! `UUIDv5` over the 6-tuple
 //! `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
 //! entry_type)` (`cpt-cf-usage-collector-adr-record-identity-derivation`),
-//! which is the same six columns `usage_records_dedup_uniq` spans — so
-//! "distinct ids" and "distinct rows" are one fact, and a point lookup
-//! addresses exactly one of them.
+//! which is the six of the seven columns `usage_records_dedup_uniq` spans that
+//! are identity inputs — the seventh, `type_key`, is the partition key a
+//! hypertable UNIQUE must carry and is a function of `gts_type_id`, so it
+//! separates no two rows. "Distinct ids" and "distinct rows" are therefore one
+//! fact, and a point lookup addresses exactly one of them.
 //!
 //! `entry_type` is the sixth input, and the ADR is explicit about what it buys:
 //! "An invalidation repeats its target's idempotency key, so the entry type is
