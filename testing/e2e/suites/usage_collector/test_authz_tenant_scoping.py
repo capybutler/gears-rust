@@ -64,14 +64,16 @@ async def test_cross_tenant_read_no_existence_leak(api, make_meter):
 
 
 async def test_idempotent_repost_returns_same_record(api, make_meter):
-    """Seam: dedup on (tenant_id, gts_type_id, idempotency_key, period).
+    """Seam: dedup on the derived entry identity, over real HTTP.
 
     An identical re-POST is deduplicated, not duplicated: same record id back,
-    and one row visible in the listing. The covered period is part of the dedup
-    identity (`cpt-cf-usage-collector-adr-record-identity-derivation`), so it is
-    pinned here rather than regenerated per call — a second `covered_period()`
-    would move the window bounds and make the two submissions distinct entries
-    rather than a retry.
+    and one row visible in the listing. The identity is six-part —
+    `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
+    entry_type)` (`cpt-cf-usage-collector-adr-record-identity-derivation`) —
+    so the same payload object is submitted twice rather than built twice, and
+    all six are pinned by construction. The covered period is the component a
+    rebuild would silently move: a second `covered_period()` call shifts both
+    bounds and makes the two submissions distinct entries rather than a retry.
     """
     meter_id = await make_meter()
     payload = record_payload(

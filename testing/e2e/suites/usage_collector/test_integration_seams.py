@@ -22,6 +22,7 @@ from .conftest import (
     rejected_records,
     selection_range,
     unique_suffix,
+    withdrawal_of,
 )
 
 
@@ -29,10 +30,13 @@ async def test_ingest_and_read_record_roundtrip(api, make_meter):
     """Seam: handler <-> JSON wire format <-> PostgreSQL round-trip.
 
     A Decimal `quantity` crosses as a string and comes back byte-identical, both
-    covered-period bounds survive the timestamptz round-trip, and the two
-    server-derived projections arrive: `origin` names the route that admitted
-    the entry and `entry_type` is derived from the absent `invalidates`
-    rather than stored.
+    covered-period bounds survive the timestamptz round-trip, and the read
+    projection reports the kind the submission declared. The two `entry_type`s
+    are not one field making a round trip: on the request it is required and
+    caller-supplied, and on the response it is projected from the absent
+    `invalidates` rather than read back from a stored column. `origin` is the
+    one value here the server assigns outright — the route that admitted the
+    entry.
     """
     meter_id = await make_meter()
     period = covered_period()
@@ -154,41 +158,52 @@ async def test_aggregate_folds_by_resource_and_declared_metadata(api, make_meter
 async def test_invalidation_is_admitted_at_most_once(api, make_meter):
     """Seam: at most one invalidation per target, as a dedup outcome.
 
-    Every withdrawal of one target derives the same `inv:<target_id>` key, so a
-    second withdrawal is an ordinary collision on that identity (DESIGN §3.1
+    A withdrawal repeats its target's tenant, GTS type, idempotency key and
+    covered period, and declares `entry_type = invalidation`, which fixes all
+    six identity components: every withdrawal of one target lands on one
+    identity, and a second one is an ordinary collision on it (DESIGN §3.1
     "At most one invalidation"). Under the same reason code it is an exact
     retry: accepted, answering with the stored invalidation. Under another
-    reason code it is refused per record inside a 207 as `ALREADY_INVALIDATED`,
-    whose context names the invalidation in place and its reason code.
+    reason code it is refused per record inside a 207 as
+    `ALREADY_INVALIDATED`, whose context names the invalidation in place and
+    its reason code — the reason code is not an identity input, so on a
+    faithful copy it is the only field left that can differ.
+
+    No submission here names a target. The gateway derives the target's `id`
+    from the withdrawal's own identity inputs with `entry_type` set to
+    `record`, so asserting the returned `invalidates` against the target's id
+    is what proves that derivation crossed real HTTP and found the right
+    record.
     """
     meter_id = await make_meter()
-    period = covered_period()
+    target_payload = record_payload(meter_id, quantity="3", period=covered_period())
+    withdrawal_payload = withdrawal_of(target_payload, reason_code="E2E_CORRECTION")
+
     async with api() as client:
         created = accepted_records(await client.post("/records", json={
-            "records": [record_payload(meter_id, quantity="3", period=period)]
+            "records": [target_payload]
         }))
         target_id = created[0]["id"]
 
         withdrawal = accepted_records(await client.post("/records", json={
-            "records": [record_payload(
-                meter_id, quantity="3", period=period, invalidates=target_id,
-            )]
+            "records": [withdrawal_payload]
         }))
         assert withdrawal[0]["entry_type"] == "invalidation"
         assert withdrawal[0]["invalidates"] == target_id
         assert withdrawal[0]["reason_code"] == "E2E_CORRECTION"
+        # The entry type is the sixth identity input, and it is the only one
+        # the two entries do not share — without it the withdrawal would
+        # derive its target's own id and be absorbed as a retry of it.
+        assert withdrawal[0]["id"] != target_id, withdrawal[0]
 
         retried = accepted_records(await client.post("/records", json={
-            "records": [record_payload(
-                meter_id, quantity="3", period=period, invalidates=target_id,
-            )]
+            "records": [withdrawal_payload]
         }))
 
         second = await client.post("/records", json={
-            "records": [record_payload(
-                meter_id, quantity="3", period=period, invalidates=target_id,
-                reason_code="E2E_CORRECTION_SECOND",
-            )]
+            "records": [
+                withdrawal_of(target_payload, reason_code="E2E_CORRECTION_SECOND")
+            ]
         })
 
         # The target is untouched by any attempt: an invalidation appends.

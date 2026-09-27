@@ -2,10 +2,16 @@
 
 This module owns its own server AND its own TimescaleDB container, because the
 gear's storage plugin connects and migrates a real TimescaleDB at init and
-fails hard when it cannot. It therefore gates on E2E_BINARY and skips when
-unset, exactly like mini_chat: `make e2e-local` builds a binary WITHOUT the
-usage-collector features, so running there would start a second server and a
-container for routes that binary does not serve.
+fails hard when it cannot. That is what makes the suite `launcher: pytest`
+(`e2e.yaml`), and the unscoped `make e2e-local` therefore never collects it:
+`run_e2e.py::discover_launcher_test_paths` hands pytest the paths of
+`launcher: e2e-launcher` suites only.
+
+The E2E_BINARY gate below catches a direct pytest invocation that went round
+`run_e2e.py`. It is needed even though `config/e2e-features.txt` DOES list
+`usage-collector`: what that shared binary omits is
+`timescaledb-usage-collector`, so it would serve these routes off the noop
+backend and assert nothing about storage.
 
 Run it with: make e2e-usage-collector
 """
@@ -15,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -187,10 +194,10 @@ def pytest_collection_modifyitems(items):
     alone, and passing no timeout value leaves pytest.ini's 10s in force
     (pytest_timeout._get_item_settings falls back to the ini value whenever
     the marker omits one). So every test here keeps the repo-wide 10s hard
-    kill on its own body — `docs/toolkit_unified_system/13_e2e_testing.md`
-    §3: "If a test exceeds 10s, it is broken, not slow" — while the harness's
-    startup cost is simply not counted. Raising the number instead would let
-    a genuinely hung test burn the raised budget.
+    kill on its own body — `docs/toolkit_unified_system/13_e2e_testing.md`,
+    "Anti-Flaking Practices" §3: "If a test exceeds 10s, it is broken, not
+    slow" — while the harness's startup cost is simply not counted. Raising
+    the number instead would let a genuinely hung test burn the raised budget.
 
     Session setup keeps its own bounds and its own diagnostics: READY_TIMEOUT
     (60s) and DOCKER_TIMEOUT (120s) in `lib/sidecars.py`, `health_timeout`
@@ -372,22 +379,25 @@ def record_payload(
     idempotency_key: str | None = None,
     period: tuple[str, str] | None = None,
     metadata: dict[str, str] | None = None,
-    invalidates: str | None = None,
-    reason_code: str | None = None,
 ) -> dict:
-    """One CreateUsageRecordRequest. `quantity` is a STRING on the wire.
+    """One `record` CreateUsageRecordRequest. `quantity` is a STRING on the wire.
 
-    `invalidates` / `reason_code` are both-or-neither and are what make a
-    submission a withdrawal: there is no caller-supplied discriminator, so a
-    marker cannot disagree with the payload it marks. Both are omitted
-    entirely when unset — the shape is `deny_unknown_fields` and a `null`
-    would be a different thing from an absent key.
+    `entry_type` is the required, caller-supplied discriminator between the
+    request schema's two branches, and it has no default
+    (`usage-collector-v1.yaml` `EntryType`): a submission that omits it is
+    refused rather than read as a `record`. This factory only builds
+    measurements; the withdrawal of one is `withdrawal_of(payload, ...)`,
+    which copies the measurement rather than rebuilding it.
 
-    An invalidation carries no `idempotency_key`; the gateway derives
-    `inv:<invalidates>`.
+    `idempotency_key` is caller-supplied and required on BOTH entry kinds,
+    and it is one of the six components of the dedup identity, so a fresh
+    random one per call is what keeps two tests' submissions from
+    deduplicating onto each other. A test that needs two submissions to be
+    one entry pins both the key and the covered period.
     """
     window_start, window_end = period or covered_period()
-    payload = {
+    return {
+        "entry_type": "record",
         "gts_type_id": gts_type_id,
         "tenant_id": tenant_id,
         "resource_ref": {"resource_id": resource_id, "resource_type": "compute.vm"},
@@ -395,12 +405,37 @@ def record_payload(
         "window_start": window_start,
         "window_end": window_end,
         "metadata": metadata or {},
+        "idempotency_key": idempotency_key or f"e2e-idem-{unique_suffix()}",
     }
-    if invalidates is not None:
-        payload["invalidates"] = invalidates
-        payload["reason_code"] = reason_code or "E2E_CORRECTION"
-    else:
-        payload["idempotency_key"] = idempotency_key or f"e2e-idem-{unique_suffix()}"
+
+
+def withdrawal_of(target: dict, *, reason_code: str) -> dict:
+    """The invalidation that withdraws the record `target` submitted.
+
+    A copy of the submitted payload rather than a second construction of one,
+    because that is literally what the contract asks for: an invalidation
+    repeats its target's tenant, GTS type, resource, subject, covered period,
+    quantity, metadata and idempotency key, and departs in exactly two
+    caller-supplied fields, `entry_type` and `reason_code` (DESIGN.md §3.1,
+    "Faithful copy"). A rebuilt copy that drifted in any compared field would
+    be refused naming that field, so a test about something else would fail
+    for a reason it never meant to exercise. `reason_code` has no default
+    here for the same reason `entry_type` has none on the wire: the two are
+    the whole of what a withdrawal states, and neither should be guessable.
+
+    A deep copy, so the two payloads share no nested `resource_ref` or
+    `metadata` object and a caller may edit either in place.
+
+    The target is NOT named. `invalidates` is server-derived and a submitted
+    one is refused as an unknown field; the gateway derives the target's `id`
+    from this submission's own identity inputs with `entry_type` set to
+    `record`, looks it up converged-only, and stamps what it resolved
+    (DESIGN.md §3.1, "Target resolution"). Repeating the target's key is
+    therefore not a formality — it is how the target is found.
+    """
+    payload = deepcopy(target)
+    payload["entry_type"] = "invalidation"
+    payload["reason_code"] = reason_code
     return payload
 
 
