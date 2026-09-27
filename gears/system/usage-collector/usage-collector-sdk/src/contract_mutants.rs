@@ -10,7 +10,7 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Six subjects wrap a real reference
+//! *Behaviourally* is the exact word. Seven subjects wrap a real reference
 //! backend and are that backend plus one interception; the other two
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
@@ -29,11 +29,14 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Six defects fit (quantity,
-//! period-blind dedup, entry-type-blind dedup, point-read scope, and the two
-//! withdrawal defects): one rewrites the quantity on the way in, two keep a
-//! dedup index beside the ledger, one substitutes the scope on the point
-//! read, and two rewrite how a second withdrawal of a record is answered.
+//! strongest form the subject can take. Seven defects fit (quantity,
+//! period-blind dedup, entry-type-blind dedup, the entry-type-blind conflict
+//! read-back, point-read scope, and the two withdrawal defects): one
+//! rewrites the quantity on the way in, three keep an index beside the
+//! ledger — two to refuse an admission, one only to decide which stored
+//! entry a collision is answered with — one substitutes the scope on the
+//! point read, and two rewrite how a second withdrawal of a record is
+//! answered.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other two
 //! (selection column, fold exclusion), because each changes a predicate the
@@ -98,6 +101,30 @@ pub(super) enum Defect {
     /// backend makes by carrying the pre-invalidation unique constraint
     /// forward, or by naming five of the six columns in a conflict target.
     DedupIgnoresTheEntryType,
+    /// Admits on all six identity inputs and **reads the colliding entry
+    /// back** on five of them, `entry_type` struck out — so a retry of a
+    /// withdrawn record is answered against the invalidation that withdrew
+    /// it rather than against the record itself.
+    ///
+    /// DESIGN §3.3's obligation names three places `entry_type` has to
+    /// appear and this is the second of them: *"Everything keyed on identity
+    /// — a unique constraint or conflict target, the read-back of a
+    /// conflicting entry, an in-batch dedup map — includes `entry_type` or
+    /// keys on `id`, which covers all six inputs."* A backend can get the
+    /// first right and the second wrong, and the mistake is an easy one: the
+    /// `INSERT … ON CONFLICT (six columns) DO NOTHING` names all six, and the
+    /// `SELECT` that follows it — which exists only because `DO NOTHING`
+    /// returns no row to compare against — is written by hand against the
+    /// idempotency key and its covered period, the shape the pre-invalidation
+    /// model made natural.
+    ///
+    /// Such a read-back can see two rows, and this subject takes the later
+    /// one. That is not an arbitrary tie-break: an invalidation names a
+    /// target that must already be stored, so of any record and invalidation
+    /// sharing those five components the invalidation is necessarily the
+    /// later arrival. A backend reading back *the* entry on a key finds the
+    /// withdrawal.
+    ConflictReadBackIgnoresTheEntryType,
     /// Excludes the withdrawn record from the fold but folds the
     /// invalidation. DESIGN names this one: it double-counts the withdrawn
     /// measurement.
@@ -126,6 +153,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         Defect::QuantityThroughFloat
         | Defect::DedupIgnoresThePeriod
         | Defect::DedupIgnoresTheEntryType
+        | Defect::ConflictReadBackIgnoresTheEntryType
         | Defect::IgnoresScopeOnThePointRead
         | Defect::AbsorbsAWithdrawalWithAnotherReason
         | Defect::RefusesAWithdrawalWithTheSameReason => Box::new(WrappedReference::new(defect)),
@@ -145,7 +173,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
 ///
-/// One qualification, and it holds for all six wrapped defects:
+/// One qualification, and it holds for all seven wrapped defects:
 /// [`Self::create_usage_records`] is not pure delegation. The inner backend
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
@@ -157,7 +185,7 @@ struct WrappedReference {
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
     /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
-    /// entry that claimed it. Unused by the other five defects.
+    /// entry that claimed it. Unused by the other six defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -172,7 +200,7 @@ struct WrappedReference {
     period_blind_keys: Mutex<BTreeMap<PeriodBlindKey, UsageRecord>>,
     /// The entry-type-blind dedup index [`Defect::DedupIgnoresTheEntryType`]
     /// keys on: `(tenant_id, gts_type_id, idempotency_key, window_start,
-    /// window_end)` to the entry that claimed it. Unused by the other five
+    /// window_end)` to the entry that claimed it. Unused by the other six
     /// defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
@@ -189,6 +217,26 @@ struct WrappedReference {
     /// claim left behind names that same identity, which is the only thing
     /// this index is ever asked about.
     entry_type_blind_keys: Mutex<BTreeMap<EntryTypeBlindKey, UsageRecord>>,
+    /// The rows [`Defect::ConflictReadBackIgnoresTheEntryType`] reads a
+    /// colliding entry back from: the same five components, to **every**
+    /// entry accepted under them, in arrival order. Unused by the other six
+    /// defects.
+    ///
+    /// A `Vec` rather than one entry, because two rows under one five-tuple
+    /// is the whole situation the defect is about, and the defect is which
+    /// of them the read-back picks. It takes the last, and that is a
+    /// structural choice rather than a tie-break: an invalidation names a
+    /// target that must already be stored, so of a record and an
+    /// invalidation sharing five components the invalidation is always the
+    /// later arrival.
+    ///
+    /// Written after the inner backend accepts rather than before, which is
+    /// the opposite of the two indexes above and is what keeps this subject
+    /// wrong in one way only. This index decides nothing about admission: an
+    /// entry is remembered here exactly when the exemplar stored it, so the
+    /// mirror cannot drift and no entry the inner refused is ever read back
+    /// from it.
+    five_component_rows: Mutex<BTreeMap<EntryTypeBlindKey, Vec<UsageRecord>>>,
 }
 
 /// The four inputs a period-blind dedup identity keys on:
@@ -205,9 +253,12 @@ type PeriodBlindKey = (Uuid, String, String, &'static str);
 /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
 ///
 /// Named for what it leaves out. The derived identity reads six inputs, and
-/// the one missing here is `entry_type` — which is the whole of
-/// [`Defect::DedupIgnoresTheEntryType`], because a record and its
-/// invalidation agree on the other five.
+/// the one missing here is `entry_type` — because a record and its
+/// invalidation agree on the other five. Two defects key on it, each
+/// striking that input out of a different one of the three places DESIGN
+/// §3.3 names: [`Defect::DedupIgnoresTheEntryType`] out of the unique
+/// constraint, and [`Defect::ConflictReadBackIgnoresTheEntryType`] out of
+/// the read-back of a conflicting entry.
 type EntryTypeBlindKey = (
     Uuid,
     String,
@@ -224,6 +275,7 @@ impl WrappedReference {
             defect,
             period_blind_keys: Mutex::new(BTreeMap::new()),
             entry_type_blind_keys: Mutex::new(BTreeMap::new()),
+            five_component_rows: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -251,13 +303,14 @@ impl WrappedReference {
             // entries through untouched and report no violation at all;
             // spelling the variants out makes that a compile error instead
             // of a matrix row whose subject does nothing. The point read's
-            // defect is applied on the read path, the two withdrawal defects around
-            // the inner call, and the last two never
-            // reach this type at all — `mutant` routes them to
+            // defect is applied on the read path, the two withdrawal defects
+            // and the conflict read-back around the inner call, and the last
+            // two never reach this type at all — `mutant` routes them to
             // `MutantLedger` — but exhaustiveness is the whole point.
             Defect::IgnoresScopeOnThePointRead
             | Defect::AbsorbsAWithdrawalWithAnotherReason
             | Defect::RefusesAWithdrawalWithTheSameReason
+            | Defect::ConflictReadBackIgnoresTheEntryType
             | Defect::SelectsOnWindowStart
             | Defect::FoldsTheInvalidation => Ok(record),
         }
@@ -373,13 +426,26 @@ impl WrappedReference {
         ))
     }
 
-    /// [`Defect::AbsorbsAWithdrawalWithAnotherReason`]: a conflict on a
-    /// withdrawal is answered as an absorb of the stored entry.
+    /// What the two post-inner defects do to one entry's outcome, and the
+    /// place [`Defect::ConflictReadBackIgnoresTheEntryType`] keeps its
+    /// mirror of the ledger up to date.
+    ///
+    /// * [`Defect::AbsorbsAWithdrawalWithAnotherReason`]: a conflict on a
+    ///   withdrawal is answered as an absorb of the stored entry.
+    /// * [`Defect::ConflictReadBackIgnoresTheEntryType`]: an outcome the
+    ///   inner backend decided against a *stored* entry is decided again
+    ///   here, against whichever entry a five-component read-back finds.
+    ///
+    /// Both leave admission alone, which is why they sit here rather than in
+    /// [`Self::on_admission`].
     fn after_admission(
         &self,
         record: &UsageRecord,
         outcome: Result<UsageRecord, UsageCollectorPluginError>,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        if self.defect == Defect::ConflictReadBackIgnoresTheEntryType {
+            return self.read_the_conflict_back_on_five_components(record, outcome);
+        }
         match outcome {
             Err(UsageCollectorPluginError::IdempotencyConflict { existing, .. })
                 if self.defect == Defect::AbsorbsAWithdrawalWithAnotherReason
@@ -390,6 +456,67 @@ impl WrappedReference {
             other => other,
         }
     }
+
+    /// [`Defect::ConflictReadBackIgnoresTheEntryType`]: the collision branch,
+    /// decided against a row found on five components.
+    ///
+    /// The inner backend has already decided admission on all six identity
+    /// inputs, so this reaches an entry whose `id` is already stored exactly
+    /// when the insert was a no-op — which is the only case a real backend's
+    /// read-back runs in, since `ON CONFLICT … DO NOTHING` returns no row to
+    /// compare against. A fresh entry is passed through untouched and
+    /// remembered.
+    ///
+    /// The read-back takes the last row under the five components, and the
+    /// comparison against it is the ordinary one
+    /// ([`UsageRecord::caller_supplied_eq`]): equal is an absorb answering
+    /// with that row, different is `IdempotencyConflict` carrying it. Only
+    /// *which row* is wrong here, which is the whole of the defect.
+    fn read_the_conflict_back_on_five_components(
+        &self,
+        record: &UsageRecord,
+        outcome: Result<UsageRecord, UsageCollectorPluginError>,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        let key = five_component_key(record);
+        let mut rows = self.five_component_rows.lock().map_err(|_| {
+            UsageCollectorPluginError::internal("the mutant's ledger mirror lock is poisoned")
+        })?;
+        let stored = rows.entry(key).or_default();
+        if !stored.iter().any(|entry| entry.id == record.id) {
+            if outcome.is_ok() {
+                stored.push(record.clone());
+            }
+            return outcome;
+        }
+        // Unreachable: the branch above returned unless some row under this
+        // key carries the submitted `id`, so the list is not empty here. A
+        // fall-through rather than an `expect`, because a subject the
+        // discrimination matrix drives should report the inner backend's own
+        // answer if this ever stops holding, not abort the run.
+        let Some(found) = stored.last().cloned() else {
+            return outcome;
+        };
+        drop(rows);
+        if found.caller_supplied_eq(record) {
+            return Ok(found);
+        }
+        Err(UsageCollectorPluginError::idempotency_conflict(
+            record.idempotency_key.as_str(),
+            found,
+        ))
+    }
+}
+
+/// The five caller-supplied identity components of `record`, `entry_type`
+/// struck out.
+fn five_component_key(record: &UsageRecord) -> EntryTypeBlindKey {
+    (
+        record.tenant_id,
+        record.gts_type_id.as_str().to_owned(),
+        record.idempotency_key.as_str().to_owned(),
+        record.window_start,
+        record.window_end,
+    )
 }
 
 #[async_trait]
@@ -445,19 +572,27 @@ impl UsageCollectorPluginV1 for WrappedReference {
         // A batch every entry of which this wrapper refused must not reach
         // the inner backend: the reference answers an empty batch with
         // `Internal`, and this call would then fail outright rather than
-        // reporting the per-entry refusals it already has. Three defects
-        // refuse entries here, and `DedupIgnoresTheEntryType` reaches this
-        // branch: the one batch the suite sends is
-        // `at-most-one-invalidation`'s two withdrawals of a target already
-        // stored, and both repeat that target's idempotency key over its
-        // covered period, so the entry-type-blind index refuses each of them
-        // against the claim the target left and no survivor is handed on.
-        // The other two do not. `DedupIgnoresThePeriod` admits the second
-        // withdrawal under the claim the first left, both deriving one `id`;
+        // reporting the per-entry refusals it already has.
+        //
+        // **Reached by exactly one subject today, `DedupIgnoresTheEntryType`,
+        // and that count is part of the claim.** The one batch the suite
+        // sends is `at-most-one-invalidation`'s two withdrawals of a target
+        // already stored, and both repeat that target's idempotency key over
+        // its covered period, so the entry-type-blind index refuses each of
+        // them against the claim the target left and no survivor is handed
+        // on. Of the other two defects that can refuse an entry here,
+        // `DedupIgnoresThePeriod` admits the second withdrawal under the
+        // claim the first left, both deriving one `id`, and
         // `RefusesAWithdrawalWithTheSameReason` finds no withdrawal stored to
-        // refuse either against. So the guard is a live path rather than a
-        // precaution, which is also why it is repeated here rather than left
-        // to the inner backend to raise.
+        // refuse either against. A later defect that reaches this branch a
+        // second way must say so here rather than inherit a paragraph
+        // written about one subject: the reasoning above is per subject, not
+        // a general argument, and it was established by instrumenting this
+        // line rather than by reading it.
+        //
+        // So the guard is a live path rather than a precaution, which is also
+        // why it is repeated here rather than left to the inner backend to
+        // raise.
         let inner = if survivors.is_empty() {
             Vec::new()
         } else {

@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds eight deliberately
+//! as coverage. [`super::contract_mutants`] holds nine deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -124,13 +124,19 @@ async fn the_reference_backend_conforms_under_an_eventual_declaration() {
 /// exists for. That is one mistake meeting three checks, not three
 /// mistakes, so the row names all three.
 ///
-/// What the wider row costs is worth saying plainly. It establishes that
-/// these three checks together notice an entry-type-blind plugin; it does
-/// not establish that `record-and-invalidation-distinct-identity` is the
-/// one that noticed. The other two report the refusal as a fixture they
-/// could not build, and only this one asserts the rule the refusal breaks
-/// — but that is a fact about the checks' own docs rather than something
-/// this matrix measures.
+/// What the wider row costs is worth saying plainly: it establishes that
+/// these three checks together notice an entry-type-blind plugin, not which
+/// of them noticed. [`Defect::ConflictReadBackIgnoresTheEntryType`] is the
+/// row that answers that, and it is why the two sit beside each other.
+/// DESIGN's obligation names three places `entry_type` has to appear, and
+/// the two subjects strike it out of one each: the unique constraint, where
+/// an entry is refused and every check needing that pair loses its
+/// fixtures, and the read-back of a conflicting entry, where nothing is
+/// refused and only the answer to a retry changes. The second isolates to
+/// `record-and-invalidation-distinct-identity` alone, and to the one
+/// assertion in it that no other check makes — that a retry of a withdrawn
+/// record is absorbed against the record rather than against the
+/// invalidation sharing its five caller-supplied components.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (
@@ -145,6 +151,10 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
             INVALIDATION_EXCLUDED_FROM_FOLD,
             AT_MOST_ONE_INVALIDATION,
         ],
+    ),
+    (
+        Defect::ConflictReadBackIgnoresTheEntryType,
+        &[RECORD_AND_INVALIDATION_DISTINCT_IDENTITY],
     ),
     (
         Defect::FoldsTheInvalidation,
@@ -168,7 +178,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all eight mutants is not
+/// of sensitivity. A check that fails against all nine mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.

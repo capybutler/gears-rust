@@ -119,7 +119,12 @@ struct DistinctIdentityFixtures {
 ///    which is the order the row gives and the order that discriminates: a
 ///    backend that resolved the retry against the invalidation - the other
 ///    entry sharing its five components - would answer with an entry the
-///    caller never sent.
+///    caller never sent. This is the one property here no other check in
+///    the suite makes, and `contract_mutants`'s
+///    `Defect::ConflictReadBackIgnoresTheEntryType` is the subject built to
+///    break it: it admits on all six identity inputs and reads the colliding
+///    entry back on five, which is the second of the three places DESIGN
+///    §3.3 obliges `entry_type` to appear.
 /// 4. **A read returns exactly two entries**, both of them the ones
 ///    submitted, and the invalidation among them still naming its target.
 ///
