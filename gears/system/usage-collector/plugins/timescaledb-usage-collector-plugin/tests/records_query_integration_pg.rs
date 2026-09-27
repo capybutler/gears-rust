@@ -1034,11 +1034,12 @@ async fn an_orphan_invalidation_contributes_nothing() {
 /// substitute for a rule it cannot express: it is what §3.1 requires on this
 /// fixture, and 7 is the divergence.
 ///
-/// The check that would catch it, `latest-tie-break`, is writable against the
-/// current seven-method SPI and merely unwritten — it is in the SDK's
-/// `UNWRITTEN_CHECKS`, and `BLOCKED_CHECKS` is empty — so nothing asserts the
-/// declared rule against this backend yet. Read the expectation below as *what
-/// this plugin does*, not as conformance, and note that the precondition
+/// The check that catches it, `latest-tie-break`, has landed: it is in the
+/// SDK's `IMPLEMENTED_CHECKS`, `contract::run_all` dispatches it, and
+/// `contract_conformance_pg`'s `NOT_YET_CONFORMING` row for it is what keeps
+/// that suite green while this backend still diverges. Read the expectation
+/// below as *what this plugin does*, not as conformance, and note that the
+/// precondition
 /// assertion now guards against an edit (ordering by `id` after the period end)
 /// that would move this backend **toward** §3.1 rather than away from it. See
 /// `fold_select_expr`'s docs for the three cases where the two orders part.

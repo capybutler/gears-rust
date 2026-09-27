@@ -25,8 +25,8 @@ use crate::time_range::TimeRange;
 ///
 /// A hundred and eighty days past [`FIXTURE_EPOCH`], for the reason
 /// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 210, 240, 270 and
-/// 300 offsets the other checks take. It matters here because this check counts
+/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 210, 240, 270,
+/// 300 and 330 offsets the other checks take. It matters here because this check counts
 /// the rows a range returns, so a stray entry inside it would be read as a
 /// third entry.
 ///

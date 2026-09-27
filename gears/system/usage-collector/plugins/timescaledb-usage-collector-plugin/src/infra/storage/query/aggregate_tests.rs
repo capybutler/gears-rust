@@ -59,10 +59,10 @@ fn latest_picks_the_greatest_window_end_then_acceptance_sequence() {
     // greatest `accepted_at`, then greatest `id` in byte order, and
     // `acceptance_sequence` is this plugin's own column rather than anything
     // DESIGN names. `fold_select_expr`'s docs carry the three cases where the
-    // two orders disagree. No contract check catches it either way yet:
-    // `latest-tie-break` is writable against the current SPI and unwritten, so
-    // it is in the SDK's `UNWRITTEN_CHECKS` and not in `BLOCKED_CHECKS`, which
-    // is empty.
+    // two orders disagree. The SDK's `latest-tie-break` check now catches it:
+    // it is in `IMPLEMENTED_CHECKS`, `contract::run_all` dispatches it, and
+    // `contract_conformance_pg` carries the declared non-conformance row that
+    // keeps that suite green until slice 7 changes this expression.
     assert_eq!(
         fold_select_expr(AggregationFold::Latest),
         "(ARRAY_AGG(r.quantity ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric"

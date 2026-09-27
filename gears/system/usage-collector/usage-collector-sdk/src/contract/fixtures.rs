@@ -83,8 +83,10 @@ pub const CONTRACT_METER_TYPE_ID: &str =
 /// `dead_code` stopped firing and `unfulfilled_lint_expectations` fired in
 /// its place. That is a warning by default and an error under the
 /// `-D warnings` this workspace's clippy target passes, so the attribute had
-/// to go, and it went without anyone having to remember it. The same shape
-/// still guards [`contract_tenant`] below, which has no caller yet.
+/// to go, and it went without anyone having to remember it.
+/// [`contract_tenant`] below carried the same shape until
+/// [`latest_tie_break`](super::checks::latest_tie_break()) became its first
+/// caller, and it retired the same way.
 pub fn check_meter(check: &str, role: &str) -> Result<MeterTypeId, String> {
     let slug = format!("{check}_{role}").replace('-', "_");
     MeterTypeId::new(format!("{USAGE_RECORD_BASE_TYPE}cf.core.uc.{slug}.v1~"))
@@ -195,19 +197,77 @@ const _: () = {
 /// than a matter of inspection; the comment on that assertion says why an
 /// overlap would be worse than a failing check.
 ///
-/// The dead-code exemption is the self-retiring form [`check_meter`]'s docs
-/// explain, for the same reason.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until a check in `super::checks` needs a tenant beyond the four \
-                  named above; the first one that does leaves this expectation unfulfilled"
-    )
-)]
+/// **`feed-position-bounded` is not the first caller after all**, and the
+/// dead-code exemption retired itself exactly as [`check_meter`]'s docs said
+/// it would. [`latest_tie_break`](super::checks::latest_tie_break()) got here
+/// first, for a reason of the same shape: DESIGN §3.3's `latest-tie-break`
+/// row asks for *"an aggregate spanning tenants"*, and the `id` key of
+/// §3.1's order can only be reached by a group that two tenants' entries
+/// both fall in. It mints two, at index 0 and 1.
 #[must_use]
 pub fn contract_tenant(index: u32) -> Uuid {
     Uuid::from_u128(CONTRACT_TENANT_BLOCK + u128::from(index))
+}
+
+/// How many indexed idempotency keys [`inverted_id_pair`] tries before it
+/// gives up.
+///
+/// Each attempt inverts with probability one half and the attempts are
+/// independent, so sixty-four of them miss with probability 2^-64. The bound
+/// is there so a derivation that stopped producing an inversion at all fails
+/// loudly instead of looping.
+const ID_INVERSION_ATTEMPTS: u32 = 64;
+
+/// Searches indexed idempotency keys for a pair of entries whose **winner**
+/// carries the smaller `id`.
+///
+/// `build` is handed an attempt index and returns the pair `(winner, loser)`
+/// the caller wants for that index — "winner" meaning the entry the rule
+/// under test is required to select. The search stops at the first index
+/// where `winner.id < loser.id` and returns the pair alongside that index;
+/// `Err` carries a ready-to-report detail naming `purpose`, which the caller
+/// supplies to say what its own scenario needed the inversion for.
+///
+/// **The inversion cannot be chosen, which is why this is a search.** An
+/// `id` is the `UUIDv5` over the six identity inputs
+/// ([`derive_usage_record_id`](crate::id::derive_usage_record_id)), so which
+/// of two entries carries the greater one is a property of the derived
+/// values. The one input a fixture is free to vary without changing what the
+/// entry means is the idempotency key, and the index this varies is part of
+/// that key.
+///
+/// **Two callers, one rule between them.** DESIGN §3.1's `LATEST` order ends
+/// *"then greatest `id` in byte order"*, so a scenario about either of the
+/// two keys above `id` proves nothing unless the entry those keys select is
+/// the entry `id` would reject:
+/// [`latest_tie_break`](super::checks::latest_tie_break()) needs it twice and
+/// `super::contract_tests`'s
+/// `latest_breaks_a_window_end_tie_on_the_greater_accepted_at` once, and a
+/// single search is what keeps the three from drifting apart.
+///
+/// The failure is loud rather than silent for the same reason: a scenario
+/// built on an inversion that did not happen asserts nothing and reports
+/// nothing, which is the one outcome worse than a failing check.
+pub fn inverted_id_pair<F>(
+    purpose: &str,
+    build: F,
+) -> Result<(UsageRecord, UsageRecord, u32), String>
+where
+    F: Fn(u32) -> Result<(UsageRecord, UsageRecord), String>,
+{
+    for attempt in 0..ID_INVERSION_ATTEMPTS {
+        let (winner, loser) = build(attempt)?;
+        if winner.id < loser.id {
+            return Ok((winner, loser, attempt));
+        }
+    }
+    Err(format!(
+        "no pair of indexed idempotency keys put the winning entry under the smaller `id` \
+         within {ID_INVERSION_ATTEMPTS} attempts. {purpose} An `id` is the UUIDv5 over the six \
+         identity inputs, so which of two entries carries the greater one is a property of the \
+         derived values rather than something a fixture chooses, and the search varies the one \
+         input that is free here - the idempotency key - rather than picking a pair."
+    ))
 }
 
 /// `2020-01-01T00:00:00Z`, the base every fixture covered period is offset
@@ -443,8 +503,8 @@ pub fn fixture_invalidation(target: &UsageRecord) -> Result<UsageRecord, String>
 
 /// A [`ContractViolation`] attributed to one check.
 ///
-/// The check name is a parameter rather than baked in. Eleven checks report
-/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a twelfth
+/// The check name is a parameter rather than baked in. Twelve checks report
+/// through it and [`HARNESS_FAULT`](super::HARNESS_FAULT) is a thirteenth
 /// caller, and the whole point of [`ContractViolation::check`] is that a
 /// violation says which assertion produced it — a helper that stamped one
 /// name on every report would quietly undo that.

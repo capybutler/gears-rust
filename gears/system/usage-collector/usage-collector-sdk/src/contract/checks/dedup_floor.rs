@@ -23,8 +23,8 @@ use crate::time_range::TimeRange;
 ///
 /// Two hundred and forty days past [`FIXTURE_EPOCH`], for the reason
 /// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 270 and
-/// 300 offsets the other checks take. It matters here because this check counts
+/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 270,
+/// 300 and 330 offsets the other checks take. It matters here because this check counts
 /// the rows a range returns against the identities it seeded, so a stray
 /// entry inside it would be read as a row no identity of this check accounts
 /// for — which is exactly the shape of the failure the check exists to

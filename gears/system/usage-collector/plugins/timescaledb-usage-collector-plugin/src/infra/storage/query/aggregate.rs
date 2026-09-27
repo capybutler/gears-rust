@@ -54,13 +54,17 @@ use super::translate::SqlCtx;
 ///   case DESIGN §3.3's `dedup-concurrent` row explicitly contemplates — where
 ///   the two rules pick opposite entries.
 ///
-/// **No contract check asserts this expression either way.** The SDK's
-/// `latest-tie-break` check is writable against the current seven-method SPI
-/// (`UsageRecord` carries `window_end`, `accepted_at` and `id`) and is simply
-/// unwritten, so it sits in the SDK's `UNWRITTEN_CHECKS` rather than its
-/// `BLOCKED_CHECKS`, which is empty. It is therefore expected to **fail here**
-/// when it lands, and the divergence above is what it would report; this
-/// module's tests pin the expression as written, not as DESIGN declares it.
+/// **The SDK's `latest-tie-break` check has landed, and this expression fails
+/// it.** It is in the SDK's `IMPLEMENTED_CHECKS` now and `contract::run_all`
+/// dispatches it, so `contract_conformance_pg`'s `NOT_YET_CONFORMING` row for
+/// it is live rather than waiting: the check reports the second of the three
+/// divergences above, two entries sharing a `window_end` where `accepted_at`
+/// ranks them one way and `acceptance_sequence` the other. Its cross-tenant
+/// scenario, the first divergence, is not reported reliably here and that is
+/// this expression's doing rather than the check's - with both keys tied the
+/// `ORDER BY` ranks nothing, so which entry `[1]` picks is whatever the scan
+/// produced. This module's tests pin the expression as written, not as DESIGN
+/// declares it; slice 7 is where it changes.
 ///
 /// `LATEST` is an ordered pick, not an aggregate function — but
 /// `ARRAY_AGG(… ORDER BY …)[1]` composes in a grouped SELECT list exactly as

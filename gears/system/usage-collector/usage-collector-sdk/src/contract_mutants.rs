@@ -11,7 +11,7 @@
 //! column against each of them.
 //!
 //! *Behaviourally* is the exact word. Ten subjects wrap a real reference
-//! backend and are that backend plus one interception; the other five
+//! backend and are that backend plus one interception; the other eight
 //! re-implement it, and a re-implementation is the same backend only as far
 //! as the checks can see. [`MutantLedger`] states how far that is.
 //!
@@ -40,15 +40,33 @@
 //! to decide, and two rewrite how a second withdrawal of a record is
 //! answered.
 //!
-//! **A ledger of its own** ([`MutantLedger`]) is needed by the other five
+//! **A ledger of its own** ([`MutantLedger`]) is needed by the other eight
 //! (selection column, fold exclusion, missing unique constraint, missing
-//! in-batch dedup map, a divergent write that displaces the survivor),
-//! because each changes something the inner backend owns and no interception
-//! can reach it: which column a range meets, which rows a fold walks, what
-//! admission writes, what a batch's own rows are decided against, and which
-//! row a decided collision leaves behind. It mirrors the reference where the
+//! in-batch dedup map, a divergent write that displaces the survivor, and
+//! the three `LATEST` orders), because each changes something the inner
+//! backend owns and no interception can reach it: which column a range
+//! meets, which rows a fold walks, what admission writes, what a batch's own
+//! rows are decided against, which row a decided collision leaves behind,
+//! and which row a fold ranks highest. It mirrors the reference where the
 //! defect is not, and it is smaller in one stated way that no check reaches
 //! — see [`MutantLedger`].
+//!
+//! # DESIGN's three `LATEST` keys, and the subject for each
+//!
+//! §3.1 states the order as *"Greatest `window_end`, then greatest
+//! `accepted_at`, then greatest `id` in byte order"*, and each of the three
+//! is struck out by one subject: [`Defect::LatestIgnoresThePeriodEnd`],
+//! [`Defect::LatestSkipsTheAcceptanceInstant`] and
+//! [`Defect::LatestStopsAtTheAcceptanceInstant`]. The set is complete
+//! because the order is: a fourth way to get it wrong would be a fourth key,
+//! and there is no fourth key. [`LatestOrder`] is where that shows in the
+//! code — one enum with one variant per key omitted, rather than three
+//! branches scattered over a fold.
+//!
+//! One of the three is not new wrongness but recovered wrongness:
+//! `LatestSkipsTheAcceptanceInstant` is the reference backend's own fold as
+//! it stood before it was corrected. A subject that was once the exemplar is
+//! the strongest evidence a defect is plausible.
 //!
 //! # DESIGN's three identity sites, and the subject for each
 //!
@@ -431,6 +449,69 @@ pub(super) enum Defect {
     /// the one that was meant to win. The matrix runs every subject at
     /// `Linearizable`, where the outcomes do name it.
     ADivergentWriteDisplacesTheSurvivor,
+    /// Folds `LATEST` on `(window_end, id)`, the middle key of DESIGN §3.1's
+    /// three struck out.
+    ///
+    /// **This is the reference backend's own fold before it was corrected**,
+    /// which is what makes it the plausible one rather than an invented
+    /// wrongness. The two keys it keeps are the two a backend already has an
+    /// index on: a ledger page is ordered by `(window_end, id)` throughout
+    /// this SPI, and reaching for that same pair to settle a fold is the
+    /// short step. The order it yields is still *total*, so nothing about the
+    /// answer looks unreliable - it is simply the wrong entry whenever the
+    /// middle key and the last disagree.
+    ///
+    /// DESIGN §3.1's `LATEST` tie-break is what it breaks: *"Greatest
+    /// `window_end`, then greatest `accepted_at`, then greatest `id` in byte
+    /// order."*
+    ///
+    /// **It reaches `latest-tie-break`'s `accepted_at` scenario and no
+    /// other**, measured by neutering each of that check's three in turn. The
+    /// `window_end` scenario separates on the first key, which this subject
+    /// keeps; the cross-tenant scenario ties on the first two and falls to
+    /// `id`, which this subject also keeps and which is DESIGN's own answer
+    /// there.
+    LatestSkipsTheAcceptanceInstant,
+    /// Folds `LATEST` on `(window_end, accepted_at)` and settles what is left
+    /// on arrival order - the last key of DESIGN §3.1's three struck out, so
+    /// the order is no longer total.
+    ///
+    /// The mistake is not a substituted key but a **missing** one, and DESIGN
+    /// states the consequence rather than leaving it to be inferred: `id` *"is
+    /// unique, so the order is total"*. A backend whose `ORDER BY` stops at
+    /// `accepted_at` answers whichever row its scan happened to reach last,
+    /// so two entries a deployment cannot tell apart get an answer that
+    /// depends on the storage layout. This is the class of mistake the
+    /// `TimescaleDB` plugin makes by ordering on a counter that is monotonic
+    /// per `(tenant_id, gts_type_id)` alone: inside one tenant it ranks
+    /// something, and across a group spanning tenants it ranks nothing.
+    ///
+    /// **It reaches `latest-tie-break`'s cross-tenant scenario and no
+    /// other**, measured the same way, and it is the only subject that
+    /// reaches it: the other two both keep `id` and so both agree with DESIGN
+    /// wherever the two keys above it tie. That scenario submits its two
+    /// entries in descending `id` order precisely so that this subject's
+    /// arrival tie-break picks the loser.
+    LatestStopsAtTheAcceptanceInstant,
+    /// Folds `LATEST` on `(accepted_at, id)`, the **first** key of DESIGN
+    /// §3.1's three struck out.
+    ///
+    /// *Latest* reads as *most recently accepted*, and a backend that takes
+    /// the fold's name at its word orders by the acceptance instant and stops
+    /// thinking about the covered period. It is also where a port of a
+    /// pre-period model lands: with no period column to order on, the
+    /// acceptance instant is the only time a row carries.
+    ///
+    /// DESIGN puts the period end first, and the whole of §3.1's `Covered
+    /// period` model is why: an entry states what it measured and *when the
+    /// measurement covers*, which is not when the gear happened to accept it.
+    ///
+    /// **It reaches `latest-tie-break`'s `window_end` scenario and no
+    /// other**, measured the same way. That scenario is built for it: its
+    /// later-ending entry carries the *smaller* acceptance instant, so a fold
+    /// that reads `accepted_at` first reports the other entry rather than
+    /// agreeing by accident.
+    LatestIgnoresThePeriodEnd,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -457,7 +538,10 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::FoldsTheInvalidation
         | Defect::LedgerHasNoUniqueConstraint
         | Defect::BatchResolvesAgainstThePreCallLedger
-        | Defect::ADivergentWriteDisplacesTheSurvivor => Box::new(MutantLedger::new(defect)),
+        | Defect::ADivergentWriteDisplacesTheSurvivor
+        | Defect::LatestSkipsTheAcceptanceInstant
+        | Defect::LatestStopsAtTheAcceptanceInstant
+        | Defect::LatestIgnoresThePeriodEnd => Box::new(MutantLedger::new(defect)),
     }
 }
 
@@ -616,7 +700,7 @@ impl WrappedReference {
             // of a matrix row whose subject does nothing. The point read's
             // defect is applied on the read path, the two withdrawal defects
             // and the conflict read-back around the inner call, and the last
-            // two never reach this type at all — `mutant` routes them to
+            // five never reach this type at all — `mutant` routes them to
             // `MutantLedger` — but exhaustiveness is the whole point.
             Defect::IgnoresScopeOnThePointRead
             | Defect::AnswersNotConvergedForAnAcknowledgedEntry
@@ -627,7 +711,10 @@ impl WrappedReference {
             | Defect::FoldsTheInvalidation
             | Defect::LedgerHasNoUniqueConstraint
             | Defect::BatchResolvesAgainstThePreCallLedger
-            | Defect::ADivergentWriteDisplacesTheSurvivor => Ok(record),
+            | Defect::ADivergentWriteDisplacesTheSurvivor
+            | Defect::LatestSkipsTheAcceptanceInstant
+            | Defect::LatestStopsAtTheAcceptanceInstant
+            | Defect::LatestIgnoresThePeriodEnd => Ok(record),
         }
     }
 
@@ -1474,6 +1561,13 @@ impl UsageCollectorPluginV1 for MutantLedger {
     /// nothing to pair against and the withdrawn measurement is
     /// double-counted.
     ///
+    /// The three `LATEST` defects change nothing about which rows reach the
+    /// fold and everything about which of them it ranks highest: they travel
+    /// as a [`LatestOrder`] into [`fold_rows`] and are read by that function
+    /// alone. A fold defect is the one kind this type can carry without
+    /// touching its own selection, which is why the row filter above is
+    /// blind to all three.
+    ///
     /// Everything after the row filter — the grouping, the bucket cap, the
     /// split an empty selection makes by fold — is [`fold_rows`]'s, which
     /// mirrors the reference's function of the same name. Answering only one
@@ -1500,7 +1594,7 @@ impl UsageCollectorPluginV1 for MutantLedger {
                 rows.push(entry);
             }
         }
-        fold_rows(fold, &rows, group_by)
+        fold_rows(fold, &rows, group_by, LatestOrder::of(self.defect))
     }
 
     async fn list_usage_records(
@@ -1551,7 +1645,7 @@ impl UsageCollectorPluginV1 for MutantLedger {
     /// `feed-retention-refusal`, though no mark can rise until this type is
     /// drivable.
     ///
-    /// Neither defect routed here touches the feed. This method is a mirror
+    /// No defect routed here touches the feed. This method is a mirror
     /// and nothing more: a wrong answer invented for it would fail a future
     /// check for a reason no matrix row names.
     async fn read_feed_page(
@@ -1658,7 +1752,7 @@ impl UsageCollectorPluginV1 for MutantLedger {
 
         Ok(ReconciliationMetadata {
             accepted_count: u64::try_from(accepted_count).unwrap_or(u64::MAX),
-            quantity_summary: fold_value(fold, &folded)?,
+            quantity_summary: fold_value(fold, &folded, LatestOrder::of(self.defect))?,
             max_accepted_at: in_scope().map(|entry| entry.accepted_at).max(),
             max_window_end: in_scope().map(|entry| entry.window_end).max(),
         })
@@ -1886,12 +1980,13 @@ fn fold_rows(
     fold: AggregationFold,
     rows: &[&UsageRecord],
     group_by: &[AggregationDimension],
+    latest_order: LatestOrder,
 ) -> Result<AggregationResult, UsageCollectorPluginError> {
     if group_by.is_empty() {
         return Ok(AggregationResult {
             buckets: vec![AggregationBucket {
                 key: Vec::new(),
-                value: fold_value(fold, rows)?,
+                value: fold_value(fold, rows, latest_order)?,
             }],
         });
     }
@@ -1907,7 +2002,7 @@ fn fold_rows(
     for (key, group) in groups.into_iter().take(MAX_AGGREGATION_BUCKETS + 1) {
         buckets.push(AggregationBucket {
             key,
-            value: fold_value(fold, &group)?,
+            value: fold_value(fold, &group, latest_order)?,
         });
     }
     Ok(AggregationResult { buckets })
@@ -1950,13 +2045,16 @@ fn bucket_key(row: &UsageRecord, group_by: &[AggregationDimension]) -> Option<Ve
 /// and answer `None`. This mirror used to answer absent for an empty `SUM`,
 /// which was the reference's own answer before it was brought to DESIGN.
 ///
-/// **`LATEST` takes the greatest `(window_end, accepted_at, id)`**, the whole
-/// of DESIGN §3.1's declared order. All three keys are read, and `id` is
-/// compared as bytes by [`Uuid`]'s derived `Ord`, so the order is total and
-/// the answer never depends on ledger insertion order.
+/// **`LATEST` takes whichever order [`LatestOrder`] names**, which is
+/// [`LatestOrder::Declared`] — the whole of DESIGN §3.1's three keys — for
+/// every subject but the three that exist to get one of those keys wrong.
+/// Under the declared order all three keys are read, and `id` is compared as
+/// bytes by [`Uuid`]'s derived `Ord`, so the order is total and the answer
+/// never depends on ledger insertion order.
 fn fold_value(
     fold: AggregationFold,
     rows: &[&UsageRecord],
+    latest_order: LatestOrder,
 ) -> Result<Option<BigDecimal>, UsageCollectorPluginError> {
     if matches!(fold, AggregationFold::Count) {
         let count = u64::try_from(rows.len()).map_err(|_| {
@@ -1974,14 +2072,86 @@ fn fold_value(
         }
         AggregationFold::Max => rows.iter().max_by_key(|row| row.quantity.as_decimal()),
         AggregationFold::Min => rows.iter().min_by_key(|row| row.quantity.as_decimal()),
-        AggregationFold::Latest => rows
-            .iter()
-            .max_by_key(|row| (row.window_end, row.accepted_at, row.id)),
+        AggregationFold::Latest => latest_order.pick(rows),
         AggregationFold::Count => None,
     };
     winner
         .map(|row| widen(row.quantity.as_decimal()))
         .transpose()
+}
+
+/// Which of DESIGN §3.1's three `LATEST` keys a subject's fold reads.
+///
+/// The order is *"Greatest `window_end`, then greatest `accepted_at`, then
+/// greatest `id` in byte order"*, and one variant here strikes out each of
+/// the three. They are spelled as one enum rather than as three branches on
+/// [`Defect`] because that is what makes the set visibly complete: a fourth
+/// way to get this order wrong would be a fourth key, and there is no fourth
+/// key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatestOrder {
+    /// All three keys, as DESIGN declares them. Every subject but three.
+    Declared,
+    /// `(window_end, id)` — [`Defect::LatestSkipsTheAcceptanceInstant`].
+    WithoutTheAcceptanceInstant,
+    /// `(window_end, accepted_at)` —
+    /// [`Defect::LatestStopsAtTheAcceptanceInstant`]. What is left is settled
+    /// on arrival, because [`Iterator::max_by_key`] answers the **last**
+    /// maximum: a partial order does not stop a backend answering, it stops
+    /// the answer meaning anything.
+    WithoutTheIdentifier,
+    /// `(accepted_at, id)` — [`Defect::LatestIgnoresThePeriodEnd`].
+    WithoutThePeriodEnd,
+}
+
+impl LatestOrder {
+    /// The order one subject folds `LATEST` under.
+    fn of(defect: Defect) -> Self {
+        match defect {
+            Defect::LatestSkipsTheAcceptanceInstant => Self::WithoutTheAcceptanceInstant,
+            Defect::LatestStopsAtTheAcceptanceInstant => Self::WithoutTheIdentifier,
+            Defect::LatestIgnoresThePeriodEnd => Self::WithoutThePeriodEnd,
+            // Enumerated rather than caught by a wildcard, for the reason
+            // `WrappedReference::admit_here` enumerates its own: a fold
+            // defect added later and forgotten here would silently fold
+            // under DESIGN's order and report nothing at all, which is a
+            // matrix row whose subject does nothing rather than a compile
+            // error. Ten of these never reach this type - `mutant` routes
+            // them to `WrappedReference` - but exhaustiveness is the point.
+            Defect::QuantityThroughFloat
+            | Defect::StampsItsOwnAcceptedAt
+            | Defect::DefaultsOriginToLive
+            | Defect::SelectsOnWindowStart
+            | Defect::DedupIgnoresThePeriod
+            | Defect::DedupIgnoresTheEntryType
+            | Defect::ConflictReadBackIgnoresTheEntryType
+            | Defect::FoldsTheInvalidation
+            | Defect::AbsorbsAWithdrawalWithAnotherReason
+            | Defect::RefusesAWithdrawalWithTheSameReason
+            | Defect::IgnoresScopeOnThePointRead
+            | Defect::AnswersNotConvergedForAnAcknowledgedEntry
+            | Defect::LedgerHasNoUniqueConstraint
+            | Defect::BatchResolvesAgainstThePreCallLedger
+            | Defect::ADivergentWriteDisplacesTheSurvivor => Self::Declared,
+        }
+    }
+
+    /// The row this order picks out of a bucket, or `None` when the bucket is
+    /// empty.
+    fn pick<'rows>(self, rows: &'rows [&UsageRecord]) -> Option<&'rows &'rows UsageRecord> {
+        match self {
+            Self::Declared => rows
+                .iter()
+                .max_by_key(|row| (row.window_end, row.accepted_at, row.id)),
+            Self::WithoutTheAcceptanceInstant => {
+                rows.iter().max_by_key(|row| (row.window_end, row.id))
+            }
+            Self::WithoutTheIdentifier => rows
+                .iter()
+                .max_by_key(|row| (row.window_end, row.accepted_at)),
+            Self::WithoutThePeriodEnd => rows.iter().max_by_key(|row| (row.accepted_at, row.id)),
+        }
+    }
 }
 
 /// Widens a quantity to the aggregate surface's carrier, through the decimal

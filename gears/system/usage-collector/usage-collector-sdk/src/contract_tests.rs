@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds fifteen deliberately
+//! as coverage. [`super::contract_mutants`] holds eighteen deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -49,7 +49,7 @@ use super::contract_mutants::{Defect, mutant};
 use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, CONVERGED_TARGET_LOOKUP,
     DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, HARNESS_FAULT,
-    IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD, QUANTITY_ROUND_TRIP,
+    IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD, LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP,
     RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH,
     SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS, WINDOW_END_SELECTION,
     reference::InMemoryReferencePlugin, retention::ContractRetention, run_all,
@@ -141,7 +141,7 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
 /// A literal here would go on matching a constant that had been respelled,
 /// and the row would then assert nothing about the check it names.
 ///
-/// **Five rows name more than one check**, and none is a mutant wrong
+/// **Six rows name more than one check**, and none is a mutant wrong
 /// twice: each is a real overlap between checks, which is what the matrix
 /// has to be able to say without loosening into a subset assertion.
 ///
@@ -248,9 +248,37 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
 /// caller-facing one each report on their own and taking either away leaves
 /// the row unchanged. Taking both away removes this check from the row and
 /// changes nothing else.
+///
+/// [`Defect::StampsItsOwnAcceptedAt`] is the sixth, and the newest: it
+/// arrived at a second check when `latest-tie-break` landed. That subject
+/// writes one fixed instant into `accepted_at` on admission, so any two
+/// entries it stores agree on the middle key of DESIGN §3.1's `LATEST`
+/// order — and that check's `accepted_at` scenario is two entries that agree
+/// on the first key and are separated by the middle one. With the middle key
+/// flattened the fold falls to `id`, which that scenario deliberately
+/// inverts, so the wrong entry wins.
+///
+/// This coupling is DESIGN's too, and it is the tightest of the six. §3.1's
+/// "Server-assigned field fidelity" obliges a plugin to persist the
+/// `accepted_at` it was handed, and §3.1's `LATEST` tie-break reads that same
+/// field as its middle key. A backend that does not keep the value cannot
+/// order by it, so no fixture arrangement separates the two checks: one is
+/// about storing the field and the other about ranking on it, and the second
+/// presupposes the first. `latest-tie-break`'s other two scenarios pass
+/// against this subject, which is the evidence the coupling is confined to
+/// the one key — the `window_end` scenario separates above it and the
+/// cross-tenant scenario ties on it by construction.
+///
+/// The three subjects that follow it in the matrix are the isolating ones
+/// for that check: one per key of DESIGN's three-key order, each naming
+/// `latest-tie-break` alone. `super::contract_mutants`'s header says why the
+/// set of three is complete.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
-    (Defect::StampsItsOwnAcceptedAt, &[SERVER_FIELD_ROUND_TRIP]),
+    (
+        Defect::StampsItsOwnAcceptedAt,
+        &[SERVER_FIELD_ROUND_TRIP, LATEST_TIE_BREAK],
+    ),
     (Defect::DefaultsOriginToLive, &[SERVER_FIELD_ROUND_TRIP]),
     (
         Defect::SelectsOnWindowStart,
@@ -309,13 +337,19 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
         Defect::ADivergentWriteDisplacesTheSurvivor,
         &[DEDUP_CONCURRENT],
     ),
+    (Defect::LatestSkipsTheAcceptanceInstant, &[LATEST_TIE_BREAK]),
+    (
+        Defect::LatestStopsAtTheAcceptanceInstant,
+        &[LATEST_TIE_BREAK],
+    ),
+    (Defect::LatestIgnoresThePeriodEnd, &[LATEST_TIE_BREAK]),
 ];
 
 /// Every check fails against a backend that gets its rule wrong, and passes
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all fifteen mutants is not
+/// of sensitivity. A check that fails against all eighteen mutants is not
 /// detecting its own rule; it is detecting that something is different. So
 /// each row asserts a full column: the named check fails, and the others
 /// still pass against the same mutant.
@@ -2156,13 +2190,13 @@ async fn the_retention_refusal_does_not_consult_the_callers_scope() {
 // ---------------------------------------------------------------------------
 //
 // The reference backend's fold and its reconciliation figures. Unit tests of
-// the reference implementation rather than contract checks: DESIGN section
-// 3.3's `latest-tie-break` is written against the SPI for any backend and is
-// in `UNWRITTEN_CHECKS`, and no check of the sixteen reads a reconciliation
-// quantity summary at all. What the tests below hold is the suite's own
-// subject to the rules a check will later assert against every plugin, so
-// that when one lands it is validated against a backend already answering
-// them.
+// the reference implementation rather than contract checks, and the halves
+// have parted: DESIGN section 3.3's `latest-tie-break` has landed, so the
+// `LATEST` order below is now asserted against every plugin as well as here,
+// while no check of the sixteen reads a reconciliation quantity summary at
+// all. What the tests below hold is the suite's own subject to those rules,
+// which is how the check was validated before it was pointed at anything
+// else.
 
 /// The meter the tests below write to.
 ///
@@ -2236,14 +2270,6 @@ const LATEST_TIE_EARLIER_QUANTITY: &str = "11";
 /// reports. Distinct from the one above, which is the whole assertion.
 const LATEST_TIE_LATER_QUANTITY: &str = "22";
 
-/// How many indexed key pairs [`latest_tie_break_pair`] tries.
-///
-/// Each attempt inverts with probability one half and the attempts are
-/// independent, so sixty-four of them miss with probability 2^-64. The bound
-/// is there so a derivation that stopped producing an inversion at all fails
-/// loudly instead of looping.
-const LATEST_TIE_BREAK_ATTEMPTS: u32 = 64;
-
 /// One entry of the tie, on the shared meter and tenant.
 fn latest_tie_break_entry(
     role: &str,
@@ -2276,35 +2302,41 @@ fn latest_tie_break_entry(
 ///
 /// It cannot simply be chosen. An `id` is the `UUIDv5` over the six identity
 /// inputs, so which of two entries carries the greater one is a property of
-/// the derived values; the loop varies the one input that is free here, the
+/// the derived values; the search varies the one input that is free here, the
 /// idempotency key, and stops at the first index that inverts. Returns the
 /// two entries and the index they were found at.
+///
+/// The search itself is [`super::fixtures::inverted_id_pair`] rather than a
+/// loop of this test's own, and it is shared with the
+/// [`latest_tie_break`](super::checks::latest_tie_break()) contract check,
+/// which needs the same inversion twice. What is shared is the search and
+/// the bound; what stays here is why *this* pair needs it, which the helper
+/// takes as its `purpose` and reports if it never inverts.
 fn latest_tie_break_pair() -> (UsageRecord, UsageRecord, u32) {
-    for attempt in 0..LATEST_TIE_BREAK_ATTEMPTS {
-        let earlier = latest_tie_break_entry(
-            "earlier",
-            attempt,
-            LATEST_TIE_EARLIER_QUANTITY,
-            super::fixtures::CONTRACT_ACCEPTED_AT,
-        );
-        let later = latest_tie_break_entry(
-            "later",
-            attempt,
-            LATEST_TIE_LATER_QUANTITY,
-            LATEST_TIE_LATER_ACCEPTED_AT,
-        );
-        if later.id < earlier.id {
-            return (earlier, later, attempt);
-        }
-    }
-    panic!(
-        "no pair of indexed idempotency keys inverted the id order within \
-         {LATEST_TIE_BREAK_ATTEMPTS} attempts. The pair this test needs is one whose \
-         later-accepted entry carries the smaller `id`, and an `id` is the UUIDv5 over the six \
-         identity inputs, so the loop searches for it rather than choosing it. Without the \
-         inversion a fold keyed on `(window_end, id)` alone picks the same winner as one keyed \
-         on `(window_end, accepted_at, id)`, and this test would pass while asserting nothing"
-    );
+    let (later, earlier, attempt) = super::fixtures::inverted_id_pair(
+        "The pair this test needs is one whose later-accepted entry carries the smaller `id`: \
+         without the inversion a fold keyed on `(window_end, id)` alone picks the same winner \
+         as one keyed on `(window_end, accepted_at, id)`, and this test would pass while \
+         asserting nothing.",
+        |attempt| {
+            Ok((
+                latest_tie_break_entry(
+                    "later",
+                    attempt,
+                    LATEST_TIE_LATER_QUANTITY,
+                    LATEST_TIE_LATER_ACCEPTED_AT,
+                ),
+                latest_tie_break_entry(
+                    "earlier",
+                    attempt,
+                    LATEST_TIE_EARLIER_QUANTITY,
+                    super::fixtures::CONTRACT_ACCEPTED_AT,
+                ),
+            ))
+        },
+    )
+    .unwrap_or_else(|detail| panic!("{detail}"));
+    (earlier, later, attempt)
 }
 
 /// `LATEST` breaks a `window_end` tie on the greater `accepted_at`, the
