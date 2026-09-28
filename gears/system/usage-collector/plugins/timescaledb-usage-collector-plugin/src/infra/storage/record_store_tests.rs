@@ -253,6 +253,7 @@ fn row_matching(
         invalidates,
         reason_code,
         origin: record.origin.as_str().to_owned(),
+        entry_type: record.entry_type().as_str().to_owned(),
         acceptance_sequence: 1,
         accepted_at: record.window_end,
         xact_id: "1001".to_owned(),
@@ -377,9 +378,25 @@ async fn resolve_dedup_hit_compares_the_reason_code() {
 // The `.bind()` call sequence is one layer further down and still uncovered
 // here — it needs a live backend, and it is Task 15's.
 
-/// The comma-separated names of a SQL column list.
+/// The comma-separated entries of a SQL column list, verbatim.
 fn names(list: &str) -> Vec<&str> {
     list.split(',').map(str::trim).collect()
+}
+
+/// [`names`], reduced to the name each entry decodes as: the alias of an
+/// `expr AS alias` entry, and the entry itself otherwise.
+///
+/// `RECORD_COLUMNS` carries two cast entries whose aliases are what
+/// `UsageRecordRow`'s fields are looked up by, so a set comparison against
+/// `INSERT_COLUMNS` has to be over these rather than over the raw entries.
+/// Deliberately narrow: it recognizes ` AS ` and nothing else, so an entry
+/// shaped some other way stays whole and reds a comparison rather than being
+/// silently normalized into one.
+fn decoded_names(list: &str) -> Vec<&str> {
+    names(list)
+        .into_iter()
+        .map(|entry| entry.rsplit_once(" AS ").map_or(entry, |(_, alias)| alias))
+        .collect()
 }
 
 /// Every inserted column paired with the array element type the batch insert
@@ -451,21 +468,20 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
     // stamps it from `pg_current_xact_id()` — so it is read and never
     // written, and it is the whole of the difference.
     //
-    // The read side's entry is asserted as the full select expression
-    // `xact_id::text AS xact_id`, because `names()` splits on commas and
-    // trims and does nothing else. Read literally on purpose rather than
-    // normalized down to the bare name, and the two halves are pinned for
-    // different reasons. `::text` is load-bearing: `xid8` has no `sqlx`
-    // decode, so without the cast every read of the ledger fails, and much of
-    // the pg lane says so. The alias is *not* — dropping it and running the
-    // whole `--features postgres` lane leaves every other test green, because
-    // `PostgreSQL` names the output of a bare column cast after the column
-    // anyway. It is pinned here because that is a naming rule of the server
-    // and `UsageRecordRow`'s field is looked up by name: the alias says which
-    // name is meant instead of inheriting one, and this assertion is the only
-    // thing that would notice it going away.
+    // The comparison is over the name each entry *decodes as*, because two of
+    // the read list's entries are select expressions rather than bare names:
+    // `xact_id::text AS xact_id` and `entry_type::text AS entry_type`. Both
+    // casts are load-bearing and neither alias is. `xid8` has no `sqlx` decode
+    // at all and `usage_entry_type` is a Postgres enum, which `sqlx` refuses to
+    // decode into the `String` the row carries -- so without either cast every
+    // read of the ledger fails, and much of the pg lane says so. Dropping an
+    // alias and running the whole `--features postgres` lane leaves every other
+    // test green, because `PostgreSQL` names the output of a bare column cast
+    // after the column anyway; the aliases are pinned below because that is a
+    // naming rule of the server and `UsageRecordRow`'s fields are looked up by
+    // name.
     let insert_names: BTreeSet<&str> = names(INSERT_COLUMNS).into_iter().collect();
-    let record_names: BTreeSet<&str> = names(RECORD_COLUMNS).into_iter().collect();
+    let record_names: BTreeSet<&str> = decoded_names(RECORD_COLUMNS).into_iter().collect();
     assert!(
         insert_names.is_subset(&record_names),
         "every written column must also be read back: missing {:?}",
@@ -473,16 +489,16 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
     );
     assert_eq!(
         record_names.difference(&insert_names).collect::<Vec<_>>(),
-        vec![&"xact_id::text AS xact_id"],
+        vec![&"xact_id"],
         "the read list may add only the columns the ledger writes itself, and \
-         xact_id is the only one RECORD_COLUMNS decodes"
+         xact_id is the only column the ledger writes itself"
     );
     // The two comparisons above are over sets, which de-duplicate before they
     // compare: a repeated entry would pass both. The sorted-vector form this
     // test used to have caught that for free and the set form does not, so the
     // multiplicity is asserted directly rather than lost with the re-aim.
     assert_eq!(
-        names(RECORD_COLUMNS).len(),
+        decoded_names(RECORD_COLUMNS).len(),
         record_names.len(),
         "RECORD_COLUMNS must name each column exactly once"
     );
@@ -491,16 +507,15 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
         INSERT_COLUMN_ARRAY_TYPES.len(),
         "one array type per inserted column, in the same order"
     );
-    assert!(
-        !names(RECORD_COLUMNS).contains(&"entry_type"),
-        "entry_type is a generated column: no insert binds it, and no \
-         production select decodes it -- it is absent from RECORD_COLUMNS, so \
-         no row carries it and the mapper projects the model's entry type from \
-         `invalidates`. It is named in the dedup arbiter and in the conflict \
-         read-back's predicate, where Postgres evaluates it rather than \
-         handing it back. A pg test may still select it to assert the \
-         generation expression"
-    );
+    // The two casts, pinned as the literal select expressions they are --
+    // `decoded_names` above deliberately cannot see them.
+    let record_exprs = names(RECORD_COLUMNS);
+    for expr in ["entry_type::text AS entry_type", "xact_id::text AS xact_id"] {
+        assert!(
+            record_exprs.contains(&expr),
+            "`{expr}` must be read back exactly so, cast and alias: {RECORD_COLUMNS}"
+        );
+    }
     assert_eq!(
         names(INSERT_COLUMNS).last(),
         Some(&"metadata"),
@@ -524,13 +539,29 @@ fn the_single_insert_binds_one_placeholder_per_inserted_column() {
         .and_then(|(_, rest)| rest.split_once(')'))
         .expect("the insert has a VALUES list")
         .0;
-    let want: Vec<String> = (1..=names(INSERT_COLUMNS).len())
-        .map(|i| format!("${i}"))
+    // `entry_type` is the one placeholder that carries a cast, and it carries
+    // the enum the migration declares the column as: `sqlx` types the bound
+    // `&str` as `text`, and PostgreSQL refuses `text` in assignment to an enum
+    // column. Derived from `ddl_column_array_types` rather than written out, so
+    // a renamed enum moves both sides together and a cast applied to the wrong
+    // column still reds.
+    let want: Vec<String> = ddl_column_array_types()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, ty))| {
+            let n = i + 1;
+            if name == "entry_type" {
+                format!("${n}::{ty}")
+            } else {
+                format!("${n}")
+            }
+        })
         .collect();
     assert_eq!(
         names(values),
         want,
-        "$n must be column n, numbered from 1 with no gap"
+        "$n must be column n, numbered from 1 with no gap, and only the enum \
+         column's placeholder may carry a cast"
     );
     assert!(
         sql.contains(
@@ -822,6 +853,12 @@ fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
         "and the pair travels together"
     );
     assert_eq!(cols.origins, vec!["live".to_owned(), "live".to_owned()]);
+    assert_eq!(
+        cols.entry_types,
+        vec!["record", "invalidation"],
+        "each representative's own declared kind, and the pair here is one of \
+         each so a constant would not pass"
+    );
     assert_eq!(
         cols.sequences,
         vec![7, 8],
@@ -1537,6 +1574,7 @@ fn keyed_row() -> UsageRecordRow {
         invalidates: None,
         reason_code: None,
         origin: "backfill".to_owned(),
+        entry_type: "record".to_owned(),
         acceptance_sequence: 9,
         accepted_at: time::OffsetDateTime::from_unix_timestamp(WINDOW_END_UNIX).expect("valid ts"),
         xact_id: "9042".to_owned(),
@@ -1607,12 +1645,14 @@ fn each_cursor_key_reads_the_column_its_order_field_names() {
 #[test]
 fn a_field_that_is_not_a_keyset_key_mints_no_boundary() {
     // All four resolve through `record_column`, so all four can appear in an
-    // `ORDER BY` that renders. None is keyset-safe: three are domain-optional
-    // and `entry_type` is derived from an optional attribute, so a row-value
-    // tuple over any of them can compare as NULL and drop rows out of the page
-    // silently. Refusing to mint is the fail-closed answer, and `subject_id` /
-    // `subject_type` are populated on this row so the refusal cannot be read as
-    // a NULL column.
+    // `ORDER BY` that renders. None is keyset-safe. Three are domain-optional,
+    // so a row-value tuple over them can compare as NULL and drop rows out of
+    // the page silently; `entry_type` is `NOT NULL` in the ledger and is
+    // refused for the other reason `record_row_key`'s doc gives -- the SDK's
+    // `KEYSET_SAFE_RECORD_FIELDS` is the whole rule, and the SDK does not carry
+    // the kind as an attribute in its own right. Refusing to mint is the
+    // fail-closed answer, and `subject_id` / `subject_type` are populated on
+    // this row so the refusal cannot be read as a NULL column.
     let row = keyed_row();
 
     for field in ["subject_id", "subject_type", "invalidates", "entry_type"] {

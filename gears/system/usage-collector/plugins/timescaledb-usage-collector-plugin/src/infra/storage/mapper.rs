@@ -189,12 +189,16 @@ pub fn metadata_map_to_jsonb(map: &BTreeMap<MetadataKey, String>) -> JsonValue {
 
 /// Map a [`UsageRecordRow`] into a validated [`UsageRecord`].
 ///
-/// The row's ordering columns, `acceptance_sequence` and `xact_id`, are read
-/// and deliberately dropped, because the model has no field for either: one is
-/// this plugin's own assignment and the other the database's, and neither
-/// travels back out through the SPI as a record field. This is not an
-/// oversight; see [`UsageRecordRow`]'s own doc for why they are decoded at
-/// all.
+/// The row's two ordering columns and its `entry_type` are read and
+/// deliberately dropped, because the model has no field for any of them.
+/// `acceptance_sequence` and `xact_id` are assignments made where the entry is
+/// stored — one this plugin's, one the database's — and neither travels back
+/// out through the SPI as a record field. `entry_type` is dropped for the
+/// opposite reason: the model already answers what it holds, projecting an
+/// entry's kind from the `Invalidation` it carries, and
+/// `cpt-cf-usage-collector-adr-append-only-invalidation` is explicit that no
+/// discriminator may sit beside that projection. None of this is an oversight;
+/// see [`UsageRecordRow`]'s own doc for why they are decoded at all.
 ///
 /// The two stored pairs are treated asymmetrically, deliberately. A
 /// half-populated invalidation pair is *refused*, because [`Invalidation`] has

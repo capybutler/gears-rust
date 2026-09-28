@@ -70,14 +70,14 @@ const MIGRATION_SQL: &str = include_str!("../../../migrations/0001_init.sql");
 /// A column line is indented exactly four spaces, names an all-lower-case
 /// identifier, and has a second token after it. That drops the `--` comments,
 /// the upper-case `PRIMARY KEY`/`CONSTRAINT` lines, and the more deeply
-/// indented constraint bodies and generated-column continuations. The second
-/// token is the declared type, with a trailing `,` stripped — a nullable
-/// column ends its line at the type, so `subject_id text,` yields `text` and
-/// not `text,`. Every column in this table spells its type as a single word, so
-/// `NOT NULL`, `DEFAULT …`, `CHECK …` and `GENERATED ALWAYS …` all fall after
-/// it; a parenthesized type carrying a space (`numeric(38, 9)`) would split
-/// across tokens and red the pairing test rather than pass a wrong type
-/// silently, which is the direction this parser fails in throughout.
+/// indented constraint bodies. The second token is the declared type, with a
+/// trailing `,` stripped — a nullable column ends its line at the type, so
+/// `subject_id text,` yields `text` and not `text,`. Every column in this
+/// table spells its type as a single word, so `NOT NULL`, `DEFAULT …` and
+/// `CHECK …` all fall after it; a parenthesized type carrying a space
+/// (`numeric(38, 9)`) would split across tokens and red the pairing test
+/// rather than pass a wrong type silently, which is the direction this parser
+/// fails in throughout.
 #[expect(
     clippy::expect_used,
     reason = "a migration this parser cannot read must abort loudly; an Option a caller \
@@ -113,25 +113,24 @@ pub fn ledger_columns() -> Vec<(&'static str, &'static str)> {
 /// The columns of [`ledger_columns`] that an `INSERT` writes, `(name, type)` in
 /// declaration order.
 ///
-/// The exclusions are named here and **not** derived from `INSERT_COLUMNS`,
-/// which is one of the constants this oracle exists to check: deriving them
+/// The exclusion is named here and **not** derived from `INSERT_COLUMNS`,
+/// which is one of the constants this oracle exists to check: deriving it
 /// from the code under test would let a column dropped from `INSERT_COLUMNS`
-/// disappear from the expectation with it. `entry_type` is `GENERATED ALWAYS
-/// … STORED`, so the ledger writes it itself; `xact_id` is stamped by its
-/// column default `pg_current_xact_id()` and never bound by the Record Store,
-/// which is what makes every entry of one batch share one value (this
-/// plugin's DESIGN §3.6); every other column, `metadata`'s own default
-/// notwithstanding, is supplied per row.
+/// disappear from the expectation with it. `xact_id` is stamped by its column
+/// default `pg_current_xact_id()` and never bound by the Record Store, which
+/// is what makes every entry of one batch share one value (this plugin's
+/// DESIGN §3.6); every other column, `metadata`'s own default and
+/// `entry_type`'s enum type notwithstanding, is supplied per row.
 ///
-/// Both exclusions are held to the live table by
+/// The exclusion is held to the live table by
 /// `schema_integration_pg::the_live_columns_are_the_migrations_columns_in_order`,
-/// which reads back that `entry_type` is generated and that `xact_id` carries
-/// a default — so neither is an exclusion this parse merely asserts about
+/// which reads back that `xact_id` carries a default and that `entry_type`
+/// does not — so it is not an exclusion this parse merely asserts about
 /// itself.
 #[must_use]
 pub fn insertable_columns() -> Vec<(&'static str, &'static str)> {
     ledger_columns()
         .into_iter()
-        .filter(|(name, _)| !matches!(*name, "entry_type" | "xact_id"))
+        .filter(|(name, _)| *name != "xact_id")
         .collect()
 }

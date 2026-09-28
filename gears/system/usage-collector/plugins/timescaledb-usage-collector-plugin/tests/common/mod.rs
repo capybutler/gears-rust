@@ -738,3 +738,112 @@ pub fn tenant_scope(tenant: Uuid) -> ast::Expr {
         Box::new(ast::Expr::Value(ast::Value::Uuid(tenant))),
     )
 }
+
+/// Insert one `usage_records` row binding every column directly, so a test can
+/// write a shape the SPI cannot express.
+///
+/// Every column is defaulted to a well-formed ordinary measurement, and the
+/// columns `usage_records_invalidation_pairing` spans are the settable ones,
+/// because they are the whole point: the SPI builds an entry's kind and its
+/// withdrawal pair from one `Option<Invalidation>` (`UsageRecord::entry_type`,
+/// `mapper::invalidation_to_row`), so a row whose declared kind disagrees with
+/// its pair is unreachable through `RecordStore::create` and reachable only
+/// here.
+///
+/// It binds `entry_type` explicitly, which is what makes it an escape hatch
+/// rather than a second `create`: the column is written from the dispatched
+/// entry's declared kind, so a raw insert is the only writer that can declare
+/// one thing and store another.
+#[must_use]
+pub fn insert_raw_entry(pool: &PgPool) -> RawEntry<'_> {
+    RawEntry {
+        pool,
+        id: Uuid::new_v4(),
+        entry_type: "record",
+        invalidates: None,
+        reason_code: None,
+    }
+}
+
+/// The tenant every [`insert_raw_entry`] row is written under.
+///
+/// The max UUID, because every other tenant in these suites is a small
+/// hand-picked integer: a raw row can then never be mistaken for one an
+/// SPI-driven test wrote, whatever values that test picks later.
+const RAW_ENTRY_TENANT: Uuid = Uuid::max();
+
+/// The builder [`insert_raw_entry`] returns. See its doc.
+pub struct RawEntry<'a> {
+    pool: &'a PgPool,
+    id: Uuid,
+    entry_type: &'a str,
+    invalidates: Option<Uuid>,
+    reason_code: Option<&'a str>,
+}
+
+impl<'a> RawEntry<'a> {
+    /// Declare the entry's kind, as the `usage_entry_type` label to store.
+    /// Taken as a string rather than as [`EntryType`] so a test can write a
+    /// label the enum does not carry.
+    #[must_use]
+    pub const fn entry_type(mut self, kind: &'a str) -> Self {
+        self.entry_type = kind;
+        self
+    }
+
+    /// Set (or clear) the entry this one withdraws.
+    #[must_use]
+    pub const fn invalidates(mut self, target: Option<Uuid>) -> Self {
+        self.invalidates = target;
+        self
+    }
+
+    /// Set (or clear) the withdrawal reason.
+    #[must_use]
+    pub const fn reason_code(mut self, reason: Option<&'a str>) -> Self {
+        self.reason_code = reason;
+        self
+    }
+
+    /// Run the insert.
+    ///
+    /// Returns the raw `sqlx` error on refusal, so a caller can assert on the
+    /// constraint name `PostgreSQL` reports.
+    ///
+    /// The type key is bound as a literal rather than resolved through
+    /// `usage_type_key`: nothing references that table, so any integer
+    /// partitions the row correctly for a test that never reads it back by
+    /// type.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `PostgreSQL` refuses the row with.
+    pub async fn execute(self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO usage_records (id, tenant_id, gts_type_id, type_key, quantity, \
+                 window_start, window_end, resource_id, resource_type, subject_id, \
+                 subject_type, idempotency_key, invalidates, reason_code, origin, \
+                 entry_type, acceptance_sequence, accepted_at, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, $12, 'live', \
+                 $13::usage_entry_type, $14, $15, '{}'::jsonb)",
+        )
+        .bind(self.id)
+        .bind(RAW_ENTRY_TENANT)
+        .bind(VCPU_METER)
+        .bind(1_i32)
+        .bind(Decimal::ONE)
+        .bind(fixture_window_start())
+        .bind(fixture_window_end())
+        .bind("raw-resource-id")
+        .bind("raw-resource-type")
+        .bind(self.id.to_string())
+        .bind(self.invalidates)
+        .bind(self.reason_code)
+        .bind(self.entry_type)
+        .bind(1_i64)
+        .bind(fixture_window_end())
+        .execute(self.pool)
+        .await
+        .map(|_| ())
+    }
+}

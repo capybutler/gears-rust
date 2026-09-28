@@ -1,10 +1,9 @@
 //! `sqlx` row struct mirroring the `usage_records` hypertable (see
-//! `migrations/0001_init.sql`). It is the only table with a row struct here,
-//! and the reason is what this struct is for rather than a rule about the
-//! others: [`super::mapper`] turns a whole ledger row into the validated SDK
-//! `UsageRecord`, and looking its columns up by field name is what keeps that
-//! mapping legible against the DDL. A query against any other table decodes
-//! just what that query needs, at its own call site.
+//! `migrations/0001_init.sql`). It exists because [`super::mapper`] turns a
+//! whole ledger row into the validated SDK `UsageRecord`, and looking its
+//! columns up by field name is what keeps that mapping legible against the
+//! DDL. A query that needs only part of some table decodes just that part, at
+//! its own call site, and wants no struct here.
 //!
 //! It carries the raw storage-typed columns; [`super::mapper`] turns a row
 //! into the validated SDK model (and back where needed: the same module holds
@@ -12,8 +11,11 @@
 //! DDL: `uuid` → [`Uuid`], `text` → [`String`], `int` → `i32`, `numeric` →
 //! [`Decimal`], `timestamptz` → [`OffsetDateTime`], `bigint` → `i64`, `jsonb`
 //! → [`serde_json::Value`], and a nullable `text` / `uuid` → `Option<…>`.
-//! `xid8` is the exception, and not a mapping at all: `sqlx` cannot decode it,
-//! so the read list casts it and it arrives as a [`String`].
+//! `xid8` and `usage_entry_type` are exceptions, and neither is a mapping at
+//! all: `sqlx` decodes neither into anything this struct could carry — it has
+//! no `xid8` implementation, and [`String`] declares itself `TEXT`, which
+//! `sqlx` holds incompatible with a `PostgreSQL` enum — so the read list casts
+//! both to `text` and both arrive as [`String`]s.
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -37,12 +39,16 @@ use uuid::Uuid;
 /// the database and orders the feed. Both are decoded rather than left out of
 /// the struct so a row is a faithful picture of what was stored.
 ///
-/// The ledger's `entry_type` is deliberately *not* a field. It is a stored
-/// generated column — `CASE WHEN invalidates IS NULL THEN 'record' ELSE
-/// 'invalidation' END` — that exists so `$filter=entry_type eq 'invalidation'`
-/// resolves to a real column. Nothing decodes it, because the SDK model
-/// derives the same fact from `invalidation.is_some()`; a field here would be
-/// a second, redundant spelling of [`Self::invalidates`].
+/// [`Self::entry_type`] has no counterpart on the SDK's `UsageRecord` either,
+/// for a different reason: the model projects an entry's kind from the
+/// [`Invalidation`](usage_collector_sdk::Invalidation) it carries and
+/// deliberately stores no discriminator beside it
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`), so
+/// [`super::mapper::record_row_to_model`] has nowhere to put the column and
+/// does not carry it across. The ledger stores it all the same, because the
+/// dedup identity needs the kind as an indexable column of
+/// `usage_records_dedup_uniq`; `usage_records_invalidation_pairing` is what
+/// keeps the stored kind and the stored pair from disagreeing.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UsageRecordRow {
     /// `id` — deterministic gateway-derived entry identity (part of the
@@ -93,6 +99,15 @@ pub struct UsageRecordRow {
     /// spelling [`RecordOrigin`](usage_collector_sdk::RecordOrigin) owns and
     /// the DDL `CHECK` pins.
     pub origin: String,
+    /// `entry_type` — the entry's declared kind, as the dispatched entry
+    /// declared it. Read by [`super::record_store`]'s dedup key, which needs
+    /// the stored row and an incoming record to key alike; not carried on the
+    /// SDK model, see the struct doc.
+    ///
+    /// A `String` because `usage_entry_type` is a `PostgreSQL` enum and
+    /// `sqlx` refuses to decode one into a `TEXT`-declared Rust type, so the
+    /// read list selects `entry_type::text`.
+    pub entry_type: String,
     /// `acceptance_sequence` — plugin-assigned, strictly monotonic per
     /// `(tenant_id, gts_type_id)`. Not carried on the SDK model; see the
     /// struct doc.

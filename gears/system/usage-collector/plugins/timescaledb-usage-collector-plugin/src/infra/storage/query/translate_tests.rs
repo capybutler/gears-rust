@@ -280,9 +280,69 @@ fn binary_eq_renders_single_placeholder_and_one_bind() {
     );
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "entry_type = $1");
+    assert_eq!(sql, "entry_type = $1::usage_entry_type");
     assert_eq!(ctx.binds.len(), 1);
     assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "record"));
+}
+
+/// The cast lands on the bound literal, on the one column whose type no
+/// `SqlBind` variant matches, and on nothing else.
+///
+/// `entry_type` is a `PostgreSQL` enum and every bind here is one of five
+/// storage types, none of them that enum, so `usage_records.entry_type = $1`
+/// with a `text` parameter has no operator to resolve to and `PostgreSQL`
+/// refuses the statement. The column stays bare because this plugin's
+/// `DESIGN.md` §3.7 puts the cast on the literal, and because two other
+/// modules document `record_column` as returning bare column names.
+///
+/// The `origin` half is the "and on nothing else": a cast applied to every
+/// comparison would pass the entry-type half alone.
+#[test]
+fn only_the_enum_column_casts_its_bound_literal() {
+    let mut ctx = SqlCtx::new(1);
+    let sql = translate_record_filter(
+        &binary(
+            "entry_type",
+            FilterOp::Eq,
+            ODataValue::String("invalidation".to_owned()),
+        ),
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(sql, "entry_type = $1::usage_entry_type");
+
+    let mut ctx = SqlCtx::new(1);
+    let sql = translate_record_filter(
+        &binary(
+            "origin",
+            FilterOp::Eq,
+            ODataValue::String("backfill".to_owned()),
+        ),
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        sql, "origin = $1",
+        "`origin` is a text column; a bound text value needs no cast"
+    );
+
+    let mut ctx = SqlCtx::new(1);
+    let sql = translate_record_filter(
+        &FilterNode::InList {
+            field: rec_field("entry_type"),
+            values: vec![
+                ODataValue::String("record".to_owned()),
+                ODataValue::String("invalidation".to_owned()),
+            ],
+        },
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        sql, "entry_type IN ($1::usage_entry_type, $2::usage_entry_type)",
+        "a membership test compares through the same operator, so every \
+         literal in it needs the cast too"
+    );
 }
 
 #[test]
@@ -350,7 +410,10 @@ fn composite_or_joins_children_with_or_inside_parens() {
     };
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "(entry_type = $1 OR entry_type = $2)");
+    assert_eq!(
+        sql,
+        "(entry_type = $1::usage_entry_type OR entry_type = $2::usage_entry_type)"
+    );
     assert_eq!(ctx.binds.len(), 2);
 }
 
@@ -374,7 +437,7 @@ fn not_wraps_inner_predicate() {
     )));
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "NOT (entry_type = $1)");
+    assert_eq!(sql, "NOT (entry_type = $1::usage_entry_type)");
 }
 
 #[test]
@@ -386,7 +449,7 @@ fn placeholder_numbering_honors_start_offset() {
     );
     let mut ctx = SqlCtx::new(3);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "entry_type = $3");
+    assert_eq!(sql, "entry_type = $3::usage_entry_type");
 }
 
 // The translator must fail closed on a field whose `name()` is not on the

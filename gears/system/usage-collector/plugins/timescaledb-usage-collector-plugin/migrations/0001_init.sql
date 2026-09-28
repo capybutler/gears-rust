@@ -6,11 +6,22 @@
 -- storage SPI never sees one (the gear's DESIGN §3.7; this plugin's own §3.7
 -- states the target schema, which the migrations on this branch still trail).
 --
--- This file replaces the schema that preceded it and its rename migration
--- outright rather than migrating from them. The gear is unreleased, so no
--- deployment holds rows worth a migration path; the retired 0002 said as much
--- in its own header.
+-- This file replaces the schema that preceded it and that schema's rename
+-- migration outright rather than migrating from them. Neither survives in this
+-- directory. The gear is unreleased, so no deployment holds rows worth a
+-- migration path.
 CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+-- The entry kind, as a 4-byte enum rather than a variable-length string (this
+-- plugin's DESIGN §3.7). `CREATE TYPE` has no `IF NOT EXISTS`, and every
+-- statement in this file must be re-runnable, so the duplicate is swallowed.
+DO $$
+BEGIN
+    CREATE TYPE usage_entry_type AS ENUM ('record', 'invalidation');
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS usage_records (
     -- Deterministic gateway-derived entry identity: UUIDv5 over the 6-tuple
@@ -47,19 +58,16 @@ CREATE TABLE IF NOT EXISTS usage_records (
     origin              text        NOT NULL
         CONSTRAINT usage_records_origin_valid
         CHECK (origin IN ('live', 'backfill')),
-    -- Materialized so `$filter=entry_type eq 'invalidation'` resolves to a
-    -- column. The SDK spells out exactly this expression and notes that the
-    -- value hook cannot carry the field instead (models.rs, UsageRecordQuery).
+    -- The entry's declared kind, written from the dispatched entry and never
+    -- derived from another column (this plugin's DESIGN §3.7). It is the sixth
+    -- input to the derived identity and a column of the dedup UNIQUE below: a
+    -- withdrawal repeats its target's tenant, type, idempotency key and covered
+    -- period, so a constraint over the first five alone would make every
+    -- invalidation a collision with the entry it withdraws.
     --
-    -- Generated, and this migration trails the design on that (this plugin's
-    -- DESIGN §4.5): §3.7's target schema makes it a `usage_entry_type` enum
-    -- "written from the dispatched entry's declared kind and never derived
-    -- from another column". When that lands it takes two things with it — the
-    -- STORED rationale on the dedup UNIQUE below, which is what lets a
-    -- generated column sit in one, and `row_dedup_key`'s reading of an entry's
-    -- kind off `invalidates` (`record_store.rs`).
-    entry_type          text        GENERATED ALWAYS AS
-        (CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END) STORED,
+    -- `$filter=entry_type eq 'invalidation'` compares against it directly, the
+    -- literal casting to the enum.
+    entry_type          usage_entry_type NOT NULL,
     -- Strictly monotonic per (tenant_id, gts_type_id); assigned by this plugin,
     -- never by the gear (the gear's DESIGN §3.7). Claimed from
     -- `usage_acceptance_sequence` below. Gaps are permitted: the obligation is
@@ -76,11 +84,11 @@ CREATE TABLE IF NOT EXISTS usage_records (
     acceptance_sequence bigint      NOT NULL,
     -- Gear-assigned acceptance instant, stamped by the Ingestion Gateway and
     -- written as given. An absorbed retry returns this stored value. `xact_id`
-    -- below is declared between this column and `metadata`, and like
-    -- `entry_type` above it is in neither `INSERT_COLUMNS` (`record_store.rs`)
-    -- nor the binds: that constant is this declaration order with `entry_type`
-    -- and `xact_id` dropped out of it — which still leaves `metadata` last,
-    -- where the batch insert needs it (see the constant's doc).
+    -- below is declared between this column and `metadata`, and it is the one
+    -- column in neither `INSERT_COLUMNS` (`record_store.rs`) nor the binds:
+    -- that constant is this declaration order with `xact_id` dropped out of it
+    -- — which still leaves `metadata` last, where the batch insert needs it
+    -- (see the constant's doc).
     accepted_at         timestamptz NOT NULL,
     -- The inserting transaction's id, and the feed order's first key
     -- (this plugin's DESIGN §3.6 `cpt-cf-uc-plugin-seq-feed-page`). Stamped by
@@ -111,9 +119,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- `entry_type` has to be in it. A withdrawal repeats its target's tenant,
     -- type, idempotency key and covered period, so a constraint over the first
     -- five alone would make every invalidation a collision with the very entry
-    -- it withdraws. It can be in it because it is GENERATED … STORED: a stored
-    -- generated column is an ordinary column to an index, so it may sit in a
-    -- UNIQUE and be named as an ON CONFLICT arbiter. A VIRTUAL one could not.
+    -- it withdraws.
     CONSTRAINT usage_records_dedup_uniq
         UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key),
 
@@ -122,13 +128,17 @@ CREATE TABLE IF NOT EXISTS usage_records (
     CONSTRAINT usage_records_window_ordered
         CHECK (window_start <= window_end),
 
-    -- The pair is all-or-nothing: an invalidation names a target and carries a
-    -- reason, an ordinary measurement does neither. A reason without a target
-    -- would be an unmarked correction, which the model has no room for.
+    -- The declared kind and the withdrawal pair must agree. An invalidation
+    -- names a target and carries a reason; an ordinary measurement carries
+    -- neither. Under the retired generated column this held by construction,
+    -- because the kind *was* a function of `invalidates`. Written, the two can
+    -- disagree, and this is what refuses it.
     CONSTRAINT usage_records_invalidation_pairing
         CHECK (
-            (invalidates IS NULL AND reason_code IS NULL)
-            OR (invalidates IS NOT NULL AND reason_code IS NOT NULL)
+            (entry_type = 'record'
+                AND invalidates IS NULL AND reason_code IS NULL)
+            OR (entry_type = 'invalidation'
+                AND invalidates IS NOT NULL AND reason_code IS NOT NULL)
         ),
 
     -- `SubjectRef` makes `subject_id` required and `subject_type` optional
@@ -169,9 +179,9 @@ CREATE INDEX IF NOT EXISTS usage_records_feed_idx
 
 -- The reconciliation acceptance watermark, `MAX(accepted_at)` per
 -- (gts_type_id, tenant_id) and unbounded by any range, per this plugin's
--- DESIGN §3.6 `cpt-cf-uc-plugin-seq-reconciliation`. No other index reaches
--- `accepted_at`, which is stamped upstream by the Ingestion Gateway and so does
--- not share an order with anything the plugin assigns.
+-- DESIGN §3.6 `cpt-cf-uc-plugin-seq-reconciliation`. No other index in these
+-- migrations reaches `accepted_at`, which is stamped upstream by the Ingestion
+-- Gateway rather than assigned here.
 CREATE INDEX IF NOT EXISTS usage_records_watermark_idx
     ON usage_records (gts_type_id, tenant_id, accepted_at DESC);
 

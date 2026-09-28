@@ -564,8 +564,9 @@ fn order_key_of(record: &UsageRecord, field: &str) -> String {
 ///
 /// `origin` and `entry_type` are the two the DESIGN section 3.3 contract suite's
 /// fixtures cannot serve, and they are also the two whose columns are unlike the
-/// rest: `entry_type` is a stored generated column over `invalidates`, and
-/// `origin` is server-assigned rather than caller-supplied.
+/// rest: `entry_type` is a `usage_entry_type` enum, the only filterable column
+/// whose comparison value is cast rather than bound as it stands, and `origin`
+/// is server-assigned rather than caller-supplied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_published_filter_field_resolves_and_discriminates() {
     let (_h, store) = setup().await;
@@ -644,8 +645,8 @@ async fn each_published_filter_field_resolves_and_discriminates() {
 
     // The complement of the `entry_type` case: filtering for `record` returns
     // the two measurements and not the withdrawal. Written out because a
-    // generated column that answered one spelling and not the other would pass
-    // the case above.
+    // column that answered one enum label and not the other would pass the
+    // case above.
     let q = page_query(default_order(), None).with_filter(eq_str("entry_type", "record"));
     let page = store
         .list(meter, wide_range(), &q, &[])

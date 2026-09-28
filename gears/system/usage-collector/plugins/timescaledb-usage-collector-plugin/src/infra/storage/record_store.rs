@@ -85,24 +85,24 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 ///
 /// This is a **superset** of [`INSERT_COLUMNS`], not the same set reordered:
 /// `xact_id` is stamped by its column default and bound by no insert, so it is
-/// read and never written. It is selected as `xact_id::text AS xact_id`
-/// because `xid8` has no `sqlx` decode implementation. The cast is required;
-/// the alias is not, since `PostgreSQL` names the output of a bare column cast
-/// after the column anyway. It is written out so the decoded name that
-/// [`UsageRecordRow`]'s field is looked up by is stated here rather than
-/// inherited from a server naming rule.
+/// read and never written, and it is the whole of the difference.
 ///
-/// The ledger's `entry_type` is deliberately absent. It is a stored generated
-/// column that exists so `$filter=entry_type eq 'invalidation'` resolves to a
-/// real column; nothing decodes it, because [`UsageRecordRow`] has no field
-/// for it (see that struct's doc).
+/// **Two entries are cast rather than named bare**, and each one's cast is
+/// what makes the column decodable at all. `xid8` has no `sqlx` decode
+/// implementation; `usage_entry_type` is a `PostgreSQL` enum, and the
+/// [`String`] [`UsageRecordRow`] carries declares itself `TEXT`, which `sqlx`
+/// holds incompatible with an enum. Both therefore read as `… ::text AS …`.
+/// The casts are required; the aliases are not, since `PostgreSQL` names the
+/// output of a bare column cast after the column anyway. They are written out
+/// so the decoded name each [`UsageRecordRow`] field is looked up by is stated
+/// here rather than inherited from a server naming rule.
 const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
      window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
-     invalidates, reason_code, origin, acceptance_sequence, accepted_at, \
-     xact_id::text AS xact_id, metadata";
+     invalidates, reason_code, origin, entry_type::text AS entry_type, acceptance_sequence, \
+     accepted_at, xact_id::text AS xact_id, metadata";
 
-/// The columns every insert writes: [`RECORD_COLUMNS`] less `xact_id`, which
-/// the database stamps. `entry_type` is generated and is in neither.
+/// The columns every insert writes: every ledger column but `xact_id`, which
+/// the database stamps.
 ///
 /// **One spelling, used four times** — the single-row insert's column list, the
 /// batch insert's column list, its `SELECT` list and its `UNNEST` alias list.
@@ -118,12 +118,25 @@ const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, wi
 /// column after it.
 const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
      window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
-     invalidates, reason_code, origin, acceptance_sequence, accepted_at, metadata";
+     invalidates, reason_code, origin, entry_type, acceptance_sequence, accepted_at, metadata";
+
+/// The `PostgreSQL` enum `entry_type` is declared as
+/// (`migrations/0001_init.sql`), and the one cast both insert paths carry.
+///
+/// **Measured, not argued.** `sqlx` types a bound `&str` as `text`, and
+/// `PostgreSQL` refuses `text` in assignment to an enum column (`42804`, "you
+/// will need to rewrite or cast the expression"), so a bare `$n` does not
+/// land. The batch's `UNNEST($n::usage_entry_type[])` takes the same bound
+/// `text[]` through an explicit array cast and does land, which is why
+/// [`INSERT_COLUMN_ARRAY_TYPES`] names the enum where the DDL does rather than
+/// diverging to `text` the way `metadata` does.
+const ENTRY_TYPE_ENUM: &str = "usage_entry_type";
 
 /// Postgres array types for [`INSERT_COLUMNS`], **in the same order**, as the
-/// batch insert's `UNNEST` needs them. The length is what fixes the placeholder
-/// count for both inserts.
-const INSERT_COLUMN_ARRAY_TYPES: [&str; 18] = [
+/// batch insert's `UNNEST` needs them. A test pins its length equal to the
+/// number of names in [`INSERT_COLUMNS`], which is what fixes the `UNNEST`
+/// parameter count.
+const INSERT_COLUMN_ARRAY_TYPES: [&str; 19] = [
     "uuid",
     "uuid",
     "text",
@@ -139,6 +152,7 @@ const INSERT_COLUMN_ARRAY_TYPES: [&str; 18] = [
     "uuid",
     "text",
     "text",
+    ENTRY_TYPE_ENUM,
     "bigint",
     "timestamptz",
     "text",
@@ -146,10 +160,11 @@ const INSERT_COLUMN_ARRAY_TYPES: [&str; 18] = [
 
 /// The dedup 6-tuple plus the partition key the hypertable requires in every UNIQUE, as an `ON CONFLICT` arbiter. Both insert paths spend their one arbiter here.
 ///
-/// `entry_type` is one of the six. It is a `GENERATED … STORED` column, so it
-/// is an ordinary column to the index and may be named here; without it a
-/// withdrawal would arbitrate against the very entry it withdraws, which
-/// repeats its tenant, type, idempotency key and covered period.
+/// `entry_type` is one of the six, and is named here as the bare column: an
+/// arbiter names index columns, never the values compared against them, so the
+/// enum needs no cast in this position. Without it a withdrawal would
+/// arbitrate against the very entry it withdraws, which repeats its tenant,
+/// type, idempotency key and covered period.
 const DEDUP_CONFLICT_TARGET: &str =
     "tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key";
 
@@ -161,13 +176,37 @@ const DEDUP_CONFLICT_TARGET: &str =
 /// A read-back on the first five alone would be ambiguous once a record is
 /// withdrawn: the pair shares those five columns, so a record's retry could
 /// read its invalidation back and be answered `IdempotencyConflict`.
-const DEDUP_MATCH_PREDICATE: &str = "tenant_id = $1 AND gts_type_id = $2 AND idempotency_key = $3 \
-     AND window_start = $4 AND window_end = $5 AND entry_type = $6";
+///
+/// `$6` carries [`ENTRY_TYPE_ENUM`]: the bound value is a `text` parameter and
+/// no `usage_entry_type = text` operator exists, so without the cast
+/// `PostgreSQL` refuses the predicate outright (`42883`).
+static DEDUP_MATCH_PREDICATE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "tenant_id = $1 AND gts_type_id = $2 AND idempotency_key = $3 \
+         AND window_start = $4 AND window_end = $5 AND entry_type = $6::{ENTRY_TYPE_ENUM}"
+    )
+});
 
-/// `$1, $2, …, $n`.
-fn placeholders(n: usize) -> String {
-    (1..=n)
-        .map(|i| format!("${i}"))
+/// `$1, $2, …` for [`INSERT_COLUMNS`], with `entry_type`'s placeholder cast to
+/// [`ENTRY_TYPE_ENUM`].
+///
+/// Numbered off [`INSERT_COLUMNS`] itself rather than off a count, so `$n` is
+/// column `n` by construction and the one cast lands on the one column that
+/// needs it. The batch insert carries the same cast on its `UNNEST` array
+/// instead; this is the single-row path's half of it.
+fn insert_placeholders() -> String {
+    INSERT_COLUMNS
+        .split(',')
+        .map(str::trim)
+        .enumerate()
+        .map(|(i, name)| {
+            let n = i + 1;
+            if name == "entry_type" {
+                format!("${n}::{ENTRY_TYPE_ENUM}")
+            } else {
+                format!("${n}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -183,7 +222,7 @@ static SINGLE_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
         "INSERT INTO usage_records ({INSERT_COLUMNS}) VALUES ({}) \
          ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
          RETURNING {RECORD_COLUMNS}",
-        placeholders(INSERT_COLUMN_ARRAY_TYPES.len()),
+        insert_placeholders(),
     )
 });
 
@@ -382,13 +421,11 @@ impl PgRecordStore {
         //    row only when we won the slot — `DO NOTHING` suppresses it on a
         //    conflict — so `Some` = fresh insert, `None` = a row with this
         //    6-tuple already exists. Every column [`INSERT_COLUMNS`] names is
-        //    bound here, `accepted_at` included — it is written rather than
-        //    defaulted. [`RECORD_COLUMNS`] reads back one more: `xact_id`,
-        //    which the column default stamps and no bind supplies.
-        //    `entry_type` is in neither list and is generated, so it is the
-        //    one identity component the insert does not bind — Postgres
-        //    computes it for the proposed row and the arbiter probes
-        //    `usage_records_dedup_uniq` with it.
+        //    bound here, `accepted_at` and `entry_type` included — the kind is
+        //    written from the dispatched entry's own declaration, never
+        //    computed for the proposed row. [`RECORD_COLUMNS`] reads back one
+        //    more: `xact_id`, which the column default stamps and no bind
+        //    supplies.
         let subject_id = record
             .subject_ref
             .as_ref()
@@ -417,6 +454,7 @@ impl PgRecordStore {
                 .bind(invalidates)
                 .bind(reason_code)
                 .bind(record.origin.as_str())
+                .bind(record.entry_type().as_str())
                 .bind(acceptance_sequence)
                 .bind(record.accepted_at)
                 .bind(metadata)
@@ -451,8 +489,10 @@ impl PgRecordStore {
         //     sequence value claimed in step 1, which is why an absorbed
         //     single-row retry leaves no gap (a batch's block claim does; see
         //     [`claim_acceptance_sequence`]).
-        let select_sql =
-            format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE {DEDUP_MATCH_PREDICATE}");
+        let select_sql = format!(
+            "SELECT {RECORD_COLUMNS} FROM usage_records WHERE {}",
+            DEDUP_MATCH_PREDICATE.as_str()
+        );
         let stored = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
             .bind(record.tenant_id)
             .bind(record.gts_type_id.as_str())
@@ -555,6 +595,7 @@ impl PgRecordStore {
             .bind(&cols.invalidates)
             .bind(&cols.reason_codes)
             .bind(&cols.origins)
+            .bind(&cols.entry_types)
             .bind(&cols.sequences)
             .bind(&cols.accepted_ats)
             .bind(&cols.metadata)
@@ -603,13 +644,17 @@ impl PgRecordStore {
         let entry_types: Vec<&'static str> =
             not_won.iter().map(|r| r.entry_type().as_str()).collect();
 
+        // `$6` is cast to the enum for the reason [`DEDUP_MATCH_PREDICATE`]
+        // gives: the bound array is `text[]`, and the row-value comparison
+        // against `entry_type` has no `usage_entry_type = text` operator to
+        // resolve to.
         let select_sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records \
              WHERE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, \
                     entry_type) IN \
                (SELECT t1, t2, t3, t4, t5, t6 \
                 FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[], \
-                            $5::timestamptz[], $6::text[]) \
+                            $5::timestamptz[], $6::{ENTRY_TYPE_ENUM}[]) \
                   AS t(t1, t2, t3, t4, t5, t6))"
         );
         let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
@@ -806,6 +851,9 @@ struct InsertColumns {
     invalidates: Vec<Option<Uuid>>,
     reason_codes: Vec<Option<String>>,
     origins: Vec<String>,
+    /// Borrowed rather than owned: `EntryType::as_str` hands back a
+    /// `&'static str`, so there is nothing here to clone.
+    entry_types: Vec<&'static str>,
     sequences: Vec<i64>,
     accepted_ats: Vec<OffsetDateTime>,
     metadata: Vec<String>,
@@ -854,6 +902,7 @@ impl InsertColumns {
             invalidates: Vec::with_capacity(reps.len()),
             reason_codes: Vec::with_capacity(reps.len()),
             origins: Vec::with_capacity(reps.len()),
+            entry_types: Vec::with_capacity(reps.len()),
             sequences: sequences.to_vec(),
             accepted_ats: Vec::with_capacity(reps.len()),
             metadata: Vec::with_capacity(reps.len()),
@@ -885,6 +934,7 @@ impl InsertColumns {
             cols.invalidates.push(invalidates);
             cols.reason_codes.push(reason_code.map(str::to_owned));
             cols.origins.push(r.origin.as_str().to_owned());
+            cols.entry_types.push(r.entry_type().as_str());
             cols.accepted_ats.push(r.accepted_at);
             cols.metadata
                 .push(metadata_map_to_jsonb(&r.metadata).to_string());
@@ -1417,26 +1467,46 @@ fn dedup_key(record: &UsageRecord) -> DedupKey {
     )
 }
 
+/// [`entry_type_rank`] for a **stored** `entry_type` label.
+///
+/// The two spellings are read off [`EntryType::as_str`] rather than restated
+/// here, and each one's rank comes from [`entry_type_rank`] rather than being
+/// written out again, so a stored row and the record it came from cannot drift
+/// apart in either the vocabulary or the order.
+///
+/// Any other label ranks [`u8::MAX`]. `usage_entry_type` declares exactly these
+/// two labels, so a third could only reach this function from a database this
+/// build was not made against; ranking it apart from both makes such a row
+/// match no incoming key at all, so it comes back as the retention race's
+/// retryable `Transient`, where folding it into one would make it match the
+/// wrong entry.
+fn stored_entry_type_rank(raw: &str) -> u8 {
+    if raw == EntryType::Record.as_str() {
+        entry_type_rank(EntryType::Record)
+    } else if raw == EntryType::Invalidation.as_str() {
+        entry_type_rank(EntryType::Invalidation)
+    } else {
+        u8::MAX
+    }
+}
+
 /// Build the [`DedupKey`] for a stored row, so an `INSERT … RETURNING` result
 /// and an incoming record map to the same key (both bounds canonicalized).
 ///
-/// The entry type is read off `invalidates`, not off the `entry_type` column,
-/// which the row does not carry: the generated column is that same expression,
-/// and [`UsageRecord::entry_type`] projects the model side from the same fact,
-/// so no two of the three can disagree.
+/// The entry type is read off the stored `entry_type` column, which the ledger
+/// writes from the dispatched entry's own declaration and derives from nothing
+/// (`migrations/0001_init.sql`). `usage_records_invalidation_pairing` is what
+/// keeps that column and `invalidates` agreeing in storage, so reading either
+/// one gives the same answer; this reads the column because the column is what
+/// the dedup UNIQUE this key mirrors is built over.
 fn row_dedup_key(row: &UsageRecordRow) -> DedupKey {
-    let entry_type = if row.invalidates.is_some() {
-        EntryType::Invalidation
-    } else {
-        EntryType::Record
-    };
     (
         row.tenant_id,
         row.gts_type_id.clone(),
         row.idempotency_key.clone(),
         canonical_period_bound(row.window_start),
         canonical_period_bound(row.window_end),
-        entry_type_rank(entry_type),
+        stored_entry_type_rank(&row.entry_type),
     )
 }
 

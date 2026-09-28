@@ -69,10 +69,10 @@ pub use toolkit_odata::filter::ODataValue;
 /// [`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`], and `window_end` must
 /// resolve for the canonical `(window_end, id)` keyset to render at all.
 ///
-/// `entry_type` resolves to the stored generated column
-/// (`CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END`),
+/// `entry_type` resolves to the ledger's written `usage_entry_type` column,
 /// which is why the field is filterable here at all: the SDK stores no such
-/// attribute and its value hook cannot carry one.
+/// attribute and its value hook cannot carry one. It is the one column whose
+/// comparison value needs a cast — see `bind_cast` below.
 #[must_use]
 pub fn record_column(field_name: &str) -> Option<&'static str> {
     // Declaration order of `UsageRecordQuery`, so the module doc's list above
@@ -126,6 +126,32 @@ impl SqlCtx {
         self.next += 1;
         self.binds.push(b);
         n
+    }
+}
+
+/// The `::type` suffix a bound comparison value needs to be comparable with
+/// `column`, or `""` where the bind's own type already is.
+///
+/// Every value this translator binds reaches `PostgreSQL` as a [`SqlBind`],
+/// and `entry_type` is the one allowlisted column no variant of that enum
+/// types: the column is a `PostgreSQL` enum, the bind is `text`, and no
+/// `usage_entry_type = text` operator exists, so an uncast comparison is
+/// refused outright (`42883`). The cast goes on the **literal** rather than on
+/// the column, per this plugin's DESIGN §3.7 — `$filter=entry_type eq
+/// 'invalidation'` "compares against it directly, the literal casting to the
+/// enum" — which also keeps [`record_column`]'s output the bare column name
+/// every other part of this module assumes it is.
+///
+/// A value that is not one of the enum's labels is therefore rejected by
+/// `PostgreSQL` (`22P02`) rather than selecting nothing, which is the cost of
+/// comparing against the column directly.
+///
+/// Keyed on the resolved column rather than the field name, so it is the
+/// spelling that actually reaches the SQL that decides.
+fn bind_cast(column: &str) -> &'static str {
+    match column {
+        "entry_type" => "::usage_entry_type",
+        _ => "",
     }
 }
 
@@ -277,8 +303,9 @@ fn translate_filter<F: FilterField>(
             let column = col(field.name())
                 .ok_or_else(|| format!("field not allowlisted: {}", field.name()))?;
             let operator = op_sql(*op)?;
+            let cast = bind_cast(column);
             let n = ctx.push(odata_value_to_bind(value)?);
-            Ok(format!("{column} {operator} ${n}"))
+            Ok(format!("{column} {operator} ${n}{cast}"))
         }
         FilterNode::InList { field, values } => {
             let column = col(field.name())
@@ -286,9 +313,10 @@ fn translate_filter<F: FilterField>(
             if values.is_empty() {
                 return Err("IN list must not be empty".to_owned());
             }
+            let cast = bind_cast(column);
             let placeholders = values
                 .iter()
-                .map(|v| Ok(format!("${}", ctx.push(odata_value_to_bind(v)?))))
+                .map(|v| Ok(format!("${}{cast}", ctx.push(odata_value_to_bind(v)?))))
                 .collect::<Result<Vec<_>, String>>()?;
             Ok(format!("{column} IN ({})", placeholders.join(", ")))
         }

@@ -189,11 +189,16 @@ struct Raw {
     entry_type: String,
 }
 
-/// The `SELECT` that fills a [`Raw`]: every column an insert writes, plus the
-/// generated `entry_type`, named explicitly and read back by name.
+/// The `SELECT` that fills a [`Raw`], naming every column explicitly and
+/// reading each back by name.
+///
+/// `entry_type` is cast because `usage_entry_type` is a `PostgreSQL` enum and
+/// `sqlx` will not decode one into a `String`; the production read list casts
+/// it for the same reason.
 const RAW_SELECT_SQL: &str = "SELECT id, tenant_id, gts_type_id, quantity, window_start, window_end, resource_id, \
      resource_type, subject_id, subject_type, idempotency_key, invalidates, reason_code, \
-     origin, acceptance_sequence, metadata, entry_type FROM usage_records WHERE id = $1";
+     origin, acceptance_sequence, metadata, entry_type::text AS entry_type \
+     FROM usage_records WHERE id = $1";
 
 /// The acceptance sequences stored for one scope, in insertion order.
 async fn sequences_for(pool: &sqlx::PgPool, tenant: Uuid, meter: &str) -> Vec<i64> {

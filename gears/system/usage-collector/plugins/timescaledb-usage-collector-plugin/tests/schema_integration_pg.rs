@@ -95,9 +95,9 @@ async fn no_table_wide_retention_policy_is_registered() {
 /// The constraint definition is compared as text rather than by name alone: a
 /// constraint keeping its name while losing a column is the failure this exists
 /// to catch, and `usage_records_dedup_uniq` exists either way. `entry_type` is
-/// the column that failure would most plausibly take: it is generated rather
-/// than bound, and dropping it makes every withdrawal collide with the entry it
-/// withdraws.
+/// the column that failure would most plausibly take: it is the one identity
+/// input a withdrawal does not share with the entry it withdraws, so dropping
+/// it makes every withdrawal collide with that entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_dedup_unique_spans_the_six_tuple() {
     let h = common::bring_up()
@@ -167,44 +167,117 @@ async fn the_invalidation_lookup_index_is_partial_and_not_unique() {
     );
 }
 
-/// `entry_type` is a **stored generated** column, which is what makes
-/// `$filter=entry_type eq 'invalidation'` resolve to a real column.
+/// `entry_type` is a written `usage_entry_type` enum, and not a generated
+/// column.
 ///
-/// `attgenerated = 's'` is the stored kind. A plain column of the same name
-/// would serve the filter and could then disagree with `invalidates`, which is
-/// the disagreement `cpt-cf-usage-collector-adr-append-only-invalidation`
-/// forbids; a `VIRTUAL` one would not be indexable.
+/// `DESIGN.md` §3.7: the column is "written from the dispatched entry's
+/// declared kind and never derived from another column". The gear made the
+/// entry type caller-supplied end to end; this column inferred it from
+/// `invalidates` anyway, and so did the Record Store's dedup key, and neither
+/// does now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn entry_type_is_a_stored_generated_column_over_invalidates() {
+async fn entry_type_is_a_written_enum_and_not_generated() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
 
-    let generated: String = sqlx::query_scalar(
-        "SELECT attgenerated::text FROM pg_attribute \
-         WHERE attrelid = 'usage_records'::regclass AND attname = 'entry_type'",
+    let (data_type, udt, generated): (String, String, String) = sqlx::query_as(
+        "SELECT data_type, udt_name, is_generated FROM information_schema.columns \
+         WHERE table_name = 'usage_records' AND column_name = 'entry_type'",
     )
     .fetch_one(&h.pool)
     .await
-    .expect("entry_type must be a column of usage_records");
+    .expect("usage_records.entry_type must exist");
+    assert_eq!(data_type, "USER-DEFINED");
+    assert_eq!(udt, "usage_entry_type");
     assert_eq!(
-        generated, "s",
-        "entry_type must be GENERATED ALWAYS ... STORED (attgenerated = 's')"
+        generated, "NEVER",
+        "a generated column would derive the kind again"
     );
 
-    let expr: String = sqlx::query_scalar(
-        "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef d \
-         JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
-         WHERE d.adrelid = 'usage_records'::regclass AND a.attname = 'entry_type'",
+    let labels: Vec<String> = sqlx::query_scalar(
+        "SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid \
+         WHERE t.typname = 'usage_entry_type' ORDER BY e.enumsortorder",
     )
-    .fetch_one(&h.pool)
+    .fetch_all(&h.pool)
     .await
-    .expect("the generated expression must be readable");
+    .expect("enum labels");
+    assert_eq!(labels, vec!["record".to_owned(), "invalidation".to_owned()]);
+}
+
+/// The pairing constraint refuses a declared kind that disagrees with the
+/// withdrawal pair, in either direction.
+///
+/// `DESIGN.md` §3.7: `usage_records_invalidation_pairing` is
+/// "`entry_type = 'invalidation'` exactly when `invalidates` and `reason_code`
+/// are both set; an ordinary measurement carries neither", which "keeps the
+/// declared kind and the withdrawal fields from disagreeing in storage".
+///
+/// Under the generated column this was unassertable: the kind was a function of
+/// `invalidates`, so the two could not disagree by construction. Written, they
+/// can, and this is what refuses it. Driven as raw SQL because the SPI cannot
+/// express the disagreement - an entry's kind and its pair are two projections
+/// of one `Option<Invalidation>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pairing_constraint_refuses_a_kind_that_disagrees_with_the_withdrawal_pair() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    let err = common::insert_raw_entry(&h.pool)
+        .entry_type("invalidation")
+        .invalidates(None)
+        .execute()
+        .await
+        .expect_err("a declared invalidation with no target must be refused");
     assert!(
-        expr.contains("invalidates IS NULL"),
-        "entry_type must be derived from `invalidates` and from nothing else, so the \
-         kind cannot disagree with the reference it is a projection of: {expr}"
+        err.to_string()
+            .contains("usage_records_invalidation_pairing"),
+        "the pairing constraint must be what refuses a targetless invalidation, got: {err}"
     );
+
+    // The other direction, which the `entry_type =` conjuncts are equally what
+    // refuses: without them a row naming a target and a reason would be
+    // admitted while declaring itself an ordinary measurement.
+    let err = common::insert_raw_entry(&h.pool)
+        .entry_type("record")
+        .invalidates(Some(Uuid::from_u128(0x2100_0001)))
+        .reason_code(Some("duplicate_submission"))
+        .execute()
+        .await
+        .expect_err("a declared record that names a target must be refused");
+    assert!(
+        err.to_string()
+            .contains("usage_records_invalidation_pairing"),
+        "the pairing constraint must be what refuses a record naming a target, got: {err}"
+    );
+}
+
+/// A row whose declared kind and withdrawal pair agree is admitted, in both
+/// shapes.
+///
+/// The premise of the refusals above: they must fail on the disagreement and
+/// not on something [`common::insert_raw_entry`] gets wrong for every row it
+/// writes, which a refusal-only pair of assertions cannot tell apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pairing_constraint_admits_a_kind_that_agrees_with_the_withdrawal_pair() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    common::insert_raw_entry(&h.pool)
+        .entry_type("record")
+        .execute()
+        .await
+        .expect("an ordinary measurement carrying neither half must be admitted");
+
+    common::insert_raw_entry(&h.pool)
+        .entry_type("invalidation")
+        .invalidates(Some(Uuid::from_u128(0x2100_0002)))
+        .reason_code(Some("duplicate_submission"))
+        .execute()
+        .await
+        .expect("a withdrawal carrying both halves must be admitted");
 }
 
 /// There is no usage-type catalog table, and this is a real assertion rather
@@ -286,22 +359,23 @@ async fn the_live_columns_are_the_migrations_columns_in_order() {
         "the live ledger's columns must be the migration's, in declaration order"
     );
 
-    // The insertable subset is the same list minus the columns the ledger
-    // writes itself, and this asserts the *reason* each is excluded rather
-    // than the exclusion: `entry_type` is generated, and `xact_id` is stamped
-    // by a column default. `accepted_at` replaced the defaulted-and-omitted
-    // `ingested_at`; unlike it, `accepted_at` is bound on every insert, so it
-    // stays in the insertable set.
+    // The insertable subset is the same list minus the one column the ledger
+    // writes itself, and this asserts the *reason* it is excluded rather than
+    // the exclusion: `xact_id` is stamped by a column default. `accepted_at`
+    // replaced the defaulted-and-omitted `ingested_at`; unlike it,
+    // `accepted_at` is bound on every insert, so it stays in the insertable
+    // set. `entry_type` is bound on every insert too, and is named here
+    // because it used to be the other exclusion.
     let insertable: BTreeSet<&str> = migration_probe::insertable_columns()
         .into_iter()
         .map(|(name, _)| name)
         .collect();
     assert!(
-        !insertable.contains("entry_type")
-            && !insertable.contains("xact_id")
-            && insertable.contains("accepted_at"),
-        "the insertable set must exclude the generated and the database-stamped column \
-         and keep accepted_at"
+        !insertable.contains("xact_id")
+            && insertable.contains("accepted_at")
+            && insertable.contains("entry_type"),
+        "the insertable set must exclude the database-stamped column and keep \
+         accepted_at and entry_type"
     );
     let self_written: Vec<String> = sqlx::query_scalar(
         "SELECT attname::text FROM pg_attribute \
@@ -316,9 +390,10 @@ async fn the_live_columns_are_the_migrations_columns_in_order() {
     // so this is a superset check rather than an equality: what must hold is
     // that nothing the insert writes is a column the ledger computes.
     assert!(
-        self_written.iter().any(|c| c == "entry_type"),
-        "entry_type must be generated in the live table, which is why \
-         insertable_columns() drops it: {self_written:?}"
+        !self_written.iter().any(|c| c == "entry_type"),
+        "entry_type must carry neither a generation expression nor a DEFAULT in the \
+         live table, because every insert writes it from the dispatched entry's \
+         declared kind: {self_written:?}"
     );
     assert!(
         !self_written.iter().any(|c| c == "accepted_at"),
