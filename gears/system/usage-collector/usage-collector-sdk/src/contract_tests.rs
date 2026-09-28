@@ -61,12 +61,12 @@ use super::contract_mutants::{
 use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, CONVERGED_TARGET_LOOKUP,
     ContractViolation, DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel,
-    FEED_BOOTSTRAP_POSITION, FEED_COMPLETENESS, FEED_RETENTION_REFUSAL, FEED_SNAPSHOT_AND_REPLAY,
-    HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD, LATEST_TIE_BREAK,
-    QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, RETENTION_DRIVEN_CHECKS,
-    SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS,
-    WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, retention::ContractRetention,
-    run_all, run_all_with_retention,
+    FEED_BOOTSTRAP_POSITION, FEED_COMPLETENESS, FEED_POSITION_BOUNDED, FEED_RETENTION_REFUSAL,
+    FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD,
+    LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
+    RETENTION_DRIVEN_CHECKS, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, SERVER_FIELD_ROUND_TRIP,
+    UNWRITTEN_CHECKS, WINDOW_END_SELECTION, reference::InMemoryReferencePlugin,
+    retention::ContractRetention, run_all, run_all_with_retention,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
@@ -652,6 +652,25 @@ fn the_retention_driven_checks_are_checks_run_all_dispatches() {
 /// `crate::contract::checks::feed_bootstrap_position`'s own docs record
 /// which of its assertions the subject reaches and which stay gaps.
 ///
+/// **The last two rows are the isolating ones for `feed-position-bounded`,
+/// and there are two of them because one of that check's two comparisons
+/// cannot see the other's defect.**
+/// [`Defect::AFeedPositionIsKeyedPerTenant`] is the failure DESIGN §3.1 and
+/// §3.10 both name in those words, and it is caught by that check's first
+/// comparison — many tenants against few, one GTS type each.
+/// [`Defect::AFeedPositionIsKeyedPerSubscribedType`] is invisible to that
+/// comparison, because both of its subscriptions name one type, and is
+/// caught by the second — two types against one, over the same entries
+/// under the same tenants. Each row names that check alone, and measured by
+/// neutering, each comparison empties exactly one of the two rows and
+/// changes nothing else.
+///
+/// Neither reaches `feed-snapshot-and-replay`'s own size comparison, which
+/// varies a **grant** rather than a subscription: both subjects key on the
+/// tenants a subscription's ledger holds, because a position that moved
+/// with the grant could not be resumed by a caller whose grant had since
+/// widened. That check's docs record the gap that leaves.
+///
 /// **Six subjects in `super::contract_mutants` are deliberately not in this
 /// matrix.** Each of their defects needs retention to have swept, `run_all`
 /// sweeps nothing, and a row for any of them would therefore assert the
@@ -758,6 +777,14 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
             FEED_COMPLETENESS,
             SERVER_FIELD_ROUND_TRIP,
         ],
+    ),
+    (
+        Defect::AFeedPositionIsKeyedPerTenant,
+        &[FEED_POSITION_BOUNDED],
+    ),
+    (
+        Defect::AFeedPositionIsKeyedPerSubscribedType,
+        &[FEED_POSITION_BOUNDED],
     ),
 ];
 
@@ -1182,7 +1209,20 @@ fn every_check_name_derives_a_distinct_valid_meter() {
         .chain(ADDITIONAL_CHECKS)
         .chain(UNWRITTEN_CHECKS)
     {
-        for role in ["main", "busy", "quiet", "other"] {
+        for role in [
+            "main",
+            "busy",
+            "quiet",
+            "other",
+            "across-tenants",
+            "swept",
+            "intact",
+            "empty",
+            "many",
+            "few",
+            "split_first",
+            "split_second",
+        ] {
             let meter = super::fixtures::check_meter(check, role).unwrap_or_else(|err| {
                 panic!(
                     "`{check}` under role `{role}` must derive a valid meter, and a failure here \

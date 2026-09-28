@@ -163,9 +163,12 @@ async fn the_timescale_backend_fails_exactly_the_declared_checks() {
     // with it before the comparison: a row naming a check still in
     // `contract::UNWRITTEN_CHECKS` names one `run_all` never runs, and a
     // check that never runs cannot fail, so it must not be expected to.
-    // That intersection is what lets the whole list land before any of the
-    // checks it names exists — without it the assertion would be wrong at
-    // every commit until the last one.
+    // That intersection is what let the whole list land before any of the
+    // checks it names existed — without it the assertion would have been
+    // wrong at every commit until the last one. It is inert now that
+    // `contract::UNWRITTEN_CHECKS` is empty, and it is kept rather than
+    // simplified away: it costs nothing and it re-arms the moment DESIGN
+    // §3.3's table grows a row the suite has not written yet.
     let running: BTreeSet<&str> = contract::IMPLEMENTED_CHECKS
         .iter()
         .chain(contract::ADDITIONAL_CHECKS)

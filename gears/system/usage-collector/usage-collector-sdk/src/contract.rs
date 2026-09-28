@@ -45,27 +45,28 @@
 //! remove its own entries, and is then responsible for putting them back —
 //! see that entry point's caution.
 //!
-//! # Fifteen of DESIGN's sixteen, sixteen checks in all
+//! # All sixteen of DESIGN's, seventeen checks in all
 //!
-//! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
-//! fifteen in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not
-//! a statement about the rest**.
+//! DESIGN §3.3 tabulates sixteen checks. [`run_all`] now runs all sixteen,
+//! which are [`IMPLEMENTED_CHECKS`], and **an empty violation list is still
+//! not a statement about every assertion of every one of them** — see
+//! [`RETENTION_DRIVEN_CHECKS`] below.
 //!
-//! **Two counts run through this file, and both are right.** Fifteen is
-//! what [`run_all`] covers of DESIGN's sixteen; sixteen is how many checks
-//! it runs, the sixteenth being the one in [`ADDITIONAL_CHECKS`] that
+//! **Two counts run through this file, and both are right.** Sixteen is
+//! what [`run_all`] covers of DESIGN's sixteen; seventeen is how many checks
+//! it runs, the seventeenth being the one in [`ADDITIONAL_CHECKS`] that
 //! DESIGN does not tabulate. A count about coverage of DESIGN is therefore
-//! fifteen and a count about what a run executed is sixteen, and neither
-//! substitutes for the other. **That the two counts now coincide with each
-//! other's neighbours is a coincidence of arithmetic and not a simpler
-//! story**: one of them is a count over DESIGN's table and the other a count
-//! over this suite's dispatch list, and they will part again the next time
-//! either grows. The last of the sixteen is named, not omitted:
+//! sixteen and a count about what a run executed is seventeen, and neither
+//! substitutes for the other. The two parted company again the moment the
+//! last DESIGN check landed, which is what they do whenever either grows:
+//! one is a count over DESIGN's table and the other a count over this
+//! suite's dispatch list, and nothing keeps them together. Nothing DESIGN
+//! tabulates is left out:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
-//!   gear's SPI declares, not yet written. One.
+//!   gear's SPI declares, not yet written. **Now empty.**
 //! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
-//!   it. Now empty: no check DESIGN tabulates is beyond the current trait.
+//!   it. Empty too: no check DESIGN tabulates is beyond the current trait.
 //!
 //! **And a check [`run_all`] does dispatch can still be covered only in
 //! part.** [`RETENTION_DRIVEN_CHECKS`] names the checks with assertions
@@ -120,9 +121,9 @@
 use crate::plugin_api::UsageCollectorPluginV1;
 use checks::{
     at_most_one_invalidation, converged_target_lookup, dedup_concurrent, dedup_floor,
-    dedup_identity_over_window, feed_bootstrap_position, feed_completeness, feed_retention_refusal,
-    feed_snapshot_and_replay, invalidation_excluded_from_fold, latest_tie_break,
-    quantity_round_trip, record_and_invalidation_distinct_identity,
+    dedup_identity_over_window, feed_bootstrap_position, feed_completeness, feed_position_bounded,
+    feed_retention_refusal, feed_snapshot_and_replay, invalidation_excluded_from_fold,
+    latest_tie_break, quantity_round_trip, record_and_invalidation_distinct_identity,
     scope_is_a_filter_on_every_read_path, server_field_round_trip, window_end_selection,
 };
 use retention::ContractRetention;
@@ -284,14 +285,18 @@ pub const LATEST_TIE_BREAK: &str = "latest-tie-break";
 /// holding no entries — and asserted nowhere in this suite. A porter
 /// reading a green run should not read it as that path being exercised.
 ///
-/// Four further checks dispatch a feed read — `server-field-round-trip`,
-/// `feed-completeness` and `feed-bootstrap-position` always, and
-/// `dedup-concurrent` under an `Eventual` declaration — and none of them
-/// narrows anything: every entry any of the four stores is inside the scope
-/// it sends, so those reads buy shape coverage on the path — a plugin that
-/// chokes on a compiled scope there meets one — and no scope *enforcement*
-/// whatever, for the reason the suite's shared single-tenant filter buys
-/// none either.
+/// Five further checks dispatch a feed read — `server-field-round-trip`,
+/// `feed-completeness`, `feed-bootstrap-position` and
+/// `feed-position-bounded` always, and `dedup-concurrent` under an
+/// `Eventual` declaration — and none of them narrows anything: every entry
+/// any of the five stores is inside the scope it sends, so those reads buy
+/// shape coverage on the path — a plugin that chokes on a compiled scope
+/// there meets one — and no scope *enforcement* whatever, for the reason
+/// the suite's shared single-tenant filter buys none either.
+/// `feed-position-bounded` sends the widest of those scopes, a disjunction
+/// naming ten tenants, and it is the widest for a reason that is not about
+/// enforcement: a grant that withholds nothing is what keeps the difference
+/// between two positions attributable to the subscription.
 pub const SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH: &str = "scope-is-a-filter-on-every-read-path";
 
 /// The [`ContractViolation::check`] value a violation carries when the
@@ -330,6 +335,7 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     FEED_COMPLETENESS,
     FEED_BOOTSTRAP_POSITION,
     FEED_RETENTION_REFUSAL,
+    FEED_POSITION_BOUNDED,
 ];
 
 /// The checks [`run_all`] runs that DESIGN §3.3 does not tabulate.
@@ -352,37 +358,34 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// **One of DESIGN's sixteen**, which is every check [`run_all`] does
-/// not run. It is expressible against the seven methods this gear's SPI
-/// declares — nothing here waits on the SPI to grow, and
-/// [`BLOCKED_CHECKS`] is empty. Being unwritten is a statement about this
-/// crate's progress, not about the SPI's reach, and the two are different
-/// claims: one is closed by writing a check, the other only by changing
-/// the trait.
+/// **Empty.** Every check DESIGN §3.3 tabulates is written, named in
+/// [`IMPLEMENTED_CHECKS`] and dispatched by [`run_all`]. The constant stands
+/// rather than being deleted for the reason [`BLOCKED_CHECKS`] does: it is
+/// one of the three the partition test holds against DESIGN's sixteen, so a
+/// check the table grows has somewhere to be named on the commit that adds
+/// it, before anyone writes it. The alternative to a name here is a DESIGN
+/// check nothing accounts for, which is the failure the partition exists to
+/// catch.
 ///
-/// **[`FEED_RETENTION_REFUSAL`] left here for the harness rather than for an
-/// author, and both arrived.** Its refusal half asserts that a cursor whose
-/// continuation retention has truncated is refused, and a backend only
-/// reaches that state once retention has purged an entry. No SPI method
-/// purges, which is why the drive sits beside the SPI:
-/// [`retention::ContractRetention`] is the optional capability a backend
-/// under test exposes, and [`reference::InMemoryReferencePlugin`]
-/// implements it, so `CursorBeyondRetention` is reachable there. The entry
-/// point that hands a check a driver waited on a check that could use
-/// one — an entry point taking a driver nothing consumes would be a claim
-/// about a check that does not exist — so [`run_all_with_retention`] and
-/// [`RETENTION_DRIVEN_CHECKS`] landed one check earlier, with
-/// `feed-bootstrap-position`. The name is now in [`IMPLEMENTED_CHECKS`] and
-/// in [`RETENTION_DRIVEN_CHECKS`], which is the shape a check that needed
-/// the harness takes once it has it. It was never a gap in the SPI, which
-/// is why it never went into [`BLOCKED_CHECKS`].
+/// **Being unwritten was always a statement about this crate's progress, not
+/// about the SPI's reach**, and the two are different claims: one is closed
+/// by writing a check, the other only by changing the trait. Every name that
+/// passed through here was closed the first way. [`FEED_POSITION_BOUNDED`]
+/// was the last of them, and the shape of its landing is worth keeping,
+/// because it is the shape the next one will take: the mechanism it needed
+/// was already in place before the check was —
+/// [`FeedPosition::len`](crate::feed::FeedPosition::len) and the suite's own
+/// `contract_tenant` factory were both built for it and both documented as
+/// such — so what was left was the fixtures,
+/// the assertions and the subjects, none of which the SPI had anything to do
+/// with.
 ///
-/// **A caller reporting coverage has to report this constant.**
-/// [`run_all`] returning no violations says nothing whatever about a check
-/// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
-/// reports fifteen checks' worth of evidence as sixteen.
+/// **A caller reporting coverage still reports this constant.** It says
+/// today that no DESIGN check is missing from a run, which is a claim worth
+/// making explicitly; a reader who infers it from the constant's absence is
+/// inferring it from nothing.
 // @cpt-dod:cpt-cf-usage-collector-dod-plugin-conformance-suite:p1
-pub const UNWRITTEN_CHECKS: &[&str] = &[FEED_POSITION_BOUNDED];
+pub const UNWRITTEN_CHECKS: &[&str] = &[];
 
 /// The DESIGN §3.3 checks the current SPI cannot express, each paired with
 /// what unblocks it.
@@ -565,6 +568,7 @@ async fn run_every_check(
     violations.extend(feed_completeness(plugin).await);
     violations.extend(feed_bootstrap_position(plugin, retention).await);
     violations.extend(feed_retention_refusal(plugin, retention).await);
+    violations.extend(feed_position_bounded(plugin).await);
     violations.extend(scope_is_a_filter_on_every_read_path(plugin).await);
     violations
 }

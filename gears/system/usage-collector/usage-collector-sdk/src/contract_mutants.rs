@@ -10,7 +10,7 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Thirteen subjects wrap a real
+//! *Behaviourally* is the exact word. Fifteen subjects wrap a real
 //! reference backend and are that backend plus one interception; the other
 //! seventeen re-implement it, and a re-implementation is the same backend
 //! only as far as the checks can see. [`MutantLedger`] states how far that
@@ -30,17 +30,18 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Thirteen defects fit (quantity, the
+//! strongest form the subject can take. Fifteen defects fit (quantity, the
 //! store's own acceptance instant, a defaulted origin, period-blind dedup,
 //! entry-type-blind dedup, the entry-type-blind conflict read-back,
 //! point-read scope, the undecided converged-only lookup, the two
-//! withdrawal defects, and the three bootstrap defects): three rewrite a
-//! field on the way in, three keep an index beside the ledger — two to
-//! refuse an admission, one only to decide which stored entry a collision
-//! is answered with — two change what the point read answers, one by
-//! substituting the scope and one by declining to decide, two rewrite how a
-//! second withdrawal of a record is answered, and three reinterpret what
-//! `FeedStart::Oldest` names.
+//! withdrawal defects, the three bootstrap defects and the two
+//! position-encoding defects): three rewrite a field on the way in, three
+//! keep an index beside the ledger — two to refuse an admission, one only
+//! to decide which stored entry a collision is answered with — two change
+//! what the point read answers, one by substituting the scope and one by
+//! declining to decide, two rewrite how a second withdrawal of a record is
+//! answered, three reinterpret what `FeedStart::Oldest` names, and two
+//! re-encode the position a page hands back.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other
 //! seventeen (selection column, fold exclusion, missing unique constraint,
@@ -128,6 +129,27 @@
 //! [`drivable_mutant`] and [`super::run_all_with_retention`] instead, and
 //! `contract_tests` says why neither has a row in the discrimination
 //! matrix.
+//!
+//! # The two position defects, and why they are wrappers too
+//!
+//! A sixth decision is made **after** the loop: what the page's
+//! continuation is *encoded as*. DESIGN §3.1 leaves a position's structure
+//! to the plugin and takes its **encoded size** back — the size *"may not
+//! grow with a subscription's breadth"* — so a defect here is a subject that
+//! delegates the whole read and re-encodes what came back.
+//! [`Defect::AFeedPositionIsKeyedPerTenant`] appends one component per
+//! tenant the subscribed types hold entries under, and
+//! [`Defect::AFeedPositionIsKeyedPerSubscribedType`] one per type named.
+//! Both strip their own components off again on the way in, so a position
+//! either of them issued resumes exactly where the exemplar's would: what
+//! they get wrong is the size and nothing else, which is what
+//! `feed-position-bounded` measures and the only thing it measures.
+//!
+//! **Neither could be a `MutantLedger`**, and the reason is the mirror of
+//! the nine above: those nine are the page loop, which a wrapper would have
+//! to re-implement, while these two are a pure function of the position the
+//! loop produced. A ledger of their own would be the SPI's seven methods
+//! re-implemented to change the last line of one.
 //!
 //! # DESIGN's three `LATEST` keys, and the subject for each
 //!
@@ -966,6 +988,60 @@ pub(super) enum Defect {
     /// meter it never sweeps and reads a cursor over it **last**, after its
     /// own sweeps have raised a mark on the meter beside it.
     TheRetentionRefusalIgnoresTheSubscription,
+    /// Keys its feed position **per tenant**: the position it issues carries
+    /// one component for every tenant the subscribed GTS types hold entries
+    /// under, so its encoded size grows with how many tenants the
+    /// subscription spans.
+    ///
+    /// **DESIGN names this one in those words, twice.** §3.1's
+    /// `FeedPosition` row: a position's *"**encoded size** is not
+    /// [plugin-internal]: the gateway carries it inside a length-bounded wire
+    /// cursor whose size may not grow with a subscription's breadth. A
+    /// position keyed per tenant does not meet that bound, so a plugin needs
+    /// a key it can compare across a whole subscription."* §3.10's
+    /// deployment-guide item 3 repeats it as the thing a plugin author has
+    /// to show is not the case.
+    ///
+    /// It is the mistake a backend makes by having a per-tenant sequence and
+    /// no order above it — the shape this gear's own `TimescaleDB` plugin
+    /// starts from, whose `usage_acceptance_sequence` keys its counter on
+    /// `(tenant_id, gts_type_id)`. A backend in that position cannot issue
+    /// one scalar that resumes a whole subscription, so it issues a vector:
+    /// one component per tenant, and the position grows with the customer
+    /// list.
+    ///
+    /// **It keys on the tenants the subscription's ledger holds, not on the
+    /// tenants the caller's grant names**, and that is the only
+    /// self-consistent version of this mistake rather than a choice. A
+    /// position must denote the same ledger prefix under every grant (§3.1),
+    /// so a position that named only the grant's tenants could not be resumed
+    /// by a caller whose grant had since widened. Keying on the grant would
+    /// be a second defect on top of this one, and it would put this subject
+    /// in front of `feed-snapshot-and-replay`'s clause four as well — which
+    /// that check's docs record as a gap with a named owner, and the owner
+    /// is this check rather than this subject.
+    AFeedPositionIsKeyedPerTenant,
+    /// Keys its feed position **per subscribed GTS type**: one component for
+    /// every type named in the subscription, so its encoded size grows as a
+    /// consumer adds a meter.
+    ///
+    /// DESIGN does not name this one as an example, and it states the rule it
+    /// breaks three times over without qualification: *"whose size may not
+    /// grow with a subscription's breadth"* (§3.1), *"which may not grow with
+    /// the breadth of the subscription it positions"* (§3.3), *"however wide
+    /// a subscription grows"* (§3.10). A
+    /// [`FeedSubscription`](crate::feed::FeedSubscription) **is** a set of
+    /// GTS types, so a position carrying one component per type is the most
+    /// literal reading of the growth those three forbid.
+    ///
+    /// It is the mistake a backend makes by keeping one feed-order sequence
+    /// per meter — a partition per type is the natural physical layout, and a
+    /// consumer subscribing to several of them then needs a cursor naming
+    /// each. It is the same mistake as
+    /// [`Self::AFeedPositionIsKeyedPerTenant`] made about the other axis, and
+    /// it is a separate subject because the row's own contrast cannot see it:
+    /// both of the subscriptions that contrast names one GTS type.
+    AFeedPositionIsKeyedPerSubscribedType,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -1012,7 +1088,9 @@ pub(super) fn carries_its_own_ledger(defect: Defect) -> bool {
         | Defect::AFeedBootstrapReadStartsAtTheHead
         | Defect::RefusesTheOldestStartAfterASweep
         | Defect::SkipsTheOldestEntryASweepLeft
-        | Defect::RefusesAWithdrawalWithTheSameReason => false,
+        | Defect::RefusesAWithdrawalWithTheSameReason
+        | Defect::AFeedPositionIsKeyedPerTenant
+        | Defect::AFeedPositionIsKeyedPerSubscribedType => false,
         Defect::SelectsOnWindowStart
         | Defect::FoldsTheInvalidation
         | Defect::LedgerHasNoUniqueConstraint
@@ -1037,13 +1115,38 @@ pub(super) fn carries_its_own_ledger(defect: Defect) -> bool {
 // The wrapping shape
 // ---------------------------------------------------------------------------
 
+/// How many bytes one component of a keyed position carries: **sixteen**,
+/// a tenant `Uuid`'s width.
+///
+/// One width for both keyed defects, so the arithmetic that strips them off
+/// again is one rule rather than one per defect. The value is never read
+/// back — `feed-position-bounded` compares how big a position is and never
+/// what it says — so sixteen is the honest width of the thing a per-tenant
+/// key actually names rather than a figure chosen to make a difference
+/// visible.
+const MUTANT_POSITION_COMPONENT_BYTES: usize = 16;
+
+/// One position component standing for a subscribed GTS type.
+///
+/// The type id's first [`MUTANT_POSITION_COMPONENT_BYTES`] bytes, zero
+/// padded. Two types sharing that prefix would share a component and the
+/// subject would be none the worse for it: the components are counted,
+/// never compared.
+fn type_component(gts_type_id: &MeterTypeId) -> [u8; MUTANT_POSITION_COMPONENT_BYTES] {
+    let mut component = [0_u8; MUTANT_POSITION_COMPONENT_BYTES];
+    for (slot, byte) in component.iter_mut().zip(gts_type_id.as_str().as_bytes()) {
+        *slot = *byte;
+    }
+    component
+}
+
 /// A real [`InMemoryReferencePlugin`] with one method intercepted.
 ///
 /// Every path the defect is not about is the exemplar's own code, so a
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
 ///
-/// One qualification, and it holds for all ten wrapped defects:
+/// One qualification, and it holds for all fifteen wrapped defects:
 /// [`Self::create_usage_records`] is not pure delegation. The inner backend
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
@@ -1055,7 +1158,7 @@ pub(super) struct WrappedReference {
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
     /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
-    /// entry that claimed it. Unused by the other nine defects.
+    /// entry that claimed it. Unused by the other fourteen defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -1070,8 +1173,8 @@ pub(super) struct WrappedReference {
     period_blind_keys: Mutex<BTreeMap<PeriodBlindKey, UsageRecord>>,
     /// The entry-type-blind dedup index [`Defect::DedupIgnoresTheEntryType`]
     /// keys on: `(tenant_id, gts_type_id, idempotency_key, window_start,
-    /// window_end)` to the entry that claimed it. Unused by the other nine
-    /// defects.
+    /// window_end)` to the entry that claimed it. Unused by the other
+    /// fourteen defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -1089,8 +1192,8 @@ pub(super) struct WrappedReference {
     entry_type_blind_keys: Mutex<BTreeMap<EntryTypeBlindKey, UsageRecord>>,
     /// The rows [`Defect::ConflictReadBackIgnoresTheEntryType`] reads a
     /// colliding entry back from: the same five components, to **every**
-    /// entry accepted under them, in arrival order. Unused by the other nine
-    /// defects.
+    /// entry accepted under them, in arrival order. Unused by the other
+    /// fourteen defects.
     ///
     /// A `Vec` rather than one entry, because two rows under one five-tuple
     /// is the whole situation the defect is about, and the defect is which
@@ -1109,7 +1212,7 @@ pub(super) struct WrappedReference {
     five_component_rows: Mutex<BTreeMap<EntryTypeBlindKey, Vec<UsageRecord>>>,
     /// The GTS types retention has been driven over through this wrapper,
     /// which is the mark [`Defect::RefusesTheOldestStartAfterASweep`] reads.
-    /// Unused by the other ten defects.
+    /// Unused by the other fourteen defects.
     ///
     /// The wire string rather than a [`MeterTypeId`], which implements
     /// neither `Ord` nor `PartialOrd`; the reference backend's own
@@ -1120,6 +1223,27 @@ pub(super) struct WrappedReference {
     /// That over-approximates a mark and the defect's own doc says what the
     /// over-approximation costs.
     swept_types: Mutex<BTreeSet<String>>,
+    /// The tenants each GTS type has been written under, which is what
+    /// [`Defect::AFeedPositionIsKeyedPerTenant`] issues one position
+    /// component per. Unused by the other fourteen defects.
+    ///
+    /// The wire string keys it rather than a [`MeterTypeId`], which
+    /// implements neither `Ord` nor `PartialOrd`; `swept_types` above is
+    /// keyed the same way and for the same reason.
+    ///
+    /// **Recorded per type rather than in one set**, because that is the
+    /// shape the defect is about: a position is issued for a subscription,
+    /// and a per-tenant key names the tenants that subscription's types hold
+    /// entries under. One set across the whole backend would make every
+    /// subscription's position the same size, which is a backend that
+    /// happens to pass the check it exists to fail.
+    ///
+    /// A tenant is recorded when the entry is admitted rather than after the
+    /// inner backend stores it, like the two dedup indexes above, so a
+    /// tenant whose only entry the inner backend then refused is still
+    /// counted. That over-approximates the key set, in the direction of a
+    /// longer position, and nothing reads it but the encoder.
+    tenants_written: Mutex<BTreeMap<String, BTreeSet<Uuid>>>,
 }
 
 /// The four inputs a period-blind dedup identity keys on:
@@ -1160,6 +1284,7 @@ impl WrappedReference {
             entry_type_blind_keys: Mutex::new(BTreeMap::new()),
             five_component_rows: Mutex::new(BTreeMap::new()),
             swept_types: Mutex::new(BTreeSet::new()),
+            tenants_written: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1221,6 +1346,141 @@ impl WrappedReference {
         Ok(page.next)
     }
 
+    /// Records the tenant one entry is attributed to against its GTS type,
+    /// and hands the entry on untouched.
+    ///
+    /// [`Defect::AFeedPositionIsKeyedPerTenant`]'s whole admission-side
+    /// behaviour: it changes nothing about what is stored and only builds
+    /// the key set its position encoder then issues one component per.
+    ///
+    /// Synchronous, and it holds the lock only for its own body: the caller
+    /// awaits the inner backend afterwards, never while holding it.
+    fn remember_the_tenant(
+        &self,
+        record: UsageRecord,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        let mut written = self.tenants_written.lock().map_err(|_| {
+            UsageCollectorPluginError::internal("the mutant's tenant index lock is poisoned")
+        })?;
+        written
+            .entry(record.gts_type_id.as_str().to_owned())
+            .or_default()
+            .insert(record.tenant_id);
+        drop(written);
+        Ok(record)
+    }
+
+    /// Whether this subject re-encodes the positions the inner backend
+    /// issues.
+    ///
+    /// True for the two defects that key a position on something that grows
+    /// with a subscription, false for the other thirteen — which hand the
+    /// inner backend's own encoding straight back, so a position of theirs
+    /// is the exemplar's byte for byte.
+    fn keys_its_position(&self) -> bool {
+        self.defect == Defect::AFeedPositionIsKeyedPerTenant
+            || self.defect == Defect::AFeedPositionIsKeyedPerSubscribedType
+    }
+
+    /// The components this subject's position carries beside the inner
+    /// backend's own encoding.
+    ///
+    /// One per tenant the subscribed types hold entries under, or one per
+    /// type named — which of the two is the defect. The component *values*
+    /// are never read back: only how many there are matters, because the
+    /// rule is about a position's size. They are real values all the same,
+    /// because a subject whose position carried filler would be a
+    /// caricature of a plugin that has per-tenant state to name.
+    fn position_components(
+        &self,
+        subscription: &[MeterTypeId],
+    ) -> Result<Vec<[u8; MUTANT_POSITION_COMPONENT_BYTES]>, UsageCollectorPluginError> {
+        if self.defect == Defect::AFeedPositionIsKeyedPerSubscribedType {
+            return Ok(subscription.iter().map(type_component).collect());
+        }
+        if self.defect != Defect::AFeedPositionIsKeyedPerTenant {
+            return Ok(Vec::new());
+        }
+        let written = self.tenants_written.lock().map_err(|_| {
+            UsageCollectorPluginError::internal("the mutant's tenant index lock is poisoned")
+        })?;
+        let mut tenants: BTreeSet<Uuid> = BTreeSet::new();
+        for gts_type_id in subscription {
+            if let Some(under_this_type) = written.get(gts_type_id.as_str()) {
+                tenants.extend(under_this_type.iter().copied());
+            }
+        }
+        drop(written);
+        Ok(tenants.into_iter().map(Uuid::into_bytes).collect())
+    }
+
+    /// The position this subject hands a caller: its own components, then
+    /// the inner backend's encoding.
+    ///
+    /// The component **count** leads, so the encoding is self-describing and
+    /// [`Self::the_inner_position`] can strip it without knowing which
+    /// subscription the position was issued under. A subject that recovered
+    /// the count from the subscription instead would corrupt any position
+    /// resumed under a different one, which is a second defect.
+    fn the_issued_position(
+        &self,
+        subscription: &[MeterTypeId],
+        inner: &FeedPosition,
+    ) -> Result<FeedPosition, UsageCollectorPluginError> {
+        if !self.keys_its_position() {
+            return Ok(inner.clone());
+        }
+        let components = self.position_components(subscription)?;
+        let count = u8::try_from(components.len()).map_err(|_| {
+            UsageCollectorPluginError::internal(
+                "this mutant's keyed position needs more components than its own one-byte count                  can carry",
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(
+            1 + components.len() * MUTANT_POSITION_COMPONENT_BYTES + inner.len(),
+        );
+        bytes.push(count);
+        for component in &components {
+            bytes.extend_from_slice(component);
+        }
+        bytes.extend_from_slice(inner.as_bytes());
+        FeedPosition::new(bytes).map_err(|err| {
+            UsageCollectorPluginError::internal(format!(
+                "this mutant's keyed position outgrew the published position bound, which makes                  it a subject about a refusal rather than about a size: {err}"
+            ))
+        })
+    }
+
+    /// The inner backend's own position, recovered from one this subject
+    /// issued.
+    ///
+    /// The mirror of [`Self::the_issued_position`], and the reason the two
+    /// defects are wrappers at all: everything the inner backend does with a
+    /// resumed position is the exemplar's, because the position it is handed
+    /// is the one it issued.
+    fn the_inner_position(
+        &self,
+        issued: &FeedPosition,
+    ) -> Result<FeedPosition, UsageCollectorPluginError> {
+        if !self.keys_its_position() {
+            return Ok(issued.clone());
+        }
+        let malformed = || {
+            UsageCollectorPluginError::internal(
+                "this mutant was handed a position it did not issue: its own encoding is a                  component count, that many components, and then the inner backend's position",
+            )
+        };
+        let (count, rest) = issued.as_bytes().split_first().ok_or_else(malformed)?;
+        let inner = rest
+            .get(usize::from(*count) * MUTANT_POSITION_COMPONENT_BYTES..)
+            .ok_or_else(malformed)?;
+        FeedPosition::new(inner.to_vec()).map_err(|err| {
+            UsageCollectorPluginError::internal(format!(
+                "this mutant could not recover the inner backend's position from one of its own:                  {err}"
+            ))
+        })
+    }
+
     /// The defect's effect on one entry on its way in: a rewritten quantity,
     /// a refusal from the period-blind index, or the entry untouched.
     ///
@@ -1253,6 +1513,7 @@ impl WrappedReference {
             }),
             Defect::DedupIgnoresThePeriod => self.claim_period_blind_key(record),
             Defect::DedupIgnoresTheEntryType => self.claim_entry_type_blind_key(record),
+            Defect::AFeedPositionIsKeyedPerTenant => self.remember_the_tenant(record),
             // Enumerated rather than caught by a wildcard. A new defect
             // routed here and forgotten would otherwise pass its
             // entries through untouched and report no violation at all;
@@ -1260,9 +1521,10 @@ impl WrappedReference {
             // of a matrix row whose subject does nothing. The point read's
             // defect is applied on the read path, the two withdrawal defects
             // and the conflict read-back around the inner call, the three
-            // bootstrap defects on the feed path, and the last thirteen
-            // never reach this type at all — `mutant` routes them to
-            // `MutantLedger` — but exhaustiveness is the whole point.
+            // bootstrap defects on the feed path, the per-subscribed-type
+            // position defect on the way back out of it, and the last
+            // seventeen never reach this type at all — `mutant` routes them
+            // to `MutantLedger` — but exhaustiveness is the whole point.
             Defect::IgnoresScopeOnThePointRead
             | Defect::AnswersNotConvergedForAnAcknowledgedEntry
             | Defect::AbsorbsAWithdrawalWithAnotherReason
@@ -1287,6 +1549,7 @@ impl WrappedReference {
             | Defect::TheRetentionRefusalReadsTheCallersGrant
             | Defect::RefusesEveryCursorOnceASweepHasRun
             | Defect::TheRetentionRefusalIgnoresTheSubscription
+            | Defect::AFeedPositionIsKeyedPerSubscribedType
             | Defect::FeedOrdersByTheAcceptanceInstant => Ok(record),
         }
     }
@@ -1679,17 +1942,30 @@ impl UsageCollectorPluginV1 for WrappedReference {
     }
 
     /// Delegated, with `FeedStart::Oldest` reinterpreted by the two defects
-    /// that are about what that start mode means.
+    /// that are about what that start mode means and the page's
+    /// continuation re-encoded by the two that are about what a position
+    /// costs to carry.
     ///
-    /// Both land **above** the page loop rather than inside it, which is why
-    /// they can be interceptions at all where the nine feed defects in
-    /// [`MutantLedger`] cannot: one substitutes a different `start`, the
-    /// other declines to serve the call. Everything after that decision is
-    /// the exemplar's own loop, cursor and page.
+    /// The first two land **above** the page loop rather than inside it,
+    /// which is why they can be interceptions at all where the nine feed
+    /// defects in [`MutantLedger`] cannot: one substitutes a different
+    /// `start`, the other declines to serve the call. Everything after that
+    /// decision is the exemplar's own loop, cursor and page.
     ///
-    /// `FeedStart::After` is delegated untouched by both. It is matched with
-    /// a wildcard arm because [`FeedStart`] is `#[non_exhaustive]`, and a
-    /// start mode added later is one neither defect has an opinion about.
+    /// The other two land **below** it, on the position the loop produced,
+    /// and are interceptions for the mirror of that reason: a position's
+    /// encoding is a function of the position, so there is nothing of the
+    /// loop to re-implement. [`Self::the_inner_position`] strips a
+    /// subject's own components off whatever it is handed and
+    /// [`Self::the_issued_position`] puts them back on the way out, so the
+    /// inner backend is resumed at exactly the position it issued and what
+    /// differs is the size of the token a caller carries. Both are no-ops
+    /// for the other thirteen defects.
+    ///
+    /// `FeedStart::After` is delegated untouched by the bootstrap defects.
+    /// It is matched with a wildcard arm because [`FeedStart`] is
+    /// `#[non_exhaustive]`, and a start mode added later is one neither of
+    /// them has an opinion about.
     async fn read_feed_page(
         &self,
         subscription: &[MeterTypeId],
@@ -1728,9 +2004,31 @@ impl UsageCollectorPluginV1 for WrappedReference {
             None => start,
         };
 
-        self.inner
+        // A position this subject issued is the inner backend's with this
+        // subject's own components in front of it, so both of the positions
+        // a read can be handed are stripped back before the inner backend
+        // ever sees them.
+        let start = match start {
+            FeedStart::After(position) => FeedStart::After(self.the_inner_position(&position)?),
+            other => other,
+        };
+        let until = match until {
+            Some(position) => Some(self.the_inner_position(&position)?),
+            None => None,
+        };
+
+        let page = self
+            .inner
             .read_feed_page(subscription, scope, start, until, limit)
-            .await
+            .await?;
+        let next = match page.next {
+            Some(position) => Some(self.the_issued_position(subscription, &position)?),
+            None => None,
+        };
+        Ok(FeedPage {
+            entries: page.entries,
+            next,
+        })
     }
 
     /// Delegated whole. No defect routed to this wrapper touches
@@ -3148,7 +3446,7 @@ impl LatestOrder {
             // defect added later and forgotten here would silently fold
             // under DESIGN's order and report nothing at all, which is a
             // matrix row whose subject does nothing rather than a compile
-            // error. Thirteen of these never reach this type - `mutant`
+            // error. Fifteen of these never reach this type - `mutant`
             // routes them to `WrappedReference` - but exhaustiveness is the
             // point.
             Defect::QuantityThroughFloat
@@ -3177,6 +3475,8 @@ impl LatestOrder {
             | Defect::TheRetentionRefusalReadsTheCallersGrant
             | Defect::RefusesEveryCursorOnceASweepHasRun
             | Defect::TheRetentionRefusalIgnoresTheSubscription
+            | Defect::AFeedPositionIsKeyedPerTenant
+            | Defect::AFeedPositionIsKeyedPerSubscribedType
             | Defect::FeedOrdersByTheAcceptanceInstant => Self::Declared,
         }
     }

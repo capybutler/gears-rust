@@ -343,6 +343,35 @@ pub fn contract_scope() -> ast::Expr {
     )
 }
 
+/// `tenant_id eq <first> or tenant_id eq <rest...>`, right-associated.
+///
+/// This is the shape `authz::scope_to_odata_filter` projects for a grant
+/// whose constraint names several tenants, and [`contract_scope`] above is
+/// its one-tenant case spelled out. The first tenant is a parameter of its
+/// own rather than the head of a slice, so a grant naming none - which would
+/// admit nothing and make every assertion resting on it vacuous - cannot be
+/// written at all.
+///
+/// It lives here rather than in a check for the reason
+/// [`super::feed_walk`] does: it landed inside
+/// [`feed_snapshot_and_replay`](super::checks::feed_snapshot_and_replay()),
+/// the first check to need a grant naming more than one tenant, and moved
+/// here when the second one needed it.
+/// [`feed_position_bounded`](super::checks::feed_position_bounded()) is that
+/// second caller, and it needs a grant naming ten.
+pub fn tenant_disjunction(first: Uuid, rest: &[Uuid]) -> ast::Expr {
+    let named = |tenant_id: Uuid| {
+        ast::Expr::Compare(
+            Box::new(ast::Expr::Identifier("tenant_id".to_owned())),
+            ast::CompareOperator::Eq,
+            Box::new(ast::Expr::Value(ast::Value::Uuid(tenant_id))),
+        )
+    };
+    rest.iter().rev().fold(named(first), |grant, tenant_id| {
+        ast::Expr::Or(Box::new(grant), Box::new(named(*tenant_id)))
+    })
+}
+
 /// The query the suite's read paths dispatch: the compiled scope as the
 /// filter, the canonical `(window_end, id)` keyset as the order, and the
 /// `filter_hash` the gateway guarantees.

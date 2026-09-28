@@ -24,7 +24,8 @@ use crate::contract::feed_walk::{
 };
 use crate::contract::fixtures::{
     CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, SCOPE_EXCLUDED_TENANT_ID,
-    SCOPE_UNUSED_TENANT_ID, check_meter, contract_tenant, fixture_record_on, violation,
+    SCOPE_UNUSED_TENANT_ID, check_meter, contract_tenant, fixture_record_on, tenant_disjunction,
+    violation,
 };
 use crate::contract::{ContractViolation, FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT};
 use crate::feed::FeedStart;
@@ -214,10 +215,13 @@ impl FeedSnapshotFixtures {
 /// `a_bounded_page_limit_hands_two_grants_two_positions_that_each_resume`
 /// is the read where they differ, and it differs by design. Nothing here
 /// compares two grants' positions for equality. Probe 4 compares
-/// [`FeedPosition::len`](crate::feed::FeedPosition::len) — which is what
-/// DESIGN's `feed-position-bounded` row is about — and then compares what
-/// each position *does*, which is the property that holds whatever the
-/// limit.
+/// [`FeedPosition::len`](crate::feed::FeedPosition::len) — the figure
+/// DESIGN's `feed-position-bounded` row is stated over, though that row is
+/// stated over the breadth of a **subscription** and this probe varies the
+/// **grant**, so the two are neighbours rather than one claim;
+/// [`feed_position_bounded`](super::feed_position_bounded()) is the check
+/// whose row that is — and then compares what each position *does*, which
+/// is the property that holds whatever the limit.
 ///
 /// # The ledger alternates its two tenants
 ///
@@ -318,12 +322,21 @@ impl FeedSnapshotFixtures {
 ///   plausible backend does that; an implausible one would be a caricature.
 ///   **A recorded gap with that reasoning.**
 /// * **The size comparison in [`the_two_grants_stand_in_one_place`]** — the
-///   subject that reaches it is a plugin keying its position per tenant, and
-///   that subject belongs to
-///   [`FEED_POSITION_BOUNDED`](crate::contract::FEED_POSITION_BOUNDED),
-///   whose whole row is the size bound. Building it here would put a
-///   subject in front of two checks and leave that row's own matrix entry
-///   borrowing this one's. **A recorded gap with a named owner.**
+///   owner named here has landed and this gap is still open, which is worth
+///   saying plainly because the two are easy to run together.
+///   [`FEED_POSITION_BOUNDED`](crate::contract::FEED_POSITION_BOUNDED) is
+///   written and dispatched, and one of its two subjects **is** a plugin
+///   keying its position per tenant — but it keys on the tenants a
+///   subscription's ledger holds rather than on the tenants a grant names,
+///   because a position that moved with the grant could not be resumed by a
+///   caller whose grant had since widened and would be a subject wrong
+///   twice. So it does not reach this comparison. Measured rather than
+///   assumed: neutering this comparison leaves every row of both
+///   discrimination matrices unchanged. What would reach it is a backend
+///   keying its position on the **grant**, which is a different mistake
+///   from the one DESIGN names in those words, and nobody has built it.
+///   **A recorded gap, with the owner landed and the subject it still wants
+///   named.**
 ///
 /// # What this check does not reach
 ///
@@ -1154,26 +1167,6 @@ fn many_tenants_grant() -> ast::Expr {
             contract_tenant(FEED_SNAPSHOT_SECOND_UNWRITTEN_TENANT),
         ],
     )
-}
-
-/// `tenant_id eq <first> or tenant_id eq <rest…>`, right-associated.
-///
-/// This is the shape `authz::scope_to_odata_filter` projects for a grant
-/// whose constraint names several tenants. The first tenant is a parameter
-/// of its own rather than the head of a slice, so a grant naming none — which
-/// would admit nothing and make every assertion here vacuous — cannot be
-/// written at all.
-fn tenant_disjunction(first: Uuid, rest: &[Uuid]) -> ast::Expr {
-    let named = |tenant_id: Uuid| {
-        ast::Expr::Compare(
-            Box::new(ast::Expr::Identifier("tenant_id".to_owned())),
-            ast::CompareOperator::Eq,
-            Box::new(ast::Expr::Value(ast::Value::Uuid(tenant_id))),
-        )
-    };
-    rest.iter().rev().fold(named(first), |grant, tenant_id| {
-        ast::Expr::Or(Box::new(grant), Box::new(named(*tenant_id)))
-    })
 }
 
 /// Builds the four seeded entries, the two that arrive mid-scan and the two
