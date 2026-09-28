@@ -22,15 +22,24 @@ fn config_defaults_are_applied() {
 
 #[test]
 fn validate_rejects_empty_database_url() {
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str("{}").unwrap();
-    assert!(cfg.validate().is_err());
+    // The horizon is supplied although this test is about the DSN: it is the
+    // other field with no working default, so a config lacking it is `Err` for
+    // that reason alone and an empty DSN would never be what this assertion
+    // catches. The failure is read back to confirm which field produced it.
+    let json = r#"{ "feed_replay_horizon_secs": 3600 }"#;
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("an empty database_url must be rejected");
+    assert!(
+        err.contains("database_url"),
+        "the failure must name the field, got: {err}"
+    );
 }
 
 #[test]
 fn validate_rejects_min_gt_max_pool() {
-    let json = r#"{ "database_url": "postgres://x", "pool_size_min": 20, "pool_size_max": 4 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
-    assert!(cfg.validate().is_err());
+    assert!(validate_with(r#""pool_size_min": 20, "pool_size_max": 4"#).is_err());
 }
 
 #[test]
@@ -38,20 +47,16 @@ fn validate_rejects_pool_max_of_one() {
     // A max of 1 self-deadlocks startup: post-migration setup holds the single
     // connection under an advisory lock while the partitioning statements run
     // on a second, so the pool must allow at least 2.
-    let json = r#"{ "database_url": "postgres://x", "pool_size_min": 1, "pool_size_max": 1 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
     assert!(
-        cfg.validate().is_err(),
+        validate_with(r#""pool_size_min": 1, "pool_size_max": 1"#).is_err(),
         "pool_size_max of 1 must be rejected: it self-deadlocks post-migration setup"
     );
 }
 
 #[test]
 fn validate_rejects_zero_connection_timeout() {
-    let json = r#"{ "database_url": "postgres://x", "connection_timeout_secs": 0 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
     assert!(
-        cfg.validate().is_err(),
+        validate_with(r#""connection_timeout_secs": 0"#).is_err(),
         "a zero acquire timeout yields a pool that times out immediately"
     );
 }
@@ -61,10 +66,8 @@ fn validate_rejects_zero_statement_timeout() {
     // Postgres treats `statement_timeout = 0` as *disabled* (no bound), which
     // would reintroduce the unbounded-query footgun this setting exists to close,
     // so a zero must be rejected rather than silently disabling the timeout.
-    let json = r#"{ "database_url": "postgres://x", "statement_timeout_secs": 0 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
     assert!(
-        cfg.validate().is_err(),
+        validate_with(r#""statement_timeout_secs": 0"#).is_err(),
         "a zero statement_timeout disables the bound, leaving request-path queries unbounded"
     );
 }
@@ -80,9 +83,13 @@ fn validate_accepts_nonzero_statement_timeout() {
 #[test]
 fn a_transaction_timeout_at_or_below_the_statement_timeout_is_rejected() {
     // `docs/DESIGN.md` §3.5: transaction_timeout_secs "MUST be greater than
-    // `statement_timeout_secs`; config load rejects a value that is not". It
-    // bounds a whole transaction where the statement timeout bounds one
-    // statement, so an equal value makes the outer bound unreachable.
+    // `statement_timeout_secs`; config load rejects a value that is not". The
+    // transaction timer starts no later than the statement timer, so at or below
+    // it the transaction bound always fires first and the *statement* bound is
+    // the one left unreachable. Measured on `timescale/timescaledb:2.29.2-pg18`,
+    // both at 5s over a 10s statement: `FATAL: terminating connection due to
+    // transaction timeout` — the session is terminated, which kills a pooled
+    // connection, where a statement timeout is a cancellable `ERROR`.
     let mut cfg = valid_config();
     cfg.statement_timeout_secs = 30;
     cfg.transaction_timeout_secs = 30;

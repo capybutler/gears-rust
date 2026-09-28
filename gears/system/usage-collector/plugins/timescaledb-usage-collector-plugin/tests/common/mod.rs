@@ -255,10 +255,13 @@ pub async fn bring_up_with(
         // sslmode are upgraded to `require` - see `connect_options`). Built by
         // deserialization because the secret-wrapped `database_url` has no
         // public literal constructor (the production path is always serde +
-        // expand-vars).
+        // expand-vars). `feed_replay_horizon_secs` has no working default and is
+        // required, so it is set here too: without it this harness would build
+        // every pg test on a config `validate` rejects.
         let cfg: TimescaleDbPluginConfig = serde_json::from_str(&format!(
             r#"{{ "database_url": "postgres://user:pass@127.0.0.1:{port}/app?sslmode=disable",
                   "statement_timeout_secs": {statement_timeout_secs},
+                  "feed_replay_horizon_secs": 3600,
                   "pool_size_min": {pool_size_min}, "pool_size_max": {pool_size_max} }}"#
         ))
         .expect("valid test config json");
@@ -338,8 +341,10 @@ const SETTING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1
 /// # Panics
 ///
 /// If it still does not after [`SETTING_ATTEMPTS`] reads, naming the setting,
-/// what was wanted and what was last read. A test that carried on regardless
-/// would assert against the old value and pass for the wrong reason.
+/// what was wanted and what was last read. A caller that carried on regardless
+/// would be asserting against a server it has not in fact reconfigured, which
+/// surfaces as a flaky *failure* rather than a false pass: `startup_durability_pg`
+/// would get the pool its `expect_err` refuses to accept.
 pub async fn await_setting(pool: &PgPool, setting: &str, expected: &str) {
     let mut last = String::new();
     for _ in 0..SETTING_ATTEMPTS {

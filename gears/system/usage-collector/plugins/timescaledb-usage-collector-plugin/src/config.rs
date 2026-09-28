@@ -86,14 +86,30 @@ pub struct TimescaleDbPluginConfig {
     /// same pool. Bounds a whole transaction rather than one statement
     /// (`docs/DESIGN.md` §3.5, §4.1 item 2), so a transaction that opened and
     /// then stalled between statements cannot hold the feed's settled horizon
-    /// indefinitely. MUST be greater than [`Self::statement_timeout_secs`].
+    /// indefinitely.
+    ///
+    /// MUST be greater than [`Self::statement_timeout_secs`]: the transaction
+    /// timer starts no later than the statement timer, so at or below it the
+    /// transaction bound always fires first and the statement bound is never
+    /// reached — and Postgres ends a transaction timeout by terminating the
+    /// session (`FATAL`), killing a pooled connection, where a statement timeout
+    /// is a cancellable `ERROR`.
+    ///
+    /// **Requires `PostgreSQL` 17 or newer.** `transaction_timeout` arrived in
+    /// 17 and is applied as a `-c` connection startup parameter, so an older
+    /// server rejects *every* connection with
+    /// `FATAL: unrecognized configuration parameter "transaction_timeout"`
+    /// rather than degrading.
     pub transaction_timeout_secs: u64,
     /// How far an entry's `accepted_at` may sit from the INSERT statement's own
-    /// `statement_timestamp()`, in either direction, before the write path
-    /// refuses it as `Transient` (`docs/DESIGN.md` §3.6
+    /// `statement_timestamp()`, in either direction, before the write path will
+    /// refuse it as `Transient` (`docs/DESIGN.md` §3.6
     /// `cpt-cf-uc-plugin-seq-ingest-dedup`).
     ///
-    /// It is enforced at write time rather than budgeted, because the
+    /// Nothing reads it until the guarded write statement exists; it is
+    /// validated here so a deployment cannot reach that point unconfigured.
+    ///
+    /// It will be enforced at write time rather than budgeted, because the
     /// acceptance-order slack
     /// `S = 2 × feed_acceptance_slack_secs + statement_timeout_secs` is what the
     /// feed's retention refusal rests on (`docs/DESIGN.md` §3.6,
@@ -219,8 +235,11 @@ impl TimescaleDbPluginConfig {
         if self.transaction_timeout_secs <= self.statement_timeout_secs {
             return Err(format!(
                 "transaction_timeout_secs ({}) must be greater than statement_timeout_secs ({}): \
-                 it bounds a whole transaction where the statement timeout bounds one statement, \
-                 so an equal or lower value leaves the outer bound unreachable",
+                 the transaction timer starts no later than the statement timer, so at or below \
+                 the statement timeout the transaction bound always fires first and the statement \
+                 bound is never reached. Postgres ends a transaction timeout by terminating the \
+                 session (FATAL), which kills a pooled connection, where a statement timeout is a \
+                 cancellable ERROR on a connection that survives",
                 self.transaction_timeout_secs, self.statement_timeout_secs
             ));
         }

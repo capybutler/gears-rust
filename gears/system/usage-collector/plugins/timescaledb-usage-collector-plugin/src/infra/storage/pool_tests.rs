@@ -61,15 +61,24 @@ fn connection_gucs_bind_both_timeouts_and_the_fixed_lock_timeout() {
     // (seconds -> `<n>s`) and distinct values are passed so one cannot stand in
     // for the other; the lock timeout is a fixed constant so a contended lock
     // fails fast rather than blocking.
-    let gucs = connection_gucs(45, 90);
-    assert_eq!(gucs[0], ("statement_timeout", "45s".to_owned()));
-    assert_eq!(gucs[1], ("transaction_timeout", "90s".to_owned()));
-    assert_eq!(gucs[2], ("lock_timeout", LOCK_TIMEOUT.to_owned()));
+    // Compared whole, as slices, rather than index by index: a GUC added to the
+    // set would otherwise slip past assertions that only pin the entries already
+    // there, and comparing as slices makes the added entry a test failure naming
+    // it rather than a type error on the array length.
+    assert_eq!(
+        connection_gucs(45, 90).as_slice(),
+        [
+            ("statement_timeout", "45s".to_owned()),
+            ("transaction_timeout", "90s".to_owned()),
+            ("lock_timeout", LOCK_TIMEOUT.to_owned()),
+        ]
+        .as_slice()
+    );
 }
 
 #[test]
 fn pool_connect_options_sets_both_timeouts_and_the_lock_timeout() {
-    // The request-path connect options must carry all three GUCs as `-c` startup
+    // The request-path connect options must carry the GUCs as `-c` startup
     // parameters so every pooled connection is bounded at connect time.
     let opts =
         pool_connect_options("postgres://u:p@h/db?sslmode=require", 45, 90).expect("valid dsn");

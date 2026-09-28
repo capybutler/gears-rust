@@ -138,13 +138,14 @@ fn pool_connect_options(
 /// `full_page_writes` are server-wide and cannot be forced per transaction, and
 /// either one off can lose a committed write on a crash."
 ///
-/// The `TimescaleDB` extension check the same sequence names
-/// (`inst-pool-extension`) is met by the migration's
-/// `CREATE EXTENSION IF NOT EXISTS timescaledb`, which fails when the extension
-/// is unavailable. No second check is added for it.
-const REQUIRED_ON_SETTINGS: [&str; 2] = ["fsync", "full_page_writes"];
+/// The `TimescaleDB` extension check that the same provisioning steps call for
+/// (`inst-pool-extension` in `docs/features/registration-schema-provisioning.md`,
+/// alongside `inst-pool-fsync` and `inst-pool-full-page-writes`) is met by the
+/// migration's `CREATE EXTENSION IF NOT EXISTS timescaledb`, which fails when
+/// the extension is unavailable. No second check is added for it.
+const REQUIRED_DURABILITY_SETTINGS: [&str; 2] = ["fsync", "full_page_writes"];
 
-/// Verify every setting in [`REQUIRED_ON_SETTINGS`] reads `on`.
+/// Verify every setting in [`REQUIRED_DURABILITY_SETTINGS`] reads `on`.
 ///
 /// Called from [`build_pool`] before it returns, so a failure leaves the plugin
 /// unregistered rather than running against a server that can lose an
@@ -155,7 +156,7 @@ const REQUIRED_ON_SETTINGS: [&str; 2] = ["fsync", "full_page_writes"];
 /// `sqlx::Error::Configuration` naming the setting and its value if it is not
 /// `on`.
 async fn verify_durability_settings(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
-    for setting in REQUIRED_ON_SETTINGS {
+    for setting in REQUIRED_DURABILITY_SETTINGS {
         let value: String = sqlx::query_scalar("SELECT current_setting($1)")
             .bind(setting)
             .fetch_one(&mut *conn)
@@ -179,7 +180,7 @@ async fn verify_durability_settings(conn: &mut PgConnection) -> Result<(), sqlx:
 /// `connect_options`) and every request-path connection bounded by
 /// `statement_timeout` + `transaction_timeout` + `lock_timeout` (see
 /// `connection_gucs`), then refuse the server outright unless every setting
-/// in `REQUIRED_ON_SETTINGS` reads `on`.
+/// in `REQUIRED_DURABILITY_SETTINGS` reads `on`.
 ///
 /// # Errors
 /// Returns `sqlx::Error` if the DSN is malformed, the pool cannot connect

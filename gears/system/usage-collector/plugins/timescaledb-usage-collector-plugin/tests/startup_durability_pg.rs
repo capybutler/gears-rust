@@ -41,8 +41,10 @@ async fn refuses_when_setting_is_off(setting: &str) {
         .await
         .expect("reload");
     // The reload is asynchronous, so read the setting back rather than assuming
-    // it took; a test that built the pool too early would pass for the wrong
-    // reason.
+    // it took. Building the pool too early would not pass for the wrong reason:
+    // the server would still report the setting `on`, `build_pool` would admit
+    // it, and the `expect_err` below would panic. What the read-back removes is
+    // that flaky failure.
     common::await_setting(&harness.pool, setting, "off").await;
 
     let err = build_pool(&harness.cfg)
