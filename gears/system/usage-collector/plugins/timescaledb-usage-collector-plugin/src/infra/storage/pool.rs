@@ -88,13 +88,19 @@ const LOCK_TIMEOUT: &str = "5s";
 /// parameters so the bounds hold from the connection's first query, with no
 /// extra round-trip.
 ///
-/// `transaction_timeout` is what bounds the feed's settled horizon, which is
-/// cluster-wide (`docs/DESIGN.md` §4.1 item 2): a statement bound alone leaves a
-/// transaction that opened and then stalled between statements holding the
-/// horizon back. The retention sweep's detached connection is
-/// `pool.acquire().await?.detach()` ([`super::retention_sweep`]) — the same
-/// physical connection with the same startup parameters — so it carries this
-/// bound already and needs no `SET` of its own.
+/// `transaction_timeout` bounds the plugin's own request-path and retention-drop
+/// transactions, so neither can hold the feed's settled horizon back
+/// indefinitely (`docs/DESIGN.md` §4.1 item 2). It does not bound the horizon
+/// itself: the horizon is cluster-wide, bounded by the longest-running write
+/// transaction in the `PostgreSQL` instance, and item 2's table leaves the
+/// rollup refresh "not bounded by configuration" and anything else in the
+/// instance "not bounded by the plugin". A statement bound alone would not give
+/// even this much: a transaction that opened and then stalled between statements
+/// holds the horizon back with every one of its statements inside the bound. The
+/// retention sweep's detached connection is `pool.acquire().await?.detach()`
+/// ([`super::retention_sweep`]) — the same physical connection with the same
+/// startup parameters — so it carries this bound already and needs no `SET` of
+/// its own.
 fn connection_gucs(
     statement_timeout_secs: u64,
     transaction_timeout_secs: u64,
@@ -170,9 +176,9 @@ async fn verify_durability_settings(conn: &mut PgConnection) -> Result<(), sqlx:
 }
 
 /// Build the connection pool with TLS enforced (`sslmode >= require`, see
-/// [`connect_options`]) and every request-path connection bounded by
+/// `connect_options`) and every request-path connection bounded by
 /// `statement_timeout` + `transaction_timeout` + `lock_timeout` (see
-/// [`connection_gucs`]), then refuse the server outright unless every setting
+/// `connection_gucs`), then refuse the server outright unless every setting
 /// in `REQUIRED_ON_SETTINGS` reads `on`.
 ///
 /// # Errors

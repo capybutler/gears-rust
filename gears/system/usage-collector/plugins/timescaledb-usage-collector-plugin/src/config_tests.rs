@@ -285,7 +285,8 @@ fn valid_config() -> TimescaleDbPluginConfig {
     cfg
 }
 
-/// Parse `{ "database_url": "postgres://x", <extra> }` and validate it.
+/// Parse `{ "database_url": "postgres://x", "feed_replay_horizon_secs": 3600, <extra> }`
+/// and validate it.
 ///
 /// Carries `feed_replay_horizon_secs` for the same reason [`valid_config`]
 /// does: without it every call would return `Err` naming the horizon, and a

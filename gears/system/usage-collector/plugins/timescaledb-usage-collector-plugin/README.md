@@ -14,10 +14,10 @@ Config maps to `TimescaleDbPluginConfig` (`src/config.rs`). Durations are whole 
 | `connection_timeout_secs` | `10` | Connection acquire timeout (seconds). |
 | `statement_timeout_secs` | `30` | Per-statement timeout on every request-path connection (seconds). |
 | `transaction_timeout_secs` | `60` | Postgres `transaction_timeout` on every pool connection, and so on the retention sweep's detached connection. Bounds a whole transaction, not one statement. Must be greater than `statement_timeout_secs`. |
+| `feed_acceptance_slack_secs` | `120` | How far an entry's `accepted_at` may sit from its INSERT's own `statement_timestamp()`, in either direction, before the write path refuses it as transient. Zero does not disable the check and is rejected. |
 | `chunk_time_interval_secs` | `604800` (7d) | Time width of new ledger chunks; a multiple of 3600; applies to chunks created afterwards. |
 | `type_key_slice_width` | `1` | How many type keys share one chunk slice; applies to chunks created afterwards. See [Retention](#retention). |
 | `retention_sweep_interval_secs` | `3600` (1h) | Seconds between retention sweeps. |
-| `feed_acceptance_slack_secs` | `120` | How far an entry's `accepted_at` may sit from its INSERT's own `statement_timestamp()`, in either direction, before the write path refuses it as transient. Zero does not disable the check and is rejected. |
 | `feed_replay_horizon_secs` | _(required)_ | The deployment's operational replay horizon; every feed position no older than this is served. Required because the SPI does not carry it. |
 | `rollup_materialization_lag_secs` | `7200` (2h) | Buckets newer than this are answered from the ledger rather than materialised. Multiple of 3600, at least 3600, below `rollup_live_window_secs`. See [Aggregate path](#aggregate-path). |
 | `rollup_live_window_secs` | `259200` (3d) | Reach of the frequent refresh policy. Size it to the gateway's live past tolerance (48h by default). Multiple of 3600. |
@@ -34,10 +34,10 @@ pool_size_max = 16
 connection_timeout_secs = 10
 statement_timeout_secs = 30
 transaction_timeout_secs = 60
+feed_acceptance_slack_secs = 120
 chunk_time_interval_secs = 604800
 type_key_slice_width = 1
 retention_sweep_interval_secs = 3600
-feed_acceptance_slack_secs = 120
 feed_replay_horizon_secs = 86400
 rollup_materialization_lag_secs = 7200
 rollup_live_window_secs = 259200

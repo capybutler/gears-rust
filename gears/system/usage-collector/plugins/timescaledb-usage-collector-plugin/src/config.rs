@@ -88,17 +88,6 @@ pub struct TimescaleDbPluginConfig {
     /// then stalled between statements cannot hold the feed's settled horizon
     /// indefinitely. MUST be greater than [`Self::statement_timeout_secs`].
     pub transaction_timeout_secs: u64,
-    /// Time width of a new ledger chunk, in seconds. Applied at startup to
-    /// chunks created afterwards; existing chunks keep their range.
-    pub chunk_time_interval_secs: u64,
-    /// How many consecutive type keys share one slice of the ledger's second
-    /// partitioning dimension. `1` gives every type its own chunks, so each is
-    /// dropped exactly at its own retention; `N` lets up to `N` types share a
-    /// chunk, which is then held to the longest retention among them. Applied at
-    /// startup to chunks created afterwards.
-    pub type_key_slice_width: u32,
-    /// Seconds between two retention sweeps.
-    pub retention_sweep_interval_secs: u64,
     /// How far an entry's `accepted_at` may sit from the INSERT statement's own
     /// `statement_timestamp()`, in either direction, before the write path
     /// refuses it as `Transient` (`docs/DESIGN.md` §3.6
@@ -111,6 +100,17 @@ pub struct TimescaleDbPluginConfig {
     /// Acceptance-order slack). **Zero does not mean disabled** and is
     /// rejected: a slack of zero refuses every entry.
     pub feed_acceptance_slack_secs: u64,
+    /// Time width of a new ledger chunk, in seconds. Applied at startup to
+    /// chunks created afterwards; existing chunks keep their range.
+    pub chunk_time_interval_secs: u64,
+    /// How many consecutive type keys share one slice of the ledger's second
+    /// partitioning dimension. `1` gives every type its own chunks, so each is
+    /// dropped exactly at its own retention; `N` lets up to `N` types share a
+    /// chunk, which is then held to the longest retention among them. Applied at
+    /// startup to chunks created afterwards.
+    pub type_key_slice_width: u32,
+    /// Seconds between two retention sweeps.
+    pub retention_sweep_interval_secs: u64,
     /// The deployment's operational replay horizon H. `docs/DESIGN.md` §3.5:
     /// "every feed position no older than this is served."
     ///
@@ -148,10 +148,10 @@ impl Default for TimescaleDbPluginConfig {
             connection_timeout_secs: 10,
             statement_timeout_secs: 30,
             transaction_timeout_secs: 60,
+            feed_acceptance_slack_secs: 120,
             chunk_time_interval_secs: 7 * 86_400,
             type_key_slice_width: 1,
             retention_sweep_interval_secs: 3_600,
-            feed_acceptance_slack_secs: 120,
             feed_replay_horizon_secs: 0,
             rollup_materialization_lag_secs: 7_200,
             rollup_live_window_secs: 259_200,
