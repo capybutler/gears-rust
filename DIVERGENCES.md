@@ -1087,10 +1087,12 @@ stops advertising three dimensions it does not have.
 **Resolved in code by the TimescaleDB port, and kept rather than deleted.**
 `record_column` is the model that exists: the three dead columns are gone,
 `window_start`, `window_end`, `invalidates` and `origin` are mapped, and
-`entry_type` is the stored generated column over `invalidates` — the proposed
-resolution at the foot of this entry, implemented as written. The plugin is a
-workspace member again, `RECORD_COLUMNS` and `UsageRecordRow` name the current
-columns, and the DESIGN §3.3 contract suite runs against a live container.
+`entry_type` resolves to a real column — the proposed resolution at the foot of
+this entry, implemented, though no longer as the generated column that
+resolution names: the column is now a written `usage_entry_type` enum, per the
+plugin's own DESIGN §3.7. The plugin is a workspace member again,
+`RECORD_COLUMNS` and `UsageRecordRow` name the current columns, and the
+DESIGN §3.3 contract suite runs against a live container.
 `$filter=origin eq 'backfill'` is served rather than answered with a `500`.
 
 **What the resolution did not close is entry 19, which this entry sends a porter

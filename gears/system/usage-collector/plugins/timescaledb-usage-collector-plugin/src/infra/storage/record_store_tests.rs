@@ -474,12 +474,14 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
     // casts are load-bearing and neither alias is. `xid8` has no `sqlx` decode
     // at all and `usage_entry_type` is a Postgres enum, which `sqlx` refuses to
     // decode into the `String` the row carries -- so without either cast every
-    // read of the ledger fails, and much of the pg lane says so. Dropping an
-    // alias and running the whole `--features postgres` lane leaves every other
-    // test green, because `PostgreSQL` names the output of a bare column cast
-    // after the column anyway; the aliases are pinned below because that is a
-    // naming rule of the server and `UsageRecordRow`'s fields are looked up by
-    // name.
+    // read of the ledger fails, and much of the pg lane says so. Dropping
+    // either alias and running the whole `--features postgres` lane reds this
+    // test and nothing else - measured for both, one alias at a time - because
+    // `PostgreSQL` names the output of a bare column cast after the column
+    // anyway. They are pinned below because that is a naming rule of the server
+    // and `UsageRecordRow`'s fields are looked up by name: the alias says which
+    // name is meant instead of inheriting one, and this is the only thing that
+    // would notice one going away.
     let insert_names: BTreeSet<&str> = names(INSERT_COLUMNS).into_iter().collect();
     let record_names: BTreeSet<&str> = decoded_names(RECORD_COLUMNS).into_iter().collect();
     assert!(

@@ -175,24 +175,58 @@ async fn the_invalidation_lookup_index_is_partial_and_not_unique() {
 /// entry type caller-supplied end to end; this column inferred it from
 /// `invalidates` anyway, and so did the Record Store's dedup key, and neither
 /// does now.
+///
+/// It reads `attnotnull` in the same query, because a written column can be
+/// NULL where the generated one could not, and a NULL kind defeats
+/// `usage_records_invalidation_pairing` outright - see the comment on that
+/// assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn entry_type_is_a_written_enum_and_not_generated() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
 
-    let (data_type, udt, generated): (String, String, String) = sqlx::query_as(
-        "SELECT data_type, udt_name, is_generated FROM information_schema.columns \
-         WHERE table_name = 'usage_records' AND column_name = 'entry_type'",
+    // `pg_attribute` plus `format_type` rather than `information_schema`, per
+    // this suite's convention and for the reason
+    // `the_feed_order_column_is_an_xid8_the_database_stamps` gives: the
+    // catalogs hand back `text`, where `information_schema.columns` would need
+    // three `character_data` / `sql_identifier` domains decoded. It also reads
+    // `attnotnull`, which `information_schema` splits into a fourth column and
+    // which nothing else here would see.
+    let (data_type, generated, not_null): (String, String, bool) = sqlx::query_as(
+        "SELECT format_type(a.atttypid, a.atttypmod), a.attgenerated::text, a.attnotnull \
+         FROM pg_attribute a \
+         WHERE a.attrelid = 'usage_records'::regclass AND a.attname = 'entry_type' \
+           AND a.attnum > 0 AND NOT a.attisdropped",
     )
     .fetch_one(&h.pool)
     .await
     .expect("usage_records.entry_type must exist");
-    assert_eq!(data_type, "USER-DEFINED");
-    assert_eq!(udt, "usage_entry_type");
     assert_eq!(
-        generated, "NEVER",
-        "a generated column would derive the kind again"
+        data_type, "usage_entry_type",
+        "the kind is stored as the enum, not as a variable-length string"
+    );
+    assert_eq!(
+        generated, "",
+        "a generated column would derive the kind again (attgenerated is 's' for STORED)"
+    );
+    // `NOT NULL` is what makes `usage_records_invalidation_pairing` total. A
+    // `CHECK` admits a row whose predicate evaluates to NULL, and with a NULL
+    // `entry_type` both of that constraint's arms are NULL, so the row would be
+    // stored declaring no kind at all and carrying whatever withdrawal fields
+    // it liked - the disagreement the constraint exists to refuse. Under the
+    // retired generated column the expression could not yield NULL, so this is
+    // a property the written column introduced.
+    //
+    // Asserted here for the reason
+    // `the_feed_order_column_is_an_xid8_the_database_stamps` gives about
+    // `xact_id`: `ledger_columns()` reads the declared type and stops, so the
+    // migration's own `NOT NULL` reaches no oracle, and the live table is where
+    // it can be seen.
+    assert!(
+        not_null,
+        "entry_type must be NOT NULL: a CHECK admits a row whose predicate is NULL, so a \
+         NULL kind would walk straight through usage_records_invalidation_pairing"
     );
 
     let labels: Vec<String> = sqlx::query_scalar(

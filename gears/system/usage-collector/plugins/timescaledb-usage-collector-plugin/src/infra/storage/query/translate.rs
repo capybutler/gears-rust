@@ -50,6 +50,8 @@ use toolkit_odata::ast;
 use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, convert_expr_to_filter_node};
 use usage_collector_sdk::UsageRecordFilterField;
 
+use crate::infra::storage::record_store::ENTRY_TYPE_ENUM;
+
 pub use super::bind::{SqlBind, bind_one, bind_one_query, odata_value_to_bind};
 pub use toolkit_odata::filter::ODataValue;
 
@@ -73,6 +75,17 @@ pub use toolkit_odata::filter::ODataValue;
 /// which is why the field is filterable here at all: the SDK stores no such
 /// attribute and its value hook cannot carry one. It is the one column whose
 /// comparison value needs a cast — see `bind_cast` below.
+///
+/// **This map also feeds `render_order_by`, so the enum decides one sort.**
+/// `$orderby=entry_type` orders by the enum's *declaration* order — `record`
+/// then `invalidation` — where the retired `text` column ordered the two
+/// alphabetically, the other way round. The labels are declared in that order
+/// in `migrations/0001_init.sql` and read back by
+/// `schema_integration_pg::entry_type_is_a_written_enum_and_not_generated`, so
+/// the order a caller sees is pinned; it is pinned there as an identity
+/// property, and this is the other thing it decides. `entry_type` is still not
+/// a keyset key (`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`), so no
+/// cursor rests on it.
 #[must_use]
 pub fn record_column(field_name: &str) -> Option<&'static str> {
     // Declaration order of `UsageRecordQuery`, so the module doc's list above
@@ -129,8 +142,8 @@ impl SqlCtx {
     }
 }
 
-/// The `::type` suffix a bound comparison value needs to be comparable with
-/// `column`, or `""` where the bind's own type already is.
+/// The type a bound comparison value must be cast to before it can be compared
+/// with `column`, or `None` where the bind's own type already serves.
 ///
 /// Every value this translator binds reaches `PostgreSQL` as a [`SqlBind`],
 /// and `entry_type` is the one allowlisted column no variant of that enum
@@ -147,12 +160,18 @@ impl SqlCtx {
 /// comparing against the column directly.
 ///
 /// Keyed on the resolved column rather than the field name, so it is the
-/// spelling that actually reaches the SQL that decides.
-fn bind_cast(column: &str) -> &'static str {
+/// spelling that actually reaches the SQL that decides. The type name is
+/// [`ENTRY_TYPE_ENUM`], not a second spelling of it.
+fn bind_cast(column: &str) -> Option<&'static str> {
     match column {
-        "entry_type" => "::usage_entry_type",
-        _ => "",
+        "entry_type" => Some(ENTRY_TYPE_ENUM),
+        _ => None,
     }
+}
+
+/// [`bind_cast`] rendered as the SQL suffix a placeholder carries, or empty.
+fn bind_cast_suffix(column: &str) -> String {
+    bind_cast(column).map_or_else(String::new, |ty| format!("::{ty}"))
 }
 
 /// Map a comparison [`FilterOp`] to its SQL operator.
@@ -303,7 +322,7 @@ fn translate_filter<F: FilterField>(
             let column = col(field.name())
                 .ok_or_else(|| format!("field not allowlisted: {}", field.name()))?;
             let operator = op_sql(*op)?;
-            let cast = bind_cast(column);
+            let cast = bind_cast_suffix(column);
             let n = ctx.push(odata_value_to_bind(value)?);
             Ok(format!("{column} {operator} ${n}{cast}"))
         }
@@ -313,7 +332,7 @@ fn translate_filter<F: FilterField>(
             if values.is_empty() {
                 return Err("IN list must not be empty".to_owned());
             }
-            let cast = bind_cast(column);
+            let cast = bind_cast_suffix(column);
             let placeholders = values
                 .iter()
                 .map(|v| Ok(format!("${}{cast}", ctx.push(odata_value_to_bind(v)?))))

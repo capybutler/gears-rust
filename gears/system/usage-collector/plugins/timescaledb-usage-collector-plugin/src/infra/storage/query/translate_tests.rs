@@ -16,7 +16,8 @@ use super::super::keyset::{
     cursor_key_to_bind, ensure_forward_cursor, keyset_predicate, render_order_by, uniform_dir,
 };
 use super::{
-    ODataValue, SqlCtx, filter_fields, record_column, translate_record_filter, translate_scope,
+    ENTRY_TYPE_ENUM, ODataValue, SqlCtx, filter_fields, record_column, translate_record_filter,
+    translate_scope,
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -288,10 +289,10 @@ fn binary_eq_renders_single_placeholder_and_one_bind() {
 /// The cast lands on the bound literal, on the one column whose type no
 /// `SqlBind` variant matches, and on nothing else.
 ///
-/// `entry_type` is a `PostgreSQL` enum and every bind here is one of five
-/// storage types, none of them that enum, so `usage_records.entry_type = $1`
-/// with a `text` parameter has no operator to resolve to and `PostgreSQL`
-/// refuses the statement. The column stays bare because this plugin's
+/// `entry_type` is a `PostgreSQL` enum and every bind here is a [`SqlBind`],
+/// no variant of which is that enum, so `usage_records.entry_type = $1` with a
+/// `text` parameter has no operator to resolve to and `PostgreSQL` refuses the
+/// statement. The column stays bare because this plugin's
 /// `DESIGN.md` §3.7 puts the cast on the literal, and because two other
 /// modules document `record_column` as returning bare column names.
 ///
@@ -309,7 +310,10 @@ fn only_the_enum_column_casts_its_bound_literal() {
         &mut ctx,
     )
     .unwrap();
-    assert_eq!(sql, "entry_type = $1::usage_entry_type");
+    // Built from `ENTRY_TYPE_ENUM`, the one spelling of the type name, rather
+    // than from a copy: a copy here would agree with a stale `bind_cast` after
+    // a rename and leave only the pg lane to notice.
+    assert_eq!(sql, format!("entry_type = $1::{ENTRY_TYPE_ENUM}"));
 
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(
@@ -339,7 +343,8 @@ fn only_the_enum_column_casts_its_bound_literal() {
     )
     .unwrap();
     assert_eq!(
-        sql, "entry_type IN ($1::usage_entry_type, $2::usage_entry_type)",
+        sql,
+        format!("entry_type IN ($1::{ENTRY_TYPE_ENUM}, $2::{ENTRY_TYPE_ENUM})"),
         "a membership test compares through the same operator, so every \
          literal in it needs the cast too"
     );

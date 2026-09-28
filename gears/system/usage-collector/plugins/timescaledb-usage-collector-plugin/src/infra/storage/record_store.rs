@@ -121,7 +121,8 @@ const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, wi
      invalidates, reason_code, origin, entry_type, acceptance_sequence, accepted_at, metadata";
 
 /// The `PostgreSQL` enum `entry_type` is declared as
-/// (`migrations/0001_init.sql`), and the one cast both insert paths carry.
+/// (`migrations/0001_init.sql`), and the cast every bind of that column
+/// carries.
 ///
 /// **Measured, not argued.** `sqlx` types a bound `&str` as `text`, and
 /// `PostgreSQL` refuses `text` in assignment to an enum column (`42804`, "you
@@ -130,7 +131,12 @@ const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, wi
 /// `text[]` through an explicit array cast and does land, which is why
 /// [`INSERT_COLUMN_ARRAY_TYPES`] names the enum where the DDL does rather than
 /// diverging to `text` the way `metadata` does.
-const ENTRY_TYPE_ENUM: &str = "usage_entry_type";
+///
+/// `pub(crate)` so the `$filter` translator's `bind_cast`
+/// ([`super::query::translate`]) spells it from here too. A second spelling
+/// there would let a rename leave that module and its own tests agreeing on a
+/// stale name, with only the pg lane to catch it.
+pub(crate) const ENTRY_TYPE_ENUM: &str = "usage_entry_type";
 
 /// Postgres array types for [`INSERT_COLUMNS`], **in the same order**, as the
 /// batch insert's `UNNEST` needs them. A test pins its length equal to the

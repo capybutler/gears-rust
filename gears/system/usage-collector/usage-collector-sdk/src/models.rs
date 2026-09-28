@@ -2163,11 +2163,15 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 // path rather than a hand-rolled slash-path `FilterField` impl.
 //
 // `entry_type` is declared `String` on the filter wire (`"record"` /
-// `"invalidation"`). The SDK stores no such attribute — it is a function
-// of `invalidates`, which is optional — so a plugin that wants the field
-// filterable materializes it: a stored generated column
-// (`CASE WHEN invalidates IS NULL THEN 'record' ELSE 'invalidation' END`)
-// returned from `FieldToColumn::map_field`. `map_value` cannot carry it.
+// `"invalidation"`). The SDK stores no such attribute — [`UsageRecord`]
+// projects it from `invalidates`, which is optional — so a plugin that
+// wants the field filterable holds it as a column of its own and returns
+// that column from `FieldToColumn::map_field`. **How it holds it is the
+// plugin's choice**, and this SDK prescribes neither way: writing the kind
+// each submission declares ([`CreateUsageRecord::entry_type`] carries it,
+// and DESIGN §3.1 forbids inferring it there) and deriving it in the
+// schema from `invalidates` both yield a column `map_field` can name.
+// `map_value` cannot carry it either way.
 // That hook rewrites a value and can change neither the column nor the
 // operator, and `toolkit-db`'s `sea_orm_filter` converts the mapped value
 // before it reaches its `IS NULL` / `IS NOT NULL` branch, so an
@@ -2241,11 +2245,11 @@ pub struct UsageRecordQuery {
     pub invalidates: Uuid,
     /// The derived `record` / `invalidation` discriminator. On the filter
     /// surface because the wire contract lists it there; a plugin backs it
-    /// with a stored generated column over `invalidates` and returns that
-    /// from `FieldToColumn::map_field` — `map_value` cannot express either
-    /// spelling, see the file-level comment above. **Not** an order key:
-    /// the value is a function of the optional `invalidates`, so the SDK
-    /// holds no such attribute and requires no plugin to hold one —
+    /// with a column of its own — written or derived, its choice — and
+    /// returns that from `FieldToColumn::map_field`; `map_value` cannot
+    /// express either spelling, see the file-level comment above. **Not** an
+    /// order key: the value is a function of the optional `invalidates`, so
+    /// the SDK holds no such attribute and requires no plugin to hold one —
     /// mandatory though the value is. See [`is_keyset_safe_record_field`].
     #[odata(filter(kind = "String"))]
     pub entry_type: String,
@@ -2323,11 +2327,11 @@ pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
 /// it is the first bullet, not this one, that excludes it.
 ///
 /// This is a fact about the shape this SDK guarantees, not about any
-/// storage schema. A plugin is free to materialize `entry_type` as a
-/// generated column — filtering on it needs exactly that — and doing so
-/// still does not make it an order key, because the guarantee a caller's
-/// `$orderby` rests on is the SDK's to give and the SDK does not give this
-/// one.
+/// storage schema. A plugin is free to materialize `entry_type` as a column
+/// of its own — filtering on it needs a column, whichever way the plugin
+/// comes by one — and doing so still does not make it an order key, because
+/// the guarantee a caller's `$orderby` rests on is the SDK's to give and the
+/// SDK does not give this one.
 ///
 /// Enforcement is the **gateway's alone**: it refuses a caller `$orderby` on
 /// a non-keyset-safe field with a `400` and guarantees the order slot the
