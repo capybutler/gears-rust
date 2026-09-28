@@ -86,8 +86,11 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 /// This is a **superset** of [`INSERT_COLUMNS`], not the same set reordered:
 /// `xact_id` is stamped by its column default and bound by no insert, so it is
 /// read and never written. It is selected as `xact_id::text AS xact_id`
-/// because `xid8` has no `sqlx` decode implementation, and the alias is what
-/// keeps the decoded name the one [`UsageRecordRow`]'s field carries.
+/// because `xid8` has no `sqlx` decode implementation. The cast is required;
+/// the alias is not, since `PostgreSQL` names the output of a bare column cast
+/// after the column anyway. It is written out so the decoded name that
+/// [`UsageRecordRow`]'s field is looked up by is stated here rather than
+/// inherited from a server naming rule.
 ///
 /// The ledger's `entry_type` is deliberately absent. It is a stored generated
 /// column that exists so `$filter=entry_type eq 'invalidation'` resolves to a
