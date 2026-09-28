@@ -109,7 +109,7 @@ pub fn check_meter(check: &str, role: &str) -> Result<MeterTypeId, String> {
 /// the assertion under [`FEED_OTHER_TENANT_ID`] says why.
 pub const CONTRACT_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0001);
 
-/// The tenant the dispatched scope does **not** admit, read by four checks:
+/// The tenant the dispatched scope does **not** admit, read by these checks:
 /// [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path()),
 /// [`converged_target_lookup`](super::checks::converged_target_lookup()),
 /// [`feed_snapshot_and_replay`](super::checks::feed_snapshot_and_replay())
@@ -312,9 +312,10 @@ pub const FIXTURE_EPOCH: time::OffsetDateTime =
 /// a check renamed out from under this table is a compile error rather than
 /// a row that quietly matches nothing.
 ///
-/// **This is one table rather than seventeen doc comments, and the block
-/// below is why.** Each module used to state its own offset and enumerate
-/// every other module's to argue it was clear of them. Nothing checked
+/// **This is one table rather than a doc comment per check module, and the
+/// block below is why.** Each module used to state its own offset and
+/// enumerate every other module's to argue it was clear of them. Nothing
+/// checked
 /// those enumerations, every one of them had to be edited by every check
 /// that landed afterwards, and none of them was: seven modules carried a
 /// list and all seven were wrong. [`check_window_from`] says what a
@@ -344,15 +345,15 @@ const CHECK_WINDOW_OFFSETS: &[(&str, &str, i64)] = &[
 // the crate compiles.
 //
 // This is the whole reason the offsets are tabled rather than written into
-// seventeen doc comments. `super::run_all` dispatches every check against
-// one shared, persistent backend that writes entries and never removes
-// them, and every fixture shares one meter and one tenant — deliberately,
-// so that nothing but the covered period can decide an entry. The offset is
-// therefore the only thing keeping one check's entries out of another's
-// reads, and two checks sharing one would not fail here: they would fail
-// somewhere else, as a count that came back one too high or a fold that
-// summed a quantity nobody in that check wrote, and which of the two saw it
-// would turn on the order `run_all` happened to dispatch in.
+// one doc comment per check module. `super::run_all` dispatches every check
+// against one shared, persistent backend that writes entries and never
+// removes them, and every fixture shares one meter and one tenant —
+// deliberately, so that nothing but the covered period can decide an entry.
+// The offset is therefore the only thing keeping one check's entries out of
+// another's reads, and two checks sharing one would not fail here: they
+// would fail somewhere else, as a count that came back one too high or a
+// fold that summed a quantity nobody in that check wrote, and which of the
+// two saw it would turn on the order `run_all` happened to dispatch in.
 //
 // A prose argument cannot hold that, and the prose that used to try did not:
 // seven modules carried a list of the offsets taken when they landed, and
@@ -477,11 +478,10 @@ const CONTRACT_FILTER_HASH: &str = "usage-collector-contract-suite";
 /// It is public because two of the SPI's read paths take the compiled scope
 /// as a parameter of their own rather than inside `query.filter` — the feed
 /// page and the reconciliation read — so a check reading either takes the
-/// expression from here instead of from [`contract_query`].
-/// [`server_field_round_trip`](super::checks::server_field_round_trip()) was
-/// the first caller, on the feed;
-/// [`dedup_concurrent`](super::checks::dedup_concurrent()) is the second,
-/// both on the feed and on the point read its `linearizable` half makes.
+/// expression from here instead of from [`contract_query`]. Every check that
+/// pages the feed is a caller, and
+/// [`dedup_concurrent`](super::checks::dedup_concurrent()) is one on the
+/// point read its `linearizable` half makes as well.
 pub fn contract_scope() -> ast::Expr {
     ast::Expr::Compare(
         Box::new(ast::Expr::Identifier("tenant_id".to_owned())),

@@ -269,7 +269,7 @@ pub const LATEST_TIE_BREAK: &str = "latest-tie-break";
 /// check reaches neither.
 ///
 /// **The feed page is no longer uncovered, though it is covered by other
-/// checks and for other reasons.** Two of them narrow, and both do it
+/// checks and for other reasons.** Two of them narrow, and each does it
 /// incidentally. [`FEED_SNAPSHOT_AND_REPLAY`] stores entries under two
 /// tenants on a meter of its own and walks them under a grant naming one,
 /// so a feed that ignored its `scope` argument outright now delivers
@@ -293,11 +293,11 @@ pub const LATEST_TIE_BREAK: &str = "latest-tie-break";
 /// holding no entries — and asserted nowhere in this suite. A porter
 /// reading a green run should not read it as that path being exercised.
 ///
-/// Five further checks dispatch a feed read — `server-field-round-trip`,
+/// Further checks dispatch a feed read — `server-field-round-trip`,
 /// `feed-completeness`, `feed-bootstrap-position` and
 /// `feed-position-bounded` always, and `dedup-concurrent` under an
 /// `Eventual` declaration — and none of them narrows anything: every entry
-/// any of the five stores is inside the scope it sends, so those reads buy
+/// any of them stores is inside the scope it sends, so those reads buy
 /// shape coverage on the path — a plugin that chokes on a compiled scope
 /// there meets one — and no scope *enforcement* whatever, for the reason
 /// the suite's shared single-tenant filter buys none either.
@@ -490,9 +490,9 @@ pub const RETENTION_DRIVEN_CHECKS: &[&str] = &[FEED_BOOTSTRAP_POSITION, FEED_RET
 /// own handle — `ClientHub` hands out a `dyn UsageCollectorPluginV1` —
 /// passes straight in.
 ///
-/// `level` is the dedup level the plugin declares. Three checks read it
-/// today: `at-most-one-invalidation`, whose post-convergence half runs only
-/// under an `Eventual` declaration; `converged-target-lookup`, whose first
+/// `level` is the dedup level the plugin declares. The checks that read it
+/// today are `at-most-one-invalidation`, whose post-convergence half runs
+/// only under an `Eventual` declaration; `converged-target-lookup`, whose first
 /// probe waits out the declared bound before it requires a decided answer;
 /// and `dedup-concurrent`, which asserts a raced divergent pair's outcomes
 /// only under `Linearizable` and the three post-bound read surfaces only

@@ -368,8 +368,8 @@ struct SweptCursors {
 /// a drive, and assertion 4 fires under both entry points, which is the
 /// mechanical form of the split this check's coverage claim rests on. What
 /// each *catches* was then measured by neutering it and re-running both
-/// discrimination matrices. Four subjects reach this check, all four in
-/// `contract_mutants` and all four built on `MutantLedger` — the refusal is a
+/// discrimination matrices. The subjects that reach this check are all in
+/// `contract_mutants` and all built on `MutantLedger` — the refusal is a
 /// branch of `read_feed_page` itself, and a wrapper delegating to a conforming
 /// backend cannot make that backend fail to refuse:
 ///

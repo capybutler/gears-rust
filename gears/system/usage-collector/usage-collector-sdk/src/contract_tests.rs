@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds thirty-six deliberately
+//! as coverage. [`super::contract_mutants`] holds the deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and two matrices assert a whole column
 //! against each of them.
@@ -463,9 +463,9 @@ fn the_retention_driven_checks_are_checks_run_all_dispatches() {
 /// A literal here would go on matching a constant that had been respelled,
 /// and the row would then assert nothing about the check it names.
 ///
-/// **Seven rows name more than one check**, and none is a mutant wrong
-/// twice: each is a real overlap between checks, which is what the matrix
-/// has to be able to say without loosening into a subset assertion.
+/// **A row naming more than one check is not a mutant wrong twice**: each
+/// is a real overlap between checks, which is what the matrix has to be able
+/// to say without loosening into a subset assertion.
 ///
 /// [`Defect::SelectsOnWindowStart`] is the first. `quantity-round-trip`
 /// reads its entries back over a range around each entry's `window_end`,
@@ -603,10 +603,10 @@ fn the_retention_driven_checks_are_checks_run_all_dispatches() {
 /// `latest-tie-break` alone. `super::contract_mutants`'s header says why the
 /// set of three is complete.
 ///
-/// [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] is the seventh and the
-/// last, and it joined a second check when `feed-completeness` landed. A
-/// page that resumes *at* the entry its start position names rather than
-/// after it re-delivers that entry on every page but the first, and the two
+/// [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] is the seventh, and it
+/// joined a second check when `feed-completeness` landed. A page that
+/// resumes *at* the entry its start position names rather than after it
+/// re-delivers that entry on every page but the first, and the two
 /// checks see the one mistake from two directions: the paginated scan in
 /// `feed-snapshot-and-replay` reports an entry it had already passed
 /// appearing again, and `feed-completeness` reports a delivery that carries
@@ -671,10 +671,11 @@ fn the_retention_driven_checks_are_checks_run_all_dispatches() {
 /// with the grant could not be resumed by a caller whose grant had since
 /// widened. That check's docs record the gap that leaves.
 ///
-/// **Six subjects in `super::contract_mutants` are deliberately not in this
-/// matrix.** Each of their defects needs retention to have swept, `run_all`
-/// sweeps nothing, and a row for any of them would therefore assert the
-/// empty set — which is not a statement about discrimination at all. They are
+/// **Not every subject in `super::contract_mutants` has a row here, and the
+/// absences are deliberate.** Each defect left out needs retention to have
+/// swept, `run_all` sweeps nothing, and a row for any of them would
+/// therefore assert the empty set — which is not a statement about
+/// discrimination at all. They are
 /// [`RETENTION_DRIVEN_MATRIX`]'s rows, asserted against both entry points,
 /// and that matrix is also what holds `RETENTION_DRIVEN_CHECKS` to meaning
 /// something.
@@ -1195,7 +1196,7 @@ fn the_three_coverage_constants_partition_the_design_checks() {
 /// move being made — `the_three_coverage_constants_partition_the_design_checks`
 /// holds `IMPLEMENTED_CHECKS`, `UNWRITTEN_CHECKS` and `BLOCKED_CHECKS` to
 /// DESIGN's sixteen, and `ADDITIONAL_CHECKS` carries the one name DESIGN
-/// does not tabulate. So this keeps covering all seventeen names as checks
+/// does not tabulate. So this keeps covering every check name as checks
 /// land and `UNWRITTEN_CHECKS` empties. `BLOCKED_CHECKS` is left out of the
 /// iteration because it is empty and a blocked check has no fixtures to
 /// keep apart; a name moved into it would leave this test, which that
@@ -1763,9 +1764,9 @@ async fn feed_page(
 /// it names the position arithmetic directly, where a check reports a
 /// consequence several reads downstream.
 ///
-/// **Measured, that defect now fails fourteen tests.** The four this
-/// at the first cross-grant equality below, where the two grants are handed 3
-/// and 4; the fixpoint of
+/// **Measured, that defect now fails fourteen tests.** Four of them are this
+/// file's own position assertions: the first cross-grant equality below,
+/// where the two grants are handed 3 and 4; the fixpoint of
 /// [`a_limit_bounded_feed_walk_reaches_a_fixpoint_at_the_ledger_end`], which
 /// lands on 3 rather than the ledger's end; the absent cursor
 /// [`a_bounded_feed_replay_closes_at_its_until_and_not_before`] requires,

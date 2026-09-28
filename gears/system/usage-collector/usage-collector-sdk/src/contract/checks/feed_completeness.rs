@@ -326,8 +326,9 @@ impl FeedCompletenessFixtures {
 /// Every assertion below was inverted and confirmed to fire against the
 /// reference backend, so none of the seven is dead. What each *catches* was
 /// then measured by neutering it and running the discrimination matrix, and
-/// the result bounds what this check's matrix rows establish. Four subjects
-/// reach this check, all four in `contract_mutants`:
+/// the result bounds what this check's matrix rows establish. The subjects
+/// whose reports were measured assertion by assertion, all in
+/// `contract_mutants`:
 ///
 /// * **`Defect::AFeedPageDropsTheEntryAtItsLimit`** — the subject built for
 ///   this check's own rule — is reported by assertion 2 **alone**.

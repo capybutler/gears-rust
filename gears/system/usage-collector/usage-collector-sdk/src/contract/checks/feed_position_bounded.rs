@@ -4,7 +4,7 @@
 //! twenty-four entries it writes, the four meters it writes them to, the ten
 //! tenants it attributes them to and the one grant every read here
 //! dispatches. The reads themselves are [`super::super::feed_walk`]'s,
-//! shared with the four other feed checks.
+//! shared with the other feed checks.
 //!
 //! **It is the only check in the suite whose rule is about a position's
 //! encoding rather than about what a page carries**, and that shows in what
@@ -526,8 +526,8 @@ const TWO_TYPES_READ: &str =
 /// Both assertions were inverted and confirmed to fire against the reference
 /// backend, so neither is dead. What each *catches* was then measured by
 /// neutering it and running the discrimination matrix. Two subjects reach
-/// this check, both in `contract_mutants`, and **each assertion isolates one
-/// of them**:
+/// this check, both in `contract_mutants`, and **each assertion isolates
+/// one**:
 ///
 /// * **`Defect::AFeedPositionIsKeyedPerTenant`** — the subject DESIGN names
 ///   in those words — is reported by assertion 1 **alone**. Its position

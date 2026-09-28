@@ -1,8 +1,10 @@
 //! The DESIGN §3.3 `feed-bootstrap-position` check.
 //!
 //! See [`feed_bootstrap_position`] for what it asserts. The module holds the
-//! two entries it writes, the two meters it names, and the one purge it
-//! drives. The reads it makes are [`super::super::feed_walk`]'s, shared with
+//! two entries it writes, the two meters it names, and the two drops it
+//! drives - the purge its assertions are about, and the one that puts back
+//! what the purge took. The reads it makes are
+//! [`super::super::feed_walk`]'s, shared with
 //! [`feed_snapshot_and_replay`](super::feed_snapshot_and_replay()) and
 //! [`feed_completeness`](super::feed_completeness()).
 //!
@@ -262,7 +264,7 @@ struct FeedBootstrapFixtures {
 /// reference backend, so none of the fifteen is dead. What each *catches*
 /// was then measured by neutering it and re-running the discrimination
 /// matrix and the two driven subject tests, and the result bounds what this
-/// check's rows establish. Three subjects reach it, all three in
+/// check's rows establish. The subjects that reach it, all in
 /// `contract_mutants`:
 ///
 /// * **`Defect::AFeedBootstrapReadStartsAtTheHead`** — the subject built for

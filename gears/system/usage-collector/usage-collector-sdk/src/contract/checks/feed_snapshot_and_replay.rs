@@ -266,8 +266,8 @@ impl FeedSnapshotFixtures {
 /// Every assertion below was inverted and confirmed to fire against the
 /// reference backend, so none of them is dead. What each *catches* was then
 /// measured by neutering it and running the discrimination matrix, and the
-/// result bounds what this check's matrix rows establish. Three subjects
-/// exercise it, all three in `contract_mutants`:
+/// result bounds what this check's matrix rows establish. The subjects whose
+/// reports were measured assertion by assertion, all in `contract_mutants`:
 ///
 /// * **`Defect::FeedCursorCountsAdmittedEntries`** is reported by
 ///   [`a_wider_grant_resumes_a_narrower_walk_at_the_head`] **alone**. That
