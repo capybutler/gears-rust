@@ -5,7 +5,7 @@
 use bigdecimal::BigDecimal;
 
 use crate::contract::fixtures::{
-    FIXTURE_EPOCH, contract_query, fixture_invalidation_with_reason, fixture_record, violation,
+    check_window_from, contract_query, fixture_invalidation_with_reason, fixture_record, violation,
 };
 use crate::contract::{AT_MOST_ONE_INVALIDATION, ContractViolation, DedupLevel, HARNESS_FAULT};
 use crate::error::UsageCollectorPluginError;
@@ -14,21 +14,22 @@ use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
 use crate::time_range::TimeRange;
 
-/// The start of this check's covered periods: a hundred and twenty days past
-/// [`FIXTURE_EPOCH`], clear of the ranges the checks that read back dispatch.
+/// The start of this check's covered periods: the offset
+/// [`check_window_from`] tables for this check, clear of the ranges the
+/// checks that read back dispatch.
 ///
 /// **The day offset is this check's whole separation from the others, and
 /// the three pairs below separate from each other inside it.** Every fixture
 /// here is built by [`fixture_record`], which puts it on the one shared
 /// meter, so nothing but the covered period keeps one check's entries out of
-/// another's reads. Day 120 is this check's; the pairs take successive hours
-/// inside it, and each pair's post-convergence range is the minute after its
-/// own period end, so no range of one pair selects an entry of another. A
-/// pair added here takes the next hour rather than a new day offset: the day
-/// offsets are the enumeration other check modules read, and a third pair of
-/// this check is not a third check.
+/// another's reads. The pairs take successive hours inside this check's own
+/// day, and each pair's post-convergence range is the minute after its own
+/// period end, so no range of one pair selects an entry of another. A pair
+/// added here takes the next hour rather than a row of its own in the
+/// table: a row there is what one check separates from another by, and a
+/// third pair of this check is not a third check.
 const AT_MOST_ONE_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(120));
+    check_window_from(AT_MOST_ONE_INVALIDATION, "main");
 
 /// The quantity every entry here carries; an invalidation echoes it.
 const AT_MOST_ONE_QUANTITY: &str = "1";

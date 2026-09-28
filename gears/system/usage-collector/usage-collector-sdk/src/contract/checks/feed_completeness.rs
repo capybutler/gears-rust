@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::contract::feed_walk::{FeedWalk, WalkStop, feed_walk, first_divergence, ids};
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, check_meter, contract_scope,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, check_meter, check_window_from, contract_scope,
     fixture_invalidation_on, fixture_record_on, violation,
 };
 use crate::contract::{ContractViolation, FEED_COMPLETENESS, HARNESS_FAULT};
@@ -36,9 +36,8 @@ use crate::quantity::UsageQuantity;
 
 /// The start of the covered period every entry of this check carries.
 ///
-/// Three hundred and ninety days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of every offset the other checks take.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives.
 ///
 /// It buys as little here as it does for
 /// [`feed_snapshot_and_replay`](super::feed_snapshot_and_replay()), and for
@@ -51,7 +50,7 @@ use crate::quantity::UsageQuantity;
 /// every check that *does* read a range, and a period no other check's range
 /// covers is what keeps them out of those reads.
 const FEED_COMPLETENESS_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(390));
+    check_window_from(FEED_COMPLETENESS, "main");
 
 /// The end of that covered period. All nine entries carry it: a correction
 /// repeats its target's covered period by construction (DESIGN §3.1,

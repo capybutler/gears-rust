@@ -23,8 +23,8 @@ use crate::contract::feed_walk::{
     FeedWalk, WalkStop, bounded_replay, feed_walk, first_divergence, ids,
 };
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, SCOPE_EXCLUDED_TENANT_ID,
-    SCOPE_UNUSED_TENANT_ID, check_meter, contract_tenant, fixture_record_on, tenant_disjunction,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, SCOPE_EXCLUDED_TENANT_ID, SCOPE_UNUSED_TENANT_ID,
+    check_meter, check_window_from, contract_tenant, fixture_record_on, tenant_disjunction,
     violation,
 };
 use crate::contract::{ContractViolation, FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT};
@@ -35,10 +35,8 @@ use crate::quantity::UsageQuantity;
 
 /// The start of the covered period every entry of this check carries.
 ///
-/// Three hundred and sixty days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240, 270,
-/// 300 and 330 offsets the other checks take.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives.
 ///
 /// It buys as little here as it does for
 /// [`converged_target_lookup`](super::converged_target_lookup()), and for
@@ -51,7 +49,7 @@ use crate::quantity::UsageQuantity;
 /// are there for every check that *does* read a range, and a period no other
 /// check's range covers is what keeps them out of those reads.
 const FEED_SNAPSHOT_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(360));
+    check_window_from(FEED_SNAPSHOT_AND_REPLAY, "main");
 
 /// The end of that covered period. All eight entries carry it: they are
 /// separated by their tenant and their idempotency key, and nothing here

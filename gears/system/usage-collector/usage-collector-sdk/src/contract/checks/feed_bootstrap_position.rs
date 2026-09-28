@@ -20,7 +20,7 @@
 
 use crate::contract::feed_walk::{WalkStop, feed_walk, ids};
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, check_meter, contract_scope,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, check_meter, check_window_from, contract_scope,
     fixture_record_on, violation,
 };
 use crate::contract::retention::ContractRetention;
@@ -31,25 +31,18 @@ use crate::plugin_api::UsageCollectorPluginV1;
 use crate::quantity::UsageQuantity;
 
 /// The start of the covered period this check's entries are offset from:
-/// **four hundred and twenty days** past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives.
+/// the offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives.
 ///
-/// **Which offsets the other checks hold is deliberately not enumerated
-/// here.** Seven modules in `super` carry such a list, each written as the
-/// offsets taken at the moment that check landed, and every one of the
-/// seven has to be edited by every check that lands afterwards. **None of
-/// them has been**: all seven stop at day 360, and day 390 has been taken
-/// since `feed-completeness` landed. A list that is wrong is worse than no
-/// list, because it reads as a guarantee of separation that nobody is
-/// keeping. What this constant states instead is its own value and why the
-/// separation exists at all, which is a fact about this module and stays
-/// true however many checks land beside it — the shape
-/// [`feed_completeness`](super::feed_completeness()) already took, in
-/// fewer words. A structural replacement, the offsets derived rather than
-/// written down, is proposed for this slice's closeout; until then the
-/// seven are left as they are rather than corrected in passing, because
-/// correcting them is the work the replacement exists to stop.
+/// **Where the other checks sit is not enumerated here, and this constant
+/// is where the reason is recorded.** Seven modules in `super` each carried
+/// such a list, written as the offsets taken at the moment that check
+/// landed, and every one of the seven had to be edited by every check that
+/// landed afterwards. **None of them was**, and a list that is wrong is
+/// worse than no list, because it reads as a guarantee of separation nobody
+/// is keeping. The offsets are one table now, with a compile-time guard over
+/// it, so what those lists claimed is established rather than asserted — and
+/// nothing has to be edited when a check lands.
 ///
 /// The separation buys as little here as it does for
 /// [`feed_completeness`](super::feed_completeness()), and for the same
@@ -63,7 +56,7 @@ use crate::quantity::UsageQuantity;
 /// with it. That the drive is also keyed on a GTS type is the belt to this
 /// brace — [`ContractRetention::drop_before`] says why it has to be.
 const FEED_BOOTSTRAP_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(420));
+    check_window_from(FEED_BOOTSTRAP_POSITION, "main");
 
 /// The end of the **first** entry's covered period, an hour past
 /// [`FEED_BOOTSTRAP_WINDOW_FROM`].

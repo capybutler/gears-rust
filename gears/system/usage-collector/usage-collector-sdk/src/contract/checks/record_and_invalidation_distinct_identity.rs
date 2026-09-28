@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, check_meter, contract_query,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, check_meter, check_window_from, contract_query,
     fixture_invalidation, fixture_record_on, violation,
 };
 use crate::contract::{
@@ -23,12 +23,9 @@ use crate::time_range::TimeRange;
 /// The start of the covered period this check's two entries share, and the
 /// inclusive lower bound of the range it reads them back over.
 ///
-/// A hundred and eighty days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 210, 240, 270,
-/// 300, 330 and 360 offsets the other checks take. It matters here because this check counts
-/// the rows a range returns, so a stray entry inside it would be read as a
-/// third entry.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives. It matters here because this check counts the rows a
+/// range returns, so a stray entry inside it would be read as a third entry.
 ///
 /// The offset is the second of two separations rather than the only one:
 /// this check also reads over a meter of its own (see
@@ -36,7 +33,7 @@ use crate::time_range::TimeRange;
 /// check writes to are independent reasons why nothing else can land in the
 /// page this check counts.
 const DISTINCT_IDENTITY_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(180));
+    check_window_from(RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, "main");
 
 /// The end of that covered period. Both entries carry it: an invalidation
 /// repeats its target's period, which is what makes the two a same-period

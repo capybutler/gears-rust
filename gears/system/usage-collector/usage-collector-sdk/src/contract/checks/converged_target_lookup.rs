@@ -8,8 +8,8 @@
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, SCOPE_EXCLUDED_TENANT_ID, check_meter,
-    contract_scope, fixture_record_on, violation,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, SCOPE_EXCLUDED_TENANT_ID, check_meter,
+    check_window_from, contract_scope, fixture_record_on, violation,
 };
 use crate::contract::{CONVERGED_TARGET_LOOKUP, ContractViolation, DedupLevel, HARNESS_FAULT};
 use crate::error::UsageCollectorPluginError;
@@ -20,10 +20,8 @@ use crate::quantity::UsageQuantity;
 
 /// The start of the covered period both entries of this check carry.
 ///
-/// Two hundred and seventy days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240,
-/// 300, 330 and 360 offsets the other checks take.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives.
 ///
 /// It buys less here than in any check that reads a range, and saying so is
 /// the point: **this check dispatches no range at all.**
@@ -40,7 +38,7 @@ use crate::quantity::UsageQuantity;
 /// separation; the offset holds on its own if a later check ever shares the
 /// meter.
 const CONVERGED_LOOKUP_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(270));
+    check_window_from(CONVERGED_TARGET_LOOKUP, "main");
 
 /// The end of that covered period. Both entries carry it: they are separated
 /// by their tenant and their idempotency key, and nothing here asks a range

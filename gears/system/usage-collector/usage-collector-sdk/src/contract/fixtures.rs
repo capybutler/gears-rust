@@ -4,7 +4,9 @@
 //! suite, deliberately: with everything else held fixed, nothing but an
 //! entry's covered period can decide it, and each check separates its own
 //! entries from every other check's by offsetting them from
-//! [`FIXTURE_EPOCH`]. The builders here are the only place a
+//! [`FIXTURE_EPOCH`] — [`check_window_from`] is where every one of those
+//! offsets is written down, and where no two of them colliding stops being a
+//! matter of inspection. The builders here are the only place a
 //! [`crate::models::UsageRecord`] is projected, so two entries differ
 //! exactly where the check that asked for them meant them to.
 //!
@@ -24,7 +26,14 @@ use toolkit_gts::gts_id;
 use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir, ast};
 use uuid::Uuid;
 
-use super::ContractViolation;
+use super::{
+    AT_MOST_ONE_INVALIDATION, CONVERGED_TARGET_LOOKUP, ContractViolation, DEDUP_CONCURRENT,
+    DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, FEED_BOOTSTRAP_POSITION, FEED_COMPLETENESS,
+    FEED_POSITION_BOUNDED, FEED_RETENTION_REFUSAL, FEED_SNAPSHOT_AND_REPLAY,
+    INVALIDATION_EXCLUDED_FROM_FOLD, LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP,
+    RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH,
+    SERVER_FIELD_ROUND_TRIP, WINDOW_END_SELECTION,
+};
 use crate::models::{
     CreateUsageRecord, EntryType, IdempotencyKey, MeterTypeId, RECORD_ID_FIELD, ReasonCode,
     RecordOrigin, ResourceRef, USAGE_RECORD_BASE_TYPE, UsageRecord, WINDOW_END_FIELD,
@@ -195,7 +204,7 @@ const _: () = {
 
 /// Mints the `index`-th tenant of a block disjoint from every named id.
 ///
-/// [`FEED_POSITION_BOUNDED`](super::FEED_POSITION_BOUNDED)'s rule is about a
+/// [`FEED_POSITION_BOUNDED`]'s rule is about a
 /// subscription spanning **many** tenants — DESIGN §3.3 gives it as *"A
 /// position issued for a subscription spanning many tenants encodes to the
 /// same size as one spanning few, so the wire cursor holding it stays inside
@@ -288,6 +297,144 @@ where
 /// suite would blame the plugin for the fixture's own choice of date.
 pub const FIXTURE_EPOCH: time::OffsetDateTime =
     time::OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::days(18_262));
+
+/// Where each check's fixture window sits, as whole days past
+/// [`FIXTURE_EPOCH`].
+///
+/// One row per `(check, role)`, mirroring [`check_meter`]'s shape and for
+/// the same reason: a check can need more than one, and
+/// [`INVALIDATION_EXCLUDED_FROM_FOLD`] does — one window carrying a
+/// withdrawn pair with a live entry beside it, and one carrying nothing but
+/// a withdrawn pair, because what it asserts over the second means nothing
+/// if anything survives there.
+///
+/// The check is named by its constant rather than spelled as a literal, so
+/// a check renamed out from under this table is a compile error rather than
+/// a row that quietly matches nothing.
+///
+/// **This is one table rather than seventeen doc comments, and the block
+/// below is why.** Each module used to state its own offset and enumerate
+/// every other module's to argue it was clear of them. Nothing checked
+/// those enumerations, every one of them had to be edited by every check
+/// that landed afterwards, and none of them was: seven modules carried a
+/// list and all seven were wrong. [`check_window_from`] says what a
+/// collision would cost.
+const CHECK_WINDOW_OFFSETS: &[(&str, &str, i64)] = &[
+    (QUANTITY_ROUND_TRIP, "main", 0),
+    (WINDOW_END_SELECTION, "main", 30),
+    (DEDUP_IDENTITY_OVER_WINDOW, "main", 60),
+    (INVALIDATION_EXCLUDED_FROM_FOLD, "main", 90),
+    (AT_MOST_ONE_INVALIDATION, "main", 120),
+    (SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, "main", 150),
+    (RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, "main", 180),
+    (SERVER_FIELD_ROUND_TRIP, "main", 210),
+    (DEDUP_FLOOR, "main", 240),
+    (CONVERGED_TARGET_LOOKUP, "main", 270),
+    (DEDUP_CONCURRENT, "main", 300),
+    (LATEST_TIE_BREAK, "main", 330),
+    (FEED_SNAPSHOT_AND_REPLAY, "main", 360),
+    (FEED_COMPLETENESS, "main", 390),
+    (FEED_BOOTSTRAP_POSITION, "main", 420),
+    (FEED_RETENTION_REFUSAL, "main", 450),
+    (FEED_POSITION_BOUNDED, "main", 480),
+    (INVALIDATION_EXCLUDED_FROM_FOLD, "empty", 510),
+];
+
+// No two rows of `CHECK_WINDOW_OFFSETS` name one offset, established when
+// the crate compiles.
+//
+// This is the whole reason the offsets are tabled rather than written into
+// seventeen doc comments. `super::run_all` dispatches every check against
+// one shared, persistent backend that writes entries and never removes
+// them, and every fixture shares one meter and one tenant — deliberately,
+// so that nothing but the covered period can decide an entry. The offset is
+// therefore the only thing keeping one check's entries out of another's
+// reads, and two checks sharing one would not fail here: they would fail
+// somewhere else, as a count that came back one too high or a fold that
+// summed a quantity nobody in that check wrote, and which of the two saw it
+// would turn on the order `run_all` happened to dispatch in.
+//
+// A prose argument cannot hold that, and the prose that used to try did not:
+// seven modules carried a list of the offsets taken when they landed, and
+// every one of the seven stopped short of the checks that landed after. This
+// cannot stop short.
+const _: () = {
+    let mut first = 0;
+    while first < CHECK_WINDOW_OFFSETS.len() {
+        let mut second = first + 1;
+        while second < CHECK_WINDOW_OFFSETS.len() {
+            assert!(
+                CHECK_WINDOW_OFFSETS[first].2 != CHECK_WINDOW_OFFSETS[second].2,
+                "two of the contract suite's check windows sit at one day offset past \
+                 `FIXTURE_EPOCH`: the suite runs every check against one shared backend that \
+                 never removes an entry, and every fixture shares one meter and one tenant, so \
+                 two checks on one window read each other's entries and what either observes \
+                 turns on dispatch order"
+            );
+            second += 1;
+        }
+        first += 1;
+    }
+};
+
+/// Whether two strings hold the same bytes.
+///
+/// `str`'s own `PartialEq` is not callable in a `const fn` on stable, and
+/// [`check_window_from`] is reached from the `const` every check module
+/// declares its window as, so the comparison is spelled out here.
+const fn same_name(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// The instant one check's fixture window begins.
+///
+/// A check separates its entries from every other check's by offsetting
+/// their covered periods from [`FIXTURE_EPOCH`], and
+/// [`CHECK_WINDOW_OFFSETS`] is where every one of those offsets is written
+/// down. `super::run_all` dispatches every check against one shared backend
+/// that writes entries and never removes them, and the shared meter, tenant
+/// and resource above are deliberate — with everything else held fixed,
+/// nothing but the covered period can decide an entry — so the offset is
+/// what keeps one check's entries out of another check's reads, and the
+/// other check's out of its.
+///
+/// **That no two of them collide is established when the crate compiles**,
+/// by the block above the table. It is not a matter of inspection, and it
+/// was not one that inspection kept.
+///
+/// `role` separates the windows one check needs from each other, the way it
+/// does for [`check_meter`]. A check that needs a second window takes a new
+/// row here rather than a corner of its first, so the guard sees it.
+///
+/// # Panics
+///
+/// When `(check, role)` has no row. Every caller is a `const`, so an
+/// untabled pair fails the build at the constant that asked for it.
+pub const fn check_window_from(check: &str, role: &str) -> time::OffsetDateTime {
+    let mut index = 0;
+    while index < CHECK_WINDOW_OFFSETS.len() {
+        let (tabled_check, tabled_role, days) = CHECK_WINDOW_OFFSETS[index];
+        if same_name(tabled_check, check) && same_name(tabled_role, role) {
+            return FIXTURE_EPOCH.saturating_add(time::Duration::days(days));
+        }
+        index += 1;
+    }
+    panic!(
+        "no row of `CHECK_WINDOW_OFFSETS` gives this check and role a fixture window; add one \
+         rather than reusing another check's"
+    )
+}
 
 /// The acceptance instant every fixture entry carries. Fixed rather than read
 /// from the clock so a check's expected entries compare equal to what it

@@ -6,7 +6,7 @@
 //! cannot see three of the four fields in question.
 
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, check_meter, contract_query,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, check_meter, check_window_from, contract_query,
     contract_scope, fixture_invalidation_on, fixture_record_on, violation,
 };
 use crate::contract::{ContractViolation, HARNESS_FAULT, SERVER_FIELD_ROUND_TRIP};
@@ -19,17 +19,15 @@ use crate::time_range::TimeRange;
 /// The start of the covered period every entry of this check carries, and
 /// the inclusive lower bound of the range it reads them back over.
 ///
-/// Two hundred and ten days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 240, 270,
-/// 300, 330 and 360 offsets the other checks take. It buys something narrower here than
-/// elsewhere: this check looks its entries up by `id` and never counts the
-/// rows a range returns, so a stray entry is not miscounted — but it would
-/// take a slot on a bounded page, and enough of them would truncate one of
-/// this check's own entries away and have it reported absent
-/// ([`SERVER_FIELD_PAGE_LIMIT`] carries the other half of that argument).
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives. It buys something narrower here than elsewhere: this
+/// check looks its entries up by `id` and never counts the rows a range
+/// returns, so a stray entry is not miscounted — but it would take a slot on
+/// a bounded page, and enough of them would truncate one of this check's own
+/// entries away and have it reported absent ([`SERVER_FIELD_PAGE_LIMIT`]
+/// carries the other half of that argument).
 const SERVER_FIELD_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(210));
+    check_window_from(SERVER_FIELD_ROUND_TRIP, "main");
 
 /// The end of that covered period. Every entry of this check carries it: the
 /// entries are separated by their idempotency keys and their entry type, and

@@ -12,7 +12,7 @@ use toolkit_odata::ast;
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, check_meter,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, check_meter, check_window_from,
     contract_query_with_scope, contract_scope, contract_tenant, fixture_record_on,
     inverted_id_pair, violation,
 };
@@ -24,10 +24,8 @@ use crate::time_range::TimeRange;
 
 /// The instant every covered period of this check is offset from.
 ///
-/// Three hundred and thirty days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240,
-/// 270, 300 and 360 offsets the other checks take.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives.
 ///
 /// It matters here because each of this check's three scenarios folds over a
 /// range of its own and compares the answer against **one** entry's quantity.
@@ -40,8 +38,7 @@ use crate::time_range::TimeRange;
 /// [`tie_break_scenarios`]), and a range and a meter no other check writes to
 /// are independent reasons why nothing else can reach a fold this check
 /// dispatches.
-const LATEST_TIE_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(330));
+const LATEST_TIE_FROM: time::OffsetDateTime = check_window_from(LATEST_TIE_BREAK, "main");
 
 /// The acceptance instant the **loser** of the `window_end` scenario carries,
 /// and the **winner** of the `accepted_at` scenario.

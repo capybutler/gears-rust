@@ -23,8 +23,8 @@
 
 use crate::contract::feed_walk::{WalkStop, feed_walk, ids};
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, SCOPE_EXCLUDED_TENANT_ID, check_meter,
-    contract_scope, fixture_record_on, violation,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, SCOPE_EXCLUDED_TENANT_ID, check_meter,
+    check_window_from, contract_scope, fixture_record_on, violation,
 };
 use crate::contract::retention::ContractRetention;
 use crate::contract::{ContractViolation, FEED_RETENTION_REFUSAL, HARNESS_FAULT};
@@ -36,17 +36,8 @@ use crate::quantity::UsageQuantity;
 use uuid::Uuid;
 
 /// The start of the covered period this check's entries are offset from:
-/// **four hundred and fifty days** past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives.
-///
-/// **Which offsets the other checks hold is deliberately not enumerated
-/// here**, for the reason
-/// [`feed_bootstrap_position`](super::feed_bootstrap_position())'s own window
-/// constant states at length: seven modules carry such a list, every one of
-/// them is stale, and a structural replacement is proposed for this slice's
-/// closeout. A list that is wrong reads as a guarantee of separation nobody is
-/// keeping.
+/// the offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives.
 ///
 /// The separation buys little on the read side: **this check dispatches no
 /// range at all**, every read it makes is a feed page, and a feed page selects
@@ -61,7 +52,7 @@ use uuid::Uuid;
 /// [`feed_bootstrap_position`](super::feed_bootstrap_position()) purge over
 /// one shared backend without either disturbing the other.
 const FEED_RETENTION_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(450));
+    check_window_from(FEED_RETENTION_REFUSAL, "main");
 
 /// The floor the sweep this check's assertions are about is driven to: three
 /// hours past [`FEED_RETENTION_WINDOW_FROM`].

@@ -12,7 +12,7 @@ use toolkit_odata::ast;
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_METER_TYPE_ID, CONTRACT_RESOURCE_TYPE, CONTRACT_TENANT_ID, FIXTURE_EPOCH,
+    CONTRACT_METER_TYPE_ID, CONTRACT_RESOURCE_TYPE, CONTRACT_TENANT_ID, check_window_from,
     contract_query_with_scope, fixture_record_for_tenant, violation,
 };
 use crate::contract::{ContractViolation, HARNESS_FAULT, SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH};
@@ -25,13 +25,12 @@ use crate::time_range::TimeRange;
 /// The start of the covered period both entries carry, and the inclusive
 /// lower bound of the range this check reads and folds over.
 ///
-/// A hundred and fifty days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives. It matters here because the fold half asserts a *value*: an entry
-/// from another check inside this range would be added to the total and
-/// read as a scope failure.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives. It matters here because the fold half asserts a
+/// *value*: an entry from another check inside this range would be added to
+/// the total and read as a scope failure.
 const SCOPE_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(150));
+    check_window_from(SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, "main");
 
 /// The exclusive upper bound of the covered period **both** entries carry.
 ///

@@ -14,7 +14,7 @@ use bigdecimal::BigDecimal;
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_METER_TYPE_ID, CONTRACT_TENANT_ID, FIXTURE_EPOCH, contract_query,
+    CONTRACT_METER_TYPE_ID, CONTRACT_TENANT_ID, check_window_from, contract_query,
     fixture_invalidation, fixture_record, violation,
 };
 use crate::contract::{ContractViolation, HARNESS_FAULT, INVALIDATION_EXCLUDED_FROM_FOLD};
@@ -29,13 +29,12 @@ use crate::time_range::TimeRange;
 /// The start of the live entry's covered period, and the inclusive lower
 /// bound of the range this check folds and reads over.
 ///
-/// Ninety days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives. It matters here for the same reason it matters there: this check
-/// counts the rows a range returns, so a stray entry from another check
-/// inside it would be read as a fourth entry.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives. It matters here because this check counts the rows
+/// a range returns, so a stray entry from another check inside it would be
+/// read as a fourth entry.
 const FOLD_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(90));
+    check_window_from(INVALIDATION_EXCLUDED_FROM_FOLD, "main");
 
 /// The exclusive upper bound of that range, an hour past the end of the
 /// withdrawn pair's period so all three entries are selected by their end.
@@ -78,14 +77,14 @@ const FOLD_PAGE_LIMIT: u64 = 6;
 /// The inclusive lower bound of the second range this check folds over: the
 /// one holding **nothing but a withdrawn pair**.
 ///
-/// Five hundred and ten days past [`FIXTURE_EPOCH`], the next offset free in
-/// the suite's thirty-days-per-check partition — 450 and 480 are
-/// `feed-retention-refusal`'s and `feed-position-bounded`'s. It is a range of
-/// its own rather than a corner of [`FOLD_WINDOW_FROM`]'s because what is
-/// asserted over it is that nothing survives the fold there, and the live
-/// entry over there is precisely something that does.
+/// The second offset [`check_window_from`] tables for this check, under the
+/// role `empty`. It is a window of its own rather than a corner of
+/// [`FOLD_WINDOW_FROM`]'s because what is asserted over it is that nothing
+/// survives the fold there, and the live entry over there is precisely
+/// something that does. Taking a row of its own is also what puts it under
+/// the table's collision guard.
 const FOLD_EMPTY_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(510));
+    check_window_from(INVALIDATION_EXCLUDED_FROM_FOLD, "empty");
 
 /// The exclusive upper bound of that range, an hour past the withdrawn
 /// pair's period end so both of its entries are selected by that end.

@@ -6,7 +6,7 @@
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_METER_TYPE_ID, FIXTURE_EPOCH, contract_query, fixture_record, violation,
+    CONTRACT_METER_TYPE_ID, check_window_from, contract_query, fixture_record, violation,
 };
 use crate::contract::{ContractViolation, HARNESS_FAULT, QUANTITY_ROUND_TRIP};
 use crate::models::{IdempotencyKey, MeterTypeId, UsageRecord};
@@ -187,11 +187,13 @@ pub fn quantity_fixture(index: usize, literal: &'static str) -> Result<QuantityF
         ));
     }
 
-    // An hour apart, so a one-second read range around any corner's
-    // `window_end` selects that corner alone.
+    // An hour apart inside this check's own tabled window, so a one-second
+    // read range around any corner's `window_end` selects that corner alone
+    // and reaches no other check's entries.
     let hours = i64::try_from(index)
         .map_err(|err| format!("fixture index {index} does not fit an hour offset: {err}"))?;
-    let window_end = FIXTURE_EPOCH.saturating_add(time::Duration::hours(hours));
+    let window_end =
+        check_window_from(QUANTITY_ROUND_TRIP, "main").saturating_add(time::Duration::hours(hours));
     let window_start = window_end.saturating_sub(time::Duration::hours(1));
 
     // Keyed on the **literal**, never on its position. The entry `id`

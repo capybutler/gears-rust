@@ -1,7 +1,9 @@
 //! One module per check.
 //!
-//! Each check owns its window offsets, its page limit and its fixtures, and
-//! shares [`super::fixtures`] with the others. The checks that page the feed
+//! Each check owns its page limit and its fixtures, and shares
+//! [`super::fixtures`] with the others — the fixture windows among them:
+//! they are one table there with a compile-time guard over it, rather than a
+//! constant per module with a prose argument for its separation beside it. The checks that page the feed
 //! share [`super::feed_walk`] as well: a walk re-implemented per check is
 //! one chance per check for two of them to disagree about what reaching the
 //! head means. The entry point of each is re-exported below under the

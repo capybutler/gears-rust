@@ -6,7 +6,7 @@
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_METER_TYPE_ID, CONTRACT_TENANT_ID, FIXTURE_EPOCH, contract_query, fixture_record,
+    CONTRACT_METER_TYPE_ID, CONTRACT_TENANT_ID, check_window_from, contract_query, fixture_record,
     violation,
 };
 use crate::contract::{ContractViolation, DEDUP_IDENTITY_OVER_WINDOW, HARNESS_FAULT};
@@ -19,11 +19,10 @@ use crate::time_range::TimeRange;
 /// The start of the first of this check's two covered periods, and the
 /// inclusive lower bound of the range it reads them back over.
 ///
-/// Sixty days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives.
 const DEDUP_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(60));
+    check_window_from(DEDUP_IDENTITY_OVER_WINDOW, "main");
 
 /// The exclusive upper bound of that range, an hour past the end of the
 /// later of the two periods so both are selected by their end.

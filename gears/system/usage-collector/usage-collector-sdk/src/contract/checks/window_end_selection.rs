@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_METER_TYPE_ID, FIXTURE_EPOCH, contract_query, fixture_record, violation,
+    CONTRACT_METER_TYPE_ID, check_window_from, contract_query, fixture_record, violation,
 };
 use crate::contract::{ContractViolation, HARNESS_FAULT, WINDOW_END_SELECTION};
 use crate::models::{IdempotencyKey, MeterTypeId, UsageRecord};
@@ -20,17 +20,14 @@ use crate::time_range::TimeRange;
 /// The inclusive lower bound of the range `window_end_selection` reads
 /// over, and the instant its entries are arranged around.
 ///
-/// Thirty days past [`FIXTURE_EPOCH`], which is what keeps this check's
-/// entries out of every other check's read range and every other check's
-/// entries out of this one's. Every fixture in the suite shares one meter
-/// and one tenant — deliberately, so that nothing but the covered period
-/// can decide any of these entries — which leaves the period as the only
-/// thing separating one check's entries from another's. It matters more
-/// here than elsewhere because this check asserts that some entries are
-/// **not** returned, and a stray entry inside the range would be read as
-/// one of them.
+/// The offset [`check_window_from`] tables for this check, which is what
+/// keeps this check's entries out of every other check's read range and
+/// every other check's entries out of this one's. It matters more here than
+/// elsewhere because this check asserts that some entries are **not**
+/// returned, and a stray entry inside the range would be read as one of
+/// them.
 pub const WINDOW_SELECTION_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(30));
+    check_window_from(WINDOW_END_SELECTION, "main");
 
 /// The exclusive upper bound of that range: one hour past
 /// [`WINDOW_SELECTION_FROM`].

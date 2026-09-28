@@ -11,7 +11,7 @@ use bigdecimal::BigDecimal;
 use uuid::Uuid;
 
 use crate::contract::fixtures::{
-    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, FIXTURE_EPOCH, check_meter, contract_query,
+    CONTRACT_ACCEPTED_AT, CONTRACT_TENANT_ID, check_meter, check_window_from, contract_query,
     contract_scope, fixture_record_on, violation,
 };
 use crate::contract::{ContractViolation, DEDUP_CONCURRENT, DedupLevel, HARNESS_FAULT};
@@ -26,14 +26,12 @@ use crate::time_range::TimeRange;
 /// the inclusive lower bound of the range its `Eventual` half reads them
 /// back over.
 ///
-/// Three hundred days past [`FIXTURE_EPOCH`], for the reason
-/// [`WINDOW_SELECTION_FROM`](super::window_end_selection::WINDOW_SELECTION_FROM)
-/// gives, and clear of the day-0, 30, 60, 90, 120, 150, 180, 210, 240,
-/// 270, 330 and 360 offsets the other checks take. It matters here because the
-/// `Eventual` half counts the rows a range returns against the identities
-/// this check raced, so a stray entry inside it would be read as a row no
-/// identity of this check accounts for — which is the shape of the failure
-/// that half exists to report.
+/// The offset [`check_window_from`] tables for this check, for the reason
+/// that accessor gives. It matters here because the `Eventual` half counts
+/// the rows a range returns against the identities this check raced, so a
+/// stray entry inside it would be read as a row no identity of this check
+/// accounts for — which is the shape of the failure that half exists to
+/// report.
 ///
 /// The offset is the second of two separations rather than the only one:
 /// this check also reads over a meter of its own (see
@@ -41,7 +39,7 @@ use crate::time_range::TimeRange;
 /// check writes to are independent reasons why nothing else can land in the
 /// page, the fold or the feed page this check counts.
 const DEDUP_CONCURRENT_WINDOW_FROM: time::OffsetDateTime =
-    FIXTURE_EPOCH.saturating_add(time::Duration::days(300));
+    check_window_from(DEDUP_CONCURRENT, "main");
 
 /// The end of that covered period.
 ///
