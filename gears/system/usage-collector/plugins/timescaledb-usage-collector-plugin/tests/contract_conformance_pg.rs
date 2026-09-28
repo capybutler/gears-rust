@@ -93,10 +93,11 @@ const NOT_YET_CONFORMING: &[(&str, &str)] = &[
     (
         contract::FEED_COMPLETENESS,
         "slice 3, plugin feed page and retention interlock: the feed order \
-         this check holds invariant does not exist either. \
+         this check holds invariant is declared but unread. \
          `usage_acceptance_sequence` keys its counter on \
          (tenant_id, gts_type_id) and so orders nothing across a \
-         subscription; slice 2 replaces it with an `xid8` feed-order column",
+         subscription; slice 2 replaced it with the `xid8` column \
+         `usage_records_feed_idx` orders on, and slice 3 is what reads it",
     ),
     (
         contract::FEED_BOOTSTRAP_POSITION,
@@ -106,15 +107,16 @@ const NOT_YET_CONFORMING: &[(&str, &str)] = &[
     (
         contract::FEED_RETENTION_REFUSAL,
         "slice 3, plugin feed page and retention interlock: the refusal is \
-         decided against `usage_feed_retention_marks`, a table slice 2 adds \
-         and slice 3 reads. Neither exists yet",
+         decided against `usage_feed_retention_marks`. Slice 2 added the \
+         table and it stands empty; slice 3 is what raises a mark into it \
+         and what reads one back",
     ),
     (
         contract::FEED_POSITION_BOUNDED,
         "slice 3, plugin feed page and retention interlock: this backend \
          issues no `FeedPosition` at all, so nothing here holds to a size \
          bound. What one would encode is the `xid8` feed-order column slice \
-         2 adds, which does not grow with a subscription's breadth",
+         2 added, which does not grow with a subscription's breadth",
     ),
     (
         contract::SERVER_FIELD_ROUND_TRIP,

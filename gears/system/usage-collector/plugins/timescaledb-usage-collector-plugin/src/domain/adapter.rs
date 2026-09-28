@@ -111,8 +111,9 @@ impl UsageCollectorPluginV1 for StorageAdapter {
     /// the sweep that raises a mark: slice 3.
     ///
     /// `Internal` rather than `Transient` because there is nothing to retry:
-    /// the method will answer once those three exist, and a `Transient` here
-    /// would put a caller into a retry loop against a permanent condition.
+    /// the method will answer once the page protocol and the sweep's
+    /// mark-raising exist, and a `Transient` here would put a caller into a
+    /// retry loop against a permanent condition.
     async fn read_feed_page(
         &self,
         _subscription: &[MeterTypeId],
@@ -146,10 +147,11 @@ impl UsageCollectorPluginV1 for StorageAdapter {
     /// * `MAX(accepted_at)` is served by
     ///   `usage_records_watermark_idx (gts_type_id, tenant_id, accepted_at
     ///   DESC)`, which `0001_init.sql` declares for exactly this read. It
-    ///   needed an index of its own: `accepted_at` is stamped upstream by the
-    ///   Ingestion Gateway and written as given, while every other indexed
-    ///   ordering column here is assigned by this plugin at write, so no other
-    ///   index's order is guaranteed to agree with it.
+    ///   needed an index of its own because no other index, and no
+    ///   constraint-backed one, names `accepted_at` at all: the watermark is
+    ///   unbounded by the range, so serving it without a scan means reading
+    ///   the leading edge of an index ordered by `accepted_at` within one
+    ///   `(gts_type_id, tenant_id)` group, and nothing else here is.
     ///
     /// `Internal` rather than `Transient` for the same reason
     /// [`Self::read_feed_page`] is — retrying cannot make an unbuilt method
@@ -165,8 +167,10 @@ impl UsageCollectorPluginV1 for StorageAdapter {
         Err(UsageCollectorPluginError::internal(
             "the TimescaleDB backend does not report reconciliation metadata yet: it computes \
              neither the per-scope accepted count nor the max(accepted_at) and max(window_end) \
-             watermarks. The count and max(window_end) are already served by the \
-             (tenant_id, gts_type_id, window_end) index; max(accepted_at) has no index",
+             watermarks. Every index they would need is declared: the count and \
+             max(window_end) by the (tenant_id, gts_type_id, window_end) index, and \
+             max(accepted_at) by the (gts_type_id, tenant_id, accepted_at) one. The query that \
+             reads them is what is missing",
         ))
     }
 }

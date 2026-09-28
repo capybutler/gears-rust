@@ -214,7 +214,7 @@ async fn entry_type_is_a_stored_generated_column_over_invalidates() {
 /// nothing in this crate would fail to compile if the table came back. What it
 /// catches is a **stale database surviving a migration change**: a container
 /// reused across a schema edit, or a deployment migrated forward from the
-/// pre-slice-4 schema instead of rebuilt. Either leaves a table the plugin no
+/// superseded schema instead of rebuilt. Either leaves a table the plugin no
 /// longer writes and a foreign key it no longer expects, and the first symptom
 /// would be an insert failing `23503` on a row that is perfectly well formed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

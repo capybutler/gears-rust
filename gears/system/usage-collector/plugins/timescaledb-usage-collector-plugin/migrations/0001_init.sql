@@ -6,10 +6,10 @@
 -- storage SPI never sees one (the gear's DESIGN §3.7; this plugin's own §3.7
 -- states the target schema, which the migrations on this branch still trail).
 --
--- This file replaces the pre-slice-4 schema and its rename migration outright
--- rather than migrating from them. The gear is unreleased, so no deployment
--- holds rows worth a migration path; the retired 0002 said as much in its own
--- header.
+-- This file replaces the schema that preceded it and its rename migration
+-- outright rather than migrating from them. The gear is unreleased, so no
+-- deployment holds rows worth a migration path; the retired 0002 said as much
+-- in its own header.
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 CREATE TABLE IF NOT EXISTS usage_records (
@@ -229,6 +229,6 @@ CREATE INDEX IF NOT EXISTS usage_records_tenant_window_idx
 -- Unreferenced. No read path on this branch orders on
 -- `(tenant_id, gts_type_id, acceptance_sequence DESC)`, and this plugin's
 -- DESIGN §3.7 does not list this index among the ledger's. It is kept only
--- until `acceptance_sequence` itself is retired, in slice 4.
+-- until `acceptance_sequence` itself is retired.
 CREATE INDEX IF NOT EXISTS usage_records_acceptance_seq_idx
     ON usage_records (tenant_id, gts_type_id, acceptance_sequence DESC);
