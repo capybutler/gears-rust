@@ -403,6 +403,31 @@ pub async fn refresh_rollup(pool: &PgPool) {
         .expect("refresh the rollup");
 }
 
+/// The `xact_id` the ledger stamped on the stored entry `id`.
+///
+/// Read as text and parsed, because `xid8` has no `sqlx` `Decode`
+/// implementation — the same reason `UsageRecordRow::xact_id` is a `String`.
+/// The parse is not cosmetic: it is what makes `<` an order over transaction
+/// ids rather than over their digit strings, which disagree as soon as two
+/// ids differ in length.
+///
+/// # Panics
+///
+/// If no row carries `id`, or the stored value does not parse as a `u64`. The
+/// first means the write under test did not happen; the second means the
+/// column is no longer an `xid8`.
+pub async fn xact_id_of(pool: &PgPool, id: Uuid) -> u64 {
+    let rendered: String =
+        sqlx::query_scalar("SELECT xact_id::text FROM usage_records WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the entry must be stored");
+    rendered
+        .parse()
+        .unwrap_or_else(|e| panic!("xact_id {rendered} must render as a u64: {e}"))
+}
+
 /// Build a fresh metric inventory over `pool`.
 ///
 /// Private: [`record_store`] is its only caller, and a `pub` helper here is a

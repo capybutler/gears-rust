@@ -83,17 +83,23 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 /// the DDL — rather than a decode requirement. **Omission is the hazard**: a
 /// missing column fails the decode with `no column found for name: <field>`.
 ///
+/// This is a **superset** of [`INSERT_COLUMNS`], not the same set reordered:
+/// `xact_id` is stamped by its column default and bound by no insert, so it is
+/// read and never written. It is selected as `xact_id::text AS xact_id`
+/// because `xid8` has no `sqlx` decode implementation, and the alias is what
+/// keeps the decoded name the one [`UsageRecordRow`]'s field carries.
+///
 /// The ledger's `entry_type` is deliberately absent. It is a stored generated
 /// column that exists so `$filter=entry_type eq 'invalidation'` resolves to a
 /// real column; nothing decodes it, because [`UsageRecordRow`] has no field
 /// for it (see that struct's doc).
 const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
      window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
-     invalidates, reason_code, origin, acceptance_sequence, metadata, accepted_at";
+     invalidates, reason_code, origin, acceptance_sequence, accepted_at, \
+     xact_id::text AS xact_id, metadata";
 
-/// The columns every insert writes: the same set as [`RECORD_COLUMNS`],
-/// ordered so `metadata` is last. `entry_type` is generated and appears in
-/// neither.
+/// The columns every insert writes: [`RECORD_COLUMNS`] less `xact_id`, which
+/// the database stamps. `entry_type` is generated and is in neither.
 ///
 /// **One spelling, used four times** — the single-row insert's column list, the
 /// batch insert's column list, its `SELECT` list and its `UNNEST` alias list.
@@ -372,12 +378,14 @@ impl PgRecordStore {
         // 2. Insert, deduplicated on the 6-tuple UNIQUE. `RETURNING` yields the
         //    row only when we won the slot — `DO NOTHING` suppresses it on a
         //    conflict — so `Some` = fresh insert, `None` = a row with this
-        //    6-tuple already exists. Every one of the eighteen [`RECORD_COLUMNS`]
-        //    is bound here now that `accepted_at` is written rather than
-        //    defaulted; `entry_type` is generated, so it is the one identity
-        //    component the insert does not bind — Postgres computes it for the
-        //    proposed row and the arbiter probes `usage_records_dedup_uniq`
-        //    with it.
+        //    6-tuple already exists. Every column [`INSERT_COLUMNS`] names is
+        //    bound here, `accepted_at` included — it is written rather than
+        //    defaulted. [`RECORD_COLUMNS`] reads back one more: `xact_id`,
+        //    which the column default stamps and no bind supplies.
+        //    `entry_type` is in neither list and is generated, so it is the
+        //    one identity component the insert does not bind — Postgres
+        //    computes it for the proposed row and the arbiter probes
+        //    `usage_records_dedup_uniq` with it.
         let subject_id = record
             .subject_ref
             .as_ref()

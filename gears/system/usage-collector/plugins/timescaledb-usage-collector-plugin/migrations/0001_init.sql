@@ -1,9 +1,10 @@
 -- TimescaleDB Usage Collector storage backend — base schema.
 --
--- One ledger table plus its per-scope sequence counters. There is no
--- usage-type catalog: declarations live in types-registry and the storage SPI
--- never sees one (the gear's DESIGN §3.7; this plugin's own §3.7 states the
--- target schema, which the migrations on this branch still trail).
+-- One ledger table plus the small keyed tables it needs: per-scope sequence
+-- counters, per-type partitioning keys, and per-type feed retention marks.
+-- There is no usage-type catalog: declarations live in types-registry and the
+-- storage SPI never sees one (the gear's DESIGN §3.7; this plugin's own §3.7
+-- states the target schema, which the migrations on this branch still trail).
 --
 -- This file replaces the pre-slice-4 schema and its rename migration outright
 -- rather than migrating from them. The gear is unreleased, so no deployment
@@ -74,11 +75,23 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- form that would reject it is refused by the hypertable.
     acceptance_sequence bigint      NOT NULL,
     -- Gear-assigned acceptance instant, stamped by the Ingestion Gateway and
-    -- written as given. An absorbed retry returns this stored value. Declared
-    -- immediately before `metadata` so the migration's own column order
-    -- matches `INSERT_COLUMNS` (`record_store.rs`), which keeps `metadata`
-    -- last for its own reason (see that constant's doc).
+    -- written as given. An absorbed retry returns this stored value. `xact_id`
+    -- below is declared between this column and `metadata` and is in neither
+    -- `INSERT_COLUMNS` (`record_store.rs`) nor the binds, so that constant is
+    -- this declaration order with `xact_id` dropped out of it — which still
+    -- leaves `metadata` last, where the batch insert needs it (see the
+    -- constant's doc).
     accepted_at         timestamptz NOT NULL,
+    -- The inserting transaction's id, and the feed order's first key
+    -- (this plugin's DESIGN §3.6 `cpt-cf-uc-plugin-seq-feed-page`). Stamped by
+    -- this default and never bound by the Record Store, which is what makes
+    -- every entry of one batch share one value and what lets a page read a
+    -- settled horizon off `pg_snapshot_xmin` rather than off anything the
+    -- plugin computes.
+    --
+    -- `xid8` rather than `xid`: `xid8` is 64-bit and totally ordered, where
+    -- `xid` wraps around and compares only modulo 2^32.
+    xact_id             xid8        NOT NULL DEFAULT pg_current_xact_id(),
     metadata            jsonb       NOT NULL DEFAULT '{}'::jsonb,
 
     -- A hypertable's PRIMARY KEY and every UNIQUE must contain every partition
@@ -145,6 +158,39 @@ SELECT add_dimension('usage_records', by_range('type_key', 1), if_not_exists => 
 CREATE INDEX IF NOT EXISTS usage_records_invalidates_idx
     ON usage_records (invalidates, window_end, type_key)
     WHERE invalidates IS NOT NULL;
+
+-- Feed order, per this plugin's DESIGN §3.7. The subscription selects on
+-- `gts_type_id`, the order is `(xact_id, id)` beneath it, and the compiled
+-- scope is applied as a filter on the index-ordered merge rather than as a
+-- leading key (§4.1 item 7). The retention sweep reads each type's highest
+-- position in a chunk off this same index.
+CREATE INDEX IF NOT EXISTS usage_records_feed_idx
+    ON usage_records (gts_type_id, xact_id, id);
+
+-- The reconciliation acceptance watermark, `MAX(accepted_at)` per
+-- (gts_type_id, tenant_id) and unbounded by any range, per this plugin's
+-- DESIGN §3.6 `cpt-cf-uc-plugin-seq-reconciliation`. No other index reaches
+-- `accepted_at`, which is stamped upstream by the Ingestion Gateway and so does
+-- not share an order with anything the plugin assigns.
+CREATE INDEX IF NOT EXISTS usage_records_watermark_idx
+    ON usage_records (gts_type_id, tenant_id, accepted_at DESC);
+
+-- Per-GTS-type feed retention marks.
+--
+-- One row per GTS type that has lost an entry to retention, holding the highest
+-- feed position among the entries of that type retention has deleted. A feed
+-- page refuses a position a mark stands above (this plugin's DESIGN §3.6,
+-- Retention refusal).
+--
+-- Created empty and stays empty in this slice: the retention sweep raises a
+-- mark in the transaction that drops a chunk, and `read_feed_page` reads it,
+-- and both are slice 3. An empty table here is the designed state, not an
+-- unfinished one.
+CREATE TABLE IF NOT EXISTS usage_feed_retention_marks (
+    gts_type_id text NOT NULL PRIMARY KEY,
+    xact_id     xid8 NOT NULL,
+    id          uuid NOT NULL
+);
 
 -- Per-scope acceptance-sequence counters.
 --

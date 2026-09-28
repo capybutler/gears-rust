@@ -426,6 +426,62 @@ async fn the_acceptance_sequence_is_strictly_monotonic_per_scope_and_not_shared(
 }
 
 // ---------------------------------------------------------------------------
+// The transaction id
+// ---------------------------------------------------------------------------
+
+/// Every entry of one batch carries one `xact_id`, and a call that commits
+/// afterwards carries a greater one.
+///
+/// `DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-ingest-batch`: "Every entry of one
+/// batch shares the batch's `xact_id`; feed order within it falls back to
+/// `id`." And §3.6 Correction order: an invalidation the gateway accepts only
+/// once its target has converged has its transaction "assigned its id after
+/// the target's committed", so `xact_id(invalidation) > xact_id(target)`.
+/// Correction order is that second property read on a withdrawal, which is why
+/// it is asserted over two ordinary calls here rather than over a pair: the
+/// property is about the commit order, not about the kind of entry.
+///
+/// This is what separates a database-stamped transaction id from a Rust-side
+/// counter: no per-entry counter would give two entries of one call the same
+/// value, and the equality half is the only assertion that can tell them
+/// apart. Nothing reads `xact_id` yet — the feed page is slice 3 — so without
+/// this test the column would be one the schema declares and no behaviour
+/// pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_batch_shares_one_transaction_id_and_a_later_call_takes_a_greater_one() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x7AC7);
+
+    let a = common::entry(&meter, tenant, "xact-batch-a", Decimal::from(1));
+    let b = common::entry(&meter, tenant, "xact-batch-b", Decimal::from(2));
+    let batch = store
+        .create_batch(vec![a.clone(), b.clone()])
+        .await
+        .expect("the batch as a whole succeeds");
+    assert!(
+        batch.iter().all(Result::is_ok),
+        "both entries must be accepted: {batch:?}"
+    );
+
+    let xa = common::xact_id_of(&h.pool, a.id).await;
+    let xb = common::xact_id_of(&h.pool, b.id).await;
+    assert_eq!(
+        xa, xb,
+        "one batch is one transaction, so one xact_id: got {xa} and {xb}"
+    );
+
+    let later = common::entry(&meter, tenant, "xact-later", Decimal::from(3));
+    store.create(later.clone()).await.expect("the later write");
+    let xl = common::xact_id_of(&h.pool, later.id).await;
+    assert!(
+        xl > xa,
+        "a call that commits after the batch takes a greater transaction id: \
+         batch {xa}, later {xl}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // At most one invalidation per entry: a dedup outcome of the derived key
 // ---------------------------------------------------------------------------
 

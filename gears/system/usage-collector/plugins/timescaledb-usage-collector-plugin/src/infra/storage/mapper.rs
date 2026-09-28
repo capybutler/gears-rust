@@ -189,11 +189,12 @@ pub fn metadata_map_to_jsonb(map: &BTreeMap<MetadataKey, String>) -> JsonValue {
 
 /// Map a [`UsageRecordRow`] into a validated [`UsageRecord`].
 ///
-/// One of the row's columns, `acceptance_sequence`, is read and deliberately
-/// dropped, because the model has no field for it: it is this plugin's own
-/// ordering assignment and never travels back out through the SPI. This is
-/// not an oversight; see [`UsageRecordRow`]'s own doc for why it is decoded
-/// at all.
+/// The row's ordering columns, `acceptance_sequence` and `xact_id`, are read
+/// and deliberately dropped, because the model has no field for either: one is
+/// this plugin's own assignment and the other the database's, and neither
+/// travels back out through the SPI as a record field. This is not an
+/// oversight; see [`UsageRecordRow`]'s own doc for why they are decoded at
+/// all.
 ///
 /// The two stored pairs are treated asymmetrically, deliberately. A
 /// half-populated invalidation pair is *refused*, because [`Invalidation`] has

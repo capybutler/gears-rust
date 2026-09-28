@@ -2,7 +2,7 @@
 // (clippy.toml allows unwrap/expect in tests, not panic).
 #![allow(clippy::panic)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -254,8 +254,9 @@ fn row_matching(
         reason_code,
         origin: record.origin.as_str().to_owned(),
         acceptance_sequence: 1,
-        metadata,
         accepted_at: record.window_end,
+        xact_id: "1001".to_owned(),
+        metadata,
     }
 }
 
@@ -443,21 +444,38 @@ fn each_inserted_column_is_unnested_as_the_type_the_migration_declares() {
 }
 
 #[test]
-fn record_columns_and_insert_columns_name_the_same_set() {
-    // The read list and the write list name exactly the same columns now:
-    // `accepted_at` replaced the defaulted-and-omitted `ingested_at`, and
-    // unlike it, `accepted_at` is bound on every insert, so nothing is left
-    // to a table DEFAULT and decoded back unwritten. The two lists still
-    // differ in *position* — `metadata` is last on the write side (so the
-    // batch SELECT's trailing `::jsonb` cast lands on it) and `accepted_at`
-    // is last on the read side — but not in membership.
-    let mut insert_names = names(INSERT_COLUMNS);
-    let mut record_names = names(RECORD_COLUMNS);
-    insert_names.sort_unstable();
-    record_names.sort_unstable();
+fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
+    // The read list is a *superset* of the write list, not the same set
+    // reordered. `accepted_at` is bound on every insert, so it is in both;
+    // `xact_id` is bound by no insert at all — `migrations/0001_init.sql`
+    // stamps it from `pg_current_xact_id()` — so it is read and never
+    // written, and it is the whole of the difference.
+    //
+    // The read side's entry is asserted as the full select expression
+    // `xact_id::text AS xact_id`, because `names()` splits on commas and
+    // trims and does nothing else. Read literally on purpose rather than
+    // normalized down to the bare name, and the two halves are pinned for
+    // different reasons. `::text` is load-bearing: `xid8` has no `sqlx`
+    // decode, so without the cast every read of the ledger fails, and much of
+    // the pg lane says so. The alias is *not* — dropping it and running the
+    // whole `--features postgres` lane leaves every other test green, because
+    // `PostgreSQL` names the output of a bare column cast after the column
+    // anyway. It is pinned here because that is a naming rule of the server
+    // and `UsageRecordRow`'s field is looked up by name: the alias says which
+    // name is meant instead of inheriting one, and this assertion is the only
+    // thing that would notice it going away.
+    let insert_names: BTreeSet<&str> = names(INSERT_COLUMNS).into_iter().collect();
+    let record_names: BTreeSet<&str> = names(RECORD_COLUMNS).into_iter().collect();
+    assert!(
+        insert_names.is_subset(&record_names),
+        "every written column must also be read back: missing {:?}",
+        insert_names.difference(&record_names).collect::<Vec<_>>()
+    );
     assert_eq!(
-        record_names, insert_names,
-        "RECORD_COLUMNS and INSERT_COLUMNS must name exactly the same columns"
+        record_names.difference(&insert_names).collect::<Vec<_>>(),
+        vec![&"xact_id::text AS xact_id"],
+        "the read list may add only the columns the ledger writes itself, and \
+         xact_id is the only one RECORD_COLUMNS decodes"
     );
     assert_eq!(
         names(INSERT_COLUMNS).len(),
@@ -1511,8 +1529,9 @@ fn keyed_row() -> UsageRecordRow {
         reason_code: None,
         origin: "backfill".to_owned(),
         acceptance_sequence: 9,
-        metadata: serde_json::json!({}),
         accepted_at: time::OffsetDateTime::from_unix_timestamp(WINDOW_END_UNIX).expect("valid ts"),
+        xact_id: "9042".to_owned(),
+        metadata: serde_json::json!({}),
     }
 }
 

@@ -216,6 +216,7 @@ const LEDGER_COLUMNS: &[&str] = &[
     "entry_type",
     "acceptance_sequence",
     "accepted_at",
+    "xact_id",
     "metadata",
 ];
 

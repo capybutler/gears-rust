@@ -286,18 +286,22 @@ async fn the_live_columns_are_the_migrations_columns_in_order() {
         "the live ledger's columns must be the migration's, in declaration order"
     );
 
-    // The insertable subset is the same list minus the one the ledger writes
-    // itself, and this asserts the *reason* it is excluded rather than the
-    // exclusion: `entry_type` is generated. `accepted_at` replaced the
-    // defaulted-and-omitted `ingested_at`; unlike it, `accepted_at` is bound
-    // on every insert, so it stays in the insertable set.
+    // The insertable subset is the same list minus the columns the ledger
+    // writes itself, and this asserts the *reason* each is excluded rather
+    // than the exclusion: `entry_type` is generated, and `xact_id` is stamped
+    // by a column default. `accepted_at` replaced the defaulted-and-omitted
+    // `ingested_at`; unlike it, `accepted_at` is bound on every insert, so it
+    // stays in the insertable set.
     let insertable: BTreeSet<&str> = migration_probe::insertable_columns()
         .into_iter()
         .map(|(name, _)| name)
         .collect();
     assert!(
-        !insertable.contains("entry_type") && insertable.contains("accepted_at"),
-        "the insertable set must exclude the generated column and keep accepted_at"
+        !insertable.contains("entry_type")
+            && !insertable.contains("xact_id")
+            && insertable.contains("accepted_at"),
+        "the insertable set must exclude the generated and the database-stamped column \
+         and keep accepted_at"
     );
     let self_written: Vec<String> = sqlx::query_scalar(
         "SELECT attname::text FROM pg_attribute \
@@ -321,6 +325,96 @@ async fn the_live_columns_are_the_migrations_columns_in_order() {
         "accepted_at must carry no DEFAULT in the live table — it is written from the \
          record on every insert: {self_written:?}"
     );
+    assert!(
+        self_written.iter().any(|c| c == "xact_id"),
+        "xact_id must carry a DEFAULT in the live table, which is why \
+         insertable_columns() drops it: {self_written:?}"
+    );
+}
+
+/// The feed order's first key is an `xid8` the database stamps, not a value
+/// the Record Store supplies.
+///
+/// `DESIGN.md` §3.1 makes both halves normative: it is "the `xid8` of the
+/// transaction that inserted the entry, stamped by the database default
+/// `pg_current_xact_id()` and never set by the Record Store". The type is
+/// load-bearing as well as the default — `xid8` is 64-bit and totally
+/// ordered, where `xid` wraps and compares only modulo 2^32, so a feed order
+/// built on `xid` would reorder itself every wraparound. `PostgreSQL` agrees
+/// far enough to refuse the index: substituting `xid` here fails the migration
+/// with "data type xid has no default operator class for access method btree",
+/// measured on `timescale/timescaledb:2.29.2-pg18`. That makes this assertion
+/// the narrow guard against a type that is merely *wider* than the design
+/// wants — `bigint` builds the index happily and loses the transaction
+/// semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_feed_order_column_is_an_xid8_the_database_stamps() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    // `pg_attribute` plus `pg_attrdef` rather than `information_schema`, which
+    // is this suite's convention throughout and which avoids decoding
+    // `information_schema`'s `character_data` domains: `format_type` and
+    // `pg_get_expr` both return `text`.
+    let (data_type, column_default): (String, Option<String>) = sqlx::query_as(
+        "SELECT format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid) \
+         FROM pg_attribute a \
+         LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+         WHERE a.attrelid = 'usage_records'::regclass AND a.attname = 'xact_id' \
+           AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .expect("usage_records.xact_id must exist");
+
+    assert_eq!(
+        data_type, "xid8",
+        "the feed order's first key must be xid8: xid wraps around and compares \
+         only modulo 2^32, so it is not a total order"
+    );
+    assert_eq!(
+        column_default.as_deref(),
+        Some("pg_current_xact_id()"),
+        "the default is what stamps it; without one the Record Store would have to, \
+         and then no two entries of one batch would be guaranteed to share a value"
+    );
+}
+
+/// `usage_records_feed_idx` and `usage_records_watermark_idx`, read back as
+/// the database built them.
+///
+/// `DESIGN.md` §3.7 declares `usage_records_feed_idx (gts_type_id, xact_id,
+/// id)`, which "serves the feed order", and `usage_records_watermark_idx
+/// (gts_type_id, tenant_id, accepted_at DESC)`, which "serves the
+/// reconciliation acceptance watermark". Column order is the whole point of
+/// both — an index over the same three columns in another order serves
+/// neither — so this reads each definition rather than merely asserting the
+/// index exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_feed_and_watermark_indexes_are_built_in_their_declared_order() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    for (name, expected) in [
+        ("usage_records_feed_idx", "(gts_type_id, xact_id, id)"),
+        (
+            "usage_records_watermark_idx",
+            "(gts_type_id, tenant_id, accepted_at DESC)",
+        ),
+    ] {
+        let def: String =
+            sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE indexname = $1")
+                .bind(name)
+                .fetch_one(&h.pool)
+                .await
+                .unwrap_or_else(|e| panic!("{name} must exist: {e}"));
+        assert!(
+            def.contains(expected),
+            "{name} must be built over {expected}, got: {def}"
+        );
+    }
 }
 
 /// The per-type key table: one row per type, keyed by the type, with a
@@ -348,6 +442,59 @@ async fn usage_type_key_maps_each_type_to_a_generated_integer() {
             ("type_key".to_owned(), "integer".to_owned(), "a".to_owned()),
         ],
         "usage_type_key is (gts_type_id text, type_key int GENERATED ALWAYS AS IDENTITY)"
+    );
+}
+
+/// The feed retention marks table: one row per GTS type, keyed by the type,
+/// holding a whole feed position.
+///
+/// `DESIGN.md` §3.7 keys it on `gts_type_id` and declares `xact_id` and `id`
+/// both `NOT NULL`, because the pair is one position: a mark carrying half of
+/// one names no entry, and the feed page compares positions rather than
+/// transaction ids. The primary key is what makes "one row per GTS type that
+/// has lost an entry to retention" a property of the table instead of a
+/// convention the sweep is trusted to keep.
+///
+/// Created empty and still empty: the sweep raises a mark and `read_feed_page`
+/// reads it, both in slice 3. Only the shape is asserted here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_feed_retention_marks_table_is_keyed_per_gts_type() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    let columns: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT attname::text, format_type(atttypid, atttypmod), attnotnull \
+         FROM pg_attribute \
+         WHERE attrelid = 'usage_feed_retention_marks'::regclass \
+           AND attnum > 0 AND NOT attisdropped \
+         ORDER BY attnum",
+    )
+    .fetch_all(&h.pool)
+    .await
+    .expect("usage_feed_retention_marks must exist");
+
+    assert_eq!(
+        columns,
+        vec![
+            ("gts_type_id".to_owned(), "text".to_owned(), true),
+            ("xact_id".to_owned(), "xid8".to_owned(), true),
+            ("id".to_owned(), "uuid".to_owned(), true),
+        ],
+        "usage_feed_retention_marks is (gts_type_id text, xact_id xid8, id uuid), all NOT NULL"
+    );
+
+    let pk: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid = 'usage_feed_retention_marks'::regclass AND contype = 'p'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .expect("usage_feed_retention_marks must have a primary key");
+    assert_eq!(
+        pk, "PRIMARY KEY (gts_type_id)",
+        "one mark per GTS type: a key carrying the position too would let a type \
+         hold two marks, and then no single row would be its highest deleted position"
     );
 }
 

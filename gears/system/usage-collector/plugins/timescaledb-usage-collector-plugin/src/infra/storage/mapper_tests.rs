@@ -196,8 +196,9 @@ fn sample_row() -> UsageRecordRow {
         reason_code: None,
         origin: "live".to_owned(),
         acceptance_sequence: 7,
-        metadata: valid_metadata_json(),
         accepted_at: OffsetDateTime::from_unix_timestamp(1_700_003_700).unwrap(),
+        xact_id: "8341".to_owned(),
+        metadata: valid_metadata_json(),
     }
 }
 

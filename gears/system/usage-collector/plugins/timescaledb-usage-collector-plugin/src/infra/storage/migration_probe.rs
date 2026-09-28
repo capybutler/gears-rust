@@ -113,16 +113,25 @@ pub fn ledger_columns() -> Vec<(&'static str, &'static str)> {
 /// The columns of [`ledger_columns`] that an `INSERT` writes, `(name, type)` in
 /// declaration order.
 ///
-/// The one exclusion is named here and **not** derived from `INSERT_COLUMNS`,
-/// which is one of the constants this oracle exists to check: deriving it
+/// The exclusions are named here and **not** derived from `INSERT_COLUMNS`,
+/// which is one of the constants this oracle exists to check: deriving them
 /// from the code under test would let a column dropped from `INSERT_COLUMNS`
 /// disappear from the expectation with it. `entry_type` is `GENERATED ALWAYS
-/// … STORED`, so the ledger writes it itself; every other column,
-/// `metadata`'s own default notwithstanding, is supplied per row.
+/// … STORED`, so the ledger writes it itself; `xact_id` is stamped by its
+/// column default `pg_current_xact_id()` and never bound by the Record Store,
+/// which is what makes every entry of one batch share one value (this
+/// plugin's DESIGN §3.6); every other column, `metadata`'s own default
+/// notwithstanding, is supplied per row.
+///
+/// Both exclusions are held to the live table by
+/// `schema_integration_pg::the_live_columns_are_the_migrations_columns_in_order`,
+/// which reads back that `entry_type` is generated and that `xact_id` carries
+/// a default — so neither is an exclusion this parse merely asserts about
+/// itself.
 #[must_use]
 pub fn insertable_columns() -> Vec<(&'static str, &'static str)> {
     ledger_columns()
         .into_iter()
-        .filter(|(name, _)| !matches!(*name, "entry_type"))
+        .filter(|(name, _)| !matches!(*name, "entry_type" | "xact_id"))
         .collect()
 }

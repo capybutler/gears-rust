@@ -1,7 +1,9 @@
 //! `sqlx` row struct mirroring the `usage_records` hypertable (see
-//! `migrations/0001_init.sql`). The schema's other table,
-//! `usage_acceptance_sequence`, is a keyed counter and has no row struct
-//! here.
+//! `migrations/0001_init.sql`). It is the only table with a row struct here.
+//! Nothing decodes a whole row of the schema's other tables —
+//! `usage_acceptance_sequence`, `usage_type_key`,
+//! `usage_feed_retention_marks` — so none of them has one; a table earns a
+//! struct here when something needs its row rather than a column of it.
 //!
 //! It carries the raw storage-typed columns; [`super::mapper`] turns a row
 //! into the validated SDK model (and back where needed: the same module holds
@@ -9,6 +11,8 @@
 //! DDL: `uuid` → [`Uuid`], `text` → [`String`], `int` → `i32`, `numeric` →
 //! [`Decimal`], `timestamptz` → [`OffsetDateTime`], `bigint` → `i64`, `jsonb`
 //! → [`serde_json::Value`], and a nullable `text` / `uuid` → `Option<…>`.
+//! `xid8` is the exception, and not a mapping at all: `sqlx` cannot decode it,
+//! so the read list casts it and it arrives as a [`String`].
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
@@ -22,13 +26,15 @@ use uuid::Uuid;
 /// each column up by its own field name, so a `SELECT` list in another order
 /// still decodes correctly and one missing a column fails naming it.
 ///
-/// One column below has no counterpart on the SDK's `UsageRecord`:
-/// `acceptance_sequence`, assigned by this plugin — the gear's DESIGN §3.7
-/// (`gears/system/usage-collector/docs/DESIGN.md`) obliges the plugin to
-/// keep it strictly monotonic per `(tenant_id, gts_type_id)` — and orders
-/// reads here, never travelling back out through the SPI. It is decoded
-/// rather than left out of the struct so a row is a faithful picture of
-/// what was stored.
+/// [`Self::acceptance_sequence`] and [`Self::xact_id`] have no counterpart on
+/// the SDK's `UsageRecord`: both are ordering values assigned where the entry
+/// is stored rather than values the gear submits. `acceptance_sequence` is
+/// assigned by this plugin — the gear's DESIGN §3.7
+/// (`gears/system/usage-collector/docs/DESIGN.md`) obliges the plugin to keep
+/// it strictly monotonic per `(tenant_id, gts_type_id)` — and orders reads
+/// here, never travelling back out through the SPI; `xact_id` is assigned by
+/// the database and orders the feed. Both are decoded rather than left out of
+/// the struct so a row is a faithful picture of what was stored.
 ///
 /// The ledger's `entry_type` is deliberately *not* a field. It is a stored
 /// generated column — `CASE WHEN invalidates IS NULL THEN 'record' ELSE
@@ -90,8 +96,20 @@ pub struct UsageRecordRow {
     /// `(tenant_id, gts_type_id)`. Not carried on the SDK model; see the
     /// struct doc.
     pub acceptance_sequence: i64,
-    /// `metadata` — `jsonb` object of declared metadata keys → string values.
-    pub metadata: serde_json::Value,
     /// `accepted_at` — gear-assigned acceptance instant.
     pub accepted_at: OffsetDateTime,
+    /// `xact_id` — the inserting transaction's id, and the feed order's first
+    /// key. Stamped by the column default and never bound by the Record Store,
+    /// so it appears in [`super::record_store`]'s read column list and not in
+    /// its insert column list. Not carried on the SDK model: it reaches a
+    /// caller only inside a `FeedPosition`, which this backend does not yet
+    /// issue.
+    ///
+    /// A `String` because `xid8` has no `sqlx` decode implementation, so the
+    /// read list selects `xact_id::text`; a reader wanting the order parses
+    /// it, and comparing the rendered digits instead would misorder two ids of
+    /// different lengths.
+    pub xact_id: String,
+    /// `metadata` — `jsonb` object of declared metadata keys → string values.
+    pub metadata: serde_json::Value,
 }
