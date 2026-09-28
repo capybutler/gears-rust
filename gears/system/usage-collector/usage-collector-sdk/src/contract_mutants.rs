@@ -605,12 +605,12 @@ pub(super) enum Defect {
     /// What it breaks is the position's **meaning**. DESIGN §3.1 fixes a
     /// position's age by the oldest subsequent entry of a subscribed type
     /// *"whether or not the reader's authorization scope admits that
-    /// entry"*, and has *"a page reaching the settled head return its cursor
-    /// at the head"*. Under this defect a position means "the last entry
-    /// this grant admitted", so a cursor minted under one grant and resumed
-    /// under a wider one silently skips every entry the narrower grant
-    /// withheld ahead of it, and a walk whose tail is withheld never reaches
-    /// the head at all.
+    /// entry"*, and states that *"A page reaching the settled head returns
+    /// its cursor at the head"*. Under this defect a position means "the
+    /// last entry this grant admitted", so a cursor minted under one grant
+    /// and resumed under a wider one silently skips every entry the narrower
+    /// grant withheld ahead of it, and a walk whose tail is withheld never
+    /// reaches the head at all.
     ///
     /// **The suite reaches it from one direction only**, and the direction
     /// matters because three others do not. Measured by neutering each of
