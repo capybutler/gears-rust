@@ -169,6 +169,41 @@ async fn the_reference_backend_conforms_under_a_retention_drive() {
     );
 }
 
+/// The fourth corner: the weaker declaration **and** the drive.
+///
+/// The other three combinations of entry point and declaration each have a
+/// test above, and this one completes the pair of pairs. It is not
+/// redundant on the two it crosses, because neither can see an interaction:
+/// [`run_all_with_retention`] takes a [`DedupLevel`] like [`run_all`] does
+/// and hands it to the same checks, so a check whose retention-driven
+/// assertions read differently under a declaration that admits a
+/// convergence window would be green in both of the runs that vary one
+/// thing and red only here.
+///
+/// Nothing is known to branch that way today, which is the point of writing
+/// it down rather than reasoning it away: the combination was expressible
+/// from the moment the driven entry point took a level, and until this test
+/// nothing had ever evaluated it.
+#[tokio::test]
+async fn the_reference_backend_conforms_under_an_eventual_declaration_and_a_drive() {
+    let plugin = InMemoryReferencePlugin::new();
+
+    let violations = run_all_with_retention(
+        &plugin,
+        DedupLevel::Eventual {
+            convergence_bound: std::time::Duration::ZERO,
+        },
+        &plugin,
+    )
+    .await;
+
+    assert!(
+        violations.is_empty(),
+        "the reference backend must pass every implemented check under the weaker declaration \
+         with the retention drive as well as without it; it reported: {violations:#?}"
+    );
+}
+
 /// The driven suite three times against **one** backend.
 ///
 /// This is [`the_reference_backend_conforms_to_a_repeated_run`] for the
