@@ -114,7 +114,7 @@ pub struct TimescaleDbPluginConfig {
     /// `S = 2 × feed_acceptance_slack_secs + statement_timeout_secs` is what the
     /// feed's retention refusal rests on (`docs/DESIGN.md` §3.6,
     /// Acceptance-order slack). **Zero does not mean disabled** and is
-    /// rejected: a slack of zero refuses every entry.
+    /// rejected: a slack of zero would refuse every entry.
     pub feed_acceptance_slack_secs: u64,
     /// Time width of a new ledger chunk, in seconds. Applied at startup to
     /// chunks created afterwards; existing chunks keep their range.
@@ -248,7 +248,7 @@ impl TimescaleDbPluginConfig {
         {
             return Err(format!(
                 "feed_acceptance_slack_secs must be in (0, {MAX_INTERVAL_SECS}]: zero does not \
-                 disable the write-time acceptance check, it refuses every entry"
+                 disable the write-time acceptance check, it would refuse every entry"
             ));
         }
         if self.feed_replay_horizon_secs == 0 || self.feed_replay_horizon_secs > MAX_INTERVAL_SECS {
