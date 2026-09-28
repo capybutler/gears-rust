@@ -268,17 +268,25 @@ pub const LATEST_TIE_BREAK: &str = "latest-tie-break";
 /// the reconciliation read take a separate `scope: &ast::Expr`, and this
 /// check reaches neither.
 ///
-/// **The feed page is no longer uncovered, though it is covered by another
-/// check and for another reason.**
-/// [`FEED_SNAPSHOT_AND_REPLAY`] stores entries under two tenants on a meter
-/// of its own and walks them under a grant naming one, so a feed that
-/// ignored its `scope` argument outright now delivers entries that check
-/// reports as never written under the grant it read. That is a consequence
-/// of what that check needs — a withheld entry between every pair of
-/// admitted ones — rather than an assertion about authorization, and it is
-/// reported under that check's name. A porter who wants the enforcement
-/// obligation stated should still read the SPI doc: *"`scope` is the
-/// compiled PDP scope. An entry outside it is absent."*
+/// **The feed page is no longer uncovered, though it is covered by other
+/// checks and for other reasons.** Two of them narrow, and both do it
+/// incidentally. [`FEED_SNAPSHOT_AND_REPLAY`] stores entries under two
+/// tenants on a meter of its own and walks them under a grant naming one,
+/// so a feed that ignored its `scope` argument outright now delivers
+/// entries that check reports as never written under the grant it read.
+/// [`FEED_RETENTION_REFUSAL`] narrows the same way, and needs to: its
+/// sharpest clause is that a cursor is refused *"whether or not the
+/// caller's scope admitted that entry"*, which is unaskable without an
+/// entry the read's own grant withholds, so it stores one under the
+/// suite's excluded tenant too.
+///
+/// Neither is an assertion about authorization — each is a consequence of
+/// what its own check needs, a withheld entry between every pair of
+/// admitted ones in the first case and a withheld removal in the second —
+/// and each is reported under its own check's name, which is what a porter
+/// debugging a scope bug on the feed path will see first. A porter who
+/// wants the enforcement obligation stated should still read the SPI doc:
+/// *"`scope` is the compiled PDP scope. An entry outside it is absent."*
 ///
 /// **The reconciliation read is still reached by nothing.** Its obligation
 /// is in its SPI doc — a tenant the scope excludes answers exactly as one

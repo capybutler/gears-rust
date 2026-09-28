@@ -1736,14 +1736,24 @@ async fn feed_page(
 /// without one.
 ///
 /// Moving the scope gate above `cursor = entry.sequence` in `read_feed_page`
-/// still compiles, still passes the entire contract suite — every feed check
-/// is in `UNWRITTEN_CHECKS`, so `run_all` has nothing to say here — and still
-/// reads correctly under every single grant. It would simply make a position
-/// mean "the last entry this grant admitted", so a cursor minted under one
-/// grant and resumed under a wider one silently skips every entry the
-/// narrower grant withheld ahead of it.
+/// still compiles and still reads correctly under every single grant. It
+/// would simply make a position mean "the last entry this grant admitted",
+/// so a cursor minted under one grant and resumed under a wider one silently
+/// skips every entry the narrower grant withheld ahead of it.
 ///
-/// **Measured, that defect fails four tests and no other.** It fails this one
+/// **`run_all` now reports that defect, and once did not.** This paragraph
+/// used to say the suite had nothing to say about it, because every feed
+/// check sat in `UNWRITTEN_CHECKS`; that constant is now empty.
+/// [`super::CHECKS`]' `feed-snapshot-and-replay` reports it under `run_all`,
+/// and `feed-retention-refusal` joins it under
+/// [`run_all_with_retention`](super::run_all_with_retention) — measured by
+/// applying the defect, not reasoned from the matrix. The test below is
+/// therefore no longer the only thing standing between this property and a
+/// silent regression, which is a reason to keep it rather than to retire it:
+/// it names the position arithmetic directly, where a check reports a
+/// consequence several reads downstream.
+///
+/// **Measured, that defect now fails fourteen tests.** The four this
 /// at the first cross-grant equality below, where the two grants are handed 3
 /// and 4; the fixpoint of
 /// [`a_limit_bounded_feed_walk_reaches_a_fixpoint_at_the_ledger_end`], which
@@ -1755,6 +1765,18 @@ async fn feed_page(
 /// which is handed 0 rather than 4. Inside this test all three position
 /// assertions fire, in order: 3 against 4, then 4 against the untranslatable
 /// grant's 0, then 3 against the ledger's end.
+///
+/// The other ten are the landed checks arriving: the five conformance
+/// dispatches (plain, repeated, under a drive, repeated under a drive, and
+/// under an eventual declaration), both discrimination matrices — every
+/// column moves, because the subjects wrap this same reference — and the
+/// three bespoke feed tests that read through it
+/// ([`a_cursor_at_the_retention_mark_is_still_served`],
+/// [`the_oldest_start_is_never_refused_on_the_retention_floor`] and
+/// [`an_undecided_lookup_is_still_a_violation_once_the_bound_has_passed`]).
+/// Each of the ten is explained by the defect rather than incidental to it,
+/// which is the condition a mutation this broad has to meet before its
+/// breadth counts as evidence instead of noise.
 ///
 /// The fifth guard is gone.
 /// [`a_bounded_page_limit_hands_two_grants_two_positions_that_each_resume`]
