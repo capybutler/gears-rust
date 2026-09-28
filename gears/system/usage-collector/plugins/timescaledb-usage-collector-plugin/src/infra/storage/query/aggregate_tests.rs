@@ -29,9 +29,11 @@ use super::{
 
 #[test]
 fn every_fold_casts_to_numeric() {
+    // `SUM` is the one arm with a `COALESCE`: `PostgreSQL` answers `NULL` over
+    // zero rows and DESIGN 3.3 fixes an empty selection's `SUM` at 0.
     assert_eq!(
         fold_select_expr(AggregationFold::Sum),
-        "SUM(r.quantity)::numeric"
+        "COALESCE(SUM(r.quantity), 0)::numeric"
     );
     assert_eq!(
         fold_select_expr(AggregationFold::Count),

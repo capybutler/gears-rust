@@ -2306,7 +2306,7 @@ fn the_fold_assembles_one_statement_from_the_builders_both_read_paths_share() {
     // same constant the two layers would only be agreeing with each other.
     assert_eq!(
         sql,
-        "SELECT r.subject_type, r.metadata ->> $8, SUM(r.quantity)::numeric \
+        "SELECT r.subject_type, r.metadata ->> $8, COALESCE(SUM(r.quantity), 0)::numeric \
          FROM usage_records r \
          WHERE r.gts_type_id = $1 \
          AND r.type_key = (SELECT k.type_key FROM usage_type_key k WHERE k.gts_type_id = $1) \

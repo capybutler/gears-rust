@@ -139,6 +139,14 @@ fn ranges() -> Vec<TimeRange> {
             h0() + Duration::hours(3) + Duration::minutes(17),
             h0() + Duration::hours(7) + Duration::minutes(59),
         ),
+        // Far past the fixture: a selection empty because the range matches no
+        // entry at all, rather than because every entry in it is withdrawn.
+        // Hour-aligned, so the rollup half stands alone with no edge scan beside
+        // it - the one shape where `parts` itself is empty.
+        range(
+            h0() + Duration::days(30),
+            h0() + Duration::days(30) + Duration::hours(2),
+        ),
     ]
 }
 
@@ -204,8 +212,21 @@ async fn the_rollup_path_equals_the_scan_before_and_after_a_refresh() {
     assert_paths_agree(&s, "after refresh").await;
 }
 
+/// A tenant whose every entry is withdrawn: no group when grouped, and an
+/// ungrouped bucket carrying `0` under both folds.
+///
+/// The fold excludes the pair, which **empties** the bucket's selection rather
+/// than removing the bucket (the gear's DESIGN §3.3, "An empty selection still
+/// answers"), and `SUM` and `COUNT` are both defined over an empty selection.
+/// Grouped, there is no bucket at all: the scan never forms a group from
+/// withdrawn entries alone, and the rollup's `HAVING` drops the grain row whose
+/// count nets to zero.
+///
+/// Both folds are asserted on the rollup and on the scan, because each path
+/// carries its own expression for the empty selection and the two owe the same
+/// answer (spec §6.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fully_withdrawn_tenant_has_no_group_and_folds_to_null_sum_and_zero_count() {
+async fn a_fully_withdrawn_tenant_has_no_group_and_folds_to_zero_sum_and_zero_count() {
     let s = stores().await;
     seed(&s.rollup).await;
     common::refresh_rollup(&s.h.pool).await;
@@ -233,22 +254,21 @@ async fn a_fully_withdrawn_tenant_has_no_group_and_folds_to_null_sum_and_zero_co
     );
 
     let only_c = ODataQuery::new().with_filter(tenant_eq(TENANT_C));
-    let sum = s
-        .rollup
-        .aggregate(meter.clone(), day, AggregationFold::Sum, &only_c, &[], &[])
-        .await
-        .expect("sum");
-    assert_eq!(sum.buckets.len(), 1);
-    assert_eq!(sum.buckets[0].value, None, "a SUM over nothing is null");
-    let count = s
-        .rollup
-        .aggregate(meter, day, AggregationFold::Count, &only_c, &[], &[])
-        .await
-        .expect("count");
-    assert_eq!(
-        count.buckets[0].value.as_ref().map(BigDecimal::normalized),
-        Some(BigDecimal::from(0).normalized())
-    );
+    for (path, reader) in [("rollup", &s.rollup), ("scan", &s.scan)] {
+        for fold in [AggregationFold::Sum, AggregationFold::Count] {
+            let result = reader
+                .aggregate(meter.clone(), day, fold, &only_c, &[], &[])
+                .await
+                .unwrap_or_else(|e| panic!("{path} {fold}: {e:?}"));
+            assert_eq!(result.buckets.len(), 1, "{path} {fold}: {result:?}");
+            assert_eq!(
+                result.buckets[0].value.as_ref().map(BigDecimal::normalized),
+                Some(BigDecimal::from(0).normalized()),
+                "{path}: the withdrawn pair empties the selection rather than removing \
+                 the bucket, and {fold} over an empty selection is 0"
+            );
+        }
+    }
 }
 
 /// Routing by behaviour: after a refresh, a late write below the watermark is

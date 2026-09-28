@@ -94,13 +94,28 @@ const LATEST_SELECT_EXPR: &str =
 /// `SUM` no longer hits `rust_decimal::Decimal`'s ceiling of roughly 7.9e28 and
 /// turns into an `Internal`/500 on decode.
 ///
+/// **`SUM` folds through `COALESCE(…, 0)` and the other four do not.** The
+/// gear's DESIGN §3.3 ("An empty selection still answers") defines `SUM` and
+/// `COUNT` over an empty selection at `0`, and leaves `MAX`, `MIN` and `LATEST`
+/// undefined there, so those three keep the `NULL` the backend answers and it
+/// reads back as an absent value. `COUNT(*)` is already `0` over zero rows;
+/// `PostgreSQL`'s `SUM` is `NULL`, which is the aggregate's own convention
+/// rather than anything this fold means to say, so the wrapper supplies the
+/// defined value. Two selections reach it: the ungrouped bucket of a query
+/// matching no entry, and the ungrouped bucket of a range whose every entry is
+/// a withdrawn pair, since [`withdrawal_exclusion_clause`] empties that
+/// selection rather than removing the bucket. Grouped, the wrapper is inert - a
+/// group exists only because a row survived into it - and a group nothing
+/// survives in yields no bucket at all. A surviving selection keeps its total
+/// either way, zero and negative alike.
+///
 /// The returned string is a `'static` constant from the closed enum match,
 /// never caller text. Each arm naming a column qualifies it with the alias
 /// [`super::ledger_from_clause`] declares; `COUNT(*)` names none.
 #[must_use]
 pub fn fold_select_expr(fold: AggregationFold) -> &'static str {
     match fold {
-        AggregationFold::Sum => "SUM(r.quantity)::numeric",
+        AggregationFold::Sum => "COALESCE(SUM(r.quantity), 0)::numeric",
         AggregationFold::Count => "COUNT(*)::numeric",
         AggregationFold::Min => "MIN(r.quantity)::numeric",
         AggregationFold::Max => "MAX(r.quantity)::numeric",

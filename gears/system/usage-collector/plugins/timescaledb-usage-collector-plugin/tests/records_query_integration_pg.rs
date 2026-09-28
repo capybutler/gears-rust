@@ -1121,17 +1121,38 @@ async fn the_five_folds_answer_over_a_known_population() {
     }
 }
 
-/// A bare fold over an **empty** selection still answers one bucket, and `COUNT`
-/// answers `Some(0)` where the others answer `None`.
+/// A bare fold over an **empty** selection still answers one bucket; `SUM` and
+/// `COUNT` carry `Some(0)` there while `MAX`, `MIN` and `LATEST` carry `None`.
 ///
-/// That split is `SELECT COUNT(*)`'s own answer rather than anything the plugin
-/// does, which is exactly why only a real query demonstrates it: a unit test
-/// reaches the statement that leads here and no further.
+/// The gear's DESIGN §3.3 splits the folds that way — `SUM` and `COUNT` are
+/// defined over an empty selection, the other three are not — and only a real
+/// query demonstrates it: a unit test reaches the statement that leads here and
+/// no further. `COUNT`'s zero is `SELECT COUNT(*)`'s own answer; `SUM`'s is
+/// `PostgreSQL`'s `NULL` over zero rows put right by the statement's `COALESCE`.
+///
+/// **The second half is what keeps that `COALESCE` honest.** A zero from an
+/// empty selection is worth nothing if a real total can also come back as zero
+/// or be lost on the way, so two more selections are folded here, neither of
+/// them empty: one whose surviving entries net to zero, and one whose total is
+/// negative. A negative `SUM` is an ordinary outcome (DESIGN §3.3, "No business
+/// logic"), and the `COUNT` beside each is what says the selection had entries
+/// in it — without that, a `0` would be indistinguishable from the empty case.
+///
+/// **`SUM` and `COUNT` are asked on both read paths.** Every range here covers a
+/// whole hour, so both folds are rollup-eligible and `store` answers them from
+/// `usage_rollup_1h` while `scan` has the rollup off and reads the ledger. The
+/// two owe the same answer (spec §6.4), the empty selection included, and each
+/// carries its own expression for it — so asking only one would leave the
+/// other's free to drift. `MAX`, `MIN` and `LATEST` are never rollup-eligible,
+/// so both readers take the scan for those and the pair is one assertion said
+/// twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bare_fold_over_an_empty_selection_is_one_bucket_and_count_is_zero() {
-    let (_h, store) = setup().await;
+async fn a_bare_fold_tells_an_empty_selection_a_netted_one_and_a_negative_total_apart() {
+    let (h, store) = setup().await;
+    let scan = common::record_store(&h.pool).without_rollup();
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x200E);
+    let paths: [(&str, &PgRecordStore); 2] = [("rollup", &store), ("scan", &scan)];
 
     // A populated ledger, and a range that selects none of it — so the empty
     // selection is the range's doing rather than an empty table's.
@@ -1142,38 +1163,93 @@ async fn a_bare_fold_over_an_empty_selection_is_one_bucket_and_count_is_zero() {
     )
     .expect("ordered range");
 
-    let count = store
-        .aggregate(
-            meter.clone(),
-            empty,
-            AggregationFold::Count,
-            &ODataQuery::new(),
-            &[],
-            &[],
-        )
-        .await
-        .expect("count over an empty selection");
-    assert_eq!(
-        only_bucket_value(&count).map(|v| v.normalized()),
-        Some(BigDecimal::from(0).normalized()),
-        "COUNT over an empty selection is Some(0), not None: counting nothing is zero"
-    );
+    for (path, reader) in paths {
+        for fold in [AggregationFold::Sum, AggregationFold::Count] {
+            let result = reader
+                .aggregate(meter.clone(), empty, fold, &ODataQuery::new(), &[], &[])
+                .await
+                .unwrap_or_else(|e| panic!("{path} {fold}: {e:?}"));
+            assert_eq!(
+                only_bucket_value(&result).map(|v| v.normalized()),
+                Some(BigDecimal::from(0).normalized()),
+                "{path}: {fold} is defined over an empty selection and answers Some(0), \
+                 never None"
+            );
+        }
 
-    for fold in [
-        AggregationFold::Sum,
-        AggregationFold::Min,
-        AggregationFold::Max,
-        AggregationFold::Latest,
+        for fold in [
+            AggregationFold::Min,
+            AggregationFold::Max,
+            AggregationFold::Latest,
+        ] {
+            let result = reader
+                .aggregate(meter.clone(), empty, fold, &ODataQuery::new(), &[], &[])
+                .await
+                .unwrap_or_else(|e| panic!("{path} {fold}: {e:?}"));
+            assert_eq!(
+                only_bucket_value(&result),
+                None,
+                "{path}: {fold} over an empty selection has no value to answer with"
+            );
+        }
+    }
+
+    // A selection that nets to zero and one that is negative, each two surviving
+    // entries at its own instant, far from the seeded hours and from each other.
+    for (day, entries, expected) in [
+        (40_i64, [("net-a", 5_i64), ("net-b", -5)], 0_i64),
+        (50, [("neg-a", 2), ("neg-b", -7)], -5),
     ] {
-        let result = store
-            .aggregate(meter.clone(), empty, fold, &ODataQuery::new(), &[], &[])
-            .await
-            .unwrap_or_else(|e| panic!("{fold}: {e:?}"));
-        assert_eq!(
-            only_bucket_value(&result),
-            None,
-            "{fold} over an empty selection has no value to answer with"
-        );
+        let at = common::fixture_window_end() + Duration::days(day);
+        for (key, value) in entries {
+            let rec = common::entry_over(
+                &meter,
+                tenant,
+                key,
+                Decimal::from(value),
+                at - Duration::minutes(30),
+                at,
+            );
+            store.create(rec).await.expect("seed entry");
+        }
+        let around = TimeRange::new(at - Duration::hours(1), at + Duration::hours(1))
+            .expect("ordered range");
+
+        for (path, reader) in paths {
+            let sum = reader
+                .aggregate(
+                    meter.clone(),
+                    around,
+                    AggregationFold::Sum,
+                    &ODataQuery::new(),
+                    &[],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{path} sum: {e:?}"));
+            assert_eq!(
+                only_bucket_value(&sum).map(|v| v.normalized()),
+                Some(BigDecimal::from(expected).normalized()),
+                "{path}: a surviving selection keeps its total; {entries:?} sums to {expected}"
+            );
+            let count = reader
+                .aggregate(
+                    meter.clone(),
+                    around,
+                    AggregationFold::Count,
+                    &ODataQuery::new(),
+                    &[],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{path} count: {e:?}"));
+            assert_eq!(
+                only_bucket_value(&count).map(|v| v.normalized()),
+                Some(BigDecimal::from(2).normalized()),
+                "{path}: the selection holds both entries, so its total was folded rather \
+                 than defaulted"
+            );
+        }
     }
 }
 

@@ -2049,9 +2049,17 @@ impl RecordStore for PgRecordStore {
     ///   ([`aggregate_bucket`]), so an empty `group_by` — a bare aggregate with
     ///   no `GROUP BY`, which `PostgreSQL` answers with exactly one row — yields
     ///   the single empty-keyed bucket the SPI asks for rather than an empty
-    ///   bucket list. `COUNT` over an empty selection is `Some(0)` for the same
-    ///   reason: it is `SELECT COUNT(*)`'s own answer, not a special case here
-    ///   ([`usage_collector_sdk::AggregationBucket::value`]).
+    ///   bucket list. That bucket carries `Some(0)` under `COUNT` **and** under
+    ///   `SUM`, both of which DESIGN §3.3 defines over an empty selection;
+    ///   `MAX`, `MIN` and `LATEST` are not defined over one and keep the `None`
+    ///   ([`usage_collector_sdk::AggregationBucket::value`]). The two zeroes are
+    ///   not reached the same way, and the difference is the part worth stating:
+    ///   `COUNT` is `SELECT COUNT(*)`'s own answer, while `SUM` over zero rows
+    ///   is `NULL` in `PostgreSQL` and is made `0` by a `COALESCE` in the
+    ///   statement — [`fold_select_expr`] on the scan path,
+    ///   [`build_rollup_aggregate_sql`] on the rollup one. So neither is a
+    ///   special case in this method, but only one of them is the backend's
+    ///   unaided answer.
     ///
     /// Both are held rather than asserted, by one test each against a lazy pool
     /// at a dead DSN — where reaching the pool answers `Transient` and stopping

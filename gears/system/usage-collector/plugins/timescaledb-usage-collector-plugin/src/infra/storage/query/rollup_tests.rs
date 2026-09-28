@@ -303,7 +303,7 @@ fn a_grouped_statement_with_both_edges_and_a_filter_reads_as_the_spec_states() {
 }
 
 #[test]
-fn an_aligned_ungrouped_sum_reads_the_rollup_alone_and_nulls_a_netted_selection() {
+fn an_aligned_ungrouped_sum_reads_the_rollup_alone_and_zeroes_an_empty_selection() {
     let split = hour_split(aligned()).expect("whole hours");
     let st = build_rollup_aggregate_sql(&meter(), split, AggregationFold::Sum, None, &[])
         .expect("renders");
@@ -315,7 +315,7 @@ fn an_aligned_ungrouped_sum_reads_the_rollup_alone_and_nulls_a_netted_selection(
              FROM usage_rollup_1h r \
              WHERE r.gts_type_id = $1 AND {TYPE_KEY} \
              AND r.bucket >= $2 AND r.bucket < $3) \
-             SELECT (CASE WHEN COALESCE(SUM(c), 0) = 0 THEN NULL ELSE SUM(s) END)::numeric FROM parts"
+             SELECT COALESCE(SUM(s), 0)::numeric FROM parts"
         )
     );
     assert_eq!((st.binds.len(), st.dim_count), (3, 0));

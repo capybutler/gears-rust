@@ -169,10 +169,19 @@ pub struct RollupStatement {
 /// statement.
 ///
 /// The result shape matches the scan's exactly (spec §6.4). A grouped query
-/// drops a group whose count nets to zero, because the scan never forms a group
-/// from withdrawn entries alone. An ungrouped `SUM` is `NULL` over a selection
-/// whose count nets to zero, and an ungrouped `COUNT` is `0`. Both tests read
-/// the count, never the sum, so a genuine zero or negative total still returns.
+/// drops a group whose count nets to zero - the `HAVING` - because the scan
+/// never forms a group from withdrawn entries alone.
+///
+/// **Ungrouped there is no such test, and the two folds agree.** `SUM` and
+/// `COUNT` are both defined over an empty selection and both report `0` (the
+/// gear's DESIGN §3.3, "An empty selection still answers"), so each wraps its
+/// total in `COALESCE(…, 0)` and neither asks how the selection came to be
+/// empty. The `CASE` that used to stand here read the count to tell an empty
+/// selection from a surviving one whose total nets to zero, and answered `NULL`
+/// for the first; under the obligation both answer `0`, so the distinction it
+/// drew is one the caller cannot observe. A surviving selection reaches the same
+/// expression and keeps its total, zero and negative alike - a negative `SUM` is
+/// an ordinary outcome (DESIGN §3.3, "No business logic").
 ///
 /// Precondition: [`rollup_eligible`] returned `Ok(split)` for these inputs. The
 /// filter is rendered once per half with its own placeholders. Its bare column
@@ -192,9 +201,7 @@ pub fn build_rollup_aggregate_sql(
 ) -> Result<RollupStatement, String> {
     let grouped = !group_by.is_empty();
     let fold_expr = match (fold, grouped) {
-        (AggregationFold::Sum, false) => {
-            "(CASE WHEN COALESCE(SUM(c), 0) = 0 THEN NULL ELSE SUM(s) END)::numeric"
-        }
+        (AggregationFold::Sum, false) => "COALESCE(SUM(s), 0)::numeric",
         (AggregationFold::Count, false) => "COALESCE(SUM(c), 0)::numeric",
         (AggregationFold::Sum, true) => "SUM(s)::numeric",
         (AggregationFold::Count, true) => "SUM(c)::numeric",
