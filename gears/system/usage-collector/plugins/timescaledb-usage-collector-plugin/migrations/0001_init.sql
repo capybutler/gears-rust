@@ -76,11 +76,11 @@ CREATE TABLE IF NOT EXISTS usage_records (
     acceptance_sequence bigint      NOT NULL,
     -- Gear-assigned acceptance instant, stamped by the Ingestion Gateway and
     -- written as given. An absorbed retry returns this stored value. `xact_id`
-    -- below is declared between this column and `metadata` and is in neither
-    -- `INSERT_COLUMNS` (`record_store.rs`) nor the binds, so that constant is
-    -- this declaration order with `xact_id` dropped out of it — which still
-    -- leaves `metadata` last, where the batch insert needs it (see the
-    -- constant's doc).
+    -- below is declared between this column and `metadata`, and like
+    -- `entry_type` above it is in neither `INSERT_COLUMNS` (`record_store.rs`)
+    -- nor the binds: that constant is this declaration order with `entry_type`
+    -- and `xact_id` dropped out of it — which still leaves `metadata` last,
+    -- where the batch insert needs it (see the constant's doc).
     accepted_at         timestamptz NOT NULL,
     -- The inserting transaction's id, and the feed order's first key
     -- (this plugin's DESIGN §3.6 `cpt-cf-uc-plugin-seq-feed-page`). Stamped by
@@ -226,7 +226,9 @@ CREATE INDEX IF NOT EXISTS usage_records_tenant_type_window_idx
     ON usage_records (tenant_id, gts_type_id, window_end DESC, acceptance_sequence DESC);
 CREATE INDEX IF NOT EXISTS usage_records_tenant_window_idx
     ON usage_records (tenant_id, window_end DESC);
--- The feed's future keyset: it orders by arrival rather than by the column
--- selection reads, scoped per (tenant, meter).
+-- Unreferenced. No read path on this branch orders on
+-- `(tenant_id, gts_type_id, acceptance_sequence DESC)`, and this plugin's
+-- DESIGN §3.7 does not list this index among the ledger's. It is kept only
+-- until `acceptance_sequence` itself is retired, in slice 4.
 CREATE INDEX IF NOT EXISTS usage_records_acceptance_seq_idx
     ON usage_records (tenant_id, gts_type_id, acceptance_sequence DESC);

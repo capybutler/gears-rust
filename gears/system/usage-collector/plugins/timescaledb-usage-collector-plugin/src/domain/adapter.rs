@@ -94,20 +94,21 @@ impl UsageCollectorPluginV1 for StorageAdapter {
             .await
     }
 
-    /// Not built yet: this backend has no subscription-wide feed order, no
-    /// retention-mark table and no page protocol, so it can issue no position
-    /// and decide no retention refusal.
+    /// Not built yet: nothing reads the feed order or the retention marks, so
+    /// this backend can issue no position and decide no retention refusal.
     ///
-    /// **The ordering column is not what is missing.**
-    /// `migrations/0001_init.sql` already declares `acceptance_sequence` and
-    /// indexes it for exactly this read. What it does not give is a
-    /// *subscription-wide* order: `usage_acceptance_sequence` keys its counter
-    /// on `(tenant_id, gts_type_id)`, so the sequence is monotonic per scope
-    /// only. A `FeedPosition` must be comparable across a whole subscription
-    /// without its encoded size growing with that subscription's breadth, and
-    /// the gear DESIGN says outright that a position keyed per tenant fails
-    /// that bound. The cross-subscription key is the thing to design here; the
-    /// column is already there.
+    /// **Neither the ordering column nor the mark table is what is missing any
+    /// more.** `migrations/0001_init.sql` declares `xact_id`, the inserting
+    /// transaction's id, indexes it as
+    /// `usage_records_feed_idx (gts_type_id, xact_id, id)`, and declares the
+    /// `usage_feed_retention_marks` table. That order is comparable across a
+    /// whole subscription without its encoded size growing with that
+    /// subscription's breadth, which is the bound `acceptance_sequence` fails:
+    /// `usage_acceptance_sequence` keys its counter on
+    /// `(tenant_id, gts_type_id)`, so that sequence is monotonic per scope
+    /// only, and the gear DESIGN says outright that a position keyed per tenant
+    /// fails the bound. What is left is the page protocol that reads them, and
+    /// the sweep that raises a mark: slice 3.
     ///
     /// `Internal` rather than `Transient` because there is nothing to retry:
     /// the method will answer once those three exist, and a `Transient` here
@@ -121,9 +122,9 @@ impl UsageCollectorPluginV1 for StorageAdapter {
         _limit: u64,
     ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
         Err(UsageCollectorPluginError::internal(
-            "the TimescaleDB backend does not serve the usage feed yet: its acceptance_sequence \
-             is monotonic per (tenant, meter) rather than across a subscription, and it has no \
-             retention-mark table and no page protocol",
+            "the TimescaleDB backend does not serve the usage feed yet: its schema declares the \
+             subscription-wide (xact_id, id) order and the retention-mark table, but no page \
+             protocol reads them and no sweep raises a mark",
         ))
     }
 
@@ -142,12 +143,13 @@ impl UsageCollectorPluginV1 for StorageAdapter {
     ///   `usage_records_tenant_type_window_idx`, whose leading columns are
     ///   `(tenant_id, gts_type_id, window_end DESC)` — the range count is a
     ///   scan of one index interval and the watermark is its leading edge.
-    /// * `MAX(accepted_at)` is served by **no** index: `accepted_at` appears
-    ///   in the schema as a column only, and none of the four indexes names
-    ///   it. `usage_records_acceptance_seq_idx` is not a substitute —
-    ///   `acceptance_sequence` is plugin-assigned at write while `accepted_at`
-    ///   is stamped upstream by the Ingestion Gateway and written as given, so
-    ///   the two orders are not guaranteed to agree.
+    /// * `MAX(accepted_at)` is served by
+    ///   `usage_records_watermark_idx (gts_type_id, tenant_id, accepted_at
+    ///   DESC)`, which `0001_init.sql` declares for exactly this read. It
+    ///   needed an index of its own: `accepted_at` is stamped upstream by the
+    ///   Ingestion Gateway and written as given, while every other indexed
+    ///   ordering column here is assigned by this plugin at write, so no other
+    ///   index's order is guaranteed to agree with it.
     ///
     /// `Internal` rather than `Transient` for the same reason
     /// [`Self::read_feed_page`] is — retrying cannot make an unbuilt method

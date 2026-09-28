@@ -357,8 +357,9 @@ async fn the_feed_order_column_is_an_xid8_the_database_stamps() {
     // is this suite's convention throughout and which avoids decoding
     // `information_schema`'s `character_data` domains: `format_type` and
     // `pg_get_expr` both return `text`.
-    let (data_type, column_default): (String, Option<String>) = sqlx::query_as(
-        "SELECT format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid) \
+    let (data_type, column_default, not_null): (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), \
+                a.attnotnull \
          FROM pg_attribute a \
          LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
          WHERE a.attrelid = 'usage_records'::regclass AND a.attname = 'xact_id' \
@@ -378,6 +379,16 @@ async fn the_feed_order_column_is_an_xid8_the_database_stamps() {
         Some("pg_current_xact_id()"),
         "the default is what stamps it; without one the Record Store would have to, \
          and then no two entries of one batch would be guaranteed to share a value"
+    );
+    // The same property the marks table's `xact_id` carries, asserted here for
+    // the same reason. `ledger_columns()` reads the declared type and stops, so
+    // the migration's own `NOT NULL` reaches no oracle; the live table is where
+    // it can be seen.
+    assert!(
+        not_null,
+        "xact_id must be NOT NULL: a feed page selects `(xact_id, id) > $after` and orders \
+         on it (DESIGN section 3.6), and a NULL compares NULL in both, so an entry with no \
+         transaction id would be silently unservable rather than out of order"
     );
 }
 

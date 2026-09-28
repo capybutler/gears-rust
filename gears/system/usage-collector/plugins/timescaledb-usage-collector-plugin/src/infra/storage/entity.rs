@@ -1,9 +1,10 @@
 //! `sqlx` row struct mirroring the `usage_records` hypertable (see
-//! `migrations/0001_init.sql`). It is the only table with a row struct here.
-//! Nothing decodes a whole row of the schema's other tables —
-//! `usage_acceptance_sequence`, `usage_type_key`,
-//! `usage_feed_retention_marks` — so none of them has one; a table earns a
-//! struct here when something needs its row rather than a column of it.
+//! `migrations/0001_init.sql`). It is the only table with a row struct here,
+//! and the reason is what this struct is for rather than a rule about the
+//! others: [`super::mapper`] turns a whole ledger row into the validated SDK
+//! `UsageRecord`, and looking its columns up by field name is what keeps that
+//! mapping legible against the DDL. A query against any other table decodes
+//! just what that query needs, at its own call site.
 //!
 //! It carries the raw storage-typed columns; [`super::mapper`] turns a row
 //! into the validated SDK model (and back where needed: the same module holds

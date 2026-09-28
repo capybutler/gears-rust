@@ -477,6 +477,15 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
         "the read list may add only the columns the ledger writes itself, and \
          xact_id is the only one RECORD_COLUMNS decodes"
     );
+    // The two comparisons above are over sets, which de-duplicate before they
+    // compare: a repeated entry would pass both. The sorted-vector form this
+    // test used to have caught that for free and the set form does not, so the
+    // multiplicity is asserted directly rather than lost with the re-aim.
+    assert_eq!(
+        names(RECORD_COLUMNS).len(),
+        record_names.len(),
+        "RECORD_COLUMNS must name each column exactly once"
+    );
     assert_eq!(
         names(INSERT_COLUMNS).len(),
         INSERT_COLUMN_ARRAY_TYPES.len(),
