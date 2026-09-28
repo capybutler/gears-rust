@@ -213,9 +213,10 @@ struct FeedBootstrapFixtures {
 /// constant a caller reporting coverage reads to find that out.
 ///
 /// That claim is held mechanically rather than by this paragraph:
-/// `contract_tests`' `a_retention_driven_assertion_is_reached_only_with_a_driver`
-/// runs a subject whose only defect is one assertion 4 reaches, and requires
-/// it to pass under `run_all` and fail under `run_all_with_retention`.
+/// `contract_tests`' `RETENTION_DRIVEN_MATRIX` carries two rows whose only
+/// defect is one assertion 4 reaches, and
+/// `each_driven_check_fails_against_its_own_defect_and_no_other` requires
+/// both to pass under `run_all` and to fail under `run_all_with_retention`.
 ///
 /// # Surviving a repeated run
 ///
@@ -300,9 +301,8 @@ struct FeedBootstrapFixtures {
 ///
 /// **Neither driven subject is in the discrimination matrix**, and neither
 /// could be: `run_all` drives nothing, so under the matrix's dispatch both
-/// are behaviourally the reference backend. Their columns are asserted by
-/// `a_retention_driven_assertion_is_reached_only_with_a_driver` and
-/// `a_bootstrap_after_a_sweep_must_begin_at_the_oldest_entry_left`.
+/// are behaviourally the reference backend. Their columns are the first two
+/// rows of `contract_tests`' `RETENTION_DRIVEN_MATRIX`.
 ///
 /// # Eleven assertions no subject reaches, and why each stays
 ///

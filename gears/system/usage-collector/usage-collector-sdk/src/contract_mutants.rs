@@ -12,7 +12,7 @@
 //!
 //! *Behaviourally* is the exact word. Thirteen subjects wrap a real
 //! reference backend and are that backend plus one interception; the other
-//! thirteen re-implement it, and a re-implementation is the same backend
+//! seventeen re-implement it, and a re-implementation is the same backend
 //! only as far as the checks can see. [`MutantLedger`] states how far that
 //! is.
 //!
@@ -43,19 +43,21 @@
 //! `FeedStart::Oldest` names.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other
-//! thirteen (selection column, fold exclusion, missing unique constraint,
+//! seventeen (selection column, fold exclusion, missing unique constraint,
 //! missing in-batch dedup map, a divergent write that displaces the
-//! survivor, the three `LATEST` orders, and the five feed defects), because
-//! each changes something the inner backend owns and no interception can
-//! reach it: which column a range meets, which rows a fold walks, what
-//! admission writes, what a batch's own rows are decided against, which row
-//! a decided collision leaves behind, which row a fold ranks highest, in
-//! what order a feed page walks, which entries its cursor moves past, where
-//! a page resumes, and whether a bounded replay says it is finished. It
-//! mirrors the reference where the defect is not, and it is smaller in one
-//! stated way that no check reaches — see [`MutantLedger`].
+//! survivor, the three `LATEST` orders, the five feed defects, and the four
+//! retention-refusal defects), because each changes something the inner
+//! backend owns and no interception can reach it: which column a range
+//! meets, which rows a fold walks, what admission writes, what a batch's own
+//! rows are decided against, which row a decided collision leaves behind,
+//! which row a fold ranks highest, in what order a feed page walks, which
+//! entries its cursor moves past, where a page resumes, whether a bounded
+//! replay says it is finished, and which question the retention refusal asks
+//! of its own marks. It mirrors the reference where the defect is not, and it
+//! is smaller in one stated way that no check reaches — see
+//! [`MutantLedger`].
 //!
-//! # The eight feed defects: five in the loop, three above it
+//! # The twelve feed defects: nine in the loop, three above it
 //!
 //! `read_feed_page` is one loop over a ledger, and it makes four decisions a
 //! defect can land in: what **order** it walks the ledger in, where the page
@@ -82,8 +84,26 @@
 //! on and reads positions off that key, which is what a backend with no
 //! feed-order column of its own actually does.
 //!
-//! None of the five is a wrapper, and none could be: the loop is the
-//! method, so an interception would have had to re-implement it anyway.
+//! **A fifth decision is made before any of those four**, and it has four
+//! subjects of its own: whether the page is served at all. DESIGN §3.3's
+//! `feed-retention-refusal` row is the rule, the refusal reads what a sweep
+//! removed and nothing else, and the row names three things that are not
+//! inputs to it. [`Defect::ServesAShortPageWhereRetentionTruncatedACursor`]
+//! asks nothing, [`Defect::TheRetentionRefusalReadsTheCallersGrant`] asks
+//! what the caller's grant would have carried,
+//! [`Defect::RefusesEveryCursorOnceASweepHasRun`] asks only whether a sweep
+//! ran, and [`Defect::TheRetentionRefusalIgnoresTheSubscription`] asks it of
+//! every type at once. All four show nothing until a sweep has run, so
+//! [`mutant`] hands them out like any other subject and [`super::run_all`]
+//! finds them conforming; they are reached through
+//! [`drivable_ledger_mutant`] and [`super::run_all_with_retention`], and
+//! `contract_tests`' `RETENTION_DRIVEN_MATRIX` is where their columns are
+//! asserted.
+//!
+//! None of the nine is a wrapper, and none could be: the loop and the
+//! refusal above it are the method, so an interception would have had to
+//! re-implement it anyway — and a wrapper delegating to a conforming backend
+//! cannot make that backend fail to refuse.
 //!
 //! **Three more land above the loop, and all three are wrappers.** Before
 //! the loop runs there is one further decision: what `start` *names*. A
@@ -772,10 +792,10 @@ pub(super) enum Defect {
     /// be.** Its defect needs a mark to exist, a mark needs a sweep, and a
     /// sweep needs a driver; `super::run_all` hands none, so under the
     /// matrix's dispatch this subject is behaviourally the reference backend
-    /// and a row for it would assert the empty set. It is the subject
-    /// `contract_tests`' `a_retention_driven_assertion_is_reached_only_with_a_driver`
-    /// runs instead, against both entry points, and that test is where its
-    /// column is asserted.
+    /// and a row for it would assert the empty set. It is a row of
+    /// `contract_tests`' `RETENTION_DRIVEN_MATRIX` instead, which asserts an
+    /// empty column against `run_all` and its own against
+    /// `run_all_with_retention`.
     ///
     /// The mark it keeps is its own rather than the inner backend's, which
     /// the wrapper cannot see. It records the type of every drop driven
@@ -828,6 +848,124 @@ pub(super) enum Defect {
     /// **Not in the discrimination matrix**, for the reason
     /// [`Defect::RefusesTheOldestStartAfterASweep`] is not.
     SkipsTheOldestEntryASweepLeft,
+    /// Serves a cursor whose continuation retention has truncated as an
+    /// ordinary page — the refusal left out altogether.
+    ///
+    /// **The failure DESIGN §3.3's `feed-retention-refusal` row names
+    /// outright**: a cursor after which retention has removed an entry of a
+    /// subscribed GTS type *"is refused rather than served as a short page"*.
+    /// It is the mistake a backend makes by having no marks table at all —
+    /// the sweep drops the rows, the feed goes on seeking past whatever
+    /// position it is handed, and every read after a sweep is answered
+    /// correctly *except* the ones that span it. A port arrives here by
+    /// building the feed first and the retention interlock second, which is
+    /// the order both of them get built in.
+    ///
+    /// What it costs is the only feed failure a consumer cannot see. The page
+    /// is well formed, its cursor advances, and the entries swept away between
+    /// the consumer's position and the ones it is handed are simply never
+    /// delivered: the usage they record is charged to nobody and nothing says
+    /// so. Every other way a feed can go wrong either refuses, repeats, or
+    /// stalls.
+    ///
+    /// **Nothing shows until a sweep has run**, so [`mutant`] hands it out
+    /// like any other subject and [`super::run_all`] finds it conforming. It
+    /// is reached through [`drivable_ledger_mutant`] and
+    /// [`super::run_all_with_retention`] instead, and `contract_tests`'
+    /// `RETENTION_DRIVEN_MATRIX` is where its column is asserted.
+    ServesAShortPageWhereRetentionTruncatedACursor,
+    /// Decides the retention refusal from **what the caller's grant would
+    /// have been delivered** rather than from what the sweep removed, so a
+    /// cursor whose continuation lost only entries the caller could not read
+    /// is served.
+    ///
+    /// **The clause it breaks is the sharpest one in the row**: a cursor is
+    /// refused *"whether or not the caller's scope admitted that entry"*.
+    /// `usage-collector-v1.yaml` draws the conclusion in as many words —
+    /// removal *"is read per subscribed GTS type, so a cursor can be refused
+    /// for an entry the caller's own scope excluded"*.
+    ///
+    /// It is the mistake a backend makes by keying its marks table on
+    /// `(gts_type_id, tenant_id)` rather than on `gts_type_id`, which is the
+    /// natural shape when every other table in the schema is keyed that way,
+    /// and then joining the refusal to the caller's own tenant. Such a backend
+    /// is right about every single-tenant subscription and wrong about
+    /// everything else, so nothing in a single-tenant test suite finds it.
+    ///
+    /// What it costs is a silently truncated range for exactly the consumers
+    /// whose scope narrows and widens — the case DESIGN §3.2 already warns
+    /// leaves a gap no feed error marks. A consumer re-granted a tenant
+    /// bootstraps to recover what it missed; a consumer served a short page
+    /// here never learns there was anything to recover.
+    ///
+    /// This subject keeps the removed entries rather than only their highest
+    /// sequence, which is what lets it evaluate the caller's scope against
+    /// them. A real backend with a per-tenant marks table needs no such
+    /// memory; the mirror keeps one because its mark is a sequence and a
+    /// sequence carries no tenant.
+    ///
+    /// **Nothing shows until a sweep has run**, for the reason
+    /// [`Self::ServesAShortPageWhereRetentionTruncatedACursor`] gives.
+    TheRetentionRefusalReadsTheCallersGrant,
+    /// Refuses every cursor over a subscription some sweep has touched,
+    /// whatever that cursor's continuation still holds — the refusal decided
+    /// from the **floor** rather than from what was removed.
+    ///
+    /// **The second sentence of DESIGN §3.3's row is what it breaks**: *"A
+    /// cursor whose continuation is intact is served, including one older than
+    /// the floor where the plugin retains longer than it."* A mark records what
+    /// a sweep *actually removed*; a floor records what a sweep *would be
+    /// permitted to remove*. They are not the same set, because DESIGN §3.1's
+    /// "Plugin-owned lifecycle" row makes the horizon a floor rather than a
+    /// boundary — *"A purge later than the horizon is permitted"* — so a
+    /// conforming deployment holds entries below its own floor.
+    ///
+    /// It is the mistake a backend makes by storing the instant it last swept
+    /// to and refusing any cursor issued before it, which needs no marks table
+    /// and looks like the cheap version of one. It is also the mistake a
+    /// backend makes by testing `mark IS NOT NULL` where the contract wants
+    /// `mark > :position`.
+    ///
+    /// What it costs is every consumer at once, and permanently: a retention
+    /// mark only ever rises, so from the first sweep onwards no consumer can
+    /// resume and no consumer can retry its way out. It is the loudest of the
+    /// three retention-refusal subjects and the easiest to miss in review,
+    /// because the refusal it returns is the contract's own variant.
+    ///
+    /// **Nothing shows until a sweep has run**, for the reason
+    /// [`Self::ServesAShortPageWhereRetentionTruncatedACursor`] gives.
+    RefusesEveryCursorOnceASweepHasRun,
+    /// Reads its retention marks across every GTS type at once rather than
+    /// per subscribed type, so a sweep over one meter refuses a cursor over
+    /// another.
+    ///
+    /// `usage-collector-v1.yaml` states the obligation it breaks where it
+    /// states the refusal itself: removal *"is read per subscribed GTS type,
+    /// so a cursor can be refused for an entry the caller's own scope
+    /// excluded"*. DESIGN §3.1 says the same thing from the position's side,
+    /// fixing a position's age by the acceptance instant of *"the oldest entry
+    /// of a subscribed GTS type after it"* — subscribed, rather than any type
+    /// this backend holds.
+    ///
+    /// It is the mistake a backend makes by keeping **one** retention
+    /// watermark rather than one row per type — the shape a deployment
+    /// arrives at when every meter is swept on one timer and one instant
+    /// describes the whole sweep — and it is also the mistake a backend makes
+    /// by writing the marks table correctly and forgetting the
+    /// `WHERE gts_type_id = ANY(:subscription)` on the read.
+    ///
+    /// What it costs is every consumer of every quiet meter. A meter nothing
+    /// has been removed from is exactly the meter whose consumer has no reason
+    /// to expect a refusal, and this backend refuses it the moment any other
+    /// meter is swept — which, on a deployment where retention runs on a
+    /// timer, is continuously.
+    ///
+    /// **Nothing shows until a sweep has run**, for the reason
+    /// [`Self::ServesAShortPageWhereRetentionTruncatedACursor`] gives. What
+    /// makes it visible after one is that `feed-retention-refusal` keeps a
+    /// meter it never sweeps and reads a cursor over it **last**, after its
+    /// own sweeps have raised a mark on the meter beside it.
+    TheRetentionRefusalIgnoresTheSubscription,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -839,6 +977,28 @@ pub(super) enum Defect {
 /// at, and a caller that could tell them apart could be tempted to expect
 /// different things of them.
 pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
+    if carries_its_own_ledger(defect) {
+        return Box::new(MutantLedger::new(defect));
+    }
+    Box::new(WrappedReference::new(defect))
+}
+
+/// Which of the two shapes one defect takes: a ledger of its own, or a real
+/// reference backend with one method intercepted.
+///
+/// The routing is a `match` rather than a default, and exhaustively: a defect
+/// added and forgotten here is a compile error, where a wildcard would silently
+/// give it whichever shape the fall-through named and a subject of the wrong
+/// shape is a subject that does nothing. This module's header says which
+/// defects take which shape and why.
+///
+/// It is a function rather than an arm inside [`mutant`] because two callers
+/// need the answer and neither may guess it: [`mutant`] erases the subject
+/// behind `Box<dyn UsageCollectorPluginV1>`, and a driven run needs the
+/// concrete type so it can lend the same value as a [`ContractRetention`] too.
+/// `contract_tests` asks this before choosing between [`drivable_mutant`] and
+/// [`drivable_ledger_mutant`].
+pub(super) fn carries_its_own_ledger(defect: Defect) -> bool {
     match defect {
         Defect::QuantityThroughFloat
         | Defect::StampsItsOwnAcceptedAt
@@ -852,7 +1012,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::AFeedBootstrapReadStartsAtTheHead
         | Defect::RefusesTheOldestStartAfterASweep
         | Defect::SkipsTheOldestEntryASweepLeft
-        | Defect::RefusesAWithdrawalWithTheSameReason => Box::new(WrappedReference::new(defect)),
+        | Defect::RefusesAWithdrawalWithTheSameReason => false,
         Defect::SelectsOnWindowStart
         | Defect::FoldsTheInvalidation
         | Defect::LedgerHasNoUniqueConstraint
@@ -865,7 +1025,11 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::AFeedPageRedeliversTheEntryAtItsCursor
         | Defect::ABoundedReplayNeverCloses
         | Defect::AFeedPageDropsTheEntryAtItsLimit
-        | Defect::FeedOrdersByTheAcceptanceInstant => Box::new(MutantLedger::new(defect)),
+        | Defect::ServesAShortPageWhereRetentionTruncatedACursor
+        | Defect::TheRetentionRefusalReadsTheCallersGrant
+        | Defect::RefusesEveryCursorOnceASweepHasRun
+        | Defect::TheRetentionRefusalIgnoresTheSubscription
+        | Defect::FeedOrdersByTheAcceptanceInstant => true,
     }
 }
 
@@ -1119,6 +1283,10 @@ impl WrappedReference {
             | Defect::AFeedBootstrapReadStartsAtTheHead
             | Defect::RefusesTheOldestStartAfterASweep
             | Defect::SkipsTheOldestEntryASweepLeft
+            | Defect::ServesAShortPageWhereRetentionTruncatedACursor
+            | Defect::TheRetentionRefusalReadsTheCallersGrant
+            | Defect::RefusesEveryCursorOnceASweepHasRun
+            | Defect::TheRetentionRefusalIgnoresTheSubscription
             | Defect::FeedOrdersByTheAcceptanceInstant => Ok(record),
         }
     }
@@ -1514,7 +1682,7 @@ impl UsageCollectorPluginV1 for WrappedReference {
     /// that are about what that start mode means.
     ///
     /// Both land **above** the page loop rather than inside it, which is why
-    /// they can be interceptions at all where the five feed defects in
+    /// they can be interceptions at all where the nine feed defects in
     /// [`MutantLedger`] cannot: one substitutes a different `start`, the
     /// other declines to serve the call. Everything after that decision is
     /// the exemplar's own loop, cursor and page.
@@ -1752,15 +1920,29 @@ struct Ledger {
     /// Per GTS type, the highest sequence retention has removed, keyed by the
     /// type's wire string because [`MeterTypeId`] implements no `Ord`.
     ///
-    /// **Nothing raises a mark here yet.** A mark is raised by a sweep, a
-    /// sweep is driven through
-    /// [`ContractRetention`](super::retention::ContractRetention), and this
-    /// type does not implement that trait — the impl lands with the
-    /// retention-driven entry point the matrix does not yet have. Until then
-    /// this map stays empty and the refusal in [`MutantLedger`]'s `read_feed_page`
-    /// never fires, which is exactly the answer the reference gives for a
-    /// backend nobody has driven.
+    /// **Raised by [`Self::drop_before`], which landed with
+    /// `feed-retention-refusal`.** It stayed empty while nothing could drive a
+    /// sweep against this type, and the refusal in [`MutantLedger`]'s
+    /// `read_feed_page` never fired — which was exactly the answer the
+    /// reference gives for a backend nobody has driven. A subject handed to
+    /// [`super::run_all`] is still in that state, because that entry point
+    /// drives nothing.
     retention_marks: BTreeMap<String, u64>,
+    /// The entries a sweep removed, with the sequences they were admitted
+    /// under.
+    ///
+    /// **Read by one defect alone**,
+    /// [`Defect::TheRetentionRefusalReadsTheCallersGrant`], which decides the
+    /// refusal from what the caller's grant would have carried and therefore
+    /// needs the rows rather than a high-water mark. The reference backend
+    /// keeps no such list and needs none: its refusal reads
+    /// [`Self::retention_marks`] and nothing else, which is the whole of what
+    /// DESIGN asks for.
+    ///
+    /// It is a mirror of what a sweep took rather than a second ledger: no
+    /// read path consults it, nothing is ever removed from it, and a subject
+    /// that does not carry that defect never looks at it.
+    removed: Vec<Entry>,
 }
 
 impl Ledger {
@@ -1819,10 +2001,84 @@ impl Ledger {
                 .is_some_and(|mark| *mark > position)
         })
     }
+
+    /// Removes every entry of `gts_type_id` whose covered period ends before
+    /// `floor`, raising that type's mark to the highest sequence removed, as
+    /// the reference's sweep does.
+    ///
+    /// The bound is exclusive and the mark is raised rather than assigned, so
+    /// a later drop at a lower floor cannot lower it. Sequences are stamped in
+    /// admission order and never reissued, so a mark goes on meaning the same
+    /// thing against a position issued before the drop.
+    ///
+    /// The removed entries are kept in [`Self::removed`] as well, which the
+    /// reference does not do; that field says which single defect reads them
+    /// and why the reference needs no such list.
+    fn drop_before(&mut self, gts_type_id: &MeterTypeId, floor: time::OffsetDateTime) {
+        let mut kept = Vec::with_capacity(self.entries.len());
+        for entry in std::mem::take(&mut self.entries) {
+            if entry.record.gts_type_id != *gts_type_id || entry.record.window_end >= floor {
+                kept.push(entry);
+                continue;
+            }
+            let mark = self
+                .retention_marks
+                .entry(gts_type_id.as_str().to_owned())
+                .or_default();
+            *mark = (*mark).max(entry.sequence);
+            self.removed.push(entry);
+        }
+        self.entries = kept;
+    }
+
+    /// Whether any subscribed type carries a retention mark at all, whatever
+    /// that mark is and whatever `position` a cursor names.
+    ///
+    /// [`Defect::RefusesEveryCursorOnceASweepHasRun`] reads this in place of
+    /// [`Self::retention_has_passed`], which is the whole of that defect: the
+    /// comparison against the position is what separates a truncated
+    /// continuation from an intact one, and dropping it refuses both.
+    fn a_subscribed_type_has_been_swept(&self, subscription: &[MeterTypeId]) -> bool {
+        subscription
+            .iter()
+            .any(|gts_type_id| self.retention_marks.contains_key(gts_type_id.as_str()))
+    }
+
+    /// Whether retention has removed an entry strictly after `position` on
+    /// **any** type, subscribed or not.
+    ///
+    /// [`Defect::TheRetentionRefusalIgnoresTheSubscription`] reads this in
+    /// place of [`Self::retention_has_passed`]. The comparison against the
+    /// position is the conforming one; what is dropped is the subscription,
+    /// which `usage-collector-v1.yaml` makes the unit the refusal is read
+    /// over.
+    fn retention_has_passed_on_any_type(&self, position: u64) -> bool {
+        self.retention_marks.values().any(|mark| *mark > position)
+    }
+
+    /// Whether retention removed an entry after `position` that `scope` would
+    /// have admitted, on a subscribed type.
+    ///
+    /// [`Defect::TheRetentionRefusalReadsTheCallersGrant`] reads this in place
+    /// of [`Self::retention_has_passed`]. Everything about it is the
+    /// conforming rule except the last conjunct, which is the one DESIGN
+    /// forbids: the refusal is read from what a sweep removed, never from what
+    /// this caller's grant would have been handed.
+    fn retention_removed_something_this_grant_admits(
+        &self,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        position: u64,
+    ) -> bool {
+        self.removed.iter().any(|entry| {
+            entry.sequence > position
+                && subscription.contains(&entry.record.gts_type_id)
+                && expr_admits(&entry.record, scope)
+        })
+    }
 }
 
-/// A ledger of this module's own, for the five defects a wrapper cannot
-/// reach.
+/// A ledger of this module's own, for the defects a wrapper cannot reach.
 ///
 /// Two of them change a predicate the inner backend owns — which column a
 /// range meets, and which rows a fold walks — so there is no method to
@@ -1876,8 +2132,9 @@ impl Ledger {
 /// returning `count + 1`, which took both subjects built on this type out of
 /// their own rows.
 ///
-/// **Three of the feed's four unpinned behaviours are now pinned**, and
-/// `feed-snapshot-and-replay` is what pinned them. Each was measured after
+/// **The feed's four originally unpinned behaviours are now all pinned**,
+/// three of them by `feed-snapshot-and-replay` and the fourth by
+/// `feed-retention-refusal`. Each was measured after
 /// that check landed, the same way the rest were — broken here, then the
 /// matrix run:
 ///
@@ -1890,15 +2147,22 @@ impl Ledger {
 /// * **The subscription gate** is pinned. A feed answering every meter's
 ///   entries delivers, into the same walk, entries every other check left on
 ///   the suite's shared meter.
-/// * **The seek is still unpinned**, and that is a fact about this ledger
-///   rather than about the check. Replacing `sequence > resumed_at` with a
-///   `skip` of that many rows leaves the matrix green, because this
-///   backend's sequences are dense over one append-ordered ledger: a count
-///   of rows past the start and a seek to the first greater sequence name
-///   the same entry on every input the suite produces. What separates them
-///   is a ledger with **gaps** — a retention drop, a sequence a rolled-back
-///   write burned — and `feed-retention-refusal` is the check that will
-///   build one. The `>` itself is pinned:
+/// * **The seek was unpinned until `feed-retention-refusal` landed**, and
+///   why it was is worth keeping: replacing `sequence > resumed_at` with a
+///   `skip` of that many rows left the matrix green, because this backend's
+///   sequences are dense over one append-ordered ledger and a count of rows
+///   past the start names the same entry a seek to the first greater
+///   sequence does. **Only a gap separates them**, a retention drop is what
+///   makes one, and that check is the one that reads across a gap. Measured
+///   again with the skip in place, the driven run now reports it — through
+///   `contract_tests`'
+///   `a_subject_carrying_its_own_ledger_is_still_itself_under_a_drive`,
+///   whose subject is chosen for touching no feed path of its own, and
+///   through that check's assertion that a cursor whose continuation is
+///   intact is served: under a skip the walk from such a cursor never
+///   reaches the head. The undriven matrix stays green under the same
+///   change, which is the measurement rather than the design intent. The
+///   `>` itself was already pinned:
 ///   [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] is the subject for
 ///   getting that comparison wrong.
 ///
@@ -1914,18 +2178,24 @@ impl Ledger {
 /// the entry each of its pages steps over is one its grant withheld anyway.
 /// That immunity is a property of those fixtures, not of those assertions.
 ///
+/// **The feed's retention refusal is pinned too, and its sweep with it.**
+/// Both used to be unpinned because no check drove a drop — measured by
+/// disabling the refusal outright and watching the matrix stay green — and
+/// `feed-retention-refusal` is what changed that. It is pinned only under
+/// [`super::run_all_with_retention`], because [`super::run_all`] still
+/// drives nothing: the test that spends it is
+/// `a_subject_carrying_its_own_ledger_is_still_itself_under_a_drive`, and a
+/// reader should not take a green undriven matrix as covering any of it.
+///
 /// Everything else here is level with the reference and **unpinned**: the
 /// ledger page's *order* (its membership is pinned, its sort is asserted by
-/// no check), the grouped folds and the three that read a quantity, the
-/// reconciliation figures, the feed's seek above, and the feed's retention
-/// refusal, which stays unpinned because no check yet drives a drop —
-/// measured by disabling the refusal outright and watching the matrix stay
-/// green. They are mirrored because the checks that read them are coming,
-/// and each becomes pinned by the check that first dispatches it. An
-/// unpinned behaviour is where this mirror can still rot in silence, which
-/// is the argument for keeping it level now rather than letting it answer
-/// `Internal` until someone needs it.
-struct MutantLedger {
+/// no check), the grouped folds and the three that read a quantity, and the
+/// reconciliation figures. They are mirrored because the checks that read
+/// them are coming, and each becomes pinned by the check that first
+/// dispatches it. An unpinned behaviour is where this mirror can still rot
+/// in silence, which is the argument for keeping it level now rather than
+/// letting it answer `Internal` until someone needs it.
+pub(super) struct MutantLedger {
     /// The entries admitted so far, with the sequences the feed orders them
     /// by.
     entries: Mutex<Ledger>,
@@ -2029,8 +2299,12 @@ impl MutantLedger {
     /// One consequence is worth naming: under this subject a position is a
     /// composite key rather than a sequence, while [`Ledger`]'s retention
     /// marks are sequences. Comparing the two would mean nothing, and it
-    /// never happens — no check drives a retention sweep against this type,
-    /// so the marks are empty and the refusal never fires.
+    /// never happens under [`super::run_all`], which drives no sweep at all.
+    /// Under [`super::run_all_with_retention`] it could, and this subject is
+    /// simply never handed to that entry point: it is a row of
+    /// `contract_tests`' undriven discrimination matrix and of no driven
+    /// test. Whoever drives it first has to reconcile the two keys here
+    /// before reading anything into the result.
     fn feed_key(&self, entry: &Entry) -> u64 {
         if self.defect != Defect::FeedOrdersByTheAcceptanceInstant {
             return entry.sequence;
@@ -2075,6 +2349,50 @@ impl MutantLedger {
             return admit_displacing_the_survivor(ledger, record);
         }
         admit(ledger, record)
+    }
+
+    /// Whether this subject refuses a cursor at `position`, and the one place
+    /// the three retention-refusal defects live.
+    ///
+    /// The conforming rule is the reference's: refuse when some subscribed
+    /// type's retention mark is beyond the position, which reads what a sweep
+    /// removed and nothing else. Each of the three defects substitutes a
+    /// different question:
+    ///
+    /// * [`Defect::ServesAShortPageWhereRetentionTruncatedACursor`] asks
+    ///   nothing and never refuses.
+    /// * [`Defect::TheRetentionRefusalReadsTheCallersGrant`] asks what the
+    ///   caller's grant would have carried.
+    /// * [`Defect::RefusesEveryCursorOnceASweepHasRun`] asks only whether a
+    ///   sweep ran, dropping the comparison against the position.
+    ///
+    /// A wildcard rather than an enumeration, unlike
+    /// [`WrappedReference::on_admission`]'s, and the direction is why: there
+    /// the fall-through passes an entry untouched, so a defect routed there
+    /// and forgotten would do nothing and report nothing. Here the
+    /// fall-through is the *conforming* rule, so a defect routed here and
+    /// forgotten behaves as the exemplar does — which is what every defect
+    /// this method is not about already wants.
+    fn refuses_the_cursor(
+        &self,
+        ledger: &Ledger,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        position: u64,
+    ) -> bool {
+        match self.defect {
+            Defect::ServesAShortPageWhereRetentionTruncatedACursor => false,
+            Defect::TheRetentionRefusalReadsTheCallersGrant => {
+                ledger.retention_removed_something_this_grant_admits(subscription, scope, position)
+            }
+            Defect::RefusesEveryCursorOnceASweepHasRun => {
+                ledger.a_subscribed_type_has_been_swept(subscription)
+            }
+            Defect::TheRetentionRefusalIgnoresTheSubscription => {
+                ledger.retention_has_passed_on_any_type(position)
+            }
+            _ => ledger.retention_has_passed(subscription, position),
+        }
     }
 
     /// Whether one entry is inside a read path's selection.
@@ -2236,13 +2554,13 @@ impl UsageCollectorPluginV1 for MutantLedger {
     /// `a_feed_position_denotes_the_same_ledger_prefix_under_every_grant`
     /// pins for the reference and
     /// [`Defect::FeedCursorCountsAdmittedEntries`] is the subject that puts
-    /// it in front of a check here. And a cursor whose
-    /// continuation retention has truncated is refused, which is DESIGN §3.3's
-    /// `feed-retention-refusal`, though no mark can rise until this type is
-    /// drivable.
+    /// it in front of a check here. And a cursor whose continuation retention
+    /// has truncated is refused, which is DESIGN §3.3's
+    /// `feed-retention-refusal`; [`Ledger::drop_before`] is what raises the
+    /// mark it reads, and only [`super::run_all_with_retention`] drives one.
     ///
-    /// **Five defects routed here touch the feed**, between them covering
-    /// the four decisions this method makes:
+    /// **Nine defects routed here touch the feed.** Five cover the four
+    /// decisions the page loop makes:
     /// [`Defect::FeedOrdersByTheAcceptanceInstant`] walks the ledger in
     /// another order (through [`MutantLedger::feed_order`], which is the
     /// whole reason that method exists),
@@ -2253,9 +2571,12 @@ impl UsageCollectorPluginV1 for MutantLedger {
     /// [`Defect::AFeedPageDropsTheEntryAtItsLimit`] checks the limit after
     /// the cursor has moved so it runs one entry past, and
     /// [`Defect::ABoundedReplayNeverCloses`] keeps minting a continuation
-    /// past the `until`. Everything else in this method is a mirror and
-    /// nothing more — a wrong answer invented for it would fail a check for
-    /// a reason no matrix row names.
+    /// past the `until`. The other four are the decision made *before* the
+    /// loop — whether the page is served at all — and they live in
+    /// [`MutantLedger::refuses_the_cursor`], which says what each of them
+    /// substitutes for the conforming question. Everything else in this
+    /// method is a mirror and nothing more — a wrong answer invented for it
+    /// would fail a check for a reason no matrix row names.
     async fn read_feed_page(
         &self,
         subscription: &[MeterTypeId],
@@ -2288,8 +2609,12 @@ impl UsageCollectorPluginV1 for MutantLedger {
 
         // `FeedStart::Oldest` is exempt by construction rather than by a mark
         // that happens not to fire: it begins at the oldest entry still
-        // retained, so nothing it asks for is missing.
-        if matches!(start, FeedStart::After(_)) && ledger.retention_has_passed(subscription, from) {
+        // retained, so nothing it asks for is missing. Which question the
+        // refusal asks of the ledger is the whole of the three retention
+        // defects; see `MutantLedger::refuses_the_cursor`.
+        if matches!(start, FeedStart::After(_))
+            && self.refuses_the_cursor(&ledger, subscription, scope, from)
+        {
             return Err(UsageCollectorPluginError::CursorBeyondRetention);
         }
 
@@ -2401,6 +2726,69 @@ impl UsageCollectorPluginV1 for MutantLedger {
             max_window_end: in_scope().map(|entry| entry.window_end).max(),
         })
     }
+}
+
+/// The retention drive, mirroring the reference's.
+///
+/// Every subject carrying a ledger of its own implements it rather than only
+/// the three defects that read a mark, for the reason every wrapped subject
+/// implements [`ContractRetention`] too: a capability that exists on the shape
+/// means any defect routed here can be handed to
+/// [`run_all_with_retention`](super::run_all_with_retention) without first
+/// growing a second shape. That is not only a convenience — it is what puts a
+/// mirror subject in front of the driven assertions at all, which is how the
+/// mirror's feed **seek** is pinned. `contract_tests`'
+/// `a_subject_carrying_its_own_ledger_is_still_itself_under_a_drive` is the
+/// test that spends it, and [`MutantLedger`]'s own docs say what a seek over a
+/// ledger with gaps in it establishes that a dense one cannot.
+#[async_trait]
+impl ContractRetention for MutantLedger {
+    /// Runs this subject's retention over one GTS type, to one floor.
+    ///
+    /// The sweep is [`Ledger::drop_before`]'s, which is the reference's rule:
+    /// every entry of the type whose covered period ends before `floor` is
+    /// removed and the type's mark rises to the highest sequence removed, both
+    /// under one lock acquisition.
+    ///
+    /// **No defect in this module is about the sweep**, and none should be. A
+    /// subject whose sweep removed the wrong rows would be a harness that sets
+    /// the wrong scenario up rather than a backend that answers an SPI call
+    /// wrongly, and every assertion a drive reaches is about what the backend
+    /// *answers* once the rows are gone.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the poisoned ledger lock, the one way this can fail.
+    async fn drop_before(
+        &self,
+        gts_type_id: &MeterTypeId,
+        floor: time::OffsetDateTime,
+    ) -> Result<(), String> {
+        let mut ledger = self
+            .ledger()
+            .map_err(|err| format!("the mutant ledger could not run retention: {err}"))?;
+        ledger.drop_before(gts_type_id, floor);
+        Ok(())
+    }
+}
+
+/// The subject one defect names, as a concrete ledger-carrying type a driven
+/// run can hold.
+///
+/// [`drivable_mutant`] is this for the wrapped shape and says why the erasure
+/// [`mutant`] applies is useless to
+/// [`run_all_with_retention`](super::run_all_with_retention): that entry point
+/// wants the same backend as a [`ContractRetention`] too, and a value erased
+/// behind one of the two traits cannot be recovered as the other.
+///
+/// **Both shapes are now offered**, where only the wrapped one used to be. The
+/// four retention-refusal defects live inside `read_feed_page`'s own refusal
+/// branch, and a wrapper cannot reach it: the branch is the inner backend's,
+/// the inner backend refuses correctly, and no interception can make a
+/// conforming backend fail to refuse. They carry a ledger of their own for the
+/// same reason the five feed defects before them do.
+pub(super) fn drivable_ledger_mutant(defect: Defect) -> MutantLedger {
+    MutantLedger::new(defect)
 }
 
 /// Whether one entry may be admitted, without admitting it.
@@ -2760,7 +3148,7 @@ impl LatestOrder {
             // defect added later and forgotten here would silently fold
             // under DESIGN's order and report nothing at all, which is a
             // matrix row whose subject does nothing rather than a compile
-            // error. Twelve of these never reach this type - `mutant`
+            // error. Thirteen of these never reach this type - `mutant`
             // routes them to `WrappedReference` - but exhaustiveness is the
             // point.
             Defect::QuantityThroughFloat
@@ -2785,6 +3173,10 @@ impl LatestOrder {
             | Defect::AFeedBootstrapReadStartsAtTheHead
             | Defect::RefusesTheOldestStartAfterASweep
             | Defect::SkipsTheOldestEntryASweepLeft
+            | Defect::ServesAShortPageWhereRetentionTruncatedACursor
+            | Defect::TheRetentionRefusalReadsTheCallersGrant
+            | Defect::RefusesEveryCursorOnceASweepHasRun
+            | Defect::TheRetentionRefusalIgnoresTheSubscription
             | Defect::FeedOrdersByTheAcceptanceInstant => Self::Declared,
         }
     }

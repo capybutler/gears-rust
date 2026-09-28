@@ -35,6 +35,17 @@
 //!   backend already sweeps — `retention_sweep_integration_pg` drives it —
 //!   so what is missing is the `contract::retention::ContractRetention`
 //!   impl beside the SPI one, not the capability.
+//!
+//!   **How much of a check an undriven run leaves out is not the same for
+//!   every name in that constant**, and it matters to whoever pays a row
+//!   off. `feed-bootstrap-position` loses one assertion of four here;
+//!   `feed-retention-refusal` loses three of four, and the one that runs is
+//!   the weakest of them — that a cursor over a ledger nothing has been
+//!   removed from is served. A green run against that row would be evidence
+//!   of almost nothing about the row DESIGN states, which is a cursor whose
+//!   continuation a sweep truncated being refused. The check's own module
+//!   says which assertions those are; this note exists so the difference is
+//!   not discovered by deleting the row first.
 //! * A green run no longer means "everything that ran passed". It means
 //!   exactly the non-conformances [`NOT_YET_CONFORMING`] declares failed,
 //!   no more and no fewer — that list names what this backend cannot pass

@@ -12,24 +12,28 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds twenty-six deliberately
+//! as coverage. [`super::contract_mutants`] holds thirty deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
-//! in exactly one plausible way, and
-//! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
-//! column against each of them. That test runs every subject at
-//! [`DedupLevel::Linearizable`];
+//! in exactly one plausible way, and two matrices assert a whole column
+//! against each of them.
+//! [`each_check_fails_against_its_own_defect_and_no_other`] runs
+//! [`DISCRIMINATION_MATRIX`] at [`DedupLevel::Linearizable`];
 //! [`an_undecided_lookup_is_still_a_violation_once_the_bound_has_passed`]
 //! and
 //! [`a_race_that_left_two_writes_is_a_violation_once_the_bound_has_passed`]
-//! are the
-//! two columns asserted at the other declaration, because two checks have
-//! paths only an `Eventual` declaration reaches. Two further columns are
-//! asserted against [`run_all_with_retention`] rather than [`run_all`] —
-//! [`a_retention_driven_assertion_is_reached_only_with_a_driver`] and
-//! [`a_bootstrap_after_a_sweep_must_begin_at_the_oldest_entry_left`] —
-//! because their subjects break nothing until a retention sweep has run and
-//! [`run_all`] drives none. Each asserts the undriven column as well, so a
-//! subject that started failing without a drive is caught too.
+//! are the two columns asserted at the other declaration, because two checks
+//! have paths only an `Eventual` declaration reaches.
+//! [`each_driven_check_fails_against_its_own_defect_and_no_other`] runs
+//! [`RETENTION_DRIVEN_MATRIX`] against [`run_all_with_retention`] as well as
+//! [`run_all`], because every subject there breaks nothing until a retention
+//! sweep has run and [`run_all`] drives none; asserting the undriven column
+//! too is what catches a subject that started failing without a drive.
+//!
+//! [`a_subject_carrying_its_own_ledger_is_still_itself_under_a_drive`] is a
+//! column of a third kind: not a subject only a drive catches, but a subject
+//! the drive must **not** change, which is what holds the hand-written
+//! mirror in [`super::contract_mutants`] level with the reference across the
+//! one thing only a drive produces — a ledger with gaps in it.
 //!
 //! The third is that the three coverage constants still partition DESIGN's
 //! sixteen checks, so a passing run cannot read as a complete one.
@@ -51,13 +55,15 @@ use bigdecimal::BigDecimal;
 use toolkit_odata::{ODataQuery, ast};
 use uuid::Uuid;
 
-use super::contract_mutants::{Defect, drivable_mutant, mutant};
+use super::contract_mutants::{
+    Defect, carries_its_own_ledger, drivable_ledger_mutant, drivable_mutant, mutant,
+};
 use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, CONVERGED_TARGET_LOOKUP,
-    DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, FEED_BOOTSTRAP_POSITION,
-    FEED_COMPLETENESS, FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT, IMPLEMENTED_CHECKS,
-    INVALIDATION_EXCLUDED_FROM_FOLD, LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP,
-    RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, RETENTION_DRIVEN_CHECKS,
+    ContractViolation, DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel,
+    FEED_BOOTSTRAP_POSITION, FEED_COMPLETENESS, FEED_RETENTION_REFUSAL, FEED_SNAPSHOT_AND_REPLAY,
+    HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD, LATEST_TIE_BREAK,
+    QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, RETENTION_DRIVEN_CHECKS,
     SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS,
     WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, retention::ContractRetention,
     run_all, run_all_with_retention,
@@ -198,122 +204,222 @@ async fn the_reference_backend_conforms_to_a_repeated_run_under_a_retention_driv
     }
 }
 
-/// A defect only a retention drive reaches is invisible to [`run_all`] and
-/// reported by [`run_all_with_retention`].
+/// One row per defect a retention drive is needed to reach: the subject, and
+/// the checks `run_all_with_retention` must report against it.
 ///
-/// **This is the structural guard on [`RETENTION_DRIVEN_CHECKS`]**, and it
-/// is here because the claim that constant makes cannot be held by a
-/// paragraph. "Some assertions of this check did not run" is exactly the
-/// kind of statement that stays in a doc comment after it has stopped being
-/// true, and a reader of a green `run_all` has no way to tell.
+/// **This is [`DISCRIMINATION_MATRIX`] for the other entry point**, and it
+/// asserts one thing more than that matrix does. Every row here is a subject
+/// whose only mistake is one no undriven run can provoke, so the row states
+/// two columns rather than one: nothing under [`run_all`], and exactly the
+/// named checks under [`run_all_with_retention`]. A subject that needed no
+/// drive would fail the first half and a subject the drive stopped reaching
+/// would fail the second.
 ///
-/// [`Defect::RefusesTheOldestStartAfterASweep`] is a backend whose *only*
-/// mistake is one no undriven run can provoke: it refuses
-/// `FeedStart::Oldest` once retention has swept a subscribed type, and
-/// nothing sweeps unless a driver is handed in. So the subject is
-/// behaviourally the reference backend under [`run_all`] and a
-/// non-conforming one under [`run_all_with_retention`].
+/// **The first half is the structural guard on
+/// [`RETENTION_DRIVEN_CHECKS`]**, and it is a table rather than a paragraph
+/// because the claim that constant makes cannot be held by one. "Some
+/// assertions of this check did not run" is exactly the kind of statement
+/// that stays in a doc comment after it has stopped being true, and a reader
+/// of a green `run_all` has no way to tell. If a row's undriven column
+/// started reporting, a driven check would have grown an undriven half that
+/// reaches that defect and the constant would be over-claiming — the coverage
+/// it says is missing would in fact be there. If a driven column emptied, the
+/// drive would have stopped reaching the defect and the check would be listed
+/// as covered in part with no part of it being the part that needs a driver.
 ///
-/// **Both halves are load-bearing and they fail in opposite directions.**
-/// If the first assertion started failing, a driven check would have grown
-/// an undriven half that reaches this defect — and the constant would be
-/// over-claiming, because the coverage it says is missing would in fact be
-/// there. If the second started passing, the drive would have stopped
-/// reaching the defect: the check would still be listed as covered in part
-/// and no part of it would be the part that needs a driver.
+/// **A fresh subject for each of the two runs**, which the test below builds
+/// rather than sharing one. The first run purges, and the suite's fixtures
+/// survive a repeated run by being re-delivered and absorbed; a shared
+/// subject would carry a mark of its own into the undriven run, where it
+/// would be met before anything had driven it.
 ///
-/// **A fresh subject for each call**, because the first call purges. The
-/// suite's fixtures survive a repeated run by being re-delivered and
-/// absorbed, and a driven subject would carry this defect's own mark into
-/// the second call, where the undriven run would meet it before it had
-/// driven anything.
+/// # The two rows for `feed-bootstrap-position`
+///
+/// DESIGN §3.3's row for that check states two things about a read taken
+/// after retention has swept — that it begins at the oldest entry still
+/// retained, and that it is never refused on the retention floor — and a
+/// subject for one is not a subject for the other.
+/// [`Defect::RefusesTheOldestStartAfterASweep`] never answers;
+/// [`Defect::SkipsTheOldestEntryASweepLeft`] answers, and answers from one
+/// entry too far in. Without the second, the position half of that clause
+/// would be an assertion no subject reaches, and a check nothing can fail
+/// reads as coverage it does not have.
+///
+/// # The four rows for `feed-retention-refusal`
+///
+/// That row is one rule stated from both sides — the refusal reads what a
+/// sweep *removed*, and nothing else — and it names three things that are not
+/// inputs to it. Each of the four subjects substitutes one of them, the fourth
+/// substituting the unit the refusal is read over:
+///
+/// * [`Defect::ServesAShortPageWhereRetentionTruncatedACursor`] is the
+///   failure the row names outright and reaches both of that check's refusal
+///   assertions, so neither of the two is individually load-bearing against
+///   it alone.
+/// * [`Defect::TheRetentionRefusalReadsTheCallersGrant`] refuses correctly
+///   wherever the caller's grant admitted what was swept, so it reaches the
+///   second refusal assertion alone — which is what makes *"whether or not
+///   the caller's scope admitted that entry"* a clause the suite establishes
+///   rather than restates.
+/// * [`Defect::RefusesEveryCursorOnceASweepHasRun`] passes both refusal
+///   assertions and fails the one that requires an intact continuation to be
+///   served, which is the row's second sentence.
+/// * [`Defect::TheRetentionRefusalIgnoresTheSubscription`] passes all three
+///   and fails the one assertion of that check a drive is *not* needed to
+///   reach — a cursor over a meter nothing has removed anything from. It is
+///   the only subject that reaches it, and it reaches it only because that
+///   assertion is taken after the check's own sweeps.
+///
+/// All four name one check, which is a narrower thing than the wide rows in
+/// [`DISCRIMINATION_MATRIX`] and worth stating: what they establish together
+/// is not that this check notices something, but which of its assertions
+/// notices what. The check's own module carries that measurement.
+const RETENTION_DRIVEN_MATRIX: &[(Defect, &[&str])] = &[
+    (
+        Defect::RefusesTheOldestStartAfterASweep,
+        &[FEED_BOOTSTRAP_POSITION],
+    ),
+    (
+        Defect::SkipsTheOldestEntryASweepLeft,
+        &[FEED_BOOTSTRAP_POSITION],
+    ),
+    (
+        Defect::ServesAShortPageWhereRetentionTruncatedACursor,
+        &[FEED_RETENTION_REFUSAL],
+    ),
+    (
+        Defect::TheRetentionRefusalReadsTheCallersGrant,
+        &[FEED_RETENTION_REFUSAL],
+    ),
+    (
+        Defect::RefusesEveryCursorOnceASweepHasRun,
+        &[FEED_RETENTION_REFUSAL],
+    ),
+    (
+        Defect::TheRetentionRefusalIgnoresTheSubscription,
+        &[FEED_RETENTION_REFUSAL],
+    ),
+];
+
+/// Every defect a drive is needed to reach is invisible to [`run_all`] and
+/// reported by [`run_all_with_retention`], against exactly its own checks.
+///
+/// [`RETENTION_DRIVEN_MATRIX`] carries the rows and the argument for each.
 #[tokio::test]
-async fn a_retention_driven_assertion_is_reached_only_with_a_driver() {
-    let undriven = drivable_mutant(Defect::RefusesTheOldestStartAfterASweep);
-    let without_a_drive: BTreeSet<&str> = run_all(&undriven, DedupLevel::Linearizable)
-        .await
-        .into_iter()
-        .map(|violation| violation.check)
+async fn each_driven_check_fails_against_its_own_defect_and_no_other() {
+    for (defect, expected) in RETENTION_DRIVEN_MATRIX {
+        let without_a_drive = undriven_column(*defect).await;
+        assert!(
+            without_a_drive.is_empty(),
+            "the `{defect:?}` subject breaks nothing until retention has swept, and `run_all` \
+             sweeps nothing: it must pass there, and it reported {without_a_drive:?}. A check \
+             that catches this subject without a drive is a check whose coverage under \
+             `run_all` is not partial after all, and `RETENTION_DRIVEN_CHECKS` is then \
+             over-claiming."
+        );
+
+        let with_a_drive = driven_column(*defect).await;
+        let expected: BTreeSet<&str> = expected.iter().copied().collect();
+        assert_eq!(
+            with_a_drive, expected,
+            "the `{defect:?}` subject must be caught once the suite is handed its retention \
+             drive, and by the checks whose rows that mistake belongs to. Nothing reported \
+             means the drive no longer reaches the defect, so the assertion that needs a \
+             driver has stopped needing one or stopped running; an extra check reported means \
+             this subject is wrong in more than the one way it is built to be."
+        );
+    }
+
+    let named: BTreeSet<&str> = RETENTION_DRIVEN_MATRIX
+        .iter()
+        .flat_map(|(_, checks)| checks.iter().copied())
         .collect();
-
-    assert!(
-        without_a_drive.is_empty(),
-        "a backend that refuses `FeedStart::Oldest` once retention has swept must pass \
-         `run_all`, which sweeps nothing: it reported {without_a_drive:?}. A check that catches \
-         this subject without a drive is a check whose coverage under `run_all` is not partial \
-         after all, and `RETENTION_DRIVEN_CHECKS` is then over-claiming."
-    );
-
-    let driven = drivable_mutant(Defect::RefusesTheOldestStartAfterASweep);
-    let with_a_drive: BTreeSet<&str> =
-        run_all_with_retention(&driven, DedupLevel::Linearizable, &driven)
-            .await
-            .into_iter()
-            .map(|violation| violation.check)
-            .collect();
-
+    let driven: BTreeSet<&str> = RETENTION_DRIVEN_CHECKS.iter().copied().collect();
     assert_eq!(
-        with_a_drive,
-        BTreeSet::from([FEED_BOOTSTRAP_POSITION]),
-        "the same backend must be caught once the suite is handed its retention drive, and by \
-         the check whose row exempts `FeedStart::Oldest` from the retention floor. Nothing \
-         reported means the drive no longer reaches the defect, so the assertion that needs a \
-         driver has stopped needing one or stopped running; a second check reported means this \
-         subject is wrong in more than the one way it is built to be."
+        named, driven,
+        "every check `RETENTION_DRIVEN_CHECKS` names as covered only in part must have a \
+         subject here that only a drive catches, and this matrix must name no check that \
+         constant does not. A check listed as partly covered with no such subject is a check \
+         whose driven assertions nothing establishes anything about, which is the same blind \
+         spot `each_check_fails_against_its_own_defect_and_no_other` closes for the undriven \
+         half."
     );
 }
 
-/// A bootstrap that begins one entry past what a sweep left is caught, and
-/// only under a drive.
+/// A subject carrying a ledger of its own is still that subject under a
+/// retention drive.
 ///
-/// The test above establishes that a driven assertion exists at all. This
-/// one establishes that the *other* half of DESIGN's
-/// `feed-bootstrap-position` row is driven too. The row states two things
-/// about a read taken after retention has swept — that it begins at the
-/// oldest entry still retained, and that it is never refused on the
-/// retention floor — and a subject for one is not a subject for the other.
-/// [`Defect::RefusesTheOldestStartAfterASweep`] never answers;
-/// [`Defect::SkipsTheOldestEntryASweepLeft`] answers, and answers from one
-/// entry too far in.
+/// **This is what pins the mirror's feed seek**, and it is the only thing that
+/// can. `super::contract_mutants`' [`MutantLedger`] is a hand-written mirror
+/// of the reference backend, and the discrimination matrix keeps it honest by
+/// running every check against subjects built on it — but only over a ledger
+/// `run_all` produced, which has no **gaps** in it. Over a dense,
+/// append-ordered ledger a seek to the first greater sequence and a skip of
+/// that many rows name the same entry, so the mirror's `sequence > from` could
+/// be replaced by a count and nothing would notice. A retention drop is what
+/// makes a gap, and `feed-retention-refusal` is the check that reads across
+/// one.
 ///
-/// Without it the position half of that clause would be an assertion no
-/// subject reaches — it would fire only against a backend nobody had built,
-/// and a check nothing can fail reads as coverage it does not have.
+/// The subject is chosen for what it is **not** about: its defect is
+/// `SelectsOnWindowStart`, which touches no feed path at all, so every feed
+/// assertion a drive reaches has to pass against it. Its column is therefore
+/// its ordinary [`DISCRIMINATION_MATRIX`] row, and any drift in the mirror's
+/// sweep, refusal, or resumption shows up as a check that row does not name.
 ///
-/// **A fresh subject for each call**, for the reason the test above gives.
+/// It is deliberately not a row of [`RETENTION_DRIVEN_MATRIX`]: every row
+/// there asserts an empty undriven column, and this subject fails two checks
+/// undriven — which is the point of picking it.
 #[tokio::test]
-async fn a_bootstrap_after_a_sweep_must_begin_at_the_oldest_entry_left() {
-    let undriven = drivable_mutant(Defect::SkipsTheOldestEntryASweepLeft);
-    let without_a_drive: BTreeSet<&str> = run_all(&undriven, DedupLevel::Linearizable)
-        .await
-        .into_iter()
-        .map(|violation| violation.check)
-        .collect();
-
-    assert!(
-        without_a_drive.is_empty(),
-        "a backend that begins a bootstrap one entry past what a sweep left must pass \
-         `run_all`, which sweeps nothing and so leaves that backend nothing to be wrong \
-         about: it reported {without_a_drive:?}."
-    );
-
-    let driven = drivable_mutant(Defect::SkipsTheOldestEntryASweepLeft);
-    let with_a_drive: BTreeSet<&str> =
-        run_all_with_retention(&driven, DedupLevel::Linearizable, &driven)
-            .await
-            .into_iter()
-            .map(|violation| violation.check)
-            .collect();
+async fn a_subject_carrying_its_own_ledger_is_still_itself_under_a_drive() {
+    let failed = driven_column(Defect::SelectsOnWindowStart).await;
 
     assert_eq!(
-        with_a_drive,
-        BTreeSet::from([FEED_BOOTSTRAP_POSITION]),
-        "the same backend must be caught once the suite is handed its retention drive. \
-         Nothing reported means the assertion that a post-sweep bootstrap begins at the \
-         oldest entry still retained has stopped discriminating, and the only other \
-         assertion on that read is the one that requires it not to be refused - which this \
-         subject does not break, because it answers."
+        failed,
+        BTreeSet::from([WINDOW_END_SELECTION, QUANTITY_ROUND_TRIP]),
+        "a subject carrying a ledger of its own must report the same checks under a retention \
+         drive that it reports without one, plus nothing: its defect is about which column a \
+         range meets and touches no feed path. An extra check here is the mirror disagreeing \
+         with the reference somewhere a drive reaches and `run_all` does not - its sweep, its \
+         cursor refusal, or its resumption across the gap a sweep leaves, which is the one \
+         shape a dense ledger cannot exercise."
     );
+}
+
+/// The checks one fresh subject reports under [`run_all`].
+async fn undriven_column(defect: Defect) -> BTreeSet<&'static str> {
+    if carries_its_own_ledger(defect) {
+        let subject = drivable_ledger_mutant(defect);
+        return checks_reported(run_all(&subject, DedupLevel::Linearizable).await);
+    }
+    let subject = drivable_mutant(defect);
+    checks_reported(run_all(&subject, DedupLevel::Linearizable).await)
+}
+
+/// The checks one fresh subject reports under [`run_all_with_retention`],
+/// lent to that entry point as both the backend and its own retention drive.
+///
+/// The shape has to be known here because the two traits are lent from one
+/// value and [`mutant`] erases it behind only one of them;
+/// `carries_its_own_ledger` is `super::contract_mutants`' own routing rule
+/// rather than a second copy of it.
+async fn driven_column(defect: Defect) -> BTreeSet<&'static str> {
+    if carries_its_own_ledger(defect) {
+        let subject = drivable_ledger_mutant(defect);
+        return checks_reported(
+            run_all_with_retention(&subject, DedupLevel::Linearizable, &subject).await,
+        );
+    }
+    let subject = drivable_mutant(defect);
+    checks_reported(run_all_with_retention(&subject, DedupLevel::Linearizable, &subject).await)
+}
+
+/// The set of check names one run reported, which is the whole of what every
+/// column assertion compares.
+fn checks_reported(violations: Vec<ContractViolation>) -> BTreeSet<&'static str> {
+    violations
+        .into_iter()
+        .map(|violation| violation.check)
+        .collect()
 }
 
 /// Every check named as covered only in part is a check [`run_all`]
@@ -546,14 +652,13 @@ fn the_retention_driven_checks_are_checks_run_all_dispatches() {
 /// `crate::contract::checks::feed_bootstrap_position`'s own docs record
 /// which of its assertions the subject reaches and which stay gaps.
 ///
-/// **One subject in `super::contract_mutants` is deliberately not in this
-/// matrix.** [`Defect::RefusesTheOldestStartAfterASweep`]'s defect needs
-/// retention to have swept, `run_all` sweeps nothing, and a row for it would
-/// therefore assert the empty set — which is not a statement about
-/// discrimination at all. Its column is asserted by
-/// [`a_retention_driven_assertion_is_reached_only_with_a_driver`], against
-/// both entry points, and that is also the test that holds
-/// `RETENTION_DRIVEN_CHECKS` to meaning something.
+/// **Six subjects in `super::contract_mutants` are deliberately not in this
+/// matrix.** Each of their defects needs retention to have swept, `run_all`
+/// sweeps nothing, and a row for any of them would therefore assert the
+/// empty set — which is not a statement about discrimination at all. They are
+/// [`RETENTION_DRIVEN_MATRIX`]'s rows, asserted against both entry points,
+/// and that matrix is also what holds `RETENTION_DRIVEN_CHECKS` to meaning
+/// something.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (
@@ -660,10 +765,10 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
 /// against every other backend.
 ///
 /// The second half is what makes this a test of *discrimination* rather than
-/// of sensitivity. A check that fails against all twenty-three mutants is not
-/// detecting its own rule; it is detecting that something is different. So
-/// each row asserts a full column: the named check fails, and the others
-/// still pass against the same mutant.
+/// of sensitivity. A check that fails against every mutant is not detecting
+/// its own rule; it is detecting that something is different. So each row
+/// asserts a full column: the named check fails, and the others still pass
+/// against the same mutant.
 ///
 /// The subjects are in [`super::contract_mutants`], which also says why each
 /// is built by wrapping the reference backend or by carrying a ledger of its
@@ -703,6 +808,11 @@ async fn each_check_fails_against_its_own_defect_and_no_other() {
         );
     }
 
+    named.extend(
+        RETENTION_DRIVEN_MATRIX
+            .iter()
+            .flat_map(|(_, checks)| checks.iter().copied()),
+    );
     let declared_by_the_coverage_constants: BTreeSet<&str> = IMPLEMENTED_CHECKS
         .iter()
         .chain(ADDITIONAL_CHECKS)
@@ -711,11 +821,15 @@ async fn each_check_fails_against_its_own_defect_and_no_other() {
     assert_eq!(
         named, declared_by_the_coverage_constants,
         "every check `IMPLEMENTED_CHECKS` and `ADDITIONAL_CHECKS` declare must be named by some \
-         row of the discrimination matrix, and the matrix must name no check they do not declare. \
+         row of a discrimination matrix, and the matrices must name no check they do not declare. \
          A declared check with no subject built to fail it is a check nothing here establishes \
-         anything about. This is a statement about the coverage constants, not about `run_all`'s \
-         call list: a check added to `run_all` and to neither constant escapes this assertion, \
-         and see this test's doc for why that gap is not this test's to close."
+         anything about. Both matrices count: `RETENTION_DRIVEN_MATRIX` holds the subjects that \
+         break nothing until a sweep has run, and a check whose only subjects are those is a \
+         check this matrix cannot name - `feed-retention-refusal` is one, because \
+         `CursorBeyondRetention` has no reachable state until something has been removed. This \
+         is a statement about the coverage constants, not about `run_all`'s call list: a check \
+         added to `run_all` and to neither constant escapes this assertion, and see this test's \
+         doc for why that gap is not this test's to close."
     );
 }
 
@@ -2080,10 +2194,12 @@ async fn a_zero_limit_feed_read_is_refused_as_internal() {
 // The reference backend's retention, and the feed refusal it drives. Still
 // unit tests of the reference implementation rather than contract checks:
 // DESIGN section 3.3's `feed-retention-refusal` is written against the SPI
-// for any backend, is in `UNWRITTEN_CHECKS`, and lands with the entry point
-// that hands `run_all` a driver. What the tests below establish is that the
-// capability the check will be built on works, and works for the reasons
-// DESIGN gives rather than by coincidence.
+// for any backend and now runs there, in `IMPLEMENTED_CHECKS` and in
+// `RETENTION_DRIVEN_CHECKS`. These stay because they establish something that
+// check cannot: that the reference's own sweep and refusal work for the
+// reasons DESIGN gives rather than by coincidence, read against this
+// backend's own ledger rather than through the SPI. A check asserts what any
+// backend owes; these assert what the exemplar a porter copies does.
 
 /// A covered-period floor `hours` past `FIXTURE_EPOCH`.
 ///

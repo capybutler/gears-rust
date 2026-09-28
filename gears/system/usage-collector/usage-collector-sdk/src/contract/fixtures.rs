@@ -100,17 +100,26 @@ pub fn check_meter(check: &str, role: &str) -> Result<MeterTypeId, String> {
 /// the assertion under [`FEED_OTHER_TENANT_ID`] says why.
 pub const CONTRACT_TENANT_ID: Uuid = Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0001);
 
-/// The tenant the dispatched scope does **not** admit, read by two checks:
-/// [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path())
+/// The tenant the dispatched scope does **not** admit, read by four checks:
+/// [`scope_is_a_filter_on_every_read_path`](super::checks::scope_is_a_filter_on_every_read_path()),
+/// [`converged_target_lookup`](super::checks::converged_target_lookup()),
+/// [`feed_snapshot_and_replay`](super::checks::feed_snapshot_and_replay())
 /// and
-/// [`converged_target_lookup`](super::checks::converged_target_lookup()).
-/// Each module says what it is for. Two readers are safe here where two
-/// would not be under [`SCOPE_UNUSED_TENANT_ID`] below, and the difference
-/// is what each asserts: nothing here turns on how many entries this tenant
-/// owns, because both readers name an entry of their own and require that
-/// one withheld. So a second reader adds an entry rather than dissolving a
+/// [`feed_retention_refusal`](super::checks::feed_retention_refusal()). Each
+/// module says what it is for. Several readers are safe here where two would
+/// not be under [`SCOPE_UNUSED_TENANT_ID`] below, and the difference is what
+/// each asserts: nothing here turns on how many entries this tenant owns,
+/// because every reader names an entry of its own and requires that one
+/// withheld. So a further reader adds an entry rather than dissolving a
 /// premise. Each names its own by `id` on the point read and keeps its
-/// entries off the other's collection reads through [`check_meter`].
+/// entries off the others' collection reads through [`check_meter`].
+///
+/// **One reader now removes entries under it.**
+/// [`feed_retention_refusal`](super::checks::feed_retention_refusal()) drives
+/// a retention sweep that takes an entry of this tenant's, and that is safe
+/// for the same reason: [`ContractRetention`](super::retention::ContractRetention)'s
+/// drive is keyed on a GTS type, so it reaches only that check's own meter
+/// and no other reader's entries.
 pub const SCOPE_EXCLUDED_TENANT_ID: Uuid =
     Uuid::from_u128(0xc047_c047_0000_4000_8000_0000_0000_0002);
 

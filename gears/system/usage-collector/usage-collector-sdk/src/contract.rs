@@ -45,29 +45,32 @@
 //! remove its own entries, and is then responsible for putting them back —
 //! see that entry point's caution.
 //!
-//! # Fourteen of DESIGN's sixteen, fifteen checks in all
+//! # Fifteen of DESIGN's sixteen, sixteen checks in all
 //!
 //! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
-//! fourteen in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not
+//! fifteen in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not
 //! a statement about the rest**.
 //!
-//! **Two counts run through this file, and both are right.** Fourteen is
-//! what [`run_all`] covers of DESIGN's sixteen; fifteen is how many checks
-//! it runs, the fifteenth being the one in [`ADDITIONAL_CHECKS`] that
+//! **Two counts run through this file, and both are right.** Fifteen is
+//! what [`run_all`] covers of DESIGN's sixteen; sixteen is how many checks
+//! it runs, the sixteenth being the one in [`ADDITIONAL_CHECKS`] that
 //! DESIGN does not tabulate. A count about coverage of DESIGN is therefore
-//! fourteen and a count about what a run executed is fifteen, and neither
-//! substitutes for the other. The other two of the sixteen are named, not
-//! omitted:
+//! fifteen and a count about what a run executed is sixteen, and neither
+//! substitutes for the other. **That the two counts now coincide with each
+//! other's neighbours is a coincidence of arithmetic and not a simpler
+//! story**: one of them is a count over DESIGN's table and the other a count
+//! over this suite's dispatch list, and they will part again the next time
+//! either grows. The last of the sixteen is named, not omitted:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
-//!   gear's SPI declares, not yet written. Both.
+//!   gear's SPI declares, not yet written. One.
 //! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
 //!   it. Now empty: no check DESIGN tabulates is beyond the current trait.
 //!
 //! **And a check [`run_all`] does dispatch can still be covered only in
-//! part.** [`RETENTION_DRIVEN_CHECKS`] names the checks with an assertion
-//! that needs a backend's retention to have swept; [`run_all`] cannot drive
-//! one and skips it, and [`run_all_with_retention`] runs them whole. A
+//! part.** [`RETENTION_DRIVEN_CHECKS`] names the checks with assertions
+//! that need a backend's retention to have swept; [`run_all`] cannot drive
+//! one and skips them, and [`run_all_with_retention`] runs them whole. A
 //! caller reporting coverage reports that constant too: it is the one way a
 //! green, dispatched, implemented check can still be short of its row.
 //!
@@ -117,7 +120,7 @@
 use crate::plugin_api::UsageCollectorPluginV1;
 use checks::{
     at_most_one_invalidation, converged_target_lookup, dedup_concurrent, dedup_floor,
-    dedup_identity_over_window, feed_bootstrap_position, feed_completeness,
+    dedup_identity_over_window, feed_bootstrap_position, feed_completeness, feed_retention_refusal,
     feed_snapshot_and_replay, invalidation_excluded_from_fold, latest_tie_break,
     quantity_round_trip, record_and_invalidation_distinct_identity,
     scope_is_a_filter_on_every_read_path, server_field_round_trip, window_end_selection,
@@ -326,6 +329,7 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     FEED_SNAPSHOT_AND_REPLAY,
     FEED_COMPLETENESS,
     FEED_BOOTSTRAP_POSITION,
+    FEED_RETENTION_REFUSAL,
 ];
 
 /// The checks [`run_all`] runs that DESIGN §3.3 does not tabulate.
@@ -348,16 +352,16 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// **Two of DESIGN's sixteen**, which is every check [`run_all`] does
-/// not run. Each is expressible against the seven methods this gear's SPI
+/// **One of DESIGN's sixteen**, which is every check [`run_all`] does
+/// not run. It is expressible against the seven methods this gear's SPI
 /// declares — nothing here waits on the SPI to grow, and
 /// [`BLOCKED_CHECKS`] is empty. Being unwritten is a statement about this
 /// crate's progress, not about the SPI's reach, and the two are different
 /// claims: one is closed by writing a check, the other only by changing
 /// the trait.
 ///
-/// **[`FEED_RETENTION_REFUSAL`] needed one thing more than an author, and
-/// it now has all of it.** Its refusal half asserts that a cursor whose
+/// **[`FEED_RETENTION_REFUSAL`] left here for the harness rather than for an
+/// author, and both arrived.** Its refusal half asserts that a cursor whose
 /// continuation retention has truncated is refused, and a backend only
 /// reaches that state once retention has purged an entry. No SPI method
 /// purges, which is why the drive sits beside the SPI:
@@ -366,18 +370,19 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// implements it, so `CursorBeyondRetention` is reachable there. The entry
 /// point that hands a check a driver waited on a check that could use
 /// one — an entry point taking a driver nothing consumes would be a claim
-/// about a check that does not exist — and `feed-bootstrap-position` is
-/// that check, so [`run_all_with_retention`] and [`RETENTION_DRIVEN_CHECKS`]
-/// landed with it. Nothing is left in this one's way but an author. This
-/// was a gap in the harness rather than in the SPI, which is why the name
-/// stayed here and never went back into [`BLOCKED_CHECKS`].
+/// about a check that does not exist — so [`run_all_with_retention`] and
+/// [`RETENTION_DRIVEN_CHECKS`] landed one check earlier, with
+/// `feed-bootstrap-position`. The name is now in [`IMPLEMENTED_CHECKS`] and
+/// in [`RETENTION_DRIVEN_CHECKS`], which is the shape a check that needed
+/// the harness takes once it has it. It was never a gap in the SPI, which
+/// is why it never went into [`BLOCKED_CHECKS`].
 ///
 /// **A caller reporting coverage has to report this constant.**
 /// [`run_all`] returning no violations says nothing whatever about a check
 /// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
-/// reports thirteen checks' worth of evidence as sixteen.
+/// reports fifteen checks' worth of evidence as sixteen.
 // @cpt-dod:cpt-cf-usage-collector-dod-plugin-conformance-suite:p1
-pub const UNWRITTEN_CHECKS: &[&str] = &[FEED_RETENTION_REFUSAL, FEED_POSITION_BOUNDED];
+pub const UNWRITTEN_CHECKS: &[&str] = &[FEED_POSITION_BOUNDED];
 
 /// The DESIGN §3.3 checks the current SPI cannot express, each paired with
 /// what unblocks it.
@@ -408,8 +413,14 @@ pub const UNWRITTEN_CHECKS: &[&str] = &[FEED_RETENTION_REFUSAL, FEED_POSITION_BO
 /// establish it for them.
 pub const BLOCKED_CHECKS: &[(&str, &str)] = &[];
 
-/// The checks [`run_all`] covers **only in part**, because an assertion of
-/// each needs a backend's retention to have actually swept.
+/// The checks [`run_all`] covers **only in part**, because at least one
+/// assertion of each needs a backend's retention to have actually swept.
+///
+/// How much of a check is missing differs, and the constant deliberately does
+/// not say: `feed-bootstrap-position` loses one assertion of four and
+/// `feed-retention-refusal` three of four. A caller reporting coverage learns
+/// from this constant that a green dispatch is short of the row, and from the
+/// check's own docs by how much.
 ///
 /// No method on [`UsageCollectorPluginV1`] removes anything — DESIGN
 /// declares none — so the drive sits beside the SPI as
@@ -428,13 +439,17 @@ pub const BLOCKED_CHECKS: &[(&str, &str)] = &[];
 /// report it, for the same reason it has to report [`UNWRITTEN_CHECKS`].
 ///
 /// The claim is held mechanically as well as written down.
-/// `contract_tests`' `a_retention_driven_assertion_is_reached_only_with_a_driver`
-/// runs a subject whose only defect is one a driven assertion reaches, and
-/// requires it to pass under [`run_all`] and fail under
+/// `contract_tests`' `RETENTION_DRIVEN_MATRIX` carries one row per subject
+/// whose only defect is one a driven assertion reaches, and
+/// `each_driven_check_fails_against_its_own_defect_and_no_other` requires
+/// every one of them to pass under [`run_all`] and fail under
 /// [`run_all_with_retention`]. A check that grew a half needing no drive
 /// would start failing the first half of that test; one whose drive stopped
-/// reaching its defect would start passing the second.
-pub const RETENTION_DRIVEN_CHECKS: &[&str] = &[FEED_BOOTSTRAP_POSITION];
+/// reaching its defect would start passing the second. That matrix is also
+/// asserted to name exactly the checks this constant names, so a check
+/// listed here with no such subject fails the run rather than reading as
+/// covered.
+pub const RETENTION_DRIVEN_CHECKS: &[&str] = &[FEED_BOOTSTRAP_POSITION, FEED_RETENTION_REFUSAL];
 
 /// Run every implemented check, returning one entry per violation.
 ///
@@ -499,10 +514,18 @@ pub async fn run_all(
 /// does, and the suite's premise that a repeated run re-delivers identical
 /// entries rather than colliding with different ones rests on nothing ever
 /// being removed. Each driven check is therefore responsible for putting its
-/// own fixtures back — `feed-bootstrap-position` does, and its
-/// `restore_this_checks_own_meter` says how and why — and
+/// own meter back, and
 /// `the_reference_backend_conforms_to_a_repeated_run_under_a_retention_drive`
-/// is what holds them to it.
+/// is what holds them to it. What "back" means is the check's own to decide:
+/// `feed-bootstrap-position` re-delivers its two entries in its own order,
+/// because what it asserts is which of them a read begins at, and its
+/// `restore_this_checks_own_meter` says why; `feed-retention-refusal` leaves
+/// its swept meter **empty**, because what it asserts is what lies after a
+/// cursor it issued and the only ledger from which that is the same on every
+/// run is one built in front of the cursor from nothing. Both restorations are
+/// driven over a meter the suite's `check_meter` derived for one check's
+/// exclusive use, and [`retention::ContractRetention::drop_before`] is keyed
+/// on a GTS type, so neither can reach the other's fixtures.
 pub async fn run_all_with_retention(
     plugin: &dyn UsageCollectorPluginV1,
     level: DedupLevel,
@@ -541,6 +564,7 @@ async fn run_every_check(
     violations.extend(feed_snapshot_and_replay(plugin).await);
     violations.extend(feed_completeness(plugin).await);
     violations.extend(feed_bootstrap_position(plugin, retention).await);
+    violations.extend(feed_retention_refusal(plugin, retention).await);
     violations.extend(scope_is_a_filter_on_every_read_path(plugin).await);
     violations
 }

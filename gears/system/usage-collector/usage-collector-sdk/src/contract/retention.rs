@@ -18,12 +18,22 @@
 //! [`RETENTION_DRIVEN_CHECKS`](super::RETENTION_DRIVEN_CHECKS) run there
 //! without the assertions that need a sweep.
 //!
-//! **The first check to need one is `feed-bootstrap-position`**, and it
+//! **The first check to need one was `feed-bootstrap-position`**, and it
 //! needs the exemption rather than the refusal: DESIGN section 3.3 has
 //! `FeedStart::Oldest` *"never refused on the retention floor"* and
 //! beginning *"at the oldest entry the subscription retains"*, and neither
-//! clause says anything until something has been swept. The refusal itself
-//! is `feed-retention-refusal`'s, still unwritten.
+//! clause says anything until something has been swept.
+//!
+//! **The refusal itself is `feed-retention-refusal`'s, and it has landed.**
+//! That is the check this trait exists for: the exemption can at least be
+//! stated over an unswept ledger, where `FeedStart::Oldest` is served
+//! because nothing has been removed, but
+//! [`UsageCollectorPluginError::CursorBeyondRetention`](crate::error::UsageCollectorPluginError::CursorBeyondRetention)
+//! has no reachable state at all until a sweep has removed something. Three
+//! of that check's four assertions run only through
+//! [`run_all_with_retention`](super::run_all_with_retention), which is the
+//! largest share of any check in
+//! [`RETENTION_DRIVEN_CHECKS`](super::RETENTION_DRIVEN_CHECKS).
 //!
 //! # This is a conforming capability, not a test hook
 //!
@@ -63,6 +73,17 @@
 //! drives a sweep therefore restores its own meter before it returns, and
 //! `the_reference_backend_conforms_to_a_repeated_run_under_a_retention_drive`
 //! is what holds them to it.
+//!
+//! **What "back" is differs per check**, because what each of them asserts
+//! about its own ledger differs. `feed-bootstrap-position` re-delivers its
+//! two entries in its own order, since it asserts which of them a read
+//! begins at. `feed-retention-refusal` leaves its swept meter empty, since
+//! it asserts what lies *after* cursors it issues and builds the ledger in
+//! front of them: an entry already on the meter would be behind the first
+//! cursor rather than in front of it. Both drive over a meter derived for
+//! one check's exclusive use, and [`ContractRetention::drop_before`] is
+//! keyed on a GTS type, so neither restoration can reach the other's
+//! fixtures however the floors compare.
 
 use crate::models::MeterTypeId;
 
