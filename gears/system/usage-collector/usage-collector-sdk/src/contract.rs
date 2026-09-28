@@ -375,18 +375,13 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// check nothing accounts for, which is the failure the partition exists to
 /// catch.
 ///
-/// **Being unwritten was always a statement about this crate's progress, not
-/// about the SPI's reach**, and the two are different claims: one is closed
-/// by writing a check, the other only by changing the trait. Every name that
-/// passed through here was closed the first way. [`FEED_POSITION_BOUNDED`]
-/// was the last of them, and the shape of its landing is worth keeping,
-/// because it is the shape the next one will take: the mechanism it needed
-/// was already in place before the check was —
-/// [`FeedPosition::len`](crate::feed::FeedPosition::len) and the suite's own
-/// `contract_tenant` factory were both built for it and both documented as
-/// such — so what was left was the fixtures,
-/// the assertions and the subjects, none of which the SPI had anything to do
-/// with.
+/// **Covered only in part is a different claim from unwritten.** Some of
+/// what [`run_all`] dispatches has an assertion that needs a backend's
+/// retention to have swept, and skips it; those checks are written all the
+/// same, and [`run_all_with_retention`] runs them whole.
+/// [`RETENTION_DRIVEN_CHECKS`] is where they are named, rather than named
+/// again here: a list repeated in two places goes stale in one of them the
+/// commit a check joins it, which is one commit before anything fails.
 ///
 /// **A caller reporting coverage still reports this constant.** It says
 /// today that no DESIGN check is missing from a run, which is a claim worth

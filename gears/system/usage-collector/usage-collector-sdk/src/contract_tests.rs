@@ -1574,14 +1574,14 @@ async fn an_untranslatable_node_refuses_a_caller_filter_and_excludes_a_scope() {
 // The reference backend's feed page
 // ---------------------------------------------------------------------------
 //
-// Unit tests of the reference implementation, not contract checks. DESIGN
-// section 3.3's `feed-snapshot-and-replay` check is written against the SPI
-// for any backend and belongs to a later slice; nothing below is added to
-// `run_all` or to a coverage constant, because none of it is an obligation
-// this suite puts on a plugin. What it is for is the suite's own subject:
-// the reference backend's feed answers are what a plugin author reads as an
-// exemplar, and they must not rot in the interval before the check that
-// covers them arrives.
+// Unit tests of the reference implementation, not contract checks. The feed
+// obligations this suite puts on a plugin are DESIGN section 3.3's own
+// rows, and they are checked in `contract::checks` against the SPI for any
+// backend; nothing below is added to `run_all` or to a coverage constant,
+// because none of it is such an obligation. What it is for is the suite's
+// own subject: the reference backend's feed answers are what a plugin
+// author reads as an exemplar, and a check written against the SPI pins the
+// obligation rather than the exemplar's way of meeting it.
 
 /// The tenant the feed reads below withhold.
 ///

@@ -10,13 +10,13 @@
 //!
 //! **It is not a production backend, and it is not an example of how to
 //! write one.** It holds everything in process memory, it scans linearly,
-//! it mints no `next_cursor`, and it loses every entry when the process
-//! exits. What it is for is the suite's own subject: a backend known to
-//! conform, so that a check reporting a violation against it is a bug in
-//! the check rather than an open question about the backend. A real plugin
-//! projects the same obligations into its storage engine — a `WHERE` clause,
-//! a unique index, a transaction — and this module deliberately does not
-//! model any of that.
+//! it mints no `next_cursor` on `list_usage_records`, and it loses every
+//! entry when the process exits. What it is for is the suite's own subject:
+//! a backend known to conform, so that a check reporting a violation against
+//! it is a bug in the check rather than an open question about the backend.
+//! A real plugin projects the same obligations into its storage engine — a
+//! `WHERE` clause, a unique index, a transaction — and this module
+//! deliberately does not model any of that.
 //!
 //! # Stated limits
 //!
@@ -29,26 +29,19 @@
 //!   fold entirely** — see `bucket_key`. A row with no `subject_ref`
 //!   contributes to no bucket of a `subject_id` grouping, where naive SQL
 //!   would collect those rows into a NULL group. The consequence is that
-//!   grouped buckets need not sum to the ungrouped total. DESIGN says
-//!   nothing about the case, and `usage-collector-v1.yaml` types every
-//!   `AggregationBucket.key` item as a non-nullable `string`, so dropping
-//!   may be the only answer the wire shape can carry — which is why the
-//!   behaviour stands rather than being changed here.
+//!   grouped buckets need not sum to the ungrouped total. It is listed here
+//!   because a projection answers otherwise, not because it is this
+//!   backend's own choice: DESIGN §3.1's `AggregationDimension` row settles
+//!   the case — *"An entry carrying no value at a selected dimension is
+//!   excluded from the grouping rather than bucketed under an absent
+//!   value"* — and `usage-collector-v1.yaml` says the same of
+//!   `AggregationBucket.key`: *"No entry is ever null: an entry carrying no
+//!   value for a selected dimension is excluded from the result rather than
+//!   bucketed under an absent value"*.
 //! * **`list_usage_records` ignores `query.order` and mints no
 //!   `next_cursor`** — it serves the canonical `(window_end, id)` ascending
 //!   order and one page. A real plugin owes both; the SPI's own method doc
 //!   is normative for it.
-//! * **Retention never runs of its own accord** — this backend holds no
-//!   declared retention and no sweep timer, so it removes an entry only when
-//!   a caller drives it through [`ContractRetention`]. A real plugin reads
-//!   the retention it enforces from `types-registry` itself,
-//!   which DESIGN §3.3 makes *"the one permitted registry read, because the
-//!   plugin applies it"*, and sweeps on its own schedule. What is faithful
-//!   here is what a sweep leaves behind rather than what triggers one: a
-//!   mark per GTS type recording the highest sequence removed, which is what
-//!   `read_feed_page` refuses a cursor on. `CursorBeyondRetention` is
-//!   therefore reachable here — it was not before this backend could be
-//!   driven — but only after a caller has driven a drop.
 //!
 //! # A test-only mirror of this file exists
 //!
@@ -527,10 +520,6 @@ impl UsageCollectorPluginV1 for InMemoryReferencePlugin {
     /// never driven to drop past it. That is DESIGN's *"A cursor whose
     /// continuation is intact is served, including one older than the floor
     /// where the plugin retains longer than it"*.
-    ///
-    /// A later slice brings this to conformance with every feed check; what is
-    /// here now is a correct page, a correct cursor and a correct refusal, not
-    /// the whole obligation.
     ///
     /// # Errors
     ///
