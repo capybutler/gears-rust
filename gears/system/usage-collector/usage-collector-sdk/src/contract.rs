@@ -64,7 +64,7 @@
 //! tabulates is left out:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
-//!   gear's SPI declares, not yet written. **Now empty.**
+//!   gear's SPI declares, not yet written. **Empty.**
 //! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
 //!   it. Empty too: no check DESIGN tabulates is beyond the current trait.
 //!
