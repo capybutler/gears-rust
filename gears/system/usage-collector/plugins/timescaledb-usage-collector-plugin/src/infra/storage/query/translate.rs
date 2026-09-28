@@ -88,8 +88,10 @@ pub use toolkit_odata::filter::ODataValue;
 /// page through `establish_keyset_order` and on a continuation through
 /// `require_continuation_keyset`, both in the gear's `domain::query`
 /// (`gears/system/usage-collector/usage-collector/src/domain/query.rs`), which
-/// share one `keyset_defect` check. The SDK states that enforcement is the
-/// gateway's alone (`KEYSET_SAFE_RECORD_FIELDS`' own doc), so an order this
+/// share one `keyset_defect` check, and `usage_collector_sdk`'s
+/// `models_tests::the_order_key_refusal_names_the_derived_ground_alongside_the_optional_one`
+/// pins that refusal for this very field. The SDK states that enforcement is
+/// the gateway's alone (`is_keyset_safe_record_field`'s doc), so an order this
 /// function ever renders for `entry_type` is a host breach, not a caller's
 /// request. Recorded here because such a host would now get a different order
 /// than it used to, not because a conforming deployment can see one.
