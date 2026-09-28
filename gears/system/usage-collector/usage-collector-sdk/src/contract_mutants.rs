@@ -1788,9 +1788,15 @@ impl WrappedReference {
         ))
     }
 
-    /// What the two post-inner defects do to one entry's outcome, and the
-    /// place [`Defect::ConflictReadBackIgnoresTheEntryType`] keeps its
-    /// mirror of the ledger up to date.
+    /// What the two post-inner defects **this method decides** do to one
+    /// entry's outcome, and the place
+    /// [`Defect::ConflictReadBackIgnoresTheEntryType`] keeps its mirror of
+    /// the ledger up to date.
+    ///
+    /// There is a third post-inner defect and it is not here:
+    /// [`Defect::ConflictNamesTheRecord`] needs an SPI read to answer, so it
+    /// is applied by [`Self::conflict_against_the_withdrawn_record`] after
+    /// this method returns.
     ///
     /// * [`Defect::AbsorbsAWithdrawalWithAnotherReason`]: a conflict on a
     ///   withdrawal is answered as an absorb of the stored entry.
@@ -1832,8 +1838,8 @@ impl WrappedReference {
     /// passed through too.
     ///
     /// Async, which is why it sits here rather than in
-    /// [`Self::after_admission`] with the other two post-inner defects: the
-    /// read-back is an SPI call. It is applied **after** that method on both
+    /// [`Self::after_admission`] with the other two post-inner defects: that
+    /// method is synchronous and the read-back is an SPI call. It is applied **after** that method on both
     /// create paths, so a conflict this subject rewrites is one the exemplar
     /// decided.
     ///
