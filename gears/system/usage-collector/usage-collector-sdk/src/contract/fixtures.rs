@@ -315,10 +315,9 @@ pub const FIXTURE_EPOCH: time::OffsetDateTime =
 /// **This is one table rather than a doc comment per check module, and the
 /// block below is why.** Each module used to state its own offset and
 /// enumerate every other module's to argue it was clear of them. Nothing
-/// checked
-/// those enumerations, every one of them had to be edited by every check
-/// that landed afterwards, and none of them was: seven modules carried a
-/// list and all seven were wrong. [`check_window_from`] says what a
+/// checked those enumerations, every one of them had to be edited by every
+/// check that landed afterwards, and none of them was: seven modules
+/// carried a list and all seven were wrong. [`check_window_from`] says what a
 /// collision would cost.
 const CHECK_WINDOW_OFFSETS: &[(&str, &str, i64)] = &[
     (QUANTITY_ROUND_TRIP, "main", 0),

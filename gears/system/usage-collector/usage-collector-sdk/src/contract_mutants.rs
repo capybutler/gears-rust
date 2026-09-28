@@ -567,11 +567,10 @@ pub(super) enum Defect {
     /// so. A subject refusing the first entry of an identity fails most of
     /// the suite and is a caricature rather than a mistake anyone makes,
     /// which accounts for the separate-call acceptance and both "earlier
-    /// entry accepted" assertions. The
-    /// identical in-batch absorb is the third: an absorb and a second
-    /// acceptance both answer `Ok` carrying an entry equal in every
-    /// caller-supplied field, so no outcome tells them apart and only the row
-    /// count can — which is the floor half, not that assertion.
+    /// entry accepted" assertions. The identical in-batch absorb is the
+    /// third: an absorb and a second acceptance both answer `Ok` carrying an
+    /// entry equal in every caller-supplied field, so no outcome tells them
+    /// apart and only the row count can — which is the floor half, not that assertion.
     ///
     /// **The retry and the divergent submission are a deliberate gap**,
     /// recorded here rather than closed. The subject that would close them is
