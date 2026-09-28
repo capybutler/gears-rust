@@ -76,16 +76,23 @@ pub use toolkit_odata::filter::ODataValue;
 /// attribute and its value hook cannot carry one. It is the one column whose
 /// comparison value needs a cast — see `bind_cast` below.
 ///
-/// **This map also feeds `render_order_by`, so the enum decides one sort.**
-/// `$orderby=entry_type` orders by the enum's *declaration* order — `record`
-/// then `invalidation` — where the retired `text` column ordered the two
-/// alphabetically, the other way round. The labels are declared in that order
-/// in `migrations/0001_init.sql` and read back by
-/// `schema_integration_pg::entry_type_is_a_written_enum_and_not_generated`, so
-/// the order a caller sees is pinned; it is pinned there as an identity
-/// property, and this is the other thing it decides. `entry_type` is still not
-/// a keyset key (`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`), so no
-/// cursor rests on it.
+/// **This map also feeds `render_order_by`, and the enum changed what an
+/// `ORDER BY entry_type` would mean — but nothing can ask for one.** Rendered,
+/// it would sort by the enum's *declaration* order, `record` then
+/// `invalidation`, where the retired `text` column sorted the two labels
+/// alphabetically and so the other way round.
+///
+/// No caller reaches it. `entry_type` is absent from
+/// [`usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS`], and the gear refuses a
+/// caller `$orderby` naming a field off that list with a `400` — on a first
+/// page through `establish_keyset_order` and on a continuation through
+/// `require_continuation_keyset`, both in the gear's `domain::query`
+/// (`gears/system/usage-collector/usage-collector/src/domain/query.rs`), which
+/// share one `keyset_defect` check. The SDK states that enforcement is the
+/// gateway's alone (`KEYSET_SAFE_RECORD_FIELDS`' own doc), so an order this
+/// function ever renders for `entry_type` is a host breach, not a caller's
+/// request. Recorded here because such a host would now get a different order
+/// than it used to, not because a conforming deployment can see one.
 #[must_use]
 pub fn record_column(field_name: &str) -> Option<&'static str> {
     // Declaration order of `UsageRecordQuery`, so the module doc's list above

@@ -16,8 +16,7 @@ use super::super::keyset::{
     cursor_key_to_bind, ensure_forward_cursor, keyset_predicate, render_order_by, uniform_dir,
 };
 use super::{
-    ENTRY_TYPE_ENUM, ODataValue, SqlCtx, filter_fields, record_column, translate_record_filter,
-    translate_scope,
+    ODataValue, SqlCtx, filter_fields, record_column, translate_record_filter, translate_scope,
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -310,10 +309,18 @@ fn only_the_enum_column_casts_its_bound_literal() {
         &mut ctx,
     )
     .unwrap();
-    // Built from `ENTRY_TYPE_ENUM`, the one spelling of the type name, rather
-    // than from a copy: a copy here would agree with a stale `bind_cast` after
-    // a rename and leave only the pg lane to notice.
-    assert_eq!(sql, format!("entry_type = $1::{ENTRY_TYPE_ENUM}"));
+    // Written out rather than built from `ENTRY_TYPE_ENUM`, and deliberately:
+    // an oracle derived from the constant under test cannot see a rename that
+    // moves the constant, because both sides move together. A literal reds
+    // here instead, in the `--lib` lane, which is where an author renaming the
+    // type wants to be told. Every other oracle for this cast in this file is a
+    // literal too. What the const does buy is one spelling in *production*
+    // Rust: `bind_cast` reads it from `record_store::ENTRY_TYPE_ENUM` rather
+    // than hardcoding the name a second time. The const's own spelling is held
+    // to the migration by
+    // `record_store_tests::each_inserted_column_is_unnested_as_the_type_the_migration_declares`,
+    // through `migration_probe::insertable_columns`.
+    assert_eq!(sql, "entry_type = $1::usage_entry_type");
 
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(
@@ -343,8 +350,7 @@ fn only_the_enum_column_casts_its_bound_literal() {
     )
     .unwrap();
     assert_eq!(
-        sql,
-        format!("entry_type IN ($1::{ENTRY_TYPE_ENUM}, $2::{ENTRY_TYPE_ENUM})"),
+        sql, "entry_type IN ($1::usage_entry_type, $2::usage_entry_type)",
         "a membership test compares through the same operator, so every \
          literal in it needs the cast too"
     );

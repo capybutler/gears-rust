@@ -133,9 +133,10 @@ const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, wi
 /// diverging to `text` the way `metadata` does.
 ///
 /// `pub(crate)` so the `$filter` translator's `bind_cast`
-/// ([`super::query::translate`]) spells it from here too. A second spelling
-/// there would let a rename leave that module and its own tests agreeing on a
-/// stale name, with only the pg lane to catch it.
+/// ([`super::query::translate`]) spells it from here too: this const is the
+/// only place *production* Rust in this crate names the type. Test oracles
+/// spell it out instead, and deliberately - one derived from this const could
+/// not see a rename that moved it, because both sides would move together.
 pub(crate) const ENTRY_TYPE_ENUM: &str = "usage_entry_type";
 
 /// Postgres array types for [`INSERT_COLUMNS`], **in the same order**, as the
