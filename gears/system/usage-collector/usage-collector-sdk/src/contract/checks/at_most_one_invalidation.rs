@@ -40,8 +40,20 @@ const FIRST_REASON: &str = "at-most-one-invalidation-first";
 /// The reason code the divergent withdrawal of each target states.
 const SECOND_REASON: &str = "at-most-one-invalidation-second";
 
-/// The read limit of the `Eventual` ledger read: twice the entries one pair's
-/// range holds.
+/// The read limit of the `Eventual` ledger read.
+///
+/// It must be **strictly greater than any number of entries a backend could
+/// leave in one pair's range**, because the read that uses it counts the
+/// withdrawals it got back and compares that count against one. A limit that
+/// truncated would hand the comparison a count the ledger did not earn, and a
+/// backend holding two withdrawals would read as converged.
+///
+/// One pair's range is `[window_end, +1 minute)` and the three pairs take
+/// successive hours, so it holds that pair alone: the target, plus one
+/// withdrawal once converged, plus transiently a second under `Eventual` -
+/// three. Eight is well clear of three and of any near-miss a backend might
+/// produce, and the margin is the point; the figure is not derived from the
+/// fixtures and must not be tightened onto them.
 const AT_MOST_ONE_PAGE_LIMIT: u64 = 8;
 
 /// A record and two withdrawals of it that differ in their reason code alone.
