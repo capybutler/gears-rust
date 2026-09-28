@@ -10,7 +10,7 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Fifteen subjects wrap a real
+//! *Behaviourally* is the exact word. Eighteen subjects wrap a real
 //! reference backend and are that backend plus one interception; the other
 //! seventeen re-implement it, and a re-implementation is the same backend
 //! only as far as the checks can see. [`MutantLedger`] states how far that
@@ -30,18 +30,19 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Fifteen defects fit (quantity, the
+//! strongest form the subject can take. Eighteen defects fit (quantity, the
 //! store's own acceptance instant, a defaulted origin, period-blind dedup,
 //! entry-type-blind dedup, the entry-type-blind conflict read-back,
 //! point-read scope, the undecided converged-only lookup, the two
-//! withdrawal defects, the three bootstrap defects and the two
-//! position-encoding defects): three rewrite a field on the way in, three
-//! keep an index beside the ledger — two to refuse an admission, one only
-//! to decide which stored entry a collision is answered with — two change
-//! what the point read answers, one by substituting the scope and one by
-//! declining to decide, two rewrite how a second withdrawal of a record is
-//! answered, three reinterpret what `FeedStart::Oldest` names, and two
-//! re-encode the position a page hands back.
+//! withdrawal defects, the three bootstrap defects, the two
+//! position-encoding defects and the three empty-selection defects): three
+//! rewrite a field on the way in, three keep an index beside the ledger —
+//! two to refuse an admission, one only to decide which stored entry a
+//! collision is answered with — two change what the point read answers, one
+//! by substituting the scope and one by declining to decide, two rewrite how
+//! a second withdrawal of a record is answered, three reinterpret what
+//! `FeedStart::Oldest` names, two re-encode the position a page hands back,
+//! and three rewrite what a fold answers where nothing survived.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other
 //! seventeen (selection column, fold exclusion, missing unique constraint,
@@ -150,6 +151,45 @@
 //! to re-implement, while these two are a pure function of the position the
 //! loop produced. A ledger of their own would be the SPI's seven methods
 //! re-implemented to change the last line of one.
+//!
+//! # DESIGN's three empty-selection clauses, and the subject for each
+//!
+//! §3.3's plugin obligations state what a fold answers where nothing
+//! survived, and they state it as three clauses rather than one rule:
+//! *"`SUM` and `COUNT` are defined over an empty selection and report `0`;
+//! `MAX`, `MIN` and `LATEST` are not and report absent. […] A grouped query
+//! yields no bucket for a group nothing survives in."* Each of the three has
+//! one subject, and each subject is a wrapper, because all three are
+//! functions of the answer the exemplar already computed:
+//!
+//! * **`SUM` and `COUNT` report `0`** — [`Defect::EmptySumIsAbsent`], which
+//!   answers absent instead, as `SUM(x)` over no rows does in SQL.
+//! * **`MAX`, `MIN` and `LATEST` report absent** —
+//!   [`Defect::CoalescesEveryEmptyFoldToZero`], which answers `0` instead:
+//!   the blanket `COALESCE` a porter reaches for once the clause above has
+//!   bitten.
+//! * **A grouped query yields no bucket** —
+//!   [`Defect::AGroupNothingSurvivesInStillGetsABucket`], which yields one.
+//!
+//! The first two are each other's mirror on purpose. The obligation is a
+//! **split**, so a check asserting one side alone is passed by the backend
+//! that collapses it the other way, and one subject collapses it each way.
+//! The third runs opposite to both: a grouped query answers *fewer* buckets
+//! where an ungrouped one answers the same bucket emptied, so a backend with
+//! one rule for "nothing survived" fails one of the two whichever rule it
+//! holds.
+//!
+//! **`COUNT` over an empty selection has no subject of its own, and the gap
+//! is recorded rather than closed.** `EmptySumIsAbsent` breaks the clause
+//! the two folds share, so `invalidation-excluded-from-fold`'s `COUNT`
+//! assertion is reached by no subject: neutering it changes no row of the
+//! matrix. A second subject would be one for a site that already has one,
+//! which is the reasoning [`Defect::LedgerHasNoUniqueConstraint`]'s own gap
+//! is left open on. It would not be an absurd subject — a `COUNT` served
+//! from a pre-aggregated per-bucket count is `SUM(c)`, which *is* `NULL`
+//! over no rows, and the `TimescaleDB` plugin's rollup carries a `COALESCE`
+//! for exactly that reason — so whoever closes it is deciding that a second
+//! subject on one clause buys more than it costs.
 //!
 //! # DESIGN's three `LATEST` keys, and the subject for each
 //!
@@ -335,6 +375,45 @@ pub(super) enum Defect {
     /// invalidation. DESIGN names this one: it double-counts the withdrawn
     /// measurement.
     FoldsTheInvalidation,
+    /// Answers absent for `SUM` over an empty selection, where DESIGN
+    /// defines it as `0` — the reference backend's own fold before slice 1b
+    /// corrected it.
+    ///
+    /// It is also `SUM`'s own answer in SQL: `SUM(x)` over no rows is
+    /// `NULL`, so a backend gets this wrong by writing the obvious
+    /// expression and nothing else. That makes it the one defect in this
+    /// module a porter reaches without making a mistake, which is why the
+    /// subject exists even though the rule it breaks is a single clause.
+    EmptySumIsAbsent,
+    /// Answers `0` for `MAX`, `MIN` and `LATEST` over an empty selection,
+    /// where DESIGN has all three report absent — the mistake a backend
+    /// makes by wrapping every fold in `COALESCE(…, 0)` once it has found
+    /// out that `SUM` needs one.
+    ///
+    /// It is [`Self::EmptySumIsAbsent`]'s mirror, and the pair is why the
+    /// empty-selection rule needs two subjects rather than one. DESIGN
+    /// §3.3's obligation is a **split** — *"`SUM` and `COUNT` are defined
+    /// over an empty selection and report `0`; `MAX`, `MIN` and `LATEST` are
+    /// not and report absent"* — and a backend that collapses it answers
+    /// one family with the other's answer. One subject collapses it each
+    /// way, so a check asserting only one side would pass one of them.
+    CoalescesEveryEmptyFoldToZero,
+    /// Emits a bucket for a group nothing survives in, keyed from the rows
+    /// the range selects rather than from the rows that survive the fold —
+    /// the mistake a backend makes by leaving the withdrawal exclusion out
+    /// of its `WHERE` and putting it in a `FILTER (WHERE …)` on the
+    /// aggregate instead.
+    ///
+    /// That rewrite is exact under every fold **but** for which groups
+    /// exist: `GROUP BY` then forms a group per key the range holds, and
+    /// the group whose every row the filter removes comes back as a bucket
+    /// carrying the empty fold's answer rather than not coming back at all.
+    /// DESIGN §3.3's obligation ends on that case — *"A grouped query yields
+    /// no bucket for a group nothing survives in"* — and it is the half of
+    /// the empty-selection rule that runs the opposite way from the
+    /// ungrouped one, which is why neither [`Self::EmptySumIsAbsent`] nor
+    /// [`Self::CoalescesEveryEmptyFoldToZero`] reaches it.
+    AGroupNothingSurvivesInStillGetsABucket,
     /// Absorbs a second withdrawal of a record even under another reason code —
     /// the mistake a backend makes by comparing only the dedup identity.
     AbsorbsAWithdrawalWithAnotherReason,
@@ -1089,6 +1168,9 @@ pub(super) fn carries_its_own_ledger(defect: Defect) -> bool {
         | Defect::RefusesTheOldestStartAfterASweep
         | Defect::SkipsTheOldestEntryASweepLeft
         | Defect::RefusesAWithdrawalWithTheSameReason
+        | Defect::EmptySumIsAbsent
+        | Defect::CoalescesEveryEmptyFoldToZero
+        | Defect::AGroupNothingSurvivesInStillGetsABucket
         | Defect::AFeedPositionIsKeyedPerTenant
         | Defect::AFeedPositionIsKeyedPerSubscribedType => false,
         Defect::SelectsOnWindowStart
@@ -1146,7 +1228,7 @@ fn type_component(gts_type_id: &MeterTypeId) -> [u8; MUTANT_POSITION_COMPONENT_B
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
 ///
-/// One qualification, and it holds for all fifteen wrapped defects:
+/// One qualification, and it holds for all eighteen wrapped defects:
 /// [`Self::create_usage_records`] is not pure delegation. The inner backend
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
@@ -1158,7 +1240,7 @@ pub(super) struct WrappedReference {
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
     /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
-    /// entry that claimed it. Unused by the other fourteen defects.
+    /// entry that claimed it. Unused by the other seventeen defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -1174,7 +1256,7 @@ pub(super) struct WrappedReference {
     /// The entry-type-blind dedup index [`Defect::DedupIgnoresTheEntryType`]
     /// keys on: `(tenant_id, gts_type_id, idempotency_key, window_start,
     /// window_end)` to the entry that claimed it. Unused by the other
-    /// fourteen defects.
+    /// seventeen defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -1193,7 +1275,7 @@ pub(super) struct WrappedReference {
     /// The rows [`Defect::ConflictReadBackIgnoresTheEntryType`] reads a
     /// colliding entry back from: the same five components, to **every**
     /// entry accepted under them, in arrival order. Unused by the other
-    /// fourteen defects.
+    /// seventeen defects.
     ///
     /// A `Vec` rather than one entry, because two rows under one five-tuple
     /// is the whole situation the defect is about, and the defect is which
@@ -1212,7 +1294,7 @@ pub(super) struct WrappedReference {
     five_component_rows: Mutex<BTreeMap<EntryTypeBlindKey, Vec<UsageRecord>>>,
     /// The GTS types retention has been driven over through this wrapper,
     /// which is the mark [`Defect::RefusesTheOldestStartAfterASweep`] reads.
-    /// Unused by the other fourteen defects.
+    /// Unused by the other seventeen defects.
     ///
     /// The wire string rather than a [`MeterTypeId`], which implements
     /// neither `Ord` nor `PartialOrd`; the reference backend's own
@@ -1225,7 +1307,7 @@ pub(super) struct WrappedReference {
     swept_types: Mutex<BTreeSet<String>>,
     /// The tenants each GTS type has been written under, which is what
     /// [`Defect::AFeedPositionIsKeyedPerTenant`] issues one position
-    /// component per. Unused by the other fourteen defects.
+    /// component per. Unused by the other seventeen defects.
     ///
     /// The wire string keys it rather than a [`MeterTypeId`], which
     /// implements neither `Ord` nor `PartialOrd`; `swept_types` above is
@@ -1374,7 +1456,7 @@ impl WrappedReference {
     /// issues.
     ///
     /// True for the two defects that key a position on something that grows
-    /// with a subscription, false for the other thirteen — which hand the
+    /// with a subscription, false for the other sixteen — which hand the
     /// inner backend's own encoding straight back, so a position of theirs
     /// is the exemplar's byte for byte.
     fn keys_its_position(&self) -> bool {
@@ -1532,6 +1614,9 @@ impl WrappedReference {
             | Defect::ConflictReadBackIgnoresTheEntryType
             | Defect::SelectsOnWindowStart
             | Defect::FoldsTheInvalidation
+            | Defect::EmptySumIsAbsent
+            | Defect::CoalescesEveryEmptyFoldToZero
+            | Defect::AGroupNothingSurvivesInStillGetsABucket
             | Defect::LedgerHasNoUniqueConstraint
             | Defect::BatchResolvesAgainstThePreCallLedger
             | Defect::ADivergentWriteDisplacesTheSurvivor
@@ -1743,6 +1828,67 @@ impl WrappedReference {
             found,
         ))
     }
+
+    /// [`Defect::AGroupNothingSurvivesInStillGetsABucket`]'s grouped answer:
+    /// the exemplar's buckets, plus one for every key the range **selects**
+    /// that none of them carries.
+    ///
+    /// The extra keys are read off the exemplar's own ledger page, which
+    /// returns a withdrawn pair as persisted, so they are the keys a
+    /// `GROUP BY` sees when the withdrawal exclusion sits in a
+    /// `FILTER (WHERE …)` on the aggregate rather than in the `WHERE`.
+    /// A key the grouping drops for a missing value is dropped here too,
+    /// because [`bucket_key`] is the same function the mirror groups with —
+    /// this subject is wrong about which groups exist, not about how one is
+    /// keyed.
+    ///
+    /// Each added bucket carries the empty fold's own answer, taken from
+    /// [`fold_value`] over no rows rather than spelled out again, so the
+    /// subject is wrong in one way only: `SUM` and `COUNT` answer `0` there
+    /// and the other three absent, exactly as the exemplar would have
+    /// answered had the group existed and been emptied.
+    ///
+    /// The page is bounded by the caller's own `query.limit`, so a key
+    /// carried only by rows past that limit is not added. Every grouped
+    /// dispatch the suite makes reads a range of two rows under a limit of
+    /// six, so nothing here rests on that; a check that grouped over a wider
+    /// range would have to widen the limit with it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the SPI's own aggregate signature, plus the delegated answer this rewrites; \
+                  bundling them into a struct would name the SPI's parameters twice"
+    )]
+    async fn bucket_every_selected_key(
+        &self,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        query: &ODataQuery,
+        metadata_filter: &[MetadataFilter],
+        group_by: &[AggregationDimension],
+        answered: AggregationResult,
+    ) -> Result<AggregationResult, UsageCollectorPluginError> {
+        let page = self
+            .inner
+            .list_usage_records(gts_type_id, time_range, query, metadata_filter)
+            .await?;
+        let mut buckets = answered.buckets;
+        let mut present: BTreeSet<Vec<String>> =
+            buckets.iter().map(|bucket| bucket.key.clone()).collect();
+        let empty = fold_value(fold, &[], LatestOrder::Declared)?;
+        for entry in &page.items {
+            let Some(key) = bucket_key(entry, group_by) else {
+                continue;
+            };
+            if present.insert(key.clone()) {
+                buckets.push(AggregationBucket {
+                    key,
+                    value: empty.clone(),
+                });
+            }
+        }
+        Ok(AggregationResult { buckets })
+    }
 }
 
 /// The five caller-supplied identity components of `record`, `entry_type`
@@ -1908,6 +2054,41 @@ impl UsageCollectorPluginV1 for WrappedReference {
         answer
     }
 
+    /// Delegated, with the three empty-selection defects rewriting what
+    /// comes back.
+    ///
+    /// Each touches a different part of the answer, and each leaves every
+    /// non-empty bucket the exemplar computed exactly as it computed it:
+    ///
+    /// * [`Defect::EmptySumIsAbsent`] — the **value** of a `SUM` bucket
+    ///   whose selection was empty.
+    /// * [`Defect::CoalescesEveryEmptyFoldToZero`] — the value of a `MAX`,
+    ///   `MIN` or `LATEST` bucket the exemplar answered absent, which over
+    ///   these three folds is exactly an empty selection.
+    /// * [`Defect::AGroupNothingSurvivesInStillGetsABucket`] — which
+    ///   **buckets** a grouped fold emits at all. See
+    ///   [`Self::bucket_every_selected_key`].
+    ///
+    /// **A second dispatch is what tells an empty `SUM` bucket from one
+    /// whose rows sum to zero**, and the two have to be told apart:
+    /// `SUM(x)` over no rows is `NULL` in SQL while `SUM(x)` over rows that
+    /// cancel is `0`, so a subject that answered absent to both would be
+    /// wrong about a rule no check here asks it about. The exemplar's own
+    /// `COUNT` over the same arguments is the signal — same selection, same
+    /// exclusion, same grouping, so its buckets carry the same keys and a
+    /// zero count is exactly an empty selection. Reading the `SUM` result
+    /// alone cannot do it, and re-implementing the fold here would make this
+    /// a [`MutantLedger`] rather than a wrapper. The other two folds need no
+    /// probe: an absent `MAX` *is* an empty selection, and a missing bucket
+    /// is read off the ledger page instead.
+    ///
+    /// The `SUM` rewrite is keyed on the bucket key rather than on position,
+    /// so it does not rest on two calls returning their buckets in one
+    /// order. It therefore reaches the ungrouped bucket and, in principle, a
+    /// grouped one — but no grouped bucket the exemplar emits is ever empty,
+    /// because a group is keyed from a surviving row, so in practice it only
+    /// touches the no-grouping case. That is the whole of the clause it
+    /// breaks.
     async fn query_aggregated_usage_records(
         &self,
         gts_type_id: MeterTypeId,
@@ -1917,16 +2098,83 @@ impl UsageCollectorPluginV1 for WrappedReference {
         metadata_filter: &[MetadataFilter],
         group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
-        self.inner
+        let result = self
+            .inner
             .query_aggregated_usage_records(
-                gts_type_id,
+                gts_type_id.clone(),
                 time_range,
                 fold,
                 query,
                 metadata_filter,
                 group_by,
             )
-            .await
+            .await?;
+        match self.defect {
+            Defect::EmptySumIsAbsent if fold == AggregationFold::Sum => {
+                let counted = self
+                    .inner
+                    .query_aggregated_usage_records(
+                        gts_type_id,
+                        time_range,
+                        AggregationFold::Count,
+                        query,
+                        metadata_filter,
+                        group_by,
+                    )
+                    .await?;
+                let zero = BigDecimal::from(0);
+                let empty: BTreeSet<Vec<String>> = counted
+                    .buckets
+                    .into_iter()
+                    .filter(|bucket| bucket.value.as_ref() == Some(&zero))
+                    .map(|bucket| bucket.key)
+                    .collect();
+                Ok(AggregationResult {
+                    buckets: result
+                        .buckets
+                        .into_iter()
+                        .map(|mut bucket| {
+                            if empty.contains(&bucket.key) {
+                                bucket.value = None;
+                            }
+                            bucket
+                        })
+                        .collect(),
+                })
+            }
+            Defect::CoalescesEveryEmptyFoldToZero
+                if matches!(
+                    fold,
+                    AggregationFold::Max | AggregationFold::Min | AggregationFold::Latest
+                ) =>
+            {
+                Ok(AggregationResult {
+                    buckets: result
+                        .buckets
+                        .into_iter()
+                        .map(|mut bucket| {
+                            if bucket.value.is_none() {
+                                bucket.value = Some(BigDecimal::from(0));
+                            }
+                            bucket
+                        })
+                        .collect(),
+                })
+            }
+            Defect::AGroupNothingSurvivesInStillGetsABucket if !group_by.is_empty() => {
+                self.bucket_every_selected_key(
+                    gts_type_id,
+                    time_range,
+                    fold,
+                    query,
+                    metadata_filter,
+                    group_by,
+                    result,
+                )
+                .await
+            }
+            _ => Ok(result),
+        }
     }
 
     async fn list_usage_records(
@@ -1960,7 +2208,7 @@ impl UsageCollectorPluginV1 for WrappedReference {
     /// [`Self::the_issued_position`] puts them back on the way out, so the
     /// inner backend is resumed at exactly the position it issued and what
     /// differs is the size of the token a caller carries. Both are no-ops
-    /// for the other thirteen defects.
+    /// for the other sixteen defects.
     ///
     /// `FeedStart::After` is delegated untouched by the bootstrap defects.
     /// It is matched with a wildcard arm because [`FeedStart`] is
@@ -3446,7 +3694,7 @@ impl LatestOrder {
             // defect added later and forgotten here would silently fold
             // under DESIGN's order and report nothing at all, which is a
             // matrix row whose subject does nothing rather than a compile
-            // error. Fifteen of these never reach this type - `mutant`
+            // error. Eighteen of these never reach this type - `mutant`
             // routes them to `WrappedReference` - but exhaustiveness is the
             // point.
             Defect::QuantityThroughFloat
@@ -3457,6 +3705,9 @@ impl LatestOrder {
             | Defect::DedupIgnoresTheEntryType
             | Defect::ConflictReadBackIgnoresTheEntryType
             | Defect::FoldsTheInvalidation
+            | Defect::EmptySumIsAbsent
+            | Defect::CoalescesEveryEmptyFoldToZero
+            | Defect::AGroupNothingSurvivesInStillGetsABucket
             | Defect::AbsorbsAWithdrawalWithAnotherReason
             | Defect::RefusesAWithdrawalWithTheSameReason
             | Defect::IgnoresScopeOnThePointRead

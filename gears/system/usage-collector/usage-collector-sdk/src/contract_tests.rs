@@ -708,6 +708,15 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
         Defect::FoldsTheInvalidation,
         &[INVALIDATION_EXCLUDED_FROM_FOLD],
     ),
+    (Defect::EmptySumIsAbsent, &[INVALIDATION_EXCLUDED_FROM_FOLD]),
+    (
+        Defect::CoalescesEveryEmptyFoldToZero,
+        &[INVALIDATION_EXCLUDED_FROM_FOLD],
+    ),
+    (
+        Defect::AGroupNothingSurvivesInStillGetsABucket,
+        &[INVALIDATION_EXCLUDED_FROM_FOLD],
+    ),
     (
         Defect::AbsorbsAWithdrawalWithAnotherReason,
         &[AT_MOST_ONE_INVALIDATION],
@@ -2916,6 +2925,13 @@ const EMPTY_FOLD_TO: time::OffsetDateTime =
 /// bound, so the emptiness is the range's doing rather than the backend's
 /// having nothing to read - which is what a real plugin's `WHERE` clause
 /// would be answering too.
+///
+/// **`invalidation-excluded-from-fold` now asserts the same split against
+/// any plugin**, and this test is still not that one. DESIGN's obligation
+/// names two ways an ungrouped bucket empties - *"a query matching no
+/// entry"* and *"a range whose every entry is a withdrawn pair"* - and the
+/// portable check takes the second. This takes the first, which no check
+/// reaches, and it takes it against the exemplar a plugin author copies.
 #[tokio::test]
 async fn an_empty_selection_splits_zero_from_absent_by_fold() {
     let plugin = InMemoryReferencePlugin::new();
