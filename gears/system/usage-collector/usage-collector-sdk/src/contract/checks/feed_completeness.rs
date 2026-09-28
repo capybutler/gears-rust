@@ -369,18 +369,27 @@ impl FeedCompletenessFixtures {
 ///   meter with entries in it, and this check's second meter is empty by
 ///   definition of the clause it exists for. **A recorded gap with that
 ///   reasoning.**
-/// * **Assertion 5's three parts** — refused, invented, closed — have an
-///   owner waiting rather than a missing subject.
+/// * **Assertion 5's three parts** — refused, invented, closed — had an
+///   owner waiting rather than a missing subject, and **the owner has
+///   landed**.
 ///   [`FEED_BOOTSTRAP_POSITION`](crate::contract::FEED_BOOTSTRAP_POSITION)'s
 ///   row is *"A subscription retaining no entries returns an empty page
 ///   carrying a head cursor"*, which is those same three obligations read
-///   off the `FeedStart::Oldest` read. A subject built for them would report
-///   against that check and this one at once, and building it now would put
-///   a subject in front of a check that does not exist. **Recorded gaps with
-///   a named owner.** When that check lands it takes the `Oldest` half; what
-///   stays here is the **second** read, from the continuation the first
-///   handed back, which is the only one of the two that is about a consumer
-///   that keeps reading.
+///   off the `FeedStart::Oldest` read, and that check now asserts them over
+///   a meter of its own. What it did not bring is a subject: its three
+///   subjects were measured against these three assertions and none reaches
+///   them, so **the gaps are still open and they are now recorded in two
+///   places rather than one**. The reasoning is that check's to carry, and
+///   [`feed_bootstrap_position`](super::feed_bootstrap_position()) carries
+///   it, including the one candidate subject that is named rather than
+///   built.
+///
+///   What the landing moved is the **ownership of the rule**, not the
+///   reads. The `Oldest` read below stays because a consumer has to get its
+///   first position from somewhere; it is a means here and the rule there.
+///   What is this check's own is the **second** read, from the continuation
+///   the first handed back, which is the only one of the two that is about
+///   a consumer that keeps reading.
 /// * Assertion 5b has a second reason to be a gap rather than a subject: a
 ///   feed that ignored its subscription and answered every meter's entries
 ///   is already pinned, by `feed-snapshot-and-replay`, whose walk would be
@@ -644,9 +653,20 @@ fn the_quiet_meter_added_nothing(
 /// stays quiet while its consumer keeps reading"* describes a consumer that
 /// already holds a position and comes back to it, which is `FeedStart::After`
 /// rather than `FeedStart::Oldest`. The first read is here because a
-/// consumer has to get its first position from somewhere, and when
+/// consumer has to get its first position from somewhere, and
 /// [`FEED_BOOTSTRAP_POSITION`](crate::contract::FEED_BOOTSTRAP_POSITION)
-/// lands it owns that read's rule.
+/// has landed and owns that read's rule: DESIGN gives it *"A subscription
+/// retaining no entries returns an empty page carrying a head cursor"*, and
+/// [`feed_bootstrap_position`](super::feed_bootstrap_position()) asserts it
+/// over a meter of its own.
+///
+/// **The read stays here, and the three reports on it stay with it.** They
+/// are not a second claim on that rule; they are what says *why the second
+/// read was not taken* when the first one fails, and a probe that dropped
+/// them would report a quiet subscription as unexamined rather than as
+/// refused. A backend that breaks the rule is reported by both checks, which
+/// is right: it has broken a consumer's bootstrap and a consumer's
+/// resumption, and those are two consumers.
 async fn the_quiet_subscription_keeps_its_consumers_place(
     plugin: &dyn UsageCollectorPluginV1,
     fixtures: &FeedCompletenessFixtures,

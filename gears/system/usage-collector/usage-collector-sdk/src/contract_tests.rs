@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds twenty-three deliberately
+//! as coverage. [`super::contract_mutants`] holds twenty-six deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and
 //! [`each_check_fails_against_its_own_defect_and_no_other`] asserts a whole
@@ -23,7 +23,13 @@
 //! [`a_race_that_left_two_writes_is_a_violation_once_the_bound_has_passed`]
 //! are the
 //! two columns asserted at the other declaration, because two checks have
-//! paths only an `Eventual` declaration reaches.
+//! paths only an `Eventual` declaration reaches. Two further columns are
+//! asserted against [`run_all_with_retention`] rather than [`run_all`] —
+//! [`a_retention_driven_assertion_is_reached_only_with_a_driver`] and
+//! [`a_bootstrap_after_a_sweep_must_begin_at_the_oldest_entry_left`] —
+//! because their subjects break nothing until a retention sweep has run and
+//! [`run_all`] drives none. Each asserts the undriven column as well, so a
+//! subject that started failing without a drive is caught too.
 //!
 //! The third is that the three coverage constants still partition DESIGN's
 //! sixteen checks, so a passing run cannot read as a complete one.
@@ -45,15 +51,16 @@ use bigdecimal::BigDecimal;
 use toolkit_odata::{ODataQuery, ast};
 use uuid::Uuid;
 
-use super::contract_mutants::{Defect, mutant};
+use super::contract_mutants::{Defect, drivable_mutant, mutant};
 use super::{
     ADDITIONAL_CHECKS, AT_MOST_ONE_INVALIDATION, BLOCKED_CHECKS, CONVERGED_TARGET_LOOKUP,
-    DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, FEED_COMPLETENESS,
-    FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT, IMPLEMENTED_CHECKS, INVALIDATION_EXCLUDED_FROM_FOLD,
-    LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP, RECORD_AND_INVALIDATION_DISTINCT_IDENTITY,
+    DEDUP_CONCURRENT, DEDUP_FLOOR, DEDUP_IDENTITY_OVER_WINDOW, DedupLevel, FEED_BOOTSTRAP_POSITION,
+    FEED_COMPLETENESS, FEED_SNAPSHOT_AND_REPLAY, HARNESS_FAULT, IMPLEMENTED_CHECKS,
+    INVALIDATION_EXCLUDED_FROM_FOLD, LATEST_TIE_BREAK, QUANTITY_ROUND_TRIP,
+    RECORD_AND_INVALIDATION_DISTINCT_IDENTITY, RETENTION_DRIVEN_CHECKS,
     SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH, SERVER_FIELD_ROUND_TRIP, UNWRITTEN_CHECKS,
     WINDOW_END_SELECTION, reference::InMemoryReferencePlugin, retention::ContractRetention,
-    run_all,
+    run_all, run_all_with_retention,
 };
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
@@ -131,6 +138,214 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
              written for a store that already holds its fixtures: a re-delivery is absorbed \
              rather than stored, and an assertion that an entry is accepted has to admit that \
              absorb."
+        );
+    }
+}
+
+/// The suite under a retention drive, against a backend that conforms.
+///
+/// [`run_all_with_retention`] runs the same checks as [`run_all`] plus the
+/// assertions in [`RETENTION_DRIVEN_CHECKS`] that need a sweep. The
+/// reference backend implements [`ContractRetention`], so it is the subject
+/// both entry points are validated against, and a green run here is what
+/// makes a violation reported against a driven real plugin worth reading.
+#[tokio::test]
+async fn the_reference_backend_conforms_under_a_retention_drive() {
+    let plugin = InMemoryReferencePlugin::new();
+
+    let violations = run_all_with_retention(&plugin, DedupLevel::Linearizable, &plugin).await;
+
+    assert!(
+        violations.is_empty(),
+        "the reference backend must pass every implemented check when the suite is also handed \
+         its retention drive, which is the only way the checks in `RETENTION_DRIVEN_CHECKS` run \
+         whole; it reported: {violations:#?}"
+    );
+}
+
+/// The driven suite three times against **one** backend.
+///
+/// This is [`the_reference_backend_conforms_to_a_repeated_run`] for the
+/// other entry point, and it is a sharper test than that one rather than a
+/// copy of it. A driven check may **remove** entries, and removal is the one
+/// thing re-delivery does not undo: an absorbed re-delivery leaves a ledger
+/// where it was, and a re-delivery of something that was swept is an
+/// *insert*, which joins the feed's order at the head rather than back where
+/// it came from. A check that purged its oldest entry and left it purged
+/// would find that entry last in its own meter's order on the next run, and
+/// any assertion of its about where a read begins would then be about the
+/// other entry.
+///
+/// So a driven check has to put its own fixtures back, and this is what
+/// holds it to that. `feed-bootstrap-position` does it in
+/// `restore_this_checks_own_meter`; the failure this test catches is that
+/// function being dropped, or a later driven check landing without one.
+#[tokio::test]
+async fn the_reference_backend_conforms_to_a_repeated_run_under_a_retention_drive() {
+    let plugin = InMemoryReferencePlugin::new();
+
+    for run in 1..=3 {
+        let violations = run_all_with_retention(&plugin, DedupLevel::Linearizable, &plugin).await;
+        assert!(
+            violations.is_empty(),
+            "run {run} of the driven suite against one backend that kept the previous runs' \
+             entries reported: {violations:#?}. A driven check is the only kind that removes \
+             anything, and a removed entry is not absorbed on re-delivery but inserted afresh \
+             at the head of the feed's order. Every driven check therefore has to restore its \
+             own fixtures before it returns; one that does not passes its first run and fails \
+             its second."
+        );
+    }
+}
+
+/// A defect only a retention drive reaches is invisible to [`run_all`] and
+/// reported by [`run_all_with_retention`].
+///
+/// **This is the structural guard on [`RETENTION_DRIVEN_CHECKS`]**, and it
+/// is here because the claim that constant makes cannot be held by a
+/// paragraph. "Some assertions of this check did not run" is exactly the
+/// kind of statement that stays in a doc comment after it has stopped being
+/// true, and a reader of a green `run_all` has no way to tell.
+///
+/// [`Defect::RefusesTheOldestStartAfterASweep`] is a backend whose *only*
+/// mistake is one no undriven run can provoke: it refuses
+/// `FeedStart::Oldest` once retention has swept a subscribed type, and
+/// nothing sweeps unless a driver is handed in. So the subject is
+/// behaviourally the reference backend under [`run_all`] and a
+/// non-conforming one under [`run_all_with_retention`].
+///
+/// **Both halves are load-bearing and they fail in opposite directions.**
+/// If the first assertion started failing, a driven check would have grown
+/// an undriven half that reaches this defect — and the constant would be
+/// over-claiming, because the coverage it says is missing would in fact be
+/// there. If the second started passing, the drive would have stopped
+/// reaching the defect: the check would still be listed as covered in part
+/// and no part of it would be the part that needs a driver.
+///
+/// **A fresh subject for each call**, because the first call purges. The
+/// suite's fixtures survive a repeated run by being re-delivered and
+/// absorbed, and a driven subject would carry this defect's own mark into
+/// the second call, where the undriven run would meet it before it had
+/// driven anything.
+#[tokio::test]
+async fn a_retention_driven_assertion_is_reached_only_with_a_driver() {
+    let undriven = drivable_mutant(Defect::RefusesTheOldestStartAfterASweep);
+    let without_a_drive: BTreeSet<&str> = run_all(&undriven, DedupLevel::Linearizable)
+        .await
+        .into_iter()
+        .map(|violation| violation.check)
+        .collect();
+
+    assert!(
+        without_a_drive.is_empty(),
+        "a backend that refuses `FeedStart::Oldest` once retention has swept must pass \
+         `run_all`, which sweeps nothing: it reported {without_a_drive:?}. A check that catches \
+         this subject without a drive is a check whose coverage under `run_all` is not partial \
+         after all, and `RETENTION_DRIVEN_CHECKS` is then over-claiming."
+    );
+
+    let driven = drivable_mutant(Defect::RefusesTheOldestStartAfterASweep);
+    let with_a_drive: BTreeSet<&str> =
+        run_all_with_retention(&driven, DedupLevel::Linearizable, &driven)
+            .await
+            .into_iter()
+            .map(|violation| violation.check)
+            .collect();
+
+    assert_eq!(
+        with_a_drive,
+        BTreeSet::from([FEED_BOOTSTRAP_POSITION]),
+        "the same backend must be caught once the suite is handed its retention drive, and by \
+         the check whose row exempts `FeedStart::Oldest` from the retention floor. Nothing \
+         reported means the drive no longer reaches the defect, so the assertion that needs a \
+         driver has stopped needing one or stopped running; a second check reported means this \
+         subject is wrong in more than the one way it is built to be."
+    );
+}
+
+/// A bootstrap that begins one entry past what a sweep left is caught, and
+/// only under a drive.
+///
+/// The test above establishes that a driven assertion exists at all. This
+/// one establishes that the *other* half of DESIGN's
+/// `feed-bootstrap-position` row is driven too. The row states two things
+/// about a read taken after retention has swept — that it begins at the
+/// oldest entry still retained, and that it is never refused on the
+/// retention floor — and a subject for one is not a subject for the other.
+/// [`Defect::RefusesTheOldestStartAfterASweep`] never answers;
+/// [`Defect::SkipsTheOldestEntryASweepLeft`] answers, and answers from one
+/// entry too far in.
+///
+/// Without it the position half of that clause would be an assertion no
+/// subject reaches — it would fire only against a backend nobody had built,
+/// and a check nothing can fail reads as coverage it does not have.
+///
+/// **A fresh subject for each call**, for the reason the test above gives.
+#[tokio::test]
+async fn a_bootstrap_after_a_sweep_must_begin_at_the_oldest_entry_left() {
+    let undriven = drivable_mutant(Defect::SkipsTheOldestEntryASweepLeft);
+    let without_a_drive: BTreeSet<&str> = run_all(&undriven, DedupLevel::Linearizable)
+        .await
+        .into_iter()
+        .map(|violation| violation.check)
+        .collect();
+
+    assert!(
+        without_a_drive.is_empty(),
+        "a backend that begins a bootstrap one entry past what a sweep left must pass \
+         `run_all`, which sweeps nothing and so leaves that backend nothing to be wrong \
+         about: it reported {without_a_drive:?}."
+    );
+
+    let driven = drivable_mutant(Defect::SkipsTheOldestEntryASweepLeft);
+    let with_a_drive: BTreeSet<&str> =
+        run_all_with_retention(&driven, DedupLevel::Linearizable, &driven)
+            .await
+            .into_iter()
+            .map(|violation| violation.check)
+            .collect();
+
+    assert_eq!(
+        with_a_drive,
+        BTreeSet::from([FEED_BOOTSTRAP_POSITION]),
+        "the same backend must be caught once the suite is handed its retention drive. \
+         Nothing reported means the assertion that a post-sweep bootstrap begins at the \
+         oldest entry still retained has stopped discriminating, and the only other \
+         assertion on that read is the one that requires it not to be refused - which this \
+         subject does not break, because it answers."
+    );
+}
+
+/// Every check named as covered only in part is a check [`run_all`]
+/// dispatches.
+///
+/// [`RETENTION_DRIVEN_CHECKS`] is not one of the constants that partition
+/// DESIGN's sixteen and it makes a different kind of claim: not that a check
+/// is unwritten, but that a written, dispatched, green check still has an
+/// assertion that did not run. That claim is only meaningful about a check
+/// `run_all` actually runs — a name here that was unwritten or blocked would
+/// be saying a check is *partly* covered when it is not covered at all,
+/// which reads as more coverage rather than less.
+#[test]
+fn the_retention_driven_checks_are_checks_run_all_dispatches() {
+    assert!(
+        !RETENTION_DRIVEN_CHECKS.is_empty(),
+        "`RETENTION_DRIVEN_CHECKS` is empty, so `run_all` covers every check it dispatches in \
+         full and `run_all_with_retention` adds nothing. If that is true, the second entry \
+         point and this constant have both outlived their reason and should go together; if it \
+         is not, a check has been dropped from the accounting"
+    );
+    let dispatched: BTreeSet<&str> = IMPLEMENTED_CHECKS
+        .iter()
+        .chain(ADDITIONAL_CHECKS)
+        .copied()
+        .collect();
+    for check in RETENTION_DRIVEN_CHECKS {
+        assert!(
+            dispatched.contains(check),
+            "`{check}` is named as covered only in part by `run_all`, and `run_all` does not \
+             dispatch it at all. `UNWRITTEN_CHECKS` and `BLOCKED_CHECKS` are where a check that \
+             does not run is named; naming it here reports no coverage as partial coverage"
         );
     }
 }
@@ -299,7 +514,46 @@ async fn the_reference_backend_conforms_to_a_repeated_run() {
 /// [`Defect::AFeedPageDropsTheEntryAtItsLimit`] for completeness and
 /// [`Defect::FeedOrdersByTheAcceptanceInstant`] for correction order, each
 /// naming that check alone. `super::contract_mutants`'s header says which
-/// decision of a feed page each of the five feed subjects lands in.
+/// decision of a feed page each of the six feed subjects lands in.
+///
+/// [`Defect::AFeedBootstrapReadStartsAtTheHead`] is the eighth wide row and
+/// the widest of them, and it is the one whose coupling is easiest to state:
+/// **every feed read in this suite bootstraps from `FeedStart::Oldest`,
+/// because that is the only way to start one.** A consumer that holds no
+/// position has one name to ask by, so a backend that reads that name as
+/// "start from now" hands an empty stream to every read the suite takes
+/// before it has a cursor of its own — which is the first read of every feed
+/// check there is. The four it meets are the four that take one:
+/// `feed-bootstrap-position` reports that a bootstrap delivered nothing and
+/// so did not begin at the oldest entry, `feed-snapshot-and-replay` that its
+/// paginated scan never delivered the entries it seeded,
+/// `feed-completeness` that entries its replicas had acknowledged were never
+/// handed to a walk, and `server-field-round-trip` that the one of its five
+/// properties read off the feed could not be answered at all.
+///
+/// There is no fixture arrangement that separates them, and the reason is
+/// stronger than the one behind the other wide rows: the others are coupled
+/// through a rule DESIGN states once, and this one is coupled through the
+/// *start mode itself*. A check that avoided `FeedStart::Oldest` would have
+/// to begin from a position it was issued, and a position is issued by a
+/// read — so the first read is `Oldest` or there is no first read.
+///
+/// What the wider row costs is what the others cost: it establishes that
+/// these four checks together notice a backend whose bootstrap starts at the
+/// head, not which of them noticed. What makes it worth having anyway is
+/// that no other subject in the matrix reaches
+/// `feed-bootstrap-position` at all — this is that check's only row, and
+/// `crate::contract::checks::feed_bootstrap_position`'s own docs record
+/// which of its assertions the subject reaches and which stay gaps.
+///
+/// **One subject in `super::contract_mutants` is deliberately not in this
+/// matrix.** [`Defect::RefusesTheOldestStartAfterASweep`]'s defect needs
+/// retention to have swept, `run_all` sweeps nothing, and a row for it would
+/// therefore assert the empty set — which is not a statement about
+/// discrimination at all. Its column is asserted by
+/// [`a_retention_driven_assertion_is_reached_only_with_a_driver`], against
+/// both entry points, and that is also the test that holds
+/// `RETENTION_DRIVEN_CHECKS` to meaning something.
 const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (Defect::QuantityThroughFloat, &[QUANTITY_ROUND_TRIP]),
     (
@@ -390,6 +644,15 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
     (
         Defect::FeedOrdersByTheAcceptanceInstant,
         &[FEED_COMPLETENESS],
+    ),
+    (
+        Defect::AFeedBootstrapReadStartsAtTheHead,
+        &[
+            FEED_BOOTSTRAP_POSITION,
+            FEED_SNAPSHOT_AND_REPLAY,
+            FEED_COMPLETENESS,
+            SERVER_FIELD_ROUND_TRIP,
+        ],
     ),
 ];
 

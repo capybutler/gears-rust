@@ -10,10 +10,11 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Ten subjects wrap a real reference
-//! backend and are that backend plus one interception; the other thirteen
-//! re-implement it, and a re-implementation is the same backend only as far
-//! as the checks can see. [`MutantLedger`] states how far that is.
+//! *Behaviourally* is the exact word. Thirteen subjects wrap a real
+//! reference backend and are that backend plus one interception; the other
+//! thirteen re-implement it, and a re-implementation is the same backend
+//! only as far as the checks can see. [`MutantLedger`] states how far that
+//! is.
 //!
 //! # Why none of this lives in `reference`
 //!
@@ -29,16 +30,17 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Ten defects fit (quantity, the
+//! strongest form the subject can take. Thirteen defects fit (quantity, the
 //! store's own acceptance instant, a defaulted origin, period-blind dedup,
 //! entry-type-blind dedup, the entry-type-blind conflict read-back,
-//! point-read scope, the undecided converged-only lookup, and the two
-//! withdrawal defects): three rewrite a field on the way in, three keep an
-//! index beside the ledger — two to refuse an admission, one only to decide
-//! which stored entry a collision is answered with — two change what the
-//! point read answers, one by substituting the scope and one by declining
-//! to decide, and two rewrite how a second withdrawal of a record is
-//! answered.
+//! point-read scope, the undecided converged-only lookup, the two
+//! withdrawal defects, and the three bootstrap defects): three rewrite a
+//! field on the way in, three keep an index beside the ledger — two to
+//! refuse an admission, one only to decide which stored entry a collision
+//! is answered with — two change what the point read answers, one by
+//! substituting the scope and one by declining to decide, two rewrite how a
+//! second withdrawal of a record is answered, and three reinterpret what
+//! `FeedStart::Oldest` names.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other
 //! thirteen (selection column, fold exclusion, missing unique constraint,
@@ -53,8 +55,7 @@
 //! mirrors the reference where the defect is not, and it is smaller in one
 //! stated way that no check reaches — see [`MutantLedger`].
 //!
-//! # The five feed defects, and the four places a feed page decides
-//! something
+//! # The eight feed defects: five in the loop, three above it
 //!
 //! `read_feed_page` is one loop over a ledger, and it makes four decisions a
 //! defect can land in: what **order** it walks the ledger in, where the page
@@ -83,6 +84,30 @@
 //!
 //! None of the five is a wrapper, and none could be: the loop is the
 //! method, so an interception would have had to re-implement it anyway.
+//!
+//! **Three more land above the loop, and all three are wrappers.** Before
+//! the loop runs there is one further decision: what `start` *names*. A
+//! defect there substitutes a different start or declines the call, and
+//! everything after it is the exemplar's own — which is what an
+//! interception is for. DESIGN §3.3's `feed-bootstrap-position` row is the
+//! rule all three break, and it has three clauses:
+//!
+//! * **Never the head** — [`Defect::AFeedBootstrapReadStartsAtTheHead`],
+//!   an absent cursor read as "start from now".
+//! * **Never refused on the retention floor** —
+//!   [`Defect::RefusesTheOldestStartAfterASweep`], the cursor refusal
+//!   decided above the branch instead of inside it.
+//! * **At the oldest entry the subscription retains** —
+//!   [`Defect::SkipsTheOldestEntryASweepLeft`], the bootstrap position
+//!   derived from the retention mark with the boundary the wrong side of
+//!   it.
+//!
+//! The last two show nothing until a sweep has run, so
+//! [`mutant`] hands them out like any other subject and
+//! [`super::run_all`] finds them conforming. They are reached through
+//! [`drivable_mutant`] and [`super::run_all_with_retention`] instead, and
+//! `contract_tests` says why neither has a row in the discrimination
+//! matrix.
 //!
 //! # DESIGN's three `LATEST` keys, and the subject for each
 //!
@@ -164,6 +189,7 @@ use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, ast};
 use uuid::Uuid;
 
 use super::reference::InMemoryReferencePlugin;
+use super::retention::ContractRetention;
 use crate::error::UsageCollectorPluginError;
 use crate::feed::{FeedPage, FeedPosition, FeedStart};
 use crate::models::{
@@ -692,6 +718,116 @@ pub(super) enum Defect {
     /// invalidation off a feed page and looks each up by identifier, so a
     /// reordered page changes nothing it reads.
     FeedOrdersByTheAcceptanceInstant,
+    /// Begins a bootstrap feed read at the head — `FeedStart::Oldest`
+    /// delegated as `FeedStart::After(<the position the feed has reached>)`.
+    ///
+    /// **The mistake a backend makes by treating "no cursor supplied" as
+    /// "start from now".** It is the natural shape when a feed is built on a
+    /// change stream, a logical-replication slot or a `LISTEN`/`NOTIFY`
+    /// channel: those hand out a position at the moment you subscribe, and
+    /// "where the subscriber is" is the only position the machinery has. A
+    /// port that reaches for it answers every resumed read correctly, which
+    /// is every read a consumer that already holds a cursor ever makes — and
+    /// then hands every *new* consumer an empty stream and a cursor at the
+    /// head. DESIGN rules it out in the two places it defines the name:
+    /// §3.1's `FeedStart` row has *"v1 admits these two, and neither begins
+    /// at the head"*, and the SPI's `read_feed_page` doc has
+    /// *"`FeedStart::Oldest` means the oldest position this plugin still
+    /// serves for `subscription` under `scope` — never the head"*.
+    ///
+    /// **It is a wrapper, and it is the first feed defect that could be
+    /// one.** The five before it land inside the page loop, so intercepting
+    /// them would have meant re-implementing the loop; this one lands in how
+    /// `start` is *interpreted* before the loop runs, which is exactly what
+    /// an interception can replace. The head position it substitutes is read
+    /// out of the inner backend — one unbounded page over the same
+    /// subscription and scope, whose cursor is by definition the head — for
+    /// want of any other way to name a position a plugin owns.
+    ///
+    /// Nothing else changes: `FeedStart::After` is delegated untouched, the
+    /// page carries whatever the inner backend carries, and the cursor is
+    /// the inner backend's own.
+    AFeedBootstrapReadStartsAtTheHead,
+    /// Refuses `FeedStart::Oldest` with `CursorBeyondRetention` once
+    /// retention has swept a subscribed type — the cursor refusal applied to
+    /// both arms of `FeedStart` instead of to one.
+    ///
+    /// **The mistake a backend makes by deciding the refusal before it looks
+    /// at where the read begins.** `read_feed_page` has one retention check
+    /// to make and two start modes to make it for, and the check reads a
+    /// mark that says nothing about the caller: *"has retention removed an
+    /// entry of a subscribed type after this position"*. Written once, above
+    /// the branch, it is correct for `After` and wrong for `Oldest` — which
+    /// asks for no particular continuation and so cannot have lost one.
+    /// DESIGN §3.3's `feed-bootstrap-position` row says so in as many words:
+    /// `FeedStart::Oldest` *"is never refused on the retention floor"*.
+    ///
+    /// What it costs is the worst failure this row has: a consumer that has
+    /// to bootstrap **after** a sweep — which is every consumer that
+    /// bootstraps at all on a backend old enough to have swept once — can
+    /// never start. It cannot retry its way out either, because the mark
+    /// only ever rises.
+    ///
+    /// **This subject is not in the discrimination matrix, and could not
+    /// be.** Its defect needs a mark to exist, a mark needs a sweep, and a
+    /// sweep needs a driver; `super::run_all` hands none, so under the
+    /// matrix's dispatch this subject is behaviourally the reference backend
+    /// and a row for it would assert the empty set. It is the subject
+    /// `contract_tests`' `a_retention_driven_assertion_is_reached_only_with_a_driver`
+    /// runs instead, against both entry points, and that test is where its
+    /// column is asserted.
+    ///
+    /// The mark it keeps is its own rather than the inner backend's, which
+    /// the wrapper cannot see. It records the type of every drop driven
+    /// through it, which over-approximates a real mark: a drop that removed
+    /// nothing raises no mark in the reference backend and records a type
+    /// here. Nothing observes the difference, because every drop the suite
+    /// drives over this subject removes an entry — and the
+    /// over-approximation is in the direction that makes the subject *more*
+    /// wrong, never less, so it cannot hide the defect it exists to show.
+    RefusesTheOldestStartAfterASweep,
+    /// Begins a bootstrap feed read one entry **past** the oldest entry a
+    /// sweep left — the bootstrap position derived from the retention floor
+    /// with the boundary the wrong side of it.
+    ///
+    /// **The mistake a backend makes by resolving `FeedStart::Oldest` out of
+    /// its own retention marks.** That is a reasonable way to answer the
+    /// question: a mark records the highest position of the entries a sweep
+    /// removed — the `TimescaleDB` plugin's DESIGN gives
+    /// `usage_feed_retention_marks` exactly that meaning — so "the oldest I
+    /// still serve" is *after* the mark, and a read resolved that way is
+    /// correct. It is correct only while the boundary is exclusive on the
+    /// mark and inclusive on the first row above it, and that is the same
+    /// inclusive/exclusive choice
+    /// [`Defect::AFeedPageRedeliversTheEntryAtItsCursor`] gets wrong on the
+    /// resume path. Here it is got wrong on the bootstrap path, and in the
+    /// other direction: one entry is skipped rather than repeated.
+    ///
+    /// **Nothing shows until a sweep has run.** With no mark there is no
+    /// boundary to be on the wrong side of, so an undriven run meets the
+    /// exemplar exactly. That is what makes this a second subject only a
+    /// drive reaches, and it reaches the half of DESIGN's
+    /// `feed-bootstrap-position` row that
+    /// [`Defect::RefusesTheOldestStartAfterASweep`] does not: that one is
+    /// refused and never answers, this one answers and begins in the wrong
+    /// place. The row states both — *"begins at the oldest entry the
+    /// subscription retains … and is never refused on the retention
+    /// floor"* — and a subject for one is not a subject for the other.
+    ///
+    /// What it costs is an entry per sweep, silently. Every consumer that
+    /// bootstraps after a sweep begins one entry late, and the entry it
+    /// skipped is the oldest thing the backend still holds, so nothing will
+    /// offer it again.
+    ///
+    /// The position it skips to is read out of the inner backend — one page
+    /// at a limit of one from `Oldest`, whose cursor is the oldest retained
+    /// entry's own position — for want of any way for a wrapper to see a
+    /// sequence. A backend making this mistake for real reads it from its
+    /// marks table.
+    ///
+    /// **Not in the discrimination matrix**, for the reason
+    /// [`Defect::RefusesTheOldestStartAfterASweep`] is not.
+    SkipsTheOldestEntryASweepLeft,
 }
 
 /// The subject one defect names, ready to be handed to
@@ -713,6 +849,9 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
         | Defect::IgnoresScopeOnThePointRead
         | Defect::AnswersNotConvergedForAnAcknowledgedEntry
         | Defect::AbsorbsAWithdrawalWithAnotherReason
+        | Defect::AFeedBootstrapReadStartsAtTheHead
+        | Defect::RefusesTheOldestStartAfterASweep
+        | Defect::SkipsTheOldestEntryASweepLeft
         | Defect::RefusesAWithdrawalWithTheSameReason => Box::new(WrappedReference::new(defect)),
         Defect::SelectsOnWindowStart
         | Defect::FoldsTheInvalidation
@@ -745,7 +884,7 @@ pub(super) fn mutant(defect: Defect) -> Box<dyn UsageCollectorPluginV1> {
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
 /// answer — is code written here. See that method's doc.
-struct WrappedReference {
+pub(super) struct WrappedReference {
     /// The conforming backend everything is delegated to.
     inner: InMemoryReferencePlugin,
     /// Which rule this subject breaks.
@@ -804,6 +943,19 @@ struct WrappedReference {
     /// mirror cannot drift and no entry the inner refused is ever read back
     /// from it.
     five_component_rows: Mutex<BTreeMap<EntryTypeBlindKey, Vec<UsageRecord>>>,
+    /// The GTS types retention has been driven over through this wrapper,
+    /// which is the mark [`Defect::RefusesTheOldestStartAfterASweep`] reads.
+    /// Unused by the other ten defects.
+    ///
+    /// The wire string rather than a [`MeterTypeId`], which implements
+    /// neither `Ord` nor `PartialOrd`; the reference backend's own
+    /// `retention_marks` is keyed the same way and for the same reason.
+    ///
+    /// A type is recorded whatever the drop removed, because a wrapper
+    /// cannot see the inner backend's marks and has only the call to go on.
+    /// That over-approximates a mark and the defect's own doc says what the
+    /// over-approximation costs.
+    swept_types: Mutex<BTreeSet<String>>,
 }
 
 /// The four inputs a period-blind dedup identity keys on:
@@ -843,7 +995,66 @@ impl WrappedReference {
             period_blind_keys: Mutex::new(BTreeMap::new()),
             entry_type_blind_keys: Mutex::new(BTreeMap::new()),
             five_component_rows: Mutex::new(BTreeMap::new()),
+            swept_types: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Whether retention has been driven over any type in `subscription`.
+    ///
+    /// The subscription is scanned rather than the whole set compared,
+    /// because the reference backend's own refusal reads its marks *"per
+    /// subscribed GTS type"* and a subject wrong about which types it
+    /// consults would be wrong in a second way.
+    fn a_subscribed_type_has_been_swept(
+        &self,
+        subscription: &[MeterTypeId],
+    ) -> Result<bool, UsageCollectorPluginError> {
+        let swept = self.swept_types.lock().map_err(|_| {
+            UsageCollectorPluginError::internal("the mutant's retention mark lock is poisoned")
+        })?;
+        Ok(subscription
+            .iter()
+            .any(|gts_type_id| swept.contains(gts_type_id.as_str())))
+    }
+
+    /// The position the feed has reached for `subscription` under `scope`,
+    /// read out of the inner backend.
+    ///
+    /// One unbounded page at the widest limit there is: the inner backend
+    /// advances its cursor past every entry it scans whether or not the
+    /// page carries it, so a page that scanned the whole ledger hands back
+    /// the head. [`Defect::AFeedBootstrapReadStartsAtTheHead`] substitutes
+    /// it for `FeedStart::Oldest`.
+    async fn the_head(
+        &self,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+    ) -> Result<Option<FeedPosition>, UsageCollectorPluginError> {
+        let page = self
+            .inner
+            .read_feed_page(subscription, scope, FeedStart::Oldest, None, u64::MAX)
+            .await?;
+        Ok(page.next)
+    }
+
+    /// The position just after the oldest entry `subscription` still
+    /// retains, read out of the inner backend.
+    ///
+    /// One page at a limit of one from `FeedStart::Oldest`: the inner
+    /// backend's cursor stops on the entry the page carried, so resuming
+    /// after it is resuming one entry too late.
+    /// [`Defect::SkipsTheOldestEntryASweepLeft`] substitutes it for
+    /// `FeedStart::Oldest` once a sweep has run.
+    async fn past_the_oldest_retained_entry(
+        &self,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+    ) -> Result<Option<FeedPosition>, UsageCollectorPluginError> {
+        let page = self
+            .inner
+            .read_feed_page(subscription, scope, FeedStart::Oldest, None, 1)
+            .await?;
+        Ok(page.next)
     }
 
     /// The defect's effect on one entry on its way in: a rewritten quantity,
@@ -884,8 +1095,9 @@ impl WrappedReference {
             // spelling the variants out makes that a compile error instead
             // of a matrix row whose subject does nothing. The point read's
             // defect is applied on the read path, the two withdrawal defects
-            // and the conflict read-back around the inner call, and the last
-            // seven never reach this type at all — `mutant` routes them to
+            // and the conflict read-back around the inner call, the three
+            // bootstrap defects on the feed path, and the last thirteen
+            // never reach this type at all — `mutant` routes them to
             // `MutantLedger` — but exhaustiveness is the whole point.
             Defect::IgnoresScopeOnThePointRead
             | Defect::AnswersNotConvergedForAnAcknowledgedEntry
@@ -904,6 +1116,9 @@ impl WrappedReference {
             | Defect::AFeedPageRedeliversTheEntryAtItsCursor
             | Defect::ABoundedReplayNeverCloses
             | Defect::AFeedPageDropsTheEntryAtItsLimit
+            | Defect::AFeedBootstrapReadStartsAtTheHead
+            | Defect::RefusesTheOldestStartAfterASweep
+            | Defect::SkipsTheOldestEntryASweepLeft
             | Defect::FeedOrdersByTheAcceptanceInstant => Ok(record),
         }
     }
@@ -1295,7 +1510,18 @@ impl UsageCollectorPluginV1 for WrappedReference {
             .await
     }
 
-    /// Delegated whole. No defect routed to this wrapper touches the feed.
+    /// Delegated, with `FeedStart::Oldest` reinterpreted by the two defects
+    /// that are about what that start mode means.
+    ///
+    /// Both land **above** the page loop rather than inside it, which is why
+    /// they can be interceptions at all where the five feed defects in
+    /// [`MutantLedger`] cannot: one substitutes a different `start`, the
+    /// other declines to serve the call. Everything after that decision is
+    /// the exemplar's own loop, cursor and page.
+    ///
+    /// `FeedStart::After` is delegated untouched by both. It is matched with
+    /// a wildcard arm because [`FeedStart`] is `#[non_exhaustive]`, and a
+    /// start mode added later is one neither defect has an opinion about.
     async fn read_feed_page(
         &self,
         subscription: &[MeterTypeId],
@@ -1304,6 +1530,36 @@ impl UsageCollectorPluginV1 for WrappedReference {
         until: Option<FeedPosition>,
         limit: u64,
     ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
+        let bootstrapping = matches!(start, FeedStart::Oldest);
+
+        if bootstrapping
+            && self.defect == Defect::RefusesTheOldestStartAfterASweep
+            && self.a_subscribed_type_has_been_swept(subscription)?
+        {
+            return Err(UsageCollectorPluginError::CursorBeyondRetention);
+        }
+
+        let substituted =
+            if bootstrapping && self.defect == Defect::AFeedBootstrapReadStartsAtTheHead {
+                self.the_head(subscription, scope).await?
+            } else if bootstrapping
+                && self.defect == Defect::SkipsTheOldestEntryASweepLeft
+                && self.a_subscribed_type_has_been_swept(subscription)?
+            {
+                self.past_the_oldest_retained_entry(subscription, scope)
+                    .await?
+            } else {
+                None
+            };
+        // The inner backend carries a continuation on every live page, so
+        // `None` from either probe is unreachable through it. Delegating the
+        // original start is the only answer to it that is not a second
+        // defect.
+        let start = match substituted {
+            Some(position) => FeedStart::After(position),
+            None => start,
+        };
+
         self.inner
             .read_feed_page(subscription, scope, start, until, limit)
             .await
@@ -1323,6 +1579,58 @@ impl UsageCollectorPluginV1 for WrappedReference {
             .get_reconciliation_metadata(tenant_id, gts_type_id, time_range, fold, scope)
             .await
     }
+}
+
+/// The retention drive, delegated to the exemplar and recorded.
+///
+/// Every wrapped subject implements it rather than only the one defect that
+/// reads the record, for the reason every wrapped subject carries the three
+/// dedup indexes it may not use: a capability that exists on the shape means
+/// any defect routed here can be handed to
+/// [`run_all_with_retention`](super::run_all_with_retention) without first
+/// growing a second shape. The sweep itself is the exemplar's, so a subject
+/// under a drive is still the reference backend plus exactly its own named
+/// mistake.
+#[async_trait]
+impl ContractRetention for WrappedReference {
+    /// Records the type and hands the drive to the inner backend.
+    ///
+    /// The record is taken **before** the delegation for the same reason the
+    /// two dedup indexes claim a key before the inner call does: it is a
+    /// write inside the same transaction as the sweep, and a mark a backend
+    /// raised for a sweep that then failed is a mark a real backend would
+    /// also be left holding.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the inner backend answers, plus a poisoned-lock report of
+    /// this wrapper's own.
+    async fn drop_before(
+        &self,
+        gts_type_id: &MeterTypeId,
+        floor: time::OffsetDateTime,
+    ) -> Result<(), String> {
+        self.swept_types
+            .lock()
+            .map_err(|_| "the mutant's retention mark lock is poisoned".to_owned())?
+            .insert(gts_type_id.as_str().to_owned());
+        self.inner.drop_before(gts_type_id, floor).await
+    }
+}
+
+/// The subject one defect names, as a concrete type a driven run can hold.
+///
+/// [`mutant`] erases its subject behind `Box<dyn UsageCollectorPluginV1>`,
+/// which is right for the discrimination matrix and useless for
+/// [`run_all_with_retention`](super::run_all_with_retention): that entry
+/// point wants the same backend as a [`ContractRetention`] too, and a value
+/// erased behind one of the two traits cannot be recovered as the other.
+/// This returns the wrapper itself, so a caller can lend it as both.
+///
+/// Only the wrapped shape is offered. [`MutantLedger`] implements no
+/// retention and none of its defects is about one.
+pub(super) fn drivable_mutant(defect: Defect) -> WrappedReference {
+    WrappedReference::new(defect)
 }
 
 /// One round trip of a quantity through a binary float.
@@ -2452,8 +2760,9 @@ impl LatestOrder {
             // defect added later and forgotten here would silently fold
             // under DESIGN's order and report nothing at all, which is a
             // matrix row whose subject does nothing rather than a compile
-            // error. Ten of these never reach this type - `mutant` routes
-            // them to `WrappedReference` - but exhaustiveness is the point.
+            // error. Twelve of these never reach this type - `mutant`
+            // routes them to `WrappedReference` - but exhaustiveness is the
+            // point.
             Defect::QuantityThroughFloat
             | Defect::StampsItsOwnAcceptedAt
             | Defect::DefaultsOriginToLive
@@ -2473,6 +2782,9 @@ impl LatestOrder {
             | Defect::AFeedPageRedeliversTheEntryAtItsCursor
             | Defect::ABoundedReplayNeverCloses
             | Defect::AFeedPageDropsTheEntryAtItsLimit
+            | Defect::AFeedBootstrapReadStartsAtTheHead
+            | Defect::RefusesTheOldestStartAfterASweep
+            | Defect::SkipsTheOldestEntryASweepLeft
             | Defect::FeedOrdersByTheAcceptanceInstant => Self::Declared,
         }
     }

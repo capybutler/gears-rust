@@ -22,6 +22,19 @@
 //!   (`a_page_minted_without_a_fingerprint_is_refused_rather_than_shipped`,
 //!   `a_cursor_is_refused_when_the_query_carries_no_fingerprint`) and the
 //!   other pg suites. Not `keyset`, which carries no tests of its own.
+//! * This run is **undriven**: it calls [`contract::run_all`], not
+//!   `contract::run_all_with_retention`, so the checks in
+//!   [`contract::RETENTION_DRIVEN_CHECKS`] run here without the assertions
+//!   that need a retention sweep to have happened. That is right while
+//!   those checks have a row below — a backend whose feed refuses every
+//!   read fails them on their undriven half alone, and driving a sweep
+//!   would add nothing but a second way to say so. It stops being right
+//!   the moment such a row is paid off: whoever does that is claiming
+//!   conformance for a check this run only partly exercised, and should
+//!   switch this test to the driven entry point at the same time. This
+//!   backend already sweeps — `retention_sweep_integration_pg` drives it —
+//!   so what is missing is the `contract::retention::ContractRetention`
+//!   impl beside the SPI one, not the capability.
 //! * A green run no longer means "everything that ran passed". It means
 //!   exactly the non-conformances [`NOT_YET_CONFORMING`] declares failed,
 //!   no more and no fewer — that list names what this backend cannot pass

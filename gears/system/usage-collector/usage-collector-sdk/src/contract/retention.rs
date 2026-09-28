@@ -5,15 +5,25 @@
 //! rather than served as a short page, whatever that cursor's own age and
 //! whether or not the caller's scope admitted that entry"*. A backend only
 //! reaches that state once retention has actually removed something, and
-//! nothing in this suite's reach removes anything:
+//! nothing on the SPI removes anything:
 //! [`UsageCollectorPluginV1`](crate::plugin_api::UsageCollectorPluginV1)
-//! declares seven methods and none of them purges, while
-//! [`run_all`](super::run_all) takes a plugin handle and a dedup level and
-//! nothing else.
+//! declares seven methods and none of them purges.
 //!
 //! So the drive arrives beside the SPI. [`ContractRetention`] is an optional
 //! capability a backend under test exposes, rather than an eighth SPI method
 //! or an out-of-band step no type describes and no run performs.
+//! [`run_all_with_retention`](super::run_all_with_retention) is where it
+//! reaches the checks; [`run_all`](super::run_all) takes a plugin handle and
+//! a dedup level and nothing else, and the checks in
+//! [`RETENTION_DRIVEN_CHECKS`](super::RETENTION_DRIVEN_CHECKS) run there
+//! without the assertions that need a sweep.
+//!
+//! **The first check to need one is `feed-bootstrap-position`**, and it
+//! needs the exemption rather than the refusal: DESIGN section 3.3 has
+//! `FeedStart::Oldest` *"never refused on the retention floor"* and
+//! beginning *"at the oldest entry the subscription retains"*, and neither
+//! clause says anything until something has been swept. The refusal itself
+//! is `feed-retention-refusal`'s, still unwritten.
 //!
 //! # This is a conforming capability, not a test hook
 //!
@@ -41,8 +51,18 @@
 //! A plugin under test implements this against whatever its storage engine
 //! already does on a timer: a chunk drop, a partition detach, a `DELETE`.
 //! It is not asked for a new capability, only for that one on demand. A
-//! backend that cannot be driven is simply not handed to the checks that
-//! need a drive, and its conformance is reported as covering less.
+//! backend that cannot be driven is handed to [`run_all`](super::run_all)
+//! instead, and its conformance is reported as covering less - which is
+//! what [`RETENTION_DRIVEN_CHECKS`](super::RETENTION_DRIVEN_CHECKS) is for.
+//!
+//! **A driven check may remove entries, and has to put them back.** The
+//! suite's own premise is that it never removes anything, so a repeated run
+//! re-delivers identical entries and a conforming backend absorbs them; a
+//! swept entry is not absorbed on re-delivery but inserted afresh, at the
+//! head of the feed's order rather than where it was. Every check that
+//! drives a sweep therefore restores its own meter before it returns, and
+//! `the_reference_backend_conforms_to_a_repeated_run_under_a_retention_drive`
+//! is what holds them to it.
 
 use crate::models::MeterTypeId;
 

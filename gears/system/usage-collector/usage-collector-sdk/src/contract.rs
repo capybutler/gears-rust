@@ -37,29 +37,39 @@
 //!
 //! Every entry of the returned vector names the check that produced it
 //! ([`ContractViolation::check`]), so one run reports every failure rather
-//! than stopping at the first. The suite writes entries and never removes
-//! them, so a backend under test starts each run from whatever state the
-//! previous one left; the fixtures are keyed so that a repeated run
-//! resubmits identical entries rather than colliding with different ones.
+//! than stopping at the first. Under [`run_all`] the suite writes entries
+//! and never removes them, so a backend under test starts each run from
+//! whatever state the previous one left; the fixtures are keyed so that a
+//! repeated run resubmits identical entries rather than colliding with
+//! different ones. Under [`run_all_with_retention`] a driven check may
+//! remove its own entries, and is then responsible for putting them back —
+//! see that entry point's caution.
 //!
-//! # Thirteen of DESIGN's sixteen, fourteen checks in all
+//! # Fourteen of DESIGN's sixteen, fifteen checks in all
 //!
 //! DESIGN §3.3 tabulates sixteen checks. [`run_all`] currently runs the
-//! thirteen in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not
+//! fourteen in [`IMPLEMENTED_CHECKS`], and **an empty violation list is not
 //! a statement about the rest**.
 //!
-//! **Two counts run through this file, and both are right.** Thirteen is
-//! what [`run_all`] covers of DESIGN's sixteen; fourteen is how many checks
-//! it runs, the fourteenth being the one in [`ADDITIONAL_CHECKS`] that
+//! **Two counts run through this file, and both are right.** Fourteen is
+//! what [`run_all`] covers of DESIGN's sixteen; fifteen is how many checks
+//! it runs, the fifteenth being the one in [`ADDITIONAL_CHECKS`] that
 //! DESIGN does not tabulate. A count about coverage of DESIGN is therefore
-//! thirteen and a count about what a run executed is fourteen, and neither
-//! substitutes for the other. The other three of the sixteen are named, not
+//! fourteen and a count about what a run executed is fifteen, and neither
+//! substitutes for the other. The other two of the sixteen are named, not
 //! omitted:
 //!
 //! * [`UNWRITTEN_CHECKS`] — expressible against the seven methods this
-//!   gear's SPI declares, not yet written. All three.
+//!   gear's SPI declares, not yet written. Both.
 //! * [`BLOCKED_CHECKS`] — out of the SPI's reach, each with what unblocks
 //!   it. Now empty: no check DESIGN tabulates is beyond the current trait.
+//!
+//! **And a check [`run_all`] does dispatch can still be covered only in
+//! part.** [`RETENTION_DRIVEN_CHECKS`] names the checks with an assertion
+//! that needs a backend's retention to have swept; [`run_all`] cannot drive
+//! one and skips it, and [`run_all_with_retention`] runs them whole. A
+//! caller reporting coverage reports that constant too: it is the one way a
+//! green, dispatched, implemented check can still be short of its row.
 //!
 //! The three constants are asserted to partition DESIGN's sixteen exactly,
 //! so the split is a fact the test suite keeps rather than a paragraph that
@@ -107,11 +117,12 @@
 use crate::plugin_api::UsageCollectorPluginV1;
 use checks::{
     at_most_one_invalidation, converged_target_lookup, dedup_concurrent, dedup_floor,
-    dedup_identity_over_window, feed_completeness, feed_snapshot_and_replay,
-    invalidation_excluded_from_fold, latest_tie_break, quantity_round_trip,
-    record_and_invalidation_distinct_identity, scope_is_a_filter_on_every_read_path,
-    server_field_round_trip, window_end_selection,
+    dedup_identity_over_window, feed_bootstrap_position, feed_completeness,
+    feed_snapshot_and_replay, invalidation_excluded_from_fold, latest_tie_break,
+    quantity_round_trip, record_and_invalidation_distinct_identity,
+    scope_is_a_filter_on_every_read_path, server_field_round_trip, window_end_selection,
 };
+use retention::ContractRetention;
 
 mod checks;
 mod feed_walk;
@@ -270,13 +281,14 @@ pub const LATEST_TIE_BREAK: &str = "latest-tie-break";
 /// holding no entries — and asserted nowhere in this suite. A porter
 /// reading a green run should not read it as that path being exercised.
 ///
-/// Two further checks dispatch a feed read — `server-field-round-trip`
-/// always, and `dedup-concurrent` under an `Eventual` declaration — and
-/// neither narrows anything: every entry either one stores is inside the
-/// scope it sends, so those reads buy shape coverage on the path — a plugin
-/// that chokes on a compiled scope there meets one — and no scope
-/// *enforcement* whatever, for the reason the suite's shared single-tenant
-/// filter buys none either.
+/// Four further checks dispatch a feed read — `server-field-round-trip`,
+/// `feed-completeness` and `feed-bootstrap-position` always, and
+/// `dedup-concurrent` under an `Eventual` declaration — and none of them
+/// narrows anything: every entry any of the four stores is inside the scope
+/// it sends, so those reads buy shape coverage on the path — a plugin that
+/// chokes on a compiled scope there meets one — and no scope *enforcement*
+/// whatever, for the reason the suite's shared single-tenant filter buys
+/// none either.
 pub const SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH: &str = "scope-is-a-filter-on-every-read-path";
 
 /// The [`ContractViolation::check`] value a violation carries when the
@@ -313,6 +325,7 @@ pub const IMPLEMENTED_CHECKS: &[&str] = &[
     LATEST_TIE_BREAK,
     FEED_SNAPSHOT_AND_REPLAY,
     FEED_COMPLETENESS,
+    FEED_BOOTSTRAP_POSITION,
 ];
 
 /// The checks [`run_all`] runs that DESIGN §3.3 does not tabulate.
@@ -335,7 +348,7 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// The DESIGN §3.3 checks that are writable against the current SPI and are
 /// not yet written.
 ///
-/// **Three of DESIGN's sixteen**, which is every check [`run_all`] does
+/// **Two of DESIGN's sixteen**, which is every check [`run_all`] does
 /// not run. Each is expressible against the seven methods this gear's SPI
 /// declares — nothing here waits on the SPI to grow, and
 /// [`BLOCKED_CHECKS`] is empty. Being unwritten is a statement about this
@@ -344,29 +357,27 @@ pub const ADDITIONAL_CHECKS: &[&str] = &[SCOPE_IS_A_FILTER_ON_EVERY_READ_PATH];
 /// the trait.
 ///
 /// **[`FEED_RETENTION_REFUSAL`] needed one thing more than an author, and
-/// it now has it.** Its refusal half asserts that a cursor whose
+/// it now has all of it.** Its refusal half asserts that a cursor whose
 /// continuation retention has truncated is refused, and a backend only
 /// reaches that state once retention has purged an entry. No SPI method
 /// purges, which is why the drive sits beside the SPI:
 /// [`retention::ContractRetention`] is the optional capability a backend
 /// under test exposes, and [`reference::InMemoryReferencePlugin`]
-/// implements it, so `CursorBeyondRetention` is reachable there. The check
-/// itself is still unwritten, and so is the entry point that would hand
-/// [`run_all`] a driver — both land together, because an entry point taking
-/// a driver it cannot yet use would be a claim about a check that does not
-/// exist. This was a gap in the harness rather than in the SPI, which is
-/// why the name stayed here and never went back into [`BLOCKED_CHECKS`].
+/// implements it, so `CursorBeyondRetention` is reachable there. The entry
+/// point that hands a check a driver waited on a check that could use
+/// one — an entry point taking a driver nothing consumes would be a claim
+/// about a check that does not exist — and `feed-bootstrap-position` is
+/// that check, so [`run_all_with_retention`] and [`RETENTION_DRIVEN_CHECKS`]
+/// landed with it. Nothing is left in this one's way but an author. This
+/// was a gap in the harness rather than in the SPI, which is why the name
+/// stayed here and never went back into [`BLOCKED_CHECKS`].
 ///
 /// **A caller reporting coverage has to report this constant.**
 /// [`run_all`] returning no violations says nothing whatever about a check
 /// it never ran, so a green run read against [`IMPLEMENTED_CHECKS`] alone
 /// reports thirteen checks' worth of evidence as sixteen.
 // @cpt-dod:cpt-cf-usage-collector-dod-plugin-conformance-suite:p1
-pub const UNWRITTEN_CHECKS: &[&str] = &[
-    FEED_BOOTSTRAP_POSITION,
-    FEED_RETENTION_REFUSAL,
-    FEED_POSITION_BOUNDED,
-];
+pub const UNWRITTEN_CHECKS: &[&str] = &[FEED_RETENTION_REFUSAL, FEED_POSITION_BOUNDED];
 
 /// The DESIGN §3.3 checks the current SPI cannot express, each paired with
 /// what unblocks it.
@@ -397,12 +408,55 @@ pub const UNWRITTEN_CHECKS: &[&str] = &[
 /// establish it for them.
 pub const BLOCKED_CHECKS: &[(&str, &str)] = &[];
 
+/// The checks [`run_all`] covers **only in part**, because an assertion of
+/// each needs a backend's retention to have actually swept.
+///
+/// No method on [`UsageCollectorPluginV1`] removes anything — DESIGN
+/// declares none — so the drive sits beside the SPI as
+/// [`retention::ContractRetention`], and it reaches the checks through
+/// [`run_all_with_retention`] rather than through [`run_all`]. A check named
+/// here runs under both entry points and asserts strictly more under the
+/// second.
+///
+/// **It is not a fourth coverage constant** and it does not partition
+/// anything: every name here is also in [`IMPLEMENTED_CHECKS`], which is
+/// asserted rather than stated — a check `run_all` does not dispatch at all
+/// is not a check `run_all` covers in part. What this constant adds is the
+/// one thing the other four cannot say: that a check can be *listed as
+/// implemented, dispatched, and green* and still have an assertion that did
+/// not run. A caller reporting coverage from a [`run_all`] result has to
+/// report it, for the same reason it has to report [`UNWRITTEN_CHECKS`].
+///
+/// The claim is held mechanically as well as written down.
+/// `contract_tests`' `a_retention_driven_assertion_is_reached_only_with_a_driver`
+/// runs a subject whose only defect is one a driven assertion reaches, and
+/// requires it to pass under [`run_all`] and fail under
+/// [`run_all_with_retention`]. A check that grew a half needing no drive
+/// would start failing the first half of that test; one whose drive stopped
+/// reaching its defect would start passing the second.
+pub const RETENTION_DRIVEN_CHECKS: &[&str] = &[FEED_BOOTSTRAP_POSITION];
+
 /// Run every implemented check, returning one entry per violation.
 ///
 /// An empty result means the plugin conforms as far as this suite reaches.
 /// The checks are run in sequence rather than concurrently: several store
 /// entries and then read them back, and interleaving them would let one
 /// check observe another's rows.
+///
+/// # Some of the checks this runs are covered only in part
+///
+/// **An empty result is not a statement about every assertion of every
+/// check it dispatched.** [`RETENTION_DRIVEN_CHECKS`] names the checks with
+/// an assertion that needs a backend's retention to have swept, which
+/// nothing on the SPI performs and this entry point therefore cannot drive.
+/// Those checks run here and skip that assertion.
+/// [`run_all_with_retention`] takes the drive and runs them whole.
+///
+/// Which checks those are is left to the constant rather than counted here,
+/// for the reason every other count in this file is: a name joining it would
+/// leave the sentence stale one commit before anything failed.
+///
+/// # The rest of the signature
 ///
 /// The plugin arrives behind `&dyn` rather than a generic parameter. The
 /// suite is dispatched once per backend and its cost is entirely in the
@@ -421,6 +475,58 @@ pub async fn run_all(
     plugin: &dyn UsageCollectorPluginV1,
     level: DedupLevel,
 ) -> Vec<ContractViolation> {
+    run_every_check(plugin, level, None).await
+}
+
+/// The same suite, with the checks in [`RETENTION_DRIVEN_CHECKS`] run
+/// whole.
+///
+/// `retention` is the capability a backend under test exposes beside the
+/// SPI: [`retention::ContractRetention`] runs that backend's own retention
+/// sweep at a moment a check chooses, which is the one thing the seven SPI
+/// methods cannot be asked for. Its module docs say why that is a
+/// conforming capability rather than a test hook, and what a porter
+/// implements it against.
+///
+/// **Prefer this entry point.** [`run_all`] keeps its signature and its
+/// meaning, and a backend that cannot be driven is handed to it and reported
+/// as covering less; a backend that can be driven and is handed to
+/// [`run_all`] anyway is reported as covering less for no reason.
+///
+/// # One caution a caller has to read
+///
+/// A driven check may **remove** entries, which no other check in this suite
+/// does, and the suite's premise that a repeated run re-delivers identical
+/// entries rather than colliding with different ones rests on nothing ever
+/// being removed. Each driven check is therefore responsible for putting its
+/// own fixtures back — `feed-bootstrap-position` does, and its
+/// `restore_this_checks_own_meter` says how and why — and
+/// `the_reference_backend_conforms_to_a_repeated_run_under_a_retention_drive`
+/// is what holds them to it.
+pub async fn run_all_with_retention(
+    plugin: &dyn UsageCollectorPluginV1,
+    level: DedupLevel,
+    retention: &dyn ContractRetention,
+) -> Vec<ContractViolation> {
+    run_every_check(plugin, level, Some(retention)).await
+}
+
+/// The suite both entry points dispatch, with the retention drive optional.
+///
+/// One body rather than [`run_all_with_retention`] calling [`run_all`] and
+/// then running the driven checks itself. That shape would dispatch every
+/// driven check **twice** — once undriven from the inner call and once
+/// driven — and a check that writes fixtures and reads them back is not
+/// idempotent under a second dispatch inside one run: the undriven pass of
+/// `feed-bootstrap-position` would leave its meter stocked and the driven
+/// pass would purge it, so the two passes would report on two different
+/// ledgers and every violation would be doubled. Here each check is
+/// dispatched once, and the option is the only thing that differs.
+async fn run_every_check(
+    plugin: &dyn UsageCollectorPluginV1,
+    level: DedupLevel,
+    retention: Option<&dyn ContractRetention>,
+) -> Vec<ContractViolation> {
     let mut violations = quantity_round_trip(plugin).await;
     violations.extend(window_end_selection(plugin).await);
     violations.extend(dedup_identity_over_window(plugin).await);
@@ -434,6 +540,7 @@ pub async fn run_all(
     violations.extend(latest_tie_break(plugin).await);
     violations.extend(feed_snapshot_and_replay(plugin).await);
     violations.extend(feed_completeness(plugin).await);
+    violations.extend(feed_bootstrap_position(plugin, retention).await);
     violations.extend(scope_is_a_filter_on_every_read_path(plugin).await);
     violations
 }
