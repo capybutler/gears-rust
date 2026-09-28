@@ -80,14 +80,31 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 const LOCK_TIMEOUT: &str = "5s";
 
 /// Session GUCs applied to every request-path pool connection at connect time:
-/// `statement_timeout` (config-driven) bounds how long a statement may run, and
-/// `lock_timeout` (fixed at [`LOCK_TIMEOUT`]) how long it waits on a contended
-/// lock, so a wedged backend cannot pin pool connections indefinitely and
-/// exhaust the pool. Applied as `-c name=value` startup parameters so the bound
-/// holds from the connection's first query, with no extra round-trip.
-fn connection_gucs(statement_timeout_secs: u64) -> [(&'static str, String); 2] {
+/// `statement_timeout` (config-driven) bounds how long a statement may run,
+/// `transaction_timeout` (config-driven) how long a whole transaction may stay
+/// open, and `lock_timeout` (fixed at [`LOCK_TIMEOUT`]) how long a statement
+/// waits on a contended lock, so a wedged backend cannot pin pool connections
+/// indefinitely and exhaust the pool. Applied as `-c name=value` startup
+/// parameters so the bounds hold from the connection's first query, with no
+/// extra round-trip.
+///
+/// `transaction_timeout` is what bounds the feed's settled horizon, which is
+/// cluster-wide (`docs/DESIGN.md` §4.1 item 2): a statement bound alone leaves a
+/// transaction that opened and then stalled between statements holding the
+/// horizon back. The retention sweep's detached connection is
+/// `pool.acquire().await?.detach()` ([`super::retention_sweep`]) — the same
+/// physical connection with the same startup parameters — so it carries this
+/// bound already and needs no `SET` of its own.
+fn connection_gucs(
+    statement_timeout_secs: u64,
+    transaction_timeout_secs: u64,
+) -> [(&'static str, String); 3] {
     [
         ("statement_timeout", format!("{statement_timeout_secs}s")),
+        (
+            "transaction_timeout",
+            format!("{transaction_timeout_secs}s"),
+        ),
         ("lock_timeout", LOCK_TIMEOUT.to_owned()),
     ]
 }
@@ -100,31 +117,88 @@ fn connection_gucs(statement_timeout_secs: u64) -> [(&'static str, String); 2] {
 fn pool_connect_options(
     database_url: &str,
     statement_timeout_secs: u64,
+    transaction_timeout_secs: u64,
 ) -> Result<PgConnectOptions, sqlx::Error> {
-    Ok(connect_options(database_url)?.options(connection_gucs(statement_timeout_secs)))
+    Ok(connect_options(database_url)?.options(connection_gucs(
+        statement_timeout_secs,
+        transaction_timeout_secs,
+    )))
+}
+
+/// Server-wide settings the plugin refuses to start without.
+///
+/// `docs/DESIGN.md` §3.5 states both the rule and the reason it cannot be met
+/// per transaction: "Unlike `synchronous_commit`, `fsync` and
+/// `full_page_writes` are server-wide and cannot be forced per transaction, and
+/// either one off can lose a committed write on a crash."
+///
+/// The `TimescaleDB` extension check the same sequence names
+/// (`inst-pool-extension`) is met by the migration's
+/// `CREATE EXTENSION IF NOT EXISTS timescaledb`, which fails when the extension
+/// is unavailable. No second check is added for it.
+const REQUIRED_ON_SETTINGS: [&str; 2] = ["fsync", "full_page_writes"];
+
+/// Verify every setting in [`REQUIRED_ON_SETTINGS`] reads `on`.
+///
+/// Called from [`build_pool`] before it returns, so a failure leaves the plugin
+/// unregistered rather than running against a server that can lose an
+/// acknowledged write (`inst-pool-return`).
+///
+/// # Errors
+/// Returns `sqlx::Error` if a setting cannot be read, or
+/// `sqlx::Error::Configuration` naming the setting and its value if it is not
+/// `on`.
+async fn verify_durability_settings(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    for setting in REQUIRED_ON_SETTINGS {
+        let value: String = sqlx::query_scalar("SELECT current_setting($1)")
+            .bind(setting)
+            .fetch_one(&mut *conn)
+            .await?;
+        if value != "on" {
+            return Err(sqlx::Error::Configuration(
+                format!(
+                    "TimescaleDB server reports {setting} = {value}; this plugin refuses to start \
+                     against a server that can lose an acknowledged write. The setting is \
+                     server-wide and cannot be forced per transaction, so it is the operator's to \
+                     fix on the server"
+                )
+                .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build the connection pool with TLS enforced (`sslmode >= require`, see
 /// [`connect_options`]) and every request-path connection bounded by
-/// `statement_timeout` + `lock_timeout` (see [`connection_gucs`]).
+/// `statement_timeout` + `transaction_timeout` + `lock_timeout` (see
+/// [`connection_gucs`]), then refuse the server outright unless every setting
+/// in `REQUIRED_ON_SETTINGS` reads `on`.
 ///
 /// # Errors
-/// Returns `sqlx::Error` if the DSN is malformed or the pool cannot connect
-/// within the timeout.
+/// Returns `sqlx::Error` if the DSN is malformed, the pool cannot connect
+/// within the timeout, or a durability setting is not `on`.
 pub async fn build_pool(cfg: &TimescaleDbPluginConfig) -> Result<PgPool, sqlx::Error> {
     // Unwrap the secret DSN only here, at the connection boundary: keep it behind
     // `secrecy`'s opaque-debug/zeroize guarantees and expose the bytes just long
     // enough for sqlx to parse them into `PgConnectOptions`.
     let dsn = cfg.database_url.clone_into_secret_string();
-    PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .min_connections(cfg.pool_size_min)
         .max_connections(cfg.pool_size_max)
         .acquire_timeout(Duration::from_secs(cfg.connection_timeout_secs))
         .connect_with(pool_connect_options(
             dsn.expose_secret(),
             cfg.statement_timeout_secs,
+            cfg.transaction_timeout_secs,
         )?)
-        .await
+        .await?;
+    // On one acquired connection, and before the pool is handed out: the caller
+    // never sees a pool built against a server that fails the check.
+    let mut conn = pool.acquire().await?;
+    verify_durability_settings(&mut conn).await?;
+    drop(conn);
+    Ok(pool)
 }
 
 /// Fixed advisory-lock key namespacing the plugin's post-migration setup.

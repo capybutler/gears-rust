@@ -320,6 +320,45 @@ pub async fn bring_up_with(
     })
 }
 
+/// How many times [`await_setting`] reads a server setting back, and how long
+/// it waits between reads - 5 seconds in total.
+///
+/// `pg_reload_conf()` signals the postmaster and returns before every backend
+/// has re-read the file, so a caller that asserted straight after it would be
+/// asserting against the value the connection still held. Measured on
+/// `timescale/timescaledb:2.29.2-pg18`, a `sighup` setting flipped by
+/// `ALTER SYSTEM` reads back changed on the very next statement, on a session
+/// that was already open; the budget is what turns a slower box into a failure
+/// rather than a hang.
+const SETTING_ATTEMPTS: u32 = 50;
+const SETTING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Block until `current_setting(setting)` reads `expected` on `pool`.
+///
+/// # Panics
+///
+/// If it still does not after [`SETTING_ATTEMPTS`] reads, naming the setting,
+/// what was wanted and what was last read. A test that carried on regardless
+/// would assert against the old value and pass for the wrong reason.
+pub async fn await_setting(pool: &PgPool, setting: &str, expected: &str) {
+    let mut last = String::new();
+    for _ in 0..SETTING_ATTEMPTS {
+        last = sqlx::query_scalar("SELECT current_setting($1)")
+            .bind(setting)
+            .fetch_one(pool)
+            .await
+            .expect("read the setting back");
+        if last == expected {
+            return;
+        }
+        tokio::time::sleep(SETTING_INTERVAL).await;
+    }
+    panic!(
+        "{setting} still reads {last} after {:?}, wanted {expected}",
+        SETTING_INTERVAL * SETTING_ATTEMPTS
+    );
+}
+
 /// Wait for the two refresh policies' first run, which `TimescaleDB` starts
 /// within seconds of creating them, then delete them. A background refresh
 /// racing a test would make "stale until refreshed" assertions flaky; tests

@@ -56,24 +56,31 @@ fn connect_options_rejects_malformed_dsn() {
 }
 
 #[test]
-fn connection_gucs_bind_statement_and_fixed_lock_timeout() {
-    // The statement timeout is config-driven (seconds -> `<n>s`); the lock
-    // timeout is a fixed constant so a contended lock fails fast rather than
-    // blocking.
-    let gucs = connection_gucs(45);
+fn connection_gucs_bind_both_timeouts_and_the_fixed_lock_timeout() {
+    // Both the statement and the transaction timeout are config-driven
+    // (seconds -> `<n>s`) and distinct values are passed so one cannot stand in
+    // for the other; the lock timeout is a fixed constant so a contended lock
+    // fails fast rather than blocking.
+    let gucs = connection_gucs(45, 90);
     assert_eq!(gucs[0], ("statement_timeout", "45s".to_owned()));
-    assert_eq!(gucs[1], ("lock_timeout", LOCK_TIMEOUT.to_owned()));
+    assert_eq!(gucs[1], ("transaction_timeout", "90s".to_owned()));
+    assert_eq!(gucs[2], ("lock_timeout", LOCK_TIMEOUT.to_owned()));
 }
 
 #[test]
-fn pool_connect_options_sets_statement_and_lock_timeouts() {
-    // The request-path connect options must carry both GUCs as `-c` startup
+fn pool_connect_options_sets_both_timeouts_and_the_lock_timeout() {
+    // The request-path connect options must carry all three GUCs as `-c` startup
     // parameters so every pooled connection is bounded at connect time.
-    let opts = pool_connect_options("postgres://u:p@h/db?sslmode=require", 45).expect("valid dsn");
+    let opts =
+        pool_connect_options("postgres://u:p@h/db?sslmode=require", 45, 90).expect("valid dsn");
     let applied = opts.get_options().expect("runtime options must be set");
     assert!(
         applied.contains("statement_timeout=45s"),
         "statement_timeout GUC missing; got: {applied}"
+    );
+    assert!(
+        applied.contains("transaction_timeout=90s"),
+        "transaction_timeout GUC missing; got: {applied}"
     );
     assert!(
         applied.contains("lock_timeout=5s"),

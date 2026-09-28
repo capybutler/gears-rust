@@ -23,11 +23,16 @@ impl ConfigProvider for StaticConfig {
 
 #[tokio::test]
 async fn init_aborts_before_startup_io_when_already_cancelled() {
-    // `cfg.validate()` runs before the cancel race and requires a non-empty
-    // `database_url`; the bogus DSN is never dialed because the cancelled token
-    // short-circuits before `build_pool`.
+    // `cfg.validate()` runs before the cancel race, so the config must carry
+    // every field that has no working default - `database_url` and
+    // `feed_replay_horizon_secs` - or init fails validation and never reaches
+    // the race this test is about. The bogus DSN is never dialed, because the
+    // cancelled token short-circuits before `build_pool`.
     let provider = Arc::new(StaticConfig(json!({
-        "config": { "database_url": "postgres://127.0.0.1:1/unused?sslmode=disable" }
+        "config": {
+            "database_url": "postgres://127.0.0.1:1/unused?sslmode=disable",
+            "feed_replay_horizon_secs": 3600
+        }
     })));
 
     let cancel = CancellationToken::new();

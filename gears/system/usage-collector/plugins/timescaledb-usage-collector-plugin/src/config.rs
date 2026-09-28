@@ -81,6 +81,13 @@ pub struct TimescaleDbPluginConfig {
     /// Postgres treats `statement_timeout = 0` as *disabled*, which would
     /// reintroduce the unbounded-query footgun.
     pub statement_timeout_secs: u64,
+    /// Postgres `transaction_timeout` applied on every pool connection and so
+    /// on the retention sweep's detached connection, which is drawn from the
+    /// same pool. Bounds a whole transaction rather than one statement
+    /// (`docs/DESIGN.md` §3.5, §4.1 item 2), so a transaction that opened and
+    /// then stalled between statements cannot hold the feed's settled horizon
+    /// indefinitely. MUST be greater than [`Self::statement_timeout_secs`].
+    pub transaction_timeout_secs: u64,
     /// Time width of a new ledger chunk, in seconds. Applied at startup to
     /// chunks created afterwards; existing chunks keep their range.
     pub chunk_time_interval_secs: u64,
@@ -92,6 +99,27 @@ pub struct TimescaleDbPluginConfig {
     pub type_key_slice_width: u32,
     /// Seconds between two retention sweeps.
     pub retention_sweep_interval_secs: u64,
+    /// How far an entry's `accepted_at` may sit from the INSERT statement's own
+    /// `statement_timestamp()`, in either direction, before the write path
+    /// refuses it as `Transient` (`docs/DESIGN.md` §3.6
+    /// `cpt-cf-uc-plugin-seq-ingest-dedup`).
+    ///
+    /// It is enforced at write time rather than budgeted, because the
+    /// acceptance-order slack
+    /// `S = 2 × feed_acceptance_slack_secs + statement_timeout_secs` is what the
+    /// feed's retention refusal rests on (`docs/DESIGN.md` §3.6,
+    /// Acceptance-order slack). **Zero does not mean disabled** and is
+    /// rejected: a slack of zero refuses every entry.
+    pub feed_acceptance_slack_secs: u64,
+    /// The deployment's operational replay horizon H. `docs/DESIGN.md` §3.5:
+    /// "every feed position no older than this is served."
+    ///
+    /// Required, because the SPI does not carry it and configuration is its only
+    /// source. Nothing reads it until the feed read path exists; it is validated
+    /// here so a deployment cannot reach that point unconfigured. The retention
+    /// it obliges of every GTS type is §4.1 item 6, which is the deployer's rule
+    /// and not checked by this plugin.
+    pub feed_replay_horizon_secs: u64,
     /// Seconds before now that the rollup's newest materialised bucket ends.
     /// Newer buckets are answered from the ledger by real-time aggregation, so
     /// a refresh never recomputes the hours ingestion is still writing. A
@@ -119,9 +147,12 @@ impl Default for TimescaleDbPluginConfig {
             pool_size_max: 16,
             connection_timeout_secs: 10,
             statement_timeout_secs: 30,
+            transaction_timeout_secs: 60,
             chunk_time_interval_secs: 7 * 86_400,
             type_key_slice_width: 1,
             retention_sweep_interval_secs: 3_600,
+            feed_acceptance_slack_secs: 120,
+            feed_replay_horizon_secs: 0,
             rollup_materialization_lag_secs: 7_200,
             rollup_live_window_secs: 259_200,
             rollup_refresh_interval_secs: 120,
@@ -151,9 +182,10 @@ impl TimescaleDbPluginConfig {
     ///
     /// # Errors
     /// Returns an error string for an empty DSN, a pool `max` below 2 or
-    /// `min > max`, a zero acquire timeout, a zero statement timeout, an interval
+    /// `min > max`, a zero acquire timeout, a zero statement timeout, a
+    /// transaction timeout at or below the statement timeout, an interval
     /// outside `(0, MAX_INTERVAL_SECS]`, a slice width outside
-    /// `[1, MAX_TYPE_KEY_SLICE_WIDTH]`, an hour-aligned setting that is not a multiple of 3600, a materialization lag under one hour or not below the live window, or a rollup interval outside `(0, MAX_INTERVAL_SECS]`.
+    /// `[1, MAX_TYPE_KEY_SLICE_WIDTH]`, an hour-aligned setting that is not a multiple of 3600, a materialization lag under one hour or not below the live window, or a rollup interval outside `(0, MAX_INTERVAL_SECS]`. `database_url` and `feed_replay_horizon_secs`, which carry no working default, are rejected when absent.
     pub fn validate(&self) -> Result<(), String> {
         if self.database_url.expose().trim().is_empty() {
             return Err("database_url must not be empty".to_owned());
@@ -183,6 +215,28 @@ impl TimescaleDbPluginConfig {
                  statement_timeout, leaving request-path queries unbounded)"
                     .to_owned(),
             );
+        }
+        if self.transaction_timeout_secs <= self.statement_timeout_secs {
+            return Err(format!(
+                "transaction_timeout_secs ({}) must be greater than statement_timeout_secs ({}): \
+                 it bounds a whole transaction where the statement timeout bounds one statement, \
+                 so an equal or lower value leaves the outer bound unreachable",
+                self.transaction_timeout_secs, self.statement_timeout_secs
+            ));
+        }
+        if self.feed_acceptance_slack_secs == 0
+            || self.feed_acceptance_slack_secs > MAX_INTERVAL_SECS
+        {
+            return Err(format!(
+                "feed_acceptance_slack_secs must be in (0, {MAX_INTERVAL_SECS}]: zero does not \
+                 disable the write-time acceptance check, it refuses every entry"
+            ));
+        }
+        if self.feed_replay_horizon_secs == 0 || self.feed_replay_horizon_secs > MAX_INTERVAL_SECS {
+            return Err(format!(
+                "feed_replay_horizon_secs must be in (0, {MAX_INTERVAL_SECS}] and has no default: \
+                 the SPI does not carry the replay horizon, so configuration is its only source"
+            ));
         }
         if self.chunk_time_interval_secs == 0
             || self.chunk_time_interval_secs > MAX_INTERVAL_SECS

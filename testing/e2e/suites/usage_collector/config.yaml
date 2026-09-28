@@ -185,3 +185,7 @@ gears:
       pool_size_max: 16
       connection_timeout_secs: 10
       statement_timeout_secs: 30
+      # Required: the SPI does not carry the replay horizon, so configuration is
+      # its only source. One hour is ample for a suite whose entries live for the
+      # length of one test run.
+      feed_replay_horizon_secs: 3600
