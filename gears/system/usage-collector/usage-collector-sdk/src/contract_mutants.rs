@@ -10,7 +10,7 @@
 //! `each_check_fails_against_its_own_defect_and_no_other` asserts a full
 //! column against each of them.
 //!
-//! *Behaviourally* is the exact word. Eighteen subjects wrap a real
+//! *Behaviourally* is the exact word. Nineteen subjects wrap a real
 //! reference backend and are that backend plus one interception; the other
 //! seventeen re-implement it, and a re-implementation is the same backend
 //! only as far as the checks can see. [`MutantLedger`] states how far that
@@ -30,19 +30,21 @@
 //! **A wrapper** ([`WrappedReference`]) delegates to a real
 //! [`InMemoryReferencePlugin`] and intercepts one method. Everything the
 //! defect is not about is then the exemplar's own behaviour, which is the
-//! strongest form the subject can take. Eighteen defects fit (quantity, the
+//! strongest form the subject can take. Nineteen defects fit (quantity, the
 //! store's own acceptance instant, a defaulted origin, period-blind dedup,
 //! entry-type-blind dedup, the entry-type-blind conflict read-back,
-//! point-read scope, the undecided converged-only lookup, the two
+//! point-read scope, the undecided converged-only lookup, the three
 //! withdrawal defects, the three bootstrap defects, the two
 //! position-encoding defects and the three empty-selection defects): three
 //! rewrite a field on the way in, three keep an index beside the ledger —
 //! two to refuse an admission, one only to decide which stored entry a
 //! collision is answered with — two change what the point read answers, one
-//! by substituting the scope and one by declining to decide, two rewrite how
-//! a second withdrawal of a record is answered, three reinterpret what
-//! `FeedStart::Oldest` names, two re-encode the position a page hands back,
-//! and three rewrite what a fold answers where nothing survived.
+//! by substituting the scope and one by declining to decide, three rewrite
+//! how a second withdrawal of a record is answered — one refusing it, one
+//! absorbing it and one answering it against the record it withdraws —
+//! three reinterpret what `FeedStart::Oldest` names, two re-encode the
+//! position a page hands back, and three rewrite what a fold answers where
+//! nothing survived.
 //!
 //! **A ledger of its own** ([`MutantLedger`]) is needed by the other
 //! seventeen (selection column, fold exclusion, missing unique constraint,
@@ -420,6 +422,40 @@ pub(super) enum Defect {
     /// Refuses a second withdrawal of a record even under the same reason code —
     /// the mistake a backend makes by keeping an at-most-one rule of its own.
     RefusesAWithdrawalWithTheSameReason,
+    /// Conflicts a second withdrawal against the record it withdraws rather
+    /// than against the accepted withdrawal.
+    ///
+    /// The mistake a backend makes by reading "at most one invalidation" as
+    /// a rule about the **record**: the collision is detected on the right
+    /// identity, and the entry handed back is then looked up through
+    /// `invalidates` rather than taken from the identity that collided.
+    /// DESIGN §3.3 rules that answer out in so many words — the `existing`
+    /// is *"that invalidation, never the record"* — and a caller told its
+    /// withdrawal collided with the measurement learns nothing it can act
+    /// on: the gateway lifts an invalidation's conflict to
+    /// `AlreadyInvalidated` naming `existing.id` and its reason code, and
+    /// the record carries no reason code at all.
+    ///
+    /// **Wrong about the answer alone**, and only on a refusal raised for an
+    /// entry that carries an invalidation. Admission is the exemplar's, so
+    /// the ledger holds one withdrawal per record and every read, fold and
+    /// feed page shows what a conforming backend's would; only the
+    /// `existing` a refusal carries is substituted. That is why the subject
+    /// is a wrapper, and the second confinement is what keeps it to one
+    /// check even though two others do compare a conflict's `existing`:
+    /// `dedup-floor` compares it twice and submits no invalidation at all,
+    /// and `record-and-invalidation-distinct-identity` submits one and has
+    /// all three of its submissions accepted, so neither raises a refusal
+    /// this subject can rewrite.
+    ///
+    /// **No claim is made here about the gear's own history, and one that
+    /// reads well is false.** Before `entry_type` became the sixth identity
+    /// input, the derivation read five and told a measurement from its
+    /// withdrawal by a reserved `inv:` key prefix instead — so a record and
+    /// its withdrawal derived *different* ids then too, and this answer was
+    /// never anything the gear gave. The subject exists because the clause
+    /// is DESIGN's, not because the code once broke it.
+    ConflictNamesTheRecord,
     /// Honours the scope on the list and aggregate paths and ignores it on
     /// the point read.
     IgnoresScopeOnThePointRead,
@@ -1168,6 +1204,7 @@ pub(super) fn carries_its_own_ledger(defect: Defect) -> bool {
         | Defect::RefusesTheOldestStartAfterASweep
         | Defect::SkipsTheOldestEntryASweepLeft
         | Defect::RefusesAWithdrawalWithTheSameReason
+        | Defect::ConflictNamesTheRecord
         | Defect::EmptySumIsAbsent
         | Defect::CoalescesEveryEmptyFoldToZero
         | Defect::AGroupNothingSurvivesInStillGetsABucket
@@ -1228,7 +1265,7 @@ fn type_component(gts_type_id: &MeterTypeId) -> [u8; MUTANT_POSITION_COMPONENT_B
 /// failure against one of these subjects is a failure against a conforming
 /// backend plus exactly the named mistake.
 ///
-/// One qualification, and it holds for all eighteen wrapped defects:
+/// One qualification, and it holds for all nineteen wrapped defects:
 /// [`Self::create_usage_records`] is not pure delegation. The inner backend
 /// still decides the batch, but the per-entry alignment around it — which
 /// entries reach it, and where a refusal of this wrapper's own lands in the
@@ -1240,7 +1277,7 @@ pub(super) struct WrappedReference {
     defect: Defect,
     /// The period-blind dedup index [`Defect::DedupIgnoresThePeriod`] keys
     /// on: `(tenant_id, gts_type_id, idempotency_key, entry_type)` to the
-    /// entry that claimed it. Unused by the other seventeen defects.
+    /// entry that claimed it. Unused by the other eighteen defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -1256,7 +1293,7 @@ pub(super) struct WrappedReference {
     /// The entry-type-blind dedup index [`Defect::DedupIgnoresTheEntryType`]
     /// keys on: `(tenant_id, gts_type_id, idempotency_key, window_start,
     /// window_end)` to the entry that claimed it. Unused by the other
-    /// seventeen defects.
+    /// eighteen defects.
     ///
     /// A claim is recorded when the entry is admitted rather than after the
     /// inner backend stores it, which is a unique index written inside the
@@ -1275,7 +1312,7 @@ pub(super) struct WrappedReference {
     /// The rows [`Defect::ConflictReadBackIgnoresTheEntryType`] reads a
     /// colliding entry back from: the same five components, to **every**
     /// entry accepted under them, in arrival order. Unused by the other
-    /// seventeen defects.
+    /// eighteen defects.
     ///
     /// A `Vec` rather than one entry, because two rows under one five-tuple
     /// is the whole situation the defect is about, and the defect is which
@@ -1294,7 +1331,7 @@ pub(super) struct WrappedReference {
     five_component_rows: Mutex<BTreeMap<EntryTypeBlindKey, Vec<UsageRecord>>>,
     /// The GTS types retention has been driven over through this wrapper,
     /// which is the mark [`Defect::RefusesTheOldestStartAfterASweep`] reads.
-    /// Unused by the other seventeen defects.
+    /// Unused by the other eighteen defects.
     ///
     /// The wire string rather than a [`MeterTypeId`], which implements
     /// neither `Ord` nor `PartialOrd`; the reference backend's own
@@ -1307,7 +1344,7 @@ pub(super) struct WrappedReference {
     swept_types: Mutex<BTreeSet<String>>,
     /// The tenants each GTS type has been written under, which is what
     /// [`Defect::AFeedPositionIsKeyedPerTenant`] issues one position
-    /// component per. Unused by the other seventeen defects.
+    /// component per. Unused by the other eighteen defects.
     ///
     /// The wire string keys it rather than a [`MeterTypeId`], which
     /// implements neither `Ord` nor `PartialOrd`; `swept_types` above is
@@ -1456,7 +1493,7 @@ impl WrappedReference {
     /// issues.
     ///
     /// True for the two defects that key a position on something that grows
-    /// with a subscription, false for the other sixteen — which hand the
+    /// with a subscription, false for the other seventeen — which hand the
     /// inner backend's own encoding straight back, so a position of theirs
     /// is the exemplar's byte for byte.
     fn keys_its_position(&self) -> bool {
@@ -1601,16 +1638,18 @@ impl WrappedReference {
             // entries through untouched and report no violation at all;
             // spelling the variants out makes that a compile error instead
             // of a matrix row whose subject does nothing. The point read's
-            // defect is applied on the read path, the two withdrawal defects
-            // and the conflict read-back around the inner call, the three
-            // bootstrap defects on the feed path, the per-subscribed-type
-            // position defect on the way back out of it, and the last
-            // seventeen never reach this type at all — `mutant` routes them
-            // to `MutantLedger` — but exhaustiveness is the whole point.
+            // defect is applied on the read path, the three withdrawal
+            // defects and the conflict read-back around the inner call, the
+            // three bootstrap defects on the feed path, the
+            // per-subscribed-type position defect on the way back out of it,
+            // and the last seventeen never reach this type at all — `mutant`
+            // routes them to `MutantLedger` — but exhaustiveness is the
+            // whole point.
             Defect::IgnoresScopeOnThePointRead
             | Defect::AnswersNotConvergedForAnAcknowledgedEntry
             | Defect::AbsorbsAWithdrawalWithAnotherReason
             | Defect::RefusesAWithdrawalWithTheSameReason
+            | Defect::ConflictNamesTheRecord
             | Defect::ConflictReadBackIgnoresTheEntryType
             | Defect::SelectsOnWindowStart
             | Defect::FoldsTheInvalidation
@@ -1780,6 +1819,67 @@ impl WrappedReference {
         }
     }
 
+    /// [`Defect::ConflictNamesTheRecord`]: a conflict raised for an entry
+    /// carrying an invalidation is re-answered against the entry it
+    /// withdraws.
+    ///
+    /// The target is **read back from the inner backend** rather than
+    /// remembered here, so what the caller is handed is the exemplar's own
+    /// stored row, server fields included - which is what a backend
+    /// resolving `invalidates` in its conflict branch hands back. Nothing
+    /// else about the outcome moves: an acceptance is passed through, and a
+    /// conflict raised for a record has no target to substitute and is
+    /// passed through too.
+    ///
+    /// Async, which is why it sits here rather than in
+    /// [`Self::after_admission`] with the other two post-inner defects: the
+    /// read-back is an SPI call. It is applied **after** that method on both
+    /// create paths, so a conflict this subject rewrites is one the exemplar
+    /// decided.
+    ///
+    /// A read-back that fails leaves the inner backend's own conflict in
+    /// place. It is unreachable - an invalidation is only projectable
+    /// against a target the store already holds, and the scope is that
+    /// entry's own tenant - and a fall-through rather than an `expect` keeps
+    /// a subject the matrix drives reporting the exemplar's answer if it
+    /// ever stops holding.
+    async fn conflict_against_the_withdrawn_record(
+        &self,
+        record: &UsageRecord,
+        outcome: Result<UsageRecord, UsageCollectorPluginError>,
+    ) -> Result<UsageRecord, UsageCollectorPluginError> {
+        if self.defect != Defect::ConflictNamesTheRecord {
+            return outcome;
+        }
+        let Err(UsageCollectorPluginError::IdempotencyConflict {
+            idempotency_key,
+            existing,
+        }) = outcome
+        else {
+            return outcome;
+        };
+        let Some(invalidation) = record.invalidation.as_ref() else {
+            return Err(UsageCollectorPluginError::IdempotencyConflict {
+                idempotency_key,
+                existing,
+            });
+        };
+        match self
+            .inner
+            .get_usage_record(invalidation.target, &tenant_scope(record.tenant_id), true)
+            .await
+        {
+            Ok(target) => Err(UsageCollectorPluginError::idempotency_conflict(
+                idempotency_key,
+                target,
+            )),
+            Err(_) => Err(UsageCollectorPluginError::IdempotencyConflict {
+                idempotency_key,
+                existing,
+            }),
+        }
+    }
+
     /// [`Defect::ConflictReadBackIgnoresTheEntryType`]: the collision branch,
     /// decided against a row found on five components.
     ///
@@ -1914,7 +2014,9 @@ impl UsageCollectorPluginV1 for WrappedReference {
             return Err(refusal);
         }
         let outcome = self.inner.create_usage_record(record.clone()).await;
-        self.after_admission(&record, outcome)
+        let outcome = self.after_admission(&record, outcome);
+        self.conflict_against_the_withdrawn_record(&record, outcome)
+            .await
     }
 
     /// The batch, with the defect applied per entry and the survivors handed
@@ -1996,20 +2098,31 @@ impl UsageCollectorPluginV1 for WrappedReference {
             self.inner.create_usage_records(survivors).await?
         };
         let mut inner = inner.into_iter();
-        Ok(prepared
-            .into_iter()
-            .map(|entry| match entry {
+        // A loop rather than a `map`, because one post-inner defect is
+        // async: `conflict_against_the_withdrawn_record` reads the withdrawn
+        // record back from the inner backend, and a closure cannot await.
+        // The alignment is otherwise exactly what the `map` did - one inner
+        // outcome consumed per entry this wrapper passed on, in order, and a
+        // refusal of this wrapper's own kept where the entry stood.
+        let mut answers = Vec::with_capacity(prepared.len());
+        for entry in prepared {
+            match entry {
                 Ok(record) => {
                     let outcome = inner.next().unwrap_or_else(|| {
                         Err(UsageCollectorPluginError::internal(
                             "the inner backend answered fewer outcomes than the batch carried entries",
                         ))
                     });
-                    self.after_admission(&record, outcome)
+                    let outcome = self.after_admission(&record, outcome);
+                    answers.push(
+                        self.conflict_against_the_withdrawn_record(&record, outcome)
+                            .await,
+                    );
                 }
-                Err(err) => Err(err),
-            })
-            .collect())
+                Err(err) => answers.push(Err(err)),
+            }
+        }
+        Ok(answers)
     }
 
     /// The point read, and the two defects that change what it answers.
@@ -2208,7 +2321,7 @@ impl UsageCollectorPluginV1 for WrappedReference {
     /// [`Self::the_issued_position`] puts them back on the way out, so the
     /// inner backend is resumed at exactly the position it issued and what
     /// differs is the size of the token a caller carries. Both are no-ops
-    /// for the other sixteen defects.
+    /// for the other seventeen defects.
     ///
     /// `FeedStart::After` is delegated untouched by the bootstrap defects.
     /// It is matched with a wildcard arm because [`FeedStart`] is
@@ -3694,7 +3807,7 @@ impl LatestOrder {
             // defect added later and forgotten here would silently fold
             // under DESIGN's order and report nothing at all, which is a
             // matrix row whose subject does nothing rather than a compile
-            // error. Eighteen of these never reach this type - `mutant`
+            // error. Nineteen of these never reach this type - `mutant`
             // routes them to `WrappedReference` - but exhaustiveness is the
             // point.
             Defect::QuantityThroughFloat
@@ -3710,6 +3823,7 @@ impl LatestOrder {
             | Defect::AGroupNothingSurvivesInStillGetsABucket
             | Defect::AbsorbsAWithdrawalWithAnotherReason
             | Defect::RefusesAWithdrawalWithTheSameReason
+            | Defect::ConflictNamesTheRecord
             | Defect::IgnoresScopeOnThePointRead
             | Defect::AnswersNotConvergedForAnAcknowledgedEntry
             | Defect::LedgerHasNoUniqueConstraint

@@ -12,7 +12,7 @@
 //! establishes that the suite **runs** and nothing about whether any check
 //! would notice a non-conforming plugin — and a check that cannot fail is
 //! worse than a missing one, because a port is accepted on it and it reads
-//! as coverage. [`super::contract_mutants`] holds thirty deliberately
+//! as coverage. [`super::contract_mutants`] holds thirty-six deliberately
 //! non-conforming subjects, each behaviourally the reference backend wrong
 //! in exactly one plausible way, and two matrices assert a whole column
 //! against each of them.
@@ -725,6 +725,7 @@ const DISCRIMINATION_MATRIX: &[(Defect, &[&str])] = &[
         Defect::RefusesAWithdrawalWithTheSameReason,
         &[AT_MOST_ONE_INVALIDATION],
     ),
+    (Defect::ConflictNamesTheRecord, &[AT_MOST_ONE_INVALIDATION]),
     (
         Defect::IgnoresScopeOnThePointRead,
         &[
