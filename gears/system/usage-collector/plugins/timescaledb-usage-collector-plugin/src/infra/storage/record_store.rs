@@ -192,6 +192,27 @@ const INSERT_COLUMN_TYPES: [&str; 18] = [
 const DEDUP_CONFLICT_TARGET: &str =
     "tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key";
 
+/// The first statement of every write transaction, per `DESIGN.md` §3.5:
+/// *"Every write transaction runs `SET LOCAL synchronous_commit = on`, so an
+/// operator-level `synchronous_commit` of `off` or `local` cannot weaken an
+/// acknowledgement."*
+///
+/// **Why it cannot be a connection parameter like the timeouts.** The bound the
+/// plugin owes is per *transaction*, and a session default is what an operator
+/// can already set; `SET LOCAL` reverts at `COMMIT`, so it states the write
+/// path's own requirement rather than reconfiguring the pool. The server-wide
+/// `fsync` and `full_page_writes` are the pair that genuinely cannot be forced
+/// here, which is why they are startup checks instead
+/// ([`crate::infra::storage::pool`]).
+///
+/// **It does not cost the guarded statement its place as the transaction's
+/// first write**, which `DESIGN.md` §3.6 requires of it and the feed's settled
+/// horizon rests on. `SET` writes no tuple and takes no `XID`: `PostgreSQL`
+/// assigns one lazily, at the first statement that actually writes, so the
+/// transaction is still virtual until the `INSERT` runs. A later reader will
+/// ask, which is why this says so here.
+const FORCE_SYNCHRONOUS_COMMIT_SQL: &str = "SET LOCAL synchronous_commit = on";
+
 /// The ledger's **time** partition column, named beside the `id` in both
 /// conflict read-backs **for pruning and for nothing else**.
 ///
@@ -657,8 +678,9 @@ impl PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        let mut tx = conn
-            .begin()
+        // The write transaction, opened with `SET LOCAL synchronous_commit = on`
+        // as its first statement ([`begin_durable_write`]).
+        let mut tx = begin_durable_write(&mut conn)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
@@ -1130,8 +1152,9 @@ impl PgRecordStore {
             type_keys.push(key);
         }
 
-        let mut tx = conn
-            .begin()
+        // Same transaction shape as the single-row path, for the same reason
+        // ([`begin_durable_write`]).
+        let mut tx = begin_durable_write(&mut conn)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
@@ -1294,6 +1317,31 @@ impl InsertColumns {
 /// after a failure, so "now" is the property that matters. A
 /// rollback that itself fails says the connection is gone; the pool discards
 /// it, and the caller's original error is the one worth returning.
+/// Open a write transaction and force its durability before anything writes.
+///
+/// One helper rather than two call sites, so the two write paths cannot drift
+/// in whether they issue [`FORCE_SYNCHRONOUS_COMMIT_SQL`] or in what they issue
+/// it before. Both paths resolve their type keys in autocommit first, so the
+/// transaction this opens carries the guarded statement and nothing ahead of it
+/// but the `SET LOCAL`.
+///
+/// Errors come back as the raw `sqlx::Error`: the caller owns the mapping, and
+/// on this path a failed `SET` leaves a transaction to roll back.
+// @cpt-dod:cpt-cf-uc-plugin-dod-durable-acknowledgement:p1
+async fn begin_durable_write(
+    conn: &mut PoolConnection<Postgres>,
+) -> Result<sqlx::Transaction<'_, Postgres>, sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    if let Err(e) = sqlx::query(FORCE_SYNCHRONOUS_COMMIT_SQL)
+        .execute(&mut *tx)
+        .await
+    {
+        rollback(tx).await;
+        return Err(e);
+    }
+    Ok(tx)
+}
+
 async fn rollback(tx: sqlx::Transaction<'_, Postgres>) {
     if let Err(err) = tx.rollback().await {
         tracing::warn!(
@@ -1718,9 +1766,6 @@ fn build_list_page(
 /// Called rather than written out at each site so that every identity decision
 /// on this path is visibly one, and so this doc is what a reader meets first.
 // @cpt-state:cpt-cf-uc-plugin-state-dedup-identity:p2
-// @cpt-dod:cpt-cf-uc-plugin-dod-dedup-identity-enforcement:p1
-// @cpt-algo:cpt-cf-uc-plugin-algo-withdrawal-identity-derivation:p1
-// @cpt-dod:cpt-cf-uc-plugin-dod-at-most-one-withdrawal:p1
 const fn entry_identity(record: &UsageRecord) -> Uuid {
     record.id
 }
@@ -2245,6 +2290,7 @@ impl RecordStore for PgRecordStore {
     /// that `async fn` returns — before [`with_retry`] reaches `on_retry` or
     /// its backoff sleep. Neither path holds a connection across a wait.
     // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-dedup:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-persist-single-entry:p1
     // @cpt-flow:cpt-cf-uc-plugin-flow-persist-withdrawal:p1
     // @cpt-state:cpt-cf-uc-plugin-state-entry-withdrawal:p2
     // @cpt-dod:cpt-cf-uc-plugin-dod-withdrawal-as-appended-entry:p1
@@ -2261,6 +2307,7 @@ impl RecordStore for PgRecordStore {
     }
 
     // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-batch:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-persist-entry-batch:p1
     // @cpt-dod:cpt-cf-uc-plugin-dod-record-and-withdrawal-coexist:p1
     async fn create_batch(
         &self,

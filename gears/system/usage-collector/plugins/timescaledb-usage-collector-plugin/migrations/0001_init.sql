@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- attribute (cpt-cf-usage-collector-adr-declaration-rehydration statement
     -- 6): it names the type, and a type's key never changes.
     type_key            int         NOT NULL,
+    -- `numeric` with no precision or scale modifier, so the submitted digits and
+    -- scale survive the store unchanged and nothing rounds, scales or truncates
+    -- a stored quantity.
+    -- @cpt-dod:cpt-cf-uc-plugin-dod-quantity-round-trip:p1
     quantity            numeric     NOT NULL,
     -- The covered period [window_start, window_end). The only emitter-supplied
     -- time attribution. The time-range predicate reads the end alone
@@ -115,6 +119,9 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- type, idempotency key and covered period, so a constraint over the first
     -- five alone would make every invalidation a collision with the very entry
     -- it withdraws.
+    -- @cpt-dod:cpt-cf-uc-plugin-dod-dedup-identity-enforcement:p1
+    -- @cpt-algo:cpt-cf-uc-plugin-algo-withdrawal-identity-derivation:p1
+    -- @cpt-dod:cpt-cf-uc-plugin-dod-at-most-one-withdrawal:p1
     CONSTRAINT usage_records_dedup_uniq
         UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key),
 

@@ -10,9 +10,11 @@ Updated:  2026-09-26 by Virtuozzo International GmbH
 Two definitions of done below stay unchecked and both are slice 3's, the plugin
 feed page and retention interlock: `cpt-cf-uc-plugin-dod-background-task-lifecycle`
 waits on the background loop sampling the feed's settled-horizon lag, and
-`cpt-cf-uc-plugin-dod-spi-conformance-release-gate` waits on the six feed rows
-`NOT_YET_CONFORMING` declares in `tests/contract_conformance_pg.rs`. The feature
-and status boxes above close with them.
+`cpt-cf-uc-plugin-dod-spi-conformance-release-gate` waits on the rows
+`NOT_YET_CONFORMING` declares in `tests/contract_conformance_pg.rs`, every one
+of which names slice 3. The count is left to the constant, which is expected to
+shrink as they are paid off. The feature and status boxes above close with
+them.
 
 Brings the TimescaleDB backend into existence and makes it discoverable. Covers
 the typed configuration load, the connection pool and its startup durability
@@ -601,9 +603,10 @@ statement or licensing assumption may appear outside this crate.
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-spi-conformance-release-gate`
 
-Open on the six rows `NOT_YET_CONFORMING` declares, which are slice 3's. The
-compile-time half holds: the crate implements the SDK trait's seven methods and
-nothing else on its public surface.
+Open on the rows `NOT_YET_CONFORMING` declares, every one of which names slice
+3. The compile-time half holds: the SPI is the SDK trait's seven methods, and
+the adapter implements all seven and adds no method of its own beyond its
+constructor.
 
 The system **MUST** implement the storage SPI's seven methods exactly as the gear
 declares them, verified at compile time against the SDK trait, and **MUST** pass

@@ -58,7 +58,6 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
     // @cpt-algo:cpt-cf-uc-plugin-algo-gts-registration:p1
     // @cpt-state:cpt-cf-uc-plugin-state-startup-lifecycle:p2
     // @cpt-dod:cpt-cf-uc-plugin-dod-gts-scoped-registration:p1
-    // @cpt-dod:cpt-cf-uc-plugin-dod-vendor-isolation:p1
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: TimescaleDbPluginConfig = ctx.config_expanded_or_default()?;
         cfg.validate()

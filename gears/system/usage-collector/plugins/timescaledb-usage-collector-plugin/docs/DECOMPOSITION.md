@@ -169,25 +169,26 @@ setup only.
 
   - [ ] `p1` - `cpt-cf-uc-plugin-fr-registration`
   - [x] `p1` - `cpt-cf-uc-plugin-fr-schema-provisioning`
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-durable-ack`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-durable-ack`
   - [ ] `p1` - `cpt-cf-uc-plugin-nfr-spi-stability`
 
   The durable-acknowledgement requirement is covered twice on purpose: this
   entry owns the startup check that refuses an unsafe server setting, and 2.2
   owns the per-transaction commit guarantee.
 
-  Three of the four stay open, each on something outside this entry's reach
+  Two of the four stay open, each on something outside this entry's reach
   today. `cpt-cf-uc-plugin-fr-registration` waits on the background loop's feed
-  settled-horizon sampling, which is slice 3's. `cpt-cf-uc-plugin-fr-durable-ack`
-  waits on 2.2's half, below. `cpt-cf-uc-plugin-nfr-spi-stability` waits on the
-  contract suite running with nothing declared non-conforming, which is slice
-  3's six feed rows in `NOT_YET_CONFORMING`.
+  settled-horizon sampling, which is slice 3's.
+  `cpt-cf-uc-plugin-nfr-spi-stability` waits on the contract suite running with
+  nothing declared non-conforming, which is what the rows of
+  `NOT_YET_CONFORMING` stand in the way of.
 
 - **Design Principles Covered**:
 
   - [ ] `p1` - `cpt-cf-uc-plugin-principle-spi-conformance`
 
-  Open on the same six rows as `cpt-cf-uc-plugin-nfr-spi-stability`: slice 3.
+  Open on the same rows as `cpt-cf-uc-plugin-nfr-spi-stability`, every one of
+  which names slice 3.
 
 - **Design Constraints Covered**:
 
@@ -229,9 +230,9 @@ setup only.
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`
 
-  Open on the one definition of done its feature document leaves unchecked,
-  `cpt-cf-uc-plugin-dod-durable-acknowledgement`, and on the throughput rate no
-  suite here measures. Both are named under Requirements Covered below.
+  Open on the throughput rate no suite here measures, and on nothing else:
+  every definition of done in its feature document is checked. Named under
+  Requirements Covered below.
 
 - **Purpose**: Delivers the plugin's write path: single and batch persistence
   of usage entries, deduplicated in the backend on the gear's six-part
@@ -295,16 +296,13 @@ setup only.
 
   - [x] `p1` - `cpt-cf-uc-plugin-fr-record-persistence`
   - [x] `p1` - `cpt-cf-uc-plugin-fr-idempotent-dedup`
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-durable-ack`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-durable-ack`
   - [x] `p1` - `cpt-cf-uc-plugin-fr-quantity-fidelity`
   - [x] `p1` - `cpt-cf-uc-plugin-fr-dedup-level`
   - [ ] `p1` - `cpt-cf-uc-plugin-nfr-ingestion-throughput`
 
-  Two stay open. `cpt-cf-uc-plugin-fr-durable-ack` waits on this entry's half
-  of it: the write transaction does not force `synchronous_commit`, so an
-  operator setting can still weaken an acknowledgement, and DESIGN section 3.5
-  requires it. `cpt-cf-uc-plugin-nfr-ingestion-throughput` is a rate the
-  repository runs no load test for, so no suite here can close it; the
+  One stays open. `cpt-cf-uc-plugin-nfr-ingestion-throughput` is a sustained
+  rate the repository runs no load test for, so no suite here can close it; the
   batch-shape half of it is checked through
   `cpt-cf-uc-plugin-dod-batch-positional-results`.
 

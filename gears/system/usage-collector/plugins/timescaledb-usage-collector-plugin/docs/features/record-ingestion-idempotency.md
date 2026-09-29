@@ -7,12 +7,9 @@ Updated:  2026-09-26 by Virtuozzo International GmbH
 
 - [ ] `p1` - `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`
 
-One definition of done below stays unchecked,
-`cpt-cf-uc-plugin-dod-durable-acknowledgement`: neither write transaction forces
-`synchronous_commit`, so a server-level setting can still weaken an
-acknowledgement, and DESIGN section 3.5 requires that it cannot. The feature and
-status boxes above close with it, and with the throughput rate no suite in this
-repository measures (`cpt-cf-uc-plugin-nfr-ingestion-throughput`).
+Every definition of done below is checked. What holds the feature and status
+boxes above open is `cpt-cf-uc-plugin-nfr-ingestion-throughput`, a sustained
+rate no suite in this repository measures.
 
 Delivers the plugin's write path: single and batch persistence of usage entries,
 deduplicated in the backend on the gear's six-part identity, acknowledged only
@@ -191,10 +188,7 @@ flowchart TD
 
 ### Host Persists a Single Usage Entry
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-persist-single-entry`
-
-Open on `inst-single-begin` alone: the write transaction does not force
-synchronous commit.
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-flow-persist-single-entry`
 
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
@@ -226,7 +220,7 @@ synchronous commit.
 **Steps**:
 1. [x] - `p1` - Host calls the single-entry persist method on the SPI, passing an entry that is already authorized and structurally valid - `inst-single-call`
 2. [x] - `p1` - **DB**: resolve the entry's type key with `cpt-cf-uc-plugin-algo-type-key-resolution`, outside the write transaction - `inst-single-type-key`
-3. [ ] - `p1` - **DB**: open the write transaction and force synchronous commit on it, so the acknowledgement cannot be weakened by a server-level setting - `inst-single-begin`
+3. [x] - `p1` - **DB**: open the write transaction and force synchronous commit on it, so the acknowledgement cannot be weakened by a server-level setting - `inst-single-begin`
 4. [x] - `p1` - **DB**: run the guarded insert of `cpt-cf-uc-plugin-algo-guarded-insert-statement` over `cpt-cf-uc-plugin-dbtable-usage-records`, which returns the row's admitted and won flags - `inst-single-guarded-insert`
 5. [x] - `p1` - **IF** the row was not admitted, roll back and **RETURN** a retryable transient naming stale acceptance - `inst-single-not-admitted`
 6. [x] - `p1` - **IF** the row was admitted and won, commit and **RETURN** the stored entry with its stamped transaction identifier - `inst-single-won`
@@ -235,10 +229,7 @@ synchronous commit.
 
 ### Host Persists a Batch of Usage Entries
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-persist-entry-batch`
-
-Open on `inst-batch-begin` alone, for the same reason
-`cpt-cf-uc-plugin-flow-persist-single-entry` is.
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-flow-persist-entry-batch`
 
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
@@ -268,7 +259,7 @@ Open on `inst-batch-begin` alone, for the same reason
 **Steps**:
 1. [x] - `p1` - Host calls the batch persist method with an ordered list of entries - `inst-batch-call`
 2. [x] - `p1` - **DB**: resolve every entry's type key with `cpt-cf-uc-plugin-algo-type-key-resolution` before the transaction opens - `inst-batch-type-keys`
-3. [ ] - `p1` - **DB**: open the write transaction on a fresh connection and force synchronous commit - `inst-batch-begin`
+3. [x] - `p1` - **DB**: open the write transaction on a fresh connection and force synchronous commit - `inst-batch-begin`
 4. [x] - `p1` - **DB**: run the guarded insert of `cpt-cf-uc-plugin-algo-guarded-insert-statement` over the unnested input set, one statement for the whole batch - `inst-batch-guarded-insert`
 5. [x] - `p1` - **DB**: read back the admitted, not-won rows by entry identifier in one statement, and classify each with `cpt-cf-uc-plugin-algo-duplicate-identity-resolution` - `inst-batch-read-back`
 6. [x] - `p1` - Resolve any two same-identity entries inside the batch with `cpt-cf-uc-plugin-algo-in-batch-identity-resolution` - `inst-batch-in-batch`
@@ -555,11 +546,7 @@ even though it never fires at this level. The not-converged error variant
 
 ### Durable Acknowledgement on Every Write Transaction
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-durable-acknowledgement`
-
-Open. A persist call does return only after its commit and buffers nothing, but
-nothing forces `synchronous_commit` on the write transaction, so the guarantee
-rests on the server's own setting.
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-durable-acknowledgement`
 
 The system **MUST** force synchronous commit on every write transaction, so an
 operator-level setting cannot weaken an acknowledgement, and **MUST** return from
