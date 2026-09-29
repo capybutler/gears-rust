@@ -408,9 +408,9 @@ impl PgRecordStore {
     /// row, so the resolution cannot observe a ledger the insert never saw.
     ///
     /// `ON CONFLICT DO NOTHING` is the **write transaction's** only
-    /// serialization authority, and since the per-scope counter was retired it
-    /// is the only lock that transaction takes — the path still runs one
-    /// statement that can wait, [`TypeKeyCache::resolve`]'s own
+    /// serialization authority, and the per-scope counter that used to be a
+    /// second one is retired. The path still runs one statement that can wait
+    /// before that transaction opens, [`TypeKeyCache::resolve`]'s own
     /// `INSERT ... ON CONFLICT`, in autocommit before `begin()`: a
     /// concurrent same-key insert blocks on the in-progress speculative tuple
     /// until the winner commits — bounded by the connection's `lock_timeout`
@@ -1488,11 +1488,14 @@ fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPlu
 /// `reps` are the first-occurrence representative records, one per distinct
 /// dedup key, **sorted** by [`DedupKey`] so concurrent batches take the
 /// 6-tuple-UNIQUE speculative tuple locks in one global order (deadlock-free).
-/// Since the per-scope counter was retired those are the only locks a batch's
-/// write transaction takes, so the sort is the whole of this plugin's
-/// deadlock-freedom argument rather than one half of it. `first_index` maps
-/// each key to
-/// the input index of its first occurrence, the only row that can win the slot.
+/// Since the per-scope counter was retired the sort is the whole of this
+/// plugin's deadlock-freedom argument rather than one half of it. The partition
+/// key assignment that two batches can also meet on is not a second half: it
+/// runs in autocommit before either write transaction opens, one row per
+/// statement, and is held for the statement rather than to a commit
+/// ([`crate::infra::storage::pool`]), so it cannot be an edge of a cycle.
+/// `first_index` maps each key to the input index of its first occurrence, the
+/// only row that can win the slot.
 /// Later same-key rows resolve against the winner's stored row, exactly as the
 /// single-row path resolves a same-key hit.
 struct BatchPlan<'a> {
@@ -1571,15 +1574,17 @@ fn batch_retry_backoff(attempt: u32) -> Duration {
 /// The deadlock victim surfaces as an outer `Transient` — `create_batch_inner`
 /// runs the whole batch in one transaction, and that transaction rolled back,
 /// so the attempt left nothing behind. Serialization failures (`40001`), lock
-/// timeouts (`55P03`, which a batch hits when it waits out `lock_timeout` on a
-/// speculative tuple another in-flight batch holds) and connection blips
-/// collapse to the same bucket
-/// inside the storage helpers, and so does a concurrent writer of one of this
-/// batch's own dedup identities colliding on the ledger's PRIMARY KEY, which
-/// the `ON CONFLICT` arbiter does not cover and which `record_insert_error`
-/// lifts to a `Transient` so the re-run resolves against the winner's committed
-/// row (this plugin's DESIGN §3.6). All are safe to re-run for this idempotent
-/// batch. `Internal`,
+/// timeouts (`55P03`, which a batch hits when it waits out `lock_timeout` on
+/// any contended lock: the speculative tuple another in-flight batch holds, or
+/// the chunk the retention sweep holds in `ACCESS EXCLUSIVE`) and connectivity
+/// faults (a backend unreachable or refusing work, and a pool that cannot
+/// supply a usable connection) collapse to the same bucket inside the storage
+/// helpers. A concurrent writer of one of this batch's own dedup identities
+/// colliding on the ledger's PRIMARY KEY reaches it by a different route: the
+/// arbiter does not cover that index, so `classify_db` leaves the `23505` in
+/// `Other` and `record_insert_error` is what lifts it, letting the re-run
+/// resolve against the winner's committed row (this plugin's DESIGN §3.6). All
+/// are safe to re-run for this idempotent batch. `Internal`,
 /// `IdempotencyConflict` and the other typed domain outcomes are non-retryable
 /// and returned unchanged. Per-row
 /// `Transient` outcomes carried inside an `Ok(vec)` are deliberately not seen
@@ -1851,13 +1856,12 @@ impl RecordStore for PgRecordStore {
     /// **This path deliberately does not retry, and the asymmetry with
     /// [`Self::create_batch`] is a decision rather than an omission.**
     ///
-    /// A `55P03` is reachable here, on the one lock this path's write
-    /// transaction takes: a concurrent same-key insert's speculative tuple,
-    /// waited out to `lock_timeout`. It needs a same-key write in flight, so it
-    /// is a rarity rather than an ordinary outcome on a merely busy scope — a
-    /// single-row write's transaction contends with nothing but an
-    /// exact-duplicate racer. It is
-    /// returned unretried, because a `Transient` lifts to
+    /// A `55P03` is reachable here, and the wait this path is shaped around is
+    /// a concurrent same-key insert's speculative tuple, waited out to
+    /// `lock_timeout`. That one needs a same-key write in flight, so it is a
+    /// rarity rather than an ordinary outcome on a merely busy scope: on the
+    /// dedup tuple a write contends only with another writer of the very same
+    /// entry. It is returned unretried, because a `Transient` lifts to
     /// `ServiceUnavailable` at the dispatch boundary and reaches the caller as
     /// a 503 with a `Retry-After` slot: the client already holds the one record,
     /// and re-submitting it is cheap and exactly idempotent.
@@ -1903,11 +1907,12 @@ impl RecordStore for PgRecordStore {
         // preserved by `create_batch_inner`; the multi-row write replaces the
         // former N+1 per-row loop (DESIGN cpt-cf-uc-plugin-seq-ingest-batch).
         //
-        // Wrap the whole call in a bounded retry: on an outer `Transient` (the
-        // classic ABBA deadlock victim aborted as `40P01`, a serialization
-        // failure `40001`, a `55P03` lock timeout waiting on a speculative tuple
-        // another in-flight batch holds, or a connection blip) re-run the
-        // operation up to `MAX_BATCH_ATTEMPTS` times. Each attempt acquires a
+        // Wrap the whole call in a bounded retry: on an outer `Transient`
+        // re-run the operation up to `MAX_BATCH_ATTEMPTS` times.
+        // `is_retryable_batch_error` is where the causes that reach this are
+        // listed, and it is the only place they are listed, so this comment
+        // does not carry a second copy to fall behind it.
+        // Each attempt acquires a
         // fresh connection and opens a fresh transaction on it
         // (`create_batch_inner` does both), so a rolled-back attempt leaves no
         // state behind at all. Re-running is safe: that
@@ -1927,8 +1932,8 @@ impl RecordStore for PgRecordStore {
             is_retryable_batch_error,
             |attempt, err| {
                 // Make the retry observable: a distinct warn + counter so a
-                // self-healed deadlock victim can be told apart from a returned
-                // transient error, which moves this counter not at all (most
+                // self-healed transient can be told apart from a returned one,
+                // which moves this counter not at all (most
                 // move the backend-error counter instead).
                 tracing::warn!(
                     attempt,

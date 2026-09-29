@@ -33,8 +33,9 @@ pub enum DbErrorClass {
 /// one *type* meet on that tuple - once per type per process rather than once
 /// per write ([`crate::infra::storage::pool`]'s bound covers it too, which is
 /// not the same as its being the lock that constant is sized for).
-/// Losing either race is an ordinary contention outcome between concurrent
-/// writers of one entry or of one type, self-healing on retry. Left in
+/// A wait that times out is an ordinary contention outcome rather than a
+/// defect, self-healing on retry, whichever lock it was on
+/// ([`crate::infra::storage::pool`] enumerates the ones ingest can meet). Left in
 /// `Other` it maps to a non-retryable `Internal` and
 /// `is_retryable_batch_error` refuses to re-run a batch that is idempotent by
 /// construction.

@@ -67,28 +67,38 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 }
 
 /// Fixed upper bound on how long a request-path statement waits on a contended
-/// lock. Ingest's write transaction waits on **one**: the speculative tuple an
+/// lock. The wait it is *sized* for is the speculative tuple an
 /// `INSERT ... ON CONFLICT ... DO NOTHING` meets when a not-yet-committed
 /// duplicate of the same dedup 6-tuple is in flight. The wait then fails fast
 /// (`55P03 lock_not_available`) instead of blocking on — and pinning — a pooled
 /// connection.
 ///
-/// **One inside that transaction, and not two.** This plugin took a second lock
+/// **The per-scope counter is gone.** This plugin took a second lock
 /// on every write until the per-scope counter row it claimed from was retired, so
 /// a write contended with unrelated traffic on a busy tenant or meter. It no
-/// longer does: a write contends only with another writer of the very same entry.
+/// longer does: on the dedup tuple a write contends only with another writer of
+/// the very same entry.
 ///
-/// One statement outside that transaction can still wait, and this bound covers
-/// it too: [`super::type_key::TypeKeyCache::resolve`] assigns a type's partition
-/// key with its own `INSERT ... ON CONFLICT`, in autocommit before the write
-/// transaction opens, so two first writes of one *type* meet on that tuple. It is
-/// once per type per process rather than once per write, and it is held for the
-/// statement rather than to a commit, which is why it is not the lock this
-/// constant is sized for.
+/// The bound is not sized for them, but it covers two other waits an ingest
+/// statement can meet, and neither is contention with another writer of the
+/// same entry:
 ///
-/// `55P03` is classified transient ([`super::error`]) precisely because that is
-/// an ordinary contention outcome between two writers of one identity, so a
-/// timed-out batch is retried rather than returned as a non-retryable failure.
+/// * [`super::type_key::TypeKeyCache::resolve`] assigns a type's partition
+///   key with its own `INSERT ... ON CONFLICT`, in autocommit before the write
+///   transaction opens, so two first writes of one *type* meet on that tuple. It
+///   is once per type per process rather than once per write, and it is held for
+///   the statement rather than to a commit.
+/// * An insert routed to a chunk the retention sweep is dropping waits behind
+///   that sweep's `ACCESS EXCLUSIVE` chunk lock, which is held to the sweep's
+///   own commit under a `lock_timeout` of its own (this plugin's DESIGN §3.6
+///   `cpt-cf-uc-plugin-seq-retention-sweep`). The sweep reasons about this
+///   contention from its side, where a timed-out wait keeps the chunk; from
+///   ingest's side it arrives as the same `55P03` as any other lock wait.
+///
+/// `55P03` is classified transient ([`super::error`]) precisely because a wait
+/// that times out here is an ordinary contention outcome rather than a defect,
+/// whichever of these locks it was on, so a timed-out batch is retried rather
+/// than returned as a non-retryable failure.
 const LOCK_TIMEOUT: &str = "5s";
 
 /// Session GUCs applied to every request-path pool connection at connect time:

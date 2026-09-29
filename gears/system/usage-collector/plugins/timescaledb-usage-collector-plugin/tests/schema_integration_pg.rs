@@ -369,8 +369,8 @@ async fn there_is_no_usage_type_catalog() {
 /// migration edit that brought one back - the column-order test reads the
 /// *table's* columns and sees neither a sibling table nor an index.
 ///
-/// Neither would be inert if it returned. The counter table is the second
-/// contended lock every write used to take, on a row shared by every writer of
+/// Neither would be inert if it returned. The counter table is a contended row
+/// lock every write used to take, on a row shared by every writer of
 /// one `(tenant_id, gts_type_id)` rather than by writers of one entry, which is
 /// what made an unrelated busy meter able to serialise a tenant's ingest. The
 /// index existed to order a fold on a column the fold no longer reads, and the
