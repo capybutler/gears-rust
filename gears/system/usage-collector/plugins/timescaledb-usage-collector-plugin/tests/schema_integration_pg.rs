@@ -316,6 +316,82 @@ async fn the_pairing_constraint_admits_a_kind_that_agrees_with_the_withdrawal_pa
         .expect("a withdrawal carrying both halves must be admitted");
 }
 
+/// The pairing constraint refuses a **half** withdrawal pair, under either
+/// declared kind.
+///
+/// With two labels and two nullable withdrawal columns the constraint has
+/// eight inputs. The two disagreements and the two agreements above are four
+/// of them. The four here each carry exactly one half of the pair, and §3.7
+/// admits neither: "`invalidates` and `reason_code` are both set" for a
+/// withdrawal, and "an ordinary measurement carries neither".
+///
+/// **Both the retired constraint and the retuned one refuse these**, so this
+/// is no regression. It is a gap the retune was the moment to close, on this
+/// slice's own measured lesson: a `CHECK`'s behaviour reaches no oracle unless
+/// something asserts it.
+///
+/// One of the four is the only row in the eight whose verdict separates
+/// `reason_code IS NULL` from `reason_code = NULL` - an ordinary measurement
+/// naming a reason and no target. Under the second spelling that conjunct is
+/// NULL where both its neighbours are true, so the whole predicate is NULL and
+/// the row is stored, because a `CHECK` admits a row whose predicate is NULL.
+/// Every other row meets a `false` conjunct first and is refused either way.
+///
+/// All four are collected before the assertions, so a weakened constraint
+/// reports every shape it let through rather than stopping at the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pairing_constraint_refuses_a_half_withdrawal_pair() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    let target = Uuid::from_u128(0x2100_0003);
+    // `(declared kind, invalidates, reason_code)`.
+    let shapes = [
+        ("record", Some(target), None),
+        ("record", None, Some("duplicate_submission")),
+        ("invalidation", Some(target), None),
+        ("invalidation", None, Some("duplicate_submission")),
+    ];
+
+    let mut admitted: Vec<String> = Vec::new();
+    let mut refused_by_something_else: Vec<String> = Vec::new();
+    for (kind, invalidates, reason_code) in shapes {
+        let shape = format!(
+            "entry_type={kind}, invalidates={}, reason_code={}",
+            if invalidates.is_some() { "set" } else { "NULL" },
+            if reason_code.is_some() { "set" } else { "NULL" },
+        );
+        match common::insert_raw_entry(&h.pool)
+            .entry_type(kind)
+            .invalidates(invalidates)
+            .reason_code(reason_code)
+            .execute()
+            .await
+        {
+            Ok(()) => admitted.push(shape),
+            Err(err) => {
+                if !err
+                    .to_string()
+                    .contains("usage_records_invalidation_pairing")
+                {
+                    refused_by_something_else.push(format!("{shape}: {err}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        admitted.is_empty(),
+        "a half withdrawal pair must be refused under either declared kind; admitted: {admitted:?}"
+    );
+    assert!(
+        refused_by_something_else.is_empty(),
+        "the pairing constraint must be what refuses each half pair, not some other \
+         rule the raw insert trips: {refused_by_something_else:?}"
+    );
+}
+
 /// There is no usage-type catalog table, and this is a real assertion rather
 /// than a formality.
 ///

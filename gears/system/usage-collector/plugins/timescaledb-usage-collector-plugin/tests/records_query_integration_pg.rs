@@ -659,6 +659,52 @@ async fn each_published_filter_field_resolves_and_discriminates() {
     assert_eq!(got, expected);
 }
 
+/// An `entry_type` literal that is not one of the enum's labels answers an
+/// internal error, and that is a **known wrong class** rather than the intended
+/// one.
+///
+/// `bind_cast` renders the comparison as `entry_type = $1::usage_entry_type`
+/// (this plugin's `DESIGN.md` §3.7: the literal casts to the enum), so a
+/// literal off the label set raises `22P02` inside `PostgreSQL`. That SQLSTATE
+/// is neither `23505` nor transient, so `classify_db` leaves it in `Other` and
+/// `map_sqlx_err` lowers it to `Internal`, which the gear maps to a 500
+/// (`usage-collector/src/infra/sdk_error_mapping.rs`). A well-formed caller
+/// request naming a misspelled label is therefore answered as a server fault,
+/// where the same request answered an empty page while the column was `text`.
+///
+/// **This assertion exists in order to go red.** Refusing the literal as a
+/// caller error belongs to the slice that owns the admissible `$filter` value
+/// set, slice 7, and nothing else in this repository fails when that lands - so
+/// the record is written as an oracle rather than only as prose. A failure here
+/// is the signal to assert the new class, not to restore this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_label_entry_type_filter_answers_an_internal_error() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+
+    // `Record` rather than a nonsense string: the labels are lower-case, so a
+    // capitalised one is a misspelling a caller plausibly sends, and it is
+    // still not a label.
+    let q = page_query(default_order(), None).with_filter(eq_str("entry_type", "Record"));
+    let err = store
+        .list(meter, wide_range(), &q, &[])
+        .await
+        .expect_err("a literal off the enum's labels must not be answered with a page");
+
+    // The detail is asserted, not just the variant, and that is what makes this
+    // a real marker. `map_sqlx_err`'s fixed token is the only thing separating
+    // "the backend refused a literal it could not parse" from "something in the
+    // translate layer refused the value first" - and the plugin error enum
+    // carries no invalid-argument variant, so a guard added in the translate
+    // layer would surface as `Internal` too, with a detail of its own.
+    assert!(
+        matches!(&err, UsageCollectorPluginError::Internal(detail) if detail == "database error"),
+        "an unparsable entry_type literal reaches the caller as the backend mapping's \
+         Internal today, which is the wrong class for caller input; slice 7 makes it a \
+         caller error and this assertion is what says so, got: {err:?}"
+    );
+}
+
 /// The metadata side channel: AND across filters, OR within one filter's values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_metadata_side_channel_narrows_the_selection() {
