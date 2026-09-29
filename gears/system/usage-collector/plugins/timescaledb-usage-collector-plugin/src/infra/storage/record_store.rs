@@ -1488,9 +1488,10 @@ fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPlu
 /// `reps` are the first-occurrence representative records, one per distinct
 /// dedup key, **sorted** by [`DedupKey`] so concurrent batches take the
 /// 6-tuple-UNIQUE speculative tuple locks in one global order (deadlock-free).
-/// Since the per-scope counter was retired those are the only locks a batch
-/// contends for, so the sort is the whole of this plugin's deadlock-freedom
-/// argument rather than one half of it. `first_index` maps each key to
+/// Since the per-scope counter was retired those are the only locks a batch's
+/// write transaction takes, so the sort is the whole of this plugin's
+/// deadlock-freedom argument rather than one half of it. `first_index` maps
+/// each key to
 /// the input index of its first occurrence, the only row that can win the slot.
 /// Later same-key rows resolve against the winner's stored row, exactly as the
 /// single-row path resolves a same-key hit.
@@ -1850,11 +1851,12 @@ impl RecordStore for PgRecordStore {
     /// **This path deliberately does not retry, and the asymmetry with
     /// [`Self::create_batch`] is a decision rather than an omission.**
     ///
-    /// A `55P03` is reachable here, on the one lock this path takes: a
-    /// concurrent same-key insert's speculative tuple, waited out to
-    /// `lock_timeout`. It needs a same-key write in flight, so it is a rarity
-    /// rather than an ordinary outcome on a merely busy scope — a single-row
-    /// write contends with nothing but an exact-duplicate racer. It is
+    /// A `55P03` is reachable here, on the one lock this path's write
+    /// transaction takes: a concurrent same-key insert's speculative tuple,
+    /// waited out to `lock_timeout`. It needs a same-key write in flight, so it
+    /// is a rarity rather than an ordinary outcome on a merely busy scope — a
+    /// single-row write's transaction contends with nothing but an
+    /// exact-duplicate racer. It is
     /// returned unretried, because a `Transient` lifts to
     /// `ServiceUnavailable` at the dispatch boundary and reaches the caller as
     /// a 503 with a `Retry-After` slot: the client already holds the one record,

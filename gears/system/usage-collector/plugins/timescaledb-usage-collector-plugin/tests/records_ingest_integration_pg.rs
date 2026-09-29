@@ -1134,7 +1134,8 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 ///
 /// It was written on a per-scope counter row lock, taken once per
 /// `(tenant_id, gts_type_id)` run rather than once per key. Retiring that counter
-/// left the speculative tuple as the only lock a batch contends for, so this test
+/// left the speculative tuple as the only lock a batch's write transaction
+/// takes, so this test
 /// is re-aimed rather than retired: the surviving serialisation mechanism would
 /// otherwise have no deadlock-freedom test at all.
 /// **The fixture needed no change, and that is why the re-aim is sound.** Both
