@@ -8,6 +8,21 @@ use usage_collector_sdk::{
     TimeRange, UsageCollectorPluginError, UsageRecord,
 };
 
+/// What one feed page read observed, before the adapter turns it into a
+/// `FeedPage<FeedPosition>`.
+///
+/// The store answers positions as `(u64, Uuid)` pairs rather than encoded
+/// [`FeedPosition`](usage_collector_sdk::FeedPosition)s, so the encoding stays
+/// in one module and the store stays free of it. `next` is `None` only when a
+/// bounded replay reached its `until`; a live read always carries one.
+#[derive(Debug)]
+pub struct FeedPageRows {
+    /// The page's entries, in feed order.
+    pub entries: Vec<UsageRecord>,
+    /// The continuation, as a position pair.
+    pub next: Option<(u64, Uuid)>,
+}
+
 /// Persistence + query operations on `usage_records`. Implemented by infra.
 #[async_trait]
 pub trait RecordStore: Send + Sync + 'static {
@@ -28,6 +43,35 @@ pub trait RecordStore: Send + Sync + 'static {
         id: Uuid,
         scope: &ast::Expr,
     ) -> Result<UsageRecord, UsageCollectorPluginError>;
+    /// One snapshot-consistent feed page in feed order, over the subscribed
+    /// GTS types and inside the caller's compiled PDP scope.
+    ///
+    /// `after` is the position to continue from; `None` is a first read, which
+    /// begins at the oldest entry the subscription retains and places no lower
+    /// bound on position — never the head, and never refused (this plugin's
+    /// `docs/DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-feed-page`, First read).
+    /// `until` bounds a replay from above, inclusively.
+    ///
+    /// The page carries only **settled** entries: the store fixes a snapshot,
+    /// reads the settled horizon under it, and bounds the page below that
+    /// horizon, so no entry can later become visible at or before a returned
+    /// position whatever the concurrency or commit order.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorPluginError::CursorBeyondRetention`] when retention has
+    /// removed an entry of a subscribed type after `after`, decided from the
+    /// per-type retention marks rather than from the position's age.
+    /// [`UsageCollectorPluginError::Transient`] on a retryable backend failure,
+    /// and [`UsageCollectorPluginError::Internal`] otherwise.
+    async fn feed_page(
+        &self,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        after: Option<(u64, Uuid)>,
+        until: Option<(u64, Uuid)>,
+        limit: u64,
+    ) -> Result<FeedPageRows, UsageCollectorPluginError>;
     /// Keyset-paginated ledger read over one meter and one covered-period
     /// range.
     ///

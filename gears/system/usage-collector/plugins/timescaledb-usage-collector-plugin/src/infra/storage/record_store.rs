@@ -32,7 +32,7 @@ use bigdecimal::BigDecimal;
 use rand::RngExt as _;
 use rust_decimal::Decimal;
 use sqlx::pool::PoolConnection;
-use sqlx::postgres::PgRow;
+use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{Acquire as _, AssertSqlSafe, FromRow as _, PgPool, Postgres, Row};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -47,12 +47,13 @@ use usage_collector_sdk::{
     is_keyset_safe_record_field,
 };
 
-use crate::domain::ports::RecordStore;
+use crate::domain::ports::{FeedPageRows, RecordStore};
 use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
 use crate::infra::storage::entity::UsageRecordRow;
 use crate::infra::storage::error::{
     acquire_error_clears_readiness, is_ledger_pk_violation, map_sqlx_err,
 };
+use crate::infra::storage::feed_position::MAX_UUID;
 use crate::infra::storage::mapper::{
     invalidation_to_row, metadata_map_to_jsonb, record_row_to_model,
 };
@@ -60,6 +61,7 @@ use crate::infra::storage::query::aggregate::{
     aggregate_limit_clause, dimension_presence_guard, dimension_select_expr, fold_select_expr,
     withdrawal_exclusion_clause,
 };
+use crate::infra::storage::query::feed::{MARK_ABOVE_SQL, build_feed_page_sql};
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
 };
@@ -100,7 +102,12 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 /// here rather than inherited from a server naming rule — and
 /// [`ins_record_columns`] reads exactly those decoded names back out of this
 /// constant, to qualify each one with the guarded statement's `ins` relation.
-const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
+///
+/// `pub(crate)` so `query::feed`'s page-statement builder can read the same
+/// spelling rather than a second one — the same reason [`ENTRY_TYPE_ENUM`] is
+/// `pub(crate)` for `query::translate`. The split into a feed-specific column
+/// list is a later slice's change, not this one's.
+pub(crate) const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
      window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
      invalidates, reason_code, origin, entry_type::text AS entry_type, \
      accepted_at, xact_id::text AS xact_id, metadata";
@@ -1198,6 +1205,179 @@ impl PgRecordStore {
             .map_err(|e| self.record_backend_error(&e))?;
 
         Ok(self.resolve_batch(records, &plan, &admissions, &conflict))
+    }
+
+    /// Steps 2 to 4 of the feed page protocol, inside the open snapshot
+    /// transaction `conn` already holds (`RecordStore::feed_page`'s step 1).
+    ///
+    /// Returns early with [`InTransactionPage::marked`] when step 3 finds a
+    /// mark, in which case the page statement is never sent: `docs/DESIGN.md`
+    /// §3.6's diagram wraps the page statement in `opt not marked`, so an
+    /// early mark refuses without building a page.
+    ///
+    /// Seven parameters over clippy's default of seven: each is a distinct
+    /// input the six-step protocol names (the connection, the built
+    /// statement and its binds, the subscription for the mark check, the two
+    /// optional bounds and the limit), this is a private helper with the one
+    /// call site [`RecordStore::feed_page`] already builds, and bundling them
+    /// into a struct for that alone would be a layer of indirection over
+    /// values that are already named by the protocol steps' own docs.
+    #[allow(clippy::too_many_arguments)]
+    async fn feed_page_in_transaction(
+        &self,
+        conn: &mut PgConnection,
+        sql: &str,
+        binds: &[SqlBind],
+        types: &[&str],
+        after: Option<(u64, Uuid)>,
+        until: Option<(u64, Uuid)>,
+        limit: u64,
+    ) -> Result<InTransactionPage, UsageCollectorPluginError> {
+        // Step 2. Fixes the snapshot and yields the settled horizon. Read as
+        // text because `xid8` has no `sqlx` Decode, which is the same reason
+        // `UsageRecordRow` holds `xact_id` as a String.
+        let horizon: String =
+            sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| map_sqlx_err(&e))?;
+        let horizon_num: u64 = horizon.parse().map_err(|_| {
+            UsageCollectorPluginError::internal(format!(
+                "the settled horizon `{horizon}` read off pg_snapshot_xmin did not parse as a u64"
+            ))
+        })?;
+
+        // Step 3. A fast path only: this transaction's own snapshot can miss
+        // a drop that commits after it, which is why step 6 re-checks in
+        // autocommit after COMMIT.
+        if let Some(position) = after
+            && self.mark_stands_above(&mut *conn, types, position).await?
+        {
+            return Ok(InTransactionPage::marked());
+        }
+
+        // Step 4. `persistent(false)` so the statement is parsed and planned
+        // after step 2 and never served from the connection's statement
+        // cache. TimescaleDB excludes chunks at plan time against the
+        // catalog it then sees; a plan cached before a chunk existed could
+        // silently skip that chunk's rows, which is the failure §3.6's "Why"
+        // paragraph rules out.
+        let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).persistent(false);
+        q = q.bind(types).bind(&horizon);
+        if let Some((xact_id, id)) = after {
+            q = q.bind(xact_id.to_string()).bind(id);
+        }
+        if let Some((xact_id, id)) = until {
+            q = q.bind(xact_id.to_string()).bind(id);
+        }
+        for b in binds {
+            q = bind_one(q, b);
+        }
+        let rows = q
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_sqlx_err(&e))?;
+
+        let limit_as_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+        let row_count = rows.len();
+        // Captured before `record_row_to_model` consumes each row: the SDK
+        // model carries no `xact_id` (`UsageRecordRow`'s own doc says why),
+        // so the last row's position has to be read off the raw row.
+        let last_position = rows
+            .last()
+            .map(|row| -> Result<(u64, Uuid), UsageCollectorPluginError> {
+                let xact_id: u64 = row.xact_id.parse().map_err(|_| {
+                    UsageCollectorPluginError::internal(format!(
+                        "a fed row's xact_id `{}` did not parse as a u64",
+                        row.xact_id
+                    ))
+                })?;
+                Ok((xact_id, row.id))
+            })
+            .transpose()?;
+
+        let mut entries = Vec::with_capacity(row_count);
+        for row in rows {
+            entries.push(record_row_to_model(row)?);
+        }
+
+        // The disposition, in DESIGN §3.6's own order: a bounded replay that
+        // reached its `until` closes; a page filled to its limit continues
+        // from its last entry's own position; a short page has reached the
+        // horizon and continues from the head position.
+        let next = if until.is_some() && row_count < limit_as_usize {
+            None
+        } else if row_count >= limit_as_usize {
+            Some(last_position.ok_or_else(|| {
+                UsageCollectorPluginError::internal(
+                    "a feed page filled to its limit carried no rows, which the caller's \
+                     limit >= 1 obligation should make unreachable",
+                )
+            })?)
+        } else {
+            Some((horizon_num.saturating_sub(1), MAX_UUID))
+        };
+
+        Ok(InTransactionPage {
+            entries,
+            next,
+            marked: false,
+        })
+    }
+
+    /// Whether a mark of any subscribed type stands above `position`.
+    ///
+    /// One small statement ([`MARK_ABOVE_SQL`]), run twice per page at most:
+    /// once under the page's own snapshot as a fast path
+    /// ([`Self::feed_page_in_transaction`], step 3) and once in autocommit as
+    /// the authority (`RecordStore::feed_page`, step 6) — both against the
+    /// very same pooled connection, before and after its `COMMIT`, so one
+    /// function serves both call sites rather than two statements of one SQL
+    /// string under two names.
+    async fn mark_stands_above(
+        &self,
+        conn: &mut PgConnection,
+        types: &[&str],
+        position: (u64, Uuid),
+    ) -> Result<bool, UsageCollectorPluginError> {
+        let found: Option<i32> = sqlx::query_scalar(MARK_ABOVE_SQL)
+            .bind(types)
+            .bind(position.0.to_string())
+            .bind(position.1)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| map_sqlx_err(&e))?;
+        Ok(found.is_some())
+    }
+}
+
+/// One page read's outcome inside the open snapshot transaction: either a
+/// mark already stood above the position (the fast path, step 3), or the page
+/// statement ran and this carries its rows and disposition.
+struct InTransactionPage {
+    /// The page's entries, already mapped to the SDK model. Empty when
+    /// `marked` is `true`: the page statement is never sent on that path
+    /// (`docs/DESIGN.md` §3.6's diagram wraps it in `opt not marked`).
+    entries: Vec<UsageRecord>,
+    /// The continuation, as a position pair. `None` only when `marked` is
+    /// `true` (mirroring `entries`) or when a bounded replay reached its
+    /// `until`.
+    next: Option<(u64, Uuid)>,
+    /// Whether step 3's fast-path check already found a mark above the
+    /// position. `RecordStore::feed_page` short-circuits step 6 on this: a
+    /// mark the fast path already found is certain, so the authoritative
+    /// re-check is not needed to confirm it.
+    marked: bool,
+}
+
+impl InTransactionPage {
+    /// Step 3 found a mark above the position. No page statement is sent.
+    fn marked() -> Self {
+        Self {
+            entries: Vec::new(),
+            next: None,
+            marked: true,
+        }
     }
 }
 
@@ -2453,6 +2633,72 @@ impl RecordStore for PgRecordStore {
             // them apart — that distinction *is* the existence oracle.
             None => Err(UsageCollectorPluginError::UsageRecordNotFound { id }),
         }
+    }
+
+    /// One feed page, run as the six-step protocol this plugin's
+    /// `docs/DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-feed-page` sets out.
+    ///
+    /// Steps 1-5 run on one connection, moved into and out of a snapshot
+    /// transaction by hand with raw `BEGIN` / `COMMIT` statements rather than
+    /// through `sqlx::Transaction` — the same connection carries the page's
+    /// snapshot transaction (steps 1-5) and the authoritative autocommit
+    /// mark re-check (step 6), so both reach one [`Self::mark_stands_above`]
+    /// over the same `conn`.
+    ///
+    /// # Errors
+    ///
+    /// See [`RecordStore::feed_page`].
+    async fn feed_page(
+        &self,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        after: Option<(u64, Uuid)>,
+        until: Option<(u64, Uuid)>,
+        limit: u64,
+    ) -> Result<FeedPageRows, UsageCollectorPluginError> {
+        // Translated before a connection is acquired, so a scope that cannot
+        // be rendered never opens a transaction — the discipline `get`
+        // already keeps.
+        let (sql, binds) = build_feed_page_sql(after, until, scope, limit)
+            .map_err(UsageCollectorPluginError::internal)?;
+        let types: Vec<&str> = subscription.iter().map(MeterTypeId::as_str).collect();
+
+        let mut conn = self.pool.acquire().await.map_err(|e| map_sqlx_err(&e))?;
+
+        // Step 1. READ ONLY because nothing here writes, and REPEATABLE READ
+        // because the horizon read must fix the snapshot the page statement
+        // then runs under.
+        sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_sqlx_err(&e))?;
+
+        let page = self
+            .feed_page_in_transaction(&mut conn, &sql, &binds, &types, after, until, limit)
+            .await;
+
+        // COMMIT on both paths: this is step 5, and a transaction left open
+        // would return to the pool holding a snapshot that pins the settled
+        // horizon for every later page.
+        let committed = sqlx::query("COMMIT").execute(&mut *conn).await;
+        let page = page?;
+        committed.map_err(|e| map_sqlx_err(&e))?;
+
+        // Step 6. Authoritative, in autocommit, after the COMMIT: step 3 runs
+        // under the page's snapshot and can miss a drop that commits after
+        // it. Short-circuiting on `page.marked` is what keeps this the
+        // "opt page_after present, not marked" branch of DESIGN §3.6's
+        // diagram: a mark the fast path already found is not re-read here.
+        if let Some(position) = after
+            && (page.marked || self.mark_stands_above(&mut conn, &types, position).await?)
+        {
+            return Err(UsageCollectorPluginError::CursorBeyondRetention);
+        }
+
+        Ok(FeedPageRows {
+            entries: page.entries,
+            next: page.next,
+        })
     }
 
     /// Keyset-paginated ledger read over one meter and one covered-period

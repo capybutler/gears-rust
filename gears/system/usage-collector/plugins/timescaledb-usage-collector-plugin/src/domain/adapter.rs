@@ -12,6 +12,8 @@ use usage_collector_sdk::{
 };
 
 use crate::domain::ports::RecordStore;
+use crate::infra::storage::feed_position::{decode_position, encode_position};
+use crate::infra::storage::query::MAX_PAGE_SIZE;
 
 /// The single implementation of `UsageCollectorPluginV1`. Delegates every SPI
 /// method to the [`RecordStore`] port.
@@ -94,37 +96,65 @@ impl UsageCollectorPluginV1 for StorageAdapter {
             .await
     }
 
-    /// Not built yet: nothing reads the feed order or the retention marks, so
-    /// this backend can issue no position and decide no retention refusal.
+    /// Reads one feed page, decoding the plugin's own positions on the way in
+    /// and encoding them on the way out.
     ///
-    /// **What is missing is the read, not the schema.**
-    /// `migrations/0001_init.sql` declares `xact_id`, the inserting
-    /// transaction's id, indexes it as
-    /// `usage_records_feed_idx (gts_type_id, xact_id, id)`, and declares the
-    /// `usage_feed_retention_marks` table. That order is comparable across a
-    /// whole subscription and its encoded size does not grow with that
-    /// subscription's breadth, which is the bound the gear's DESIGN places on a
-    /// position and the reason a position keyed per tenant cannot serve. What is
-    /// left is the page protocol that reads the order, and the sweep that raises
-    /// a mark for this method to refuse against: slice 3.
-    ///
-    /// `Internal` rather than `Transient` because there is nothing to retry:
-    /// the method will answer once the page protocol and the sweep's
-    /// mark-raising exist, and a `Transient` here would put a caller into a
-    /// retry loop against a permanent condition.
+    /// `FeedStart` is `#[non_exhaustive]` per the SDK's §2.2 additive-evolution
+    /// constraint, so a start mode a later gear version adds reaches the
+    /// wildcard arm and fails loudly as `Internal` rather than being silently
+    /// read as one of the two this version knows.
     async fn read_feed_page(
         &self,
-        _subscription: &[MeterTypeId],
-        _scope: &ast::Expr,
-        _start: FeedStart<FeedPosition>,
-        _until: Option<FeedPosition>,
-        _limit: u64,
+        subscription: &[MeterTypeId],
+        scope: &ast::Expr,
+        start: FeedStart<FeedPosition>,
+        until: Option<FeedPosition>,
+        limit: u64,
     ) -> Result<FeedPage<FeedPosition>, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::internal(
-            "the TimescaleDB backend does not serve the usage feed yet: its schema declares the \
-             subscription-wide (xact_id, id) order and the retention-mark table, but no page \
-             protocol reads them and no sweep raises a mark",
-        ))
+        // Refused rather than clamped, and the asymmetry with the ledger page
+        // is the SPI's own: `effective_page_size` clamps a caller's `$top`
+        // into `[1, MAX_PAGE_SIZE]`, while `read_feed_page`'s contract puts "a
+        // `limit` outside the published bound" under `Internal`, beside a start
+        // mode this plugin does not know. A clamp here would hand a consumer a
+        // page size it never asked for on a path whose whole purpose is an
+        // exactly-resumable scan, and a `limit` of 0 would return nothing for
+        // ever while looking healthy.
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(UsageCollectorPluginError::internal(format!(
+                "a feed page limit of {limit} is outside the published bound of \
+                 1..={MAX_PAGE_SIZE}"
+            )));
+        }
+
+        let after = match start {
+            FeedStart::Oldest => None,
+            FeedStart::After(position) => {
+                Some(decode_position(&position).map_err(UsageCollectorPluginError::internal)?)
+            }
+            // A start mode this version does not know. `Internal`, not a guess.
+            _ => {
+                return Err(UsageCollectorPluginError::internal(
+                    "this backend serves only the `Oldest` and `After` feed start modes; a \
+                     start mode it does not know is a host-contract breach rather than a \
+                     condition to retry",
+                ));
+            }
+        };
+        let until = until
+            .as_ref()
+            .map(decode_position)
+            .transpose()
+            .map_err(UsageCollectorPluginError::internal)?;
+
+        let page = self
+            .record
+            .feed_page(subscription, scope, after, until, limit)
+            .await?;
+
+        Ok(FeedPage {
+            entries: page.entries,
+            next: page.next.map(|(xact_id, id)| encode_position(xact_id, id)),
+        })
     }
 
     /// Not built yet: this backend reports no reconciliation metadata.

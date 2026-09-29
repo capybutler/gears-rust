@@ -25,34 +25,38 @@
 //! * This run is **undriven**: it calls [`contract::run_all`], not
 //!   `contract::run_all_with_retention`, so the checks in
 //!   [`contract::RETENTION_DRIVEN_CHECKS`] run here without the assertions
-//!   that need a retention sweep to have happened. That is right while
-//!   those checks have a row below — a backend whose feed refuses every
-//!   read fails them on their undriven half alone, and driving a sweep
-//!   would add nothing but a second way to say so. It stops being right
-//!   the moment such a row is paid off: whoever does that is claiming
-//!   conformance for a check this run only partly exercised, and should
-//!   switch this test to the driven entry point at the same time. This
-//!   backend already sweeps — `retention_sweep_integration_pg` drives it —
-//!   so what is missing is the `contract::retention::ContractRetention`
-//!   impl beside the SPI one, not the capability.
+//!   that need a retention sweep to have happened. This backend already
+//!   sweeps — `retention_sweep_integration_pg` drives it — so what is
+//!   missing is the `contract::retention::ContractRetention` impl beside
+//!   the SPI one, not the capability; that impl, and the switch to
+//!   `run_all_with_retention` it lets this test make, is slice 5's.
 //!
-//!   **How much of a check an undriven run leaves out is not the same for
-//!   every name in that constant**, and it matters to whoever pays a row
-//!   off. `feed-bootstrap-position` loses one assertion of four here;
-//!   `feed-retention-refusal` loses three of four, and the one that runs is
-//!   the weakest of them — that a cursor over a ledger nothing has been
-//!   removed from is served. A green run against that row would be evidence
-//!   of almost nothing about the row DESIGN states, which is a cursor whose
-//!   continuation a sweep truncated being refused. The check's own module
-//!   says which assertions those are; this note exists so the difference is
-//!   not discovered by deleting the row first.
+//!   **`NOT_YET_CONFORMING` being empty is not the same claim as "every
+//!   dispatched check fully conforms".** `feed-bootstrap-position` and
+//!   `feed-retention-refusal` are two checks whose coverage under `run_all`
+//!   is *partial by construction* — each skips a `retention.is_some()`
+//!   branch entirely rather than running it and failing — and their
+//!   undriven remainder now genuinely passes rather than merely going
+//!   undispatched: `feed-bootstrap-position` loses one assertion of four
+//!   here (its purge-then-resume assertion) and `feed-retention-refusal`
+//!   three of four (only "an intact continuation is served" runs, which is
+//!   the weakest of the four and evidence of almost nothing about the row
+//!   DESIGN states, which is a cursor whose continuation a sweep truncated
+//!   being refused). Neither omission earns a [`NOT_YET_CONFORMING`] row,
+//!   because neither is a failure this test can observe: a skipped
+//!   assertion is not a failed one, and the row that used to stand for that
+//!   distinction is what this paragraph now carries instead. The check's
+//!   own module says which assertions those are.
 //! * A green run no longer means "everything that ran passed". It means
 //!   exactly the non-conformances [`NOT_YET_CONFORMING`] declares failed,
 //!   no more and no fewer — that list names what this backend cannot pass
 //!   yet and the slice that closes each, and the test asserts the failing
 //!   set against it exactly. The list is expected to shrink and never to
 //!   grow: a check that starts passing takes its row with it, and a check
-//!   that fails without a row is a regression in this plugin.
+//!   that fails without a row is a regression in this plugin. An empty list
+//!   is not an exception to that: it means no *dispatched, run* assertion
+//!   fails today, not that every assertion DESIGN states has been run (the
+//!   bullet above is where that residual gap lives).
 //!
 //! See `contract.rs`'s module header and DIVERGENCES section F.
 //!
@@ -83,57 +87,12 @@ mod common;
 /// `run_all`. No count of how many rows are in that state is given here,
 /// for the reason the module header gives for the coverage split: it would
 /// go stale one check before the assertion did.
-const NOT_YET_CONFORMING: &[(&str, &str)] = &[
-    (
-        contract::FEED_SNAPSHOT_AND_REPLAY,
-        "slice 3, plugin feed page and retention interlock: `read_feed_page` \
-         is stubbed `Internal` in `src/domain/adapter.rs`, so no paginated \
-         scan can be observed at all",
-    ),
-    (
-        contract::FEED_COMPLETENESS,
-        "slice 3, plugin feed page and retention interlock: the feed order \
-         this check holds invariant is declared and no read path orders on \
-         it. It is the `xid8` column `usage_records_feed_idx` orders on, \
-         which slice 2 added in place of a per-(tenant_id, gts_type_id) \
-         counter that ordered nothing across a subscription; slice 3 brings \
-         the read path that does",
-    ),
-    (
-        contract::FEED_BOOTSTRAP_POSITION,
-        "slice 3, plugin feed page and retention interlock: `FeedStart::Oldest` \
-         needs a position to answer with, and this backend issues none",
-    ),
-    (
-        contract::FEED_RETENTION_REFUSAL,
-        "slice 3, plugin feed page and retention interlock: the refusal is \
-         decided against `usage_feed_retention_marks`. Slice 2 added the \
-         table and it stands empty; slice 3 is what raises a mark into it \
-         and what reads one back",
-    ),
-    (
-        contract::FEED_POSITION_BOUNDED,
-        "slice 3, plugin feed page and retention interlock: this backend \
-         issues no `FeedPosition` at all, so nothing here holds to a size \
-         bound. What one would encode is the `xid8` feed-order column slice \
-         2 added, which does not grow with a subscription's breadth",
-    ),
-    (
-        contract::SERVER_FIELD_ROUND_TRIP,
-        "slice 3, plugin feed page and retention interlock: the feed half \
-         alone. `read_feed_page` is stubbed `Internal` in \
-         `src/domain/adapter.rs`, so the one of this check's five properties \
-         that reads an entry back off the feed cannot be answered at all. \
-         **This names a check that is four-fifths passing**: the point \
-         lookup, the ledger page, the absorbed retry and the re-read after \
-         it all hold, because \
-         `INSERT_COLUMNS` binds `id`, `invalidates`, `origin` and \
-         `accepted_at` from the record rather than defaulting them and \
-         `RECORD_COLUMNS` returns them on every path that answers an entry. \
-         Whoever pays this row off in slice 3 is removing it for one \
-         property, not for a check this backend fails outright",
-    ),
-];
+// Empty as of slice 3. `read_feed_page` answers, so every check `run_all`
+// dispatches passes what it dispatches — the module header above is where
+// this run's undriven residue (two checks whose driven quarter to
+// three-quarters `run_all` skips rather than fails) is recorded instead, since
+// neither is a failure this list could ever have named.
+const NOT_YET_CONFORMING: &[(&str, &str)] = &[];
 
 /// Run every implemented check against the `TimescaleDB` backend, and hold
 /// the set that failed to [`NOT_YET_CONFORMING`] exactly.

@@ -14,6 +14,7 @@
 
 pub mod aggregate;
 pub mod bind;
+pub mod feed;
 pub mod keyset;
 pub mod rollup;
 pub mod translate;

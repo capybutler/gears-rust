@@ -128,8 +128,9 @@ pub struct UsageRecordRow {
     /// key. Stamped by the column default and never bound by the Record Store,
     /// so it appears in [`super::record_store`]'s read column list and not in
     /// its insert column list. Not carried on the SDK model: it reaches a
-    /// caller only inside a `FeedPosition`, which this backend does not yet
-    /// issue.
+    /// caller only inside a `FeedPosition`, which
+    /// [`super::feed_position::encode_position`] builds from this and the
+    /// row's own `id`.
     ///
     /// A `String` because `xid8` has no `sqlx` decode implementation, so the
     /// read list selects `xact_id::text`; a reader wanting the order parses
