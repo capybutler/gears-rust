@@ -249,9 +249,7 @@ pub fn dimension_presence_guard(dim: &AggregationDimension, select_expr: &str) -
 ///
 /// It bounds *groups*, not rows per group: the `LATEST` arm of
 /// [`fold_select_expr`] materializes a group's values before picking one, and
-/// nothing here caps that. Named in plain backticks rather than linked, because
-/// the constant it names is private and this item is public: an intra-doc link
-/// from here resolves only under `--document-private-items`.
+/// nothing here caps that.
 #[must_use]
 pub fn aggregate_limit_clause(dim_count: usize) -> String {
     if dim_count == 0 {

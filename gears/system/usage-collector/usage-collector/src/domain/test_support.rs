@@ -1916,7 +1916,7 @@ use usage_collector_sdk::{AggregationBucket, Invalidation, ReasonCode, derive_us
 ///   `create_usage_records` refuse. At-most-one-invalidation is an
 ///   admission outcome (the dedup conflict of an invalidation), and
 ///   admitting nothing is how this double stays small.
-
+///
 /// Empty-selection answers follow SQL: `COUNT` is zero and every other fold
 /// is absent.
 pub(crate) struct FoldingPlugin {

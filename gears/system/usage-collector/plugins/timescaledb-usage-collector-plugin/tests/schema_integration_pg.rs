@@ -360,6 +360,65 @@ async fn there_is_no_usage_type_catalog() {
     );
 }
 
+/// The retired per-scope acceptance counter left nothing behind: no
+/// `usage_acceptance_sequence` table and no `usage_records_acceptance_seq_idx`.
+///
+/// An absence is as much a part of the §3.7 target schema as a declaration, and
+/// it is the part with no other oracle. Nothing in this crate names either
+/// object any more, so no compile and no other test in this file would notice a
+/// migration edit that brought one back - the column-order test reads the
+/// *table's* columns and sees neither a sibling table nor an index.
+///
+/// Neither would be inert if it returned. The counter table is the second
+/// contended lock every write used to take, on a row shared by every writer of
+/// one `(tenant_id, gts_type_id)` rather than by writers of one entry, which is
+/// what made an unrelated busy meter able to serialise a tenant's ingest. The
+/// index existed to order a fold on a column the fold no longer reads, and the
+/// order it served is not the one the gear's `DESIGN.md` §3.1 states.
+///
+/// The column itself is covered by
+/// [`the_live_columns_are_the_migrations_columns_in_order`], which reads the
+/// live column list back against the migration's; these two are what the table
+/// and the index need instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_retired_acceptance_counter_left_no_table_and_no_index() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    let counter_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'usage_acceptance_sequence')",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .expect("usage_acceptance_sequence existence query");
+    assert!(
+        !counter_table,
+        "usage_acceptance_sequence must not exist: feed order is the xid8 of the \
+         inserting transaction and no path claims a per-scope number. Its presence \
+         means a migration edit resurrected the counter, or a database survived a \
+         schema change rather than being rebuilt."
+    );
+
+    // Named in `public`, which is where the migration would declare it. A
+    // hypertable's chunk-local clones carry generated names in
+    // `_timescaledb_internal` and are not what this asks about.
+    let seq_index: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+         WHERE schemaname = 'public' AND indexname = 'usage_records_acceptance_seq_idx')",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .expect("usage_records_acceptance_seq_idx existence query");
+    assert!(
+        !seq_index,
+        "usage_records_acceptance_seq_idx must not exist: the LATEST fold orders on \
+         window_end, accepted_at and id (the gear's DESIGN section 3.1), none of \
+         which this index leads with, and the column it was built over is gone."
+    );
+}
+
 /// The live table's column sequence is the migration's, read through the
 /// crate's one parse of that file.
 ///
@@ -501,7 +560,19 @@ async fn the_feed_order_column_is_an_xid8_the_database_stamps() {
     );
 }
 
-/// The four non-partial ledger indexes, read back as the database built them.
+/// The ledger indexes `DESIGN.md` §3.7 declares outside a constraint, read back
+/// as the database built them.
+///
+/// The population is named by its authority rather than counted, and both
+/// halves of the qualifier do work. `usage_records_pkey` and
+/// `usage_records_dedup_uniq` back constraints and reach `pg_indexes` that way,
+/// so "every index on `usage_records`" is a larger set than this one. Of the
+/// indexes that are left, `usage_records_invalidates_idx` is the one declared
+/// with a predicate, and [`the_invalidation_lookup_index_is_partial_and_not_unique`]
+/// reads its definition back - columns and `WHERE` clause both - so it is
+/// covered there rather than duplicated into the loop below. A future
+/// declaration joins this test by being added to `DESIGN.md`'s list, and no
+/// number here has to be corrected for it.
 ///
 /// `DESIGN.md` §3.7 declares every one of them over exactly these columns:
 /// `usage_records_feed_idx (gts_type_id, xact_id, id)`, which "serves the feed
@@ -512,7 +583,9 @@ async fn the_feed_order_column_is_an_xid8_the_database_stamps() {
 /// which "support time-windowed reads". Column order is the whole point of each
 /// — an index over the same columns in another order serves none of them — so
 /// this reads every definition back rather than merely asserting the index
-/// exists.
+/// exists, and refuses a predicate on any of them: `indexdef` spells a partial
+/// index as the same column list with a `WHERE` after it, so the column check
+/// alone would pass one that covers only some of the rows it is relied on for.
 ///
 /// **The two window indexes had no oracle at all until this assertion**, which
 /// is why they are here rather than only in the migration. The first of them
@@ -522,7 +595,7 @@ async fn the_feed_order_column_is_an_xid8_the_database_stamps() {
 /// have noticed it coming back: the column-order test reads the *table's*
 /// columns, and a trailing index column is invisible to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_ledger_indexes_are_built_in_their_declared_order() {
+async fn the_ledger_indexes_declared_outside_a_constraint_are_built_in_their_declared_order() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
@@ -551,6 +624,13 @@ async fn the_ledger_indexes_are_built_in_their_declared_order() {
         assert!(
             def.contains(expected),
             "{name} must be built over {expected}, got: {def}"
+        );
+        assert!(
+            !def.contains(" WHERE "),
+            "{name} is declared without a predicate, so it must be built without \
+             one: a partial index over the same columns serves only the rows \
+             matching its predicate and silently stops covering the rest. \
+             got: {def}"
         );
     }
 }

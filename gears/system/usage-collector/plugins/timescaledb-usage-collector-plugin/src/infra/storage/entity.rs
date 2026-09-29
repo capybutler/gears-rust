@@ -35,12 +35,16 @@ use uuid::Uuid;
 /// the feed (this plugin's DESIGN §3.6). It is decoded rather than left out of
 /// the struct so a row is a faithful picture of what was stored.
 ///
-/// It is the only **ordering** column on this row, and the plugin assigns no
-/// order of its own: the `LATEST` fold orders on `window_end`, `accepted_at` and
-/// `id`, all three of them gear-supplied or gear-derived, and the feed orders on
-/// a value the database owns. [`Self::type_key`] is plugin-assigned and has no
-/// counterpart either, but it is a partition key rather than an order — it names
-/// the type, and nothing sorts on it.
+/// The plugin assigns no order of its own: the `LATEST` fold orders on
+/// `window_end`, `accepted_at` and `id`, all three of them gear-supplied or
+/// gear-derived, and the feed orders on a value the database owns.
+/// [`Self::type_key`] is plugin-assigned and has no counterpart either, but it
+/// is a partition key rather than an order — it names the type, and no read
+/// path reads it as an order. Two btrees do sort on it, as the trailing key of
+/// the PRIMARY KEY and of `usage_records_dedup_uniq`; both carry it because a
+/// hypertable requires every partition column in each, and because it is a
+/// function of `gts_type_id` it separates no two rows the rest of either key
+/// would otherwise join.
 ///
 /// [`Self::entry_type`] has no counterpart on the SDK's `UsageRecord` either,
 /// for a different reason: the model projects an entry's kind from the

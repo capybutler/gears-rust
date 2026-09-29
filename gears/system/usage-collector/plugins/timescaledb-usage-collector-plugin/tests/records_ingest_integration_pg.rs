@@ -19,8 +19,8 @@
 //!   Measured, by swapping `resource_id` and `resource_type` in each of the two
 //!   bind sequences and running the whole `--features postgres` suite:
 //!
-//!   * **Batch path** (`insert_records_on_conflict`): all 214 unit tests stay
-//!     green, and so does `contract_conformance_pg`. Three tests red, all in
+//!   * **Batch path** (`insert_records_on_conflict`): the crate's whole `--lib`
+//!     suite stays green, and so does `contract_conformance_pg`. Three tests red, all in
 //!     this file, and two of them only *indirectly* — the absorb path compares
 //!     the stored attribution for canonical equality, so a transposed write
 //!     turns an absorb into a conflict. Narrow that compared field set and
@@ -36,6 +36,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -53,9 +54,7 @@ use usage_collector_sdk::{
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
-use timescaledb_usage_collector_plugin::infra::storage::record_store::{
-    MAX_BATCH_ATTEMPTS, PgRecordStore,
-};
+use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
 
 /// A container plus a store over it.
 async fn setup() -> (common::TsHarness, PgRecordStore) {
@@ -137,6 +136,20 @@ async fn the_asserted_counter_names_are_all_declared() {
              Declared: {declared:?}"
         );
     }
+}
+
+/// How many deadlock victims `PostgreSQL` has aborted in this database.
+///
+/// The deadlock detector is the only writer of this counter, which is why it can
+/// answer a question `uc_timescaledb_batch_retries_total` cannot: that counter
+/// records that a batch was re-run, not why. Read as a before/after pair rather
+/// than compared against zero, because a harness that ever deadlocks outside the
+/// section under test would otherwise be charged to it.
+async fn deadlock_count(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_database carries a row for the current database")
 }
 
 /// Total of the `u64` counter data points named `name`.
@@ -1130,16 +1143,14 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// contended at all. A fixture sharing only scopes would have gone green here
 /// while asserting nothing.
 ///
-/// **The oracle can no longer separate a deadlock from an identity collision,
-/// and the assertion is weakened to match rather than the other way round.**
-/// `uc_timescaledb_batch_retries_total` counts a retry, not its cause, and
-/// `is_retryable_batch_error` admits **any** `Transient`. Three things now reach
-/// it: the ABBA deadlock victim (`40P01`) this test exists for, a
-/// `55P03 lock_not_available` that waited out `lock_timeout` on one of those same
-/// tuples, and - since the per-scope counter was retired - a concurrent writer of
-/// one of the batch's own identities colliding on the PRIMARY KEY, which
-/// `PgRecordStore::record_insert_error` lifts to a `Transient` so the batch
-/// re-runs against the winner's committed row.
+/// **The retry counter cannot be the oracle, because it counts a retry and not
+/// its cause.** `is_retryable_batch_error` admits **any** `Transient`, and three
+/// things reach it here: the ABBA deadlock victim (`40P01`) this test exists
+/// for, a `55P03 lock_not_available` that waited out `lock_timeout` on one of
+/// those same tuples, and - since the per-scope counter was retired - a
+/// concurrent writer of one of the batch's own identities colliding on the
+/// PRIMARY KEY, which `PgRecordStore::record_insert_error` lifts to a
+/// `Transient` so the batch re-runs against the winner's committed row.
 ///
 /// **That third one is not incidental here: this fixture guarantees it.** Both
 /// batches carry byte-identical rows, so both sides submit the *same derived
@@ -1147,38 +1158,43 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// identical for a reason that still holds and is worth keeping: a divergent
 /// overlap would resolve as an `IdempotencyConflict` and would say nothing about
 /// lock order at all. So the fixture that makes the lock-order question askable
-/// is the same fixture that makes identity collisions routine, and **zero is no
-/// longer an assertable bound.**
+/// is the same fixture that makes an identity-collision retry routine, and zero
+/// retries is not an assertable bound.
 ///
-/// What is still assertable, and what this test now establishes:
+/// **The oracle is `PostgreSQL`'s own deadlock counter instead.** The deadlock
+/// detector increments `pg_stat_database.deadlocks` when it aborts a victim, and
+/// nothing else does, so it separates the cause this test is about from the two
+/// it is not - which no bound on the retry count can do. Every `bring_up` starts
+/// its own container, so that counter belongs to this test alone.
+///
+/// Cumulative statistics are flushed by the reporting backend rather than
+/// written synchronously, and a backend does not flush more often than about
+/// once a second, so the read waits before it asks. That latency can only
+/// **under**-count, never over-count, which is the asymmetry that makes the
+/// assertion safe: a scheduling accident cannot turn it red, and only a real
+/// victim can.
+///
+/// What this test establishes:
 ///
 /// * both batches complete - no row is lost to a retry budget running out;
 /// * every row resolves `Ok`, in both scopes, with one stored row per key;
-/// * the retries stay **within the cap**, derived from
-///   [`MAX_BATCH_ATTEMPTS`] rather than written as a number. A retry storm, a
-///   deadlock that outlives the budget, or a sort regression that made every
-///   round deadlock would all breach it.
+/// * **no deadlock victim was produced at all**, which is the property
+///   `reps.sort_by` exists to provide.
 ///
-/// **What it no longer establishes** is that `reps.sort_by` makes the deadlock
-/// *unreachable* rather than survivable. Telling the causes apart needs an
-/// instrument that distinguishes them, and that is deliberately not added here:
-/// Task 5 collapses both write paths onto DESIGN section 3.6's single guarded
-/// statement, which changes the retry behaviour such an instrument would measure,
-/// and slice 8 owns the metric inventory. Designing it before that collapse is
-/// the wrong order.
-///
-/// The name says `resolve_within_the_retry_cap` and not `never_deadlock` for
-/// exactly that reason - the body no longer proves the stronger claim, and a name
-/// that outruns its assertions is the defect this suite is built to avoid.
+/// The retry count is read alongside it and reported in the failure message as
+/// context, deliberately **not** asserted on: measured on this fixture it sits
+/// at 0 or 1 sorted and at 3 or 4 unsorted, so a threshold between them would be
+/// a tuned literal standing in for an instrument that already exists.
 ///
 /// Several rounds rather than one, because a deadlock needs the two
 /// transactions to interleave and one round can miss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_batches_taking_two_scopes_in_opposite_orders_resolve_within_the_retry_cap() {
+async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock() {
     let (h, store, provider, exporter) = setup_metered().await;
     let vcpu = common::meter(common::VCPU_METER);
     let gb = common::meter(common::GB_METER);
     let tenant = Uuid::from_u128(0x0DEA_D10D);
+    let deadlocks_before = deadlock_count(&h.pool).await;
 
     // One round's rows for one scope. Both batches carry byte-identical rows,
     // so every overlap is an exact retry - a divergent one would be an
@@ -1224,23 +1240,21 @@ async fn concurrent_batches_taking_two_scopes_in_opposite_orders_resolve_within_
     }
 
     provider.force_flush().expect("flush metrics");
-    // The cap, derived rather than written: every `create_batch` call may retry
-    // `MAX_BATCH_ATTEMPTS - 1` times before it gives up, and this test makes two
-    // concurrent calls per round. Reading it off the constant is what keeps the
-    // bound correct if the retry budget ever changes.
+    // Give the reporting backends time to flush their pending statistics; see
+    // the doc comment for why waiting can only under-count.
+    tokio::time::sleep(StdDuration::from_secs(2)).await;
+    let deadlocks = deadlock_count(&h.pool).await - deadlocks_before;
     let calls = u64::try_from(DEADLOCK_ROUNDS).expect("a small round count") * 2;
-    let max_retries = calls * u64::from(MAX_BATCH_ATTEMPTS - 1);
     let retries = counter_sum(&exporter, "uc_timescaledb_batch_retries_total");
-    assert!(
-        retries <= max_retries,
-        "batch retries ran past the cap: {retries} over {calls} calls, where the \
-         budget allows {max_retries} (MAX_BATCH_ATTEMPTS - 1 per call). Every call \
-         returned Ok, so this is not rows being lost - it is the retry budget being \
-         consumed far more often than contention on this fixture should. A sort \
-         regression in plan_batch is the first thing to check: unsorted, the two \
-         sides take the shared keys' speculative tuple locks in opposite orders and \
-         deadlock every round. This bound cannot say which cause fired - see the \
-         doc comment."
+    assert_eq!(
+        deadlocks, 0,
+        "PostgreSQL aborted {deadlocks} deadlock victim(s) over {calls} concurrent \
+         batch calls. Every call still returned Ok, because the batch retry absorbs \
+         a victim - so the ledger is intact and it is the lock order that regressed. \
+         plan_batch's reps.sort_by is the first thing to check: unsorted, the two \
+         sides take the shared keys' speculative tuple locks in opposite orders. \
+         ({retries} batch retries were counted, of which a deadlock victim is only \
+         one possible cause - see the doc comment.)"
     );
 
     // And the ledger holds one row per key, in both scopes.

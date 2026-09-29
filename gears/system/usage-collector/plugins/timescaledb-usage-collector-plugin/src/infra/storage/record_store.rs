@@ -407,9 +407,11 @@ impl PgRecordStore {
     /// wins no slot — the read that resolves the conflict against the committed
     /// row, so the resolution cannot observe a ledger the insert never saw.
     ///
-    /// `ON CONFLICT DO NOTHING` is the **only** serialization authority on this
-    /// path, and since the per-scope counter was retired it is the only lock the
-    /// write transaction takes: a
+    /// `ON CONFLICT DO NOTHING` is the **write transaction's** only
+    /// serialization authority, and since the per-scope counter was retired it
+    /// is the only lock that transaction takes — the path still runs one
+    /// statement that can wait, [`TypeKeyCache::resolve`]'s own
+    /// `INSERT ... ON CONFLICT`, in autocommit before `begin()`: a
     /// concurrent same-key insert blocks on the in-progress speculative tuple
     /// until the winner commits — bounded by the connection's `lock_timeout`
     /// ([`crate::infra::storage::pool`]), so the wait cannot pin the connection
@@ -460,9 +462,10 @@ impl PgRecordStore {
         //    it, so the insert needs a point to roll back to. Serially this
         //    never fires and the savepoint is two statements of pure overhead.
         //
-        //    Task 5 collapses both insert paths onto DESIGN section 3.6's single
+        //    Collapsing both insert paths onto DESIGN section 3.6's single
         //    guarded statement, whose `LEFT JOIN ins USING (id)` shape resolves
-        //    the not-won row in the same statement; the savepoint goes then.
+        //    the not-won row in the same statement, is what removes the
+        //    savepoint; until that lands it stays.
         let subject_id = record
             .subject_ref
             .as_ref()
@@ -509,8 +512,16 @@ impl PgRecordStore {
                 }
                 // A concurrent writer of this very identity won and committed —
                 // Postgres waits on its speculative token before raising this, so
-                // by now its row is visible. ROLLBACK TO SAVEPOINT clears the
-                // aborted state and leaves the outer transaction usable, and the
+                // by now its row is committed, and step 2b's `SELECT` takes a
+                // fresh snapshot and sees it. That last step is what needs
+                // `READ COMMITTED`: under a deployer-set
+                // `default_transaction_isolation = repeatable read` the read
+                // would keep this transaction's original snapshot, the winner's
+                // row would be invisible, and the loser would answer a stale
+                // `Transient` where DESIGN section 3.3's `dedup-concurrent` row
+                // requires an `IdempotencyConflict`. ROLLBACK TO SAVEPOINT
+                // clears the aborted state and leaves the outer transaction
+                // usable, and the
                 // outcome is exactly the not-won one: step 2b reads the winner and
                 // resolves absorb-vs-conflict, which is what DESIGN section 3.3's
                 // `dedup-concurrent` row requires of the loser.

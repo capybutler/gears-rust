@@ -25,10 +25,15 @@ pub enum DbErrorClass {
 /// Every request-path connection carries a fixed `lock_timeout`
 /// ([`crate::infra::storage::pool`]), so a statement that waits too long on a
 /// contended lock fails with `55P03` rather than pinning a pooled connection.
-/// The ingest path waits on exactly one lock, and only when it meets one: the
-/// speculative tuple an in-flight insert of the same dedup 6-tuple holds until
-/// it commits. Losing that race is an ordinary contention outcome between two
-/// writers of one identity, self-healing on retry. Left in
+/// The wait ingest is *sized* for is the speculative tuple an in-flight insert
+/// of the same dedup 6-tuple holds until it commits, inside the write
+/// transaction. One statement outside that transaction can wait too:
+/// [`super::type_key::TypeKeyCache::resolve`] assigns a type's partition key
+/// with its own `INSERT ... ON CONFLICT`, in autocommit, so two first writes of
+/// one *type* meet on that tuple - once per type per process rather than once
+/// per write ([`crate::infra::storage::pool`] sizes the bound for both).
+/// Losing either race is an ordinary contention outcome between concurrent
+/// writers of one entry or of one type, self-healing on retry. Left in
 /// `Other` it maps to a non-retryable `Internal` and
 /// `is_retryable_batch_error` refuses to re-run a batch that is idempotent by
 /// construction.
@@ -108,7 +113,9 @@ const LEDGER_PK: &str = "usage_records_pkey";
 /// intercepted: with the derivation correct it is unreachable outside this race,
 /// so reaching the catch-all still means something is wrong. This predicate is
 /// the write path declaring the one case it knows how to resolve, and the
-/// division of labour is the point — see `error_tests`.
+/// division of labour is the point —
+/// `error_tests::the_ledger_pk_is_recognised_under_every_chunk_local_spelling`
+/// asserts both halves on one input.
 #[must_use]
 pub fn is_ledger_pk_violation(err: &sqlx::Error) -> bool {
     matches!(err, sqlx::Error::Database(db)
@@ -122,7 +129,7 @@ pub fn is_ledger_pk_violation(err: &sqlx::Error) -> bool {
 pub fn classify_db(code: &str, constraint: Option<&str>) -> DbErrorClass {
     match code {
         // Match the dedup constraint by name. Any other unique constraint —
-        // the records PK `(id, window_end)`, say — must fall through to
+        // the records PK `(id, window_end, type_key)`, say — must fall through to
         // `Other`.
         //
         // [`DEDUP_UNIQUE`] is the dedup authority, but the ingest path reaches

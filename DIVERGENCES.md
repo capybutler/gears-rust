@@ -765,11 +765,16 @@ untouched: it still spells `value`, and it will go red on the `quantity`
 rename. `accepted_at` and `acceptance_sequence` are still absent from both
 emitted key sets.
 
-`acceptance_sequence` exists nowhere in this workspace. The TimescaleDB plugin
-did assign one in its own `usage_records` table, monotonic per
+No backend in this workspace assigns an `acceptance_sequence`. The TimescaleDB
+plugin did assign one in its own `usage_records` table, monotonic per
 `(tenant_id, gts_type_id)`, and has retired it: the column, the counter table and
 every reader are gone, feed order is the `xid8` of the inserting transaction, and
-the `LATEST` fold orders on `window_end`, `accepted_at` and `id`. **No document
+the `LATEST` fold orders on `window_end`, `accepted_at` and `id`. The name is
+still written in the SDK's contract suite, deliberately and as history:
+`contract/checks/latest_tie_break.rs` records the order the TimescaleDB backend
+used to answer a tie on, and `contract_tests.rs` carries it in a
+`RETIRED_JUSTIFICATIONS` constant so a future `NOT_YET_CONFORMING` row cannot
+justify itself by a mechanism no backend has. **No document
 in this repository obliges a plugin to keep such a sequence** — the gear's
 `DESIGN.md` does not mention the name at all, so the §3.7 *storage* obligation
 this paragraph credited it with was a misreading of that document rather than a
@@ -1325,8 +1330,11 @@ greatest `id`, skipping the middle key, and the TimescaleDB backend on its own
 `reference.rs`'s fold is `max_by_key(|row| (row.window_end, row.accepted_at,
 row.id))`, corrected when `latest-tie-break` landed, and the TimescaleDB plugin's
 `LATEST_SELECT_EXPR` is `window_end DESC, accepted_at DESC, id DESC`, rewritten
-when that plugin retired the column. `acceptance_sequence` exists nowhere in this
-workspace. The check is in `IMPLEMENTED_CHECKS`, not `UNWRITTEN_CHECKS`, and both
+when that plugin retired the column. No backend in this workspace orders on an
+`acceptance_sequence` any more; the SDK still writes the name, in this check's
+own doc and in `contract_tests.rs`'s `RETIRED_JUSTIFICATIONS`, so that a future
+row cannot justify itself by the retired mechanism.
+The check is in `IMPLEMENTED_CHECKS`, not `UNWRITTEN_CHECKS`, and both
 backends pass it. `feed-retention-refusal`
 is the one check that needs more than an author: reaching a purged state needs
 a retention input `run_all` does not take, which `UNWRITTEN_CHECKS`'s own doc

@@ -4,6 +4,67 @@
 
 use super::*;
 
+/// A `sqlx::Error::Database` carrying a chosen SQLSTATE and constraint name.
+///
+/// `PgDatabaseError` cannot be constructed outside `sqlx`, but
+/// [`is_ledger_pk_violation`] reads `code()` and `constraint()` off the
+/// `DatabaseError` **trait** rather than off the concrete driver type - so
+/// implementing the trait is what puts the predicate itself under test.
+///
+/// It is worth the twenty lines. The only other oracle in reach is
+/// [`classify_db`], and that one answers `Other` for the ledger PK *and* for
+/// every other constraint name alike: a test routed through it would still pass
+/// with [`LEDGER_PK`] misspelled, with [`is_constraint`]'s `_` anchor deleted,
+/// or with the predicate hardwired to `false`. A check that cannot fail is
+/// worse than a missing one.
+#[derive(Debug)]
+struct FakeDbError {
+    code: &'static str,
+    constraint: Option<&'static str>,
+}
+
+impl std::fmt::Display for FakeDbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} on {}",
+            self.code,
+            self.constraint.unwrap_or("<no constraint>")
+        )
+    }
+}
+
+impl std::error::Error for FakeDbError {}
+
+impl sqlx::error::DatabaseError for FakeDbError {
+    fn message(&self) -> &'static str {
+        "fixture database error"
+    }
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        Some(std::borrow::Cow::Borrowed(self.code))
+    }
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+    fn constraint(&self) -> Option<&str> {
+        self.constraint
+    }
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        sqlx::error::ErrorKind::UniqueViolation
+    }
+}
+
+/// A driver error with `code` and `constraint`, in the shape the predicates read.
+fn db_err(code: &'static str, constraint: Option<&'static str>) -> sqlx::Error {
+    sqlx::Error::Database(Box::new(FakeDbError { code, constraint }))
+}
+
 #[test]
 fn unique_violation_on_dedup_is_dedup_conflict() {
     assert_eq!(
@@ -17,8 +78,10 @@ fn unique_violation_on_unknown_constraint_is_other() {
     // misclassified as the dedup-specific violation.
     //
     // **This stays `Other` on purpose, and the write path is what reclassifies a
-    // primary-key collision it is expecting** (`is_ledger_pk_violation`, exercised
-    // below). The division matters: a PK `23505` that no insert path intercepted
+    // primary-key collision it is expecting** (`is_ledger_pk_violation`, whose
+    // own oracle is `the_ledger_pk_is_recognised_under_every_chunk_local_spelling`
+    // below, where both halves are asserted on one input). The division matters:
+    // a PK `23505` that no insert path intercepted
     // is unreachable while the derived identity is correct, so the catch-all
     // reading it as a non-retryable `Internal` is the loud failure it should be.
     // Folding the PK into this arm would silence that.
@@ -32,36 +95,66 @@ fn unique_violation_on_unknown_constraint_is_other() {
 /// `create_inner` resolves in place and `create_batch_inner` lifts to a
 /// `Transient`.
 ///
-/// Built from a real `sqlx::Error::Database` rather than from strings, because
-/// the predicate reads `code()` and `constraint()` off the driver error and a
-/// string-level test would not exercise that at all. `PgDatabaseError` cannot be
-/// constructed directly, so the cases that need one are covered against a live
-/// backend by `records_ingest_integration_pg`'s two same-identity race tests;
-/// what is unit-testable here is the constraint-name matching the predicate
-/// shares with `is_constraint`, including `TimescaleDB`'s chunk-local spellings.
+/// Asserted on [`is_ledger_pk_violation`] itself, through [`FakeDbError`],
+/// because the predicate is what the fix turns on and no other oracle in this
+/// file can see it: [`classify_db`] answers `Other` for the ledger PK and for
+/// every other constraint alike.
+///
+/// The negatives are the load-bearing half. Each one names a different way the
+/// predicate could be wrong, and a predicate that answered `true` to all comers
+/// would turn a genuine defect into a silent absorb - the write path resolves
+/// what this returns `true` for.
 #[test]
 fn the_ledger_pk_is_recognised_under_every_chunk_local_spelling() {
     // The bare name, the `CREATE TABLE` chunk clone, and the standalone-index
-    // chunk clone - the three shapes `is_constraint`'s doc enumerates. Asserted
-    // through `classify_db`, which shares that matcher: each of these must stay
-    // `Other` there, which is the same question the predicate asks in reverse.
+    // chunk clone - the three shapes `is_constraint`'s doc enumerates.
     for spelling in [
         "usage_records_pkey",
         "1_usage_records_pkey",
         "_hyper_1_1_chunk_usage_records_pkey",
     ] {
+        assert!(
+            is_ledger_pk_violation(&db_err("23505", Some(spelling))),
+            "`{spelling}` names the ledger PK and must be recognised as one"
+        );
+        // The division of labour, stated on the same input: what the write path
+        // resolves, the classifier still reads as `Other`, so a PK collision no
+        // insert path intercepted stays a non-retryable `Internal`.
         assert_eq!(
             classify_db("23505", Some(spelling)),
             DbErrorClass::Other,
             "`{spelling}` is the ledger PK, not the dedup constraint"
         );
     }
-    // And the near-miss the `_` anchor exists to reject: a different constraint
-    // that merely ends in the same characters without a separator.
-    assert_eq!(
-        classify_db("23505", Some("notusage_records_dedup_uniq")),
-        DbErrorClass::Other,
-        "no `_` separator, so this is a different constraint"
+
+    // The near-miss the `_` anchor exists to reject: a different constraint that
+    // merely ends in the same characters without a separator.
+    assert!(
+        !is_ledger_pk_violation(&db_err("23505", Some("tenantusage_records_pkey"))),
+        "no `_` separator before the suffix, so this is a different constraint"
+    );
+    // A different constraint entirely. The dedup UNIQUE is the one the arbiter
+    // already suppresses, and reading it as a PK collision would resolve a row
+    // the write path never inserted.
+    assert!(
+        !is_ledger_pk_violation(&db_err("23505", Some("usage_records_dedup_uniq"))),
+        "the dedup UNIQUE is not the ledger PK"
+    );
+    // The right constraint under the wrong SQLSTATE: 23514 is a CHECK
+    // violation, which `usage_records_invalidation_pairing` can really raise.
+    assert!(
+        !is_ledger_pk_violation(&db_err("23514", Some("usage_records_pkey"))),
+        "only a 23505 on that constraint is a unique violation on it"
+    );
+    // A `23505` the driver reported without a constraint name.
+    assert!(
+        !is_ledger_pk_violation(&db_err("23505", None)),
+        "an unattributed unique violation names no constraint to match"
+    );
+    // And a non-database error, which the `matches!` arm must not admit.
+    assert!(
+        !is_ledger_pk_violation(&sqlx::Error::RowNotFound),
+        "only a backend-reported error can be a constraint violation"
     );
 }
 #[test]
