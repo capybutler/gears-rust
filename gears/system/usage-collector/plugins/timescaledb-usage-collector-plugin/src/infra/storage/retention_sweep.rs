@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use sqlx::{AssertSqlSafe, Connection as _, PgPool};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::domain::ports::{RetentionError, RetentionSource};
 use crate::domain::retention::{Decision, drop_decision};
@@ -53,6 +54,71 @@ pub const LIST_CHUNKS_SQL: &str = "SELECT ch.relid::text AS chunk, \
 /// Drops one chunk by its schema-qualified name. `DROP TABLE <chunk>` is an
 /// equivalent fallback should this internal function change.
 pub const DROP_CHUNK_SQL: &str = "SELECT _timescaledb_functions.drop_chunk($1::regclass)";
+
+/// Bounds every lock wait in the drop transaction, not only the chunk lock.
+///
+/// A fixed design choice rather than configuration: this plugin's
+/// `docs/DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-retention-sweep` specifies the
+/// value and states the reason — "so a sweep waiting for a busy chunk does not
+/// hold feed pages and other reads queued behind its lock request for long".
+///
+/// **No `synchronous_commit` here**, per ruling C19: §3.6's `BEGIN` line for
+/// this transaction omits the durability statement, and §3.5's universal is
+/// scoped to the paths that persist acknowledged entries. A lost sweep commit
+/// weakens no acknowledgement — the next sweep retries the chunk, and the
+/// type-key row is transitively flushed by the first durable ledger commit
+/// after it.
+pub const SET_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
+
+/// The highest feed position of each GTS type in one chunk.
+///
+/// Read from the chunk's own `usage_records_feed_idx` after the `ACCESS
+/// EXCLUSIVE` lock is held, which is what makes it complete: a transaction
+/// writing into the chunk holds a lock on it until it ends, so once the lock
+/// returns no such transaction is running and none can start, and this
+/// statement's own snapshot is taken after that (§3.6
+/// `cpt-cf-uc-plugin-seq-retention-sweep`).
+///
+/// **One row per `gts_type_id`, and that is load-bearing.**
+/// [`RAISE_MARKS_SQL`] is an `ON CONFLICT … DO UPDATE` keyed on that column,
+/// and `PostgreSQL` refuses a statement presenting two rows with one conflict
+/// key — "command cannot affect row a second time". So the one-row-per-type
+/// shape is what keeps the raise from erroring inside a transaction that also
+/// drops a chunk, rather than a tidiness choice.
+///
+/// `DISTINCT ON` rather than a grouped `max`, for two reasons. There is no
+/// `max()` aggregate over `xid8` and none over a record type, so the grouped
+/// form would need an aggregate `PostgreSQL` does not have; and taking
+/// `max(xact_id)` beside `max(id)` would be wrong even where it type-checks,
+/// because the position is the **pair** and two maxima taken separately can
+/// name a position no entry carries. The `ORDER BY` here is what picks the
+/// greatest pair, and it matches this index's own key order, so the read is a
+/// walk of `usage_records_feed_idx` rather than a sort.
+///
+/// `xact_id::text` because `xid8` has no `sqlx` `Decode` — the same reason
+/// `UsageRecordRow` holds it as a `String`.
+pub const CHUNK_HIGHEST_POSITIONS_SQL: &str = "SELECT DISTINCT ON (gts_type_id) gts_type_id, xact_id::text AS xact_id, id \
+     FROM {chunk} ORDER BY gts_type_id, xact_id DESC, id DESC";
+
+/// Raise each type's mark to the greater of the stored and the read position.
+///
+/// One row per GTS type that has lost an entry to retention (§3.7
+/// `usage_feed_retention_marks`). `gts_type_id` is the table's `PRIMARY KEY`,
+/// so it is a usable conflict target.
+///
+/// **The `WHERE` on the `DO UPDATE` is the whole of "raises a row, never lowers
+/// it"** (§3.7). Chunks are swept in catalog order rather than in time order,
+/// so a later sweep reaching an older chunk presents a *lower* position for a
+/// type a newer chunk already marked; without the conjunct that sweep lowers
+/// the mark, and a feed page then serves a range retention has truncated
+/// instead of refusing it.
+pub const RAISE_MARKS_SQL: &str = "INSERT INTO usage_feed_retention_marks \
+     (gts_type_id, xact_id, id) \
+     SELECT * FROM UNNEST($1::text[], $2::xid8[], $3::uuid[]) \
+     ON CONFLICT (gts_type_id) DO UPDATE \
+     SET xact_id = excluded.xact_id, id = excluded.id \
+     WHERE (excluded.xact_id, excluded.id) > (usage_feed_retention_marks.xact_id, \
+     usage_feed_retention_marks.id)";
 
 /// One ledger chunk, as the `TimescaleDB` catalog describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,15 +385,67 @@ impl PgRetentionSweeper {
         }
     }
 
-    /// The chunk drop and the rollup cut, atomically: a rollup row never
-    /// outlives the ledger rows it was computed from, and a failed cut keeps
-    /// the chunk. Returns the rollup rows deleted.
+    /// The mark raise, the chunk drop and the rollup cut, atomically: a rollup
+    /// row never outlives the ledger rows it was computed from, a failed cut
+    /// keeps the chunk, and a mark commits exactly when the entries it covers
+    /// are gone. Returns the rollup rows deleted.
+    ///
+    /// The step order is DESIGN §3.6 `cpt-cf-uc-plugin-seq-retention-sweep`'s
+    /// and it is load-bearing rather than incidental. The chunk lock precedes
+    /// the position read because a transaction writing into the chunk holds a
+    /// lock on it until it ends: once the lock returns, no such transaction is
+    /// running and none can start, so the read's own snapshot — taken after
+    /// that — sees every row the drop removes. Reading positions before taking
+    /// the lock satisfies every single-threaded test and loses that argument.
     async fn drop_chunk_and_rollup_rows(
         &self,
         chunk: &ChunkSlice,
         rollup_table: &str,
     ) -> Result<u64, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+
+        // Bounds every lock wait below, the chunk lock included.
+        sqlx::query(SET_LOCK_TIMEOUT_SQL).execute(&mut *tx).await?;
+
+        // `LOCK TABLE` takes no parameter, so the chunk name is formatted in.
+        // Sound because `ChunkSlice::chunk` is `ch.relid::text` from
+        // `_timescaledb_catalog.chunk` — a `regclass` rendered by PostgreSQL,
+        // which quotes and schema-qualifies as needed — and never caller
+        // input. §2.2's Injection-Safe Query Translation constraint is about
+        // caller-supplied text; this is catalog output, and
+        // `delete_rollup_rows_sql` already formats a table name on the same
+        // ground.
+        sqlx::query(AssertSqlSafe(format!(
+            "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+            chunk.chunk
+        )))
+        .execute(&mut *tx)
+        .await?;
+
+        let positions: Vec<(String, String, Uuid)> = sqlx::query_as(AssertSqlSafe(
+            CHUNK_HIGHEST_POSITIONS_SQL.replace("{chunk}", &chunk.chunk),
+        ))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !positions.is_empty() {
+            let (types, xact_ids, ids) = positions.iter().fold(
+                (Vec::new(), Vec::new(), Vec::new()),
+                |(mut types, mut xact_ids, mut ids), (gts_type_id, xact_id, id)| {
+                    types.push(gts_type_id.as_str());
+                    xact_ids.push(xact_id.as_str());
+                    ids.push(*id);
+                    (types, xact_ids, ids)
+                },
+            );
+            sqlx::query(RAISE_MARKS_SQL)
+                .bind(&types)
+                .bind(&xact_ids)
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         sqlx::query(DROP_CHUNK_SQL)
             .bind(&chunk.chunk)
             .execute(&mut *tx)

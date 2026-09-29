@@ -196,10 +196,10 @@ CREATE INDEX IF NOT EXISTS usage_records_watermark_idx
 -- page refuses a position a mark stands above (this plugin's DESIGN §3.6,
 -- Retention refusal).
 --
--- Created empty and stays empty in this slice: the retention sweep raises a
--- mark in the transaction that drops a chunk, and `read_feed_page` reads it,
--- and both are slice 3. An empty table here is the designed state, not an
--- unfinished one.
+-- Created empty in slice 2. Slice 3 is what raises marks into it: the
+-- retention sweep raises one in the transaction that drops a chunk
+-- (`retention_sweep::drop_chunk_and_rollup_rows`), and `read_feed_page`, which
+-- reads them, is a later task of the same slice.
 CREATE TABLE IF NOT EXISTS usage_feed_retention_marks (
     gts_type_id text NOT NULL PRIMARY KEY,
     xact_id     xid8 NOT NULL,

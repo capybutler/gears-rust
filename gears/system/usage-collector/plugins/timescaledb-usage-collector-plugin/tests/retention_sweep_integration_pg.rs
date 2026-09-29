@@ -681,3 +681,258 @@ async fn a_failed_rollup_row_delete_rolls_back_the_chunk_drop() {
         "the chunk drop rolled back along with the failed rollup-row delete"
     );
 }
+
+/// The mark a sweep leaves for the type it dropped, or `None`.
+async fn mark_of(pool: &sqlx::PgPool, gts_type_id: &str) -> Option<(u64, Uuid)> {
+    let row: Option<(String, Uuid)> = sqlx::query_as(
+        "SELECT xact_id::text, id FROM usage_feed_retention_marks WHERE gts_type_id = $1",
+    )
+    .bind(gts_type_id)
+    .fetch_optional(pool)
+    .await
+    .expect("read the mark");
+    row.map(|(xact_id, id)| (xact_id.parse().expect("xid8 digits"), id))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drop_raises_the_marks_of_every_type_in_the_chunk() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E11);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    let entry = aged(common::VCPU_METER, tenant, "interlock-1", 400);
+    let stored_entry = store.create(entry).await.expect("the entry stores");
+    let position = common::xact_id_of(&h.pool, stored_entry.id).await;
+
+    let report = sweeper(&h.pool, &stub)
+        .sweep_once()
+        .await
+        .expect("the sweep runs");
+    assert_eq!(report.dropped, 1, "one expired chunk: {report:?}");
+    assert!(!stored(&h.pool, stored_entry.id).await, "the entry is gone");
+
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        Some((position, stored_entry.id)),
+        "the mark names the highest position the chunk held, which is this \
+         entry's: the sweep reads it under the chunk's ACCESS EXCLUSIVE lock \
+         and commits the mark in the transaction that drops the rows \
+         (DESIGN section 3.6 cpt-cf-uc-plugin-seq-retention-sweep)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_sweep_of_an_older_chunk_does_not_lower_the_mark() {
+    // Chunks are swept in catalog order, not in time order, so this is the
+    // shape a real deployment reaches rather than a contrived one: the mark
+    // must hold at the highest position retention has ever deleted for the
+    // type. A lowered mark makes a feed page serve a range retention has
+    // truncated instead of refusing it, and nothing else in the suite can
+    // see that.
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E12);
+    let stub = Arc::new(StubRetention::default());
+
+    // Two entries of one meter, far enough apart in covered period to land in
+    // two chunks at the 7-day default interval. The *newer* period is written
+    // first, so it takes the lower `xact_id` and the older period takes the
+    // higher one — which is what makes a catalog-order sweep able to lower a
+    // mark at all.
+    let newer = store
+        .create(aged(common::VCPU_METER, tenant, "interlock-newer", 400))
+        .await
+        .expect("the newer-period entry stores");
+    let older = store
+        .create(aged(common::VCPU_METER, tenant, "interlock-older", 800))
+        .await
+        .expect("the older-period entry stores");
+    let newer_pos = common::xact_id_of(&h.pool, newer.id).await;
+    let older_pos = common::xact_id_of(&h.pool, older.id).await;
+    assert!(
+        older_pos > newer_pos,
+        "the fixture needs the older *period* to carry the higher position, \
+         so that a sweep reaching its chunk second would lower the mark: \
+         newer={newer_pos}, older={older_pos}"
+    );
+
+    stub.set(common::VCPU_METER, days(30));
+    let report = sweeper(&h.pool, &stub)
+        .sweep_once()
+        .await
+        .expect("the sweep runs");
+    assert_eq!(report.dropped, 2, "both chunks expired: {report:?}");
+
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        Some((older_pos, older.id)),
+        "the mark holds at the greatest position either chunk held, whichever \
+         order the catalog returned them in"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_chunk_lock_makes_the_drop_time_out_and_keep_the_chunk() {
+    // The `lock_timeout` is what bounds the wait; without it this sweep
+    // blocks for as long as the competing transaction runs, holding every
+    // feed page queued behind its lock request. The competing lock is taken
+    // in a separate transaction that is never committed inside the timeout.
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E13);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    let entry = store
+        .create(aged(common::VCPU_METER, tenant, "interlock-locked", 400))
+        .await
+        .expect("the entry stores");
+
+    let chunk =
+        timescaledb_usage_collector_plugin::infra::storage::retention_sweep::list_chunks(&h.pool)
+            .await
+            .expect("list chunks")
+            .into_iter()
+            .next()
+            .expect("one chunk");
+
+    let mut blocker = h.pool.acquire().await.expect("a blocking connection");
+    sqlx::query("BEGIN")
+        .execute(&mut *blocker)
+        .await
+        .expect("begin");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        chunk.chunk
+    )))
+    .execute(&mut *blocker)
+    .await
+    .expect("the blocker takes the chunk lock");
+
+    let report = sweeper(&h.pool, &stub)
+        .sweep_once()
+        .await
+        .expect("the sweep completes even though the drop could not");
+    assert_eq!(report.dropped, 0, "nothing dropped: {report:?}");
+    assert_eq!(report.drop_failures, 1, "one counted failure: {report:?}");
+
+    // The blocker's ACCESS EXCLUSIVE lock is released here, before the checks
+    // below, rather than after them as the brief's draft had it. `id` is not
+    // the hypertable's partitioning key, so neither `stored`'s nor `mark_of`'s
+    // query can prune the still-locked chunk at plan time; each would need an
+    // `AccessShareLock` on it and block behind the very lock this test holds,
+    // timing out on the pool's own session-level `lock_timeout` (`pool.rs`)
+    // instead of exercising the assertion. The report above is already
+    // captured, so releasing the lock first changes nothing the test proves.
+    sqlx::query("ROLLBACK")
+        .execute(&mut *blocker)
+        .await
+        .expect("rollback");
+
+    assert!(
+        stored(&h.pool, entry.id).await,
+        "the chunk is kept for the next sweep"
+    );
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        None,
+        "a rolled-back drop leaves no mark: the mark and the drop commit \
+         together or not at all, which is what lets a page treat a mark as \
+         naming entries that are already gone"
+    );
+}
+
+/// A chunk whose two maxima cross: the entry with the greatest `xact_id` does
+/// not carry the greatest `id`, and vice versa. `id` is derived client-side
+/// before either write reaches the database, so which of two candidate
+/// entries carries the greater `id` is known before either is stored; writing
+/// the greater-`id` candidate first forces the second write — which always
+/// takes the greater `xact_id` — to carry the *lesser* `id`, guaranteeing a
+/// cross without any retry or search.
+///
+/// This is what distinguishes `CHUNK_HIGHEST_POSITIONS_SQL`'s `DISTINCT ON`
+/// from a grouped `max(xact_id)` beside `max(id)`: the two independent maxima
+/// would name `(second_pos, first_id)`, a pair no entry in the chunk actually
+/// carries, where `DISTINCT ON`'s `ORDER BY` picks the one row that is
+/// greatest as a *pair* — the second write's own `(xact_id, id)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crossing_of_the_chunks_two_maxima_still_names_a_real_entry() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E14);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    // Both candidates share one window, so both land in the same chunk.
+    let end = OffsetDateTime::now_utc() - Duration::days(400);
+    let candidate_a = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "cross-a",
+        Decimal::ONE,
+        end - Duration::hours(1),
+        end,
+    );
+    let candidate_b = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "cross-b",
+        Decimal::ONE,
+        end - Duration::hours(1),
+        end,
+    );
+    // Whichever candidate carries the greater `id` is written first, so the
+    // second write — which always takes the greater `xact_id` — is forced to
+    // carry the lesser `id`.
+    let (first, second) = if candidate_a.id > candidate_b.id {
+        (candidate_a, candidate_b)
+    } else {
+        (candidate_b, candidate_a)
+    };
+    let (first_id, second_id) = (first.id, second.id);
+    store
+        .create(first)
+        .await
+        .expect("the first candidate stores");
+    store
+        .create(second)
+        .await
+        .expect("the second candidate stores");
+    let first_pos = common::xact_id_of(&h.pool, first_id).await;
+    let second_pos = common::xact_id_of(&h.pool, second_id).await;
+    assert!(
+        second_pos > first_pos,
+        "the second write must carry the greater xact_id: first={first_pos}, \
+         second={second_pos}"
+    );
+    assert!(
+        second_id < first_id,
+        "the construction must give the second write the lesser id, so the \
+         two maxima cross: first={first_id}, second={second_id}"
+    );
+
+    let report = sweeper(&h.pool, &stub)
+        .sweep_once()
+        .await
+        .expect("the sweep runs");
+    assert_eq!(report.dropped, 1, "one expired chunk: {report:?}");
+
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        Some((second_pos, second_id)),
+        "the mark must name the greatest (xact_id, id) PAIR an entry actually \
+         carried, the second write's, not the pointwise maxima of xact_id \
+         and id taken separately, which would name (second_pos, first_id), a \
+         position no entry in the chunk carries"
+    );
+}

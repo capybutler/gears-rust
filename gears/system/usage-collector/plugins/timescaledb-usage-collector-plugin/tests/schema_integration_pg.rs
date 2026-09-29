@@ -335,7 +335,8 @@ async fn the_pairing_constraint_admits_a_kind_that_agrees_with_the_withdrawal_pa
 /// naming a reason and no target. Under the second spelling that conjunct is
 /// NULL where both its neighbours are true, so the whole predicate is NULL and
 /// the row is stored, because a `CHECK` admits a row whose predicate is NULL.
-/// Every other row meets a `false` conjunct first and is refused either way.
+/// Every other row that carries a half pair meets a `false` conjunct first and
+/// is refused either way.
 ///
 /// All four are collected before the assertions, so a weakened constraint
 /// reports every shape it let through rather than stopping at the first.
