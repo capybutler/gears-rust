@@ -1418,9 +1418,12 @@ the blocker named per check.
 ## 20. `LATEST` has an unbounded server-side allocation driven by caller input
 
 The TimescaleDB plugin's `Latest` fold is
-`(ARRAY_AGG(r.value ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]`
+`(ARRAY_AGG(r.quantity ORDER BY r.window_end DESC, r.accepted_at DESC, r.id
+DESC))[1]::numeric`
 (`plugins/timescaledb-usage-collector-plugin/src/infra/storage/query/aggregate.rs`,
 `LATEST_SELECT_EXPR`), which materializes a group's values before picking one.
+Its third ordering key widens the **sort key** and not the array, whose payload
+is one value per row.
 `aggregate_limit_clause` in the same module gives **zero** protection against
 it: that clause bounds the number of *groups* (`LIMIT MAX_AGGREGATION_BUCKETS +
 1`) and never the rows within one. The only bound on rows in a group is the
@@ -1525,11 +1528,12 @@ reason code). The TimescaleDB plugin decides that collision on
 
 **Why the key alone does not make it unconditional.** The dedup identity is not
 the key. It is `(tenant_id, gts_type_id, idempotency_key, window_start,
-window_end)` — DESIGN §3.7's 5-tuple, plus `type_key` on the index because a
-hypertable `UNIQUE` must contain every partition column. The covered-period
-bounds and the type are part of it. Two withdrawals of one target that carry the
-same `inv:<target>` key over **different** periods, or under different types,
-therefore have different identities, and **both are stored**.
+window_end, entry_type)` — the gear's DESIGN §3.1 6-tuple, plus `type_key` on
+the index because a hypertable `UNIQUE` must contain every partition column.
+The covered-period bounds, the type and the entry kind are all part of it. Two
+withdrawals of one target that carry the same `inv:<target>` key over
+**different** periods, or under different types, therefore have different
+identities, and **both are stored**.
 
 **What prevents that is the Ingestion Gateway, not the store.** Every withdrawal
 the gateway admits is a faithful copy of its target's covered period and type
@@ -1684,9 +1688,9 @@ one, so the §4 table was deliberately left alone rather than patched in place.
 **The contrast that makes the rule legible.** The same slice *corrected* the
 plugin's `README.md` — 52 lines with three wrong ones, including a **Note** that
 declared an "intentional divergence from the SPI's 3-tuple contract" where the
-shipped `usage_records_dedup_uniq` is the gear's DESIGN §3.7 5-tuple verbatim,
-the opposite of a divergence. A mostly-right document is where a wrong line does
-its damage, and is worth the edit; a uniformly stale one is worth a marker.
+shipped dedup identity is the gear's DESIGN §3.1 6-tuple verbatim, the opposite
+of a divergence. A mostly-right document is where a wrong line does its damage,
+and is worth the edit; a uniformly stale one is worth a marker.
 
 **Load-bearing.** An implementer or reviewer working the plugin's §4 table
 builds three instruments that no longer have anything to measure and mis-keys a

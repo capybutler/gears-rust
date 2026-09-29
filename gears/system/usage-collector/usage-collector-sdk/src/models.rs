@@ -2126,8 +2126,8 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 // `UsageRecordQuery` declares the filterable-field schema for the OData
 // surface of `list_usage_records`. The struct is never constructed at
 // runtime; it exists solely to feed `#[derive(ODataFilterable)]`, which
-// generates [`UsageRecordQueryFilterField`] and its
-// [`toolkit_odata::filter::FilterField`] impl. Plugin implementations supply
+// generates `UsageRecordQueryFilterField` and its
+// `toolkit_odata::filter::FilterField` impl. Plugin implementations supply
 // a `FieldToColumn<UsageRecordFilterField>` mapper next to their entity
 // definition; the SDK does not encode storage-layer column mapping.
 //
@@ -2163,12 +2163,12 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 // path rather than a hand-rolled slash-path `FilterField` impl.
 //
 // `entry_type` is declared `String` on the filter wire (`"record"` /
-// `"invalidation"`). The SDK stores no such attribute — [`UsageRecord`]
+// `"invalidation"`). The SDK stores no such attribute — `UsageRecord`
 // projects it from `invalidates`, which is optional — so a plugin that
 // wants the field filterable holds it as a column of its own and returns
 // that column from `FieldToColumn::map_field`. **How it holds it is the
 // plugin's choice**, and this SDK prescribes neither way: writing the kind
-// each submission declares ([`CreateUsageRecord::entry_type`] carries it,
+// each submission declares (`CreateUsageRecord::entry_type` carries it,
 // and DESIGN §3.1 forbids inferring it there) and deriving it in the
 // schema from `invalidates` both yield a column `map_field` can name.
 // `map_value` cannot carry it either way.
@@ -2178,11 +2178,11 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 // `ODataValue::Null` returned from the hook is refused rather than lowered
 // — for `in` as well as for `eq`. Neither wire spelling is reachable that
 // way. The SDK requires no plugin to materialize the column, which is why
-// `entry_type` is absent from [`KEYSET_SAFE_RECORD_FIELDS`]; see
-// [`is_keyset_safe_record_field`].
+// `entry_type` is absent from `KEYSET_SAFE_RECORD_FIELDS`; see
+// `is_keyset_safe_record_field`.
 //
 // `metadata` filtering does not flow through OData — see
-// [`MetadataFilter`] below, supplied as a separate parameter on
+// `MetadataFilter` below, supplied as a separate parameter on
 // `list_usage_records`. Postgres has no general `serde_json::Value` filter
 // surface in `toolkit-odata`, and there is no precedent for one in the
 // workspace.

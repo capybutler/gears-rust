@@ -166,7 +166,17 @@ impl SqlCtx {
 ///
 /// A value that is not one of the enum's labels is therefore rejected by
 /// `PostgreSQL` (`22P02`) rather than selecting nothing, which is the cost of
-/// comparing against the column directly.
+/// comparing against the column directly. **The class that reaches the caller
+/// is an internal error, not an invalid-argument**: `22P02` is neither `23505`
+/// nor transient, so [`super::super::error::classify_db`] leaves it in `Other`
+/// and [`super::super::error::map_sqlx_err`] returns
+/// `Internal("database error")`, which also counts as a backend error of class
+/// `internal`. So a misspelled literal in a well-formed request is answered as
+/// a server fault. Refusing it as a caller error instead belongs to the slice
+/// that owns the admissible `$filter` value set, slice 7; until then
+/// `a_non_label_entry_type_filter_answers_an_internal_error` in
+/// `tests/records_query_integration_pg.rs` is what holds the current class in
+/// place, and is written to go red when that slice lands.
 ///
 /// Keyed on the resolved column rather than the field name, so it is the
 /// spelling that actually reaches the SQL that decides. The type name is

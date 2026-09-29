@@ -8,8 +8,8 @@
 use usage_collector_sdk::UsageCollectorPluginError;
 
 /// Name of the dedup UNIQUE declared in `migrations/0001_init.sql`, over the
-/// 6-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
-/// window_end, entry_type)`.
+/// dedup 6-tuple plus the partition key the hypertable requires. The column
+/// list is the migration's; what is used here is the name.
 const DEDUP_UNIQUE: &str = "usage_records_dedup_uniq";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
