@@ -26,7 +26,7 @@ use timescaledb_usage_collector_plugin::domain::ports::{
 use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
 use timescaledb_usage_collector_plugin::infra::storage::pool::apply_post_migration_setup;
 use timescaledb_usage_collector_plugin::infra::storage::retention_sweep::{
-    PgRetentionSweeper, SWEEP_ADVISORY_LOCK_KEY, list_chunks,
+    CHUNK_HIGHEST_POSITIONS_SQL, PgRetentionSweeper, SWEEP_ADVISORY_LOCK_KEY, list_chunks,
 };
 use timescaledb_usage_collector_plugin::infra::storage::rollup_maintenance::materialization_table;
 
@@ -733,6 +733,18 @@ async fn a_later_sweep_of_an_older_chunk_does_not_lower_the_mark() {
     // type. A lowered mark makes a feed page serve a range retention has
     // truncated instead of refusing it, and nothing else in the suite can
     // see that.
+    //
+    // A chunk's relid is assigned at creation, and creation happens on its
+    // first write, so with only one write per chunk whichever chunk is
+    // written first gets both the lower relid (visited first by a
+    // catalog-ordered sweep) and the lower position — the two orderings are
+    // structurally coupled, and a two-chunk, one-write-each fixture can
+    // never present a lower position to a later-visited chunk. Breaking that
+    // coupling needs a *third* write, back into the first chunk, after the
+    // second chunk already exists: the first chunk stays visited first, but
+    // now holds the highest position of the three, so the second chunk's own
+    // read — visited second — presents a position lower than what the first
+    // chunk already raised.
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
@@ -740,26 +752,29 @@ async fn a_later_sweep_of_an_older_chunk_does_not_lower_the_mark() {
     let tenant = Uuid::from_u128(0x5E12);
     let stub = Arc::new(StubRetention::default());
 
-    // Two entries of one meter, far enough apart in covered period to land in
-    // two chunks at the 7-day default interval. The *newer* period is written
-    // first, so it takes the lower `xact_id` and the older period takes the
-    // higher one — which is what makes a catalog-order sweep able to lower a
-    // mark at all.
-    let newer = store
-        .create(aged(common::VCPU_METER, tenant, "interlock-newer", 400))
+    let first = store
+        .create(aged(common::VCPU_METER, tenant, "interlock-first", 400))
         .await
-        .expect("the newer-period entry stores");
-    let older = store
-        .create(aged(common::VCPU_METER, tenant, "interlock-older", 800))
+        .expect("the first entry stores");
+    let second = store
+        .create(aged(common::VCPU_METER, tenant, "interlock-second", 800))
         .await
-        .expect("the older-period entry stores");
-    let newer_pos = common::xact_id_of(&h.pool, newer.id).await;
-    let older_pos = common::xact_id_of(&h.pool, older.id).await;
+        .expect("the second entry stores");
+    // Back into the first chunk (same covered-period age as `first`), so the
+    // chunk visited first by the sweep ends up holding the highest position
+    // of the three.
+    let third = store
+        .create(aged(common::VCPU_METER, tenant, "interlock-third", 400))
+        .await
+        .expect("the third entry stores");
+
+    let first_pos = common::xact_id_of(&h.pool, first.id).await;
+    let second_pos = common::xact_id_of(&h.pool, second.id).await;
+    let third_pos = common::xact_id_of(&h.pool, third.id).await;
     assert!(
-        older_pos > newer_pos,
-        "the fixture needs the older *period* to carry the higher position, \
-         so that a sweep reaching its chunk second would lower the mark: \
-         newer={newer_pos}, older={older_pos}"
+        first_pos < second_pos && second_pos < third_pos,
+        "the fixture needs strictly increasing positions in write order: \
+         first={first_pos}, second={second_pos}, third={third_pos}"
     );
 
     stub.set(common::VCPU_METER, days(30));
@@ -771,9 +786,10 @@ async fn a_later_sweep_of_an_older_chunk_does_not_lower_the_mark() {
 
     assert_eq!(
         mark_of(&h.pool, common::VCPU_METER).await,
-        Some((older_pos, older.id)),
-        "the mark holds at the greatest position either chunk held, whichever \
-         order the catalog returned them in"
+        Some((third_pos, third.id)),
+        "the mark holds at the greatest position any chunk held, the third \
+         write's, back in the first-visited chunk, not the lower position \
+         the second-visited chunk presents afterward"
     );
 }
 
@@ -826,12 +842,14 @@ async fn a_held_chunk_lock_makes_the_drop_time_out_and_keep_the_chunk() {
 
     // The blocker's ACCESS EXCLUSIVE lock is released here, before the checks
     // below, rather than after them as the brief's draft had it. `id` is not
-    // the hypertable's partitioning key, so neither `stored`'s nor `mark_of`'s
-    // query can prune the still-locked chunk at plan time; each would need an
-    // `AccessShareLock` on it and block behind the very lock this test holds,
-    // timing out on the pool's own session-level `lock_timeout` (`pool.rs`)
-    // instead of exercising the assertion. The report above is already
-    // captured, so releasing the lock first changes nothing the test proves.
+    // the hypertable's partitioning key, so `stored`'s query can't prune the
+    // still-locked chunk at plan time; it would need an `AccessShareLock` on
+    // it and block behind the very lock this test holds, timing out on the
+    // pool's own session-level `lock_timeout` (`pool.rs`) instead of
+    // exercising the assertion. `mark_of` queries `usage_feed_retention_marks`,
+    // an ordinary non-hypertable table unrelated to the dropped chunk, so it
+    // was never at risk. The report above is already captured, so releasing
+    // the lock first changes nothing the test proves.
     sqlx::query("ROLLBACK")
         .execute(&mut *blocker)
         .await
@@ -934,5 +952,70 @@ async fn a_crossing_of_the_chunks_two_maxima_still_names_a_real_entry() {
          carried, the second write's, not the pointwise maxima of xact_id \
          and id taken separately, which would name (second_pos, first_id), a \
          position no entry in the chunk carries"
+    );
+}
+
+/// `CHUNK_HIGHEST_POSITIONS_SQL` must order `xact_id` numerically, not as
+/// rendered digit text. `PostgreSQL` resolves a bare `ORDER BY` name that
+/// matches both an output column and an input column to the *output*
+/// column, so aliasing the `::text` cast back to `xact_id` — its own source
+/// column's name — would make the `ORDER BY` bind to the text column and
+/// sort lexicographically, ranking `"9"` above `"10"`.
+///
+/// Two back-to-back inserts through the ingest path cannot reach this:
+/// consecutive `xact_id`s share a decimal digit count, so no ordinary
+/// fixture straddles the boundary. This test pins explicit `xid8` values
+/// directly, in the test's own SQL, to force the straddle. Slice 2's rule
+/// that the Record Store never binds `xact_id` binds production code, not a
+/// test pinning ordering semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_position_read_orders_xact_id_numerically_not_lexicographically() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5EA1);
+
+    let low = store
+        .create(aged(common::VCPU_METER, tenant, "digit-low", 400))
+        .await
+        .expect("the low entry stores");
+    let high = store
+        .create(aged(common::VCPU_METER, tenant, "digit-high", 400))
+        .await
+        .expect("the high entry stores");
+
+    // Pin xid8 values that straddle a digit-length boundary: under a
+    // lexicographic (text) comparison "9" sorts above "10".
+    sqlx::query("UPDATE usage_records SET xact_id = '9'::xid8 WHERE id = $1")
+        .bind(low.id)
+        .execute(&h.pool)
+        .await
+        .expect("pin the low entry's xact_id");
+    sqlx::query("UPDATE usage_records SET xact_id = '10'::xid8 WHERE id = $1")
+        .bind(high.id)
+        .execute(&h.pool)
+        .await
+        .expect("pin the high entry's xact_id");
+
+    let chunk = list_chunks(&h.pool)
+        .await
+        .expect("list chunks")
+        .into_iter()
+        .next()
+        .expect("one chunk");
+    let sql = CHUNK_HIGHEST_POSITIONS_SQL.replace("{chunk}", &chunk.chunk);
+    let positions: Vec<(String, String, Uuid)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&h.pool)
+        .await
+        .expect("read positions");
+
+    assert_eq!(
+        positions,
+        vec![(common::VCPU_METER.to_owned(), "10".to_owned(), high.id)],
+        "the numerically greater xact_id (10) must win over the \
+         lexicographically greater digit string (\"9\"); a bug here makes \
+         the sweep raise a mark below the chunk's true highest deleted \
+         position: {positions:?}"
     );
 }

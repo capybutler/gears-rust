@@ -92,12 +92,22 @@ pub const SET_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
 /// `max(xact_id)` beside `max(id)` would be wrong even where it type-checks,
 /// because the position is the **pair** and two maxima taken separately can
 /// name a position no entry carries. The `ORDER BY` here is what picks the
-/// greatest pair, and it matches this index's own key order, so the read is a
-/// walk of `usage_records_feed_idx` rather than a sort.
+/// greatest pair.
+///
+/// **The cast is aliased to a name distinct from the source column,
+/// `xact_id_text`, and that is load-bearing.** `PostgreSQL` resolves a bare
+/// `ORDER BY` name that matches both an output column and an input column to
+/// the *output* column. Aliasing the cast back to `xact_id` — its own source
+/// column's name — would make `ORDER BY … xact_id DESC` bind to the `text`
+/// column instead of the `xid8` one, sorting lexicographically over digit
+/// strings rather than numerically, so `DISTINCT ON` would keep `9` over `10`
+/// in one chunk. `sqlx::query_as`'s tuple decode is positional, so the alias
+/// carries no decode meaning; it exists only to keep `ORDER BY` unambiguous.
 ///
 /// `xact_id::text` because `xid8` has no `sqlx` `Decode` — the same reason
 /// `UsageRecordRow` holds it as a `String`.
-pub const CHUNK_HIGHEST_POSITIONS_SQL: &str = "SELECT DISTINCT ON (gts_type_id) gts_type_id, xact_id::text AS xact_id, id \
+pub const CHUNK_HIGHEST_POSITIONS_SQL: &str = "SELECT DISTINCT ON (gts_type_id) \
+     gts_type_id, xact_id::text AS xact_id_text, id \
      FROM {chunk} ORDER BY gts_type_id, xact_id DESC, id DESC";
 
 /// Raise each type's mark to the greater of the stored and the read position.
