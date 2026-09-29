@@ -7278,4 +7278,109 @@ mod withdrawal_exclusion_tests {
             "every declared fold must see the two survivors alone",
         );
     }
+
+    // ── The declared LATEST tie-break ──────────────────────────────────────
+    //
+    // Not withdrawal exclusion; here because this is where the `FoldingPlugin`
+    // fixtures live. `fold_over`'s `Latest` arm orders on all three of DESIGN
+    // section 3.1's keys, and every case above ties on none of them, so the
+    // second and third keys reached no oracle in this crate. The SDK's
+    // `latest-tie-break` check covers the reference backend and a real storage
+    // plugin, not this double.
+    //
+    // Two tests rather than one combined case: a double that got the second
+    // and third keys wrong in compensating directions would pass a single
+    // assertion over a single population.
+
+    /// A pair tying on `window_end` is decided by the greater `accepted_at`,
+    /// with the `id` order made to disagree.
+    #[tokio::test]
+    async fn latest_breaks_a_window_end_tie_on_accepted_at() {
+        let (svc, plugin) = service_over_folding_plugin(AggregationFold::Latest);
+
+        // Both entries end the same minute, so `window_end` decides nothing.
+        // Which of the two derived ids is the greater is a digest's business
+        // and not the fixture's, so the fixture reads it off and gives the
+        // *later* `accepted_at` to the **lesser** id. That is what puts the
+        // second key and the third in opposition: a fold that fell from
+        // `window_end` straight through to `id` answers the other entry.
+        let one = measurement("idem-tie-accepted-one", "0", 30);
+        let two = measurement("idem-tie-accepted-two", "0", 30);
+        assert_ne!(one.id, two.id, "two idempotency keys derive two ids");
+        assert_eq!(
+            one.window_end, two.window_end,
+            "the pair must tie on window_end or the fold never reaches accepted_at"
+        );
+        let (lesser, greater) = if one.id < two.id {
+            (one, two)
+        } else {
+            (two, one)
+        };
+
+        let lesser_end = lesser.window_end;
+        plugin.store(UsageRecord {
+            quantity: "11".parse().expect("valid decimal quantity"),
+            accepted_at: lesser_end + time::Duration::minutes(5),
+            ..lesser
+        });
+        let greater_end = greater.window_end;
+        plugin.store(UsageRecord {
+            quantity: "22".parse().expect("valid decimal quantity"),
+            accepted_at: greater_end,
+            ..greater
+        });
+
+        assert_eq!(
+            single_bucket(&aggregate(&svc).await),
+            Some(big("11")),
+            "LATEST takes the greater `accepted_at` over the greater `id`; 22 \
+             is what a fold falling from `window_end` straight to `id` answers",
+        );
+    }
+
+    /// A pair tying on `window_end` **and** `accepted_at` is decided by the
+    /// greater `id`, with insertion order made to disagree.
+    #[tokio::test]
+    async fn latest_breaks_an_accepted_at_tie_on_the_greater_id() {
+        let (svc, plugin) = service_over_folding_plugin(AggregationFold::Latest);
+
+        // `measurement` stamps `accepted_at` from `window_end`, so a pair
+        // sharing a covered period ties on both keys above `id` and leaves
+        // `id` the only thing left to decide with. The greater-`id` entry is
+        // stored **first**, against the order a fold that ran out of keys
+        // would answer in: `max_by_key` keeps the last of several equal
+        // maxima, so dropping `id` picks whichever was stored second.
+        let one = measurement("idem-tie-id-one", "0", 30);
+        let two = measurement("idem-tie-id-two", "0", 30);
+        assert_ne!(one.id, two.id, "two idempotency keys derive two ids");
+        assert_eq!(
+            one.window_end, two.window_end,
+            "the pair must tie on window_end"
+        );
+        assert_eq!(
+            one.accepted_at, two.accepted_at,
+            "the pair must tie on accepted_at too, or `id` never decides"
+        );
+        let (lesser, greater) = if one.id < two.id {
+            (one, two)
+        } else {
+            (two, one)
+        };
+
+        plugin.store(UsageRecord {
+            quantity: "33".parse().expect("valid decimal quantity"),
+            ..greater
+        });
+        plugin.store(UsageRecord {
+            quantity: "44".parse().expect("valid decimal quantity"),
+            ..lesser
+        });
+
+        assert_eq!(
+            single_bucket(&aggregate(&svc).await),
+            Some(big("33")),
+            "LATEST takes the greater `id` once both keys above it tie; 44 is \
+             what a fold that ran out of keys and fell to insertion order answers",
+        );
+    }
 }
