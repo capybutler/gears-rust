@@ -2,6 +2,12 @@ use uuid::Uuid;
 
 use super::*;
 
+// A compile-time guard rather than a runtime assertion: both operands are
+// consts, so there is no state a run could vary, and the check belongs where
+// it fails the build instead of a test. The SDK's own `contract::fixtures`
+// uses this shape for the same reason.
+const _: () = assert!(FEED_POSITION_BYTES <= usage_collector_sdk::MAX_FEED_POSITION_BYTES);
+
 #[test]
 fn a_position_round_trips() {
     let id = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
@@ -11,6 +17,14 @@ fn a_position_round_trips() {
         Ok((7_777_777_777, id)),
         "the codec is this plugin's alone and nothing else reads its bytes, so \
          a round trip is the whole of its contract"
+    );
+    // An extreme: the generic property holds for values at both ends of the
+    // space, not only the tested mid-range.
+    let position = encode_position(u64::MAX, MAX_UUID);
+    assert_eq!(
+        decode_position(&position),
+        Ok((u64::MAX, MAX_UUID)),
+        "even at the boundaries the round trip is total"
     );
 }
 
@@ -32,10 +46,6 @@ fn a_position_is_twenty_four_bytes_whatever_it_encodes() {
             "every position is one fixed width: {xact_id}, {id}"
         );
     }
-    assert!(
-        FEED_POSITION_BYTES <= usage_collector_sdk::MAX_FEED_POSITION_BYTES,
-        "and it is inside the bound the wire cursor can carry"
-    );
 }
 
 #[test]
@@ -45,9 +55,14 @@ fn the_encoding_orders_the_way_the_feed_does() {
     // `FeedPosition` provides no `Ord`, deliberately. It is asserted because
     // the plugin's own decode and the SQL row-value comparison have to agree
     // about which of two positions is greater.
-    let lower = encode_position(5, Uuid::from_u128(9));
-    let by_xact = encode_position(6, Uuid::from_u128(0));
-    let by_id = encode_position(5, Uuid::from_u128(10));
+    //
+    // The xact_id values 1 and 256 straddle a byte boundary: `BE(1) = [0,…,0,1]`
+    // and `BE(256) = [0,…,1,0]`, so bytewise comparison holds; under little-endian
+    // those would invert to `LE(1) = [1,0,…]` and `LE(256) = [0,1,…]`, which would
+    // fail the assertion and red the test.
+    let lower = encode_position(1, Uuid::from_u128(9));
+    let by_xact = encode_position(256, Uuid::from_u128(0));
+    let by_id = encode_position(1, Uuid::from_u128(10));
     assert!(lower.as_bytes() < by_xact.as_bytes(), "xact_id leads");
     assert!(lower.as_bytes() < by_id.as_bytes(), "id breaks the tie");
 }

@@ -46,12 +46,13 @@ pub const MAX_UUID: Uuid = Uuid::from_u128(u128::MAX);
 /// asserted by `a_position_is_twenty_four_bytes_whatever_it_encodes` rather
 /// than argued here alone.
 #[must_use]
-#[allow(clippy::expect_used)]
 pub fn encode_position(xact_id: u64, id: Uuid) -> FeedPosition {
     let mut bytes = Vec::with_capacity(FEED_POSITION_BYTES);
     bytes.extend_from_slice(&xact_id.to_be_bytes());
     bytes.extend_from_slice(id.as_bytes());
-    FeedPosition::new(bytes).expect("a 24-byte position is inside the SDK bound")
+    #[allow(clippy::expect_used)]
+    let position = FeedPosition::new(bytes).expect("a 24-byte position is inside the SDK bound");
+    position
 }
 
 /// Decode one feed position, or say why it is not one this plugin issued.
@@ -69,24 +70,17 @@ pub fn encode_position(xact_id: u64, id: Uuid) -> FeedPosition {
 /// detectable here and needs no detection — it selects no rows.
 pub fn decode_position(position: &FeedPosition) -> Result<(u64, Uuid), String> {
     let bytes = position.as_bytes();
-    let (xact_id, id) = bytes.split_at_checked(8).ok_or_else(|| {
-        format!(
+    if bytes.len() != FEED_POSITION_BYTES {
+        return Err(format!(
             "a feed position of {} bytes is not one this backend issued: its \
              positions are exactly {FEED_POSITION_BYTES} bytes",
             bytes.len(),
-        )
-    })?;
-    let id: [u8; 16] = id.try_into().map_err(|_| {
-        format!(
-            "a feed position of {} bytes is not one this backend issued: its \
-             positions are exactly {FEED_POSITION_BYTES} bytes",
-            bytes.len(),
-        )
-    })?;
-    #[allow(clippy::expect_used)]
-    let xact_id: [u8; 8] = xact_id
-        .try_into()
-        .expect("split_at_checked(8) yields eight bytes");
+        ));
+    }
+    let mut xact_id = [0_u8; 8];
+    xact_id.copy_from_slice(&bytes[..8]);
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&bytes[8..]);
     Ok((u64::from_be_bytes(xact_id), Uuid::from_bytes(id)))
 }
 
