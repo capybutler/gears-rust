@@ -83,9 +83,13 @@ const CONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5
 /// builds its own backend at a narrow slack. A green run in this lane is not
 /// evidence about the refusal.
 ///
-/// The value is the largest `TimescaleDbPluginConfig::validate` accepts, so it
-/// is the widest setting a deployment could choose rather than a number picked
-/// to clear this lane's fixtures by some margin.
+/// A hundred years, which is far wider than any fixture's distance from the
+/// clock, and that is the whole of why it is this number. It is deliberately
+/// **not** described as the largest a deployment could configure: the interval
+/// ceiling `TimescaleDbPluginConfig::validate` applies is private to `config`,
+/// nothing checks this constant against it — `bring_up_with` deserializes the
+/// config and never calls `validate`, which only `init` does — so a claim about
+/// that bound here would be one nothing could keep true.
 ///
 /// In production nothing carries a stale `accepted_at`: it is stamped by the
 /// Ingestion Gateway when it accepts the entry, and `origin = backfill` names

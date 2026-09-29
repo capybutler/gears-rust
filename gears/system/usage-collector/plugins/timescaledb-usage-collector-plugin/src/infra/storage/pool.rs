@@ -79,9 +79,11 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 /// longer does: on the dedup tuple a write contends only with another writer of
 /// the very same entry.
 ///
-/// The bound is not sized for it, but it covers every other wait an ingest
-/// statement can meet. Two are worth naming because neither is contention with
-/// another writer of the same entry, which is what the sizing is about:
+/// The bound is not sized for it, but it applies to every other **lock** wait
+/// an ingest statement can meet - it bounds lock acquisition and nothing else,
+/// so an I/O or commit wait is `statement_timeout`'s and `transaction_timeout`'s
+/// to bound. Two such locks are worth naming, because neither is contention
+/// with another writer of the same entry, which is what the sizing is about:
 ///
 /// * [`super::type_key::TypeKeyCache::resolve`] assigns a type's partition
 ///   key with its own `INSERT ... ON CONFLICT`, in autocommit before the write

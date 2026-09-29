@@ -16,11 +16,11 @@ use usage_collector_sdk::{
 };
 
 use super::{
-    Admission, AggregateStatement, BATCH_GUARDED_SQL, ConflictRead, DedupKey,
-    INSERT_COLUMN_ARRAY_TYPES, INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore,
-    RECORD_COLUMNS, SINGLE_GUARDED_SQL, batch_retry_backoff, batch_retry_backoff_base,
-    build_aggregate_sql, build_get_sql, build_list_page, build_list_sql, dedup_key,
-    is_retryable_batch_error, plan_batch, record_row_key, row_dedup_key, with_retry,
+    Admission, AggregateStatement, BATCH_GUARDED_SQL, ConflictRead, INSERT_COLUMN_TYPES,
+    INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS,
+    SINGLE_GUARDED_SQL, batch_retry_backoff, batch_retry_backoff_base, build_aggregate_sql,
+    build_get_sql, build_list_page, build_list_sql, entry_identity, is_retryable_batch_error,
+    plan_batch, record_row_key, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -38,12 +38,6 @@ const VCPU_METER: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours
 /// `2023-11-14T22:13:20Z` (unix `1_700_000_000`).
 const WINDOW_START_UNIX: i64 = 1_700_000_000;
 const WINDOW_END_UNIX: i64 = 1_700_003_600;
-
-/// The canonical rendering of those two bounds, spelled out rather than
-/// computed, so a test that pins the dedup key names the bytes instead of
-/// re-deriving them with the function under test.
-const WINDOW_START_CANONICAL: &str = "2023-11-14T22:13:20.000000Z";
-const WINDOW_END_CANONICAL: &str = "2023-11-14T23:13:20.000000Z";
 
 /// A test quantity. Panics on an invalid literal, which is a test bug.
 fn qty(text: &str) -> usage_collector_sdk::UsageQuantity {
@@ -109,126 +103,38 @@ fn withdrawal(
     }
 }
 
-// --- The dedup identity (the 6-tuple) ---
+// --- The identity the write path decides on ---
+//
+// `entry_identity` is the entry's own `id`, and the six-input derivation behind
+// it is the SDK's: `usage_collector_sdk::id_tests` pins every one of the six
+// discriminating, the entry type entering last, the canonical microsecond form
+// of the two bounds, and the namespace. `id_uniqueness_integration_pg` pins the
+// same properties end to end against a live ledger. Nothing is restated here,
+// because a plugin-side copy of the derivation could only ever agree with
+// itself.
+//
+// What *is* this file's to pin is the consequence: two input rows that share an
+// identity take one slot, and two that do not take two.
 
 #[test]
-fn the_dedup_key_is_the_six_tuple() {
-    let tenant = uuid::Uuid::from_u128(2);
-    let base = unit_record(tenant, "same", 100);
-
-    // The six components, named rather than re-derived: two entries differing
-    // in any one of them are distinct entries, not retries of each other.
-    let mut other_tenant = unit_record(uuid::Uuid::from_u128(3), "same", 100);
-    other_tenant.window_start = base.window_start;
-    assert_ne!(dedup_key(&base), dedup_key(&other_tenant), "tenant_id");
-
-    let mut other_meter = unit_record(tenant, "same", 100);
-    other_meter.gts_type_id = usage_collector_sdk::MeterTypeId::new(
-        "gts.cf.core.uc.usage_record.v1~cf.storage._.gb_hours.v1~",
-    )
-    .expect("valid meter id");
-    assert_ne!(dedup_key(&base), dedup_key(&other_meter), "gts_type_id");
-
-    assert_ne!(
-        dedup_key(&base),
-        dedup_key(&unit_record(tenant, "different", 100)),
-        "idempotency_key"
-    );
-
-    let mut shifted_start = unit_record(tenant, "same", 100);
-    shifted_start.window_start = base.window_start - time::Duration::hours(1);
-    assert_ne!(
-        dedup_key(&base),
-        dedup_key(&shifted_start),
-        "window_start is one of the six dedup-identity inputs, so two entries \
-         differing only in it are distinct entries, not a retry"
-    );
-
-    let mut shifted_end = unit_record(tenant, "same", 100);
-    shifted_end.window_end = base.window_end + time::Duration::hours(1);
-    assert_ne!(
-        dedup_key(&base),
-        dedup_key(&shifted_end),
-        "window_end is the fifth dedup-identity input"
-    );
-
-    // The sixth. A withdrawal repeats its target's other five, so a key that
-    // left the entry type out would make every withdrawal a retry of the entry
-    // it withdraws -- which is the whole defect this component exists to stop.
-    assert_ne!(
-        dedup_key(&base),
-        dedup_key(&withdrawal(tenant, "same", 101, base.id)),
-        "entry_type is the sixth dedup-identity input, and a withdrawal shares \
-         the other five with its target"
-    );
-
-    // ...and nothing else is in the key. `quantity` is a compared canonical
-    // field, not an identity component.
-    let mut other_value = unit_record(tenant, "same", 100);
-    other_value.quantity = qty("999");
-    assert_eq!(
-        dedup_key(&base),
-        dedup_key(&other_value),
-        "quantity is not part of the dedup key"
-    );
-}
-
-#[test]
-fn the_dedup_key_names_the_canonical_microsecond_bounds() {
-    // The bounds enter the key as the SDK's canonical rendering, the same form
-    // the entry `id` is derived over. Spelled out here rather than computed
-    // with the function under test.
+fn entry_identity_is_the_entry_id_and_reads_nothing_else() {
+    // One assertion, and it is the whole definition. It exists because the
+    // write path now rests on a caller-supplied value: a version of this
+    // function that recomputed the identity from the record's fields would be
+    // a second derivation beside the gateway's, and the two could disagree
+    // about what one entry is.
     let tenant = uuid::Uuid::from_u128(0x2A);
+    let mut record = unit_record(tenant, "k", 42);
+    assert_eq!(entry_identity(&record), record.id);
+
+    // Moving a field that *is* one of the six derivation inputs does not move
+    // the identity, because this function does not re-derive: only the `id`
+    // does, and the gateway is what sets it.
+    record.window_end += time::Duration::hours(1);
     assert_eq!(
-        dedup_key(&unit_record(tenant, "k", 42)),
-        (
-            tenant,
-            VCPU_METER.to_owned(),
-            "k".to_owned(),
-            WINDOW_START_CANONICAL.to_owned(),
-            WINDOW_END_CANONICAL.to_owned(),
-            0,
-        )
-    );
-}
-
-#[test]
-fn a_sub_microsecond_bound_keys_the_same_as_what_postgres_stores() {
-    // `timestamptz` stores microseconds, so a caller's sub-µs nanos never
-    // survive the round trip. If the key carried the raw `OffsetDateTime`, a
-    // row read back out of the ledger would key differently from the record
-    // that wrote it, and the batch path would resolve a lost key against
-    // nothing.
-    let tenant = uuid::Uuid::from_u128(0x2B);
-    let mut sub_micro = unit_record(tenant, "k", 43);
-    sub_micro.window_start = time::OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(WINDOW_START_UNIX) * 1_000_000_000 + 750,
-    )
-    .expect("valid ts");
-
-    assert_eq!(
-        dedup_key(&sub_micro),
-        dedup_key(&unit_record(tenant, "k", 43)),
-        "sub-microsecond nanos are below the precision the ledger stores, so \
-         they cannot make two submissions distinct entries"
-    );
-}
-
-#[test]
-fn a_stored_row_keys_the_same_as_the_record_it_holds() {
-    // The batch path maps the rows `read_conflict_records` reads back onto the
-    // records that asked for them through these two functions, so a
-    // disagreement between them turns every lost key into the retention
-    // race's retryable `Transient`.
-    let tenant = uuid::Uuid::from_u128(0x2C);
-    let record = unit_record(tenant, "k", 44);
-    let row = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
-
-    assert_eq!(row_dedup_key(&row), dedup_key(&record));
-    assert_eq!(
-        row_dedup_key(&row).3,
-        WINDOW_START_CANONICAL,
-        "and it is the canonical form on the row side too"
+        entry_identity(&record),
+        uuid::Uuid::from_u128(42),
+        "the identity is the id as dispatched, not a re-derivation of it"
     );
 }
 
@@ -406,13 +312,14 @@ fn decoded_names(list: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Every inserted column paired with the array element type the batch insert
-/// must `UNNEST` it as, **derived from `migrations/0001_init.sql`** by
+/// Every inserted column paired with the type each write path must bind it as
+/// — the batch as an array of it, the single-row path as a scalar cast to it —
+/// **derived from `migrations/0001_init.sql`** by
 /// [`migration_probe::insertable_columns`] rather than from the code under
 /// test.
 ///
 /// This is the whole point of the pairing test below. Checking the generated
-/// SQL against `INSERT_COLUMN_ARRAY_TYPES` proves only that the SQL was built
+/// SQL against `INSERT_COLUMN_TYPES` proves only that the SQL was built
 /// from that array — transpose two entries and both sides move together, which
 /// is exactly how the first version of this test let such a mutation survive. A
 /// transposition has to be measured against something that does not move, and
@@ -460,7 +367,7 @@ fn each_inserted_column_is_unnested_as_the_type_the_migration_declares() {
         "the inserted column sequence must be the migration's, in its order"
     );
     assert_eq!(
-        INSERT_COLUMN_ARRAY_TYPES.to_vec(),
+        INSERT_COLUMN_TYPES.to_vec(),
         want_types,
         "each column's array type must be the one the migration declares for it \
          (metadata excepted: jsonb in the table, carried as text and cast per row)"
@@ -513,7 +420,7 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
     );
     assert_eq!(
         names(INSERT_COLUMNS).len(),
-        INSERT_COLUMN_ARRAY_TYPES.len(),
+        INSERT_COLUMN_TYPES.len(),
         "one array type per inserted column, in the same order"
     );
     // The two casts, pinned as the literal select expressions they are --
@@ -528,8 +435,8 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
     assert_eq!(
         names(INSERT_COLUMNS).last(),
         Some(&"metadata"),
-        "the batch SELECT appends ::jsonb to the whole column list, so the cast \
-         lands on metadata only while metadata is last"
+        "each path's `input` CTE appends ::jsonb to the whole column list, so \
+         the cast lands on metadata only while metadata is last"
     );
 }
 
@@ -547,7 +454,8 @@ fn guarded_statements() -> [(&'static str, &'static str); 2] {
 }
 
 /// The substring between `open` and the next `close`, or a panic naming what
-/// was looked for. A reading convenience over four `split_once` chains.
+/// was looked for. A reading convenience over a `split_once` chain, which every
+/// statement-shape assertion below would otherwise spell out.
 fn between<'a>(sql: &'a str, open: &str, close: &str) -> &'a str {
     sql.split_once(open)
         .and_then(|(_, rest)| rest.split_once(close))
@@ -607,9 +515,30 @@ fn both_guarded_statements_insert_only_the_rows_their_own_guard_admitted() {
             1,
             "{label}: one clock read, and it is the guard's: {sql}"
         );
+        // The highest placeholder the statement carries, which is the slack's.
+        // An independent oracle for the obligation above: a guard that read its
+        // instant from a bind rather than from the statement would need one
+        // placeholder more, and would say so here without touching the literal
+        // transcribed above. It survives a rewording of the guard that the
+        // literal does not.
+        let highest = sql
+            .match_indices('$')
+            .filter_map(|(i, _)| {
+                sql[i + 1..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .filter(|d| !d.is_empty())
+                    .and_then(|d| d.parse::<usize>().ok())
+            })
+            .max()
+            .unwrap_or_else(|| panic!("{label}: the statement binds nothing: {sql}"));
+        assert_eq!(
+            highest, slack,
+            "{label}: the last bind is the acceptance slack, and nothing after \
+             it: {sql}"
+        );
         assert!(
-            !sql.contains("xact_id::text AS xact_id,\n")
-                && !names(INSERT_COLUMNS).contains(&"xact_id"),
+            !names(INSERT_COLUMNS).contains(&"xact_id"),
             "{label}: the store writes no xact_id; the column default stamps it"
         );
     }
@@ -705,7 +634,7 @@ fn the_batch_write_names_one_column_sequence_in_all_three_places() {
         expected.len(),
         "one UNNEST array per column: {unnest}"
     );
-    for (i, (param, ty)) in params.iter().zip(INSERT_COLUMN_ARRAY_TYPES).enumerate() {
+    for (i, (param, ty)) in params.iter().zip(INSERT_COLUMN_TYPES).enumerate() {
         assert_eq!(
             *param,
             format!("${}::{ty}[]", i + 1),
@@ -767,37 +696,47 @@ fn both_outer_selects_read_every_record_column_off_the_inserted_row() {
 // --- Batch planning ---
 
 #[test]
-fn plan_batch_collapses_and_sorts_distinct_keys() {
+fn plan_batch_collapses_and_sorts_distinct_identities() {
     let tenant = uuid::Uuid::from_u128(1);
     let mk = |idem: &str, seq: u128| unit_record(tenant, idem, seq);
+    // `unit_record` stamps the `id` from its third argument, standing in for
+    // the gateway: idx 2 repeats idx 0's, which is what a faithful gateway
+    // emits for a resubmission of one entry.
     let records = vec![
         mk("kb", 10), // idx 0
         mk("ka", 11), // idx 1
-        mk("kb", 12), // idx 2 — duplicate of idx 0's key
+        mk("kb", 10), // idx 2 — same identity as idx 0
         mk("kc", 13), // idx 3
     ];
 
     let plan = plan_batch(&records);
 
-    let idems: Vec<&str> = plan
-        .reps
-        .iter()
-        .map(|r| r.idempotency_key.as_str())
-        .collect();
-    assert_eq!(idems, vec!["ka", "kb", "kc"], "distinct, sorted by key");
+    // Sorted by identity, which here is the hand-assigned `id`: 10 (kb), 11
+    // (ka), 13 (kc). The sort is not by idempotency key and must not be read as
+    // one -- a real `id` is a digest and orders arbitrarily.
+    let ids: Vec<uuid::Uuid> = plan.reps.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            uuid::Uuid::from_u128(10),
+            uuid::Uuid::from_u128(11),
+            uuid::Uuid::from_u128(13)
+        ],
+        "distinct, sorted by identity"
+    );
 
     assert_eq!(
-        plan.first_index[&dedup_key(&records[1])],
+        plan.first_index[&entry_identity(&records[1])],
         1,
         "ka first at idx 1"
     );
     assert_eq!(
-        plan.first_index[&dedup_key(&records[0])],
+        plan.first_index[&entry_identity(&records[0])],
         0,
         "kb first at idx 0"
     );
     assert_eq!(
-        plan.first_index[&dedup_key(&records[3])],
+        plan.first_index[&entry_identity(&records[3])],
         3,
         "kc first at idx 3"
     );
@@ -811,6 +750,54 @@ fn plan_batch_collapses_and_sorts_distinct_keys() {
         kb_rep.id,
         uuid::Uuid::from_u128(10),
         "kb rep is the first occurrence"
+    );
+}
+
+#[test]
+fn plan_batch_gives_two_rows_that_share_an_id_one_slot_whatever_else_differs() {
+    // The identity the whole write path decides on is the dispatched `id`, and
+    // the plugin never re-derives it (`entry_identity`). So "two rows share an
+    // identity" has to mean "two rows share an `id`", with no second opinion
+    // taken from their other fields -- and that is what this pins, using a pair
+    // the gateway could never produce: one `id` over two different covered
+    // periods.
+    //
+    // **Why the pair must collapse rather than be caught.** The guarded
+    // statement joins its inserted rows back to its input on `id`
+    // (`LEFT JOIN ins USING (id)`), so two input rows carrying one `id` have no
+    // coherent reading: the join would pair each of them with each inserted
+    // row. A plan that kept them apart would hand the statement exactly that,
+    // and both rows would come back carrying the same verdict -- including the
+    // same freshly inserted row, returned twice, in two input positions, with
+    // nothing reporting it.
+    //
+    // The behaviour under the collapse is the ordinary same-identity one: the
+    // first occurrence takes the slot, and the second is resolved against the
+    // winner's stored row -- absorbed when its caller-supplied fields match,
+    // `IdempotencyConflict` when they do not. Nothing is refused and nothing is
+    // guarded; the state simply is not representable.
+    let tenant = uuid::Uuid::from_u128(0xC3);
+    let first = unit_record(tenant, "shared-id", 0xC300);
+    let mut second = unit_record(tenant, "shared-id", 0xC300);
+    second.window_end += time::Duration::hours(1);
+    assert_ne!(
+        first.window_end, second.window_end,
+        "test setup: the two disagree on a field that is one of the six \
+         derivation inputs, so only a faithful gateway could not emit them"
+    );
+
+    let records = vec![first.clone(), second];
+    let plan = plan_batch(&records);
+
+    assert_eq!(
+        plan.reps.len(),
+        1,
+        "two rows carrying one id are one identity and take one slot"
+    );
+    assert_eq!(
+        plan.first_index[&entry_identity(&first)],
+        0,
+        "the first occurrence is the one that can win it"
     );
 }
 
@@ -844,14 +831,19 @@ fn plan_batch_collapses_two_withdrawals_of_one_target_onto_one_slot() {
 
     let plan = plan_batch(&records);
 
-    assert_eq!(dedup_key(&records[0]), dedup_key(&records[2]));
+    assert_eq!(
+        entry_identity(&records[0]),
+        entry_identity(&records[2]),
+        "test setup: every withdrawal of one target agrees on all six \
+         derivation inputs, so the gateway stamps them one id"
+    );
     assert_eq!(
         plan.reps.len(),
         2,
         "one slot for the pair, one for the plain entry"
     );
     assert_eq!(
-        plan.first_index[&dedup_key(&records[0])],
+        plan.first_index[&entry_identity(&records[0])],
         0,
         "the earlier withdrawal holds it"
     );
@@ -859,12 +851,14 @@ fn plan_batch_collapses_two_withdrawals_of_one_target_onto_one_slot() {
 
 #[test]
 fn plan_batch_gives_a_record_and_its_withdrawal_two_slots() {
-    // The converse of the test above, and the one the five-component key got
+    // The converse of the test above, and the case a five-component key got
     // wrong: a withdrawal repeats its target's tenant, meter, idempotency key
-    // and covered period, so a plan that keyed on those alone would collapse
-    // the pair onto one slot, insert the record, and resolve the withdrawal
-    // against it as an idempotency conflict -- without the database ever being
-    // asked.
+    // and covered period, so a plan keyed on those alone would collapse the
+    // pair onto one slot, insert the record, and resolve the withdrawal against
+    // it as an idempotency conflict -- without the database ever being asked.
+    // The entry type is the sixth derivation input, which is what separates the
+    // two ids, and no order between the two reps is asserted: a `UUIDv5` orders
+    // by its digest bytes and nothing stored observes the direction.
     let tenant = uuid::Uuid::from_u128(0xC2);
     let target = unit_record(tenant, "tgt", 0xC200);
     let records = vec![
@@ -875,23 +869,16 @@ fn plan_batch_gives_a_record_and_its_withdrawal_two_slots() {
     let plan = plan_batch(&records);
 
     assert_ne!(
-        dedup_key(&records[0]),
-        dedup_key(&records[1]),
-        "the pair departs in the entry type, the sixth identity component"
+        entry_identity(&records[0]),
+        entry_identity(&records[1]),
+        "the pair departs in the entry type, the sixth derivation input, so the \
+         gateway stamps them two ids"
     );
     assert_eq!(
         plan.reps.len(),
         2,
         "a record and the withdrawal that names it are two identities, so two \
          slots -- neither swallows the other"
-    );
-    assert_eq!(
-        plan.reps[0].id, target.id,
-        "and the record sorts first, because `entry_type_rank` puts it there. \
-         Nothing stored observes that order -- the pair would share one \
-         transaction and so one `xact_id` -- so this pins the comparator's \
-         direction and claims nothing about the ledger. See the DedupKey doc, \
-         which says why the Feed order invariant is not what it pins"
     );
 }
 
@@ -1017,9 +1004,9 @@ async fn resolve_batch_missing_conflict_entry_falls_through_to_transient() {
     // Not won, and the conflict map has no entry for the key at all. The
     // defensive `None` fallthrough must still be a retryable Transient — never a
     // silent success and never a panic.
-    let admissions: HashMap<DedupKey, Admission> =
-        HashMap::from([(dedup_key(&records[0]), Admission::Lost)]);
-    let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
+    let admissions: HashMap<uuid::Uuid, Admission> =
+        HashMap::from([(entry_identity(&records[0]), Admission::Lost)]);
+    let conflict: HashMap<uuid::Uuid, ConflictRead> = HashMap::new();
 
     let results = store.resolve_batch(&records, &plan, &admissions, &conflict);
 
@@ -1033,23 +1020,24 @@ async fn resolve_batch_missing_conflict_entry_falls_through_to_transient() {
 
 #[tokio::test]
 async fn resolve_batch_conflicts_an_in_batch_duplicate_whose_canonical_fields_differ() {
-    // Two input rows share a dedup key but disagree on `quantity`. Only the first
-    // can win the slot; the second must resolve against what was written, which
-    // means comparing caller-supplied fields and an `IdempotencyConflict` — not a second copy
-    // of the winner's row handed back as though it were this row's insert.
+    // Two input rows share an identity but disagree on `quantity`. Only the
+    // first can win the slot; the second must resolve against what was written,
+    // which means comparing caller-supplied fields and an `IdempotencyConflict`
+    // — not a second copy of the winner's row handed back as though it were
+    // this row's insert.
     //
     // This is what the `plan.first_index` guard buys. Without it every input row
-    // holding a won key looks like a fresh insert, and a same-key submission
-    // carrying different data absorbs silently.
+    // holding a won identity looks like a fresh insert, and a same-identity
+    // submission carrying different data absorbs silently.
     let store = lazy_store();
     let tenant = uuid::Uuid::from_u128(0xB6);
-    let mut second = unit_record(tenant, "k", 0xB602);
+    let mut second = unit_record(tenant, "k", 0xB601);
     second.quantity = qty("999");
     let records = vec![unit_record(tenant, "k", 0xB601), second];
     assert_eq!(
-        dedup_key(&records[0]),
-        dedup_key(&records[1]),
-        "test setup: the two rows must share a dedup key"
+        entry_identity(&records[0]),
+        entry_identity(&records[1]),
+        "test setup: the two rows must share an identity"
     );
 
     let plan = plan_batch(&records);
@@ -1057,9 +1045,11 @@ async fn resolve_batch_conflicts_an_in_batch_duplicate_whose_canonical_fields_di
         &records[0],
         serde_json::Value::Object(serde_json::Map::new()),
     );
-    let admissions: HashMap<DedupKey, Admission> =
-        HashMap::from([(dedup_key(&records[0]), Admission::Won(Box::new(winner_row)))]);
-    let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
+    let admissions: HashMap<uuid::Uuid, Admission> = HashMap::from([(
+        entry_identity(&records[0]),
+        Admission::Won(Box::new(winner_row)),
+    )]);
+    let conflict: HashMap<uuid::Uuid, ConflictRead> = HashMap::new();
 
     let results = store.resolve_batch(&records, &plan, &admissions, &conflict);
 
@@ -1094,14 +1084,14 @@ async fn resolve_batch_resolves_a_second_withdrawal_against_the_first() {
         derived_withdrawal(tenant, 0xB501, target, "tgt", "late_correction"),
     ];
     let plan = plan_batch(&records);
-    let admissions: HashMap<DedupKey, Admission> = HashMap::from([(
-        dedup_key(&first),
+    let admissions: HashMap<uuid::Uuid, Admission> = HashMap::from([(
+        entry_identity(&first),
         Admission::Won(Box::new(row_matching(
             &first,
             serde_json::Value::Object(serde_json::Map::new()),
         ))),
     )]);
-    let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
+    let conflict: HashMap<uuid::Uuid, ConflictRead> = HashMap::new();
 
     let results = store.resolve_batch(&records, &plan, &admissions, &conflict);
 

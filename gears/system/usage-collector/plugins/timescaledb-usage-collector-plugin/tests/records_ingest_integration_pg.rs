@@ -454,10 +454,10 @@ async fn one_batch_shares_one_transaction_id_and_a_later_call_takes_a_greater_on
 /// It gets its own test rather than resting on the general "a later call takes
 /// a greater one", because the pair is the one case where something *else*
 /// could plausibly decide the order and be mistaken for this: the two entries
-/// share five of their six identity inputs, `DedupKey` ranks the kinds, and
-/// `id` is what feed order falls back to inside a transaction. None of those is
-/// the transaction id, and an implementation that let any of them stand in
-/// would pass every other assertion here.
+/// share five of their six identity inputs, the batch plan sorts on `id`, and
+/// `id` is also what feed order falls back to inside a transaction. Neither is
+/// the transaction id, and an implementation that let either stand in would
+/// pass every other assertion here.
 ///
 /// **Two separate calls, on purpose.** A pair written in one batch shares one
 /// transaction and one `xact_id` by design (the test above), so it could not
@@ -1185,7 +1185,14 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// `INSERT … ON CONFLICT … DO NOTHING` takes on each dedup 6-tuple it is
 /// inserting, held until that transaction commits. The statement's insert
 /// processes its `input` rows in `plan.reps` order, so that is the order the
-/// locks are taken in; sorted by dedup key, every batch in the process takes the locks of
+/// locks are taken in - **and that is an observed plan rather than a guarantee
+/// SQL makes**: no clause orders the rows an `INSERT … SELECT` inserts, and it
+/// holds here because `input` is referenced twice (by the insert and by the
+/// outer join) and is therefore materialized, so the insert reads it in the
+/// order the `VALUES` row or `UNNEST` produced. Saying so is the point: the
+/// sort below buys deadlock-freedom only while that remains true, and a plan
+/// change that reordered the insert would move the property without moving a
+/// line of this crate; sorted by dedup key, every batch in the process takes the locks of
 /// the keys it shares with another batch in one global order. Unsorted, batch A
 /// takes vcpu's keys then gb's while batch B takes gb's then vcpu's - the ABBA
 /// deadlock, which `PostgreSQL` breaks by aborting a victim after
@@ -1654,12 +1661,12 @@ async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
     );
     assert_eq!(w.entry_type, "invalidation", "entry_type");
     // The pair's order within the batch used to be readable off the ledger,
-    // through the acceptance sequence `entry_type_rank` decided. It is not any
+    // through the acceptance sequence a per-kind rank decided. It is not any
     // more, and deliberately: both rows were written by one transaction, so they
     // share one `xact_id` and the ledger records nothing that separates them.
-    // `record_store_tests`' `plan_batch` assertion is where the rank's direction
-    // is pinned now - in process, over the comparator, which is the only place
-    // the property still exists.
+    // Nothing pins a direction for the pair now either: the batch plan sorts on
+    // the entry `id`, which is a digest, so a record and its withdrawal fall
+    // whichever way their ids do and no assertion claims otherwise.
 
     // And the same through the single-row insert, whose binds are a separate
     // sequence over the same columns, with the same hazard.

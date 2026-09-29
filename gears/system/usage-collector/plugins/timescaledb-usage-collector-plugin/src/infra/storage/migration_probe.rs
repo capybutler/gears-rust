@@ -2,7 +2,7 @@
 //!
 //! Shared rather than duplicated: the constants in this crate that spell the
 //! ledger's column sequence — `LEDGER_COLUMNS`, `RECORD_COLUMNS`,
-//! `INSERT_COLUMNS` and `INSERT_COLUMN_ARRAY_TYPES` — are checked against
+//! `INSERT_COLUMNS` and `INSERT_COLUMN_TYPES` — are checked against
 //! *this* parse and never against a second hand transcription. A hand
 //! transcription is a second thing to keep, and the two drift apart silently; a
 //! parse of the shipped migration cannot, because it has nothing of its own to
