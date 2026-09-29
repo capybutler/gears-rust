@@ -50,6 +50,8 @@ pub fn encode_position(xact_id: u64, id: Uuid) -> FeedPosition {
     let mut bytes = Vec::with_capacity(FEED_POSITION_BYTES);
     bytes.extend_from_slice(&xact_id.to_be_bytes());
     bytes.extend_from_slice(id.as_bytes());
+    // Split into separate let binding to scope the `expect_used` suppression to
+    // the binding alone, not the entire function body.
     #[allow(clippy::expect_used)]
     let position = FeedPosition::new(bytes).expect("a 24-byte position is inside the SDK bound");
     position
