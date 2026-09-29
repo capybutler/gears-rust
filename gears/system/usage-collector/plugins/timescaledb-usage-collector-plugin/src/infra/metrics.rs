@@ -370,9 +370,9 @@ impl Metrics {
         let dedup_stale = meter
             .u64_counter("uc_timescaledb_dedup_stale_total")
             .with_description(
-                "Dedup hits whose conflicting row could not be read back: its chunk \
-                 aged out mid-resolution, or the submission's derived id does not \
-                 name the row its own identity inputs collided with",
+                "Dedup hits whose conflicting row could not be read back, whatever \
+                 made it unreadable: a chunk that aged out mid-resolution is one \
+                 cause and not the only one, and not every cause clears on a retry",
             )
             .build();
         let stale_acceptance_rejection = meter
@@ -577,13 +577,14 @@ impl Metrics {
     /// Increment the stale-dedup counter: one dedup hit whose conflicting row
     /// could not be read back.
     ///
-    /// **Two populations share it**, and this counter does not separate them:
-    /// the retention race it was named for, which clears on a retry, and a
-    /// submission carrying an `id` that does not name the row its own identity
-    /// inputs collided with, which does not
-    /// (`crate::infra::storage::record_store`'s `entry_identity`). Splitting
-    /// them belongs to the metric inventory rather than to the write path, so
-    /// nothing on that path adds a label for it.
+    /// **More than one thing reaches that arm and this counter separates
+    /// none of them**, including at least one that no retry clears. They are
+    /// set out on `crate::infra::storage::record_store`'s
+    /// `CONFLICT_UNREADABLE_MESSAGE`, which is the one place they are listed;
+    /// no count is repeated here, because a count of them has twice been
+    /// written and twice been wrong. Splitting them belongs to the metric
+    /// inventory rather than to the write path, so nothing on that path adds a
+    /// label for it.
     pub fn inc_dedup_stale(&self) {
         self.dedup_stale.add(1, &[]);
     }

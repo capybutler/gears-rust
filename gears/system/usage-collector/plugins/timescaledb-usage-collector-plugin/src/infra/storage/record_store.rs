@@ -190,19 +190,27 @@ const INSERT_COLUMN_TYPES: [&str; 18] = [
 const DEDUP_CONFLICT_TARGET: &str =
     "tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key";
 
-/// The ledger's time-partition column, named beside the `id` in both conflict
-/// read-backs **for pruning and for nothing else**.
+/// The ledger's **time** partition column, named beside the `id` in both
+/// conflict read-backs **for pruning and for nothing else**.
 ///
-/// `usage_records` is a hypertable partitioned on this column
-/// (`migrations/0001_init.sql`), so a predicate that does not constrain it
-/// cannot exclude a chunk: `WHERE id = $1` alone probes the
+/// `usage_records` is a hypertable with two range dimensions,
+/// `by_range('window_end')` and `by_range('type_key', …)`
+/// (`migrations/0001_init.sql`). A predicate constraining neither cannot
+/// exclude a chunk at all: `WHERE id = $1` alone probes the
 /// `(id, window_end, type_key)` index of *every* chunk the ledger holds, and
-/// grows with the deployment's retention. Both read-backs run **inside the
-/// write transaction**, while it still holds the speculative tuple locks of
-/// everything it inserted, and on the ordinary idempotent-retry path rather
-/// than an error path — which is the hold time
-/// [`crate::infra::storage::pool`]'s `lock_timeout` reasoning is about. Adding
-/// the partition column prunes to the one chunk the entry's period falls in.
+/// that count grows with the deployment's retention. Both read-backs run
+/// **inside the write transaction**, while it still holds the speculative tuple
+/// locks of everything it inserted, and on the ordinary idempotent-retry path
+/// rather than an error path — which is the hold time
+/// [`crate::infra::storage::pool`]'s `lock_timeout` reasoning is about.
+///
+/// Constraining this column prunes the **time** dimension, to the chunks of the
+/// entry's own period — **one per `type_key` slice**, not one chunk, since the
+/// second dimension is left unconstrained. The other dimension could be pruned
+/// too: `type_key` is resolved before the write transaction opens and is in
+/// scope at both read-backs. It is deliberately not bound here, so that what
+/// this constant is about stays one thing; binding it is a separate change with
+/// its own measurement to take.
 ///
 /// **It is not a retreat to the 6-tuple, and must not be read as one.** The
 /// read-back keys on `id` (`DESIGN.md` §3.6), and this column discriminates
@@ -369,10 +377,13 @@ fn batch_input_source() -> String {
 /// it for pruning and not for selection.
 ///
 /// **Measured on `timescale/timescaledb:2.29.2-pg18`, over a ledger holding
-/// eight chunks.** `WHERE id = $1` alone plans an `Append` over all eight, one
-/// index-only scan of each chunk's primary key. With `AND window_end = $2` the
-/// plan is a single index scan of the one chunk the period falls in. That is
-/// the whole reason the column is named.
+/// eight chunks of one meter type.** `WHERE id = $1` alone plans an `Append`
+/// over all eight, one index-only scan of each chunk's primary key. With
+/// `AND window_end = $2` the plan is an index scan of the chunks the entry's
+/// period falls in — one, on that ledger, because one `type_key` slice existed;
+/// the second partition dimension is unconstrained, so a ledger carrying *N*
+/// meter types in that period would plan *N* ([`PARTITION_PRUNE_COLUMN`]). That
+/// is the whole reason the column is named.
 static SINGLE_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT {RECORD_COLUMNS} FROM usage_records \
@@ -389,12 +400,14 @@ static SINGLE_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
 /// by the row-value and is therefore easy to mistake for dead weight.
 ///
 /// **Measured on the same container and ledger as
-/// [`SINGLE_CONFLICT_READ_SQL`], two identities out of eight chunks.** The
-/// row-value `IN` on its own plans a nested loop whose `Append` still lists all
-/// eight chunks, probing each one's `window_end` index per outer row: better
-/// than keying on `id` alone, which bitmap-scans eight primary keys, and still
-/// every chunk. With the `= ANY` conjunct the `Append` lists **two**, and a
-/// hash semi join enforces the exact pairing. Delete it and the read-back goes
+/// [`SINGLE_CONFLICT_READ_SQL`], two identities out of eight chunks of one
+/// meter type.** The row-value `IN` on its own plans a nested loop whose
+/// `Append` still lists all eight chunks, probing each one's `window_end` index
+/// per outer row: better than keying on `id` alone, which bitmap-scans eight
+/// primary keys, and still every chunk. With the `= ANY` conjunct the `Append`
+/// lists the chunks of the two periods — **two** on that ledger, and *N* per
+/// distinct period on one carrying *N* meter types, for the reason
+/// [`PARTITION_PRUNE_COLUMN`] gives. Delete the conjunct and the read-back goes
 /// back to touching every chunk the deployment retains, inside the write
 /// transaction and while it holds the batch's speculative tuple locks.
 static BATCH_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
@@ -722,7 +735,10 @@ impl PgRecordStore {
                 // would keep this transaction's original snapshot, the winner's
                 // row would be invisible, and the loser would answer a stale
                 // `Transient` where DESIGN section 3.3's `dedup-concurrent` row
-                // requires it to resolve absorb-vs-conflict. ROLLBACK TO
+                // requires it to resolve absorb-vs-conflict. That `Transient` is
+                // [`CONFLICT_UNREADABLE_MESSAGE`], which is where this and the
+                // other things reaching that arm are set out together.
+                // ROLLBACK TO
                 // SAVEPOINT clears the aborted state and leaves the outer
                 // transaction usable.
                 //
@@ -932,7 +948,7 @@ impl PgRecordStore {
     ///
     /// Maps each identity to `Stored` (row found → resolve absorb/conflict) or
     /// `Stale` (the row this one conflicted with could not be read — see
-    /// [`CONFLICT_UNREADABLE_MESSAGE`] for the two ways that happens).
+    /// [`CONFLICT_UNREADABLE_MESSAGE`] for what does that).
     async fn read_conflict_records(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -1591,7 +1607,7 @@ fn build_list_page(
 /// the gateway having derived it faithfully, and that is a trust boundary worth
 /// naming rather than a fact worth assuming silently.
 ///
-/// Two things rest on it, and both are chosen rather than inherited:
+/// What rests on it, each chosen rather than inherited:
 ///
 /// * **The in-batch comparison.** [`plan_batch`] collapses a batch to one
 ///   representative per `id` and [`resolve_batch`](PgRecordStore::resolve_batch)
@@ -1612,35 +1628,39 @@ fn build_list_page(
 /// What does **not** rest on it is the ledger's own uniqueness. The
 /// `ON CONFLICT` arbiter is [`DEDUP_CONFLICT_TARGET`], the six columns plus the
 /// partition key, so the database decides what collides from the row's stored
-/// values and not from anything a caller asserted about them. A gateway that
-/// derived an `id` inconsistent with its own six inputs is therefore caught by
-/// the ledger rather than silently absorbed.
+/// values and not from anything a caller asserted about them.
 ///
-/// **What "caught" means, exactly, because this is the case the trust above
-/// accepts the risk of.** A submission whose `id` does not match its own six
-/// inputs still collides on the arbiter, which reads those six off the row; the
-/// read-back that follows then looks for the winner by an `id` no stored row
-/// carries, finds nothing, and takes the arm meant for a conflicting row that
-/// retention dropped mid-resolution. So the call answers a `Transient` reading
-/// [`CONFLICT_UNREADABLE_MESSAGE`], counted on
-/// `uc_timescaledb_dedup_stale_total`. Three consequences are worth stating
-/// rather than leaving to be discovered:
+/// **What a mis-derived `id` costs, because this is the case the trust above
+/// accepts the risk of.** What happens depends on what the ledger already
+/// holds, and the two outcomes below are the ones worth a reader's attention
+/// rather than a closed account of every route:
 ///
-/// * **It does not self-heal.** Every retry re-derives the same wrong `id` and
-///   lands in the same arm, where the retention race really does clear on a
-///   retry. A `Transient` the host keeps retrying is what an operator sees.
-/// * **It is not distinguishable from the retention race** at the call site or
-///   in the log line, which names neither cause: both arrive as one row
-///   conflicting with a row the read cannot see.
-/// * **It is charged to the retention race's counter**, which was that arm's
-///   only population until this key changed. Splitting the two is the metric
-///   inventory's to do, not this path's, so nothing here adds a counter or a
-///   label for it.
+/// * **Its six inputs are already stored.** It collides on the arbiter, which
+///   reads those six off the row, and the read-back then looks for the winner
+///   by an `id` no stored row carries. It finds nothing and answers a
+///   `Transient` reading [`CONFLICT_UNREADABLE_MESSAGE`], counted on
+///   `uc_timescaledb_dedup_stale_total`. That **does not self-heal**: every
+///   retry re-derives the same `id` and lands in the same arm. It is also
+///   indistinguishable, at the call site and in the log line, from the other
+///   things that reach that arm. Separately: should the `id` happen to collide
+///   with a stored row's `(id, window_end, type_key)`, the raise is on the
+///   PRIMARY KEY, which the arbiter does not cover — the single path rolls back
+///   to its savepoint and resolves against that row, the batch lifts it to a
+///   `Transient` and re-runs.
+/// * **Its six inputs are novel.** Nothing collides, so it is **stored**, and
+///   the ledger is not what catches it. The row carries an `id` no faithful
+///   derivation of its own columns produces, which makes it unreachable by the
+///   identity it ought to have: every later faithful submission of that entry
+///   collides on the arbiter and then cannot find it, so that entry takes the
+///   never-clearing `Transient` above from then on. One mis-derivation is
+///   permanent for one identity, not transient.
 ///
 /// This is the accepted cost of not re-deriving, and it is the shape a faithful
 /// gateway never produces. Re-deriving here to close it would put a second
 /// derivation beside the SDK's, which
 /// `cpt-cf-usage-collector-adr-record-identity-derivation` places above the SPI.
+/// Splitting the counter is the metric inventory's to do, not this path's, so
+/// nothing here adds a counter or a label for it.
 ///
 /// Called rather than written out at each site so that every identity decision
 /// on this path is visibly one, and so this doc is what a reader meets first.
@@ -1701,22 +1721,30 @@ const STALE_ACCEPTANCE_MESSAGE: &str =
 /// What a caller is told when a submission lost its dedup slot and the row that
 /// took it could not then be read back.
 ///
-/// **Two populations reach it, and the message names neither**, because the
-/// path cannot tell them apart:
+/// **The wording says what happened, not why, and the retryability it implies
+/// does not hold of everything that reaches here.** No count is given and none
+/// should be added: an enumeration of this arm's population has been written
+/// twice and been wrong both times. Those worth a reader's attention, in
+/// descending order of how well a retry serves them:
 ///
-/// * The **retention race**: the conflicting row's chunk was dropped between
-///   the conflicting insert and this read. Near-impossible against the
-///   retention boundary, and genuinely retryable — the unique entry went with
-///   the chunk, so a retry wins the freed slot as a fresh insert. This was the
-///   arm's only population while the read-back keyed on the stored 6-tuple.
+/// * The **retention race** the arm is named for: the conflicting row's chunk
+///   was dropped between the conflicting insert and this read. Near-impossible
+///   against the retention boundary, and genuinely retryable — the unique entry
+///   went with the chunk, so a retry wins the freed slot as a fresh insert.
+/// * A deployer-set **`default_transaction_isolation = repeatable read`**,
+///   under which the read-back keeps the write transaction's original snapshot
+///   and cannot see a winner that committed after it. The savepoint arm of
+///   [`PgRecordStore::create_inner`] is where that is reasoned about. A retry
+///   does clear it, because a retry opens a fresh transaction and so takes a
+///   fresh snapshot — but it recurs on every contended write for as long as the
+///   setting stands, so what an operator sees is a rate rather than one blip.
 /// * A **submission whose `id` does not match its own six inputs**, which
 ///   collides on an arbiter that reads those six off the row and is then looked
 ///   for under an `id` no row carries ([`entry_identity`]). It does **not**
 ///   clear on a retry, because a retry re-derives the same `id`.
 ///
-/// So the wording says what happened rather than why, and the retryability it
-/// implies holds for the first population only. Separating the two at the
-/// metric is the metric inventory's work, not this path's.
+/// Nothing here can tell them apart, and separating them at the metric is the
+/// metric inventory's work rather than this path's.
 const CONFLICT_UNREADABLE_MESSAGE: &str =
     "conflicting record could not be read back during dedup resolution; retry";
 
@@ -1926,12 +1954,10 @@ where
 enum ConflictRead {
     /// The conflicting row exists — resolve absorb vs conflict against it.
     Stored(Box<UsageRecordRow>),
-    /// It could not be read: the chunk holding it was dropped by retention
-    /// between the conflicting insert and the read, **or** the submission's
-    /// `id` does not name the row its own six inputs collided with. Both
-    /// answer a `Transient`, and only the first of them clears on a retry
-    /// ([`CONFLICT_UNREADABLE_MESSAGE`]). The name is the older population's
-    /// and is kept because the arm is one arm.
+    /// It could not be read. More than one thing does that, they answer alike,
+    /// and not all of them clear on a retry
+    /// ([`CONFLICT_UNREADABLE_MESSAGE`] is where they are set out). The name is
+    /// the oldest of them and is kept because the arm is one arm.
     Stale,
 }
 

@@ -49,9 +49,9 @@ const STALE_ACCEPTANCE_COUNTER: &str = "uc_timescaledb_stale_acceptance_rejectio
 ///
 /// Transcribed by hand from `record_store.rs`'s `STALE_ACCEPTANCE_MESSAGE`,
 /// which is private: a `Transient` alone does not discriminate this refusal
-/// from the retention-race one the same function also produces, and an oracle
-/// derived from the constant under test could not see it being reworded onto
-/// the wrong arm.
+/// from the unreadable-conflict one the same function also produces, and an
+/// oracle derived from the constant under test could not see it being reworded
+/// onto the wrong arm.
 const STALE_ACCEPTANCE_MESSAGE: &str = "acceptance instant outside the configured acceptance slack";
 
 /// `common::bring_up_with` plus `common::record_store`, at a narrow slack.
@@ -148,10 +148,10 @@ fn seconds_outside_the_slack() -> Duration {
 
 /// Assert `err` is the guard's own refusal, not merely some `Transient`.
 ///
-/// `create` answers `Transient` on the retention race too, from the same
-/// function, so `matches!(err, Transient { .. })` alone cannot tell a backend
-/// that refused the acceptance instant from one that lost a conflicting row to
-/// retention. The message is what separates them.
+/// `create` answers a `Transient` on its unreadable-conflict arm too, from the
+/// same function, so `matches!(err, Transient { .. })` alone cannot tell a
+/// backend that refused the acceptance instant from one that lost its slot and
+/// could not read the winner back. The message is what separates them.
 fn assert_stale_acceptance(err: &UsageCollectorPluginError, context: &str) {
     match err {
         UsageCollectorPluginError::Transient { detail, .. } => assert!(
@@ -218,7 +218,8 @@ async fn an_entry_accepted_too_long_ago_is_refused_and_counted() {
 
     // The refusal is counted, by this instrument and not by
     // `uc_timescaledb_dedup_stale_total`, which the unreadable-conflict arm
-    // owns.
+    // owns and which answers a `Transient` of the same shape from the same
+    // function.
     provider.force_flush().expect("flush metrics");
     assert_eq!(
         counter_sum(&exporter, STALE_ACCEPTANCE_COUNTER),
@@ -228,8 +229,7 @@ async fn an_entry_accepted_too_long_ago_is_refused_and_counted() {
     assert_eq!(
         counter_sum(&exporter, "uc_timescaledb_dedup_stale_total"),
         0,
-        "and not charged to the retention race's counter, which answers the \
-         same `Transient` from the same function"
+        "and not charged to the unreadable-conflict arm's counter"
     );
 }
 

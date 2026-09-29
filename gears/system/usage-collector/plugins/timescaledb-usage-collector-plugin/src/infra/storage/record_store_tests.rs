@@ -110,7 +110,9 @@ fn withdrawal(
 // of the six discriminating (`distinct_keys_yield_distinct_ids`,
 // `distinct_tenants_yield_distinct_ids`, `distinct_gts_ids_yield_distinct_ids`,
 // `a_different_covered_period_yields_a_different_id`, and the entry type in
-// `derive_matches_golden_vector_for_an_invalidation`), the entry type entering
+// `a_record_and_its_invalidation_derive_two_ids_from_one_key`, which is that
+// property's own oracle -- the pair of golden vectors pins it too, but only as
+// a pair, so neither alone is the locator for it), the entry type entering
 // last (`the_pre_image_is_the_six_inputs_entry_type_last`), the canonical
 // microsecond form of the two bounds (`canonical_period_bound_*`,
 // `equivalent_spellings_of_one_instant_derive_one_id`) and the namespace
