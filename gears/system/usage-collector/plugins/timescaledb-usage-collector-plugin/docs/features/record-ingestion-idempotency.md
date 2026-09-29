@@ -92,7 +92,8 @@ identifier, which covers all six inputs in one column.
 
 An acknowledgement is the one surface the gear's consistency floor binds for
 write-derived state. That is why this feature forces synchronous commit on every
-write transaction and buffers nothing that has been acknowledged.
+write transaction of its persist paths and buffers nothing that has been
+acknowledged.
 
 **Requirements**: `cpt-cf-uc-plugin-fr-record-persistence`,
 `cpt-cf-uc-plugin-fr-idempotent-dedup`, `cpt-cf-uc-plugin-fr-durable-ack`,
