@@ -201,7 +201,7 @@ The plugin **MUST** declare the dedup level `linearizable` and meet it: its conv
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-fr-durable-ack`
 
-The plugin **MUST** return from a persist call only after every entry it reports accepted is durable in the store, **MUST NOT** buffer acknowledged entries in memory, **MUST** refuse to start under a store durability setting that could lose a committed write, and **MUST** force synchronous commit on its own write transactions.
+The plugin **MUST** return from a persist call only after every entry it reports accepted is durable in the store, **MUST NOT** buffer acknowledged entries in memory, **MUST** refuse to start under a store durability setting that could lose a committed write, and **MUST** force synchronous commit on every write transaction whose commit it acknowledges to a caller.
 
 - **Rationale**: An acknowledgement is the only surface the gear's consistency floor binds for write-derived state; losing an acknowledged entry breaks both the idempotency contract and every charge derived from it.
 - **Actors**: `cpt-cf-uc-plugin-actor-plugin-host`
@@ -601,7 +601,7 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 - [ ] The plugin emits the enumerated OpenTelemetry metrics under its `uc_timescaledb_*` sub-namespace, including a backend-readiness signal.
 - [ ] The plugin registers under a GTS instance identifier with its configured vendor and priority and does not self-select as the active backend.
 - [ ] The plugin declares the `linearizable` dedup level with a zero convergence bound; racing same-identity submissions yield one entry, a divergent later one an idempotency conflict.
-- [ ] A persist call returns only after its accepted entries are durable; the plugin refuses to start under a durability setting that can lose a committed write and forces synchronous commit on its own write transactions.
+- [ ] A persist call returns only after its accepted entries are durable; the plugin refuses to start under a durability setting that can lose a committed write and forces synchronous commit on every write transaction whose commit it acknowledges to a caller.
 - [ ] Every quantity in the published range and precision, negative half included, reads back digit for digit.
 - [ ] `LATEST` breaks ties by covered-period end, then acceptance instant, then entry identifier in byte order, across tenants.
 - [ ] A converged-only lookup returns the entry or not-found immediately and never reports an acknowledged, retained entry absent.

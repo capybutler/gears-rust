@@ -124,9 +124,9 @@ const NOT_YET_CONFORMING: &[(&str, &str)] = &[
          alone. `read_feed_page` is stubbed `Internal` in \
          `src/domain/adapter.rs`, so the one of this check's five properties \
          that reads an entry back off the feed cannot be answered at all. \
-         **Unlike the five feed rows above, this names a check that is \
-         four-fifths passing**: the point lookup, the ledger page, the \
-         absorbed retry and the re-read after it all hold, because \
+         **This names a check that is four-fifths passing**: the point \
+         lookup, the ledger page, the absorbed retry and the re-read after \
+         it all hold, because \
          `INSERT_COLUMNS` binds `id`, `invalidates`, `origin` and \
          `accepted_at` from the record rather than defaulting them and \
          `RECORD_COLUMNS` returns them on every path that answers an entry. \

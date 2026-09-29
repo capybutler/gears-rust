@@ -1,11 +1,13 @@
 #![cfg(feature = "postgres")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-//! Durable acknowledgement on every write transaction (`docs/DESIGN.md` §3.5,
+//! Durable acknowledgement on the write transactions whose commit is
+//! acknowledged to a caller (`docs/DESIGN.md` §3.5,
 //! `docs/features/record-ingestion-idempotency.md` `inst-single-begin` and
 //! `inst-batch-begin`). Requires Docker.
 //!
-//! §3.5: *"Every write transaction runs `SET LOCAL synchronous_commit = on`, so
-//! an operator-level `synchronous_commit` of `off` or `local` cannot weaken an
+//! §3.5: *"Every write transaction whose commit is acknowledged to a caller
+//! runs `SET LOCAL synchronous_commit = on`, so an operator-level
+//! `synchronous_commit` of `off` or `local` cannot weaken an
 //! acknowledgement."* The half that is checkable without crashing a server is
 //! the *"cannot"*: that the write transaction's own setting is `on` whatever
 //! the operator left the server at.
@@ -129,8 +131,9 @@ fn assert_durable(rows: &[String], expected_writes: usize, path: &str) {
     );
     assert!(
         rows.iter().all(|value| value == REQUIRED),
-        "{path}: every write transaction must run `SET LOCAL synchronous_commit = on`, \
-         so an operator-level setting cannot weaken an acknowledgement. The server is \
+        "{path}: a write transaction whose commit is acknowledged to a caller must \
+         run `SET LOCAL synchronous_commit = on`, so an operator-level setting \
+         cannot weaken an acknowledgement. The server is \
          at `{WEAKENED}` and the ledger insert saw: {rows:?}"
     );
 }

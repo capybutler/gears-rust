@@ -585,8 +585,8 @@ is a property of each write transaction, not of shutdown.
 - [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-vendor-isolation`
 
 The system **MUST** keep every backend-specific dependency, SQL statement and
-schema object inside this crate. The crate **MUST** depend on the storage SDK and
-the registry SDK alone and **MUST NOT** carry a compile-time dependency on the
+schema object inside this crate. The crate **MUST** depend on the storage SDK
+and the registry SDK and **MUST NOT** carry a compile-time dependency on the
 host gear crate, so the binding is established at runtime through the registry
 and the client hub rather than at link time. No TimescaleDB-specific type,
 statement or licensing assumption may appear outside this crate.

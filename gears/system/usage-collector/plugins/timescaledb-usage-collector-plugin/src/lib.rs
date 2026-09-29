@@ -6,12 +6,14 @@
 //! `TimescaleDB`. Layered DDD-light: [`gear`] performs the GTS registration
 //! handshake, [`domain`] holds the SPI adapter and the store port trait, and
 //! [`infra`] holds the `sqlx`-backed Postgres implementations.
+//!
+//! Every backend-specific dependency, SQL statement and schema object lives in
+//! this crate, and `Cargo.toml` carries no dependency on the host gear crate:
+//! the binding is established at runtime through the registry and the client
+//! hub rather than at link time.
+//!
+//! @cpt-dod:cpt-cf-uc-plugin-dod-vendor-isolation:p1
 
-// @cpt-dod:cpt-cf-uc-plugin-dod-vendor-isolation:p1
-// Every backend-specific dependency, SQL statement and schema object lives in
-// this crate, and `Cargo.toml` carries no dependency on the host gear crate: the
-// binding is established at runtime through the registry and the client hub
-// rather than at link time.
 pub mod gear;
 
 pub use gear::TimescaleDbUsageCollectorPlugin;

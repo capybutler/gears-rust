@@ -43,7 +43,7 @@ write transaction.
   - [Duplicate Resolution: Silent Absorb or Idempotency Conflict](#duplicate-resolution-silent-absorb-or-idempotency-conflict)
   - [Acceptance-Slack Refusal Takes Precedence](#acceptance-slack-refusal-takes-precedence)
   - [Linearizable Dedup Level With a Convergence Bound of Zero](#linearizable-dedup-level-with-a-convergence-bound-of-zero)
-  - [Durable Acknowledgement on Every Write Transaction](#durable-acknowledgement-on-every-write-transaction)
+  - [Durable Acknowledgement](#durable-acknowledgement)
   - [Digit-for-Digit Quantity Round-Trip](#digit-for-digit-quantity-round-trip)
   - [Per-Type Key Assigned on First Write](#per-type-key-assigned-on-first-write)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
@@ -544,16 +544,17 @@ even though it never fires at this level. The not-converged error variant
 - API: `create_usage_record` (SPI), `create_usage_records` (SPI)
 - Component: `cpt-cf-uc-plugin-component-record-store`
 
-### Durable Acknowledgement on Every Write Transaction
+### Durable Acknowledgement
 
 - [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-durable-acknowledgement`
 
-The system **MUST** force synchronous commit on every write transaction, so an
-operator-level setting cannot weaken an acknowledgement, and **MUST** return from
-a persist call only after every entry it reports accepted is durable. It **MUST
-NOT** buffer acknowledged entries in memory and **MUST NOT** offer a flush call
-on shutdown as a substitute for per-transaction durability. The startup checks
-that refuse an unsafe server-wide durability setting belong to
+The system **MUST** force synchronous commit on every write transaction whose
+commit is acknowledged to a caller, so an operator-level setting cannot weaken
+an acknowledgement, and **MUST** return from a persist call only after every
+entry it reports accepted is durable. It **MUST NOT** buffer acknowledged
+entries in memory and **MUST NOT** offer a flush call on shutdown as a
+substitute for per-transaction durability. The startup checks that refuse an
+unsafe server-wide durability setting belong to
 `cpt-cf-uc-plugin-feature-registration-schema-provisioning`; this feature owns
 the per-transaction guarantee.
 

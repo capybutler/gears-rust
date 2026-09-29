@@ -192,10 +192,12 @@ const INSERT_COLUMN_TYPES: [&str; 18] = [
 const DEDUP_CONFLICT_TARGET: &str =
     "tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key";
 
-/// The first statement of every write transaction, per `DESIGN.md` §3.5:
-/// *"Every write transaction runs `SET LOCAL synchronous_commit = on`, so an
+/// The first statement of every write transaction whose commit is acknowledged
+/// to a caller, per `DESIGN.md` §3.5: *"Every write transaction whose commit is
+/// acknowledged to a caller runs `SET LOCAL synchronous_commit = on`, so an
 /// operator-level `synchronous_commit` of `off` or `local` cannot weaken an
-/// acknowledgement."*
+/// acknowledgement."* The retention sweep's transaction is not one of them, and
+/// §3.6's sweep sequence omits this statement deliberately.
 ///
 /// **Why it cannot be a connection parameter like the timeouts.** The bound the
 /// plugin owes is per *transaction*, and a session default is what an operator
@@ -1309,14 +1311,6 @@ impl InsertColumns {
     }
 }
 
-/// Roll `tx` back now, logging a failure rather than propagating it.
-///
-/// Dropping a `Transaction` rolls it back too, but lazily — the `ROLLBACK` is
-/// queued and sent when the connection is next used. Every caller here rolls
-/// back precisely because it is about to return the connection to the pool
-/// after a failure, so "now" is the property that matters. A
-/// rollback that itself fails says the connection is gone; the pool discards
-/// it, and the caller's original error is the one worth returning.
 /// Open a write transaction and force its durability before anything writes.
 ///
 /// One helper rather than two call sites, so the two write paths cannot drift
@@ -1342,6 +1336,14 @@ async fn begin_durable_write(
     Ok(tx)
 }
 
+/// Roll `tx` back now, logging a failure rather than propagating it.
+///
+/// Dropping a `Transaction` rolls it back too, but lazily — the `ROLLBACK` is
+/// queued and sent when the connection is next used. Every caller here rolls
+/// back precisely because it is about to return the connection to the pool
+/// after a failure, so "now" is the property that matters. A
+/// rollback that itself fails says the connection is gone; the pool discards
+/// it, and the caller's original error is the one worth returning.
 async fn rollback(tx: sqlx::Transaction<'_, Postgres>) {
     if let Err(err) = tx.rollback().await {
         tracing::warn!(
