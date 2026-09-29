@@ -51,9 +51,10 @@ Three absences this document once described as present are asserted rather than
 asserted-about: there is no usage-type catalog
 (`schema_integration_pg::there_is_no_usage_type_catalog`, read back from a live
 database), no superseded schema (the same suite reads the whole ledger back
-against DESIGN section 3.7), and no deactivation method (the crate implements
-the SDK's `UsageCollectorPluginV1` and nothing else is on its public surface, so
-a method it does not declare is a compile error away from being noticed).
+against DESIGN section 3.7), and no deactivation method: the SPI is the seven
+methods of the SDK's `UsageCollectorPluginV1`, none of which deactivates
+anything, and the adapter that implements it adds no method of its own beyond
+its constructor.
 
 **The split axis is the SPI surface, not the component model.** The plugin's
 eight DESIGN components do not partition cleanly into deliverable units: the
