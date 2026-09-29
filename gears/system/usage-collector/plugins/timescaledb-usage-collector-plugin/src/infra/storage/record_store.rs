@@ -180,7 +180,9 @@ const INSERT_COLUMN_TYPES: [&str; 18] = [
     "text",
 ];
 
-/// The dedup 6-tuple plus the partition key the hypertable requires in every UNIQUE, as an `ON CONFLICT` arbiter. Both write paths spend their one arbiter here.
+/// The dedup 6-tuple plus the partition key the hypertable requires in every
+/// UNIQUE, as an `ON CONFLICT` arbiter. Both write paths spend their one
+/// arbiter here.
 ///
 /// `entry_type` is one of the six, and is named here as the bare column: an
 /// arbiter names index columns, never the values compared against them, so the
@@ -313,6 +315,9 @@ fn ins_record_columns() -> String {
 /// a transposition of them. The alias is written out rather than left to
 /// `PostgreSQL` naming a bare column cast after its column, for the reason
 /// [`RECORD_COLUMNS`] gives: here the inherited name would be load-bearing.
+// @cpt-algo:cpt-cf-uc-plugin-algo-guarded-insert-statement:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-single-entry-persistence:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-acceptance-slack-refusal:p1
 fn guarded_statement(input_source: &str) -> String {
     format!(
         "WITH input AS (\
@@ -852,6 +857,8 @@ impl PgRecordStore {
     /// defence in depth, and the earlier one was: it was written when the
     /// read-back selected on the stored 6-tuple and could therefore return a
     /// row with some other `id`.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-duplicate-identity-resolution:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-duplicate-resolution:p1
     fn resolve_dedup_hit(
         &self,
         row: UsageRecordRow,
@@ -894,9 +901,9 @@ impl PgRecordStore {
     /// primary-key index and meets a row there surfaces as a `23505` rather
     /// than as an absent `ins` row - a concurrent writer of one of these
     /// identities is the case that is sized for, and [`entry_identity`] sets
-    /// out one that needs no concurrency. Unlike the single-row path there is nothing to
-    /// resolve in place - a failed statement reports no verdict at all, not even
-    /// for the rows it would have admitted - so
+    /// out one that needs no concurrency. Unlike the single-row path there is
+    /// nothing to resolve in place - a failed statement reports no verdict at
+    /// all, not even for the rows it would have admitted - so
     /// `create_batch_inner` lifts it to a `Transient`
     /// ([`PgRecordStore::record_insert_error`]) and the whole batch re-runs on a
     /// fresh transaction.
@@ -1022,6 +1029,8 @@ impl PgRecordStore {
     /// identity are two refusals and two counter increments, exactly as two
     /// input rows sharing an absorbed identity are two absorbs. Asserted by
     /// `acceptance_slack_pg::a_batch_counts_every_refused_row_not_every_refused_identity`.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-in-batch-identity-resolution:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-batch-positional-results:p1
     fn resolve_batch(
         &self,
         records: &[UsageRecord],
@@ -1098,6 +1107,7 @@ impl PgRecordStore {
     /// there is nothing to resolve in place: the transaction is rolled back, the
     /// failure is lifted to a `Transient`, and the whole batch re-runs on a
     /// fresh transaction (see [`Self::run_guarded_batch_write`]).
+    // @cpt-algo:cpt-cf-uc-plugin-algo-batch-transient-retry:p1
     async fn create_batch_inner(
         &self,
         records: &[UsageRecord],
@@ -1674,12 +1684,9 @@ fn build_list_page(
 ///     [`PgRecordStore::resolve_dedup_hit`] compares caller-supplied fields
 ///     against an entry that is not this submission's — so the caller receives
 ///     an `IdempotencyConflict` carrying another identity's stored entry as
-///     `existing`, possibly another tenant's, since
-///     [`SINGLE_CONFLICT_READ_SQL`] binds the `id` and the period and nothing
-///     else. Nothing on this path detects it. An `id` equality check here
-///     would, and it was removed deliberately: every *faithful* caller selects
-///     the row by the identity it is resolving against, which makes the check
-///     a tautology in every case but this one.
+///     `existing`, possibly another tenant's, since both read-backs bind the
+///     `id` and the period and nothing else ([`SINGLE_CONFLICT_READ_SQL`],
+///     [`BATCH_CONFLICT_READ_SQL`]). Nothing on either path detects it.
 /// * **Its six inputs are novel.** Nothing collides *on the arbiter*, so the
 ///   insert proceeds — and only then is every other unique index checked. Two
 ///   ends to that:
@@ -1710,6 +1717,10 @@ fn build_list_page(
 ///
 /// Called rather than written out at each site so that every identity decision
 /// on this path is visibly one, and so this doc is what a reader meets first.
+// @cpt-state:cpt-cf-uc-plugin-state-dedup-identity:p2
+// @cpt-dod:cpt-cf-uc-plugin-dod-dedup-identity-enforcement:p1
+// @cpt-algo:cpt-cf-uc-plugin-algo-withdrawal-identity-derivation:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-at-most-one-withdrawal:p1
 const fn entry_identity(record: &UsageRecord) -> Uuid {
     record.id
 }
@@ -2234,6 +2245,11 @@ impl RecordStore for PgRecordStore {
     /// that `async fn` returns — before [`with_retry`] reaches `on_retry` or
     /// its backoff sleep. Neither path holds a connection across a wait.
     // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-dedup:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-persist-withdrawal:p1
+    // @cpt-state:cpt-cf-uc-plugin-state-entry-withdrawal:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-withdrawal-as-appended-entry:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-no-mutation-of-target:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-linearizable-dedup-level:p1
     async fn create(&self, record: UsageRecord) -> Result<UsageRecord, UsageCollectorPluginError> {
         // Time the whole single-row call; the per-row counters live in
         // `create_inner` so they count once regardless of single-vs-batch.
@@ -2245,6 +2261,7 @@ impl RecordStore for PgRecordStore {
     }
 
     // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-batch:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-record-and-withdrawal-coexist:p1
     async fn create_batch(
         &self,
         records: Vec<UsageRecord>,

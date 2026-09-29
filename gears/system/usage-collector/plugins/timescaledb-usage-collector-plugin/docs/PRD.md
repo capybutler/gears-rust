@@ -58,7 +58,7 @@ This PRD specifies **only plugin-specific requirements** for the TimescaleDB bac
 
 The core owns authentication, PDP authorization, attribution and shape validation, idempotency-key presence and usage-type resolution; the plugin is pure persistence and query and receives only already-authorized, structurally-validated calls.
 
-This PRD is **normative for the gear's target seven-method Plugin SPI**; the shipped crate predates it (DESIGN §4.5).
+This PRD is **normative for the gear's seven-method Plugin SPI**; DESIGN §4.5 says where to read what the crate still trails it in.
 
 ### 1.2 Background / Problem Statement
 

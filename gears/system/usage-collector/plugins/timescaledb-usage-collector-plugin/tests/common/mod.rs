@@ -659,8 +659,9 @@ pub fn entry(meter_id: &MeterTypeId, tenant: Uuid, idem: &str, value: Decimal) -
 /// A faithful withdrawal of `target`: a copy of the entry it withdraws, plus the
 /// invalidation pair, under the target's own idempotency key.
 ///
-/// "A faithful copy of the entry it withdraws" is the schema's own phrase, and
-/// every field copied below is copied for a reason rather than for tidiness:
+/// The published schema's own phrase for this shape is *"An invalidation is a
+/// faithful copy of its target"* (`usage-collector-v1.yaml`), and every field
+/// copied below is copied for a reason rather than for tidiness:
 ///
 /// * **The quantity** — an invalidation echoes what it withdraws rather than
 ///   negating it (`cpt-cf-usage-collector-adr-append-only-invalidation`), which

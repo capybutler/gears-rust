@@ -93,10 +93,10 @@ const NOT_YET_CONFORMING: &[(&str, &str)] = &[
     (
         contract::FEED_COMPLETENESS,
         "slice 3, plugin feed page and retention interlock: the feed order \
-         this check holds invariant is declared but unread. It is the `xid8` \
-         column `usage_records_feed_idx` orders on, which slice 2 added in \
-         place of a per-(tenant_id, gts_type_id) counter that ordered nothing \
-         across a subscription; slice 3 is what reads it",
+         this check holds invariant is declared and nothing orders on it. It \
+         is the `xid8` column `usage_records_feed_idx` orders on, which slice \
+         2 added in place of a per-(tenant_id, gts_type_id) counter that \
+         ordered nothing across a subscription; slice 3 is what orders on it",
     ),
     (
         contract::FEED_BOOTSTRAP_POSITION,

@@ -58,6 +58,7 @@ impl ExpandVarsTrait for SecretFromEnv {
 
 /// Configuration for the `TimescaleDB` Usage Collector storage backend.
 /// Durations are whole seconds (repo convention).
+// @cpt-flow:cpt-cf-uc-plugin-flow-backend-configuration:p1
 #[derive(Debug, Clone, Deserialize, toolkit_macros::ExpandVars)]
 #[serde(default, deny_unknown_fields)]
 pub struct TimescaleDbPluginConfig {
@@ -203,7 +204,13 @@ impl TimescaleDbPluginConfig {
     /// `min > max`, a zero acquire timeout, a zero statement timeout, a
     /// transaction timeout at or below the statement timeout, an interval
     /// outside `(0, MAX_INTERVAL_SECS]`, a slice width outside
-    /// `[1, MAX_TYPE_KEY_SLICE_WIDTH]`, an hour-aligned setting that is not a multiple of 3600, a materialization lag under one hour or not below the live window, or a rollup interval outside `(0, MAX_INTERVAL_SECS]`. `database_url` and `feed_replay_horizon_secs`, which carry no working default, are rejected when absent.
+    /// `[1, MAX_TYPE_KEY_SLICE_WIDTH]`, an hour-aligned setting that is not a
+    /// multiple of 3600, a materialization lag under one hour or not below the
+    /// live window, or a rollup interval outside `(0, MAX_INTERVAL_SECS]`.
+    /// `database_url` and `feed_replay_horizon_secs`, which carry no working
+    /// default, are rejected when absent.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-config-load-validate:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-typed-configuration:p1
     pub fn validate(&self) -> Result<(), String> {
         if self.database_url.expose().trim().is_empty() {
             return Err("database_url must not be empty".to_owned());

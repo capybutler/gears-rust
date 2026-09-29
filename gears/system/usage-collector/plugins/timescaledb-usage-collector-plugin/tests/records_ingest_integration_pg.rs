@@ -20,11 +20,11 @@
 //!   bind sequences and running the whole `--features postgres` suite:
 //!
 //!   * **Batch path** (`run_guarded_batch_write`): the crate's whole `--lib`
-//!     suite stays green, and so does `contract_conformance_pg`. Three tests red, all in
-//!     this file, and two of them only *indirectly* — the absorb path compares
-//!     the stored attribution for canonical equality, so a transposed write
-//!     turns an absorb into a conflict. Narrow that compared field set and
-//!     those two stop noticing.
+//!     suite stays green, and so does `contract_conformance_pg`. Three tests
+//!     red, all in this file, and two of them only *indirectly* — the absorb
+//!     path compares the stored attribution for canonical equality, so a
+//!     transposed write turns an absorb into a conflict. Narrow that compared
+//!     field set and those two stop noticing.
 //!     `a_row_written_through_the_batch_insert_reads_back_column_for_column`
 //!     is the one that asks the question directly.
 //!   * **Single-row path** (`create_inner`): `contract_conformance_pg` reds as
@@ -1192,11 +1192,11 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// order the `VALUES` row or `UNNEST` produced. Saying so is the point: the
 /// sort below buys deadlock-freedom only while that remains true, and a plan
 /// change that reordered the insert would move the property without moving a
-/// line of this crate; sorted by entry identity, every batch in the process takes the locks of
-/// the keys it shares with another batch in one global order. Unsorted, batch A
-/// takes vcpu's keys then gb's while batch B takes gb's then vcpu's - the ABBA
-/// deadlock, which `PostgreSQL` breaks by aborting a victim after
-/// `deadlock_timeout`.
+/// line of this crate; sorted by entry identity, every batch in the process
+/// takes the locks of the keys it shares with another batch in one global
+/// order. Unsorted, batch A takes vcpu's keys then gb's while batch B takes
+/// gb's then vcpu's - the ABBA deadlock, which `PostgreSQL` breaks by aborting
+/// a victim after `deadlock_timeout`.
 ///
 /// It was written on a per-scope counter row lock, taken once per
 /// `(tenant_id, gts_type_id)` run rather than once per key. Retiring that counter

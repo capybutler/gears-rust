@@ -51,6 +51,8 @@ impl TypeKeyCache {
     /// # Errors
     ///
     /// Returns the `sqlx` error of either statement.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-type-key-resolution:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-type-key-assignment:p1
     pub async fn resolve(
         &self,
         conn: &mut PgConnection,

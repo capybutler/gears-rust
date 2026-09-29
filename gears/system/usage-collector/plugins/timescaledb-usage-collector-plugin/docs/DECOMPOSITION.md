@@ -37,12 +37,23 @@ authentication, authorization, attribution, type resolution, the declared
 aggregation fold -- is enforced upstream by the gear core and is therefore not
 decomposed here.
 
-**Nothing below is built yet.** DESIGN section 4.5 states plainly that the
-design is normative for the gear's target seven-method SPI and that this
-branch's plugin code predates it, down to the SPI shape: the crate still
-carries a usage-type catalog, deactivation methods, and the superseded schema,
-and the SDK carries no SPI contract suite. Every checkbox in this document is
-therefore unchecked. This document describes target work, not landed work.
+**The checkboxes are the status, and nothing else here is.** DESIGN section 4.5
+is normative for the gear's seven-method SPI and the crate is still catching up
+to it, so this document is part target and part record: an entry whose boxes are
+checked names work that has landed, and an unchecked box names work that has
+not. No prose summary of which is which is written here, because a summary is
+what goes stale between the checkbox and the reader. What this backend does not
+yet answer of the SPI contract suite is declared, check by check with the slice
+that closes it, in `NOT_YET_CONFORMING` (`tests/contract_conformance_pg.rs`),
+which the suite asserts is exactly the set that fails.
+
+Three absences this document once described as present are asserted rather than
+asserted-about: there is no usage-type catalog
+(`schema_integration_pg::there_is_no_usage_type_catalog`, read back from a live
+database), no superseded schema (the same suite reads the whole ledger back
+against DESIGN section 3.7), and no deactivation method (the crate implements
+the SDK's `UsageCollectorPluginV1` and nothing else is on its public surface, so
+a method it does not declare is a compile error away from being noticed).
 
 **The split axis is the SPI surface, not the component model.** The plugin's
 eight DESIGN components do not partition cleanly into deliverable units: the
@@ -96,6 +107,10 @@ setup only.
 ### 2.1 [Registration & Schema Provisioning](feature-registration-schema-provisioning/) - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-registration-schema-provisioning`
+
+  Open on the two definitions of done its feature document leaves unchecked,
+  both slice 3's: the background loop's feed settled-horizon sampling, and the
+  contract suite as a release gate with nothing declared non-conforming.
 
 - **Purpose**: Brings the backend into existence and makes it discoverable.
   At startup the plugin loads and validates its configuration, creates the
@@ -152,7 +167,7 @@ setup only.
 - **Requirements Covered**:
 
   - [ ] `p1` - `cpt-cf-uc-plugin-fr-registration`
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-schema-provisioning`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-schema-provisioning`
   - [ ] `p1` - `cpt-cf-uc-plugin-fr-durable-ack`
   - [ ] `p1` - `cpt-cf-uc-plugin-nfr-spi-stability`
 
@@ -160,13 +175,22 @@ setup only.
   entry owns the startup check that refuses an unsafe server setting, and 2.2
   owns the per-transaction commit guarantee.
 
+  Three of the four stay open, each on something outside this entry's reach
+  today. `cpt-cf-uc-plugin-fr-registration` waits on the background loop's feed
+  settled-horizon sampling, which is slice 3's. `cpt-cf-uc-plugin-fr-durable-ack`
+  waits on 2.2's half, below. `cpt-cf-uc-plugin-nfr-spi-stability` waits on the
+  contract suite running with nothing declared non-conforming, which is slice
+  3's six feed rows in `NOT_YET_CONFORMING`.
+
 - **Design Principles Covered**:
 
   - [ ] `p1` - `cpt-cf-uc-plugin-principle-spi-conformance`
 
+  Open on the same six rows as `cpt-cf-uc-plugin-nfr-spi-stability`: slice 3.
+
 - **Design Constraints Covered**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-constraint-vendor-isolation`
+  - [x] `p1` - `cpt-cf-uc-plugin-constraint-vendor-isolation`
 
 - **Domain Model Entities**:
   - TimescaleDbPluginConfig
@@ -176,7 +200,11 @@ setup only.
 - **Design Components**:
 
   - [ ] `p2` - `cpt-cf-uc-plugin-component-gear`
-  - [ ] `p1` - `cpt-cf-uc-plugin-component-migrations`
+  - [x] `p1` - `cpt-cf-uc-plugin-component-migrations`
+
+  The Gear component stays open for the reason `cpt-cf-uc-plugin-fr-registration`
+  does: its background loop does not yet sample the feed's settled-horizon lag,
+  which is slice 3's.
 
 - **API**:
   - Gear `init` lifecycle hook (config load, pool, migrations, registration)
@@ -190,15 +218,19 @@ setup only.
 
 - **Data**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-db-schema`
-  - [ ] `p1` - `cpt-cf-uc-plugin-dbtable-usage-records`
-  - [ ] `p1` - `cpt-cf-uc-plugin-dbtable-usage-type-key`
-  - [ ] `p1` - `cpt-cf-uc-plugin-dbtable-usage-rollup-1h`
-  - [ ] `p1` - `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`
+  - [x] `p1` - `cpt-cf-uc-plugin-db-schema`
+  - [x] `p1` - `cpt-cf-uc-plugin-dbtable-usage-records`
+  - [x] `p1` - `cpt-cf-uc-plugin-dbtable-usage-type-key`
+  - [x] `p1` - `cpt-cf-uc-plugin-dbtable-usage-rollup-1h`
+  - [x] `p1` - `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`
 
 ### 2.2 [Record Ingestion & Idempotency](feature-record-ingestion-idempotency/) - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`
+
+  Open on the one definition of done its feature document leaves unchecked,
+  `cpt-cf-uc-plugin-dod-durable-acknowledgement`, and on the throughput rate no
+  suite here measures. Both are named under Requirements Covered below.
 
 - **Purpose**: Delivers the plugin's write path: single and batch persistence
   of usage entries, deduplicated in the backend on the gear's six-part
@@ -260,20 +292,28 @@ setup only.
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-record-persistence`
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-idempotent-dedup`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-record-persistence`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-idempotent-dedup`
   - [ ] `p1` - `cpt-cf-uc-plugin-fr-durable-ack`
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-quantity-fidelity`
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-dedup-level`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-quantity-fidelity`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-dedup-level`
   - [ ] `p1` - `cpt-cf-uc-plugin-nfr-ingestion-throughput`
+
+  Two stay open. `cpt-cf-uc-plugin-fr-durable-ack` waits on this entry's half
+  of it: the write transaction does not force `synchronous_commit`, so an
+  operator setting can still weaken an acknowledgement, and DESIGN section 3.5
+  requires it. `cpt-cf-uc-plugin-nfr-ingestion-throughput` is a rate the
+  repository runs no load test for, so no suite here can close it; the
+  batch-shape half of it is checked through
+  `cpt-cf-uc-plugin-dod-batch-positional-results`.
 
 - **Design Principles Covered**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-principle-pure-persistence`
+  - [x] `p1` - `cpt-cf-uc-plugin-principle-pure-persistence`
 
 - **Design Constraints Covered**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-constraint-dedup-key-preservation`
+  - [x] `p1` - `cpt-cf-uc-plugin-constraint-dedup-key-preservation`
 
 - **Domain Model Entities**:
   - UsageRecord
@@ -283,7 +323,7 @@ setup only.
 
 - **Design Components**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-component-record-store`
+  - [x] `p1` - `cpt-cf-uc-plugin-component-record-store`
 
 - **API**:
   - `create_usage_record` (SPI)
@@ -291,8 +331,8 @@ setup only.
 
 - **Sequences**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-seq-ingest-dedup`
-  - [ ] `p1` - `cpt-cf-uc-plugin-seq-ingest-batch`
+  - [x] `p1` - `cpt-cf-uc-plugin-seq-ingest-dedup`
+  - [x] `p1` - `cpt-cf-uc-plugin-seq-ingest-batch`
 
 - **Data**: None -- the ledger and type-key tables this feature writes are
   provisioned by 2.1; this feature adds no schema object of its own.
@@ -300,6 +340,9 @@ setup only.
 ### 2.3 [Invalidation Persistence](feature-invalidation-persistence/) - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-invalidation-persistence`
+
+  Open on the withdrawal-reference lookup, named under Requirements Covered
+  below.
 
 - **Purpose**: Persists a withdrawal as an ordinary appended entry that names
   the entry it withdraws and carries a reason code, never rewriting the
@@ -345,6 +388,14 @@ setup only.
 - **Requirements Covered**:
 
   - [ ] `p1` - `cpt-cf-uc-plugin-fr-invalidation-persistence`
+
+  Open on the withdrawal-reference lookup alone. The index is provisioned by
+  2.1 and the fold's exclusion predicate reads the reference, but nothing
+  matches on the covered-period end beside it and no test reads a plan back, so
+  `cpt-cf-uc-plugin-algo-withdrawal-reference-lookup` and
+  `cpt-cf-uc-plugin-dod-withdrawal-reference-index` stay unchecked. They close
+  with the query rules of slice 7, which owns the read paths that issue the
+  lookup. Every other part of this entry is checked.
 
 - **Design Principles Covered**: None -- the write path's pure-persistence
   principle is carried by 2.2, whose insert path this feature reuses unchanged.

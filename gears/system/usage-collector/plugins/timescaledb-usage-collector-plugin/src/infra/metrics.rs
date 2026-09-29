@@ -3,7 +3,7 @@
 //! Realizes design ID `cpt-cf-uc-plugin-design-metric-inventory`: every
 //! backend-internal series the plugin owns under the `uc_timescaledb_`
 //! sub-namespace. The gear's `DESIGN.md` §3.11.5 owns the request-path `uc_`
-//! inventory and delegates the rest, verbatim at `DESIGN.md:1821-1822`:
+//! inventory and delegates the rest, verbatim in its §3.11.5:
 //!
 //! > Plugins may expose backend-internal metrics under their own prefix. Those
 //! > series are owned by the plugin's deployment guide.
@@ -16,12 +16,12 @@
 //!
 //! Note what the clause delegates ownership *to*: the plugin's **deployment
 //! guide** — no such document exists under that name here, and
-//! `docs/DESIGN.md` §4 is the closest thing this crate has to one (its own
-//! traceability row at `docs/DESIGN.md:90` claims the role). That table cannot
-//! currently be read as one: it predates the slice-4 record model and still
-//! lists instruments this crate deleted with the usage-type catalog. **The code
-//! below is what the plugin actually emits, and the gap is a documentation debt
-//! rather than a second opinion.**
+//! `docs/DESIGN.md` §4 is the closest thing this crate has to one (its
+//! traceability row for `cpt-cf-uc-plugin-nfr-operational-visibility` claims
+//! the role). The series §4.3 tabulates and this module does not declare are
+//! its feed and reconciliation instruments, which arrive with the read paths
+//! that emit them. **The code below is what the plugin actually emits, and
+//! §4.3 is not a second opinion on it.**
 //!
 //! Instrument names are the **full literal** Prometheus names (snake_case,
 //! `_total` on counters, `_seconds` on duration histograms) with **no**

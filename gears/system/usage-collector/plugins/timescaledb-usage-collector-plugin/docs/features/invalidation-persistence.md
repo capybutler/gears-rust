@@ -7,6 +7,12 @@ Updated:  2026-09-26 by Virtuozzo International GmbH
 
 - [ ] `p1` - `cpt-cf-uc-plugin-feature-invalidation-persistence`
 
+One process and one definition of done below stay unchecked, both on the
+withdrawal-reference lookup and both slice 7's, the query rules: the index is
+provisioned and the fold's exclusion predicate reads the reference, but nothing
+matches on the covered-period end beside it and no test reads a plan back. The
+feature and status boxes above close with them.
+
 Persists a withdrawal as an ordinary appended entry that names the entry it
 withdraws and carries a reason code, never rewriting the withdrawn entry, and
 admits at most one withdrawal per target. Covers the shared dedup identity every
@@ -168,7 +174,7 @@ flowchart TD
 
 ### Host Persists a Withdrawal
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-persist-withdrawal`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-flow-persist-withdrawal`
 
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
@@ -198,14 +204,14 @@ flowchart TD
   ahead of every identity outcome.
 
 **Steps**:
-1. [ ] - `p1` - Host resolves the target, validates the withdrawal is a faithful copy of it, and derives the withdrawal's identifier and its reference to the target; none of this is repeated by the plugin - `inst-inv-host-prepares`
-2. [ ] - `p1` - Host dispatches the withdrawal through the ordinary single or batch persist method, with the entry type declaring it a withdrawal - `inst-inv-dispatch`
-3. [ ] - `p1` - Plugin derives no identity of its own; the withdrawal's identity follows from its fields per `cpt-cf-uc-plugin-algo-withdrawal-identity-derivation` - `inst-inv-identity`
-4. [ ] - `p1` - **DB**: insert through the same guarded statement the ordinary write path uses, against `cpt-cf-uc-plugin-dbtable-usage-records` - `inst-inv-insert`
-5. [ ] - `p1` - **DB**: the ledger's pairing rule of `cpt-cf-uc-plugin-algo-withdrawal-pairing-enforcement` admits the row only when its declared kind and its withdrawal fields agree - `inst-inv-pairing`
-6. [ ] - `p1` - **IF** the row won its identity, **RETURN** the stored withdrawal; the withdrawn entry is neither updated nor deleted - `inst-inv-won`
-7. [ ] - `p1` - **ELSE** resolve against the stored withdrawal on the ordinary duplicate terms: absorbed when identical, an idempotency conflict when divergent - `inst-inv-duplicate`
-8. [ ] - `p1` - **RETURN** the outcome; a second, different withdrawal of one target is exactly the conflict case - `inst-inv-return`
+1. [x] - `p1` - Host resolves the target, validates the withdrawal is a faithful copy of it, and derives the withdrawal's identifier and its reference to the target; none of this is repeated by the plugin - `inst-inv-host-prepares`
+2. [x] - `p1` - Host dispatches the withdrawal through the ordinary single or batch persist method, with the entry type declaring it a withdrawal - `inst-inv-dispatch`
+3. [x] - `p1` - Plugin derives no identity of its own; the withdrawal's identity follows from its fields per `cpt-cf-uc-plugin-algo-withdrawal-identity-derivation` - `inst-inv-identity`
+4. [x] - `p1` - **DB**: insert through the same guarded statement the ordinary write path uses, against `cpt-cf-uc-plugin-dbtable-usage-records` - `inst-inv-insert`
+5. [x] - `p1` - **DB**: the ledger's pairing rule of `cpt-cf-uc-plugin-algo-withdrawal-pairing-enforcement` admits the row only when its declared kind and its withdrawal fields agree - `inst-inv-pairing`
+6. [x] - `p1` - **IF** the row won its identity, **RETURN** the stored withdrawal; the withdrawn entry is neither updated nor deleted - `inst-inv-won`
+7. [x] - `p1` - **ELSE** resolve against the stored withdrawal on the ordinary duplicate terms: absorbed when identical, an idempotency conflict when divergent - `inst-inv-duplicate`
+8. [x] - `p1` - **RETURN** the outcome; a second, different withdrawal of one target is exactly the conflict case - `inst-inv-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -215,24 +221,24 @@ exclusion rule depends on.
 
 ### Withdrawal Identity Derivation
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-withdrawal-identity-derivation`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-withdrawal-identity-derivation`
 
 **Input**: a withdrawal entry as the gateway dispatched it.
 
 **Output**: the dedup identity under which it is written.
 
 **Steps**:
-1. [ ] - `p1` - Take the tenant, the GTS type, the idempotency key and the covered period from the entry as supplied; a faithful copy carries its target's values in all four - `inst-wid-copy-four`
-2. [ ] - `p1` - Take the entry type from the entry's own declared kind, never derived from whether a withdrawal reference happens to be present - `inst-wid-declared-kind`
-3. [ ] - `p1` - Compose the identity from those inputs, which gives every withdrawal of one target the same identity - `inst-wid-compose`
-4. [ ] - `p1` - Treat that shared identity as the source of the at-most-one bound: a second withdrawal of one target collides with the first as an ordinary duplicate - `inst-wid-at-most-one`
-5. [ ] - `p1` - Add no store-side uniqueness rule over the withdrawal reference; a separate rule would be a second source of truth that could disagree with the dedup constraint - `inst-wid-no-second-rule`
-6. [ ] - `p1` - Note that the identity differs from its target's in the entry type alone, so the pair are two rows sharing five columns - `inst-wid-pair-shape`
-7. [ ] - `p1` - **RETURN** the identity; the plugin mints nothing, since the gateway already derived the entry identifier over these same inputs - `inst-wid-return`
+1. [x] - `p1` - Take the tenant, the GTS type, the idempotency key and the covered period from the entry as supplied; a faithful copy carries its target's values in all four - `inst-wid-copy-four`
+2. [x] - `p1` - Take the entry type from the entry's own declared kind, never derived from whether a withdrawal reference happens to be present - `inst-wid-declared-kind`
+3. [x] - `p1` - Compose the identity from those inputs, which gives every withdrawal of one target the same identity - `inst-wid-compose`
+4. [x] - `p1` - Treat that shared identity as the source of the at-most-one bound: a second withdrawal of one target collides with the first as an ordinary duplicate - `inst-wid-at-most-one`
+5. [x] - `p1` - Add no store-side uniqueness rule over the withdrawal reference; a separate rule would be a second source of truth that could disagree with the dedup constraint - `inst-wid-no-second-rule`
+6. [x] - `p1` - Note that the identity differs from its target's in the entry type alone, so the pair are two rows sharing five columns - `inst-wid-pair-shape`
+7. [x] - `p1` - **RETURN** the identity; the plugin mints nothing, since the gateway already derived the entry identifier over these same inputs - `inst-wid-return`
 
 ### Withdrawal Pairing Enforcement
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-withdrawal-pairing-enforcement`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-withdrawal-pairing-enforcement`
 
 **Input**: any entry offered to the ledger.
 
@@ -240,17 +246,19 @@ exclusion rule depends on.
 rejection.
 
 **Steps**:
-1. [ ] - `p1` - **DB**: evaluate the ledger's pairing check on every insert, ordinary measurements included - `inst-pair-evaluate`
-2. [ ] - `p1` - Admit a row declaring itself a withdrawal only when both its withdrawal reference and its reason code are set - `inst-pair-withdrawal-both-set`
-3. [ ] - `p1` - Admit a row declaring itself an ordinary measurement only when it carries neither - `inst-pair-measurement-neither`
-4. [ ] - `p1` - Reject any other combination, so the declared kind and the withdrawal fields cannot disagree in storage - `inst-pair-reject-mismatch`
-5. [ ] - `p1` - Store the withdrawal reference and the reason code exactly as the gateway supplied them, with no normalization of either - `inst-pair-store-verbatim`
-6. [ ] - `p1` - Keep the check in the schema rather than in plugin code, so a write that bypassed the store's own path could not defeat it - `inst-pair-in-schema`
-7. [ ] - `p1` - **RETURN** the admitted row, or the rejection - `inst-pair-return`
+1. [x] - `p1` - **DB**: evaluate the ledger's pairing check on every insert, ordinary measurements included - `inst-pair-evaluate`
+2. [x] - `p1` - Admit a row declaring itself a withdrawal only when both its withdrawal reference and its reason code are set - `inst-pair-withdrawal-both-set`
+3. [x] - `p1` - Admit a row declaring itself an ordinary measurement only when it carries neither - `inst-pair-measurement-neither`
+4. [x] - `p1` - Reject any other combination, so the declared kind and the withdrawal fields cannot disagree in storage - `inst-pair-reject-mismatch`
+5. [x] - `p1` - Store the withdrawal reference and the reason code exactly as the gateway supplied them, with no normalization of either - `inst-pair-store-verbatim`
+6. [x] - `p1` - Keep the check in the schema rather than in plugin code, so a write that bypassed the store's own path could not defeat it - `inst-pair-in-schema`
+7. [x] - `p1` - **RETURN** the admitted row, or the rejection - `inst-pair-return`
 
 ### Withdrawal Reference Lookup
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-withdrawal-reference-lookup`
+
+Open, with the read paths that issue the lookup, in slice 7.
 
 **Input**: a set of entry identifiers whose withdrawals are being sought, within
 a covered-period range and a type partition.
@@ -268,7 +276,7 @@ a covered-period range and a type partition.
 
 ### Entry Withdrawal State Machine
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-state-entry-withdrawal`
+- [x] `p2` - **ID**: `cpt-cf-uc-plugin-state-entry-withdrawal`
 
 **States**: Standing, Withdrawn
 
@@ -280,17 +288,17 @@ no write ever changes the entry's own row. An entry is Withdrawn exactly when a
 second entry exists that names it, and that is the only evidence there is.
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Standing **TO** Withdrawn **WHEN** a withdrawal naming this entry commits; the transition is the appearance of a new row, not a change to this one - `inst-ews-to-withdrawn`
-2. [ ] - `p1` - **FROM** Withdrawn **TO** Withdrawn **WHEN** an identical withdrawal is re-submitted; it is absorbed against the stored one and nothing changes - `inst-ews-absorb`
-3. [ ] - `p1` - **FROM** Withdrawn **TO** Withdrawn **WHEN** a divergent second withdrawal arrives; it collides on the shared identity and is refused, so the state cannot be reached twice - `inst-ews-second-refused`
-4. [ ] - `p1` - **FROM** Withdrawn **TO** Standing never; there is no un-withdraw operation, and the store offers no way to delete the withdrawal that produced the state - `inst-ews-no-reversal`
-5. [ ] - `p1` - **FROM** Withdrawn **TO** Withdrawn **WHEN** retention drops the chunk; the pair shares a covered-period end and a type, so both rows leave together and neither outlives the other - `inst-ews-retention-together`
+1. [x] - `p1` - **FROM** Standing **TO** Withdrawn **WHEN** a withdrawal naming this entry commits; the transition is the appearance of a new row, not a change to this one - `inst-ews-to-withdrawn`
+2. [x] - `p1` - **FROM** Withdrawn **TO** Withdrawn **WHEN** an identical withdrawal is re-submitted; it is absorbed against the stored one and nothing changes - `inst-ews-absorb`
+3. [x] - `p1` - **FROM** Withdrawn **TO** Withdrawn **WHEN** a divergent second withdrawal arrives; it collides on the shared identity and is refused, so the state cannot be reached twice - `inst-ews-second-refused`
+4. [x] - `p1` - **FROM** Withdrawn **TO** Standing never; there is no un-withdraw operation, and the store offers no way to delete the withdrawal that produced the state - `inst-ews-no-reversal`
+5. [x] - `p1` - **FROM** Withdrawn **TO** Withdrawn **WHEN** retention drops the chunk; the pair shares a covered-period end and a type, so both rows leave together and neither outlives the other - `inst-ews-retention-together`
 
 ## 5. Definitions of Done
 
 ### A Withdrawal Is an Appended Entry
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-withdrawal-as-appended-entry`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-withdrawal-as-appended-entry`
 
 The system **MUST** persist a withdrawal through the ordinary insert path as an
 entry that names the entry it withdraws and carries a reason code, both stored
@@ -312,7 +320,7 @@ batch result alignment.
 
 ### At Most One Withdrawal per Target, by Shared Identity
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-at-most-one-withdrawal`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-at-most-one-withdrawal`
 
 The system **MUST** give every withdrawal of one target the same dedup identity
 -- the target's tenant, GTS type, idempotency key and covered period, with the
@@ -336,7 +344,7 @@ re-submission **MUST** be absorbed and return the stored withdrawal.
 
 ### The Storage-Enforced Pairing Rule
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-withdrawal-pairing-rule`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-withdrawal-pairing-rule`
 
 The system **MUST** admit a row whose withdrawal reference and reason code are
 both set exactly when that row's entry type declares it a withdrawal, and
@@ -357,7 +365,7 @@ storage by any route.
 
 ### A Record and Its Withdrawal Coexist as Two Entries
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-record-and-withdrawal-coexist`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-record-and-withdrawal-coexist`
 
 The system **MUST** persist a record and its withdrawal as two distinct entries
 under the same idempotency key and covered period, differing in entry type, and
@@ -381,7 +389,7 @@ withdrawal retry.
 
 ### The Withdrawn Entry Is Never Mutated or Deleted
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-no-mutation-of-target`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-no-mutation-of-target`
 
 The system **MUST NOT** update, flag, tombstone or delete the entry a withdrawal
 withdraws. Withdrawal status **MUST** remain derived from the presence of the
@@ -403,6 +411,10 @@ reverses a withdrawal.
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-withdrawal-reference-index`
 
+Open with `cpt-cf-uc-plugin-algo-withdrawal-reference-lookup`, in slice 7. The
+one-chunk half holds and is tested
+(`retention_sweep_integration_pg::an_invalidation_and_its_target_drop_together`).
+
 The system **MUST** serve withdrawal-reference lookups from the ledger's
 withdrawal-reference index, matching on the reference together with the
 covered-period end and the type key so the read prunes to the partitions the
@@ -420,6 +432,9 @@ land in one chunk, so retention removes both together and never one alone.
 - DB Table: `cpt-cf-uc-plugin-dbtable-usage-records`
 
 ## 6. Acceptance Criteria
+
+These are the feature's own release gate rather than traceability identifiers,
+and they close with the feature ID box at the head of this document.
 
 - [ ] Persisting a withdrawal of an entry that has none stores a second row and leaves the withdrawn row byte-for-byte unchanged.
 - [ ] The stored withdrawal carries the withdrawal reference and the reason code exactly as dispatched, with no normalization of either.

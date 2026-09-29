@@ -16,6 +16,8 @@ use crate::config::TimescaleDbPluginConfig;
 use crate::infra::storage::rollup_maintenance::apply_rollup_policies;
 
 /// Embedded schema migrations (`migrations/` at crate root).
+// @cpt-algo:cpt-cf-uc-plugin-algo-schema-migration:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-idempotent-schema-provisioning:p1
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Parse the DSN into connection options with TLS enforced by default.
@@ -211,6 +213,8 @@ async fn verify_durability_settings(conn: &mut PgConnection) -> Result<(), sqlx:
 /// # Errors
 /// Returns `sqlx::Error` if the DSN is malformed, the pool cannot connect
 /// within the timeout, or a durability setting is not `on`.
+// @cpt-algo:cpt-cf-uc-plugin-algo-pool-build-durability-check:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-connection-pool-durability-gate:p1
 pub async fn build_pool(cfg: &TimescaleDbPluginConfig) -> Result<PgPool, sqlx::Error> {
     // Unwrap the secret DSN only here, at the connection boundary: keep it behind
     // `secrecy`'s opaque-debug/zeroize guarantees and expose the bytes just long
@@ -292,6 +296,8 @@ async fn acquire_init_lock(lock_conn: &mut PgConnection) -> Result<(), sqlx::Err
 /// # Errors
 /// Returns `sqlx::Error` if the lock cannot be acquired or a setup statement
 /// fails.
+// @cpt-algo:cpt-cf-uc-plugin-algo-post-migration-setup:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-partitioning-setup:p1
 pub async fn apply_post_migration_setup(
     pool: &PgPool,
     cfg: &TimescaleDbPluginConfig,

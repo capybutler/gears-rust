@@ -43,7 +43,7 @@ It has four responsibilities: **record persistence** — single and batch insert
 
 TimescaleDB fits append-heavy time-series ingestion with time-windowed analytical reads, and its partitioning lets the plugin run a per-type retention sweep and an hourly continuous aggregate natively: `usage_records` is a hypertable partitioned on `window_end` and a per-type integer `type_key`, so a chunk drops by the retention of the types it holds. The plugin is statically linked, binds at runtime through `types-registry` + `ClientHub` GTS instance scope, and has no compile-time dependency on the host gear.
 
-**This design is normative for the gear's target SPI.** This branch's plugin code predates it, down to its SPI shape, and the file, module, function and test names in this design are the target layout (§4.5).
+**This design is normative for the gear's target SPI**, and the file, module, function and test names in it are a target layout rather than a description of the tree. §4.5 says where to read what still trails it.
 
 ### 1.2 Architecture Drivers
 
@@ -1013,7 +1013,7 @@ All labels are bounded to the enumerated value sets above. Unbounded identifiers
 
 Columnar compression is deferred; it is additive and does not change the SPI surface.
 
-**This design is normative, and this branch's plugin code predates it**, down to its SPI shape: the code still carries the usage-type catalog and deactivation methods and the superseded schema, the SDK carries no SPI contract suite, and `README.md` still describes the superseded configuration. File, module, function and test names this design gives are the target layout, not a description of this branch. The code slice that implements this design derives its work from the design itself, not from a list kept here.
+**This design is normative, and the code has been catching up to it rather than the other way round.** What this backend does not yet answer is declared row by row in `NOT_YET_CONFORMING` (`tests/contract_conformance_pg.rs`), each row naming the roadmap slice that closes it; that suite asserts the failing set of the SDK contract suite is exactly the declared one, so the list cannot go stale unnoticed, which is why no summary of it is kept here. File, module, function and test names this design gives are a target layout rather than a description of the tree. The code that implements this design derives its work from the design itself, not from a list kept here.
 
 **To verify when implementing**, on `timescale/timescaledb:2.29.2-pg18`:
 
@@ -1032,7 +1032,7 @@ Columnar compression is deferred; it is additive and does not change the SPI sur
 
 ### 4.6 Testing Architecture
 
-This subsection is the **target** test architecture; §4.5 says the code on this branch predates it. Integration tests run against a real TimescaleDB via `testcontainers` (the `timescale/timescaledb` image, pulled on demand), gated behind the `postgres` Cargo feature and requiring Docker:
+This subsection is the **target** test architecture; §4.5 says where to read what still trails it. Integration tests run against a real TimescaleDB via `testcontainers` (the `timescale/timescaledb` image, pulled on demand), gated behind the `postgres` Cargo feature and requiring Docker:
 
 ```sh
 cargo test -p cf-gears-timescaledb-usage-collector-plugin --features postgres
@@ -1055,16 +1055,16 @@ Without the feature, only unit tests run (no Docker needed). The target suites, 
 
 Several suites also drive counter series they assert on by name. Each name is checked against the instrument names the metrics module declares, not hand-copied, so a renamed instrument fails those assertions rather than silently reading back a stale name.
 
-The crate compiles against the SDK trait, which gives compile-time type conformance once the trait carries the target SPI.
+The crate compiles against the SDK trait, which carries the target SPI and so gives compile-time type conformance to it.
 
 ## 5. Traceability
 
 - **Plugin PRD**: [`PRD.md`](./PRD.md)
 - **Gear PRD**: [`PRD.md`](../../../docs/PRD.md)
 - **Gear DESIGN**: [`DESIGN.md`](../../../docs/DESIGN.md) — §2.1 cursor gateway ownership, §3.1 invariants, §3.3 SPI and obligations, §3.7 delegates table shapes here, §3.10 the consistency profile, §3.11 budgets and the metric namespace
-- **Operator guide**: [`README.md`](../README.md) — predates §3.5 (§4.5); §3.5 and §4 above are normative
-- **SPI trait**: [`usage-collector-sdk/src/plugin_api.rs`](../../../usage-collector-sdk/src/plugin_api.rs) — predates the target SPI (§4.5)
-- **Schema on this branch** (predates §3.7, see §4.5): [`migrations/0001_init.sql`](../migrations/0001_init.sql), [`migrations/0002_rename_uuid_to_id.sql`](../migrations/0002_rename_uuid_to_id.sql)
+- **Operator guide**: [`README.md`](../README.md) — §3.5 and §4 above are normative
+- **SPI trait**: [`usage-collector-sdk/src/plugin_api.rs`](../../../usage-collector-sdk/src/plugin_api.rs)
+- **Schema**: [`migrations/0001_init.sql`](../migrations/0001_init.sql) (§3.7), [`migrations/0002_usage_rollup.sql`](../migrations/0002_usage_rollup.sql)
 - **Reference wiring**: [`plugins/noop-usage-collector-plugin/src/module.rs`](../../noop-usage-collector-plugin/src/module.rs)
 - **ADRs**: [`0002 pluggable storage`](../../../docs/ADR/0002-cpt-cf-usage-collector-adr-pluggable-storage.md), [`0004 mandatory idempotency`](../../../docs/ADR/0004-cpt-cf-usage-collector-adr-mandatory-idempotency.md), [`0006 consistency contract`](../../../docs/ADR/0006-cpt-cf-usage-collector-adr-consistency-contract.md), [`0007 record identity derivation`](../../../docs/ADR/0007-cpt-cf-usage-collector-adr-record-identity-derivation.md), [`0008 registry-owned typing`](../../../docs/ADR/0008-cpt-cf-usage-collector-adr-registry-owned-typing.md), [`0009 declared fold`](../../../docs/ADR/0009-cpt-cf-usage-collector-adr-declared-fold.md), [`0010 append-only invalidation`](../../../docs/ADR/0010-cpt-cf-usage-collector-adr-append-only-invalidation.md), [`0011 feed/aggregate split`](../../../docs/ADR/0011-cpt-cf-usage-collector-adr-feed-aggregate-split.md), [`0014 window-end selection`](../../../docs/ADR/0014-cpt-cf-usage-collector-adr-window-end-selection.md)
 - **Gateway assumptions**: §2.2 Gateway-Owned Cursors, §3.6 `cpt-cf-uc-plugin-seq-feed-page` (Head position, Retention refusal) and `cpt-cf-uc-plugin-seq-reconciliation`, and §4.1 items 1 and 6 state the gateway-side assumptions and shortfalls this design relies on; plugin PRD §13 lists the open questions.

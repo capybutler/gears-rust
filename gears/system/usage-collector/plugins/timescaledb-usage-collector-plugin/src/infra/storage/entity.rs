@@ -69,6 +69,7 @@ pub struct UsageRecordRow {
     /// (`usage_type_key`). Not carried on the SDK model; see the struct doc.
     pub type_key: i32,
     /// `quantity` — signed `numeric` quantity.
+    // @cpt-dod:cpt-cf-uc-plugin-dod-quantity-round-trip:p1
     pub quantity: Decimal,
     /// `window_start` — inclusive start of the covered period.
     pub window_start: OffsetDateTime,

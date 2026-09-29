@@ -128,6 +128,8 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- neither. Under the retired generated column this held by construction,
     -- because the kind *was* a function of `invalidates`. Written, the two can
     -- disagree, and this is what refuses it.
+    -- @cpt-algo:cpt-cf-uc-plugin-algo-withdrawal-pairing-enforcement:p1
+    -- @cpt-dod:cpt-cf-uc-plugin-dod-withdrawal-pairing-rule:p1
     CONSTRAINT usage_records_invalidation_pairing
         CHECK (
             (entry_type = 'record'

@@ -266,8 +266,9 @@ async fn recording_helpers_emit_expected_series() {
 /// removed came to look plausible in the first place.
 ///
 /// **Kind, not spelling — including which histograms are durations.** `_total`
-/// is asserted of everything the SDK exports as a `Sum`, so all eleven counters
-/// are covered rather than the five a hardcoded list of names happened to hold.
+/// is asserted of everything the SDK exports as a `Sum`, so every counter the
+/// inventory declares is covered rather than the subset a hardcoded list of
+/// names happened to hold.
 /// The `_seconds` suffix and the **`DURATION_BOUNDARIES_SECS` bucket layout**
 /// must agree **in both directions**, the layout read back off the exported
 /// bounds. Not "every histogram whose name contains duration", which would let

@@ -7,6 +7,13 @@ Updated:  2026-09-26 by Virtuozzo International GmbH
 
 - [ ] `p1` - `cpt-cf-uc-plugin-feature-registration-schema-provisioning`
 
+Two definitions of done below stay unchecked and both are slice 3's, the plugin
+feed page and retention interlock: `cpt-cf-uc-plugin-dod-background-task-lifecycle`
+waits on the background loop sampling the feed's settled-horizon lag, and
+`cpt-cf-uc-plugin-dod-spi-conformance-release-gate` waits on the six feed rows
+`NOT_YET_CONFORMING` declares in `tests/contract_conformance_pg.rs`. The feature
+and status boxes above close with them.
+
 Brings the TimescaleDB backend into existence and makes it discoverable. Covers
 the typed configuration load, the connection pool and its startup durability
 checks, the idempotent schema migrations that build the whole ledger schema, the
@@ -192,7 +199,7 @@ flowchart TD
 
 ### Operator Supplies the Backend Configuration
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-backend-configuration`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-flow-backend-configuration`
 
 **Actor**: `cpt-cf-usage-collector-actor-platform-operator`
 
@@ -227,17 +234,21 @@ flowchart TD
   database rather than in the plugin's configuration.
 
 **Steps**:
-1. [ ] - `p1` - Operator provisions a PostgreSQL database with the TimescaleDB extension and a TLS-capable endpoint, as `cpt-cf-uc-plugin-contract-timescaledb` requires - `inst-prov-database`
-2. [ ] - `p1` - Operator sets the plugin's typed configuration through the gear's configuration surface, supplying at minimum `database_url` and `feed_replay_horizon_secs` - `inst-prov-config-set`
-3. [ ] - `p1` - Operator sizes the database for the deployment's throughput and retention, and budgets `max_connections` for `pool_size_max` plus one per replica, since the retention sweep holds one extra detached connection - `inst-prov-size-connections`
-4. [ ] - `p1` - Operator declares retention on every GTS type at least the backfill window plus the replay horizon plus the acceptance-order slack; the plugin does not check this and the deployment carries the obligation - `inst-prov-retention-rule`
-5. [ ] - `p1` - Operator starts the gear; configuration is read once during `init`, so a later edit has no effect until the next restart - `inst-prov-restart-semantics`
-6. [ ] - `p1` - **IF** validation rejects any field, startup aborts naming the offending key and the plugin does not register - `inst-prov-validation-abort`
-7. [ ] - `p1` - **RETURN** a started plugin whose schema exists and whose SPI client is registered, or an aborted startup that published nothing - `inst-prov-return`
+1. [x] - `p1` - Operator provisions a PostgreSQL database with the TimescaleDB extension and a TLS-capable endpoint, as `cpt-cf-uc-plugin-contract-timescaledb` requires - `inst-prov-database`
+2. [x] - `p1` - Operator sets the plugin's typed configuration through the gear's configuration surface, supplying at minimum `database_url` and `feed_replay_horizon_secs` - `inst-prov-config-set`
+3. [x] - `p1` - Operator sizes the database for the deployment's throughput and retention, and budgets `max_connections` for `pool_size_max` plus one per replica, since the retention sweep holds one extra detached connection - `inst-prov-size-connections`
+4. [x] - `p1` - Operator declares retention on every GTS type at least the backfill window plus the replay horizon plus the acceptance-order slack; the plugin does not check this and the deployment carries the obligation - `inst-prov-retention-rule`
+5. [x] - `p1` - Operator starts the gear; configuration is read once during `init`, so a later edit has no effect until the next restart - `inst-prov-restart-semantics`
+6. [x] - `p1` - **IF** validation rejects any field, startup aborts naming the offending key and the plugin does not register - `inst-prov-validation-abort`
+7. [x] - `p1` - **RETURN** a started plugin whose schema exists and whose SPI client is registered, or an aborted startup that published nothing - `inst-prov-return`
 
 ### Plugin Provisions Its Schema and Publishes Itself at Startup
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-startup-provision-register`
+
+Open on `inst-start-background` alone, which is slice 3's: the loop sweeps
+retention and samples rollup health, and samples no feed horizon because no feed
+read path exists to have one.
 
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
@@ -266,16 +277,16 @@ flowchart TD
   reporting that at startup is clearer than failing every later dispatch.
 
 **Steps**:
-1. [ ] - `p1` - Host invokes the plugin's `init` lifecycle hook - `inst-start-init-hook`
-2. [ ] - `p1` - Plugin loads and validates its typed configuration with `cpt-cf-uc-plugin-algo-config-load-validate` - `inst-start-config`
-3. [ ] - `p1` - Plugin builds the connection pool and runs the startup durability checks with `cpt-cf-uc-plugin-algo-pool-build-durability-check` - `inst-start-pool`
-4. [ ] - `p1` - **DB**: run the migration set over `cpt-cf-uc-plugin-db-schema` with `cpt-cf-uc-plugin-algo-schema-migration`, building the ledger hypertable, the type-key table, the feed retention marks table and the hourly continuous aggregate - `inst-start-migrate`
-5. [ ] - `p1` - **DB**: apply the configuration-driven post-migration setup with `cpt-cf-uc-plugin-algo-post-migration-setup` on `cpt-cf-uc-plugin-dbtable-usage-records` - `inst-start-post-migration`
-6. [ ] - `p1` - Plugin performs the GTS handshake with `cpt-cf-uc-plugin-algo-gts-registration`, carrying its configured vendor and priority - `inst-start-register`
-7. [ ] - `p1` - **IF** any step above fails, abort startup without registering; a partially provisioned backend is never published - `inst-start-fail-closed`
+1. [x] - `p1` - Host invokes the plugin's `init` lifecycle hook - `inst-start-init-hook`
+2. [x] - `p1` - Plugin loads and validates its typed configuration with `cpt-cf-uc-plugin-algo-config-load-validate` - `inst-start-config`
+3. [x] - `p1` - Plugin builds the connection pool and runs the startup durability checks with `cpt-cf-uc-plugin-algo-pool-build-durability-check` - `inst-start-pool`
+4. [x] - `p1` - **DB**: run the migration set over `cpt-cf-uc-plugin-db-schema` with `cpt-cf-uc-plugin-algo-schema-migration`, building the ledger hypertable, the type-key table, the feed retention marks table and the hourly continuous aggregate - `inst-start-migrate`
+5. [x] - `p1` - **DB**: apply the configuration-driven post-migration setup with `cpt-cf-uc-plugin-algo-post-migration-setup` on `cpt-cf-uc-plugin-dbtable-usage-records` - `inst-start-post-migration`
+6. [x] - `p1` - Plugin performs the GTS handshake with `cpt-cf-uc-plugin-algo-gts-registration`, carrying its configured vendor and priority - `inst-start-register`
+7. [x] - `p1` - **IF** any step above fails, abort startup without registering; a partially provisioned backend is never published - `inst-start-fail-closed`
 8. [ ] - `p1` - Host invokes `start`, which runs the single background loop that sweeps retention, samples rollup health and samples the feed's settled-horizon lag - `inst-start-background`
-9. [ ] - `p1` - **ON** `stop`, cancel the background loop and let the pool close; no flush call and no readiness probe is offered to the host - `inst-start-stop`
-10. [ ] - `p1` - **RETURN** a registered, dispatchable plugin whose schema matches the target design - `inst-start-return`
+9. [x] - `p1` - **ON** `stop`, cancel the background loop and let the pool close; no flush call and no readiness probe is offered to the host - `inst-start-stop`
+10. [x] - `p1` - **RETURN** a registered, dispatchable plugin whose schema matches the target design - `inst-start-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -284,7 +295,7 @@ them aborts startup rather than degrading into a partially usable backend.
 
 ### Typed Configuration Load and Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-config-load-validate`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-config-load-validate`
 
 **Input**: the plugin's configuration as the gear's configuration surface
 delivers it.
@@ -293,18 +304,18 @@ delivers it.
 the offending field.
 
 **Steps**:
-1. [ ] - `p1` - Deserialize the configuration into the typed struct, applying the declared default for every field the operator left out - `inst-cfg-deserialize`
-2. [ ] - `p1` - **IF** `database_url` is absent or empty, **RETURN** a startup failure naming it; there is no default connection string - `inst-cfg-require-dsn`
-3. [ ] - `p1` - **IF** `feed_replay_horizon_secs` is absent, **RETURN** a startup failure naming it; the SPI does not carry the replay horizon, so configuration is its only source - `inst-cfg-require-horizon`
-4. [ ] - `p1` - **IF** `transaction_timeout_secs` is not greater than `statement_timeout_secs`, **RETURN** a startup failure naming both - `inst-cfg-timeout-ordering`
-5. [ ] - `p1` - **IF** `pool_size_max` is below 2, **RETURN** a startup failure; the retention sweep's detached connection needs room beside a request-path connection - `inst-cfg-pool-min-two`
-6. [ ] - `p1` - **IF** `chunk_time_interval_secs` is not a whole multiple of 3600, **RETURN** a startup failure; hourly aggregate buckets must align to chunk boundaries - `inst-cfg-chunk-hour-multiple`
-7. [ ] - `p1` - Hold `database_url` in a debug-redacted secret wrapper from the moment it is read, so no later diagnostic can print it - `inst-cfg-redact-dsn`
-8. [ ] - `p1` - **RETURN** the validated configuration; every field consumed later in startup is read from this one value and never re-read from the environment - `inst-cfg-return`
+1. [x] - `p1` - Deserialize the configuration into the typed struct, applying the declared default for every field the operator left out - `inst-cfg-deserialize`
+2. [x] - `p1` - **IF** `database_url` is absent or empty, **RETURN** a startup failure naming it; there is no default connection string - `inst-cfg-require-dsn`
+3. [x] - `p1` - **IF** `feed_replay_horizon_secs` is absent, **RETURN** a startup failure naming it; the SPI does not carry the replay horizon, so configuration is its only source - `inst-cfg-require-horizon`
+4. [x] - `p1` - **IF** `transaction_timeout_secs` is not greater than `statement_timeout_secs`, **RETURN** a startup failure naming both - `inst-cfg-timeout-ordering`
+5. [x] - `p1` - **IF** `pool_size_max` is below 2, **RETURN** a startup failure; the retention sweep's detached connection needs room beside a request-path connection - `inst-cfg-pool-min-two`
+6. [x] - `p1` - **IF** `chunk_time_interval_secs` is not a whole multiple of 3600, **RETURN** a startup failure; hourly aggregate buckets must align to chunk boundaries - `inst-cfg-chunk-hour-multiple`
+7. [x] - `p1` - Hold `database_url` in a debug-redacted secret wrapper from the moment it is read, so no later diagnostic can print it - `inst-cfg-redact-dsn`
+8. [x] - `p1` - **RETURN** the validated configuration; every field consumed later in startup is read from this one value and never re-read from the environment - `inst-cfg-return`
 
 ### Connection Pool Build and Startup Durability Checks
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-pool-build-durability-check`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-pool-build-durability-check`
 
 **Input**: the validated configuration.
 
@@ -312,40 +323,40 @@ the offending field.
 lose a committed write, or a startup failure.
 
 **Steps**:
-1. [ ] - `p1` - Build one connection pool over `database_url`, bounded by `pool_size_min` and `pool_size_max`, with `connection_timeout_secs` as its acquire timeout - `inst-pool-build`
-2. [ ] - `p1` - Apply `statement_timeout_secs` and `transaction_timeout_secs` to every pool connection, so no request-path statement or transaction outlives its bound - `inst-pool-timeouts`
-3. [ ] - `p1` - Note that this one pool serves ingestion, query, feed and reconciliation alike; the paths are not isolated, and that shortfall is published rather than hidden - `inst-pool-single`
-4. [ ] - `p1` - **DB**: verify the TimescaleDB extension is available, since hypertables and continuous aggregates are what the schema is built on - `inst-pool-extension`
-5. [ ] - `p1` - **DB**: read `current_setting('fsync')`; **IF** it is not `on`, **RETURN** a startup failure - `inst-pool-fsync`
-6. [ ] - `p1` - **DB**: read `current_setting('full_page_writes')`; **IF** it is not `on`, **RETURN** a startup failure - `inst-pool-full-page-writes`
-7. [ ] - `p1` - Treat both settings as server-wide and unforceable per transaction, which is exactly why they are checked once at startup rather than set per write - `inst-pool-why-startup-check`
-8. [ ] - `p1` - **RETURN** the pool; a failure here leaves the plugin unregistered rather than running against a server that can lose an acknowledged write - `inst-pool-return`
+1. [x] - `p1` - Build one connection pool over `database_url`, bounded by `pool_size_min` and `pool_size_max`, with `connection_timeout_secs` as its acquire timeout - `inst-pool-build`
+2. [x] - `p1` - Apply `statement_timeout_secs` and `transaction_timeout_secs` to every pool connection, so no request-path statement or transaction outlives its bound - `inst-pool-timeouts`
+3. [x] - `p1` - Note that this one pool serves ingestion, query, feed and reconciliation alike; the paths are not isolated, and that shortfall is published rather than hidden - `inst-pool-single`
+4. [x] - `p1` - **DB**: verify the TimescaleDB extension is available, since hypertables and continuous aggregates are what the schema is built on - `inst-pool-extension`
+5. [x] - `p1` - **DB**: read `current_setting('fsync')`; **IF** it is not `on`, **RETURN** a startup failure - `inst-pool-fsync`
+6. [x] - `p1` - **DB**: read `current_setting('full_page_writes')`; **IF** it is not `on`, **RETURN** a startup failure - `inst-pool-full-page-writes`
+7. [x] - `p1` - Treat both settings as server-wide and unforceable per transaction, which is exactly why they are checked once at startup rather than set per write - `inst-pool-why-startup-check`
+8. [x] - `p1` - **RETURN** the pool; a failure here leaves the plugin unregistered rather than running against a server that can lose an acknowledged write - `inst-pool-return`
 
 ### Idempotent Schema Provisioning
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-schema-migration`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-schema-migration`
 
 **Input**: the built pool.
 
 **Output**: a database holding the target schema, or a startup failure.
 
 **Steps**:
-1. [ ] - `p1` - Run the migration set through the migrator, which records what it has applied so a restart re-runs nothing it has already done - `inst-mig-run-set`
-2. [ ] - `p1` - **DB**: create `cpt-cf-uc-plugin-dbtable-usage-records` as a hypertable partitioned on `window_end` and on `type_key`, with its primary key covering both partition columns - `inst-mig-ledger`
-3. [ ] - `p1` - **DB**: create the ledger's dedup unique constraint over tenant, GTS type, idempotency key, covered period, entry type and type key, which is the store's dedup authority - `inst-mig-dedup-uniq`
-4. [ ] - `p1` - **DB**: create the ledger's check constraints -- covered-period ordering, the invalidation pairing rule that ties the withdrawal reference and reason code to the declared entry type, and the subject pairing rule - `inst-mig-checks`
-5. [ ] - `p1` - **DB**: create the ledger's indexes -- the withdrawal-reference lookup index, the two time-windowed read indexes, the feed-order index, and the reconciliation watermark index - `inst-mig-indexes`
-6. [ ] - `p1` - **DB**: create `cpt-cf-uc-plugin-dbtable-usage-type-key`, whose key is generated once per GTS type and never changes, carrying no declared attribute and no foreign key to any catalog - `inst-mig-type-key`
-7. [ ] - `p1` - Construct the process-wide `TypeKeyCache` empty during `init`; this feature owns only its construction, and its population on an entry's first write belongs to `cpt-cf-uc-plugin-feature-record-ingestion-idempotency` - `inst-mig-type-key-cache-empty`
-8. [ ] - `p1` - **DB**: create `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`, one row per GTS type that has lost an entry to retention - `inst-mig-retention-marks`
-9. [ ] - `p1` - **DB**: create `cpt-cf-uc-plugin-dbtable-usage-rollup-1h` as a real-time hourly continuous aggregate over the ledger, keyed on bucket, tenant, GTS type and type key - `inst-mig-rollup`
-10. [ ] - `p1` - **IF** any statement fails, record `uc_timescaledb_migration_failures_total` and **RETURN** a startup failure - `inst-mig-failure`
-11. [ ] - `p1` - Keep every statement idempotent, so a restart re-runs provisioning as a no-op - `inst-mig-idempotent`
-12. [ ] - `p1` - **RETURN** a provisioned schema; the crate is pre-release, so the migration set is edited in place to the target shape rather than extended with a data migration - `inst-mig-return`
+1. [x] - `p1` - Run the migration set through the migrator, which records what it has applied so a restart re-runs nothing it has already done - `inst-mig-run-set`
+2. [x] - `p1` - **DB**: create `cpt-cf-uc-plugin-dbtable-usage-records` as a hypertable partitioned on `window_end` and on `type_key`, with its primary key covering both partition columns - `inst-mig-ledger`
+3. [x] - `p1` - **DB**: create the ledger's dedup unique constraint over tenant, GTS type, idempotency key, covered period, entry type and type key, which is the store's dedup authority - `inst-mig-dedup-uniq`
+4. [x] - `p1` - **DB**: create the ledger's check constraints -- covered-period ordering, the invalidation pairing rule that ties the withdrawal reference and reason code to the declared entry type, and the subject pairing rule - `inst-mig-checks`
+5. [x] - `p1` - **DB**: create the ledger's indexes -- the withdrawal-reference lookup index, the two time-windowed read indexes, the feed-order index, and the reconciliation watermark index - `inst-mig-indexes`
+6. [x] - `p1` - **DB**: create `cpt-cf-uc-plugin-dbtable-usage-type-key`, whose key is generated once per GTS type and never changes, carrying no declared attribute and no foreign key to any catalog - `inst-mig-type-key`
+7. [x] - `p1` - Construct the process-wide `TypeKeyCache` empty during `init`; this feature owns only its construction, and its population on an entry's first write belongs to `cpt-cf-uc-plugin-feature-record-ingestion-idempotency` - `inst-mig-type-key-cache-empty`
+8. [x] - `p1` - **DB**: create `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`, one row per GTS type that has lost an entry to retention - `inst-mig-retention-marks`
+9. [x] - `p1` - **DB**: create `cpt-cf-uc-plugin-dbtable-usage-rollup-1h` as a real-time hourly continuous aggregate over the ledger, keyed on bucket, tenant, GTS type and type key - `inst-mig-rollup`
+10. [x] - `p1` - **IF** any statement fails, record `uc_timescaledb_migration_failures_total` and **RETURN** a startup failure - `inst-mig-failure`
+11. [x] - `p1` - Keep every statement idempotent, so a restart re-runs provisioning as a no-op - `inst-mig-idempotent`
+12. [x] - `p1` - **RETURN** a provisioned schema; the crate is pre-release, so the migration set is edited in place to the target shape rather than extended with a data migration - `inst-mig-return`
 
 ### Configuration-Driven Post-Migration Setup
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-post-migration-setup`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-post-migration-setup`
 
 **Input**: the provisioned schema and the validated configuration.
 
@@ -353,17 +364,17 @@ lose a committed write, or a startup failure.
 table-wide retention policy.
 
 **Steps**:
-1. [ ] - `p1` - Take an advisory lock, so replicas starting together serialize this step instead of racing on the same DDL - `inst-post-advisory-lock`
-2. [ ] - `p1` - Take that lock on a connection whose lifetime this step controls, and release it before the connection returns to the pool, so no later borrower inherits it - `inst-post-lock-hygiene`
-3. [ ] - `p1` - **DB**: set the ledger's chunk time interval from `chunk_time_interval_secs`; the value applies to chunks created afterwards and does not reshape existing ones - `inst-post-chunk-interval`
-4. [ ] - `p1` - **DB**: set the type-key partition's slice width from `type_key_slice_width`, on the same forward-only terms - `inst-post-slice-width`
-5. [ ] - `p1` - **DB**: remove any table-wide declarative retention policy on the ledger; per-type retention is the plugin's own sweep, and a table-wide policy would drop chunks the sweep is still holding for an unresolved type - `inst-post-drop-table-policy`
-6. [ ] - `p1` - Delegate the rollup's live and history refresh-policy application, which this step invokes but does not define - `inst-post-delegate-rollup`
-7. [ ] - `p1` - **RETURN** once the setup is applied; re-running it against an already-configured database changes nothing - `inst-post-return`
+1. [x] - `p1` - Take an advisory lock, so replicas starting together serialize this step instead of racing on the same DDL - `inst-post-advisory-lock`
+2. [x] - `p1` - Take that lock on a connection whose lifetime this step controls, and release it before the connection returns to the pool, so no later borrower inherits it - `inst-post-lock-hygiene`
+3. [x] - `p1` - **DB**: set the ledger's chunk time interval from `chunk_time_interval_secs`; the value applies to chunks created afterwards and does not reshape existing ones - `inst-post-chunk-interval`
+4. [x] - `p1` - **DB**: set the type-key partition's slice width from `type_key_slice_width`, on the same forward-only terms - `inst-post-slice-width`
+5. [x] - `p1` - **DB**: remove any table-wide declarative retention policy on the ledger; per-type retention is the plugin's own sweep, and a table-wide policy would drop chunks the sweep is still holding for an unresolved type - `inst-post-drop-table-policy`
+6. [x] - `p1` - Delegate the rollup's live and history refresh-policy application, which this step invokes but does not define - `inst-post-delegate-rollup`
+7. [x] - `p1` - **RETURN** once the setup is applied; re-running it against an already-configured database changes nothing - `inst-post-return`
 
 ### GTS Registration Handshake
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-gts-registration`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-gts-registration`
 
 **Input**: the provisioned backend, plus the configured vendor and priority.
 
@@ -371,19 +382,19 @@ table-wide retention policy.
 startup failure.
 
 **Steps**:
-1. [ ] - `p1` - Build the plugin registration for the usage-collector plugin specification type, carrying the configured `vendor` and `priority` as its selection metadata - `inst-reg-build`
-2. [ ] - `p1` - **API**: publish the registration to `types-registry`, which is what makes the plugin visible to the host's selector - `inst-reg-publish`
-3. [ ] - `p1` - Register the plugin's SPI client on `ClientHub`, scoped to the GTS instance identifier just published, so the host's per-call scoped lookup resolves it - `inst-reg-client-hub`
-4. [ ] - `p1` - Use the published instance identifier as the client's scope and nothing else; a client registered under a different scope is a packaging defect that makes every dispatch miss - `inst-reg-scope-match`
-5. [ ] - `p1` - Decide nothing about whether this plugin is the active backend; vendor and priority are selection inputs the host reads, not a claim the plugin makes - `inst-reg-no-self-selection`
-6. [ ] - `p1` - **IF** either the publish or the client registration fails, **RETURN** a startup failure rather than a running but unreachable plugin - `inst-reg-fail-closed`
-7. [ ] - `p1` - **RETURN** a discoverable, dispatchable plugin; the host resolves its binding lazily on its own first dispatch, so nothing here waits on the host - `inst-reg-return`
+1. [x] - `p1` - Build the plugin registration for the usage-collector plugin specification type, carrying the configured `vendor` and `priority` as its selection metadata - `inst-reg-build`
+2. [x] - `p1` - **API**: publish the registration to `types-registry`, which is what makes the plugin visible to the host's selector - `inst-reg-publish`
+3. [x] - `p1` - Register the plugin's SPI client on `ClientHub`, scoped to the GTS instance identifier just published, so the host's per-call scoped lookup resolves it - `inst-reg-client-hub`
+4. [x] - `p1` - Use the published instance identifier as the client's scope and nothing else; a client registered under a different scope is a packaging defect that makes every dispatch miss - `inst-reg-scope-match`
+5. [x] - `p1` - Decide nothing about whether this plugin is the active backend; vendor and priority are selection inputs the host reads, not a claim the plugin makes - `inst-reg-no-self-selection`
+6. [x] - `p1` - **IF** either the publish or the client registration fails, **RETURN** a startup failure rather than a running but unreachable plugin - `inst-reg-fail-closed`
+7. [x] - `p1` - **RETURN** a discoverable, dispatchable plugin; the host resolves its binding lazily on its own first dispatch, so nothing here waits on the host - `inst-reg-return`
 
 ## 4. States (CDSL)
 
 ### Plugin Startup Lifecycle State Machine
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-state-startup-lifecycle`
+- [x] `p2` - **ID**: `cpt-cf-uc-plugin-state-startup-lifecycle`
 
 **States**: Unstarted, Configured, Pooled, Provisioned, Registered, Running,
 Stopped, StartupFailed
@@ -396,23 +407,23 @@ provisioning, and every failure path leads to the same terminal state, in which
 nothing was published.
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Unstarted **TO** Configured **WHEN** the typed configuration loads and every validation rule passes - `inst-state-to-configured`
-2. [ ] - `p1` - **FROM** Configured **TO** Pooled **WHEN** the pool is built, the TimescaleDB extension is present, and both durability settings read `on` - `inst-state-to-pooled`
-3. [ ] - `p1` - **FROM** Pooled **TO** Provisioned **WHEN** every migration has applied and the post-migration partitioning setup has run - `inst-state-to-provisioned`
-4. [ ] - `p1` - **FROM** Provisioned **TO** Registered **WHEN** the registration is published and the scoped SPI client is registered - `inst-state-to-registered`
-5. [ ] - `p1` - **FROM** Registered **TO** Running **WHEN** the host invokes `start` and the background loop begins - `inst-state-to-running`
-6. [ ] - `p1` - **FROM** Running **TO** Stopped **WHEN** the host invokes `stop` and the background loop is cancelled - `inst-state-to-stopped`
-7. [ ] - `p1` - **FROM** Configured **TO** StartupFailed **WHEN** the pool cannot be built, the extension is missing, or either durability setting is off - `inst-state-configured-failed`
-8. [ ] - `p1` - **FROM** Pooled **TO** StartupFailed **WHEN** a migration or the post-migration setup fails - `inst-state-pooled-failed`
-9. [ ] - `p1` - **FROM** Provisioned **TO** StartupFailed **WHEN** the registry publish or the scoped client registration fails - `inst-state-provisioned-failed`
-10. [ ] - `p1` - **FROM** Unstarted **TO** StartupFailed **WHEN** configuration validation rejects a field - `inst-state-unstarted-failed`
-11. [ ] - `p1` - **FROM** StartupFailed **TO** StartupFailed **WHEN** anything else is attempted; the state is terminal for the process, and nothing was published from it - `inst-state-failed-terminal`
+1. [x] - `p1` - **FROM** Unstarted **TO** Configured **WHEN** the typed configuration loads and every validation rule passes - `inst-state-to-configured`
+2. [x] - `p1` - **FROM** Configured **TO** Pooled **WHEN** the pool is built, the TimescaleDB extension is present, and both durability settings read `on` - `inst-state-to-pooled`
+3. [x] - `p1` - **FROM** Pooled **TO** Provisioned **WHEN** every migration has applied and the post-migration partitioning setup has run - `inst-state-to-provisioned`
+4. [x] - `p1` - **FROM** Provisioned **TO** Registered **WHEN** the registration is published and the scoped SPI client is registered - `inst-state-to-registered`
+5. [x] - `p1` - **FROM** Registered **TO** Running **WHEN** the host invokes `start` and the background loop begins - `inst-state-to-running`
+6. [x] - `p1` - **FROM** Running **TO** Stopped **WHEN** the host invokes `stop` and the background loop is cancelled - `inst-state-to-stopped`
+7. [x] - `p1` - **FROM** Configured **TO** StartupFailed **WHEN** the pool cannot be built, the extension is missing, or either durability setting is off - `inst-state-configured-failed`
+8. [x] - `p1` - **FROM** Pooled **TO** StartupFailed **WHEN** a migration or the post-migration setup fails - `inst-state-pooled-failed`
+9. [x] - `p1` - **FROM** Provisioned **TO** StartupFailed **WHEN** the registry publish or the scoped client registration fails - `inst-state-provisioned-failed`
+10. [x] - `p1` - **FROM** Unstarted **TO** StartupFailed **WHEN** configuration validation rejects a field - `inst-state-unstarted-failed`
+11. [x] - `p1` - **FROM** StartupFailed **TO** StartupFailed **WHEN** anything else is attempted; the state is terminal for the process, and nothing was published from it - `inst-state-failed-terminal`
 
 ## 5. Definitions of Done
 
 ### Typed Configuration Is Loaded Once and Validated Before Anything Is Wired
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-typed-configuration`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-typed-configuration`
 
 The system **MUST** load the plugin's configuration into a typed value during
 `init`, before the pool is built, and **MUST** fail startup naming the offending
@@ -436,7 +447,7 @@ deployment that sets only the two required fields starts.
 
 ### Connection Pool and Startup Durability Gate
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-connection-pool-durability-gate`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-connection-pool-durability-gate`
 
 The system **MUST** create one connection pool over the operator-provisioned
 database, bounded by the configured pool sizes and acquire timeout, and **MUST**
@@ -463,7 +474,7 @@ detached connection while it runs.
 
 ### Idempotent Schema Provisioning at Startup
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-idempotent-schema-provisioning`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-idempotent-schema-provisioning`
 
 The system **MUST** provision its whole schema during `init`, before
 registration, and **MUST** make every statement idempotent so a restart re-runs
@@ -494,7 +505,7 @@ database itself.
 
 ### Configuration-Driven Partitioning Setup
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-partitioning-setup`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-partitioning-setup`
 
 The system **MUST** apply the configured chunk time interval and type-key slice
 width to the ledger after the migrations run, and **MUST** treat both as
@@ -518,7 +529,7 @@ already-configured database **MUST** change nothing.
 
 ### GTS-Scoped Registration After Provisioning
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-gts-scoped-registration`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-gts-scoped-registration`
 
 The system **MUST** publish its plugin registration to `types-registry` and
 register its SPI client on `ClientHub` scoped to that published instance
@@ -547,6 +558,8 @@ startup rather than leave a provisioned but unreachable backend running.
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-background-task-lifecycle`
 
+Open on the feed's settled-horizon sampling, which is slice 3's.
+
 The system **MUST** own exactly one background task, started by the gear's
 `start` hook and cancelled by its `stop` hook, that runs the retention sweep,
 samples rollup health and samples the feed's settled-horizon lag. The task
@@ -567,7 +580,7 @@ is a property of each write transaction, not of shutdown.
 
 ### Vendor Isolation of Every Backend-Specific Dependency
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-vendor-isolation`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-vendor-isolation`
 
 The system **MUST** keep every backend-specific dependency, SQL statement and
 schema object inside this crate. The crate **MUST** depend on the storage SDK and
@@ -587,6 +600,10 @@ statement or licensing assumption may appear outside this crate.
 ### SPI Conformance as the Release Gate
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-spi-conformance-release-gate`
+
+Open on the six rows `NOT_YET_CONFORMING` declares, which are slice 3's. The
+compile-time half holds: the crate implements the SDK trait's seven methods and
+nothing else on its public surface.
 
 The system **MUST** implement the storage SPI's seven methods exactly as the gear
 declares them, verified at compile time against the SDK trait, and **MUST** pass
@@ -610,6 +627,9 @@ this feature owns the obligation to run the suite green as the gate.
 - Interface: `cpt-cf-uc-plugin-interface-storage-spi`
 
 ## 6. Acceptance Criteria
+
+These are the feature's own release gate rather than traceability identifiers,
+and they close with the feature ID box at the head of this document.
 
 - [ ] Starting with `database_url` and `feed_replay_horizon_secs` set and every other field absent succeeds, which shows each remaining field carries a working default.
 - [ ] Starting with `database_url` absent or empty fails, naming the field, and no pool is built.

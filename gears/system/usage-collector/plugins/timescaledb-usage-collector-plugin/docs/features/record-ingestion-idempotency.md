@@ -7,6 +7,13 @@ Updated:  2026-09-26 by Virtuozzo International GmbH
 
 - [ ] `p1` - `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`
 
+One definition of done below stays unchecked,
+`cpt-cf-uc-plugin-dod-durable-acknowledgement`: neither write transaction forces
+`synchronous_commit`, so a server-level setting can still weaken an
+acknowledgement, and DESIGN section 3.5 requires that it cannot. The feature and
+status boxes above close with it, and with the throughput rate no suite in this
+repository measures (`cpt-cf-uc-plugin-nfr-ingestion-throughput`).
+
 Delivers the plugin's write path: single and batch persistence of usage entries,
 deduplicated in the backend on the gear's six-part identity, acknowledged only
 once durable, with every caller-supplied value stored verbatim. Covers the
@@ -186,6 +193,9 @@ flowchart TD
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-persist-single-entry`
 
+Open on `inst-single-begin` alone: the write transaction does not force
+synchronous commit.
+
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
 **Success Scenarios**:
@@ -214,18 +224,21 @@ flowchart TD
   acknowledged.
 
 **Steps**:
-1. [ ] - `p1` - Host calls the single-entry persist method on the SPI, passing an entry that is already authorized and structurally valid - `inst-single-call`
-2. [ ] - `p1` - **DB**: resolve the entry's type key with `cpt-cf-uc-plugin-algo-type-key-resolution`, outside the write transaction - `inst-single-type-key`
+1. [x] - `p1` - Host calls the single-entry persist method on the SPI, passing an entry that is already authorized and structurally valid - `inst-single-call`
+2. [x] - `p1` - **DB**: resolve the entry's type key with `cpt-cf-uc-plugin-algo-type-key-resolution`, outside the write transaction - `inst-single-type-key`
 3. [ ] - `p1` - **DB**: open the write transaction and force synchronous commit on it, so the acknowledgement cannot be weakened by a server-level setting - `inst-single-begin`
-4. [ ] - `p1` - **DB**: run the guarded insert of `cpt-cf-uc-plugin-algo-guarded-insert-statement` over `cpt-cf-uc-plugin-dbtable-usage-records`, which returns the row's admitted and won flags - `inst-single-guarded-insert`
-5. [ ] - `p1` - **IF** the row was not admitted, roll back and **RETURN** a retryable transient naming stale acceptance - `inst-single-not-admitted`
-6. [ ] - `p1` - **IF** the row was admitted and won, commit and **RETURN** the stored entry with its stamped transaction identifier - `inst-single-won`
-7. [ ] - `p1` - **ELSE** resolve the duplicate with `cpt-cf-uc-plugin-algo-duplicate-identity-resolution` - `inst-single-duplicate`
-8. [ ] - `p1` - **RETURN** the stored entry on a silent absorb, or an idempotency conflict carrying it - `inst-single-return`
+4. [x] - `p1` - **DB**: run the guarded insert of `cpt-cf-uc-plugin-algo-guarded-insert-statement` over `cpt-cf-uc-plugin-dbtable-usage-records`, which returns the row's admitted and won flags - `inst-single-guarded-insert`
+5. [x] - `p1` - **IF** the row was not admitted, roll back and **RETURN** a retryable transient naming stale acceptance - `inst-single-not-admitted`
+6. [x] - `p1` - **IF** the row was admitted and won, commit and **RETURN** the stored entry with its stamped transaction identifier - `inst-single-won`
+7. [x] - `p1` - **ELSE** resolve the duplicate with `cpt-cf-uc-plugin-algo-duplicate-identity-resolution` - `inst-single-duplicate`
+8. [x] - `p1` - **RETURN** the stored entry on a silent absorb, or an idempotency conflict carrying it - `inst-single-return`
 
 ### Host Persists a Batch of Usage Entries
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-persist-entry-batch`
+
+Open on `inst-batch-begin` alone, for the same reason
+`cpt-cf-uc-plugin-flow-persist-single-entry` is.
 
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
@@ -253,15 +266,15 @@ flowchart TD
   nothing from the abandoned attempts remains in the ledger.
 
 **Steps**:
-1. [ ] - `p1` - Host calls the batch persist method with an ordered list of entries - `inst-batch-call`
-2. [ ] - `p1` - **DB**: resolve every entry's type key with `cpt-cf-uc-plugin-algo-type-key-resolution` before the transaction opens - `inst-batch-type-keys`
+1. [x] - `p1` - Host calls the batch persist method with an ordered list of entries - `inst-batch-call`
+2. [x] - `p1` - **DB**: resolve every entry's type key with `cpt-cf-uc-plugin-algo-type-key-resolution` before the transaction opens - `inst-batch-type-keys`
 3. [ ] - `p1` - **DB**: open the write transaction on a fresh connection and force synchronous commit - `inst-batch-begin`
-4. [ ] - `p1` - **DB**: run the guarded insert of `cpt-cf-uc-plugin-algo-guarded-insert-statement` over the unnested input set, one statement for the whole batch - `inst-batch-guarded-insert`
-5. [ ] - `p1` - **DB**: read back the admitted, not-won rows by entry identifier in one statement, and classify each with `cpt-cf-uc-plugin-algo-duplicate-identity-resolution` - `inst-batch-read-back`
-6. [ ] - `p1` - Resolve any two same-identity entries inside the batch with `cpt-cf-uc-plugin-algo-in-batch-identity-resolution` - `inst-batch-in-batch`
-7. [ ] - `p1` - **DB**: commit; every entry inserted by this call shares the transaction's identifier, and feed order inside it falls back to the entry identifier - `inst-batch-commit`
-8. [ ] - `p1` - **ON** an outer transient, apply `cpt-cf-uc-plugin-algo-batch-transient-retry`; per-entry transients inside a successful batch are the host's to handle and are never retried here - `inst-batch-retry`
-9. [ ] - `p1` - **RETURN** one result per input entry, positionally aligned to input order - `inst-batch-return`
+4. [x] - `p1` - **DB**: run the guarded insert of `cpt-cf-uc-plugin-algo-guarded-insert-statement` over the unnested input set, one statement for the whole batch - `inst-batch-guarded-insert`
+5. [x] - `p1` - **DB**: read back the admitted, not-won rows by entry identifier in one statement, and classify each with `cpt-cf-uc-plugin-algo-duplicate-identity-resolution` - `inst-batch-read-back`
+6. [x] - `p1` - Resolve any two same-identity entries inside the batch with `cpt-cf-uc-plugin-algo-in-batch-identity-resolution` - `inst-batch-in-batch`
+7. [x] - `p1` - **DB**: commit; every entry inserted by this call shares the transaction's identifier, and feed order inside it falls back to the entry identifier - `inst-batch-commit`
+8. [x] - `p1` - **ON** an outer transient, apply `cpt-cf-uc-plugin-algo-batch-transient-retry`; per-entry transients inside a successful batch are the host's to handle and are never retried here - `inst-batch-retry`
+9. [x] - `p1` - **RETURN** one result per input entry, positionally aligned to input order - `inst-batch-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -271,7 +284,7 @@ bounds in-process recovery.
 
 ### Guarded Insert Statement
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-guarded-insert-statement`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-guarded-insert-statement`
 
 **Input**: one or more entries with their resolved type keys, inside an open
 write transaction.
@@ -280,18 +293,18 @@ write transaction.
 identity.
 
 **Steps**:
-1. [ ] - `p1` - Build one statement whose input stage computes each row's admission verdict from that statement's own timestamp - `inst-guard-input-stage`
-2. [ ] - `p1` - Admit a row when its acceptance instant lies within the configured acceptance slack of that timestamp, in either direction - `inst-guard-admission-rule`
-3. [ ] - `p1` - Compute the verdict inside the statement and nowhere else, because a separate earlier or later statement would evaluate it under a different timestamp - `inst-guard-single-statement`
-4. [ ] - `p1` - **DB**: insert only the admitted rows into `cpt-cf-uc-plugin-dbtable-usage-records`, with the conflict target naming the dedup identity plus the type key and doing nothing on conflict - `inst-guard-insert-admitted`
-5. [ ] - `p1` - Leave the transaction identifier to the column default, so it is the identifier of the transaction that actually inserted the row and is never set by the store's own code - `inst-guard-xact-default`
-6. [ ] - `p1` - Return each input row joined to its inserted row on the entry identifier, so the caller learns both the admitted flag and the won flag per row - `inst-guard-outer-select`
-7. [ ] - `p1` - Give the admission verdict precedence over the identity outcome: a row that was not admitted is a stale-acceptance transient even when its identity already exists - `inst-guard-verdict-precedence`
-8. [ ] - `p1` - **RETURN** the per-row flags; this is the only statement in either flow that writes to the ledger - `inst-guard-return`
+1. [x] - `p1` - Build one statement whose input stage computes each row's admission verdict from that statement's own timestamp - `inst-guard-input-stage`
+2. [x] - `p1` - Admit a row when its acceptance instant lies within the configured acceptance slack of that timestamp, in either direction - `inst-guard-admission-rule`
+3. [x] - `p1` - Compute the verdict inside the statement and nowhere else, because a separate earlier or later statement would evaluate it under a different timestamp - `inst-guard-single-statement`
+4. [x] - `p1` - **DB**: insert only the admitted rows into `cpt-cf-uc-plugin-dbtable-usage-records`, with the conflict target naming the dedup identity plus the type key and doing nothing on conflict - `inst-guard-insert-admitted`
+5. [x] - `p1` - Leave the transaction identifier to the column default, so it is the identifier of the transaction that actually inserted the row and is never set by the store's own code - `inst-guard-xact-default`
+6. [x] - `p1` - Return each input row joined to its inserted row on the entry identifier, so the caller learns both the admitted flag and the won flag per row - `inst-guard-outer-select`
+7. [x] - `p1` - Give the admission verdict precedence over the identity outcome: a row that was not admitted is a stale-acceptance transient even when its identity already exists - `inst-guard-verdict-precedence`
+8. [x] - `p1` - **RETURN** the per-row flags; this is the only statement in either flow that writes to the ledger - `inst-guard-return`
 
 ### Duplicate Identity Resolution
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-duplicate-identity-resolution`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-duplicate-identity-resolution`
 
 **Input**: an admitted row that did not win its identity, plus the submitted
 entry.
@@ -300,18 +313,18 @@ entry.
 carrying it.
 
 **Steps**:
-1. [ ] - `p1` - **DB**: read the stored row back by entry identifier, never by the tenant, type, key and covered period alone - `inst-dup-read-by-id`
-2. [ ] - `p1` - Treat the identifier as the correct key because, once an entry is withdrawn, two rows share those first columns, so a read by them could return the withdrawal for a record retry or the record for a withdrawal retry - `inst-dup-why-id`
-3. [ ] - `p1` - **IF** the read finds nothing because retention dropped the row's chunk in between, **RETURN** a retryable transient - `inst-dup-retention-race`
-4. [ ] - `p1` - Compare every caller-supplied field of the submission against the stored entry by value - `inst-dup-compare-fields`
-5. [ ] - `p1` - Compare metadata as a parsed document rather than as bytes, so key order, insignificant whitespace and a duplicate key's earlier occurrence do not register as a difference the store could not substantiate on read-back - `inst-dup-metadata-semantic`
-6. [ ] - `p1` - Exclude the server-assigned ingestion origin and acceptance instant from the comparison, so a retry that arrives over the other ingestion path still absorbs and returns the stored origin - `inst-dup-exclude-server-fields`
-7. [ ] - `p1` - **IF** every compared field is equal, **RETURN** the stored entry as a silent absorb and count the absorb - `inst-dup-absorb`
-8. [ ] - `p1` - **ELSE RETURN** an idempotency conflict carrying the idempotency key and the stored entry, and count the conflict - `inst-dup-conflict`
+1. [x] - `p1` - **DB**: read the stored row back by entry identifier, never by the tenant, type, key and covered period alone - `inst-dup-read-by-id`
+2. [x] - `p1` - Treat the identifier as the correct key because, once an entry is withdrawn, two rows share those first columns, so a read by them could return the withdrawal for a record retry or the record for a withdrawal retry - `inst-dup-why-id`
+3. [x] - `p1` - **IF** the read finds nothing because retention dropped the row's chunk in between, **RETURN** a retryable transient - `inst-dup-retention-race`
+4. [x] - `p1` - Compare every caller-supplied field of the submission against the stored entry by value - `inst-dup-compare-fields`
+5. [x] - `p1` - Compare metadata as a parsed document rather than as bytes, so key order, insignificant whitespace and a duplicate key's earlier occurrence do not register as a difference the store could not substantiate on read-back - `inst-dup-metadata-semantic`
+6. [x] - `p1` - Exclude the server-assigned ingestion origin and acceptance instant from the comparison, so a retry that arrives over the other ingestion path still absorbs and returns the stored origin - `inst-dup-exclude-server-fields`
+7. [x] - `p1` - **IF** every compared field is equal, **RETURN** the stored entry as a silent absorb and count the absorb - `inst-dup-absorb`
+8. [x] - `p1` - **ELSE RETURN** an idempotency conflict carrying the idempotency key and the stored entry, and count the conflict - `inst-dup-conflict`
 
 ### In-Batch Identity Resolution
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-in-batch-identity-resolution`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-in-batch-identity-resolution`
 
 **Input**: the batch's input rows and their per-row admitted and won flags.
 
@@ -319,52 +332,52 @@ carrying it.
 earlier entry in the same batch.
 
 **Steps**:
-1. [ ] - `p1` - Recognise two same-identity entries by equal entry identifiers, which is equivalent to equality across all six identity inputs - `inst-inb-recognise`
-2. [ ] - `p1` - Treat the earlier position in input order as the original and the later as the retry - `inst-inb-order`
-3. [ ] - `p1` - **IF** the two are identical on every compared field, mark the later absorbed against the earlier - `inst-inb-absorb`
-4. [ ] - `p1` - **ELSE** mark the later an idempotency conflict carrying the earlier - `inst-inb-conflict`
-5. [ ] - `p1` - Resolve a record and its withdrawal in one batch as two identities, each against its own row, never against each other - `inst-inb-record-and-withdrawal`
-6. [ ] - `p1` - **RETURN** the outcomes without failing any other entry in the batch - `inst-inb-return`
+1. [x] - `p1` - Recognise two same-identity entries by equal entry identifiers, which is equivalent to equality across all six identity inputs - `inst-inb-recognise`
+2. [x] - `p1` - Treat the earlier position in input order as the original and the later as the retry - `inst-inb-order`
+3. [x] - `p1` - **IF** the two are identical on every compared field, mark the later absorbed against the earlier - `inst-inb-absorb`
+4. [x] - `p1` - **ELSE** mark the later an idempotency conflict carrying the earlier - `inst-inb-conflict`
+5. [x] - `p1` - Resolve a record and its withdrawal in one batch as two identities, each against its own row, never against each other - `inst-inb-record-and-withdrawal`
+6. [x] - `p1` - **RETURN** the outcomes without failing any other entry in the batch - `inst-inb-return`
 
 ### Per-Type Key Resolution
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-type-key-resolution`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-type-key-resolution`
 
 **Input**: the GTS type identifiers of the entries about to be written.
 
 **Output**: one small integer key per type, from the cache or newly assigned.
 
 **Steps**:
-1. [ ] - `p1` - **IF** the process-wide cache holds the type's key, return it; a key never changes once assigned, so the cache never goes stale - `inst-key-cache-hit`
-2. [ ] - `p1` - **ELSE DB**: assign or read the key in `cpt-cf-uc-plugin-dbtable-usage-type-key`, whose key column is generated once per type - `inst-key-assign`
-3. [ ] - `p1` - Perform this outside the write transaction, so the guarded insert is that transaction's first write - `inst-key-before-transaction`
-4. [ ] - `p1` - Treat that ordering as load-bearing: the feed's settled-horizon reasoning depends on the insert being the transaction's first write - `inst-key-why-before`
-5. [ ] - `p1` - Cache the key for the process and use it as the ledger's type partition column, never as a declared attribute of the type - `inst-key-cache-store`
-6. [ ] - `p1` - **RETURN** the keys; resolving one assigns nothing about the type beyond its partitioning integer - `inst-key-return`
+1. [x] - `p1` - **IF** the process-wide cache holds the type's key, return it; a key never changes once assigned, so the cache never goes stale - `inst-key-cache-hit`
+2. [x] - `p1` - **ELSE DB**: assign or read the key in `cpt-cf-uc-plugin-dbtable-usage-type-key`, whose key column is generated once per type - `inst-key-assign`
+3. [x] - `p1` - Perform this outside the write transaction, so the guarded insert is that transaction's first write - `inst-key-before-transaction`
+4. [x] - `p1` - Treat that ordering as load-bearing: the feed's settled-horizon reasoning depends on the insert being the transaction's first write - `inst-key-why-before`
+5. [x] - `p1` - Cache the key for the process and use it as the ledger's type partition column, never as a declared attribute of the type - `inst-key-cache-store`
+6. [x] - `p1` - **RETURN** the keys; resolving one assigns nothing about the type beyond its partitioning integer - `inst-key-return`
 
 ### Bounded Batch Retry on a Transient Abort
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-batch-transient-retry`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-batch-transient-retry`
 
 **Input**: a batch call whose transaction aborted with an outer transient.
 
 **Output**: a completed batch result, or a transient for the whole call.
 
 **Steps**:
-1. [ ] - `p1` - **TRY** the whole batch write - `inst-retry-try`
-2. [ ] - `p1` - **CATCH** an outer transient such as a deadlock-victim abort or a serialization failure - `inst-retry-catch`
-3. [ ] - `p1` - Take a fresh connection and a fresh transaction for each attempt, so a rolled-back attempt leaves nothing behind - `inst-retry-fresh-transaction`
-4. [ ] - `p1` - Treat re-running as safe, because the write is idempotent on the same identities - `inst-retry-safe-rerun`
-5. [ ] - `p1` - Count each retry, so a write that recovered in process is distinguishable from one that surfaced a transient to the host - `inst-retry-count`
-6. [ ] - `p1` - **IF** the bounded attempt limit is reached, **RETURN** the transient to the host - `inst-retry-exhausted`
-7. [ ] - `p1` - Never retry a per-entry transient inside a successful batch; those belong to the host - `inst-retry-not-per-entry`
-8. [ ] - `p1` - **RETURN** the batch result - `inst-retry-return`
+1. [x] - `p1` - **TRY** the whole batch write - `inst-retry-try`
+2. [x] - `p1` - **CATCH** an outer transient such as a deadlock-victim abort or a serialization failure - `inst-retry-catch`
+3. [x] - `p1` - Take a fresh connection and a fresh transaction for each attempt, so a rolled-back attempt leaves nothing behind - `inst-retry-fresh-transaction`
+4. [x] - `p1` - Treat re-running as safe, because the write is idempotent on the same identities - `inst-retry-safe-rerun`
+5. [x] - `p1` - Count each retry, so a write that recovered in process is distinguishable from one that surfaced a transient to the host - `inst-retry-count`
+6. [x] - `p1` - **IF** the bounded attempt limit is reached, **RETURN** the transient to the host - `inst-retry-exhausted`
+7. [x] - `p1` - Never retry a per-entry transient inside a successful batch; those belong to the host - `inst-retry-not-per-entry`
+8. [x] - `p1` - **RETURN** the batch result - `inst-retry-return`
 
 ## 4. States (CDSL)
 
 ### Dedup Identity State Machine
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-state-dedup-identity`
+- [x] `p2` - **ID**: `cpt-cf-uc-plugin-state-dedup-identity`
 
 **States**: Absent, Converged, RetentionDropped
 
@@ -376,19 +389,19 @@ is in, and because the last transition is what makes preservation
 retention-bounded rather than permanent.
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Absent **TO** Converged **WHEN** a write under this identity commits; the first commit is the survivor and convergence is established at that commit, never from elapsed time - `inst-id-to-converged`
-2. [ ] - `p1` - **FROM** Absent **TO** Absent **WHEN** a submission is refused for stale acceptance; a refused write inserts nothing, so the identity is untouched - `inst-id-stale-no-change`
-3. [ ] - `p1` - **FROM** Converged **TO** Converged **WHEN** a later identical submission arrives; it is absorbed and returns the stored entry - `inst-id-absorb`
-4. [ ] - `p1` - **FROM** Converged **TO** Converged **WHEN** a later divergent submission arrives; it is rejected as an idempotency conflict and changes nothing - `inst-id-conflict`
-5. [ ] - `p1` - **FROM** Converged **TO** Converged **WHEN** a write whose caller was already answered reaches the store; it is discarded by the conflict rule rather than decided afresh - `inst-id-late-discard`
-6. [ ] - `p1` - **FROM** Converged **TO** RetentionDropped **WHEN** retention drops the chunk holding the entry, because the dedup index rides the chunk lifecycle and there is no separate dedup table to outlive it - `inst-id-to-dropped`
-7. [ ] - `p1` - **FROM** RetentionDropped **TO** Converged **WHEN** a submission under the same identity arrives afterwards; it is accepted as a fresh insert, which is the gear's adopted floor rather than a narrowing of it - `inst-id-fresh-after-drop`
+1. [x] - `p1` - **FROM** Absent **TO** Converged **WHEN** a write under this identity commits; the first commit is the survivor and convergence is established at that commit, never from elapsed time - `inst-id-to-converged`
+2. [x] - `p1` - **FROM** Absent **TO** Absent **WHEN** a submission is refused for stale acceptance; a refused write inserts nothing, so the identity is untouched - `inst-id-stale-no-change`
+3. [x] - `p1` - **FROM** Converged **TO** Converged **WHEN** a later identical submission arrives; it is absorbed and returns the stored entry - `inst-id-absorb`
+4. [x] - `p1` - **FROM** Converged **TO** Converged **WHEN** a later divergent submission arrives; it is rejected as an idempotency conflict and changes nothing - `inst-id-conflict`
+5. [x] - `p1` - **FROM** Converged **TO** Converged **WHEN** a write whose caller was already answered reaches the store; it is discarded by the conflict rule rather than decided afresh - `inst-id-late-discard`
+6. [x] - `p1` - **FROM** Converged **TO** RetentionDropped **WHEN** retention drops the chunk holding the entry, because the dedup index rides the chunk lifecycle and there is no separate dedup table to outlive it - `inst-id-to-dropped`
+7. [x] - `p1` - **FROM** RetentionDropped **TO** Converged **WHEN** a submission under the same identity arrives afterwards; it is accepted as a fresh insert, which is the gear's adopted floor rather than a narrowing of it - `inst-id-fresh-after-drop`
 
 ## 5. Definitions of Done
 
 ### Single-Entry Persistence Through One Guarded Statement
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-single-entry-persistence`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-single-entry-persistence`
 
 The system **MUST** persist a single entry through one guarded statement that
 computes its own admission verdict from that statement's timestamp, inserts only
@@ -414,7 +427,7 @@ come from the column default rather than from plugin code.
 
 ### Batch Persistence With Positionally Aligned Per-Entry Results
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-batch-positional-results`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-batch-positional-results`
 
 The system **MUST** persist a batch through the same guarded statement shape over
 an unnested input set, in one multi-row write, and **MUST** return one result per
@@ -440,7 +453,7 @@ be retried in process.
 
 ### Deduplication on the Gear's Six-Part Identity
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-dedup-identity-enforcement`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-dedup-identity-enforcement`
 
 The system **MUST** deduplicate on the tenant, the GTS type, the idempotency
 key, the covered period and the entry type, enforced by the ledger's unique
@@ -469,7 +482,7 @@ the first five alone.
 
 ### Duplicate Resolution: Silent Absorb or Idempotency Conflict
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-duplicate-resolution`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-duplicate-resolution`
 
 The system **MUST** resolve a duplicate identity by reading the stored row back
 by entry identifier and comparing the submission's caller-supplied fields against
@@ -496,7 +509,7 @@ than a conflict.
 
 ### Acceptance-Slack Refusal Takes Precedence
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-acceptance-slack-refusal`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-acceptance-slack-refusal`
 
 The system **MUST** refuse, as a retryable error, an entry whose acceptance
 instant differs from the store's clock at insertion by more than the configured
@@ -517,7 +530,7 @@ the acceptance-order slack the feed depends on. Each refusal **MUST** be counted
 
 ### Linearizable Dedup Level With a Convergence Bound of Zero
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-linearizable-dedup-level`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-linearizable-dedup-level`
 
 The system **MUST** declare the dedup level `linearizable` with a convergence
 bound of zero, and **MUST** meet it. Every submission under one identity **MUST**
@@ -544,6 +557,10 @@ even though it never fires at this level. The not-converged error variant
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-durable-acknowledgement`
 
+Open. A persist call does return only after its commit and buffers nothing, but
+nothing forces `synchronous_commit` on the write transaction, so the guarantee
+rests on the server's own setting.
+
 The system **MUST** force synchronous commit on every write transaction, so an
 operator-level setting cannot weaken an acknowledgement, and **MUST** return from
 a persist call only after every entry it reports accepted is durable. It **MUST
@@ -565,7 +582,7 @@ the per-transaction guarantee.
 
 ### Digit-for-Digit Quantity Round-Trip
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-quantity-round-trip`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-quantity-round-trip`
 
 The system **MUST** round-trip every quantity in the gear's published range and
 precision digit for digit, the negative half included, on every read path that
@@ -586,7 +603,7 @@ precision or scale modifier.
 
 ### Per-Type Key Assigned on First Write
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-type-key-assignment`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-type-key-assignment`
 
 The system **MUST** assign a type's key on the first write of that type, cache it
 for the process, and never change it. Resolution **MUST** happen before the write
@@ -607,6 +624,9 @@ never reach this plugin.
 - Entities: `Type key`
 
 ## 6. Acceptance Criteria
+
+These are the feature's own release gate rather than traceability identifiers,
+and they close with the feature ID box at the head of this document.
 
 - [ ] Persisting an entry whose identity is new stores it and returns it with a transaction identifier the store stamped rather than the caller.
 - [ ] Re-submitting an entry with identical caller-supplied fields returns the stored entry and creates no second row.
