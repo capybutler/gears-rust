@@ -216,8 +216,9 @@ async fn an_entry_accepted_too_long_ago_is_refused_and_counted() {
         .expect_err("a stale acceptance must be refused");
     assert_stale_acceptance(&err, "a past-dated acceptance");
 
-    // Definition-of-done item 3: the refusal is counted, by this instrument and
-    // not by `uc_timescaledb_dedup_stale_total`, which is the retention race's.
+    // The refusal is counted, by this instrument and not by
+    // `uc_timescaledb_dedup_stale_total`, which the unreadable-conflict arm
+    // owns.
     provider.force_flush().expect("flush metrics");
     assert_eq!(
         counter_sum(&exporter, STALE_ACCEPTANCE_COUNTER),

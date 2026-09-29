@@ -173,8 +173,10 @@ async fn the_invalidation_lookup_index_is_partial_and_not_unique() {
 /// `DESIGN.md` §3.7: the column is "written from the dispatched entry's
 /// declared kind and never derived from another column". The gear made the
 /// entry type caller-supplied end to end; this column inferred it from
-/// `invalidates` anyway, and so did the Record Store's dedup key, and neither
-/// does now.
+/// `invalidates` anyway, and so did an in-process key the Record Store built
+/// from a stored row's columns. The column is written now, and that key is
+/// gone: the write path keys on the entry `id`, which carries the kind because
+/// the kind is one of the six inputs it is derived over.
 ///
 /// It reads `attnotnull` in the same query, because a written column can be
 /// NULL where the generated one could not, and a NULL kind defeats

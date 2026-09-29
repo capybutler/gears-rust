@@ -1192,7 +1192,7 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// order the `VALUES` row or `UNNEST` produced. Saying so is the point: the
 /// sort below buys deadlock-freedom only while that remains true, and a plan
 /// change that reordered the insert would move the property without moving a
-/// line of this crate; sorted by dedup key, every batch in the process takes the locks of
+/// line of this crate; sorted by entry identity, every batch in the process takes the locks of
 /// the keys it shares with another batch in one global order. Unsorted, batch A
 /// takes vcpu's keys then gb's while batch B takes gb's then vcpu's - the ABBA
 /// deadlock, which `PostgreSQL` breaks by aborting a victim after

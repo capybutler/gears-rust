@@ -16,11 +16,11 @@ use usage_collector_sdk::{
 };
 
 use super::{
-    Admission, AggregateStatement, BATCH_GUARDED_SQL, ConflictRead, INSERT_COLUMN_TYPES,
-    INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS,
-    SINGLE_GUARDED_SQL, batch_retry_backoff, batch_retry_backoff_base, build_aggregate_sql,
-    build_get_sql, build_list_page, build_list_sql, entry_identity, is_retryable_batch_error,
-    plan_batch, record_row_key, with_retry,
+    Admission, AggregateStatement, BATCH_CONFLICT_READ_SQL, BATCH_GUARDED_SQL, ConflictRead,
+    INSERT_COLUMN_TYPES, INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore,
+    RECORD_COLUMNS, SINGLE_CONFLICT_READ_SQL, SINGLE_GUARDED_SQL, batch_retry_backoff,
+    batch_retry_backoff_base, build_aggregate_sql, build_get_sql, build_list_page, build_list_sql,
+    entry_identity, is_retryable_batch_error, plan_batch, record_row_key, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -106,12 +106,21 @@ fn withdrawal(
 // --- The identity the write path decides on ---
 //
 // `entry_identity` is the entry's own `id`, and the six-input derivation behind
-// it is the SDK's: `usage_collector_sdk::id_tests` pins every one of the six
-// discriminating, the entry type entering last, the canonical microsecond form
-// of the two bounds, and the namespace. `id_uniqueness_integration_pg` pins the
-// same properties end to end against a live ledger. Nothing is restated here,
-// because a plugin-side copy of the derivation could only ever agree with
-// itself.
+// it is the SDK's. `usage_collector_sdk::id_tests` is what pins it: every one
+// of the six discriminating (`distinct_keys_yield_distinct_ids`,
+// `distinct_tenants_yield_distinct_ids`, `distinct_gts_ids_yield_distinct_ids`,
+// `a_different_covered_period_yields_a_different_id`, and the entry type in
+// `derive_matches_golden_vector_for_an_invalidation`), the entry type entering
+// last (`the_pre_image_is_the_six_inputs_entry_type_last`), the canonical
+// microsecond form of the two bounds (`canonical_period_bound_*`,
+// `equivalent_spellings_of_one_instant_derive_one_id`) and the namespace
+// (`namespace_is_pinned`). Nothing is restated here, because a plugin-side copy
+// of the derivation could only ever agree with itself.
+//
+// `id_uniqueness_integration_pg` is a different claim and is not a substitute:
+// it pins that entries the gateway derived distinct ids for are separately
+// addressable in a live ledger, over four cases, not that the derivation
+// discriminates all six inputs.
 //
 // What *is* this file's to pin is the consequence: two input rows that share an
 // identity take one slot, and two that do not take two.
@@ -248,17 +257,13 @@ async fn resolve_dedup_hit_compares_the_quantity_digit_for_digit() {
     );
 }
 
-#[tokio::test]
-async fn resolve_dedup_hit_treats_id_as_canonical() {
-    let store = lazy_store();
-    let record = unit_record(uuid::Uuid::from_u128(10), "k", 1000);
-    let mut row = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
-    row.id = uuid::Uuid::from_u128(0xDEAD_BEEF);
-    assert!(matches!(
-        store.resolve_dedup_hit(row, &record),
-        Err(UsageCollectorPluginError::IdempotencyConflict { .. })
-    ));
-}
+// `resolve_dedup_hit_treats_id_as_canonical` was here. It fed a row whose `id`
+// differed from the record's and expected an `IdempotencyConflict`, which was a
+// real state while the read-back selected on the stored 6-tuple: the row that
+// came back need not have carried the record's `id`. Every caller now selects
+// the row *by* that identity, so the state is unreachable and the assertion
+// tested only a hand-built argument. `resolve_dedup_hit`'s doc says why the
+// comparison went with it.
 
 #[tokio::test]
 async fn resolve_dedup_hit_compares_the_reason_code() {
@@ -334,7 +339,7 @@ fn decoded_names(list: &str) -> Vec<&str> {
 /// hand here: `metadata` is `jsonb` in the table but travels as `text[]` and is
 /// cast `::jsonb` per row, because `jsonb[]` array encoding is the thing being
 /// sidestepped.
-fn ddl_column_array_types() -> Vec<(&'static str, &'static str)> {
+fn ddl_column_types() -> Vec<(&'static str, &'static str)> {
     migration_probe::insertable_columns()
         .into_iter()
         .map(|(name, ty)| match name {
@@ -356,8 +361,8 @@ fn ddl_column_array_types() -> Vec<(&'static str, &'static str)> {
 }
 
 #[test]
-fn each_inserted_column_is_unnested_as_the_type_the_migration_declares() {
-    let ddl = ddl_column_array_types();
+fn each_inserted_column_is_bound_as_the_type_the_migration_declares() {
+    let ddl = ddl_column_types();
     let want_names: Vec<&str> = ddl.iter().map(|(n, _)| *n).collect();
     let want_types: Vec<&str> = ddl.iter().map(|(_, t)| *t).collect();
 
@@ -369,7 +374,7 @@ fn each_inserted_column_is_unnested_as_the_type_the_migration_declares() {
     assert_eq!(
         INSERT_COLUMN_TYPES.to_vec(),
         want_types,
-        "each column's array type must be the one the migration declares for it \
+        "each column's bound type must be the one the migration declares for it \
          (metadata excepted: jsonb in the table, carried as text and cast per row)"
     );
 }
@@ -421,7 +426,7 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
     assert_eq!(
         names(INSERT_COLUMNS).len(),
         INSERT_COLUMN_TYPES.len(),
-        "one array type per inserted column, in the same order"
+        "one type per inserted column, in the same order"
     );
     // The two casts, pinned as the literal select expressions they are --
     // `decoded_names` above deliberately cannot see them.
@@ -478,7 +483,7 @@ fn both_guarded_statements_insert_only_the_rows_their_own_guard_admitted() {
     // all. Only the placeholder index is derived, off the migration's own
     // column list, because that one really does move when the ledger gains a
     // written column.
-    let slack = ddl_column_array_types().len() + 1;
+    let slack = ddl_column_types().len() + 1;
     let want_guard = format!(
         "(abs(extract(epoch FROM (t.accepted_at - statement_timestamp()))) <= ${slack}::bigint) \
          AS admitted"
@@ -586,8 +591,8 @@ fn the_single_write_binds_one_placeholder_per_inserted_column() {
     // uncast placeholder is `42P18` rather than a wrong value -- but a
     // placeholder cast to the *wrong* column's type is not, which is what this
     // pins. Derived from the migration rather than from the code under test,
-    // for the reason `ddl_column_array_types` gives.
-    let want: Vec<String> = ddl_column_array_types()
+    // for the reason `ddl_column_types` gives.
+    let want: Vec<String> = ddl_column_types()
         .into_iter()
         .enumerate()
         .map(|(i, (_, ty))| format!("${}::{ty}", i + 1))
@@ -638,7 +643,7 @@ fn the_batch_write_names_one_column_sequence_in_all_three_places() {
         assert_eq!(
             *param,
             format!("${}::{ty}[]", i + 1),
-            "UNNEST parameter {} must be column {}'s array type",
+            "UNNEST parameter {} must be the array of column {}'s type",
             i + 1,
             i + 1
         );
@@ -693,6 +698,52 @@ fn both_outer_selects_read_every_record_column_off_the_inserted_row() {
     }
 }
 
+#[test]
+fn both_conflict_read_backs_key_on_the_id_and_prune_on_the_partition_column() {
+    // Two claims, and they fail separately.
+    //
+    // *The key.* DESIGN section 3.6 requires the read-back to select on `id`.
+    // Asserted as a literal predicate rather than by looking for the substring
+    // `id`, which every column list already contains.
+    //
+    // *The pruning.* `usage_records` is partitioned on `window_end`, so a
+    // predicate that does not constrain it cannot exclude a chunk. This is the
+    // only thing that would notice the column being "simplified" out -- the
+    // read-back still returns the right row without it, just after touching
+    // every chunk the deployment retains, inside the write transaction. The
+    // measurements are on the two statements' own docs.
+    let single = SINGLE_CONFLICT_READ_SQL.as_str();
+    assert!(
+        single.contains("WHERE id = $1 AND window_end = $2"),
+        "the single read-back keys on the id and names the partition column \
+         beside it: {single}"
+    );
+
+    let batch = BATCH_CONFLICT_READ_SQL.as_str();
+    assert!(
+        batch.contains("WHERE window_end = ANY($2::timestamptz[])"),
+        "the batch read-back carries the conjunct the planner excludes chunks \
+         with: {batch}"
+    );
+    assert!(
+        batch.contains(
+            "AND (id, window_end) IN (SELECT t1, t2 FROM UNNEST($1::uuid[], \
+             $2::timestamptz[]) AS t(t1, t2))"
+        ),
+        "and pairs each id with its own period, which a second `= ANY` could \
+         not: {batch}"
+    );
+
+    // Neither may read the ledger through anything but the read list, so a
+    // column added to `RECORD_COLUMNS` reaches both without a second edit.
+    for (label, sql) in [("single", single), ("batch", batch)] {
+        assert!(
+            sql.starts_with(&format!("SELECT {RECORD_COLUMNS} FROM usage_records ")),
+            "{label}: the read-back selects the whole read list: {sql}"
+        );
+    }
+}
+
 // --- Batch planning ---
 
 #[test]
@@ -702,18 +753,26 @@ fn plan_batch_collapses_and_sorts_distinct_identities() {
     // `unit_record` stamps the `id` from its third argument, standing in for
     // the gateway: idx 2 repeats idx 0's, which is what a faithful gateway
     // emits for a resubmission of one entry.
+    //
+    // **The input order disagrees with the identity order deliberately**, and
+    // that is the whole of what makes the sort assertion below able to fail: a
+    // fixture whose first occurrences already ascend leaves `reps.sort_by_key`
+    // a no-op, so deleting the sort would keep it green. This is the only
+    // in-process oracle for the ordering `plan_batch`'s deadlock-freedom
+    // argument rests on; the live-DB deadlock test is probabilistic, so it
+    // cannot be the only one.
     let records = vec![
-        mk("kb", 10), // idx 0
+        mk("kb", 13), // idx 0
         mk("ka", 11), // idx 1
-        mk("kb", 10), // idx 2 — same identity as idx 0
-        mk("kc", 13), // idx 3
+        mk("kb", 13), // idx 2 — same identity as idx 0
+        mk("kc", 10), // idx 3
     ];
 
     let plan = plan_batch(&records);
 
-    // Sorted by identity, which here is the hand-assigned `id`: 10 (kb), 11
-    // (ka), 13 (kc). The sort is not by idempotency key and must not be read as
-    // one -- a real `id` is a digest and orders arbitrarily.
+    // First occurrences arrive as 13, 11, 10 and come out 10, 11, 13. The sort
+    // is not by idempotency key and must not be read as one -- a real `id` is a
+    // digest and orders arbitrarily, which is why any total order will do.
     let ids: Vec<uuid::Uuid> = plan.reps.iter().map(|r| r.id).collect();
     assert_eq!(
         ids,
@@ -722,9 +781,12 @@ fn plan_batch_collapses_and_sorts_distinct_identities() {
             uuid::Uuid::from_u128(11),
             uuid::Uuid::from_u128(13)
         ],
-        "distinct, sorted by identity"
+        "distinct, and ascending by identity whatever order they arrived in"
     );
 
+    // `first_index` is the input index, so it is unaffected by the sort: the
+    // two are separate facts and a plan that sorted `first_index`'s values too
+    // would resolve every in-batch duplicate against the wrong row.
     assert_eq!(
         plan.first_index[&entry_identity(&records[1])],
         1,
@@ -748,7 +810,7 @@ fn plan_batch_collapses_and_sorts_distinct_identities() {
         .expect("kb rep present");
     assert_eq!(
         kb_rep.id,
-        uuid::Uuid::from_u128(10),
+        uuid::Uuid::from_u128(13),
         "kb rep is the first occurrence"
     );
 }

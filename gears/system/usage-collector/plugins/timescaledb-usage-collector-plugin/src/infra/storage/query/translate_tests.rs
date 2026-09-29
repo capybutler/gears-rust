@@ -318,7 +318,7 @@ fn only_the_enum_column_casts_its_bound_literal() {
     // Rust: `bind_cast` reads it from `record_store::ENTRY_TYPE_ENUM` rather
     // than hardcoding the name a second time. The const's own spelling is held
     // to the migration by
-    // `record_store_tests::each_inserted_column_is_unnested_as_the_type_the_migration_declares`,
+    // `record_store_tests::each_inserted_column_is_bound_as_the_type_the_migration_declares`,
     // through `migration_probe::insertable_columns`.
     assert_eq!(sql, "entry_type = $1::usage_entry_type");
 

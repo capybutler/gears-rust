@@ -190,6 +190,28 @@ const INSERT_COLUMN_TYPES: [&str; 18] = [
 const DEDUP_CONFLICT_TARGET: &str =
     "tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key";
 
+/// The ledger's time-partition column, named beside the `id` in both conflict
+/// read-backs **for pruning and for nothing else**.
+///
+/// `usage_records` is a hypertable partitioned on this column
+/// (`migrations/0001_init.sql`), so a predicate that does not constrain it
+/// cannot exclude a chunk: `WHERE id = $1` alone probes the
+/// `(id, window_end, type_key)` index of *every* chunk the ledger holds, and
+/// grows with the deployment's retention. Both read-backs run **inside the
+/// write transaction**, while it still holds the speculative tuple locks of
+/// everything it inserted, and on the ordinary idempotent-retry path rather
+/// than an error path — which is the hold time
+/// [`crate::infra::storage::pool`]'s `lock_timeout` reasoning is about. Adding
+/// the partition column prunes to the one chunk the entry's period falls in.
+///
+/// **It is not a retreat to the 6-tuple, and must not be read as one.** The
+/// read-back keys on `id` (`DESIGN.md` §3.6), and this column discriminates
+/// nothing `id` does not already: the covered-period end is one of the six
+/// inputs the `id` is derived over, so two rows agreeing on `id` agree on it.
+/// Naming it changes which chunks are scanned, never which row is selected.
+/// Anyone tempted to simplify it back out should reach this paragraph first.
+const PARTITION_PRUNE_COLUMN: &str = "window_end";
+
 /// The `$n` the acceptance slack binds at: one past the last inserted column,
 /// on both write paths.
 ///
@@ -340,6 +362,49 @@ fn batch_input_source() -> String {
         .join(", ");
     format!("UNNEST({unnest}) AS t({INSERT_COLUMNS})")
 }
+
+/// The single-row conflict read-back: the row that took this identity's slot.
+///
+/// Keyed on `id` ([`entry_identity`]), with [`PARTITION_PRUNE_COLUMN`] beside
+/// it for pruning and not for selection.
+///
+/// **Measured on `timescale/timescaledb:2.29.2-pg18`, over a ledger holding
+/// eight chunks.** `WHERE id = $1` alone plans an `Append` over all eight, one
+/// index-only scan of each chunk's primary key. With `AND window_end = $2` the
+/// plan is a single index scan of the one chunk the period falls in. That is
+/// the whole reason the column is named.
+static SINGLE_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {RECORD_COLUMNS} FROM usage_records \
+         WHERE id = $1 AND {PARTITION_PRUNE_COLUMN} = $2"
+    )
+});
+
+/// The batch conflict read-back: the rows that took these identities' slots.
+///
+/// **Two conjuncts, and neither is redundant in practice.** The row-value `IN`
+/// pairs each `id` with its own period, which a second `= ANY` could not — that
+/// would match one entry's `id` under another's period. The leading
+/// `= ANY` is what the planner can exclude chunks with; it is logically implied
+/// by the row-value and is therefore easy to mistake for dead weight.
+///
+/// **Measured on the same container and ledger as
+/// [`SINGLE_CONFLICT_READ_SQL`], two identities out of eight chunks.** The
+/// row-value `IN` on its own plans a nested loop whose `Append` still lists all
+/// eight chunks, probing each one's `window_end` index per outer row: better
+/// than keying on `id` alone, which bitmap-scans eight primary keys, and still
+/// every chunk. With the `= ANY` conjunct the `Append` lists **two**, and a
+/// hash semi join enforces the exact pairing. Delete it and the read-back goes
+/// back to touching every chunk the deployment retains, inside the write
+/// transaction and while it holds the batch's speculative tuple locks.
+static BATCH_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {RECORD_COLUMNS} FROM usage_records \
+         WHERE {PARTITION_PRUNE_COLUMN} = ANY($2::timestamptz[]) \
+           AND (id, {PARTITION_PRUNE_COLUMN}) IN \
+             (SELECT t1, t2 FROM UNNEST($1::uuid[], $2::timestamptz[]) AS t(t1, t2))"
+    )
+});
 
 /// The single-row guarded statement ([`guarded_statement`] over
 /// [`single_input_source`]).
@@ -718,48 +783,49 @@ impl PgRecordStore {
         //     read mutates nothing and the rollback that follows discards
         //     nothing the ledger kept, so an absorbed retry leaves the ledger
         //     exactly as the winning insert left it.
-        let select_sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1");
-        let stored = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
-            .bind(entry_identity(&record))
-            .fetch_optional(&mut *tx)
-            .await;
+        let stored =
+            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(SINGLE_CONFLICT_READ_SQL.as_str()))
+                .bind(entry_identity(&record))
+                .bind(record.window_end)
+                .fetch_optional(&mut *tx)
+                .await;
         rollback(tx).await;
         let stored = stored.map_err(|e| self.record_backend_error(&e))?;
 
         if let Some(row) = stored {
             self.resolve_dedup_hit(row, &record)
         } else {
-            // Stale: the conflicting row's chunk was dropped by retention between
-            // the conflicting insert and this read — a near-impossible race
-            // against the retention boundary (the unique entry is dropped with
-            // the chunk, so a retry now wins the freed slot as a fresh insert).
-            // Return retryable Transient.
             self.metrics.inc_dedup_stale();
-            Err(write_transient(
-                &record,
-                "conflicting record aged out during dedup resolution; retry",
-            ))
+            Err(write_transient(&record, CONFLICT_UNREADABLE_MESSAGE))
         }
     }
 
-    /// Resolve a dedup-key hit into absorb or conflict.
+    /// Resolve a hit on a stored dedup identity into absorb or conflict.
     ///
     /// The stored row is mapped into a [`UsageRecord`] and compared with
     /// [`UsageRecord::caller_supplied_eq`], the SDK's one definition of the
     /// comparison, so `origin` and `accepted_at` are ignored and the quantity
-    /// compares digit for digit. `id` is compared as well, as defence in depth:
-    /// it is derived from the identity both sides share, so a mismatch is the
-    /// shape a corrupted stored row takes. Equal is absorbed and answers with
-    /// the stored entry; different is
+    /// compares digit for digit. Equal is absorbed and answers with the stored
+    /// entry; different is
     /// [`UsageCollectorPluginError::IdempotencyConflict`] carrying it. A stored
     /// row that cannot be mapped (corrupt metadata, say) is `Internal`.
+    ///
+    /// **The `id`s are not compared, because they cannot differ.** Every caller
+    /// selected this row by the very identity it is being resolved against:
+    /// the single path reads `WHERE id = $1` with the record's own
+    /// [`entry_identity`], `read_conflict_records` keys its map on `row.id`,
+    /// and the in-batch arm passes the row the statement inserted under that
+    /// same identity. An equality check here would be a tautology dressed as
+    /// defence in depth, and the earlier one was: it was written when the
+    /// read-back selected on the stored 6-tuple and could therefore return a
+    /// row with some other `id`.
     fn resolve_dedup_hit(
         &self,
         row: UsageRecordRow,
         record: &UsageRecord,
     ) -> Result<UsageRecord, UsageCollectorPluginError> {
         let stored = record_row_to_model(row)?;
-        if stored.id == record.id && stored.caller_supplied_eq(record) {
+        if stored.caller_supplied_eq(record) {
             self.metrics.inc_dedup_absorbed();
             Ok(stored)
         } else {
@@ -860,9 +926,13 @@ impl PgRecordStore {
     /// and the `id` can, because the entry kind is one of the six inputs it is
     /// derived over ([`entry_identity`]).
     ///
+    /// The covered-period end rides along for the reason
+    /// [`PARTITION_PRUNE_COLUMN`] gives; [`BATCH_CONFLICT_READ_SQL`] is where
+    /// the predicate's two conjuncts are explained and measured.
+    ///
     /// Maps each identity to `Stored` (row found → resolve absorb/conflict) or
-    /// `Stale` (the conflicting row's chunk was dropped by retention between
-    /// the conflicting insert and this read).
+    /// `Stale` (the row this one conflicted with could not be read — see
+    /// [`CONFLICT_UNREADABLE_MESSAGE`] for the two ways that happens).
     async fn read_conflict_records(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -874,13 +944,14 @@ impl PgRecordStore {
         }
 
         let ids: Vec<Uuid> = lost.iter().copied().map(entry_identity).collect();
-        let select_sql =
-            format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = ANY($1::uuid[])");
-        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
-            .bind(&ids)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
+        let window_ends: Vec<OffsetDateTime> = lost.iter().map(|r| r.window_end).collect();
+        let rows =
+            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(BATCH_CONFLICT_READ_SQL.as_str()))
+                .bind(&ids)
+                .bind(&window_ends)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| self.record_backend_error(&e))?;
 
         let mut found: HashMap<Uuid, UsageRecordRow> = HashMap::new();
         for row in rows {
@@ -888,10 +959,8 @@ impl PgRecordStore {
         }
 
         // Every lost identity resolves to Stored (its conflicting row was read)
-        // or Stale (the row's chunk was dropped by retention between the
-        // conflicting insert and this read — the near-impossible
-        // retention-boundary race). `reps` are distinct identities, so each
-        // `remove` is unambiguous.
+        // or Stale (it could not be — [`CONFLICT_UNREADABLE_MESSAGE`]).
+        // `reps` are distinct identities, so each `remove` is unambiguous.
         for id in ids {
             let read = found.remove(&id).map_or(ConflictRead::Stale, |row| {
                 ConflictRead::Stored(Box::new(row))
@@ -963,10 +1032,7 @@ impl PgRecordStore {
                     }
                     Some(ConflictRead::Stale) => {
                         self.metrics.inc_dedup_stale();
-                        Err(write_transient(
-                            record,
-                            "conflicting record aged out during dedup resolution; retry",
-                        ))
+                        Err(write_transient(record, CONFLICT_UNREADABLE_MESSAGE))
                     }
                     None => Err(write_transient(
                         record,
@@ -1547,9 +1613,34 @@ fn build_list_page(
 /// `ON CONFLICT` arbiter is [`DEDUP_CONFLICT_TARGET`], the six columns plus the
 /// partition key, so the database decides what collides from the row's stored
 /// values and not from anything a caller asserted about them. A gateway that
-/// derived an `id` inconsistent with its own six inputs would therefore be
-/// caught by the ledger — as a PRIMARY KEY collision or a dedup conflict the
-/// read-back cannot resolve — rather than silently absorbed.
+/// derived an `id` inconsistent with its own six inputs is therefore caught by
+/// the ledger rather than silently absorbed.
+///
+/// **What "caught" means, exactly, because this is the case the trust above
+/// accepts the risk of.** A submission whose `id` does not match its own six
+/// inputs still collides on the arbiter, which reads those six off the row; the
+/// read-back that follows then looks for the winner by an `id` no stored row
+/// carries, finds nothing, and takes the arm meant for a conflicting row that
+/// retention dropped mid-resolution. So the call answers a `Transient` reading
+/// [`CONFLICT_UNREADABLE_MESSAGE`], counted on
+/// `uc_timescaledb_dedup_stale_total`. Three consequences are worth stating
+/// rather than leaving to be discovered:
+///
+/// * **It does not self-heal.** Every retry re-derives the same wrong `id` and
+///   lands in the same arm, where the retention race really does clear on a
+///   retry. A `Transient` the host keeps retrying is what an operator sees.
+/// * **It is not distinguishable from the retention race** at the call site or
+///   in the log line, which names neither cause: both arrive as one row
+///   conflicting with a row the read cannot see.
+/// * **It is charged to the retention race's counter**, which was that arm's
+///   only population until this key changed. Splitting the two is the metric
+///   inventory's to do, not this path's, so nothing here adds a counter or a
+///   label for it.
+///
+/// This is the accepted cost of not re-deriving, and it is the shape a faithful
+/// gateway never produces. Re-deriving here to close it would put a second
+/// derivation beside the SDK's, which
+/// `cpt-cf-usage-collector-adr-record-identity-derivation` places above the SPI.
 ///
 /// Called rather than written out at each site so that every identity decision
 /// on this path is visibly one, and so this doc is what a reader meets first.
@@ -1607,14 +1698,38 @@ fn admission_of(row: &PgRow) -> Result<Admission, sqlx::Error> {
 const STALE_ACCEPTANCE_MESSAGE: &str =
     "acceptance instant outside the configured acceptance slack; re-stamp and retry";
 
+/// What a caller is told when a submission lost its dedup slot and the row that
+/// took it could not then be read back.
+///
+/// **Two populations reach it, and the message names neither**, because the
+/// path cannot tell them apart:
+///
+/// * The **retention race**: the conflicting row's chunk was dropped between
+///   the conflicting insert and this read. Near-impossible against the
+///   retention boundary, and genuinely retryable — the unique entry went with
+///   the chunk, so a retry wins the freed slot as a fresh insert. This was the
+///   arm's only population while the read-back keyed on the stored 6-tuple.
+/// * A **submission whose `id` does not match its own six inputs**, which
+///   collides on an arbiter that reads those six off the row and is then looked
+///   for under an `id` no row carries ([`entry_identity`]). It does **not**
+///   clear on a retry, because a retry re-derives the same `id`.
+///
+/// So the wording says what happened rather than why, and the retryability it
+/// implies holds for the first population only. Separating the two at the
+/// metric is the metric inventory's work, not this path's.
+const CONFLICT_UNREADABLE_MESSAGE: &str =
+    "conflicting record could not be read back during dedup resolution; retry";
+
 /// Log a retryable write-path transient at `warn` with the record's identifiers,
 /// then return the matching [`UsageCollectorPluginError::Transient`]. The
-/// degraded path is self-healing on retry but must still surface at `warn` so an
-/// operator can see it. This helper only logs and builds the error: any counter
-/// is the caller's, `inc_dedup_stale` on the retention-race sites,
-/// `inc_stale_acceptance_rejection` on the guard's, and none on
-/// the defensive not-found arm, which is unreachable by construction. Stated as
-/// a kind rather than a count because the call sites move.
+/// degraded path must surface at `warn` so an operator can see it — and not
+/// every one of them self-heals on a retry, which is one reason it must
+/// ([`CONFLICT_UNREADABLE_MESSAGE`]). This helper only logs and builds the
+/// error: any counter is the caller's, `inc_dedup_stale` on the
+/// unreadable-conflict sites, `inc_stale_acceptance_rejection` on the guard's,
+/// and none on the defensive not-found arm, which is unreachable by
+/// construction. Stated as a kind rather than a count because the call sites
+/// move.
 fn write_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
     tracing::warn!(
         tenant_id = %record.tenant_id,
@@ -1807,12 +1922,16 @@ where
     }
 }
 
-/// Outcome of reading the existing `usage_records` row for a not-won key.
+/// Outcome of reading the existing `usage_records` row for a lost identity.
 enum ConflictRead {
     /// The conflicting row exists — resolve absorb vs conflict against it.
     Stored(Box<UsageRecordRow>),
-    /// The conflicting row's chunk was dropped by retention between the
-    /// conflicting insert and the read → retryable `Transient`.
+    /// It could not be read: the chunk holding it was dropped by retention
+    /// between the conflicting insert and the read, **or** the submission's
+    /// `id` does not name the row its own six inputs collided with. Both
+    /// answer a `Transient`, and only the first of them clears on a retry
+    /// ([`CONFLICT_UNREADABLE_MESSAGE`]). The name is the older population's
+    /// and is kept because the arm is one arm.
     Stale,
 }
 

@@ -107,9 +107,15 @@ pub struct UsageRecordRow {
     /// the DDL `CHECK` pins.
     pub origin: String,
     /// `entry_type` — the entry's declared kind, as the dispatched entry
-    /// declared it. Read by [`super::record_store`]'s dedup key, which needs
-    /// the stored row and an incoming record to key alike; not carried on the
-    /// SDK model, see the struct doc.
+    /// declared it, and not carried on the SDK model (see the struct doc).
+    ///
+    /// **Nothing in production reads it off this struct**, and it is decoded
+    /// anyway for the reason [`Self::xact_id`] is: a row is a faithful picture
+    /// of what was stored, and the read list names every written column. It had
+    /// one reader while the write path kept an in-process dedup key built from
+    /// a stored row's columns; that key is now the entry `id`, which the row
+    /// already carries, so the column is read and dropped exactly as
+    /// [`super::mapper::record_row_to_model`] drops it.
     ///
     /// A `String` because `usage_entry_type` is a `PostgreSQL` enum and
     /// `sqlx` refuses to decode one into a `TEXT`-declared Rust type, so the

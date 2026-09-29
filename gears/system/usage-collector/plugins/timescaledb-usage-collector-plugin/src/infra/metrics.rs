@@ -369,7 +369,11 @@ impl Metrics {
             .build();
         let dedup_stale = meter
             .u64_counter("uc_timescaledb_dedup_stale_total")
-            .with_description("Dedup hits whose stored record had aged out (retryable)")
+            .with_description(
+                "Dedup hits whose conflicting row could not be read back: its chunk \
+                 aged out mid-resolution, or the submission's derived id does not \
+                 name the row its own identity inputs collided with",
+            )
             .build();
         let stale_acceptance_rejection = meter
             .u64_counter("uc_timescaledb_stale_acceptance_rejections_total")
@@ -570,7 +574,16 @@ impl Metrics {
         self.invalidation.add(1, &[]);
     }
 
-    /// Increment the stale-dedup counter (dedup hit whose record had aged out).
+    /// Increment the stale-dedup counter: one dedup hit whose conflicting row
+    /// could not be read back.
+    ///
+    /// **Two populations share it**, and this counter does not separate them:
+    /// the retention race it was named for, which clears on a retry, and a
+    /// submission carrying an `id` that does not name the row its own identity
+    /// inputs collided with, which does not
+    /// (`crate::infra::storage::record_store`'s `entry_identity`). Splitting
+    /// them belongs to the metric inventory rather than to the write path, so
+    /// nothing on that path adds a label for it.
     pub fn inc_dedup_stale(&self) {
         self.dedup_stale.add(1, &[]);
     }
@@ -579,9 +592,9 @@ impl Metrics {
     /// own admission guard refused, because its `accepted_at` sat outside
     /// `feed_acceptance_slack_secs` of that statement's `statement_timestamp()`
     /// (this plugin's DESIGN §3.6). A **different** signal from
-    /// [`Self::inc_dedup_stale`], which counts a conflicting row that retention
-    /// dropped mid-resolution; both answer `Transient`, and only this one says
-    /// the entry's acceptance instant is the reason.
+    /// [`Self::inc_dedup_stale`], which counts a conflicting row that could not
+    /// be read back at all; both answer `Transient`, and only this one says the
+    /// entry's acceptance instant is the reason.
     pub fn inc_stale_acceptance_rejection(&self) {
         self.stale_acceptance_rejection.add(1, &[]);
     }
