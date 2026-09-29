@@ -118,16 +118,16 @@ const LEDGER_PK: &str = "usage_records_pkey";
 /// same identity. Serially this cannot happen *of two faithful submissions*:
 /// the pre-check sees the committed row and skips it without touching any
 /// index. A mis-derived `id` over novel six inputs can reach it serially, which
-/// `entry_identity` sets out as the one route on which the ledger catches such
-/// a submission at all.
+/// `crate::infra::storage::record_store`'s `entry_identity` sets out.
 ///
 /// This is deliberately **not** folded into [`classify_db`], which maps a
 /// primary-key `23505` to [`DbErrorClass::Other`] and so to a non-retryable
 /// `Internal`. That remains right for a primary-key violation nothing
 /// intercepted: with the derivation correct it is unreachable outside this race,
 /// so reaching the catch-all still means something is wrong. This predicate is
-/// the write path declaring the one case it knows how to resolve, and the
-/// division of labour is the point —
+/// the write path declaring which primary-key violations it will attempt a
+/// resolution for rather than surface as a defect, and the division of labour
+/// is the point —
 /// `error_tests::the_ledger_pk_is_recognised_under_every_chunk_local_spelling`
 /// asserts both halves on one input.
 #[must_use]

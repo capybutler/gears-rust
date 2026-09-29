@@ -408,9 +408,10 @@ static SINGLE_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
 /// lists the chunks the batch's periods fall in — **two** on that ledger, one
 /// per period because those two periods landed in different time chunks, and
 /// *N* times the number of **time chunks** they span on a ledger carrying *N*
-/// meter types, for the reason [`PARTITION_PRUNE_COLUMN`] gives. Delete the conjunct and the read-back goes
-/// back to touching every chunk the deployment retains, inside the write
-/// transaction and while it holds the batch's speculative tuple locks.
+/// meter types, for the reason [`PARTITION_PRUNE_COLUMN`] gives. Delete the
+/// conjunct and the read-back goes back to touching every chunk the deployment
+/// retains, inside the write transaction and while it holds the batch's
+/// speculative tuple locks.
 static BATCH_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT {RECORD_COLUMNS} FROM usage_records \
@@ -528,8 +529,11 @@ impl PgRecordStore {
 
     /// [`Self::record_backend_error`], plus the one insert-path error that is
     /// retryable without being a connectivity or serialization fault: a PRIMARY
-    /// KEY collision with a concurrent writer of one of this write's own dedup
-    /// identities ([`is_ledger_pk_violation`]).
+    /// KEY collision on one of this write's own dedup identities
+    /// ([`is_ledger_pk_violation`]). The case it is **sized for** is a
+    /// concurrent writer of that identity; [`entry_identity`] sets out a second
+    /// route to the same raise, which a mis-derived `id` reaches with no
+    /// concurrency at all.
     ///
     /// **It is lifted here rather than in
     /// [`crate::infra::storage::error::classify_db`]**, which still maps a
@@ -538,12 +542,21 @@ impl PgRecordStore {
     /// unreachable outside this race. Only a write path knows it is in the race,
     /// so only a write path may reclassify it.
     ///
-    /// Re-running is what resolves it, and it must be a **fresh transaction**: the
-    /// winner is committed by the time this error is raised, so the re-run's
+    /// **Re-running resolves the race, and it must be a fresh transaction**:
+    /// the winner is committed by the time this error is raised, so the re-run's
     /// `ON CONFLICT` pre-check sees its row and skips that identity, leaving the
     /// batch to resolve it as an ordinary dedup hit. `create_batch`'s bounded
     /// jittered retry ([`with_retry`]) is exactly that, and it already treats a
     /// deadlock victim the same way.
+    ///
+    /// **It does not resolve the other route**, and the `Transient` it returns
+    /// says otherwise: on a mis-derived `id` the re-run's pre-check still finds
+    /// nothing, the insert meets the same primary-key entry again, and
+    /// [`MAX_BATCH_ATTEMPTS`] is spent before the host is told. The detail
+    /// string names the race because the race is what it is sized for; it is
+    /// left as it is deliberately, since re-wording it would buy a caller
+    /// nothing it can act on differently and the divergence is the accepted
+    /// cost [`entry_identity`] sets out.
     fn record_insert_error(&self, err: &sqlx::Error) -> UsageCollectorPluginError {
         if is_ledger_pk_violation(err) {
             self.metrics.inc_backend_error(ErrorClass::Transient);
@@ -660,8 +673,10 @@ impl PgRecordStore {
         //    fail on the PRIMARY KEY, which the arbiter does not cover
         //    ([`is_ledger_pk_violation`]). That error aborts the transaction,
         //    and step 2c still has to read the winner's row inside it, so the
-        //    statement needs a point to roll back to. Serially this never fires
-        //    and the savepoint is two statements of pure overhead.
+        //    statement needs a point to roll back to. Of two faithful
+        //    submissions this fires only under concurrency, and serially the
+        //    savepoint is two statements of pure overhead; a mis-derived `id`
+        //    reaches the same raise serially ([`entry_identity`]).
         //
         //    **The guarded statement does not make it redundant, and this was
         //    measured rather than argued.** Its `LEFT JOIN ins USING (id)`
@@ -727,8 +742,9 @@ impl PgRecordStore {
                     sp.commit().await?;
                     Ok(admission)
                 }
-                // A concurrent writer of this very identity won and committed —
-                // Postgres waits on its speculative token before raising this, so
+                // The sized-for case is a concurrent writer of this very
+                // identity that won and committed — Postgres waits on its
+                // speculative token before raising this, so
                 // by now its row is committed, and step 2c's `SELECT` takes a
                 // fresh snapshot and sees it. That last step is what needs
                 // `READ COMMITTED`: under a deployer-set
@@ -874,9 +890,11 @@ impl PgRecordStore {
     /// holds the transaction that has to be rolled back first.
     ///
     /// **A PRIMARY KEY collision is the caller's to handle, not this function's.**
-    /// The arbiter covers the dedup UNIQUE only, so a concurrent writer of one of
-    /// these identities surfaces as a `23505` on the primary key rather than as an
-    /// absent `ins` row. Unlike the single-row path there is nothing to
+    /// The arbiter covers the dedup UNIQUE only, so a write that reaches the
+    /// primary-key index and meets a row there surfaces as a `23505` rather
+    /// than as an absent `ins` row - a concurrent writer of one of these
+    /// identities is the case that is sized for, and [`entry_identity`] sets
+    /// out one that needs no concurrency. Unlike the single-row path there is nothing to
     /// resolve in place - a failed statement reports no verdict at all, not even
     /// for the rows it would have admitted - so
     /// `create_batch_inner` lifts it to a `Transient`
@@ -1633,29 +1651,49 @@ fn build_list_page(
 ///
 /// **What a mis-derived `id` costs, because this is the case the trust above
 /// accepts the risk of.** What happens depends on what the ledger already
-/// holds, and the two outcomes below are the ones worth a reader's attention
+/// holds, and the outcomes below are the ones worth a reader's attention
 /// rather than a closed account of every route:
 ///
 /// * **Its six inputs are already stored.** It collides on the arbiter, which
 ///   reads those six off the row, and `DO NOTHING` then skips the insert
 ///   outright — so no other unique index is reached, the PRIMARY KEY included
-///   ([`crate::infra::storage::error::classify_db`] states the suppression
-///   rule). The read-back looks for the winner by an `id` no stored row
-///   carries, finds nothing, and answers a `Transient` reading
-///   [`CONFLICT_UNREADABLE_MESSAGE`], counted on
-///   `uc_timescaledb_dedup_stale_total`. That **does not self-heal**: every
-///   retry re-derives the same `id` and lands in the same arm. It is also
-///   indistinguishable, at the call site and in the log line, from the other
-///   things that reach that arm.
+///   ([`is_ledger_pk_violation`] states that suppression rule). The read-back
+///   then looks for the winner by the mis-derived `id`, and **what it finds
+///   decides the answer**. The mis-derivation guarantees no row carries the
+///   `id` this entry *ought* to have; it guarantees nothing about the one it
+///   does carry:
+///   * **No row carries it**, which is the ordinary case. The read finds
+///     nothing and answers a `Transient` reading
+///     [`CONFLICT_UNREADABLE_MESSAGE`], counted on
+///     `uc_timescaledb_dedup_stale_total`. That **does not self-heal**: every
+///     retry re-derives the same `id` and lands in the same arm. It is also
+///     indistinguishable, at the call site and in the log line, from the other
+///     things that reach that arm.
+///   * **Some other entry carries it**, under the same covered-period end.
+///     The read returns that **foreign row**, and
+///     [`PgRecordStore::resolve_dedup_hit`] compares caller-supplied fields
+///     against an entry that is not this submission's — so the caller receives
+///     an `IdempotencyConflict` carrying another identity's stored entry as
+///     `existing`, possibly another tenant's, since
+///     [`SINGLE_CONFLICT_READ_SQL`] binds the `id` and the period and nothing
+///     else. Nothing on this path detects it. An `id` equality check here
+///     would, and it was removed deliberately: every *faithful* caller selects
+///     the row by the identity it is resolving against, which makes the check
+///     a tautology in every case but this one.
 /// * **Its six inputs are novel.** Nothing collides *on the arbiter*, so the
 ///   insert proceeds — and only then is every other unique index checked. Two
 ///   ends to that:
-///   * Should the `id` happen to equal a stored row's
+///   * Should the `id` collide with a stored row's
 ///     `(id, window_end, type_key)`, the raise is on the PRIMARY KEY, which the
-///     arbiter does not cover and `DO NOTHING` therefore does not suppress. The
-///     single path rolls back to its savepoint and resolves against that row;
-///     the batch lifts it to a `Transient` and re-runs. This is the one route
-///     on which the ledger does catch a mis-derived `id`.
+///     arbiter does not cover and `DO NOTHING` therefore does not suppress.
+///     The single path rolls back to its savepoint and resolves against that
+///     row — which is a foreign row, resolved as the sub-case above resolves
+///     one. The batch lifts it to a `Transient` and re-runs, and **that
+///     re-run does not clear it**: the arbiter pre-check still finds nothing,
+///     the insert still meets the same primary-key entry, and
+///     [`MAX_BATCH_ATTEMPTS`] is spent before the error reaches the host
+///     ([`PgRecordStore::record_insert_error`]). Here the ledger does at least
+///     refuse the row.
 ///   * Otherwise it is **stored**, and nothing catches it. The row carries an
 ///     `id` no faithful derivation of its own columns produces, which makes it
 ///     unreachable by the identity it ought to have: every later faithful
@@ -1748,9 +1786,10 @@ const STALE_ACCEPTANCE_MESSAGE: &str =
 ///   setting stands, so what an operator sees is a rate rather than one blip.
 /// * A **submission whose `id` does not match its own six inputs**, which,
 ///   *when those six are already stored*, collides on an arbiter that reads
-///   them off the row and is then looked for under an `id` no row carries
-///   ([`entry_identity`], which sets out what the other case does instead). It
-///   does **not** clear on a retry, because a retry re-derives the same `id`.
+///   them off the row and is then looked for under an `id` that — in the
+///   ordinary case, though not in every case — no row carries
+///   ([`entry_identity`] sets out the rest). It does **not** clear on a retry,
+///   because a retry re-derives the same `id`.
 ///
 /// Nothing here can tell them apart, and separating them at the metric is the
 /// metric inventory's work rather than this path's.
@@ -1894,9 +1933,12 @@ fn batch_retry_backoff(attempt: u32) -> Duration {
 /// helpers. A concurrent writer of one of this batch's own dedup identities
 /// colliding on the ledger's PRIMARY KEY reaches it by a different route: the
 /// arbiter does not cover that index, so `classify_db` leaves the `23505` in
-/// `Other` and `record_insert_error` is what lifts it, letting the re-run
-/// resolve against the winner's committed row (this plugin's DESIGN §3.6). All
-/// are safe to re-run for this idempotent batch. `Internal`,
+/// `Other` and `record_insert_error` is what lifts it, so the re-run can
+/// resolve against the winner's committed row (this plugin's DESIGN §3.6) -
+/// can, rather than will: that function names a route a re-run does not end.
+/// Every one of these is **safe** to re-run, this batch being idempotent, which
+/// is a weaker claim than that a re-run succeeds and is the only one this
+/// predicate needs. `Internal`,
 /// `IdempotencyConflict` and the other typed domain outcomes are non-retryable
 /// and returned unchanged. Per-row
 /// `Transient` outcomes carried inside an `Ok(vec)` are deliberately not seen
@@ -2231,9 +2273,12 @@ impl RecordStore for PgRecordStore {
         // fresh connection and opens a fresh transaction on it
         // (`create_batch_inner` does both), so a rolled-back attempt leaves no
         // state behind at all. Re-running is safe: that
-        // transaction is atomic and the dedup keys make it idempotent, so a
-        // re-run either re-claims the same slots or absorbs/conflicts against
-        // the now-committed survivor. `Ok(vec)` is never retried — per-row
+        // transaction is atomic and the identities make it idempotent, so a
+        // re-run cannot double-write. What it resolves *to* is not enumerated
+        // here — re-claiming the slots and resolving against a committed
+        // survivor are the ordinary endings, and `record_insert_error` names
+        // one that a re-run does not end at all. `Ok(vec)` is never retried —
+        // per-row
         // `Transient` outcomes inside it are the host's to handle (the batch as
         // a whole succeeded), and retrying them would be a correctness bug.
         let n = records.len();
