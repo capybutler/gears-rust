@@ -34,8 +34,10 @@ pub enum DbErrorClass {
 /// per write ([`crate::infra::storage::pool`]'s bound covers it too, which is
 /// not the same as its being the lock that constant is sized for).
 /// A wait that times out is an ordinary contention outcome rather than a
-/// defect, self-healing on retry, whichever lock it was on
-/// ([`crate::infra::storage::pool`] enumerates the ones ingest can meet). Left in
+/// defect, self-healing on retry, whichever lock it was on — which is why this
+/// predicate asks nothing about *which*, and why nothing here rests on a list
+/// of them ([`crate::infra::storage::pool`] names the ones worth a reader's
+/// attention). Left in
 /// `Other` it maps to a non-retryable `Internal` and
 /// `is_retryable_batch_error` refuses to re-run a batch that is idempotent by
 /// construction.

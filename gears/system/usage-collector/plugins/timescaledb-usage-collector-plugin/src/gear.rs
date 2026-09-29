@@ -138,11 +138,14 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
             .map_err(|_| anyhow::anyhow!("timescaledb plugin init ran twice"))?;
 
         // Wire the storage stack: the record store behind the adapter. It takes
-        // the one metric inventory built above via `Arc<Metrics>`.
+        // the one metric inventory built above via `Arc<Metrics>`, and the
+        // acceptance slack every write statement computes its own admission
+        // verdict against.
         let record: Arc<dyn RecordStore> = Arc::new(PgRecordStore::new(
             pool,
             metrics,
             ctx.cancellation_token().clone(),
+            cfg.feed_acceptance_slack_secs,
         ));
         let adapter = StorageAdapter::new(record);
 

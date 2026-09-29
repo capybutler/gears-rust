@@ -81,8 +81,8 @@ async fn stores() -> Stores {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let rollup = common::record_store(&h.pool);
-    let scan = common::record_store(&h.pool).without_rollup();
+    let rollup = common::record_store(&h);
+    let scan = common::record_store(&h).without_rollup();
     Stores { h, rollup, scan }
 }
 

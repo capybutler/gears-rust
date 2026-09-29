@@ -106,10 +106,12 @@ pub struct TimescaleDbPluginConfig {
     /// refuse it as `Transient` (`docs/DESIGN.md` §3.6
     /// `cpt-cf-uc-plugin-seq-ingest-dedup`).
     ///
-    /// Nothing reads it until the guarded write statement exists; it is
-    /// validated here so a deployment cannot reach that point unconfigured.
+    /// Both write paths bind it into the statement that computes their own
+    /// admission verdict
+    /// (`crate::infra::storage::record_store::PgRecordStore::new`), and nothing
+    /// else reads it.
     ///
-    /// It will be enforced at write time rather than budgeted, because the
+    /// It is enforced at write time rather than budgeted, because the
     /// acceptance-order slack
     /// `S = 2 × feed_acceptance_slack_secs + statement_timeout_secs` is what the
     /// feed's retention refusal rests on (`docs/DESIGN.md` §3.6,

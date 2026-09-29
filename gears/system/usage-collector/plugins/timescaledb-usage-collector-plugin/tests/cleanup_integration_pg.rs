@@ -73,7 +73,9 @@ async fn pg_concurrent_post_migration_setup_is_serialized() {
 /// pooled connection must still report the configured value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_init_lock_does_not_leak_statement_timeout() {
-    let h = common::bring_up_with(17, 2, 2)
+    // The acceptance slack is the shared harness's: this test writes no entry,
+    // so it is passed only because one builder owns the whole harness config.
+    let h = common::bring_up_with(17, 2, 2, common::HARNESS_ACCEPTANCE_SLACK_SECS)
         .await
         .expect("timescaledb container (Docker required)");
 

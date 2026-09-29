@@ -103,7 +103,7 @@ async fn each_type_expires_at_its_own_retention() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x5E01);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
@@ -139,7 +139,7 @@ async fn an_amended_retention_applies_to_entries_already_stored() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let stub = Arc::new(StubRetention::default());
     let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E02), "amended", 100);
     let id = entry.id;
@@ -168,7 +168,7 @@ async fn an_unresolvable_type_keeps_its_chunks_while_others_still_drop() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x5E03);
     let stub = Arc::new(StubRetention::default());
     stub.set(
@@ -219,7 +219,7 @@ async fn a_shared_slice_is_held_to_its_longest_retention() {
     common::settle_and_remove_rollup_policies(&h.pool)
         .await
         .expect("settle and remove the re-created policies");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x5E04);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
@@ -255,7 +255,7 @@ async fn an_invalidation_and_its_target_drop_together() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
 
@@ -279,7 +279,7 @@ async fn a_write_into_a_dropped_range_is_collected_by_the_next_sweep() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x5E06);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
@@ -311,7 +311,7 @@ async fn a_sweep_skips_while_another_session_holds_the_lock() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
     let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E07), "locked", 100);
@@ -366,7 +366,7 @@ async fn a_drop_takes_its_types_rollup_rows_and_leaves_the_others() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x5E10);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
@@ -424,7 +424,7 @@ async fn a_shared_slice_drop_cuts_every_type_in_its_key_range() {
     common::settle_and_remove_rollup_policies(&h.pool)
         .await
         .expect("settle and remove the re-created policies");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x5E11);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
@@ -453,7 +453,7 @@ async fn without_the_rollup_nothing_is_dropped() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
     let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E12), "kept", 100);
@@ -476,7 +476,7 @@ async fn a_late_write_into_a_dropped_range_is_the_only_thing_the_next_refresh_ro
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x5E13);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
@@ -528,7 +528,7 @@ async fn a_rollup_drop_cuts_only_the_dropped_chunks_bucket_range() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x5E20);
     let stub = Arc::new(StubRetention::default());
 
@@ -644,7 +644,7 @@ async fn a_failed_rollup_row_delete_rolls_back_the_chunk_drop() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let stub = Arc::new(StubRetention::default());
     stub.set(common::VCPU_METER, days(30));
 

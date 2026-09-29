@@ -256,6 +256,8 @@ pub struct Metrics {
     invalidation: Counter<u64>,
     /// `uc_timescaledb_dedup_stale_total`.
     dedup_stale: Counter<u64>,
+    /// `uc_timescaledb_stale_acceptance_rejections_total`.
+    stale_acceptance_rejection: Counter<u64>,
     /// `uc_timescaledb_dedup_late_convergence_total` — writes discarded after their dedup identity converged. Always zero: this plugin is `linearizable`, so no write is decided after convergence.
     _dedup_late_convergence: Counter<u64>,
     /// `uc_timescaledb_batch_retries_total` — bounded in-process `create_batch`
@@ -368,6 +370,14 @@ impl Metrics {
         let dedup_stale = meter
             .u64_counter("uc_timescaledb_dedup_stale_total")
             .with_description("Dedup hits whose stored record had aged out (retryable)")
+            .build();
+        let stale_acceptance_rejection = meter
+            .u64_counter("uc_timescaledb_stale_acceptance_rejections_total")
+            .with_description(
+                "Entries refused because their accepted_at sat outside \
+                 feed_acceptance_slack_secs of the write statement's own \
+                 statement_timestamp(), in either direction (retryable)",
+            )
             .build();
         let dedup_late_convergence = meter
             .u64_counter("uc_timescaledb_dedup_late_convergence_total")
@@ -497,6 +507,7 @@ impl Metrics {
             migration_failure,
             invalidation,
             dedup_stale,
+            stale_acceptance_rejection,
             _dedup_late_convergence: dedup_late_convergence,
             batch_retry,
             query_requests,
@@ -562,6 +573,17 @@ impl Metrics {
     /// Increment the stale-dedup counter (dedup hit whose record had aged out).
     pub fn inc_dedup_stale(&self) {
         self.dedup_stale.add(1, &[]);
+    }
+
+    /// Increment the stale-acceptance counter: one entry the write statement's
+    /// own admission guard refused, because its `accepted_at` sat outside
+    /// `feed_acceptance_slack_secs` of that statement's `statement_timestamp()`
+    /// (this plugin's DESIGN §3.6). A **different** signal from
+    /// [`Self::inc_dedup_stale`], which counts a conflicting row that retention
+    /// dropped mid-resolution; both answer `Transient`, and only this one says
+    /// the entry's acceptance instant is the reason.
+    pub fn inc_stale_acceptance_rejection(&self) {
+        self.stale_acceptance_rejection.add(1, &[]);
     }
 
     /// Increment the `create_batch` bounded-retry counter (one per retry of a
@@ -712,6 +734,7 @@ impl Metrics {
             invalidation: _,
             _dedup_late_convergence: _,
             dedup_stale: _,
+            stale_acceptance_rejection: _,
             batch_retry: _,
             query_requests: _,
             tls_handshake_failure: _,
@@ -741,6 +764,7 @@ impl Metrics {
             "uc_timescaledb_invalidations_total",
             "uc_timescaledb_dedup_late_convergence_total",
             "uc_timescaledb_dedup_stale_total",
+            "uc_timescaledb_stale_acceptance_rejections_total",
             "uc_timescaledb_batch_retries_total",
             "uc_timescaledb_query_requests_total",
             "uc_timescaledb_tls_handshake_failures_total",

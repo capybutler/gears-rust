@@ -66,20 +66,50 @@ const CONTAINER_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_m
 const CONNECT_ATTEMPTS: u32 = 20;
 const CONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The acceptance slack every shared-harness backend runs at.
+///
+/// **Why it is not the published default of 120 s.** The write path refuses a
+/// row whose `accepted_at` is further than this from the INSERT's own
+/// `statement_timestamp()` (`docs/DESIGN.md` §3.6). Every fixture in this lane
+/// is dated: [`fixture_window_end`] is 2023-11-14, and the SDK contract suite's
+/// `CONTRACT_ACCEPTED_AT` is 2026-01-01. Both are fixed deliberately —
+/// `server-field-round-trip` compares a read against a literal and
+/// `latest-tie-break` varies `accepted_at` to rank entries, and neither works
+/// against a clock — and the SDK's is a `const` this crate cannot reach.
+///
+/// So the shared harness widens the operator setting rather than re-dating the
+/// fixtures. **The consequence is that the shared run exercises the guard's
+/// admit path only**; its refusal is covered by `acceptance_slack_pg.rs`, which
+/// builds its own backend at a narrow slack. A green run in this lane is not
+/// evidence about the refusal.
+///
+/// The value is the largest `TimescaleDbPluginConfig::validate` accepts, so it
+/// is the widest setting a deployment could choose rather than a number picked
+/// to clear this lane's fixtures by some margin.
+///
+/// In production nothing carries a stale `accepted_at`: it is stamped by the
+/// Ingestion Gateway when it accepts the entry, and `origin = backfill` names
+/// the ingestion path while the old period lives in the covered-period bounds.
+pub const HARNESS_ACCEPTANCE_SLACK_SECS: u64 = 100 * 365 * 86_400;
+
 pub async fn bring_up() -> anyhow::Result<TsHarness> {
-    // Default pool bounds and statement timeout (mirrors the config defaults).
-    bring_up_with(30, 2, 16).await
+    // Default pool bounds and statement timeout (mirrors the config defaults),
+    // and the wide acceptance slack this lane's dated fixtures need.
+    bring_up_with(30, 2, 16, HARNESS_ACCEPTANCE_SLACK_SECS).await
 }
 
-/// Like [`bring_up`] but with an explicit request-path `statement_timeout` (secs)
-/// and pool bounds. Used to assert the init path does not leak a modified
-/// `statement_timeout` onto pooled connections: pass a value distinct from any
-/// the init path might set, and a small fixed pool so every connection can be
-/// inspected.
+/// Like [`bring_up`] but with an explicit request-path `statement_timeout` (secs),
+/// pool bounds, and acceptance slack. The first three are used to assert the
+/// init path does not leak a modified `statement_timeout` onto pooled
+/// connections: pass a value distinct from any the init path might set, and a
+/// small fixed pool so every connection can be inspected. The fourth is
+/// `acceptance_slack_pg`'s: it is a parameter here rather than a second builder
+/// so one function still owns the harness config.
 pub async fn bring_up_with(
     statement_timeout_secs: u64,
     pool_size_min: u32,
     pool_size_max: u32,
+    feed_acceptance_slack_secs: u64,
 ) -> anyhow::Result<TsHarness> {
     // The tag lives in `test_containers::TIMESCALEDB_TAG`; keep that constant
     // in sync with `TimescaleDbSidecar.IMAGE` in `testing/e2e/lib/sidecars.py`.
@@ -262,6 +292,7 @@ pub async fn bring_up_with(
             r#"{{ "database_url": "postgres://user:pass@127.0.0.1:{port}/app?sslmode=disable",
                   "statement_timeout_secs": {statement_timeout_secs},
                   "feed_replay_horizon_secs": 3600,
+                  "feed_acceptance_slack_secs": {feed_acceptance_slack_secs},
                   "pool_size_min": {pool_size_min}, "pool_size_max": {pool_size_max} }}"#
         ))
         .expect("valid test config json");
@@ -441,10 +472,21 @@ fn metrics(pool: &PgPool) -> Arc<Metrics> {
     Arc::new(Metrics::new(pool.clone()))
 }
 
-/// Convenience builder for a [`PgRecordStore`] with its own metric handle.
+/// Convenience builder for a [`PgRecordStore`] with its own metric handle,
+/// over the harness's own pool and acceptance slack.
+///
+/// It takes the whole [`TsHarness`] rather than its pool, because the store now
+/// reads one setting off the config too: a builder taking the pool alone would
+/// have to pick an acceptance slack of its own, and a suite that set one on the
+/// harness would silently not get it.
 #[must_use]
-pub fn record_store(pool: &PgPool) -> PgRecordStore {
-    PgRecordStore::new(pool.clone(), metrics(pool), CancellationToken::new())
+pub fn record_store(h: &TsHarness) -> PgRecordStore {
+    PgRecordStore::new(
+        h.pool.clone(),
+        metrics(&h.pool),
+        CancellationToken::new(),
+        h.cfg.feed_acceptance_slack_secs,
+    )
 }
 
 /// Bring up a migrated `TimescaleDB` and return the SPI implementation over it.
@@ -473,7 +515,7 @@ pub async fn start_backend() -> (TsHarness, StorageAdapter) {
     let harness = bring_up()
         .await
         .expect("contract suite needs a migrated TimescaleDB container");
-    let store: Arc<dyn RecordStore> = Arc::new(record_store(&harness.pool));
+    let store: Arc<dyn RecordStore> = Arc::new(record_store(&harness));
     (harness, StorageAdapter::new(store))
 }
 

@@ -21,7 +21,7 @@ async fn concurrent_first_writes_of_one_type_share_one_key() {
 
     let mut tasks = Vec::new();
     for i in 0..8u128 {
-        let store = common::record_store(&h.pool);
+        let store = common::record_store(&h);
         let meter = meter.clone();
         tasks.push(tokio::spawn(async move {
             store
@@ -60,7 +60,7 @@ async fn each_row_carries_its_own_types_key_on_both_insert_paths() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x7E10);
     let vcpu = common::meter(common::VCPU_METER);
     let gb = common::meter(common::GB_METER);

@@ -19,7 +19,7 @@
 //!   Measured, by swapping `resource_id` and `resource_type` in each of the two
 //!   bind sequences and running the whole `--features postgres` suite:
 //!
-//!   * **Batch path** (`insert_records_on_conflict`): the crate's whole `--lib`
+//!   * **Batch path** (`run_guarded_batch_write`): the crate's whole `--lib`
 //!     suite stays green, and so does `contract_conformance_pg`. Three tests red, all in
 //!     this file, and two of them only *indirectly* — the absorb path compares
 //!     the stored attribution for canonical equality, so a transposed write
@@ -61,7 +61,7 @@ async fn setup() -> (common::TsHarness, PgRecordStore) {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     (h, store)
 }
 
@@ -89,7 +89,12 @@ async fn setup_metered() -> (
         &provider.meter("uc.timescaledb"),
         h.pool.clone(),
     ));
-    let store = PgRecordStore::new(h.pool.clone(), metrics, CancellationToken::new());
+    let store = PgRecordStore::new(
+        h.pool.clone(),
+        metrics,
+        CancellationToken::new(),
+        h.cfg.feed_acceptance_slack_secs,
+    );
     (h, store, provider, exporter)
 }
 
@@ -391,12 +396,10 @@ async fn a_divergent_same_key_write_is_an_idempotency_conflict() {
 ///
 /// `DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-ingest-batch`: "Every entry of one
 /// batch shares the batch's `xact_id`; feed order within it falls back to
-/// `id`." And §3.6 Correction order: an invalidation the gateway accepts only
-/// once its target has converged has its transaction "assigned its id after
-/// the target's committed", so `xact_id(invalidation) > xact_id(target)`.
-/// Correction order is that second property read on a withdrawal, which is why
-/// it is asserted over two ordinary calls here rather than over a pair: the
-/// property is about the commit order, not about the kind of entry.
+/// `id`." The second half here is two ordinary calls, because what it is about
+/// is the commit order and not the kind of entry;
+/// [`a_withdrawal_submitted_after_its_target_carries_a_greater_transaction_id`]
+/// is the same property read on the pair §3.6 Correction order names.
 ///
 /// This is what separates a database-stamped transaction id from a Rust-side
 /// counter: no per-entry counter would give two entries of one call the same
@@ -436,6 +439,60 @@ async fn one_batch_shares_one_transaction_id_and_a_later_call_takes_a_greater_on
         xl > xa,
         "a call that commits after the batch takes a greater transaction id: \
          batch {xa}, later {xl}"
+    );
+}
+
+/// A withdrawal submitted after its target carries a greater `xact_id`.
+///
+/// `DESIGN.md` §3.6 Correction order: the gateway admits an invalidation only
+/// once its target has converged, so "the invalidation's transaction is
+/// therefore assigned its id after the target's committed, and
+/// `xact_id(invalidation) > xact_id(target)`." That is the gear's DESIGN §3.1
+/// Feed order invariant — "an invalidation follows its target" — and this
+/// plugin realizes it on `xact_id` and on nothing else.
+///
+/// It gets its own test rather than resting on the general "a later call takes
+/// a greater one", because the pair is the one case where something *else*
+/// could plausibly decide the order and be mistaken for this: the two entries
+/// share five of their six identity inputs, `DedupKey` ranks the kinds, and
+/// `id` is what feed order falls back to inside a transaction. None of those is
+/// the transaction id, and an implementation that let any of them stand in
+/// would pass every other assertion here.
+///
+/// **Two separate calls, on purpose.** A pair written in one batch shares one
+/// transaction and one `xact_id` by design (the test above), so it could not
+/// carry this property at all; Correction order is about a withdrawal the
+/// gateway admitted *after* its target converged, which is two commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_submitted_after_its_target_carries_a_greater_transaction_id() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x7AC8);
+
+    let target = store
+        .create(common::entry(
+            &meter,
+            tenant,
+            "xact-target",
+            Decimal::from(7),
+        ))
+        .await
+        .expect("the target commits first");
+    let withdrawal = store
+        .create(common::withdrawal_of(&target))
+        .await
+        .expect("the withdrawal commits after it");
+    assert_ne!(
+        withdrawal.id, target.id,
+        "the pair are two identities, so two rows to compare"
+    );
+
+    let x_target = common::xact_id_of(&h.pool, target.id).await;
+    let x_withdrawal = common::xact_id_of(&h.pool, withdrawal.id).await;
+    assert!(
+        x_withdrawal > x_target,
+        "an invalidation submitted after its target carries a greater \
+         transaction id: target {x_target}, withdrawal {x_withdrawal}"
     );
 }
 
@@ -867,11 +924,11 @@ async fn an_in_batch_duplicate_resolves_against_the_row_the_batch_wrote() {
 /// each outcome still names its own seed.
 ///
 /// Its own case rather than a weaker `batch_outcomes_are_aligned_with_input_order`
-/// - that one always wins at least one slot, so the multi-row `INSERT` always
-/// returns rows and `read_conflict_records` is always handed a proper subset.
-/// Here the insert wins nothing, `inserted` is empty, and every key goes down
-/// the conflict-read path at once. Two things could hide in that shape and in
-/// no other: an empty-`RETURNING` path that mistook "won no slot" for "found no
+/// - that one always wins at least one slot, so the guarded statement always
+/// reports at least one `won` and `read_conflict_records` is always handed a
+/// proper subset. Here nothing is won, every verdict is `Lost`, and every key
+/// goes down the conflict-read path at once. Two things could hide in that
+/// shape and in no other: a path that mistook "won no slot" for "found no
 /// row", and an off-by-one in the alignment, which needs each row to conflict
 /// against a *different* seed to be visible. So the three keys are distinct
 /// rather than three divergent writes of one.
@@ -1056,10 +1113,12 @@ async fn an_empty_batch_is_a_host_contract_breach() {
 /// complete and leave one row per dedup key.
 ///
 /// **This one does not exercise `plan_batch`'s lock ordering, and saying it did
-/// would be an unearned claim.** Both batches sit in a single
-/// `(tenant_id, gts_type_id)`, so `claim_batch_sequences` takes that one
-/// counter row first and the second batch waits there: delete
-/// `plan_batch`'s `reps.sort_by` and this test still passes. What it does
+/// would be an unearned claim.** `build` below emits its keys in ascending `n`
+/// on both sides, so the ten keys the two batches share are reached in the same
+/// relative order whether `plan_batch` sorts or not - sorted, both sides are
+/// sorted by the same comparator; unsorted, both are in ascending `n`. There is
+/// no order for the two to disagree on, so delete `plan_batch`'s `reps.sort_by`
+/// and this test still passes. What it does
 /// assert is the per-row outcome of an overlap - every shared key absorbs
 /// against the batch that won it, rather than conflicting or duplicating.
 ///
@@ -1124,9 +1183,9 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// **This is what `plan_batch`'s `reps.sort_by` is for, and the only test that
 /// reaches it.** The lock it orders is the **speculative tuple** an
 /// `INSERT … ON CONFLICT … DO NOTHING` takes on each dedup 6-tuple it is
-/// inserting, held until that transaction commits. The multi-row insert
-/// processes `plan.reps` in array order, so that is the order the locks are
-/// taken in; sorted by dedup key, every batch in the process takes the locks of
+/// inserting, held until that transaction commits. The statement's insert
+/// processes its `input` rows in `plan.reps` order, so that is the order the
+/// locks are taken in; sorted by dedup key, every batch in the process takes the locks of
 /// the keys it shares with another batch in one global order. Unsorted, batch A
 /// takes vcpu's keys then gb's while batch B takes gb's then vcpu's - the ABBA
 /// deadlock, which `PostgreSQL` breaks by aborting a victim after
@@ -1296,8 +1355,8 @@ const ROUNDS_PER_RACE: i64 = 20;
 /// `ON CONFLICT (<dedup 6-tuple>, type_key) DO NOTHING`, and that arbiter does
 /// not cover `PRIMARY KEY (id, window_end, type_key)`. Two writers of one
 /// derived `id` therefore collide on a unique index `DO NOTHING` does not
-/// suppress, and the loser takes a raw `23505` instead of the empty
-/// `RETURNING` it expects. `concurrent_overlapping_batches_leave_one_row_per_key`
+/// suppress, and the loser takes a raw `23505` instead of the `Lost` verdict
+/// it expects. `concurrent_overlapping_batches_leave_one_row_per_key`
 /// shares *keys* but never the divergent content that makes the loser's outcome
 /// observable, so it passed throughout while the window was open.
 ///

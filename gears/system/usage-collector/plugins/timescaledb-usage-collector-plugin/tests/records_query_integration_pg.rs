@@ -51,7 +51,7 @@ async fn setup() -> (common::TsHarness, PgRecordStore) {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     (h, store)
 }
 
@@ -953,7 +953,7 @@ async fn a_withdrawn_pair_is_returned_by_the_ledger_and_folded_by_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_orphan_invalidation_contributes_nothing() {
     let (h, store) = setup().await;
-    let scan = common::record_store(&h.pool).without_rollup();
+    let scan = common::record_store(&h).without_rollup();
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x200C);
 
@@ -1154,7 +1154,7 @@ async fn the_five_folds_answer_over_a_known_population() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bare_fold_tells_an_empty_selection_a_netted_one_and_a_negative_total_apart() {
     let (h, store) = setup().await;
-    let scan = common::record_store(&h.pool).without_rollup();
+    let scan = common::record_store(&h).without_rollup();
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x200E);
     let paths: [(&str, &PgRecordStore); 2] = [("rollup", &store), ("scan", &scan)];
@@ -1470,7 +1470,7 @@ async fn a_single_type_read_executes_only_that_types_chunk() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0x9A0E);
     let vcpu = common::meter(common::VCPU_METER);
     let gb = common::meter(common::GB_METER);

@@ -725,7 +725,7 @@ async fn the_chunk_catalog_query_reads_one_row_per_chunk_with_both_ranges() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let tenant = Uuid::from_u128(0xCA7A);
     store
         .create(common::entry(

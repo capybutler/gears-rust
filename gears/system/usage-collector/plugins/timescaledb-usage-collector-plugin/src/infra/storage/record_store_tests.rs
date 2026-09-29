@@ -16,11 +16,11 @@ use usage_collector_sdk::{
 };
 
 use super::{
-    AggregateStatement, BATCH_INSERT_SQL, ConflictRead, DedupKey, INSERT_COLUMN_ARRAY_TYPES,
-    INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS,
-    SINGLE_INSERT_SQL, batch_retry_backoff, batch_retry_backoff_base, build_aggregate_sql,
-    build_get_sql, build_list_page, build_list_sql, dedup_key, is_retryable_batch_error,
-    plan_batch, record_row_key, row_dedup_key, with_retry,
+    Admission, AggregateStatement, BATCH_GUARDED_SQL, ConflictRead, DedupKey,
+    INSERT_COLUMN_ARRAY_TYPES, INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore,
+    RECORD_COLUMNS, SINGLE_GUARDED_SQL, batch_retry_backoff, batch_retry_backoff_base,
+    build_aggregate_sql, build_get_sql, build_list_page, build_list_sql, dedup_key,
+    is_retryable_batch_error, plan_batch, record_row_key, row_dedup_key, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -62,6 +62,10 @@ fn lazy_store() -> PgRecordStore {
         pool.clone(),
         Arc::new(Metrics::new(pool)),
         CancellationToken::new(),
+        // The published default. Nothing on these paths reaches the guard --
+        // they return before any statement is issued -- so this only has to be
+        // a value `validate` accepts.
+        120,
     )
 }
 
@@ -191,9 +195,10 @@ fn the_dedup_key_names_the_canonical_microsecond_bounds() {
 #[test]
 fn a_sub_microsecond_bound_keys_the_same_as_what_postgres_stores() {
     // `timestamptz` stores microseconds, so a caller's sub-µs nanos never
-    // survive the round trip. If the key carried the raw `OffsetDateTime`, an
-    // `INSERT … RETURNING` row would key differently from the record that
-    // produced it and the batch path would lose track of its own winners.
+    // survive the round trip. If the key carried the raw `OffsetDateTime`, a
+    // row read back out of the ledger would key differently from the record
+    // that wrote it, and the batch path would resolve a lost key against
+    // nothing.
     let tenant = uuid::Uuid::from_u128(0x2B);
     let mut sub_micro = unit_record(tenant, "k", 43);
     sub_micro.window_start = time::OffsetDateTime::from_unix_timestamp_nanos(
@@ -211,9 +216,10 @@ fn a_sub_microsecond_bound_keys_the_same_as_what_postgres_stores() {
 
 #[test]
 fn a_stored_row_keys_the_same_as_the_record_it_holds() {
-    // The batch path maps `INSERT … RETURNING` rows back to the records that
-    // produced them through these two functions, so a disagreement between
-    // them silently turns every winner into an invariant break.
+    // The batch path maps the rows `read_conflict_records` reads back onto the
+    // records that asked for them through these two functions, so a
+    // disagreement between them turns every lost key into the retention
+    // race's retryable `Transient`.
     let tenant = uuid::Uuid::from_u128(0x2C);
     let record = unit_record(tenant, "k", 44);
     let row = row_matching(&record, serde_json::Value::Object(serde_json::Map::new()));
@@ -527,44 +533,146 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
     );
 }
 
-#[test]
-fn the_single_insert_binds_one_placeholder_per_inserted_column() {
-    let sql = SINGLE_INSERT_SQL.as_str();
-    let cols = sql
-        .split_once("usage_records (")
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .expect("the insert names its column list")
-        .0;
-    assert_eq!(names(cols), names(INSERT_COLUMNS));
+/// The two guarded statements, in the order a reader meets them.
+///
+/// Named here so every shape assertion below runs over **both** paths rather
+/// than over whichever one it was written for: DESIGN section 3.6 gives the two
+/// one shape, and an assertion that reaches only one of them would let them
+/// drift back apart. The label is what a failure names.
+fn guarded_statements() -> [(&'static str, &'static str); 2] {
+    [
+        ("single", SINGLE_GUARDED_SQL.as_str()),
+        ("batch", BATCH_GUARDED_SQL.as_str()),
+    ]
+}
 
-    let values = sql
-        .split_once("VALUES (")
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .expect("the insert has a VALUES list")
-        .0;
-    // `entry_type` is the one placeholder that carries a cast, and it carries
-    // the enum the migration declares the column as: `sqlx` types the bound
-    // `&str` as `text`, and PostgreSQL refuses `text` in assignment to an enum
-    // column. Derived from `ddl_column_array_types` rather than written out, so
-    // a renamed enum moves both sides together and a cast applied to the wrong
-    // column still reds.
+/// The substring between `open` and the next `close`, or a panic naming what
+/// was looked for. A reading convenience over four `split_once` chains.
+fn between<'a>(sql: &'a str, open: &str, close: &str) -> &'a str {
+    sql.split_once(open)
+        .and_then(|(_, rest)| rest.split_once(close))
+        .unwrap_or_else(|| panic!("no `{open}` … `{close}` in: {sql}"))
+        .0
+}
+
+#[test]
+fn both_guarded_statements_insert_only_the_rows_their_own_guard_admitted() {
+    // The four obligations DESIGN section 3.6 puts on the write statement, over
+    // both paths. Each is a separate assertion because each fails on its own:
+    // a statement can compute the verdict and insert regardless of it, or gate
+    // the insert on a verdict a `SELECT statement_timestamp()` computed a
+    // statement earlier.
+    //
+    // The guard expression is transcribed by hand rather than read off
+    // `admitted_expr`. Derived from the function under test it would move with
+    // any mutation of it -- dropping `abs(...)`, flipping the comparison,
+    // reading a clock that is not the statement's own -- and assert nothing at
+    // all. Only the placeholder index is derived, off the migration's own
+    // column list, because that one really does move when the ledger gains a
+    // written column.
+    let slack = ddl_column_array_types().len() + 1;
+    let want_guard = format!(
+        "(abs(extract(epoch FROM (t.accepted_at - statement_timestamp()))) <= ${slack}::bigint) \
+         AS admitted"
+    );
+    for (label, sql) in guarded_statements() {
+        assert!(
+            sql.contains(&want_guard),
+            "{label}: the verdict is computed inside the statement, from the \
+             statement's own clock, and in either direction: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT id, tenant_id"),
+            "{label}: the insert selects from the input CTE: {sql}"
+        );
+        assert!(
+            sql.contains(" FROM input WHERE admitted ON CONFLICT ("),
+            "{label}: only admitted rows are offered to the arbiter, so a \
+             refused row never reaches the ledger: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "SELECT input.id AS input_id, input.admitted, (ins.id IS NOT NULL) AS won,"
+            ),
+            "{label}: the outer select carries each input row's verdict and \
+             whether it won: {sql}"
+        );
+        assert!(
+            sql.ends_with(" FROM input LEFT JOIN ins USING (id)"),
+            "{label}: inserted rows are aligned to input in SQL, on the derived \
+             identity: {sql}"
+        );
+        assert_eq!(
+            sql.matches("statement_timestamp()").count(),
+            1,
+            "{label}: one clock read, and it is the guard's: {sql}"
+        );
+        assert!(
+            !sql.contains("xact_id::text AS xact_id,\n")
+                && !names(INSERT_COLUMNS).contains(&"xact_id"),
+            "{label}: the store writes no xact_id; the column default stamps it"
+        );
+    }
+}
+
+#[test]
+fn neither_guarded_statement_binds_the_column_the_database_stamps() {
+    // `xact_id` is read back and never written. Asserted over the statement
+    // text rather than over `INSERT_COLUMNS` alone, because the hazard is a
+    // second place that could name it -- and the three places a *write* could
+    // are the insert's own column list, the input CTE the values arrive in,
+    // and the SELECT that feeds the insert from it. Each is checked, and
+    // nothing here counts occurrences: the read side names it as often as the
+    // read list has entries for it, which is not this test's subject.
+    for (label, sql) in guarded_statements() {
+        let insert_cols = between(sql, "usage_records (", ")");
+        assert!(
+            !names(insert_cols).contains(&"xact_id"),
+            "{label}: the insert must not name xact_id: {insert_cols}"
+        );
+        let input_select = between(sql, "WITH input AS (SELECT ", ", (abs(");
+        assert!(
+            !input_select.contains("xact_id"),
+            "{label}: the input CTE must not carry an xact_id: {input_select}"
+        );
+        let insert_select = between(sql, ") SELECT ", " FROM input WHERE admitted");
+        assert!(
+            !insert_select.contains("xact_id"),
+            "{label}: the insert must not select an xact_id into the ledger: \
+             {insert_select}"
+        );
+    }
+}
+
+#[test]
+fn the_single_write_binds_one_placeholder_per_inserted_column() {
+    let sql = SINGLE_GUARDED_SQL.as_str();
+    assert_eq!(
+        names(between(sql, "usage_records (", ")")),
+        names(INSERT_COLUMNS)
+    );
+
+    // Every placeholder carries its column's declared type. A `VALUES` feeding
+    // a CTE has no target column for PostgreSQL to infer one from, so an
+    // uncast placeholder is `42P18` rather than a wrong value -- but a
+    // placeholder cast to the *wrong* column's type is not, which is what this
+    // pins. Derived from the migration rather than from the code under test,
+    // for the reason `ddl_column_array_types` gives.
     let want: Vec<String> = ddl_column_array_types()
         .into_iter()
         .enumerate()
-        .map(|(i, (name, ty))| {
-            let n = i + 1;
-            if name == "entry_type" {
-                format!("${n}::{ty}")
-            } else {
-                format!("${n}")
-            }
-        })
+        .map(|(i, (_, ty))| format!("${}::{ty}", i + 1))
         .collect();
     assert_eq!(
-        names(values),
+        names(between(sql, "(VALUES (", ")")),
         want,
-        "$n must be column n, numbered from 1 with no gap, and only the enum \
-         column's placeholder may carry a cast"
+        "$n must be column n, numbered from 1 with no gap, each cast to the \
+         type the migration declares for its column"
+    );
+    assert_eq!(
+        names(between(sql, " AS t(", ")")),
+        names(INSERT_COLUMNS),
+        "the VALUES row is aliased to the column list it is a row of"
     );
     assert!(
         sql.contains(
@@ -575,41 +683,22 @@ fn the_single_insert_binds_one_placeholder_per_inserted_column() {
 }
 
 #[test]
-fn the_batch_insert_names_one_column_sequence_in_all_three_places() {
-    let sql = BATCH_INSERT_SQL.as_str();
+fn the_batch_write_names_one_column_sequence_in_all_three_places() {
+    let sql = BATCH_GUARDED_SQL.as_str();
     let expected = names(INSERT_COLUMNS);
 
-    let cols = sql
-        .split_once("usage_records (")
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .expect("the insert names its column list")
-        .0;
-    assert_eq!(names(cols), expected, "INSERT column list");
-
-    let select = sql
-        .split_once("SELECT ")
-        .and_then(|(_, rest)| rest.split_once(" FROM UNNEST("))
-        .expect("the insert has a SELECT list")
-        .0;
     assert_eq!(
-        select,
-        format!("{INSERT_COLUMNS}::jsonb"),
-        "the SELECT list is the column list with the trailing metadata cast, \
-         which only works while `metadata` is last"
+        names(between(sql, "usage_records (", ")")),
+        expected,
+        "INSERT column list"
+    );
+    assert_eq!(
+        names(between(sql, " AS t(", ")")),
+        expected,
+        "UNNEST alias list"
     );
 
-    let alias = sql
-        .split_once("AS t(")
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .expect("the UNNEST has an alias list")
-        .0;
-    assert_eq!(names(alias), expected, "UNNEST alias list");
-
-    let unnest = sql
-        .split_once(" FROM UNNEST(")
-        .and_then(|(_, rest)| rest.split_once(") AS t("))
-        .expect("the insert has an UNNEST parameter list")
-        .0;
+    let unnest = between(sql, " FROM UNNEST(", ") AS t(");
     let params = names(unnest);
     assert_eq!(
         params.len(),
@@ -626,7 +715,7 @@ fn the_batch_insert_names_one_column_sequence_in_all_three_places() {
         );
     }
 
-    // Asserted here as well as on the single insert, against the same literal.
+    // Asserted here as well as on the single write, against the same literal.
     // Both builders read `DEDUP_CONFLICT_TARGET` so they cannot differ today,
     // but an arbiter hardcoded into this one alone would otherwise pass.
     assert!(
@@ -635,6 +724,44 @@ fn the_batch_insert_names_one_column_sequence_in_all_three_places() {
         ),
         "the batch arbiter is the dedup 6-tuple too: {sql}"
     );
+}
+
+#[test]
+fn both_input_ctes_carry_the_column_list_with_metadata_cast_last() {
+    // The `input` CTE's columns are what the inner `SELECT <INSERT_COLUMNS>
+    // FROM input` reads, so their names are load-bearing here in a way the old
+    // shape's were not -- that one fed an INSERT, which matches positionally.
+    // One spelling with a trailing cast is what makes a transposition between
+    // the two unrepresentable; the alias is what stops the name being inherited
+    // from PostgreSQL's rule for naming a bare column cast.
+    for (label, sql) in guarded_statements() {
+        assert_eq!(
+            between(sql, "WITH input AS (SELECT ", ", (abs("),
+            format!("{INSERT_COLUMNS}::jsonb AS metadata"),
+            "{label}: the input CTE's select list is the column list with the \
+             trailing metadata cast, which only works while `metadata` is last"
+        );
+    }
+}
+
+#[test]
+fn both_outer_selects_read_every_record_column_off_the_inserted_row() {
+    // A not-won row's record columns must all be null, which is only true while
+    // every one of them is qualified `ins.`. Unqualified, `USING (id)` merges
+    // `id` to the left side's -- never null -- and the other names resolve to
+    // `input`, so a lost row would read back as the row that was never written.
+    for (label, sql) in guarded_statements() {
+        let outer = between(sql, ") AS won, ", " FROM input LEFT JOIN");
+        let want: Vec<String> = decoded_names(RECORD_COLUMNS)
+            .into_iter()
+            .map(|n| format!("ins.{n}"))
+            .collect();
+        assert_eq!(
+            names(outer),
+            want,
+            "{label}: the outer select reads the whole read list off `ins`"
+        );
+    }
 }
 
 // --- Batch planning ---
@@ -869,16 +996,16 @@ fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
 
 // --- `resolve_batch` defensive arm (DB-free) ---
 //
-// One arm remains that no happy path reaches: a not-won key absent from the
+// One arm remains that no happy path reaches: a lost key absent from the
 // conflict map. It is pinned here against a hand-built map.
 //
 // Two further `Internal` arms used to live here — "won the slot but no
 // inserted record" and "intra-batch duplicate of a won key with no inserted
 // record". Both were artefacts of passing `resolve_batch` a `won` set derived
-// from `inserted`, which made a state representable that the code could not
-// produce; their tests could only reach them through maps the code cannot
-// build. `resolve_batch` now matches on `inserted` directly, so neither state
-// nor arm nor test exists.
+// from the inserted rows, which made a state representable that the code could
+// not produce; their tests could only reach them through maps the code cannot
+// build. `resolve_batch` now matches on the statement's own verdict, so neither
+// state nor arm nor test exists.
 
 #[tokio::test]
 async fn resolve_batch_missing_conflict_entry_falls_through_to_transient() {
@@ -890,10 +1017,11 @@ async fn resolve_batch_missing_conflict_entry_falls_through_to_transient() {
     // Not won, and the conflict map has no entry for the key at all. The
     // defensive `None` fallthrough must still be a retryable Transient — never a
     // silent success and never a panic.
-    let inserted: HashMap<DedupKey, UsageRecordRow> = HashMap::new();
+    let admissions: HashMap<DedupKey, Admission> =
+        HashMap::from([(dedup_key(&records[0]), Admission::Lost)]);
     let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
 
-    let results = store.resolve_batch(&records, &plan, &inserted, &conflict);
+    let results = store.resolve_batch(&records, &plan, &admissions, &conflict);
 
     assert_eq!(results.len(), 1);
     assert!(
@@ -929,11 +1057,11 @@ async fn resolve_batch_conflicts_an_in_batch_duplicate_whose_canonical_fields_di
         &records[0],
         serde_json::Value::Object(serde_json::Map::new()),
     );
-    let inserted: HashMap<DedupKey, UsageRecordRow> =
-        HashMap::from([(dedup_key(&records[0]), winner_row)]);
+    let admissions: HashMap<DedupKey, Admission> =
+        HashMap::from([(dedup_key(&records[0]), Admission::Won(Box::new(winner_row)))]);
     let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
 
-    let results = store.resolve_batch(&records, &plan, &inserted, &conflict);
+    let results = store.resolve_batch(&records, &plan, &admissions, &conflict);
 
     assert_eq!(results.len(), 2, "one result per input row, in input order");
     assert!(
@@ -966,13 +1094,16 @@ async fn resolve_batch_resolves_a_second_withdrawal_against_the_first() {
         derived_withdrawal(tenant, 0xB501, target, "tgt", "late_correction"),
     ];
     let plan = plan_batch(&records);
-    let inserted: HashMap<DedupKey, UsageRecordRow> = HashMap::from([(
+    let admissions: HashMap<DedupKey, Admission> = HashMap::from([(
         dedup_key(&first),
-        row_matching(&first, serde_json::Value::Object(serde_json::Map::new())),
+        Admission::Won(Box::new(row_matching(
+            &first,
+            serde_json::Value::Object(serde_json::Map::new()),
+        ))),
     )]);
     let conflict: HashMap<DedupKey, ConflictRead> = HashMap::new();
 
-    let results = store.resolve_batch(&records, &plan, &inserted, &conflict);
+    let results = store.resolve_batch(&records, &plan, &admissions, &conflict);
 
     assert_eq!(results.len(), 3, "one result per input row, in input order");
     assert_eq!(
@@ -1244,7 +1375,7 @@ async fn acquire_failure_clears_ready_gauge() {
         &provider.meter("uc.timescaledb"),
         pool.clone(),
     ));
-    let store = PgRecordStore::new(pool, metrics, CancellationToken::new());
+    let store = PgRecordStore::new(pool, metrics, CancellationToken::new(), 120);
 
     // Every operation routes through timed_acquire; call it directly.
     let result = store.timed_acquire().await;

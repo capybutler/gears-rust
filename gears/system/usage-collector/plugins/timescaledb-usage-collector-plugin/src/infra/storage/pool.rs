@@ -79,9 +79,9 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 /// longer does: on the dedup tuple a write contends only with another writer of
 /// the very same entry.
 ///
-/// The bound is not sized for them, but it covers two other waits an ingest
-/// statement can meet, and neither is contention with another writer of the
-/// same entry:
+/// The bound is not sized for it, but it covers every other wait an ingest
+/// statement can meet. Two are worth naming because neither is contention with
+/// another writer of the same entry, which is what the sizing is about:
 ///
 /// * [`super::type_key::TypeKeyCache::resolve`] assigns a type's partition
 ///   key with its own `INSERT ... ON CONFLICT`, in autocommit before the write
@@ -97,8 +97,10 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 ///
 /// `55P03` is classified transient ([`super::error`]) precisely because a wait
 /// that times out here is an ordinary contention outcome rather than a defect,
-/// whichever of these locks it was on, so a timed-out batch is retried rather
-/// than returned as a non-retryable failure.
+/// whichever lock it was on, so a timed-out batch is retried rather
+/// than returned as a non-retryable failure. That classification is what makes
+/// the list above a reading aid rather than a premise: nothing depends on it
+/// being complete.
 const LOCK_TIMEOUT: &str = "5s";
 
 /// Session GUCs applied to every request-path pool connection at connect time:

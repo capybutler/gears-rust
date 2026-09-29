@@ -45,7 +45,7 @@ async fn entries_differing_only_in_window_start_are_distinct_and_separately_addr
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x00C0_FFEE);
     let scope = common::tenant_scope(tenant);
@@ -127,7 +127,7 @@ async fn entries_differing_only_in_window_end_are_distinct() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x00C0_FFEF);
 
@@ -182,7 +182,7 @@ async fn a_point_event_is_a_distinct_entry_from_a_period_sharing_its_end() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x00C0_FFF0);
     let scope = common::tenant_scope(tenant);
@@ -244,7 +244,7 @@ async fn every_withdrawal_of_one_target_derives_the_same_id_and_a_content_mismat
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x00C0_FFF1);
 

@@ -33,7 +33,7 @@ use rand::RngExt as _;
 use rust_decimal::Decimal;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgRow;
-use sqlx::{Acquire as _, AssertSqlSafe, PgPool, Postgres, Row};
+use sqlx::{Acquire as _, AssertSqlSafe, FromRow as _, PgPool, Postgres, Row};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
@@ -97,7 +97,9 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 /// The casts are required; the aliases are not, since `PostgreSQL` names the
 /// output of a bare column cast after the column anyway. They are written out
 /// so the decoded name each [`UsageRecordRow`] field is looked up by is stated
-/// here rather than inherited from a server naming rule.
+/// here rather than inherited from a server naming rule — and
+/// [`ins_record_columns`] reads exactly those decoded names back out of this
+/// constant, to qualify each one with the guarded statement's `ins` relation.
 const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
      window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
      invalidates, reason_code, origin, entry_type::text AS entry_type, \
@@ -106,14 +108,19 @@ const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, wi
 /// The columns every insert writes: every ledger column but `xact_id`, which
 /// the database stamps.
 ///
-/// **One spelling, used four times** — the single-row insert's column list, the
-/// batch insert's column list, its `SELECT` list and its `UNNEST` alias list.
-/// Written out four times instead, a name transposed in any one of them binds a
-/// `text[]` to the wrong `text` column, which Postgres accepts without
-/// complaint and which no row-level test can see. `metadata` is deliberately
-/// **last**, because the batch `SELECT` appends `::jsonb` to this string rather
-/// than restating it (see [`BATCH_INSERT_SQL`]) — the cast binds to the final
-/// identifier only, which is what makes the `SELECT` list unable to be a
+/// **One spelling for every place a write statement names its columns** — each
+/// path's `input` CTE select list, the `INSERT`'s own column list, the `SELECT`
+/// that feeds it from `input`, and the alias list of the `VALUES` row or
+/// `UNNEST` the input is built from ([`guarded_statement`]). Written out
+/// separately instead, a name transposed in any one of them binds a value to
+/// the wrong same-typed column, which Postgres accepts without complaint and
+/// which no row-level test can see. The list is not counted here because it
+/// grows: it gained two entries when both paths collapsed onto one statement.
+///
+/// `metadata` is deliberately **last**, because the `input` select list appends
+/// `::jsonb AS metadata` to this string rather than restating it (see
+/// [`guarded_statement`]) — the cast binds to the final identifier only, which
+/// is what makes that list unable to be a
 /// transposition rather than merely tested not to be. A test asserts the
 /// position directly, because deriving it from an order assertion whose oracle
 /// happens to end in `metadata` would not survive a migration that declares a
@@ -129,10 +136,11 @@ const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, wi
 /// **Measured, not argued.** `sqlx` types a bound `&str` as `text`, and
 /// `PostgreSQL` refuses `text` in assignment to an enum column (`42804`, "you
 /// will need to rewrite or cast the expression"), so a bare `$n` does not
-/// land. The batch's `UNNEST($n::usage_entry_type[])` takes the same bound
-/// `text[]` through an explicit array cast and does land, which is why
+/// land. An explicit cast on the placeholder does, which is why
 /// [`INSERT_COLUMN_ARRAY_TYPES`] names the enum where the DDL does rather than
-/// diverging to `text` the way `metadata` does.
+/// diverging to `text` the way `metadata` does: the batch reads it as
+/// `UNNEST($n::usage_entry_type[])` and the single-row path as
+/// `$n::usage_entry_type` inside its `VALUES` row.
 ///
 /// `pub(crate)` so the `$filter` translator's `bind_cast`
 /// ([`super::query::translate`]) spells it from here too: one spelling in
@@ -142,10 +150,11 @@ const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, wi
 /// together.
 pub(crate) const ENTRY_TYPE_ENUM: &str = "usage_entry_type";
 
-/// Postgres array types for [`INSERT_COLUMNS`], **in the same order**, as the
-/// batch insert's `UNNEST` needs them. A test pins its length equal to the
-/// number of names in [`INSERT_COLUMNS`], which is what fixes the `UNNEST`
-/// parameter count.
+/// Postgres types for [`INSERT_COLUMNS`], **in the same order**, as each write
+/// path's `input` source needs them: the batch `UNNEST`s the array of each and
+/// the single-row path casts one placeholder to each. A test pins its length
+/// equal to the number of names in [`INSERT_COLUMNS`], which is what fixes both
+/// parameter counts.
 const INSERT_COLUMN_ARRAY_TYPES: [&str; 18] = [
     "uuid",
     "uuid",
@@ -167,7 +176,7 @@ const INSERT_COLUMN_ARRAY_TYPES: [&str; 18] = [
     "text",
 ];
 
-/// The dedup 6-tuple plus the partition key the hypertable requires in every UNIQUE, as an `ON CONFLICT` arbiter. Both insert paths spend their one arbiter here.
+/// The dedup 6-tuple plus the partition key the hypertable requires in every UNIQUE, as an `ON CONFLICT` arbiter. Both write paths spend their one arbiter here.
 ///
 /// `entry_type` is one of the six, and is named here as the bare column: an
 /// arbiter names index columns, never the values compared against them, so the
@@ -196,69 +205,173 @@ static DEDUP_MATCH_PREDICATE: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// `$1, $2, …` for [`INSERT_COLUMNS`], with `entry_type`'s placeholder cast to
-/// [`ENTRY_TYPE_ENUM`].
+/// The `$n` the acceptance slack binds at: one past the last inserted column,
+/// on both write paths.
 ///
-/// Numbered off [`INSERT_COLUMNS`] itself rather than off a count, so `$n` is
-/// column `n` by construction and the one cast lands on the one column that
-/// needs it. The batch insert carries the same cast on its `UNNEST` array
-/// instead; this is the single-row path's half of it.
-fn insert_placeholders() -> String {
-    INSERT_COLUMNS
+/// Counted off [`INSERT_COLUMNS`] rather than written out, so the ledger
+/// gaining or losing a written column moves it without anything being edited
+/// twice.
+fn slack_placeholder() -> usize {
+    INSERT_COLUMNS.split(',').count() + 1
+}
+
+/// The admission guard `DESIGN.md` §3.6 requires **inside** the write
+/// statement: the entry's `accepted_at` within `feed_acceptance_slack_secs` of
+/// *that statement's own* `statement_timestamp()`, **in either direction**.
+///
+/// `abs(…)` is what makes it either direction. Dropped, an entry dated next
+/// year is admitted and orders ahead of everything real in acceptance terms;
+/// the sign flipped, the past-dated half goes unguarded. `acceptance_slack_pg`
+/// carries one assertion per direction, because a single one reaches half of
+/// the predicate.
+///
+/// **One spelling, used by both write paths.** §3.6: *"Nothing before or after
+/// the statement computes the guard, since a later statement would run under a
+/// later `statement_timestamp()`."* Two spellings would be two clocks to keep
+/// agreeing; one is read from here by [`guarded_statement`] and is the whole of
+/// what either path computes. It reads `t.accepted_at` off the input relation
+/// rather than a placeholder, which is why the single-row path builds its input
+/// from a `VALUES` row rather than binding the columns into the INSERT: both
+/// paths then present the same relation to the same predicate.
+fn admitted_expr() -> String {
+    format!(
+        "(abs(extract(epoch FROM (t.accepted_at - statement_timestamp()))) <= ${}::bigint) \
+         AS admitted",
+        slack_placeholder()
+    )
+}
+
+/// [`RECORD_COLUMNS`] as the outer select reads it back off `ins`.
+///
+/// The read list's two cast entries were already cast inside `ins`'
+/// `RETURNING`, so what `ins` exposes is the **decoded** name of each entry —
+/// `entry_type` and `xact_id` are `text` columns there. Qualifying every name
+/// with `ins.` is what makes the not-won row's columns `NULL` rather than
+/// silently picking `input`'s like-named ones up, and it is what `USING (id)`
+/// would otherwise decide for `id` on its own: the merged `id` of a left join
+/// is the left side's and is never null, so `won` computed off it would be
+/// true for every row.
+fn ins_record_columns() -> String {
+    RECORD_COLUMNS
         .split(',')
         .map(str::trim)
-        .enumerate()
-        .map(|(i, name)| {
-            let n = i + 1;
-            if name == "entry_type" {
-                format!("${n}::{ENTRY_TYPE_ENUM}")
-            } else {
-                format!("${n}")
-            }
-        })
+        .map(|entry| entry.rsplit_once(" AS ").map_or(entry, |(_, alias)| alias))
+        .map(|name| format!("ins.{name}"))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// The single-row `INSERT … ON CONFLICT (6-tuple) DO NOTHING RETURNING`.
+/// `DESIGN.md` §3.6's guarded write statement over `input_source`, which is the
+/// **only** thing the two write paths differ in.
 ///
-/// Built rather than inlined so a test can read the column list, the
-/// placeholder count and the conflict target back out of it — and built
-/// **once**, because every input to it is a constant and the alternative is one
-/// `format!` per column of [`INSERT_COLUMNS`] on every write.
-static SINGLE_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
+/// ```sql
+/// WITH input AS (SELECT <INSERT_COLUMNS>::jsonb AS metadata, <admitted>
+///                FROM <input_source>),
+///      ins AS (INSERT INTO usage_records (<INSERT_COLUMNS>)
+///              SELECT <INSERT_COLUMNS> FROM input WHERE admitted
+///              ON CONFLICT (<DEDUP_CONFLICT_TARGET>) DO NOTHING
+///              RETURNING <RECORD_COLUMNS>)
+/// SELECT input.id AS input_id, input.admitted, (ins.id IS NOT NULL) AS won,
+///        <RECORD_COLUMNS off ins>
+/// FROM input LEFT JOIN ins USING (id)
+/// ```
+///
+/// **`WHERE admitted` is what makes the verdict precede the identity.** A row
+/// outside the slack never reaches `ON CONFLICT` at all, so it comes back
+/// `admitted = false, won = false` whether or not its six inputs are already
+/// stored, and the caller answers `Transient` without reading the ledger. §3.6:
+/// *"a row not admitted is `Transient` … even when its identity exists"*.
+///
+/// **`input.id` is carried out** so the batch path can align each returned row
+/// with the input it came from; `ins.id` is null on every row that did not win
+/// and cannot do that job. The single-row path returns exactly one row and
+/// ignores it.
+///
+/// **`xact_id` is bound nowhere.** [`INSERT_COLUMNS`] does not name it, so the
+/// column default stamps it from the inserting transaction, and
+/// [`RECORD_COLUMNS`] reads it back.
+///
+/// The `SELECT` list of `input` is [`INSERT_COLUMNS`] with a trailing
+/// `::jsonb AS metadata`, which lands on `metadata` alone because `metadata` is
+/// last (see [`INSERT_COLUMNS`]) — so `input`'s columns are that constant's
+/// names, exactly, and the inner `SELECT <INSERT_COLUMNS> FROM input` cannot be
+/// a transposition of them. The alias is written out rather than left to
+/// `PostgreSQL` naming a bare column cast after its column, for the reason
+/// [`RECORD_COLUMNS`] gives: here the inherited name would be load-bearing.
+fn guarded_statement(input_source: &str) -> String {
     format!(
-        "INSERT INTO usage_records ({INSERT_COLUMNS}) VALUES ({}) \
-         ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
-         RETURNING {RECORD_COLUMNS}",
-        insert_placeholders(),
+        "WITH input AS (\
+             SELECT {INSERT_COLUMNS}::jsonb AS metadata, {} FROM {input_source}\
+         ), \
+         ins AS (\
+             INSERT INTO usage_records ({INSERT_COLUMNS}) \
+             SELECT {INSERT_COLUMNS} FROM input WHERE admitted \
+             ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
+             RETURNING {RECORD_COLUMNS}\
+         ) \
+         SELECT input.id AS input_id, input.admitted, (ins.id IS NOT NULL) AS won, {} \
+         FROM input LEFT JOIN ins USING (id)",
+        admitted_expr(),
+        ins_record_columns(),
     )
-});
+}
 
-/// The multi-row `INSERT … SELECT FROM UNNEST(…) ON CONFLICT (6-tuple) DO
-/// NOTHING RETURNING`.
+/// The single-row path's `input` source: one `VALUES` row of `$1..$n`, aliased
+/// to [`INSERT_COLUMNS`].
 ///
-/// The column list, the `SELECT` list and the `UNNEST` alias list are all
-/// [`INSERT_COLUMNS`], so they cannot be transposed relative to one another —
-/// the `SELECT` differs only by the trailing `::jsonb`, which works because
-/// `metadata` is the last column. `UNNEST`'s parameters are
-/// [`INSERT_COLUMN_ARRAY_TYPES`] in the same order, so `$n` is column `n`.
+/// **Every placeholder carries its column's type**, where the previous
+/// `INSERT … VALUES` shape needed a cast on `entry_type` alone. A placeholder
+/// inside a `VALUES` feeding a CTE has no target column to be inferred from, so
+/// `PostgreSQL` refuses the statement outright (`42P18`, "could not determine
+/// data type") without one. The types come from [`INSERT_COLUMN_ARRAY_TYPES`],
+/// which is the migration's own list — the batch path spells the same types as
+/// array element types, so the two paths cannot disagree about what a column
+/// is. `metadata` is the one entry that diverges from the DDL there, `text`
+/// rather than `jsonb`, and it is bound as `text` here too and cast by the
+/// `input` select list ([`InsertColumns`] gives the reason).
+fn single_input_source() -> String {
+    let values = INSERT_COLUMN_ARRAY_TYPES
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| format!("${}::{ty}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("(VALUES ({values})) AS t({INSERT_COLUMNS})")
+}
+
+/// The batch path's `input` source: one array per column, `UNNEST`ed back into
+/// rows and aliased to [`INSERT_COLUMNS`].
 ///
-/// Built once, for the same reason as [`SINGLE_INSERT_SQL`].
-static BATCH_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
+/// `sqlx` binds arrays, not rows. `UNNEST`'s parameters are
+/// [`INSERT_COLUMN_ARRAY_TYPES`] in the same order, so `$n` is column `n`, and
+/// the alias list is [`INSERT_COLUMNS`] itself, so the two cannot be transposed
+/// relative to one another.
+fn batch_input_source() -> String {
     let unnest = INSERT_COLUMN_ARRAY_TYPES
         .iter()
         .enumerate()
         .map(|(i, ty)| format!("${}::{ty}[]", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "INSERT INTO usage_records ({INSERT_COLUMNS}) \
-         SELECT {INSERT_COLUMNS}::jsonb FROM UNNEST({unnest}) AS t({INSERT_COLUMNS}) \
-         ON CONFLICT ({DEDUP_CONFLICT_TARGET}) DO NOTHING \
-         RETURNING {RECORD_COLUMNS}"
-    )
-});
+    format!("UNNEST({unnest}) AS t({INSERT_COLUMNS})")
+}
+
+/// The single-row guarded statement ([`guarded_statement`] over
+/// [`single_input_source`]).
+///
+/// Built rather than inlined so a test can read the column list, the
+/// placeholder count and the conflict target back out of it — and built
+/// **once**, because every input to it is a constant and the alternative is one
+/// `format!` per column of [`INSERT_COLUMNS`] on every write.
+static SINGLE_GUARDED_SQL: LazyLock<String> =
+    LazyLock::new(|| guarded_statement(&single_input_source()));
+
+/// The batch guarded statement ([`guarded_statement`] over
+/// [`batch_input_source`]).
+///
+/// Built once, for the same reason as [`SINGLE_GUARDED_SQL`].
+static BATCH_GUARDED_SQL: LazyLock<String> =
+    LazyLock::new(|| guarded_statement(&batch_input_source()));
 
 /// `sqlx`-backed implementation of [`RecordStore`] over the `usage_records`
 /// hypertable.
@@ -282,6 +395,14 @@ pub struct PgRecordStore {
     /// linked, because that constructor is `#[cfg(any(test, feature =
     /// "postgres"))]` and so does not exist in a default-feature doc build.
     rollup_enabled: bool,
+    /// `feed_acceptance_slack_secs`, bound into every write statement's
+    /// admission guard (see [`admitted_expr`]).
+    ///
+    /// Held as an `i64` because that is what it binds as; the conversion
+    /// happens once here rather than on every write. Config validation caps the
+    /// setting far below `i64::MAX`, so the saturation in [`Self::new`] is a
+    /// total function rather than a case anything reaches.
+    acceptance_slack_secs: i64,
 }
 
 impl PgRecordStore {
@@ -289,14 +410,24 @@ impl PgRecordStore {
     /// cancellation token; the request path stops re-arming the `ready` gauge
     /// once it fires so a drain-time acquire cannot flip readiness back on after
     /// the shutdown watcher has cleared it.
+    ///
+    /// `acceptance_slack_secs` is the deployment's `feed_acceptance_slack_secs`
+    /// (`crate::config`), and it reaches the database as a bind on every write
+    /// rather than as anything this type decides.
     #[must_use]
-    pub fn new(pool: PgPool, metrics: Arc<Metrics>, cancel: CancellationToken) -> Self {
+    pub fn new(
+        pool: PgPool,
+        metrics: Arc<Metrics>,
+        cancel: CancellationToken,
+        acceptance_slack_secs: u64,
+    ) -> Self {
         Self {
             pool,
             metrics,
             cancel,
             type_keys: Arc::new(TypeKeyCache::default()),
             rollup_enabled: true,
+            acceptance_slack_secs: i64::try_from(acceptance_slack_secs).unwrap_or(i64::MAX),
         }
     }
 
@@ -397,11 +528,16 @@ impl PgRecordStore {
         }
     }
 
-    /// Core single-row insert path: dedup on the `usage_records`
-    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
-    /// entry_type)` UNIQUE (`usage_records_dedup_uniq`, plus the partition key
-    /// every hypertable UNIQUE carries) via `INSERT … ON CONFLICT … DO
-    /// NOTHING`, then lost-the-race absorb-vs-conflict resolution.
+    /// Core single-row write path: the guarded statement
+    /// ([`SINGLE_GUARDED_SQL`]), then lost-the-race absorb-vs-conflict
+    /// resolution.
+    ///
+    /// The statement carries its own admission verdict out beside the dedup
+    /// outcome, so the three answers `DESIGN.md` §3.6 names — refused, won,
+    /// lost — are read off one round trip. A refused row is answered without
+    /// reading the ledger at all: §3.6's *"a row not admitted is `Transient` …
+    /// even when its identity exists"* is the statement's own `WHERE admitted`,
+    /// not an ordering this function imposes.
     ///
     /// **One backend transaction**, holding the insert and — when the insert
     /// wins no slot — the read that resolves the conflict against the committed
@@ -444,75 +580,92 @@ impl PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        // 1. Insert, deduplicated on the 6-tuple UNIQUE. `RETURNING` yields the
-        //    row only when we won the slot — `DO NOTHING` suppresses it on a
-        //    conflict — so `Some` = fresh insert, `None` = a row with this
-        //    6-tuple already exists. Every column [`INSERT_COLUMNS`] names is
-        //    bound here, `accepted_at` and `entry_type` included — the kind is
+        // 1. The guarded statement. It answers three ways
+        //    ([`Admission`]): refused by the acceptance guard, won the dedup
+        //    slot, or lost it. Every column [`INSERT_COLUMNS`] names is bound
+        //    here, `accepted_at` and `entry_type` included — the kind is
         //    written from the dispatched entry's own declaration, never
-        //    computed for the proposed row. [`RECORD_COLUMNS`] reads back one
-        //    more: `xact_id`, which the column default stamps and no bind
-        //    supplies.
+        //    computed for the proposed row — plus the acceptance slack, which
+        //    is the statement's last bind and the only one that is not a
+        //    column ([`slack_placeholder`]). [`RECORD_COLUMNS`] reads back one
+        //    column more than is bound: `xact_id`, which the column default
+        //    stamps.
         //
-        //    **Inside a SAVEPOINT**, because the insert has a third outcome
-        //    besides won and not-won: a concurrent writer of this same identity
-        //    can make it fail on the PRIMARY KEY, which the arbiter does not
-        //    cover ([`is_ledger_pk_violation`]). That error aborts the
-        //    transaction, and step 2b still has to read the winner's row inside
-        //    it, so the insert needs a point to roll back to. Serially this
-        //    never fires and the savepoint is two statements of pure overhead.
+        //    **Inside a SAVEPOINT**, because the statement has a fourth
+        //    outcome: a concurrent writer of this same identity can make it
+        //    fail on the PRIMARY KEY, which the arbiter does not cover
+        //    ([`is_ledger_pk_violation`]). That error aborts the transaction,
+        //    and step 2c still has to read the winner's row inside it, so the
+        //    statement needs a point to roll back to. Serially this never fires
+        //    and the savepoint is two statements of pure overhead.
         //
-        //    Collapsing both insert paths onto DESIGN section 3.6's single
-        //    guarded statement, whose `LEFT JOIN ins USING (id)` shape resolves
-        //    the not-won row in the same statement, is what removes the
-        //    savepoint; until that lands it stays.
+        //    **The guarded statement does not make it redundant, and this was
+        //    measured rather than argued.** Its `LEFT JOIN ins USING (id)`
+        //    joins input to the rows *this statement* inserted, so a lost row
+        //    comes back with every record column null: the join reports that
+        //    the identity was taken and carries nothing about the row that took
+        //    it, which is why DESIGN section 3.6 still reads the winner back by
+        //    id in a second statement. Nor does the shape move the arbiter, so
+        //    two withdrawals of one target -- which derive one id, `reason_code`
+        //    being outside the six identity inputs -- still collide on the
+        //    PRIMARY KEY. Removing the savepoint and running
+        //    `records_ingest_integration_pg::two_concurrent_withdrawals_of_one_target_admit_exactly_one`
+        //    failed 3 of 18 runs, the loser answering `Internal` where DESIGN
+        //    section 3.3's `dedup-concurrent` row requires an
+        //    `IdempotencyConflict`; the same test passed 10 of 10 with it.
         let subject_id = record
             .subject_ref
             .as_ref()
             .map(usage_collector_sdk::SubjectRef::subject_id);
         let subject_type = record.subject_ref.as_ref().and_then(|s| s.subject_type());
-        let metadata = metadata_map_to_jsonb(&record.metadata);
+        // Rendered to text and cast `::jsonb` by the statement, exactly as the
+        // batch path carries it: `metadata` is the one column whose bound type
+        // diverges from the DDL's, and one divergence spelled once is what
+        // keeps [`INSERT_COLUMN_ARRAY_TYPES`] usable by both paths.
+        let metadata = metadata_map_to_jsonb(&record.metadata).to_string();
         // One helper for both columns, so the half-populated pair the read
         // direction refuses is unrepresentable on the way out too.
         let (invalidates, reason_code) = invalidation_to_row(record.invalidation.as_ref());
         let is_invalidation = invalidates.is_some();
 
-        // The savepoint and the insert share one scope so the borrow of `tx` ends
-        // before any outer rollback: every error below is carried out of the block
-        // and acted on after it, rather than handled inside it.
+        // The savepoint and the statement share one scope so the borrow of `tx`
+        // ends before any outer rollback: every error below is carried out of
+        // the block and acted on after it, rather than handled inside it.
         let attempted = async {
             let mut sp = tx.begin().await?;
-            let row =
-                sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(SINGLE_INSERT_SQL.as_str()))
-                    .bind(record.id)
-                    .bind(record.tenant_id)
-                    .bind(record.gts_type_id.as_str())
-                    .bind(type_key)
-                    .bind(record.quantity.as_decimal())
-                    .bind(record.window_start)
-                    .bind(record.window_end)
-                    .bind(record.resource_ref.resource_id())
-                    .bind(record.resource_ref.resource_type())
-                    .bind(subject_id)
-                    .bind(subject_type)
-                    .bind(record.idempotency_key.as_str())
-                    .bind(invalidates)
-                    .bind(reason_code)
-                    .bind(record.origin.as_str())
-                    .bind(record.entry_type().as_str())
-                    .bind(record.accepted_at)
-                    .bind(metadata)
-                    .fetch_optional(&mut *sp)
-                    .await;
+            let row = sqlx::query(AssertSqlSafe(SINGLE_GUARDED_SQL.as_str()))
+                .bind(record.id)
+                .bind(record.tenant_id)
+                .bind(record.gts_type_id.as_str())
+                .bind(type_key)
+                .bind(record.quantity.as_decimal())
+                .bind(record.window_start)
+                .bind(record.window_end)
+                .bind(record.resource_ref.resource_id())
+                .bind(record.resource_ref.resource_type())
+                .bind(subject_id)
+                .bind(subject_type)
+                .bind(record.idempotency_key.as_str())
+                .bind(invalidates)
+                .bind(reason_code)
+                .bind(record.origin.as_str())
+                .bind(record.entry_type().as_str())
+                .bind(record.accepted_at)
+                .bind(metadata)
+                .bind(self.acceptance_slack_secs)
+                .fetch_one(&mut *sp)
+                .await;
             match row {
-                // RELEASE SAVEPOINT. The row stays in the outer transaction.
+                // RELEASE SAVEPOINT. Anything the statement wrote stays in the
+                // outer transaction.
                 Ok(row) => {
+                    let admission = admission_of(&row)?;
                     sp.commit().await?;
-                    Ok(row)
+                    Ok(admission)
                 }
                 // A concurrent writer of this very identity won and committed —
                 // Postgres waits on its speculative token before raising this, so
-                // by now its row is committed, and step 2b's `SELECT` takes a
+                // by now its row is committed, and step 2c's `SELECT` takes a
                 // fresh snapshot and sees it. That last step is what needs
                 // `READ COMMITTED`: under a deployer-set
                 // `default_transaction_isolation = repeatable read` the read
@@ -521,13 +674,17 @@ impl PgRecordStore {
                 // `Transient` where DESIGN section 3.3's `dedup-concurrent` row
                 // requires it to resolve absorb-vs-conflict. ROLLBACK TO
                 // SAVEPOINT clears the aborted state and leaves the outer
-                // transaction usable, and the
-                // outcome is exactly the not-won one: step 2b reads the winner and
-                // resolves absorb-vs-conflict, which is what DESIGN section 3.3's
+                // transaction usable.
+                //
+                // The outcome is `Lost` and not a guess: a row the guard
+                // refused is never inserted, so it cannot collide on any index,
+                // and a PRIMARY KEY collision therefore says the row was
+                // admitted. Step 2c reads the winner and resolves
+                // absorb-vs-conflict, which is what DESIGN section 3.3's
                 // `dedup-concurrent` row requires of the loser.
                 Err(e) if is_ledger_pk_violation(&e) => {
                     sp.rollback().await?;
-                    Ok(None)
+                    Ok(Admission::Lost)
                 }
                 // Dropping `sp` queues its rollback; the outer transaction is
                 // rolled back wholesale below in any case.
@@ -536,26 +693,37 @@ impl PgRecordStore {
         }
         .await;
 
-        let inserted = match attempted {
-            Ok(inserted) => inserted,
+        let admission = match attempted {
+            Ok(admission) => admission,
             Err(e) => {
                 rollback(tx).await;
                 return Err(self.record_backend_error(&e));
             }
         };
 
-        if let Some(row) = inserted {
-            // 2a. Won the slot — fresh insert. Commit it.
-            tx.commit()
-                .await
-                .map_err(|e| self.record_backend_error(&e))?;
-            if is_invalidation {
-                self.metrics.inc_invalidation();
+        match admission {
+            // 2a. Refused by the guard. Nothing was written, and the ledger was
+            //     never consulted: the verdict precedes the identity.
+            Admission::Stale => {
+                rollback(tx).await;
+                self.metrics.inc_stale_acceptance_rejection();
+                return Err(write_transient(&record, STALE_ACCEPTANCE_MESSAGE));
             }
-            return record_row_to_model(row);
+            // 2b. Won the slot — fresh insert. Commit it.
+            Admission::Won(row) => {
+                tx.commit()
+                    .await
+                    .map_err(|e| self.record_backend_error(&e))?;
+                if is_invalidation {
+                    self.metrics.inc_invalidation();
+                }
+                return record_row_to_model(*row);
+            }
+            // Falls through to step 2c.
+            Admission::Lost => {}
         }
 
-        // 2b. Lost the slot — a row with this 6-tuple already exists. Read it
+        // 2c. Lost the slot — a row with this 6-tuple already exists. Read it
         //     and resolve absorb-vs-conflict. `entry_type` is in the predicate
         //     for the reason [`DEDUP_MATCH_PREDICATE`] gives: without it, a
         //     retry of a withdrawn record could read the withdrawal back. The
@@ -587,7 +755,7 @@ impl PgRecordStore {
             // the chunk, so a retry now wins the freed slot as a fresh insert).
             // Return retryable Transient.
             self.metrics.inc_dedup_stale();
-            Err(dedup_transient(
+            Err(write_transient(
                 &record,
                 "conflicting record aged out during dedup resolution; retry",
             ))
@@ -623,12 +791,18 @@ impl PgRecordStore {
         }
     }
 
-    /// Insert all distinct-key representatives in one multi-row
-    /// `INSERT … ON CONFLICT (6-tuple) DO NOTHING RETURNING`. The returned rows
-    /// are exactly the slots we won — `DO NOTHING` suppresses any row whose
-    /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
-    /// entry_type)` already exists — so the result maps each won [`DedupKey`] to its stored
-    /// row. `reps` must be sorted by [`DedupKey`] so concurrent batches take the
+    /// Run the guarded statement ([`BATCH_GUARDED_SQL`]) over all distinct-key
+    /// representatives, and return one [`Admission`] per representative.
+    ///
+    /// The statement reports each input row's verdict and whether it won, so
+    /// this is the whole of what the batch learns from the write: a refused
+    /// row, a won slot with its stored row, or a lost slot to be read back.
+    /// **There is no Rust-side `inserted.contains_key` pass** — the outer
+    /// select's `LEFT JOIN ins USING (id)` is what aligns inserted rows to
+    /// input, and `input.id` is how a returned row names the representative it
+    /// came from.
+    ///
+    /// `reps` must be sorted by [`DedupKey`] so concurrent batches take the
     /// speculative tuple locks in one global order (deadlock-free), and
     /// `type_keys` must be the partition keys resolved for `reps`, in the same
     /// order.
@@ -639,22 +813,24 @@ impl PgRecordStore {
     /// **A PRIMARY KEY collision is the caller's to handle, not this function's.**
     /// The arbiter covers the dedup UNIQUE only, so a concurrent writer of one of
     /// these identities surfaces as a `23505` on the primary key rather than as an
-    /// absent `RETURNING` row. Unlike the single-row path there is nothing to
-    /// resolve in place - a failed multi-row insert reports no won set at all - so
+    /// absent `ins` row. Unlike the single-row path there is nothing to
+    /// resolve in place - a failed statement reports no verdict at all, not even
+    /// for the rows it would have admitted - so
     /// `create_batch_inner` lifts it to a `Transient`
     /// ([`PgRecordStore::record_insert_error`]) and the whole batch re-runs on a
     /// fresh transaction.
-    async fn insert_records_on_conflict(
+    async fn run_guarded_batch_write(
         tx: &mut sqlx::Transaction<'_, Postgres>,
         reps: &[&UsageRecord],
         type_keys: &[i32],
-    ) -> Result<HashMap<DedupKey, UsageRecordRow>, sqlx::Error> {
+        acceptance_slack_secs: i64,
+    ) -> Result<HashMap<DedupKey, Admission>, sqlx::Error> {
         if reps.is_empty() {
             return Ok(HashMap::new());
         }
         let cols = InsertColumns::build(reps, type_keys);
 
-        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(BATCH_INSERT_SQL.as_str()))
+        let rows = sqlx::query(AssertSqlSafe(BATCH_GUARDED_SQL.as_str()))
             .bind(&cols.ids)
             .bind(&cols.tenants)
             .bind(&cols.gts_type_ids)
@@ -673,16 +849,30 @@ impl PgRecordStore {
             .bind(&cols.entry_types)
             .bind(&cols.accepted_ats)
             .bind(&cols.metadata)
+            .bind(acceptance_slack_secs)
             .fetch_all(&mut **tx)
             .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| (row_dedup_key(&row), row))
-            .collect())
+        // `input.id` names the representative each verdict belongs to. The walk
+        // is over `reps` rather than over the returned rows, so a key only ever
+        // enters the map built from a representative this batch actually holds;
+        // a representative with no row leaves the map without an entry, which
+        // `resolve_batch`'s defensive arm answers as retryable rather than as a
+        // silent success.
+        let mut by_input_id: HashMap<Uuid, &PgRow> = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            by_input_id.insert(row.try_get("input_id")?, row);
+        }
+        let mut out: HashMap<DedupKey, Admission> = HashMap::with_capacity(reps.len());
+        for rep in reps {
+            if let Some(row) = by_input_id.get(&rep.id) {
+                out.insert(dedup_key(rep), admission_of(row)?);
+            }
+        }
+        Ok(out)
     }
 
-    /// For the not-won keys, read the existing `usage_records` row by its
+    /// For the admitted, lost keys, read the existing `usage_records` row by its
     /// 6-tuple `(tenant_id, gts_type_id, idempotency_key, window_start,
     /// window_end, entry_type)` — the batch analogue of the single path's
     /// conflict branch. `entry_type` is in the tuple for the reason
@@ -695,28 +885,27 @@ impl PgRecordStore {
     async fn read_conflict_records(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
-        not_won: &[&UsageRecord],
+        lost: &[&UsageRecord],
     ) -> Result<HashMap<DedupKey, ConflictRead>, UsageCollectorPluginError> {
         let mut out: HashMap<DedupKey, ConflictRead> = HashMap::new();
-        if not_won.is_empty() {
+        if lost.is_empty() {
             return Ok(out);
         }
 
-        let tenants: Vec<Uuid> = not_won.iter().map(|r| r.tenant_id).collect();
-        let gtss: Vec<String> = not_won
+        let tenants: Vec<Uuid> = lost.iter().map(|r| r.tenant_id).collect();
+        let gtss: Vec<String> = lost
             .iter()
             .map(|r| r.gts_type_id.as_str().to_owned())
             .collect();
-        let keys: Vec<String> = not_won
+        let keys: Vec<String> = lost
             .iter()
             .map(|r| r.idempotency_key.as_str().to_owned())
             .collect();
-        let starts: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_start).collect();
-        let ends: Vec<OffsetDateTime> = not_won.iter().map(|r| r.window_end).collect();
+        let starts: Vec<OffsetDateTime> = lost.iter().map(|r| r.window_start).collect();
+        let ends: Vec<OffsetDateTime> = lost.iter().map(|r| r.window_end).collect();
         // Borrowed, unlike the owning vectors above: `EntryType::as_str`
         // hands back a `&'static str`, so there is nothing to clone.
-        let entry_types: Vec<&'static str> =
-            not_won.iter().map(|r| r.entry_type().as_str()).collect();
+        let entry_types: Vec<&'static str> = lost.iter().map(|r| r.entry_type().as_str()).collect();
 
         // `$6` is cast to the enum for the reason [`DEDUP_MATCH_PREDICATE`]
         // gives: the bound array is `text[]`, and the row-value comparison
@@ -747,11 +936,11 @@ impl PgRecordStore {
             found.insert(row_dedup_key(&row), row);
         }
 
-        // Every not-won key resolves to Stored (its conflicting row was read) or
+        // Every lost key resolves to Stored (its conflicting row was read) or
         // Stale (the row's chunk was dropped by retention between the conflicting
         // insert and this read — the near-impossible retention-boundary race).
         // `reps` are distinct keys, so each `remove` is unambiguous.
-        for r in not_won {
+        for r in lost {
             let key = dedup_key(r);
             match found.remove(&key) {
                 Some(row) => {
@@ -769,35 +958,54 @@ impl PgRecordStore {
     /// Resolve every input row in original order against its authoritative
     /// record, recording the per-row counters exactly as the single path does.
     ///
-    /// `inserted` is the set of slots this batch won — it *is* the answer to
-    /// "did we win this key", so there is no separate `won` set to disagree
-    /// with it. An earlier shape passed both, which made two states
-    /// representable that the code cannot produce (a won key with no inserted
-    /// row) and so two `Internal` arms that only a hand-built map could reach.
+    /// `admissions` is what the guarded statement said about each distinct key
+    /// — refused, won with its stored row, or lost — so there is no separate
+    /// `won` set to disagree with it. An earlier shape passed a won set beside
+    /// the inserted rows, which made two states representable that the code
+    /// cannot produce (a won key with no inserted row) and so two `Internal`
+    /// arms that only a hand-built map could reach.
+    ///
+    /// **A refusal is per input row, not per key**, which is what
+    /// `cpt-cf-uc-plugin-seq-ingest-batch` asks for: *"a conflict or rejection
+    /// on one record never fails the others"*. Two input rows sharing a refused
+    /// key are two refusals and two counter increments, exactly as two input
+    /// rows sharing an absorbed key are two absorbs.
     fn resolve_batch(
         &self,
         records: &[UsageRecord],
         plan: &BatchPlan<'_>,
-        inserted: &HashMap<DedupKey, UsageRecordRow>,
+        admissions: &HashMap<DedupKey, Admission>,
         conflict: &HashMap<DedupKey, ConflictRead>,
     ) -> Vec<Result<UsageRecord, UsageCollectorPluginError>> {
         let mut results = Vec::with_capacity(records.len());
         for (i, record) in records.iter().enumerate() {
             let key = dedup_key(record);
-            let outcome = match inserted.get(&key) {
+            let outcome = match admissions.get(&key) {
+                // Refused by the statement's own acceptance guard. Nothing was
+                // written for this key and no ledger row was consulted for it,
+                // whether or not its identity is already stored.
+                Some(Admission::Stale) => {
+                    self.metrics.inc_stale_acceptance_rejection();
+                    Err(write_transient(record, STALE_ACCEPTANCE_MESSAGE))
+                }
                 // We won this slot and this input row is its first occurrence:
                 // the fresh insert.
-                Some(row) if plan.first_index.get(&key) == Some(&i) => {
+                Some(Admission::Won(row)) if plan.first_index.get(&key) == Some(&i) => {
                     if record.invalidation.is_some() {
                         self.metrics.inc_invalidation();
                     }
-                    record_row_to_model(row.clone())
+                    record_row_to_model((**row).clone())
                 }
                 // We won the slot, but an earlier input row is its winner — so
                 // this is an in-batch duplicate, resolved against the row we
                 // just wrote exactly as the single path resolves a same-key hit.
-                Some(row) => self.resolve_dedup_hit(row.clone(), record),
-                None => match conflict.get(&key) {
+                Some(Admission::Won(row)) => self.resolve_dedup_hit((**row).clone(), record),
+                // Lost the slot, or — defensively — the statement returned no
+                // verdict for this key at all, which `run_guarded_batch_write`
+                // cannot produce. Both resolve against the conflict read, and
+                // the second finds nothing there and answers retryable rather
+                // than silently succeeding.
+                Some(Admission::Lost) | None => match conflict.get(&key) {
                     Some(ConflictRead::Stored(row)) => {
                         // Clone the inner row directly; `*row.clone()` would
                         // round-trip through a throwaway `Box` allocation. The
@@ -807,15 +1015,12 @@ impl PgRecordStore {
                     }
                     Some(ConflictRead::Stale) => {
                         self.metrics.inc_dedup_stale();
-                        Err(dedup_transient(
+                        Err(write_transient(
                             record,
                             "conflicting record aged out during dedup resolution; retry",
                         ))
                     }
-                    // Defensive: read_conflict_records populates every not-won key
-                    // as Stored or Stale, so a missing entry is unreachable —
-                    // surface it as retryable rather than as a silent success.
-                    None => Err(dedup_transient(
+                    None => Err(write_transient(
                         record,
                         "conflicting record not found during dedup resolution; retry",
                     )),
@@ -826,24 +1031,24 @@ impl PgRecordStore {
         results
     }
 
-    /// Orchestrate one batch inside **one transaction**: insert (dedup on the
-    /// 6-tuple UNIQUE) → read conflicts for the not-won keys → commit → resolve
-    /// per row in input order. The insert's `RETURNING` rows are themselves the
-    /// set of keys it claimed, so nothing else records that.
+    /// Orchestrate one batch inside **one transaction**: run the guarded
+    /// statement → read conflicts for the lost keys → commit → resolve per row
+    /// in input order. The statement's own per-row verdicts are the whole
+    /// record of what it did, so nothing else records that.
     ///
-    /// The transaction is not decoration. The insert and the conflict read are
-    /// one unit of work: the read has to see the ledger the insert just met, and
+    /// The transaction is not decoration. The write and the conflict read are
+    /// one unit of work: the read has to see the ledger the write just met, and
     /// every entry of the batch has to share one `xact_id` — which the column
     /// default gives only because one `pg_current_xact_id()` covers the whole
     /// transaction (this plugin's DESIGN §3.6). A per-row transaction would
     /// scatter the batch across the feed order.
     ///
     /// This path carries **no** SAVEPOINT, where the single-row path does. The
-    /// insert can fail here too on a unique index its `ON CONFLICT` arbiter does
-    /// not cover, but a failed multi-row insert reports no won set at all, so
+    /// statement can fail here too on a unique index its `ON CONFLICT` arbiter
+    /// does not cover, but a failed statement reports no verdicts at all, so
     /// there is nothing to resolve in place: the transaction is rolled back, the
     /// failure is lifted to a `Transient`, and the whole batch re-runs on a
-    /// fresh transaction (see [`Self::insert_records_on_conflict`]).
+    /// fresh transaction (see [`Self::run_guarded_batch_write`]).
     async fn create_batch_inner(
         &self,
         records: &[UsageRecord],
@@ -871,22 +1076,31 @@ impl PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        let inserted = match Self::insert_records_on_conflict(&mut tx, &plan.reps, &type_keys).await
+        let admissions = match Self::run_guarded_batch_write(
+            &mut tx,
+            &plan.reps,
+            &type_keys,
+            self.acceptance_slack_secs,
+        )
+        .await
         {
-            Ok(rows) => rows,
+            Ok(admissions) => admissions,
             Err(e) => {
                 rollback(tx).await;
                 return Err(self.record_insert_error(&e));
             }
         };
-        // `inserted` is the won set; there is no second copy of it to drift.
-        let not_won: Vec<&UsageRecord> = plan
+        // Only the **admitted, not-won** keys are read back, per
+        // `cpt-cf-uc-plugin-seq-ingest-batch`: a refused key has no outcome to
+        // resolve against the ledger, and reading one would be the ordering the
+        // guard's precedence forbids.
+        let lost: Vec<&UsageRecord> = plan
             .reps
             .iter()
             .copied()
-            .filter(|r| !inserted.contains_key(&dedup_key(r)))
+            .filter(|r| matches!(admissions.get(&dedup_key(r)), Some(Admission::Lost)))
             .collect();
-        let conflict = match self.read_conflict_records(&mut tx, &not_won).await {
+        let conflict = match self.read_conflict_records(&mut tx, &lost).await {
             Ok(conflict) => conflict,
             Err(e) => {
                 // Every other failure path here rolls back explicitly; `?` would
@@ -899,7 +1113,7 @@ impl PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        Ok(self.resolve_batch(records, &plan, &inserted, &conflict))
+        Ok(self.resolve_batch(records, &plan, &admissions, &conflict))
     }
 }
 
@@ -1446,8 +1660,11 @@ fn stored_entry_type_rank(raw: &str) -> u8 {
     }
 }
 
-/// Build the [`DedupKey`] for a stored row, so an `INSERT … RETURNING` result
-/// and an incoming record map to the same key (both bounds canonicalized).
+/// Build the [`DedupKey`] for a stored row, so a row read back out of the
+/// ledger and the incoming record it conflicts with map to the same key (both
+/// bounds canonicalized). [`PgRecordStore::read_conflict_records`] is what
+/// needs that: it selects the stored rows of a batch's lost keys in one
+/// statement and has to return each one under the key that asked for it.
 ///
 /// The entry type is read off the stored `entry_type` column, which the ledger
 /// writes from the dispatched entry's own declaration and derives from nothing
@@ -1466,14 +1683,65 @@ fn row_dedup_key(row: &UsageRecordRow) -> DedupKey {
     )
 }
 
-/// Log a retryable dedup-path transient at `warn` with the record's identifiers,
+/// What the guarded statement said about one input row: the two flags it
+/// carries out, decoded into the three outcomes `DESIGN.md` §3.6 names.
+///
+/// A sum type rather than the flags themselves, because only three of their
+/// four combinations are reachable: `WHERE admitted` is what feeds the insert,
+/// so a refused row cannot have won. Carrying the flags would leave the fourth
+/// representable and every reader to rule it out again.
+enum Admission {
+    /// Outside the acceptance slack. Refused as `Transient` whatever the ledger
+    /// holds, because the verdict precedes the identity (§3.6).
+    Stale,
+    /// Admitted, and this row took the dedup slot: a fresh insert, with the
+    /// `xact_id` the column default stamped on it.
+    Won(Box<UsageRecordRow>),
+    /// Admitted, but the identity was already stored. Resolved by reading the
+    /// stored row back and comparing caller-supplied fields.
+    Lost,
+}
+
+/// Decode one row of the guarded statement's outer select into an
+/// [`Admission`].
+///
+/// **`admitted` is read first and short-circuits**, which is the ordering rule
+/// §3.6 states as *"a row not admitted is `Transient` … even when its identity
+/// exists"*. The statement already enforces it — a refused row is never
+/// offered to `ON CONFLICT` — and reading it in this order means no decode path
+/// can reintroduce the other order.
+///
+/// The record columns are decoded only on the won arm. Every one of them is
+/// `NULL` on the other two, `ins` having contributed no row to the left join,
+/// so [`UsageRecordRow`] could not be built from them at all.
+fn admission_of(row: &PgRow) -> Result<Admission, sqlx::Error> {
+    if !row.try_get::<bool, _>("admitted")? {
+        return Ok(Admission::Stale);
+    }
+    if row.try_get::<bool, _>("won")? {
+        return Ok(Admission::Won(Box::new(UsageRecordRow::from_row(row)?)));
+    }
+    Ok(Admission::Lost)
+}
+
+/// What a caller is told when the write statement's acceptance guard refused
+/// the entry.
+///
+/// One spelling for both write paths, and it names the remedy rather than the
+/// predicate: the host lifts a `Transient` to a retryable error, and a retry is
+/// stamped afresh (`DESIGN.md` §3.6), so re-submitting is what resolves it.
+const STALE_ACCEPTANCE_MESSAGE: &str =
+    "acceptance instant outside the configured acceptance slack; re-stamp and retry";
+
+/// Log a retryable write-path transient at `warn` with the record's identifiers,
 /// then return the matching [`UsageCollectorPluginError::Transient`]. The
 /// degraded path is self-healing on retry but must still surface at `warn` so an
 /// operator can see it. This helper only logs and builds the error: any counter
-/// is the caller's, `inc_dedup_stale` on the retention-race sites and none on
+/// is the caller's, `inc_dedup_stale` on the retention-race sites,
+/// `inc_stale_acceptance_rejection` on the guard's, and none on
 /// the defensive not-found arm, which is unreachable by construction. Stated as
 /// a kind rather than a count because the call sites move.
-fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
+fn write_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
     tracing::warn!(
         tenant_id = %record.tenant_id,
         gts_type_id = %record.gts_type_id.as_str(),
@@ -1532,7 +1800,8 @@ fn plan_batch(records: &[UsageRecord]) -> BatchPlan<'_> {
 /// in-process retry so a transient backend error self-heals transparently
 /// instead of bubbling an `Err(Transient)` to the host (see `with_retry` and
 /// `is_retryable_batch_error`, both private and so named in plain backticks;
-/// the second is where the causes that reach this loop are listed).
+/// the second is where the causes that reach this loop are set against the
+/// code, and it points at the normative list in this plugin's DESIGN §3.6).
 const MAX_BATCH_ATTEMPTS: u32 = 3;
 
 /// Deterministic pre-jitter backoff base for the `attempt`-th retry (1-based).
@@ -1574,9 +1843,12 @@ fn batch_retry_backoff(attempt: u32) -> Duration {
 /// The deadlock victim surfaces as an outer `Transient` — `create_batch_inner`
 /// runs the whole batch in one transaction, and that transaction rolled back,
 /// so the attempt left nothing behind. Serialization failures (`40001`), lock
-/// timeouts (`55P03`, which a batch hits when it waits out `lock_timeout` on
-/// any contended lock: the speculative tuple another in-flight batch holds, or
-/// the chunk the retention sweep holds in `ACCESS EXCLUSIVE`) and connectivity
+/// timeouts (`55P03`, which a batch hits when it waits out `lock_timeout` on a
+/// contended lock — the locks ingest can meet are
+/// [`crate::infra::storage::pool`]'s subject, and the partition-key assignment
+/// among them, which `create_batch_inner` runs per representative in autocommit
+/// and maps through [`PgRecordStore::record_backend_error`] into this same
+/// bucket) and connectivity
 /// faults (a backend unreachable or refusing work, and a pool that cannot
 /// supply a usable connection) collapse to the same bucket inside the storage
 /// helpers. A concurrent writer of one of this batch's own dedup identities
@@ -1910,8 +2182,9 @@ impl RecordStore for PgRecordStore {
         // Wrap the whole call in a bounded retry: on an outer `Transient`
         // re-run the operation up to `MAX_BATCH_ATTEMPTS` times.
         // `is_retryable_batch_error` is where the causes that reach this are
-        // listed, and it is the only place they are listed, so this comment
-        // does not carry a second copy to fall behind it.
+        // listed against the code, and it points at the normative list in this
+        // plugin's DESIGN section 3.6, so this comment carries no third copy to
+        // fall behind either of them.
         // Each attempt acquires a
         // fresh connection and opens a fresh transaction on it
         // (`create_batch_inner` does both), so a rolled-back attempt leaves no

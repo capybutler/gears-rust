@@ -166,6 +166,7 @@ async fn remaining_recording_helpers_emit_expected_series() {
 
     metrics.inc_dedup_stale();
     metrics.inc_dedup_stale();
+    metrics.inc_stale_acceptance_rejection();
     metrics.inc_batch_retry();
     metrics.inc_batch_retry();
     metrics.inc_batch_retry();
@@ -177,6 +178,16 @@ async fn remaining_recording_helpers_emit_expected_series() {
     assert_eq!(
         counter_sum(&exporter, "uc_timescaledb_dedup_stale_total"),
         2
+    );
+    // Driven once, against the twice-driven counter beside it: the two are
+    // separate series, and a helper wired to the wrong instrument would show up
+    // here as one of them carrying the other's count.
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            "uc_timescaledb_stale_acceptance_rejections_total"
+        ),
+        1
     );
     assert_eq!(
         counter_sum(&exporter, "uc_timescaledb_batch_retries_total"),
@@ -299,6 +310,7 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
     metrics.record_batch_rows(1.0);
     metrics.inc_dedup_absorbed();
     metrics.inc_dedup_stale();
+    metrics.inc_stale_acceptance_rejection();
     metrics.inc_idempotency_conflict();
     metrics.inc_migration_failure();
     metrics.inc_tls_handshake_failure();
