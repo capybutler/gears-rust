@@ -4452,7 +4452,18 @@ mod covered_period_bounds_tests {
         // inside a tolerance measured in days.
         let plugin = HappyPathPlugin::new();
         let tenant_id = Uuid::from_u128(0xC4);
-        let window_end = time::OffsetDateTime::now_utc() - time::Duration::minutes(1);
+        // Truncated to the microsecond, as the validator's own refusal
+        // prescribes: a covered-period bound is rejected outright above
+        // microsecond precision, because the entry identity derivation
+        // reads a fixed-width microsecond form. `clock_gettime` reports
+        // nanoseconds on Linux, so an untruncated read here is refused on
+        // nearly every run; the platforms where it passed were the ones
+        // whose clock already stopped at the microsecond.
+        let now = time::OffsetDateTime::now_utc();
+        let window_end = now
+            .replace_nanosecond(now.microsecond() * 1_000)
+            .expect("a microsecond-truncated nanosecond count is in range")
+            - time::Duration::minutes(1);
         let submission = CreateUsageRecord {
             entry_type: EntryType::Record,
             window_start: window_end - time::Duration::days(30),
