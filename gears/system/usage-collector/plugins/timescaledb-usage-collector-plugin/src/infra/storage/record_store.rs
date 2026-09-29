@@ -405,9 +405,10 @@ static SINGLE_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
 /// `Append` still lists all eight chunks, probing each one's `window_end` index
 /// per outer row: better than keying on `id` alone, which bitmap-scans eight
 /// primary keys, and still every chunk. With the `= ANY` conjunct the `Append`
-/// lists the chunks of the two periods — **two** on that ledger, and *N* per
-/// distinct period on one carrying *N* meter types, for the reason
-/// [`PARTITION_PRUNE_COLUMN`] gives. Delete the conjunct and the read-back goes
+/// lists the chunks the batch's periods fall in — **two** on that ledger, one
+/// per period because those two periods landed in different time chunks, and
+/// *N* times the number of **time chunks** they span on a ledger carrying *N*
+/// meter types, for the reason [`PARTITION_PRUNE_COLUMN`] gives. Delete the conjunct and the read-back goes
 /// back to touching every chunk the deployment retains, inside the write
 /// transaction and while it holds the batch's speculative tuple locks.
 static BATCH_CONFLICT_READ_SQL: LazyLock<String> = LazyLock::new(|| {
@@ -1636,24 +1637,31 @@ fn build_list_page(
 /// rather than a closed account of every route:
 ///
 /// * **Its six inputs are already stored.** It collides on the arbiter, which
-///   reads those six off the row, and the read-back then looks for the winner
-///   by an `id` no stored row carries. It finds nothing and answers a
-///   `Transient` reading [`CONFLICT_UNREADABLE_MESSAGE`], counted on
+///   reads those six off the row, and `DO NOTHING` then skips the insert
+///   outright — so no other unique index is reached, the PRIMARY KEY included
+///   ([`crate::infra::storage::error::classify_db`] states the suppression
+///   rule). The read-back looks for the winner by an `id` no stored row
+///   carries, finds nothing, and answers a `Transient` reading
+///   [`CONFLICT_UNREADABLE_MESSAGE`], counted on
 ///   `uc_timescaledb_dedup_stale_total`. That **does not self-heal**: every
 ///   retry re-derives the same `id` and lands in the same arm. It is also
 ///   indistinguishable, at the call site and in the log line, from the other
-///   things that reach that arm. Separately: should the `id` happen to collide
-///   with a stored row's `(id, window_end, type_key)`, the raise is on the
-///   PRIMARY KEY, which the arbiter does not cover — the single path rolls back
-///   to its savepoint and resolves against that row, the batch lifts it to a
-///   `Transient` and re-runs.
-/// * **Its six inputs are novel.** Nothing collides, so it is **stored**, and
-///   the ledger is not what catches it. The row carries an `id` no faithful
-///   derivation of its own columns produces, which makes it unreachable by the
-///   identity it ought to have: every later faithful submission of that entry
-///   collides on the arbiter and then cannot find it, so that entry takes the
-///   never-clearing `Transient` above from then on. One mis-derivation is
-///   permanent for one identity, not transient.
+///   things that reach that arm.
+/// * **Its six inputs are novel.** Nothing collides *on the arbiter*, so the
+///   insert proceeds — and only then is every other unique index checked. Two
+///   ends to that:
+///   * Should the `id` happen to equal a stored row's
+///     `(id, window_end, type_key)`, the raise is on the PRIMARY KEY, which the
+///     arbiter does not cover and `DO NOTHING` therefore does not suppress. The
+///     single path rolls back to its savepoint and resolves against that row;
+///     the batch lifts it to a `Transient` and re-runs. This is the one route
+///     on which the ledger does catch a mis-derived `id`.
+///   * Otherwise it is **stored**, and nothing catches it. The row carries an
+///     `id` no faithful derivation of its own columns produces, which makes it
+///     unreachable by the identity it ought to have: every later faithful
+///     submission of that entry collides on the arbiter and then cannot find
+///     it, so that entry takes the never-clearing `Transient` above from then
+///     on. One mis-derivation is permanent for one identity, not transient.
 ///
 /// This is the accepted cost of not re-deriving, and it is the shape a faithful
 /// gateway never produces. Re-deriving here to close it would put a second
@@ -1738,10 +1746,11 @@ const STALE_ACCEPTANCE_MESSAGE: &str =
 ///   does clear it, because a retry opens a fresh transaction and so takes a
 ///   fresh snapshot — but it recurs on every contended write for as long as the
 ///   setting stands, so what an operator sees is a rate rather than one blip.
-/// * A **submission whose `id` does not match its own six inputs**, which
-///   collides on an arbiter that reads those six off the row and is then looked
-///   for under an `id` no row carries ([`entry_identity`]). It does **not**
-///   clear on a retry, because a retry re-derives the same `id`.
+/// * A **submission whose `id` does not match its own six inputs**, which,
+///   *when those six are already stored*, collides on an arbiter that reads
+///   them off the row and is then looked for under an `id` no row carries
+///   ([`entry_identity`], which sets out what the other case does instead). It
+///   does **not** clear on a retry, because a retry re-derives the same `id`.
 ///
 /// Nothing here can tell them apart, and separating them at the metric is the
 /// metric inventory's work rather than this path's.

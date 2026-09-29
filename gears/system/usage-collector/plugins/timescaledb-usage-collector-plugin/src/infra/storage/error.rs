@@ -93,23 +93,33 @@ const LEDGER_PK: &str = "usage_records_pkey";
 
 /// True when `err` is a unique violation on the ledger's PRIMARY KEY.
 ///
-/// **This denotes the same dedup identity `DEDUP_UNIQUE` covers, and that is
-/// why the write path can resolve it rather than fail.** That constant is named
+/// **On a faithfully derived `id` this denotes the same dedup identity
+/// `DEDUP_UNIQUE` covers, and that is why the write path can resolve it rather
+/// than fail.** That constant is named
 /// in plain backticks rather than linked, because it is private and this item is
 /// public. The entry `id` is a
 /// `UUIDv5` over the same 6-tuple the dedup UNIQUE spans
 /// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so two rows that
-/// collide on the primary key necessarily collide on the dedup identity too —
-/// the migration says as much where it keeps the two as "the same key".
+/// collide on the primary key collide on the dedup identity too —
+/// the migration says as much where it keeps the two as "the same key". The
+/// premise is the derivation's, not this predicate's: the plugin takes the `id`
+/// as given (`crate::infra::storage::record_store`'s `entry_identity`), so a
+/// gateway that derived one over some other six inputs can make the two
+/// disagree, and then the resolution this licenses resolves against a row that
+/// is not the submission's own identity.
 ///
-/// **It is reachable only under concurrency, and only because an `ON CONFLICT`
+/// **Under a faithful derivation it is reachable only under concurrency, and
+/// only because an `ON CONFLICT`
 /// arbiter names one index.** Both insert paths arbitrate on the dedup 6-tuple,
 /// and `DO NOTHING` suppresses a conflict on *that* index alone; a conflict on
 /// any other unique index is raised as an ordinary `23505`. A writer whose
 /// arbiter pre-check finds nothing therefore speculatively inserts, and its
 /// insert into the primary-key index can still meet a concurrent writer of the
-/// same identity. Serially this cannot happen: the pre-check sees the committed
-/// row and skips it without touching any index.
+/// same identity. Serially this cannot happen *of two faithful submissions*:
+/// the pre-check sees the committed row and skips it without touching any
+/// index. A mis-derived `id` over novel six inputs can reach it serially, which
+/// `entry_identity` sets out as the one route on which the ledger catches such
+/// a submission at all.
 ///
 /// This is deliberately **not** folded into [`classify_db`], which maps a
 /// primary-key `23505` to [`DbErrorClass::Other`] and so to a non-retryable

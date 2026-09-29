@@ -217,9 +217,10 @@ async fn an_entry_accepted_too_long_ago_is_refused_and_counted() {
     assert_stale_acceptance(&err, "a past-dated acceptance");
 
     // The refusal is counted, by this instrument and not by
-    // `uc_timescaledb_dedup_stale_total`, which the unreadable-conflict arm
-    // owns and which answers a `Transient` of the same shape from the same
-    // function.
+    // `uc_timescaledb_dedup_stale_total`. That counter belongs to the
+    // unreadable-conflict arm, and that arm answers a `Transient` of the same
+    // shape from the same function, so charging one to the other would not show
+    // up anywhere else.
     provider.force_flush().expect("flush metrics");
     assert_eq!(
         counter_sum(&exporter, STALE_ACCEPTANCE_COUNTER),
