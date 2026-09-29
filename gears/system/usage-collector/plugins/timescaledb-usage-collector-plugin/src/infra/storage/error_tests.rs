@@ -11,12 +11,12 @@ use super::*;
 /// `DatabaseError` **trait** rather than off the concrete driver type - so
 /// implementing the trait is what puts the predicate itself under test.
 ///
-/// It is worth the twenty lines. The only other oracle in reach is
-/// [`classify_db`], and that one answers `Other` for the ledger PK *and* for
-/// every other constraint name alike: a test routed through it would still pass
-/// with [`LEDGER_PK`] misspelled, with [`is_constraint`]'s `_` anchor deleted,
-/// or with the predicate hardwired to `false`. A check that cannot fail is
-/// worse than a missing one.
+/// It earns its length. The only other oracle in reach is [`classify_db`], and
+/// that one answers `Other` for the ledger PK *and* for any constraint name
+/// that is not the dedup unique: a test routed through it would still pass with
+/// [`LEDGER_PK`] misspelled, with [`is_constraint`]'s `_` anchor deleted, or
+/// with the predicate hardwired to `false`. A check that cannot fail is worse
+/// than a missing one.
 #[derive(Debug)]
 struct FakeDbError {
     code: &'static str,
@@ -98,7 +98,7 @@ fn unique_violation_on_unknown_constraint_is_other() {
 /// Asserted on [`is_ledger_pk_violation`] itself, through [`FakeDbError`],
 /// because the predicate is what the fix turns on and no other oracle in this
 /// file can see it: [`classify_db`] answers `Other` for the ledger PK and for
-/// every other constraint alike.
+/// any constraint name that is not the dedup unique.
 ///
 /// The negatives are the load-bearing half. Each one names a different way the
 /// predicate could be wrong, and a predicate that answered `true` to all comers

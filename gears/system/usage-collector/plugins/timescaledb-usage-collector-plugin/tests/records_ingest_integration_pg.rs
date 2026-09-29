@@ -1273,8 +1273,9 @@ async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock(
 /// How many rounds the two-scope deadlock-freedom test drives.
 ///
 /// Several rather than one, because a deadlock needs the two transactions to
-/// interleave and a single round can miss. It is named so the retry bound and
-/// the stored-row count are both derived from it instead of restating `6`.
+/// interleave and a single round can miss. It is named so the stored-row count
+/// and the call count the failure message quotes are both derived from it
+/// instead of restating `6`.
 const DEADLOCK_ROUNDS: i64 = 6;
 
 /// How many concurrent rounds the two same-identity race tests drive.

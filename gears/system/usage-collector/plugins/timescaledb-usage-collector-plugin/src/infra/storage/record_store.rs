@@ -519,9 +519,9 @@ impl PgRecordStore {
                 // would keep this transaction's original snapshot, the winner's
                 // row would be invisible, and the loser would answer a stale
                 // `Transient` where DESIGN section 3.3's `dedup-concurrent` row
-                // requires an `IdempotencyConflict`. ROLLBACK TO SAVEPOINT
-                // clears the aborted state and leaves the outer transaction
-                // usable, and the
+                // requires it to resolve absorb-vs-conflict. ROLLBACK TO
+                // SAVEPOINT clears the aborted state and leaves the outer
+                // transaction usable, and the
                 // outcome is exactly the not-won one: step 2b reads the winner and
                 // resolves absorb-vs-conflict, which is what DESIGN section 3.3's
                 // `dedup-concurrent` row requires of the loser.

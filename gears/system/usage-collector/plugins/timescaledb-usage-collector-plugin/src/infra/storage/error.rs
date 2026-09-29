@@ -31,7 +31,8 @@ pub enum DbErrorClass {
 /// [`super::type_key::TypeKeyCache::resolve`] assigns a type's partition key
 /// with its own `INSERT ... ON CONFLICT`, in autocommit, so two first writes of
 /// one *type* meet on that tuple - once per type per process rather than once
-/// per write ([`crate::infra::storage::pool`] sizes the bound for both).
+/// per write ([`crate::infra::storage::pool`]'s bound covers it too, which is
+/// not the same as its being the lock that constant is sized for).
 /// Losing either race is an ordinary contention outcome between concurrent
 /// writers of one entry or of one type, self-healing on retry. Left in
 /// `Other` it maps to a non-retryable `Internal` and
