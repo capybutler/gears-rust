@@ -15,9 +15,53 @@ fn unique_violation_on_dedup_is_dedup_conflict() {
 fn unique_violation_on_unknown_constraint_is_other() {
     // A future second unique constraint (or a records PK collision) must not be
     // misclassified as the dedup-specific violation.
+    //
+    // **This stays `Other` on purpose, and the write path is what reclassifies a
+    // primary-key collision it is expecting** (`is_ledger_pk_violation`, exercised
+    // below). The division matters: a PK `23505` that no insert path intercepted
+    // is unreachable while the derived identity is correct, so the catch-all
+    // reading it as a non-retryable `Internal` is the loud failure it should be.
+    // Folding the PK into this arm would silence that.
     assert_eq!(
         classify_db("23505", Some("usage_records_pkey")),
         DbErrorClass::Other
+    );
+}
+
+/// The write-path predicate for a PRIMARY KEY collision, which
+/// `create_inner` resolves in place and `create_batch_inner` lifts to a
+/// `Transient`.
+///
+/// Built from a real `sqlx::Error::Database` rather than from strings, because
+/// the predicate reads `code()` and `constraint()` off the driver error and a
+/// string-level test would not exercise that at all. `PgDatabaseError` cannot be
+/// constructed directly, so the cases that need one are covered against a live
+/// backend by `records_ingest_integration_pg`'s two same-identity race tests;
+/// what is unit-testable here is the constraint-name matching the predicate
+/// shares with `is_constraint`, including `TimescaleDB`'s chunk-local spellings.
+#[test]
+fn the_ledger_pk_is_recognised_under_every_chunk_local_spelling() {
+    // The bare name, the `CREATE TABLE` chunk clone, and the standalone-index
+    // chunk clone - the three shapes `is_constraint`'s doc enumerates. Asserted
+    // through `classify_db`, which shares that matcher: each of these must stay
+    // `Other` there, which is the same question the predicate asks in reverse.
+    for spelling in [
+        "usage_records_pkey",
+        "1_usage_records_pkey",
+        "_hyper_1_1_chunk_usage_records_pkey",
+    ] {
+        assert_eq!(
+            classify_db("23505", Some(spelling)),
+            DbErrorClass::Other,
+            "`{spelling}` is the ledger PK, not the dedup constraint"
+        );
+    }
+    // And the near-miss the `_` anchor exists to reject: a different constraint
+    // that merely ends in the same characters without a separator.
+    assert_eq!(
+        classify_db("23505", Some("notusage_records_dedup_uniq")),
+        DbErrorClass::Other,
+        "no `_` separator, so this is a different constraint"
     );
 }
 #[test]

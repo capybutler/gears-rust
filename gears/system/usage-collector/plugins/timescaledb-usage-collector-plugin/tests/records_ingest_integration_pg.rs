@@ -53,7 +53,9 @@ use usage_collector_sdk::{
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
-use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
+use timescaledb_usage_collector_plugin::infra::storage::record_store::{
+    MAX_BATCH_ATTEMPTS, PgRecordStore,
+};
 
 /// A container plus a store over it.
 async fn setup() -> (common::TsHarness, PgRecordStore) {
@@ -1128,25 +1130,51 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// contended at all. A fixture sharing only scopes would have gone green here
 /// while asserting nothing.
 ///
-/// **The assertion is on the retry counter, not on the outcome**, because the
-/// outcome hides the defect: `create_batch` wraps itself in a bounded retry, so
-/// a deadlock victim re-runs and succeeds, and every row still comes back
-/// `Ok`. `uc_timescaledb_batch_retries_total` is what distinguishes "took the
-/// locks in one order" from "deadlocked and recovered". It must be **zero**:
-/// the sort is supposed to make the deadlock unreachable, not survivable.
+/// **The oracle can no longer separate a deadlock from an identity collision,
+/// and the assertion is weakened to match rather than the other way round.**
+/// `uc_timescaledb_batch_retries_total` counts a retry, not its cause, and
+/// `is_retryable_batch_error` admits **any** `Transient`. Three things now reach
+/// it: the ABBA deadlock victim (`40P01`) this test exists for, a
+/// `55P03 lock_not_available` that waited out `lock_timeout` on one of those same
+/// tuples, and - since the per-scope counter was retired - a concurrent writer of
+/// one of the batch's own identities colliding on the PRIMARY KEY, which
+/// `PgRecordStore::record_insert_error` lifts to a `Transient` so the batch
+/// re-runs against the winner's committed row.
 ///
-/// The counter is a slightly wider oracle than the property, and the failure
-/// message says so rather than over-claiming: `is_retryable_batch_error` admits
-/// **any** `Transient`, so this really asserts "no transient at all". The one
-/// realistic alternative on a loaded runner is `55P03 lock_not_available` on one
-/// of those same speculative tuples, which needs the whole `lock_timeout` to
-/// elapse first - unlikely, but it would retry identically, and a message
-/// confidently naming a deadlock that did not happen is worse than a wider one.
+/// **That third one is not incidental here: this fixture guarantees it.** Both
+/// batches carry byte-identical rows, so both sides submit the *same derived
+/// identities*, and the arbiter covers only the dedup UNIQUE. The rows are
+/// identical for a reason that still holds and is worth keeping: a divergent
+/// overlap would resolve as an `IdempotencyConflict` and would say nothing about
+/// lock order at all. So the fixture that makes the lock-order question askable
+/// is the same fixture that makes identity collisions routine, and **zero is no
+/// longer an assertable bound.**
+///
+/// What is still assertable, and what this test now establishes:
+///
+/// * both batches complete - no row is lost to a retry budget running out;
+/// * every row resolves `Ok`, in both scopes, with one stored row per key;
+/// * the retries stay **within the cap**, derived from
+///   [`MAX_BATCH_ATTEMPTS`] rather than written as a number. A retry storm, a
+///   deadlock that outlives the budget, or a sort regression that made every
+///   round deadlock would all breach it.
+///
+/// **What it no longer establishes** is that `reps.sort_by` makes the deadlock
+/// *unreachable* rather than survivable. Telling the causes apart needs an
+/// instrument that distinguishes them, and that is deliberately not added here:
+/// Task 5 collapses both write paths onto DESIGN section 3.6's single guarded
+/// statement, which changes the retry behaviour such an instrument would measure,
+/// and slice 8 owns the metric inventory. Designing it before that collapse is
+/// the wrong order.
+///
+/// The name says `resolve_within_the_retry_cap` and not `never_deadlock` for
+/// exactly that reason - the body no longer proves the stronger claim, and a name
+/// that outruns its assertions is the defect this suite is built to avoid.
 ///
 /// Several rounds rather than one, because a deadlock needs the two
 /// transactions to interleave and one round can miss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock() {
+async fn concurrent_batches_taking_two_scopes_in_opposite_orders_resolve_within_the_retry_cap() {
     let (h, store, provider, exporter) = setup_metered().await;
     let vcpu = common::meter(common::VCPU_METER);
     let gb = common::meter(common::GB_METER);
@@ -1171,7 +1199,7 @@ async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock(
             .collect()
     };
 
-    for round in 0..6_i64 {
+    for round in 0..DEADLOCK_ROUNDS {
         let (vcpu_rows, gb_rows) = (rows_for(&vcpu, round), rows_for(&gb, round));
         // A: vcpu then gb. B: gb then vcpu. Same rows, opposite input order.
         let mut a = vcpu_rows.clone();
@@ -1196,18 +1224,23 @@ async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock(
     }
 
     provider.force_flush().expect("flush metrics");
-    assert_eq!(
-        counter_sum(&exporter, "uc_timescaledb_batch_retries_total"),
-        0,
-        "a batch was retried. The expected cause is the one this test exists for: two \
-         concurrent batches took the dedup 6-tuple speculative tuple locks in \
-         different orders and one was aborted as a deadlock victim, which plan_batch's \
-         reps.sort_by is supposed to make unreachable rather than survivable. \
-         `is_retryable_batch_error` admits any Transient, though, so check the run's \
-         logs before concluding that: a 55P03 lock_not_available on one of those same \
-         tuples retries identically, and on a loaded box that is the one other way to \
-         get here - it needs the whole lock_timeout to elapse first, so it is \
-         unlikely, not impossible."
+    // The cap, derived rather than written: every `create_batch` call may retry
+    // `MAX_BATCH_ATTEMPTS - 1` times before it gives up, and this test makes two
+    // concurrent calls per round. Reading it off the constant is what keeps the
+    // bound correct if the retry budget ever changes.
+    let calls = u64::try_from(DEADLOCK_ROUNDS).expect("a small round count") * 2;
+    let max_retries = calls * u64::from(MAX_BATCH_ATTEMPTS - 1);
+    let retries = counter_sum(&exporter, "uc_timescaledb_batch_retries_total");
+    assert!(
+        retries <= max_retries,
+        "batch retries ran past the cap: {retries} over {calls} calls, where the \
+         budget allows {max_retries} (MAX_BATCH_ATTEMPTS - 1 per call). Every call \
+         returned Ok, so this is not rows being lost - it is the retry budget being \
+         consumed far more often than contention on this fixture should. A sort \
+         regression in plan_batch is the first thing to check: unsorted, the two \
+         sides take the shared keys' speculative tuple locks in opposite orders and \
+         deadlock every round. This bound cannot say which cause fired - see the \
+         doc comment."
     );
 
     // And the ledger holds one row per key, in both scopes.
@@ -1216,7 +1249,171 @@ async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock(
         .fetch_one(&h.pool)
         .await
         .expect("count");
-    assert_eq!(rows, 48, "6 rounds x 4 keys x 2 scopes, each written once");
+    assert_eq!(
+        rows,
+        DEADLOCK_ROUNDS * 4 * 2,
+        "one stored row per key: DEADLOCK_ROUNDS rounds x 4 keys x 2 scopes"
+    );
+}
+
+/// How many rounds the two-scope deadlock-freedom test drives.
+///
+/// Several rather than one, because a deadlock needs the two transactions to
+/// interleave and a single round can miss. It is named so the retry bound and
+/// the stored-row count are both derived from it instead of restating `6`.
+const DEADLOCK_ROUNDS: i64 = 6;
+
+/// How many concurrent rounds the two same-identity race tests drive.
+///
+/// A race needs the two transactions to interleave, and one round can miss. The
+/// cost of a round is two concurrent calls; the cost of another *run* is a
+/// container bring-up, which is about as expensive as twenty rounds - so this is
+/// where attempts are bought cheaply. Twenty was enough to turn the batch path's
+/// window from "never observed in twelve runs" into a reproduction.
+const ROUNDS_PER_RACE: i64 = 20;
+
+/// Two concurrent **batches** whose row sets share one derived identity resolve
+/// to one acceptance and one `IdempotencyConflict`, the same as the single-row
+/// pair above.
+///
+/// **This exists because the batch path shares the single path's exposure and
+/// nothing drove it.** Both paths insert with
+/// `ON CONFLICT (<dedup 6-tuple>, type_key) DO NOTHING`, and that arbiter does
+/// not cover `PRIMARY KEY (id, window_end, type_key)`. Two writers of one
+/// derived `id` therefore collide on a unique index `DO NOTHING` does not
+/// suppress, and the loser takes a raw `23505` instead of the empty
+/// `RETURNING` it expects. `concurrent_overlapping_batches_leave_one_row_per_key`
+/// shares *keys* but never the divergent content that makes the loser's outcome
+/// observable, so it passed throughout while the window was open.
+///
+/// The batch analogue of the single-row conflict, so it needs the same
+/// ingredients: one shared identity (a withdrawal of one target, which derives
+/// its `id` from the target's own five inputs plus the invalidation kind) and
+/// **divergent content** under it (two different reason codes, which are not
+/// identity inputs). A shared-and-identical pair would absorb and say nothing
+/// about the losing branch.
+///
+/// Each side carries a private filler row as well, so this is a multi-row
+/// `UNNEST` insert rather than a one-row batch wearing the batch path's clothes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_batches_sharing_one_identity_admit_exactly_one() {
+    let (h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x0BA7_C401);
+
+    // **Several rounds, for the reason the deadlock test gives**: a race needs the
+    // two transactions to interleave and one round can miss it. One container
+    // bring-up costs about as much as this whole loop, so rounds are where the
+    // attempts are cheap. Each round uses a fresh target, so no round resolves
+    // against a previous round's stored withdrawal.
+    for round in 0..ROUNDS_PER_RACE {
+        let target = store
+            .create(common::entry_over(
+                &meter,
+                tenant,
+                &format!("batch-conflict-target-{round}"),
+                Decimal::new(10, 0),
+                common::fixture_window_start() + Duration::minutes(round),
+                common::fixture_window_end() + Duration::minutes(round),
+            ))
+            .await
+            .expect("create the target");
+
+        // The shared identity, with divergent content on each side.
+        let wa = common::withdrawal_of(&target);
+        let wb = common::withdrawal_of_with_reason(&target, "second_withdrawal");
+        assert_eq!(
+            wa.id, wb.id,
+            "round {round}: the two withdrawals must share one derived identity, or \
+             this test drives no collision at all: reason_code is not one of the six \
+             identity inputs"
+        );
+
+        // A private row per side, so each call is a genuine multi-row `UNNEST`
+        // insert rather than a one-row batch wearing the batch path's clothes.
+        let filler = |n: i64| {
+            common::entry_over(
+                &meter,
+                tenant,
+                &format!("batch-conflict-filler-{round}-{n}"),
+                Decimal::from(n + 1),
+                common::fixture_window_start() + Duration::minutes(round),
+                common::fixture_window_end() + Duration::minutes(round),
+            )
+        };
+
+        let (sa, sb) = (store.clone(), store.clone());
+        let (left, right) = (vec![wa, filler(1)], vec![wb, filler(2)]);
+        let (ra, rb) = tokio::join!(
+            tokio::spawn(async move { sa.create_batch(left).await }),
+            tokio::spawn(async move { sb.create_batch(right).await }),
+        );
+        let ra = ra
+            .expect("task a did not panic")
+            .unwrap_or_else(|e| panic!("round {round}: batch a failed as a whole: {e:?}"));
+        let rb = rb
+            .expect("task b did not panic")
+            .unwrap_or_else(|e| panic!("round {round}: batch b failed as a whole: {e:?}"));
+
+        // Each side's filler is its own identity and must be stored either way.
+        for (side, rows) in [("a", &ra), ("b", &rb)] {
+            assert_eq!(
+                rows.len(),
+                2,
+                "round {round} side {side} answers per input row"
+            );
+            assert!(
+                rows[1].is_ok(),
+                "round {round} side {side}'s private filler row collides with \
+                 nothing: {:?}",
+                rows[1]
+            );
+        }
+
+        // The shared identity: one acceptance, one IdempotencyConflict. Asserted
+        // over the pair rather than per side, because which side wins is the
+        // race's to decide.
+        let (left_shared, right_shared) = (&ra[0], &rb[0]);
+        let accepted = usize::from(left_shared.is_ok()) + usize::from(right_shared.is_ok());
+        assert_eq!(
+            accepted, 1,
+            "round {round}: exactly one of the two withdrawals is admitted; got \
+             a={left_shared:?} b={right_shared:?}"
+        );
+        let (winner, loser) = if let Ok(winner) = left_shared {
+            (winner, right_shared)
+        } else {
+            (
+                right_shared.as_ref().expect("exactly one of the two is Ok"),
+                left_shared,
+            )
+        };
+        match loser {
+            Err(UsageCollectorPluginError::IdempotencyConflict { existing, .. }) => {
+                assert_eq!(
+                    existing.id, winner.id,
+                    "round {round}: the conflict carries the winner"
+                );
+            }
+            other => panic!(
+                "round {round}: the losing withdrawal must be IdempotencyConflict, got \
+                 {other:?}. An Internal here is the non-arbiter PRIMARY KEY collision \
+                 this test exists for; a Transient is the same collision classified \
+                 differently"
+            ),
+        }
+
+        let withdrawals: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE invalidates = $1")
+                .bind(target.id)
+                .fetch_one(&h.pool)
+                .await
+                .expect("count withdrawals");
+        assert_eq!(
+            withdrawals, 1,
+            "round {round}: one stored withdrawal, whichever side won"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

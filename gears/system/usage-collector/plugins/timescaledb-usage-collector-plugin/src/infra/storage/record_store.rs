@@ -50,7 +50,9 @@ use usage_collector_sdk::{
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
 use crate::infra::storage::entity::UsageRecordRow;
-use crate::infra::storage::error::{acquire_error_clears_readiness, map_sqlx_err};
+use crate::infra::storage::error::{
+    acquire_error_clears_readiness, is_ledger_pk_violation, map_sqlx_err,
+};
 use crate::infra::storage::mapper::{
     invalidation_to_row, metadata_map_to_jsonb, record_row_to_model,
 };
@@ -329,6 +331,34 @@ impl PgRecordStore {
         mapped
     }
 
+    /// [`Self::record_backend_error`], plus the one insert-path error that is
+    /// retryable without being a connectivity or serialization fault: a PRIMARY
+    /// KEY collision with a concurrent writer of one of this write's own dedup
+    /// identities ([`is_ledger_pk_violation`]).
+    ///
+    /// **It is lifted here rather than in
+    /// [`crate::infra::storage::error::classify_db`]**, which still maps a
+    /// primary-key `23505` to a non-retryable `Internal`. That stays right for a
+    /// collision nothing intercepted: with the derived identity correct it is
+    /// unreachable outside this race. Only a write path knows it is in the race,
+    /// so only a write path may reclassify it.
+    ///
+    /// Re-running is what resolves it, and it must be a **fresh transaction**: the
+    /// winner is committed by the time this error is raised, so the re-run's
+    /// `ON CONFLICT` pre-check sees its row and skips that identity, leaving the
+    /// batch to resolve it as an ordinary dedup hit. `create_batch`'s bounded
+    /// jittered retry ([`with_retry`]) is exactly that, and it already treats a
+    /// deadlock victim the same way.
+    fn record_insert_error(&self, err: &sqlx::Error) -> UsageCollectorPluginError {
+        if is_ledger_pk_violation(err) {
+            self.metrics.inc_backend_error(ErrorClass::Transient);
+            return UsageCollectorPluginError::transient(
+                "a concurrent write of the same usage-entry identity committed first",
+            );
+        }
+        self.record_backend_error(err)
+    }
+
     /// Acquire a pooled connection, recording
     /// `uc_timescaledb_pool_acquire_duration_seconds`. Errors map
     /// through [`Self::record_backend_error`] (which also catches a TLS-handshake
@@ -421,6 +451,18 @@ impl PgRecordStore {
         //    computed for the proposed row. [`RECORD_COLUMNS`] reads back one
         //    more: `xact_id`, which the column default stamps and no bind
         //    supplies.
+        //
+        //    **Inside a SAVEPOINT**, because the insert has a third outcome
+        //    besides won and not-won: a concurrent writer of this same identity
+        //    can make it fail on the PRIMARY KEY, which the arbiter does not
+        //    cover ([`is_ledger_pk_violation`]). That error aborts the
+        //    transaction, and step 2b still has to read the winner's row inside
+        //    it, so the insert needs a point to roll back to. Serially this
+        //    never fires and the savepoint is two statements of pure overhead.
+        //
+        //    Task 5 collapses both insert paths onto DESIGN section 3.6's single
+        //    guarded statement, whose `LEFT JOIN ins USING (id)` shape resolves
+        //    the not-won row in the same statement; the savepoint goes then.
         let subject_id = record
             .subject_ref
             .as_ref()
@@ -432,28 +474,56 @@ impl PgRecordStore {
         let (invalidates, reason_code) = invalidation_to_row(record.invalidation.as_ref());
         let is_invalidation = invalidates.is_some();
 
-        let attempted =
-            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(SINGLE_INSERT_SQL.as_str()))
-                .bind(record.id)
-                .bind(record.tenant_id)
-                .bind(record.gts_type_id.as_str())
-                .bind(type_key)
-                .bind(record.quantity.as_decimal())
-                .bind(record.window_start)
-                .bind(record.window_end)
-                .bind(record.resource_ref.resource_id())
-                .bind(record.resource_ref.resource_type())
-                .bind(subject_id)
-                .bind(subject_type)
-                .bind(record.idempotency_key.as_str())
-                .bind(invalidates)
-                .bind(reason_code)
-                .bind(record.origin.as_str())
-                .bind(record.entry_type().as_str())
-                .bind(record.accepted_at)
-                .bind(metadata)
-                .fetch_optional(&mut *tx)
-                .await;
+        // The savepoint and the insert share one scope so the borrow of `tx` ends
+        // before any outer rollback: every error below is carried out of the block
+        // and acted on after it, rather than handled inside it.
+        let attempted = async {
+            let mut sp = tx.begin().await?;
+            let row =
+                sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(SINGLE_INSERT_SQL.as_str()))
+                    .bind(record.id)
+                    .bind(record.tenant_id)
+                    .bind(record.gts_type_id.as_str())
+                    .bind(type_key)
+                    .bind(record.quantity.as_decimal())
+                    .bind(record.window_start)
+                    .bind(record.window_end)
+                    .bind(record.resource_ref.resource_id())
+                    .bind(record.resource_ref.resource_type())
+                    .bind(subject_id)
+                    .bind(subject_type)
+                    .bind(record.idempotency_key.as_str())
+                    .bind(invalidates)
+                    .bind(reason_code)
+                    .bind(record.origin.as_str())
+                    .bind(record.entry_type().as_str())
+                    .bind(record.accepted_at)
+                    .bind(metadata)
+                    .fetch_optional(&mut *sp)
+                    .await;
+            match row {
+                // RELEASE SAVEPOINT. The row stays in the outer transaction.
+                Ok(row) => {
+                    sp.commit().await?;
+                    Ok(row)
+                }
+                // A concurrent writer of this very identity won and committed —
+                // Postgres waits on its speculative token before raising this, so
+                // by now its row is visible. ROLLBACK TO SAVEPOINT clears the
+                // aborted state and leaves the outer transaction usable, and the
+                // outcome is exactly the not-won one: step 2b reads the winner and
+                // resolves absorb-vs-conflict, which is what DESIGN section 3.3's
+                // `dedup-concurrent` row requires of the loser.
+                Err(e) if is_ledger_pk_violation(&e) => {
+                    sp.rollback().await?;
+                    Ok(None)
+                }
+                // Dropping `sp` queues its rollback; the outer transaction is
+                // rolled back wholesale below in any case.
+                Err(e) => Err(e),
+            }
+        }
+        .await;
 
         let inserted = match attempted {
             Ok(inserted) => inserted,
@@ -554,6 +624,15 @@ impl PgRecordStore {
     ///
     /// Errors come back as the raw `sqlx::Error` rather than mapped: the caller
     /// holds the transaction that has to be rolled back first.
+    ///
+    /// **A PRIMARY KEY collision is the caller's to handle, not this function's.**
+    /// The arbiter covers the dedup UNIQUE only, so a concurrent writer of one of
+    /// these identities surfaces as a `23505` on the primary key rather than as an
+    /// absent `RETURNING` row. Unlike the single-row path there is nothing to
+    /// resolve in place - a failed multi-row insert reports no won set at all - so
+    /// `create_batch_inner` lifts it to a `Transient`
+    /// ([`PgRecordStore::record_insert_error`]) and the whole batch re-runs on a
+    /// fresh transaction.
     async fn insert_records_on_conflict(
         tx: &mut sqlx::Transaction<'_, Postgres>,
         reps: &[&UsageRecord],
@@ -747,6 +826,11 @@ impl PgRecordStore {
     /// default gives only because one `pg_current_xact_id()` covers the whole
     /// transaction (this plugin's DESIGN §3.6). A per-row transaction would
     /// scatter the batch across the feed order.
+    ///
+    /// That is also what makes the insert's own SAVEPOINT necessary rather than
+    /// tidy: the insert can fail on a unique index its `ON CONFLICT` arbiter does
+    /// not cover, and the transaction has to survive that to read the conflicts
+    /// (see [`Self::insert_records_on_conflict`]).
     async fn create_batch_inner(
         &self,
         records: &[UsageRecord],
@@ -779,7 +863,7 @@ impl PgRecordStore {
             Ok(rows) => rows,
             Err(e) => {
                 rollback(tx).await;
-                return Err(self.record_backend_error(&e));
+                return Err(self.record_insert_error(&e));
             }
         };
         // `inserted` is the won set; there is no second copy of it to drift.
@@ -1429,8 +1513,14 @@ fn plan_batch(records: &[UsageRecord]) -> BatchPlan<'_> {
 
 /// Total `create_batch` attempts: one initial try plus two retries. A bounded
 /// in-process retry so a rare deadlock victim self-heals transparently instead
-/// of bubbling an `Err(Transient)` to the host (see [`with_retry`]).
-const MAX_BATCH_ATTEMPTS: u32 = 3;
+/// of bubbling an `Err(Transient)` to the host (see `with_retry`, private and so
+/// named in plain backticks).
+///
+/// `pub` for the reason `migration_probe`'s functions are: an integration-test
+/// crate is external to this one, and `records_ingest_integration_pg` derives the
+/// bound on `uc_timescaledb_batch_retries_total` it asserts from this value
+/// rather than writing a number that a change here would silently invalidate.
+pub const MAX_BATCH_ATTEMPTS: u32 = 3;
 
 /// Deterministic pre-jitter backoff base for the `attempt`-th retry (1-based).
 /// A short exponential — 5 ms, 10 ms, … — because a deadlock victim can retry

@@ -78,6 +78,44 @@ fn is_constraint(actual: &str, name: &str) -> bool {
     actual == name || actual.strip_suffix(name).is_some_and(|p| p.ends_with('_'))
 }
 
+/// Name of the ledger's PRIMARY KEY as `PostgreSQL` derives it from
+/// `PRIMARY KEY (id, window_end, type_key)` (`migrations/0001_init.sql`).
+const LEDGER_PK: &str = "usage_records_pkey";
+
+/// True when `err` is a unique violation on the ledger's PRIMARY KEY.
+///
+/// **This denotes the same dedup identity `DEDUP_UNIQUE` covers, and that is
+/// why the write path can resolve it rather than fail.** That constant is named
+/// in plain backticks rather than linked, because it is private and this item is
+/// public. The entry `id` is a
+/// `UUIDv5` over the same 6-tuple the dedup UNIQUE spans
+/// (`cpt-cf-usage-collector-adr-record-identity-derivation`), so two rows that
+/// collide on the primary key necessarily collide on the dedup identity too —
+/// the migration says as much where it keeps the two as "the same key".
+///
+/// **It is reachable only under concurrency, and only because an `ON CONFLICT`
+/// arbiter names one index.** Both insert paths arbitrate on the dedup 6-tuple,
+/// and `DO NOTHING` suppresses a conflict on *that* index alone; a conflict on
+/// any other unique index is raised as an ordinary `23505`. A writer whose
+/// arbiter pre-check finds nothing therefore speculatively inserts, and its
+/// insert into the primary-key index can still meet a concurrent writer of the
+/// same identity. Serially this cannot happen: the pre-check sees the committed
+/// row and skips it without touching any index.
+///
+/// This is deliberately **not** folded into [`classify_db`], which maps a
+/// primary-key `23505` to [`DbErrorClass::Other`] and so to a non-retryable
+/// `Internal`. That remains right for a primary-key violation nothing
+/// intercepted: with the derivation correct it is unreachable outside this race,
+/// so reaching the catch-all still means something is wrong. This predicate is
+/// the write path declaring the one case it knows how to resolve, and the
+/// division of labour is the point — see `error_tests`.
+#[must_use]
+pub fn is_ledger_pk_violation(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db)
+        if db.code().as_deref() == Some("23505")
+            && db.constraint().is_some_and(|c| is_constraint(c, LEDGER_PK)))
+}
+
 /// 23503 `foreign_key_violation` has no arm: the schema declares no foreign
 /// key, so it is unreachable and falls to `Other`.
 #[must_use]
