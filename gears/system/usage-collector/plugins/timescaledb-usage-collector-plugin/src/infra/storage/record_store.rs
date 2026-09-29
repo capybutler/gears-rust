@@ -838,10 +838,12 @@ impl PgRecordStore {
     /// transaction (this plugin's DESIGN §3.6). A per-row transaction would
     /// scatter the batch across the feed order.
     ///
-    /// That is also what makes the insert's own SAVEPOINT necessary rather than
-    /// tidy: the insert can fail on a unique index its `ON CONFLICT` arbiter does
-    /// not cover, and the transaction has to survive that to read the conflicts
-    /// (see [`Self::insert_records_on_conflict`]).
+    /// This path carries **no** SAVEPOINT, where the single-row path does. The
+    /// insert can fail here too on a unique index its `ON CONFLICT` arbiter does
+    /// not cover, but a failed multi-row insert reports no won set at all, so
+    /// there is nothing to resolve in place: the transaction is rolled back, the
+    /// failure is lifted to a `Transient`, and the whole batch re-runs on a
+    /// fresh transaction (see [`Self::insert_records_on_conflict`]).
     async fn create_batch_inner(
         &self,
         records: &[UsageRecord],
@@ -1523,15 +1525,11 @@ fn plan_batch(records: &[UsageRecord]) -> BatchPlan<'_> {
 }
 
 /// Total `create_batch` attempts: one initial try plus two retries. A bounded
-/// in-process retry so a rare deadlock victim self-heals transparently instead
-/// of bubbling an `Err(Transient)` to the host (see `with_retry`, private and so
-/// named in plain backticks).
-///
-/// `pub` for the reason `migration_probe`'s functions are: an integration-test
-/// crate is external to this one, and `records_ingest_integration_pg` derives the
-/// bound on `uc_timescaledb_batch_retries_total` it asserts from this value
-/// rather than writing a number that a change here would silently invalidate.
-pub const MAX_BATCH_ATTEMPTS: u32 = 3;
+/// in-process retry so a transient backend error self-heals transparently
+/// instead of bubbling an `Err(Transient)` to the host (see `with_retry` and
+/// `is_retryable_batch_error`, both private and so named in plain backticks;
+/// the second is where the causes that reach this loop are listed).
+const MAX_BATCH_ATTEMPTS: u32 = 3;
 
 /// Deterministic pre-jitter backoff base for the `attempt`-th retry (1-based).
 /// A short exponential — 5 ms, 10 ms, … — because a deadlock victim can retry
@@ -1575,7 +1573,11 @@ fn batch_retry_backoff(attempt: u32) -> Duration {
 /// timeouts (`55P03`, which a batch hits when it waits out `lock_timeout` on a
 /// speculative tuple another in-flight batch holds) and connection blips
 /// collapse to the same bucket
-/// inside the storage helpers, and all are safe to re-run for this idempotent
+/// inside the storage helpers, and so does a concurrent writer of one of this
+/// batch's own dedup identities colliding on the ledger's PRIMARY KEY, which
+/// the `ON CONFLICT` arbiter does not cover and which `record_insert_error`
+/// lifts to a `Transient` so the re-run resolves against the winner's committed
+/// row (this plugin's DESIGN §3.6). All are safe to re-run for this idempotent
 /// batch. `Internal`,
 /// `IdempotencyConflict` and the other typed domain outcomes are non-retryable
 /// and returned unchanged. Per-row

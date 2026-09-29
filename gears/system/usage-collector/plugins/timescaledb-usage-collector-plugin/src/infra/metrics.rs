@@ -259,7 +259,7 @@ pub struct Metrics {
     /// `uc_timescaledb_dedup_late_convergence_total` — writes discarded after their dedup identity converged. Always zero: this plugin is `linearizable`, so no write is decided after convergence.
     _dedup_late_convergence: Counter<u64>,
     /// `uc_timescaledb_batch_retries_total` — bounded in-process `create_batch`
-    /// retries after a transient backend error (deadlock victim self-heal).
+    /// retries after a transient backend error.
     batch_retry: Counter<u64>,
     /// `uc_timescaledb_query_requests_total` — labelled by `query_kind`.
     query_requests: Counter<u64>,
