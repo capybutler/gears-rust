@@ -193,14 +193,17 @@ struct TieBreakScenario {
 /// let such a backend answer correctly by accident, which is the second way
 /// a scenario here can pass while asserting nothing.
 ///
-/// That is not a hypothetical backend. The `TimescaleDB` plugin orders
-/// `LATEST` by `window_end DESC, acceptance_sequence DESC`, and
-/// `acceptance_sequence` is a per-`(tenant_id, gts_type_id)` counter claimed
-/// at insert: it is arrival order inside one tenant and one meter, and no
-/// order at all across a group spanning tenants. The `accepted_at` scenario
-/// is what puts arrival order and DESIGN's middle key in opposition, and the
-/// cross-tenant scenario is what asks for an order the counter cannot
-/// supply.
+/// That is not a hypothetical backend, and this check was written against a
+/// real one. The `TimescaleDB` plugin ordered `LATEST` by
+/// `window_end DESC, acceptance_sequence DESC`, where `acceptance_sequence` was
+/// a per-`(tenant_id, gts_type_id)` counter claimed at insert: arrival order
+/// inside one tenant and one meter, and no order at all across a group spanning
+/// tenants. The `accepted_at` scenario is what put arrival order and DESIGN's
+/// middle key in opposition, and the cross-tenant scenario is what asked for an
+/// order that counter could not supply. That plugin now orders on all three
+/// keys and passes, which is what the two scenarios were built to be able to
+/// tell — a backend is not required to have made the mistake for them to mean
+/// something, but one did, and they caught it.
 ///
 /// Each scenario is asserted separately, and they fail independently. One
 /// combined assertion would pass against a backend that got two keys wrong in

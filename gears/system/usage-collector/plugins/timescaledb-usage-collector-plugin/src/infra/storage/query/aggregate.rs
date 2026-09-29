@@ -27,44 +27,30 @@ use super::translate::SqlCtx;
 
 /// The [`AggregationFold::Latest`] arm of [`fold_select_expr`].
 ///
-/// This backend orders by *greatest `window_end`, then greatest
-/// `acceptance_sequence`*, terminating because the sequence is monotonic inside
-/// the group's scope — strictly so per `(tenant_id, gts_type_id)`, which this
-/// plugin assigns itself. A narrower group inherits that order; a group
-/// spanning tenants is outside the argument, and no cross-tenant total order is
-/// claimed.
-///
-/// **That is this plugin's rule, and DESIGN's is no longer the same one.**
-/// DESIGN §3.1 states the `LATEST` tie-break as *greatest `window_end`, then
-/// greatest `accepted_at`, then greatest `id` in byte order*, adding that `id`
+/// **Three keys, and the third is what makes the order total.** The gear's
+/// DESIGN §3.1 states the `LATEST` tie-break as *"Greatest `window_end`, then
+/// greatest `accepted_at`, then greatest `id` in byte order"*, adding that `id`
 /// is unique so the order is total and that all three keys compare across
-/// tenants and types. `acceptance_sequence` appears nowhere in the gear's
-/// DESIGN, so the earlier claim here that §3.1 declared it — and that §3.7
-/// restated it as a storage obligation — was an attribution to a rule DESIGN
-/// does not carry. The two orders agree whenever `accepted_at` separates the
-/// tied entries in the same direction as commit order, which is the ordinary
-/// case, and can disagree in three:
+/// tenants and types — so it holds for a group spanning tenants. This plugin's
+/// own DESIGN §3.6 states the same rule as its own: *"`LATEST` orders by
+/// `window_end DESC, accepted_at DESC, id DESC`, a total order across
+/// tenants."* This expression is that, key for key.
 ///
-/// * a group spanning tenants or types, where `acceptance_sequence` is scoped
-///   per `(tenant_id, gts_type_id)` and orders nothing across scopes, while
-///   §3.1 requires a total order there;
-/// * two entries sharing an `accepted_at`, where §3.1 falls to greatest `id`
-///   and this expression falls to the greater sequence;
-/// * an entry whose commit lands after one with a later `accepted_at` — the
-///   case DESIGN §3.3's `dedup-concurrent` row explicitly contemplates — where
-///   the two rules pick opposite entries.
+/// Every key is a stored column of the row being folded, so none of this rests
+/// on an ordering the plugin assigns. `id` is the `UUIDv5` entry identity and
+/// `uuid` comparison in `PostgreSQL` is over the bytes, which is the byte order
+/// §3.1 names. Nothing here is scoped: a group spanning tenants or types is
+/// ordered by the same three keys as a group inside one scope.
 ///
-/// **The SDK's `latest-tie-break` check has landed, and this expression fails
-/// it.** It is in the SDK's `IMPLEMENTED_CHECKS` now and `contract::run_all`
-/// dispatches it, so `contract_conformance_pg`'s `NOT_YET_CONFORMING` row for
-/// it is live rather than waiting: the check reports the second of the three
-/// divergences above, two entries sharing a `window_end` where `accepted_at`
-/// ranks them one way and `acceptance_sequence` the other. Its cross-tenant
-/// scenario, the first divergence, is not reported reliably here and that is
-/// this expression's doing rather than the check's - with both keys tied the
-/// `ORDER BY` ranks nothing, so which entry `[1]` picks is whatever the scan
-/// produced. This module's tests pin the expression as written, not as DESIGN
-/// declares it; slice 7 is where it changes.
+/// **None of the three keys is droppable, and that is measured rather than
+/// argued.** The SDK's `latest-tie-break` check is in `IMPLEMENTED_CHECKS` and
+/// `contract::run_all` dispatches it against this backend. Its `accepted_at`
+/// scenario builds a pair that ties on `window_end` and whose arrival order and
+/// `id` order both disagree with `accepted_at`, so a fold that falls from
+/// `window_end` straight through to `id` picks the wrong entry; its cross-tenant
+/// scenario is what asks for an order above any per-scope one. This backend
+/// passes the check, which is why `contract_conformance_pg`'s
+/// `NOT_YET_CONFORMING` carries no row for it.
 ///
 /// `LATEST` is an ordered pick, not an aggregate function — but
 /// `ARRAY_AGG(… ORDER BY …)[1]` composes in a grouped SELECT list exactly as
@@ -83,8 +69,8 @@ use super::translate::SqlCtx;
 /// The measurement itself - ~25 MB saved on a single-group worst case, and why
 /// that does not buy the composition back - is on
 /// [`super::super::record_store::PgRecordStore`]'s `aggregate`.
-const LATEST_SELECT_EXPR: &str =
-    "(ARRAY_AGG(r.quantity ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric";
+const LATEST_SELECT_EXPR: &str = "(ARRAY_AGG(r.quantity ORDER BY r.window_end DESC, \
+     r.accepted_at DESC, r.id DESC))[1]::numeric";
 
 /// SQL expression folding the selected rows, one arm per [`AggregationFold`].
 ///
@@ -261,8 +247,11 @@ pub fn dimension_presence_guard(dim: &AggregationDimension, select_expr: &str) -
 /// With no grouping (`dim_count == 0`) there is one aggregate row and no
 /// cardinality to bound, so the clause is empty.
 ///
-/// It bounds *groups*, not rows per group: [`LATEST_SELECT_EXPR`] materializes a
-/// group's values before picking one, and nothing here caps that.
+/// It bounds *groups*, not rows per group: the `LATEST` arm of
+/// [`fold_select_expr`] materializes a group's values before picking one, and
+/// nothing here caps that. Named in plain backticks rather than linked, because
+/// the constant it names is private and this item is public: an intra-doc link
+/// from here resolves only under `--document-private-items`.
 #[must_use]
 pub fn aggregate_limit_clause(dim_count: usize) -> String {
     if dim_count == 0 {

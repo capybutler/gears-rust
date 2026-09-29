@@ -501,18 +501,28 @@ async fn the_feed_order_column_is_an_xid8_the_database_stamps() {
     );
 }
 
-/// `usage_records_feed_idx` and `usage_records_watermark_idx`, read back as
-/// the database built them.
+/// The four non-partial ledger indexes, read back as the database built them.
 ///
-/// `DESIGN.md` §3.7 declares `usage_records_feed_idx (gts_type_id, xact_id,
-/// id)`, which "serves the feed order", and `usage_records_watermark_idx
-/// (gts_type_id, tenant_id, accepted_at DESC)`, which "serves the
-/// reconciliation acceptance watermark". Column order is the whole point of
-/// both — an index over the same three columns in another order serves
-/// neither — so this reads each definition rather than merely asserting the
-/// index exists.
+/// `DESIGN.md` §3.7 declares every one of them over exactly these columns:
+/// `usage_records_feed_idx (gts_type_id, xact_id, id)`, which "serves the feed
+/// order"; `usage_records_watermark_idx (gts_type_id, tenant_id, accepted_at
+/// DESC)`, which "serves the reconciliation acceptance watermark"; and
+/// `usage_records_tenant_type_window_idx (tenant_id, gts_type_id, window_end
+/// DESC)` with `usage_records_tenant_window_idx (tenant_id, window_end DESC)`,
+/// which "support time-windowed reads". Column order is the whole point of each
+/// — an index over the same columns in another order serves none of them — so
+/// this reads every definition back rather than merely asserting the index
+/// exists.
+///
+/// **The two window indexes had no oracle at all until this assertion**, which
+/// is why they are here rather than only in the migration. The first of them
+/// carried a trailing tie-break column while the `LATEST` fold ordered on a
+/// plugin-assigned sequence; the fold now orders on `accepted_at` and `id`,
+/// neither of which is a leading key here, so the column went. Nothing would
+/// have noticed it coming back: the column-order test reads the *table's*
+/// columns, and a trailing index column is invisible to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_feed_and_watermark_indexes_are_built_in_their_declared_order() {
+async fn the_ledger_indexes_are_built_in_their_declared_order() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
@@ -522,6 +532,14 @@ async fn the_feed_and_watermark_indexes_are_built_in_their_declared_order() {
         (
             "usage_records_watermark_idx",
             "(gts_type_id, tenant_id, accepted_at DESC)",
+        ),
+        (
+            "usage_records_tenant_type_window_idx",
+            "(tenant_id, gts_type_id, window_end DESC)",
+        ),
+        (
+            "usage_records_tenant_window_idx",
+            "(tenant_id, window_end DESC)",
         ),
     ] {
         let def: String =

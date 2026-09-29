@@ -25,11 +25,10 @@ pub enum DbErrorClass {
 /// Every request-path connection carries a fixed `lock_timeout`
 /// ([`crate::infra::storage::pool`]), so a statement that waits too long on a
 /// contended lock fails with `55P03` rather than pinning a pooled connection.
-/// The ingest path takes one such lock on **every** entry — the
-/// `usage_acceptance_sequence` row for the entry's `(tenant_id, gts_type_id)`
-/// scope — and waits on a second only when it meets one: the speculative tuple
-/// an in-flight same-key insert holds. Losing either race is an ordinary
-/// contention outcome on a hot scope, self-healing on retry. Left in
+/// The ingest path waits on exactly one lock, and only when it meets one: the
+/// speculative tuple an in-flight insert of the same dedup 6-tuple holds until
+/// it commits. Losing that race is an ordinary contention outcome between two
+/// writers of one identity, self-healing on retry. Left in
 /// `Other` it maps to a non-retryable `Internal` and
 /// `is_retryable_batch_error` refuses to re-run a batch that is idempotent by
 /// construction.
@@ -60,7 +59,8 @@ fn is_transient_sqlstate(code: &str) -> bool {
 /// Both end in `_<name>`, and `chunk_id` is a global sequence across every
 /// hypertable in the database, so no fixed prefix can be hardcoded. Bare
 /// equality still holds for CHECK constraints, which are not renamed, and for
-/// non-hypertable tables such as `usage_acceptance_sequence`.
+/// non-hypertable tables such as `usage_type_key` and
+/// `usage_feed_retention_marks`.
 ///
 /// The `_` anchor over a plain `ends_with` costs nothing and stops an
 /// unrelated name that merely ends in the same characters without a separator.

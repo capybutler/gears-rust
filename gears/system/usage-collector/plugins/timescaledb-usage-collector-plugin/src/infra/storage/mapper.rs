@@ -189,11 +189,11 @@ pub fn metadata_map_to_jsonb(map: &BTreeMap<MetadataKey, String>) -> JsonValue {
 
 /// Map a [`UsageRecordRow`] into a validated [`UsageRecord`].
 ///
-/// The row's two ordering columns and its `entry_type` are read and
-/// deliberately dropped, because the model has no field for any of them.
-/// `acceptance_sequence` and `xact_id` are assignments made where the entry is
-/// stored — one this plugin's, one the database's — and neither travels back
-/// out through the SPI as a record field. `entry_type` is dropped for the
+/// The row's `xact_id` and its `entry_type` are read and deliberately dropped,
+/// because the model has no field for either. `xact_id` is assigned where the
+/// entry is stored — by the database, from the inserting transaction — and does
+/// not travel back out through the SPI as a record field; it reaches a caller
+/// only inside a `FeedPosition`. `entry_type` is dropped for the
 /// opposite reason: the model already answers what it holds, projecting an
 /// entry's kind from the `Invalidation` it carries, and
 /// `cpt-cf-usage-collector-adr-append-only-invalidation` is explicit that no

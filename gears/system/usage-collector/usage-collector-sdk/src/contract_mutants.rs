@@ -1121,12 +1121,13 @@ pub(super) enum Defect {
     /// to show is not the case.
     ///
     /// It is the mistake a backend makes by having a per-tenant sequence and
-    /// no order above it — the shape this gear's own `TimescaleDB` plugin
-    /// starts from, whose `usage_acceptance_sequence` keys its counter on
-    /// `(tenant_id, gts_type_id)`. A backend in that position cannot issue
-    /// one scalar that resumes a whole subscription, so it issues a vector:
-    /// one component per tenant, and the position grows with the customer
-    /// list.
+    /// no order above it. A backend in that position cannot issue one scalar
+    /// that resumes a whole subscription, so it issues a vector: one component
+    /// per tenant, and the position grows with the customer list. This gear's
+    /// own `TimescaleDB` plugin started from a counter keyed on
+    /// `(tenant_id, gts_type_id)` and so from exactly here; it retired that
+    /// counter for the `xid8` of the inserting transaction, which is one
+    /// instance-wide order and needs no component per tenant.
     ///
     /// **It keys on the tenants the subscription's ledger holds, not on the
     /// tenants the caller's grant names**, and that is the only

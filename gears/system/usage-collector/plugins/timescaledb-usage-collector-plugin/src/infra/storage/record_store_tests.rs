@@ -20,7 +20,7 @@ use super::{
     INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore, RECORD_COLUMNS,
     SINGLE_INSERT_SQL, batch_retry_backoff, batch_retry_backoff_base, build_aggregate_sql,
     build_get_sql, build_list_page, build_list_sql, dedup_key, is_retryable_batch_error,
-    plan_batch, record_row_key, row_dedup_key, scope_runs, sequence_block, with_retry,
+    plan_batch, record_row_key, row_dedup_key, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -254,7 +254,6 @@ fn row_matching(
         reason_code,
         origin: record.origin.as_str().to_owned(),
         entry_type: record.entry_type().as_str().to_owned(),
-        acceptance_sequence: 1,
         accepted_at: record.window_end,
         xact_id: "1001".to_owned(),
         metadata,
@@ -375,8 +374,10 @@ async fn resolve_dedup_hit_compares_the_reason_code() {
 // all three onto one `INSERT_COLUMNS` makes the transposition unrepresentable;
 // these assertions are what keep it that way.
 //
-// The `.bind()` call sequence is one layer further down and still uncovered
-// here — it needs a live backend, and it is Task 15's.
+// The `.bind()` call sequence is one layer further down and is not covered
+// here — it needs a live backend. It has one:
+// `records_ingest_integration_pg::a_row_written_through_the_batch_insert_reads_back_column_for_column`
+// writes a row through each insert path and reads every column back by name.
 
 /// The comma-separated entries of a SQL column list, verbatim.
 fn names(list: &str) -> Vec<&str> {
@@ -759,20 +760,18 @@ fn plan_batch_gives_a_record_and_its_withdrawal_two_slots() {
     );
     assert_eq!(
         plan.reps[0].id, target.id,
-        "and the record sorts first, so the acceptance-sequence block hands it \
-         the lower value. That order is plugin-local and satisfies no gear \
-         rule -- see the DedupKey doc, which says why the Feed order \
-         invariant is not what it pins"
+        "and the record sorts first, because `entry_type_rank` puts it there. \
+         Nothing stored observes that order -- the pair would share one \
+         transaction and so one `xact_id` -- so this pins the comparator's \
+         direction and claims nothing about the ledger. See the DedupKey doc, \
+         which says why the Feed order invariant is not what it pins"
     );
 }
 
-// --- The batch insert's column pivot and sequence-block arithmetic ---
+// --- The batch insert's column pivot ---
 //
-// Both are pure and both are places a defect is invisible everywhere else: a
-// swapped push in the pivot corrupts every batched row while every other test
-// still passes, and an off-by-one in the block expansion reuses or skips a
-// sequence value that no constraint can object to (the counter row is the sole
-// authority, `migrations/0001_init.sql`).
+// Pure, and a place a defect is invisible everywhere else: a swapped push in the
+// pivot corrupts every batched row while every other test still passes.
 
 #[test]
 fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
@@ -798,7 +797,7 @@ fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
     );
     let with = withdrawal(tenant, "idem-b", 0xD102, target);
 
-    let cols = InsertColumns::build(&[&plain, &with], &[7, 8], &[3, 4]);
+    let cols = InsertColumns::build(&[&plain, &with], &[3, 4]);
 
     assert_eq!(cols.ids, vec![plain.id, with.id]);
     assert_eq!(cols.tenants, vec![tenant, tenant]);
@@ -862,58 +861,9 @@ fn insert_columns_pivots_each_record_into_the_column_it_is_bound_as() {
          each so a constant would not pass"
     );
     assert_eq!(
-        cols.sequences,
-        vec![7, 8],
-        "the claimed acceptance sequences, in representative order"
-    );
-    assert_eq!(
         cols.metadata,
         vec![r#"{"region":"eu-west"}"#.to_owned(), "{}".to_owned()],
         "metadata is carried as text and cast ::jsonb per row in the query"
-    );
-}
-
-#[test]
-fn scope_runs_groups_the_contiguous_same_scope_representatives() {
-    // `reps` reach this sorted by DedupKey, whose first two components are the
-    // scope — so same-scope entries are contiguous and one pass finds them.
-    let t1 = uuid::Uuid::from_u128(0xD2);
-    let t2 = uuid::Uuid::from_u128(0xD3);
-    let other_meter = usage_collector_sdk::MeterTypeId::new(
-        "gts.cf.core.uc.usage_record.v1~cf.storage._.gb_hours.v1~",
-    )
-    .expect("valid meter id");
-
-    let a1 = unit_record(t1, "a1", 0xD201);
-    let a2 = unit_record(t1, "a2", 0xD202);
-    let mut b = unit_record(t1, "b", 0xD203);
-    b.gts_type_id = other_meter;
-    let c = unit_record(t2, "c", 0xD204);
-
-    assert_eq!(
-        scope_runs(&[&a1, &a2, &b, &c]),
-        vec![(0, 2), (2, 3), (3, 4)],
-        "one run per scope: two entries on (t1, vcpu), then (t1, gb_hours), then (t2, vcpu)"
-    );
-    assert_eq!(scope_runs(&[]), vec![], "an empty batch claims nothing");
-    assert_eq!(scope_runs(&[&a1]), vec![(0, 1)]);
-}
-
-#[test]
-fn a_claimed_block_expands_to_the_values_below_its_returned_last() {
-    // `claim_acceptance_sequence` returns the block's LAST value, because
-    // `RETURNING next_value` yields the counter after adding `count`. On a
-    // scope's first claim the counter goes 0 -> 3 and the block is 1, 2, 3.
-    assert_eq!(sequence_block(3, 3), vec![1, 2, 3]);
-    assert_eq!(sequence_block(1, 1), vec![1], "the single-row case");
-    assert_eq!(
-        sequence_block(10, 3),
-        vec![8, 9, 10],
-        "a later claim continues from wherever the counter stood"
-    );
-    assert!(
-        sequence_block(5, 0).is_empty(),
-        "an empty scope run claims no values"
     );
 }
 
@@ -1577,7 +1527,6 @@ fn keyed_row() -> UsageRecordRow {
         reason_code: None,
         origin: "backfill".to_owned(),
         entry_type: "record".to_owned(),
-        acceptance_sequence: 9,
         accepted_at: time::OffsetDateTime::from_unix_timestamp(WINDOW_END_UNIX).expect("valid ts"),
         xact_id: "9042".to_owned(),
         metadata: serde_json::json!({}),

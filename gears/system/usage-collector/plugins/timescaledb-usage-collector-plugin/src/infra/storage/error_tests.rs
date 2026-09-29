@@ -215,8 +215,8 @@ fn a_name_that_merely_ends_in_a_constraint_name_is_not_that_constraint() {
 #[test]
 fn lock_not_available_is_transient_so_the_batch_retry_can_see_it() {
     // Every request-path connection sets `lock_timeout` (pool.rs), and the
-    // ingest path now takes a per-scope row lock on `usage_acceptance_sequence`
-    // plus the dedup tuple lock, so a 5s wait that times out is an ordinary
+    // ingest path waits on the dedup tuple lock when an insert of the same
+    // 6-tuple is already in flight, so a 5s wait that times out is an ordinary
     // contention outcome rather than a defect. Classified `Other` it would map
     // to a non-retryable `Internal` and `is_retryable_batch_error` would refuse
     // to re-run an operation that is idempotent by construction.

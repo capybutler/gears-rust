@@ -164,7 +164,7 @@ fn a_real_column_that_is_not_a_filter_field_does_not_resolve() {
         "gts_type_id",
         "quantity",
         "idempotency_key",
-        "acceptance_sequence",
+        "xact_id",
         "metadata",
         "accepted_at",
     ] {

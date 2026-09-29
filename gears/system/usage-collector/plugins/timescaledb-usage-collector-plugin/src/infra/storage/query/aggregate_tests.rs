@@ -53,21 +53,26 @@ fn every_fold_casts_to_numeric() {
 }
 
 #[test]
-fn latest_picks_the_greatest_window_end_then_acceptance_sequence() {
-    // This plugin's tie-break is greatest `window_end`, then greatest
-    // `acceptance_sequence`. Both keys are DESC and in that order; `[1]` takes
-    // the head of the ordered array. This pins what the expression *is*, not
-    // that it conforms: DESIGN 3.1's rule is greatest `window_end`, then
-    // greatest `accepted_at`, then greatest `id` in byte order, and
-    // `acceptance_sequence` is this plugin's own column rather than anything
-    // DESIGN names. `fold_select_expr`'s docs carry the three cases where the
-    // two orders disagree. The SDK's `latest-tie-break` check now catches it:
-    // it is in `IMPLEMENTED_CHECKS`, `contract::run_all` dispatches it, and
-    // `contract_conformance_pg` carries the declared non-conformance row that
-    // keeps that suite green until slice 7 changes this expression.
+fn latest_picks_the_greatest_window_end_then_accepted_at_then_id() {
+    // The gear's DESIGN 3.1 rule, key for key: greatest `window_end`, then
+    // greatest `accepted_at`, then greatest `id` in byte order. All three keys
+    // are DESC and in that order; `[1]` takes the head of the ordered array.
+    // `id` is unique, so the order is total and holds across a group spanning
+    // tenants -- which is why the third key is not decoration. This plugin's
+    // own DESIGN 3.6 states the same rule as its own.
+    //
+    // Pinning the whole expression as a literal, rather than asserting that it
+    // contains each key, is what makes a reordering visible: `accepted_at DESC,
+    // window_end DESC` contains all three keys and answers a different fold.
+    //
+    // The SDK's `latest-tie-break` check is what holds this to the rule against
+    // a live backend, over a pair whose `id` order and arrival order both
+    // disagree with `accepted_at`. This assertion is the in-process half: it
+    // reddens without a container.
     assert_eq!(
         fold_select_expr(AggregationFold::Latest),
-        "(ARRAY_AGG(r.quantity ORDER BY r.window_end DESC, r.acceptance_sequence DESC))[1]::numeric"
+        "(ARRAY_AGG(r.quantity ORDER BY r.window_end DESC, r.accepted_at DESC, \
+         r.id DESC))[1]::numeric"
     );
 }
 
@@ -214,7 +219,6 @@ const LEDGER_COLUMNS: &[&str] = &[
     "reason_code",
     "origin",
     "entry_type",
-    "acceptance_sequence",
     "accepted_at",
     "xact_id",
     "metadata",

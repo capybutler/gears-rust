@@ -3,8 +3,9 @@
 //! `PgRecordStore` ingest against a live `TimescaleDB`. Requires Docker.
 //!
 //! The behavioural home for the write path: dedup (absorb / conflict), the
-//! per-scope acceptance sequence, at most one invalidation as a dedup outcome (a later call, one
-//! batch, two concurrent calls), and per-row batch outcomes aligned with input order.
+//! transaction id every entry is stamped with, at most one invalidation as a
+//! dedup outcome (a later call, one batch, two concurrent calls), and per-row
+//! batch outcomes aligned with input order.
 //!
 //! One thing here exists nowhere else in the crate:
 //!
@@ -184,7 +185,6 @@ struct Raw {
     invalidates: Option<Uuid>,
     reason_code: Option<String>,
     origin: String,
-    acceptance_sequence: i64,
     metadata: JsonValue,
     entry_type: String,
 }
@@ -197,20 +197,23 @@ struct Raw {
 /// it for the same reason.
 const RAW_SELECT_SQL: &str = "SELECT id, tenant_id, gts_type_id, quantity, window_start, window_end, resource_id, \
      resource_type, subject_id, subject_type, idempotency_key, invalidates, reason_code, \
-     origin, acceptance_sequence, metadata, entry_type::text AS entry_type \
+     origin, metadata, entry_type::text AS entry_type \
      FROM usage_records WHERE id = $1";
 
-/// The acceptance sequences stored for one scope, in insertion order.
-async fn sequences_for(pool: &sqlx::PgPool, tenant: Uuid, meter: &str) -> Vec<i64> {
+/// How many entries one `(tenant, meter)` scope holds.
+///
+/// A row count is the direct statement of "nothing else was written", and it is
+/// what replaced the per-scope sequence reads in the two tests that used to ask
+/// the retired counter the same question indirectly.
+async fn scope_row_count(pool: &sqlx::PgPool, tenant: Uuid, meter: &str) -> i64 {
     sqlx::query_scalar(
-        "SELECT acceptance_sequence FROM usage_records \
-         WHERE tenant_id = $1 AND gts_type_id = $2 ORDER BY acceptance_sequence",
+        "SELECT count(*) FROM usage_records WHERE tenant_id = $1 AND gts_type_id = $2",
     )
     .bind(tenant)
     .bind(meter)
-    .fetch_all(pool)
+    .fetch_one(pool)
     .await
-    .expect("acceptance sequence query")
+    .expect("count the scope's rows")
 }
 
 // ---------------------------------------------------------------------------
@@ -284,15 +287,9 @@ async fn an_exact_retry_is_absorbed_and_returns_the_persisted_row() {
         "the retry was absorbed against the stored row, not written beside it"
     );
 
-    // The absorbed retry consumed an acceptance sequence it did not store, and
-    // that is permitted: the obligation is monotonicity, not density. What is
-    // asserted is that it did not store a *second* one.
-    assert_eq!(
-        sequences_for(&h.pool, tenant, common::VCPU_METER)
-            .await
-            .len(),
-        1
-    );
+    // The `rows == 1` above is the whole of it. There is no per-scope counter
+    // left for an absorbed retry to advance, so "it stored no second row" is
+    // the only thing the absorb can get wrong here.
 }
 
 /// An absorbed retry reports the *stored* entry's acceptance instant, not
@@ -371,66 +368,6 @@ async fn a_divergent_same_key_write_is_an_idempotency_conflict() {
 }
 
 // ---------------------------------------------------------------------------
-// The acceptance sequence
-// ---------------------------------------------------------------------------
-
-/// Strictly monotonic per `(tenant_id, gts_type_id)`, and two scopes do not
-/// share a sequence.
-///
-/// Both halves matter and neither implies the other. A single global counter
-/// would satisfy monotonicity within each scope while making the second scope's
-/// first value depend on the first scope's traffic — which is what makes feed
-/// order per scope deterministic, and what a global `SEQUENCE` would cost. The
-/// schema comment says why a Postgres `SEQUENCE` cannot be used: per-scope
-/// monotonicity would need one sequence per `(tenant, meter)`, i.e. unbounded
-/// DDL driven by tenant data.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_acceptance_sequence_is_strictly_monotonic_per_scope_and_not_shared() {
-    let (h, store) = setup().await;
-    let vcpu = common::meter(common::VCPU_METER);
-    let gb = common::meter(common::GB_METER);
-    let tenant_a = Uuid::from_u128(0x5EA1);
-    let tenant_b = Uuid::from_u128(0x5EA2);
-
-    // Interleave the three scopes so a shared counter would show up as gaps in
-    // each of them rather than as three independent runs.
-    for i in 0..4_i64 {
-        let start = common::fixture_window_start() + Duration::hours(i);
-        let end = common::fixture_window_end() + Duration::hours(i);
-        for (tenant, meter) in [(tenant_a, &vcpu), (tenant_a, &gb), (tenant_b, &vcpu)] {
-            let rec = common::entry_over(
-                meter,
-                tenant,
-                &format!("idem-seq-{i}"),
-                Decimal::from(i + 1),
-                start,
-                end,
-            );
-            store.create(rec).await.expect("create");
-        }
-    }
-
-    for (tenant, meter, label) in [
-        (tenant_a, common::VCPU_METER, "tenant A / vcpu"),
-        (tenant_a, common::GB_METER, "tenant A / gb"),
-        (tenant_b, common::VCPU_METER, "tenant B / vcpu"),
-    ] {
-        let seqs = sequences_for(&h.pool, tenant, meter).await;
-        assert_eq!(seqs.len(), 4, "{label}: four entries");
-        assert!(
-            seqs.windows(2).all(|w| w[0] < w[1]),
-            "{label}: acceptance_sequence must be strictly increasing, got {seqs:?}"
-        );
-        assert_eq!(
-            seqs,
-            vec![1, 2, 3, 4],
-            "{label}: each scope counts from its own start - a value here that reflects \
-             another scope's traffic means the counter is shared"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The transaction id
 // ---------------------------------------------------------------------------
 
@@ -449,9 +386,10 @@ async fn the_acceptance_sequence_is_strictly_monotonic_per_scope_and_not_shared(
 /// This is what separates a database-stamped transaction id from a Rust-side
 /// counter: no per-entry counter would give two entries of one call the same
 /// value, and the equality half is the only assertion that can tell them
-/// apart. Nothing reads `xact_id` yet — the feed page is slice 3 — so without
-/// this test the column would be one the schema declares and no behaviour
-/// pins.
+/// apart. **Nothing *orders* on `xact_id` yet** — every read path returns it,
+/// because `RECORD_COLUMNS` selects it, but the feed page that would page on it
+/// is slice 3 — so without this test the column would be one the schema declares
+/// and no behaviour holds to an order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_batch_shares_one_transaction_id_and_a_later_call_takes_a_greater_one() {
     let (h, store) = setup().await;
@@ -941,12 +879,8 @@ async fn a_batch_in_which_every_row_conflicts_inserts_nothing_and_stays_aligned(
         );
         seeded.push(store.create(rec).await.expect("seed"));
     }
-    let sequences_before = sequences_for(&h.pool, tenant, common::VCPU_METER).await;
-    assert_eq!(
-        sequences_before,
-        vec![1, 2, 3],
-        "three seeded entries, one block each"
-    );
+    let rows_before = scope_row_count(&h.pool, tenant, common::VCPU_METER).await;
+    assert_eq!(rows_before, 3, "three seeded entries");
 
     // The same three keys and periods, every one at a divergent quantity.
     let batch: Vec<UsageRecord> = (0..3_i64)
@@ -1008,23 +942,33 @@ async fn a_batch_in_which_every_row_conflicts_inserts_nothing_and_stays_aligned(
         "fail-closed: the seeded quantities are untouched by the divergent batch"
     );
 
-    // Nor did the refused batch leave an acceptance sequence behind. It claimed
-    // a block - the claim happens before the insert and cannot know the insert
-    // will win nothing - and rolling the transaction back is what returns it.
-    // Gaps are permitted by the contract, so this is not "the values are
-    // dense"; it is "no *stored* entry acquired a new one", which is the part a
-    // failed batch could get wrong.
+    // Nor did the refused batch leave a row behind. Asserted over the whole
+    // scope rather than over the three seeded quantities above, because those
+    // pin what the surviving rows hold and this pins that there are no others:
+    // a fourth row carrying a divergent quantity under a fresh identity would
+    // satisfy the quantity assertion and fail this one.
     assert_eq!(
-        sequences_for(&h.pool, tenant, common::VCPU_METER).await,
-        sequences_before,
-        "an all-conflict batch must store no acceptance sequence of its own"
+        scope_row_count(&h.pool, tenant, common::VCPU_METER).await,
+        rows_before,
+        "an all-conflict batch must store no row of its own"
     );
 }
 
-/// A batch of distinct entries all insert, and the sequence they were assigned
-/// is strictly monotonic across the whole block.
+/// A hundred distinct entries all insert in one batch, and every one of them
+/// carries the same `xact_id`.
+///
+/// The scale is the point of the first half: a multi-row `INSERT … SELECT FROM
+/// UNNEST` that mis-sizes one of its arrays fails on a long batch where a pair
+/// would not notice.
+///
+/// The second half is the property the retired per-scope block used to stand in
+/// for, stated over the mechanism that survives. "One batch is one transaction"
+/// is asserted at a pair by
+/// `one_batch_shares_one_transaction_id_and_a_later_call_takes_a_greater_one`;
+/// what this adds is that the batch size does not break it, which is the way a
+/// per-row transaction or a chunked insert would show up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hundred_distinct_entries_all_insert_under_one_monotonic_block() {
+async fn a_hundred_distinct_entries_all_insert_in_one_batch_under_one_xact_id() {
     let (h, store) = setup().await;
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(0x1000);
@@ -1058,17 +1002,23 @@ async fn a_hundred_distinct_entries_all_insert_under_one_monotonic_block() {
         assert!(r.is_ok(), "row {i} must insert: {r:?}");
     }
 
-    // `sequences_for` reads with `ORDER BY acceptance_sequence`, so a
-    // `windows(2)` monotonicity check can only ever fail on a duplicate - it is
-    // very nearly unfalsifiable as an assertion. The scope is fresh and this
-    // batch claimed one block, so the values are knowable exactly, and naming
-    // them is what makes a block claimed twice, claimed short, or expanded with
-    // the off-by-one in `sequence_block` visible.
-    let seqs = sequences_for(&h.pool, tenant, common::VCPU_METER).await;
+    // All hundred rows landed, and under exactly one transaction id. Counted as
+    // *distinct* values rather than compared pairwise: the failure this guards
+    // against is the batch splitting across transactions, and the number of
+    // pieces it split into is what a reader needs to see.
+    let (stored, distinct_xacts): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(DISTINCT xact_id) FROM usage_records \
+         WHERE tenant_id = $1 AND gts_type_id = $2",
+    )
+    .bind(tenant)
+    .bind(common::VCPU_METER)
+    .fetch_one(&h.pool)
+    .await
+    .expect("count the scope's rows and transaction ids");
+    assert_eq!(stored, 100, "every entry of the batch is stored");
     assert_eq!(
-        seqs,
-        (1..=100).collect::<Vec<i64>>(),
-        "one batch into a fresh scope claims one contiguous block, 1..=100"
+        distinct_xacts, 1,
+        "one batch is one transaction, so one xact_id across all hundred rows"
     );
 }
 
@@ -1157,13 +1107,26 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// concurrently: no deadlock victim is ever produced.
 ///
 /// **This is what `plan_batch`'s `reps.sort_by` is for, and the only test that
-/// reaches it.** `claim_batch_sequences` walks `plan.reps` and takes one
-/// `usage_acceptance_sequence` row lock per `(tenant_id, gts_type_id)` run, in
-/// the order the runs appear. Sorted by dedup key, whose first two components
-/// *are* the scope, every batch in the process takes those locks in one global
-/// order. Unsorted, batch A takes vcpu then gb while batch B takes gb then
-/// vcpu - the ABBA deadlock, which `PostgreSQL` breaks by aborting a victim
-/// after `deadlock_timeout`.
+/// reaches it.** The lock it orders is the **speculative tuple** an
+/// `INSERT … ON CONFLICT … DO NOTHING` takes on each dedup 6-tuple it is
+/// inserting, held until that transaction commits. The multi-row insert
+/// processes `plan.reps` in array order, so that is the order the locks are
+/// taken in; sorted by dedup key, every batch in the process takes the locks of
+/// the keys it shares with another batch in one global order. Unsorted, batch A
+/// takes vcpu's keys then gb's while batch B takes gb's then vcpu's - the ABBA
+/// deadlock, which `PostgreSQL` breaks by aborting a victim after
+/// `deadlock_timeout`.
+///
+/// It was written on a per-scope counter row lock, taken once per
+/// `(tenant_id, gts_type_id)` run rather than once per key. Retiring that counter
+/// left the speculative tuple as the only lock a batch contends for, so this test
+/// is re-aimed rather than retired: the surviving serialisation mechanism would
+/// otherwise have no deadlock-freedom test at all.
+/// **The fixture needed no change, and that is why the re-aim is sound.** Both
+/// batches already carry byte-identical rows, so the two sides share every key
+/// and not merely every scope - which is exactly what the tuple lock needs to be
+/// contended at all. A fixture sharing only scopes would have gone green here
+/// while asserting nothing.
 ///
 /// **The assertion is on the retry counter, not on the outcome**, because the
 /// outcome hides the defect: `create_batch` wraps itself in a bounded retry, so
@@ -1175,9 +1138,9 @@ async fn concurrent_overlapping_batches_leave_one_row_per_key() {
 /// The counter is a slightly wider oracle than the property, and the failure
 /// message says so rather than over-claiming: `is_retryable_batch_error` admits
 /// **any** `Transient`, so this really asserts "no transient at all". The one
-/// realistic alternative on a loaded runner is `55P03 lock_not_available`
-/// waiting on that same counter row, which needs the whole `statement_timeout`
-/// to elapse first - unlikely, but it would retry identically, and a message
+/// realistic alternative on a loaded runner is `55P03 lock_not_available` on one
+/// of those same speculative tuples, which needs the whole `lock_timeout` to
+/// elapse first - unlikely, but it would retry identically, and a message
 /// confidently naming a deadlock that did not happen is worse than a wider one.
 ///
 /// Several rounds rather than one, because a deadlock needs the two
@@ -1237,13 +1200,13 @@ async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock(
         counter_sum(&exporter, "uc_timescaledb_batch_retries_total"),
         0,
         "a batch was retried. The expected cause is the one this test exists for: two \
-         concurrent batches took the per-scope acceptance-sequence row locks in \
+         concurrent batches took the dedup 6-tuple speculative tuple locks in \
          different orders and one was aborted as a deadlock victim, which plan_batch's \
          reps.sort_by is supposed to make unreachable rather than survivable. \
          `is_retryable_batch_error` admits any Transient, though, so check the run's \
-         logs before concluding that: a 55P03 lock_not_available on the counter row \
-         retries identically, and on a loaded box that is the one other way to get \
-         here - it needs the whole statement_timeout to elapse first, so it is \
+         logs before concluding that: a 55P03 lock_not_available on one of those same \
+         tuples retries identically, and on a loaded box that is the one other way to \
+         get here - it needs the whole lock_timeout to elapse first, so it is \
          unlikely, not impossible."
     );
 
@@ -1276,9 +1239,11 @@ async fn concurrent_batches_taking_two_scopes_in_opposite_orders_never_deadlock(
 /// So every same-typed column here carries a value distinguishable from every
 /// other column of that type, and each is read back **by name** rather than by
 /// position. The two rows are written in one `create_batch` because the batch
-/// path is where the sixteen binds are arrays: a transposition there is one
-/// array bound to the wrong column, which is the harder case, and the
-/// invalidation pair (`invalidates`, `reason_code`) needs a target to point at.
+/// path is where every bind of `INSERT_COLUMNS` is an array: a transposition
+/// there is one array bound to the wrong column, which is the harder case, and
+/// the invalidation pair (`invalidates`, `reason_code`) needs a target to point
+/// at. The number of binds is not written out - it is one per column of that
+/// constant, and it moves whenever the ledger's written columns do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
     let (h, store) = setup().await;
@@ -1386,7 +1351,6 @@ async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
     assert_eq!(row.invalidates, None, "invalidates");
     assert_eq!(row.reason_code, None, "reason_code");
     assert_eq!(row.origin, "backfill", "origin");
-    assert!(row.acceptance_sequence > 0, "acceptance_sequence");
     assert_eq!(
         row.metadata,
         serde_json::json!({ "region": "metadata-value" }),
@@ -1418,18 +1382,16 @@ async fn a_row_written_through_the_batch_insert_reads_back_column_for_column() {
         "metadata"
     );
     assert_eq!(w.entry_type, "invalidation", "entry_type");
-    // Incidental to the bind sequence this test is about, and it holds for one
-    // reason only: `DedupKey`'s `entry_type_rank` sorts a record before its
-    // withdrawal, and a batch claims its acceptance-sequence block in that
-    // order. The pair used to be separated by their idempotency keys, which no
-    // longer differ. Change the rank and this assertion is what reddens.
-    assert!(
-        w.acceptance_sequence > row.acceptance_sequence,
-        "the withdrawal was accepted after its target"
-    );
+    // The pair's order within the batch used to be readable off the ledger,
+    // through the acceptance sequence `entry_type_rank` decided. It is not any
+    // more, and deliberately: both rows were written by one transaction, so they
+    // share one `xact_id` and the ledger records nothing that separates them.
+    // `record_store_tests`' `plan_batch` assertion is where the rank's direction
+    // is pinned now - in process, over the comparator, which is the only place
+    // the property still exists.
 
-    // And the same through the single-row insert, whose sixteen binds are a
-    // separate sequence with the same hazard.
+    // And the same through the single-row insert, whose binds are a separate
+    // sequence over the same columns, with the same hazard.
     let single = {
         let mut r = common::entry_over(
             &meter,

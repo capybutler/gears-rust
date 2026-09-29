@@ -93,11 +93,10 @@ const NOT_YET_CONFORMING: &[(&str, &str)] = &[
     (
         contract::FEED_COMPLETENESS,
         "slice 3, plugin feed page and retention interlock: the feed order \
-         this check holds invariant is declared but unread. \
-         `usage_acceptance_sequence` keys its counter on \
-         (tenant_id, gts_type_id) and so orders nothing across a \
-         subscription; slice 2 replaced it with the `xid8` column \
-         `usage_records_feed_idx` orders on, and slice 3 is what reads it",
+         this check holds invariant is declared but unread. It is the `xid8` \
+         column `usage_records_feed_idx` orders on, which slice 2 added in \
+         place of a per-(tenant_id, gts_type_id) counter that ordered nothing \
+         across a subscription; slice 3 is what reads it",
     ),
     (
         contract::FEED_BOOTSTRAP_POSITION,
@@ -132,15 +131,6 @@ const NOT_YET_CONFORMING: &[(&str, &str)] = &[
          `RECORD_COLUMNS` returns them on every path that answers an entry. \
          Whoever pays this row off in slice 3 is removing it for one \
          property, not for a check this backend fails outright",
-    ),
-    (
-        contract::LATEST_TIE_BREAK,
-        "slice 7, query rules: `LATEST_SELECT_EXPR` in \
-         `src/infra/storage/query/aggregate.rs` orders by \
-         `window_end DESC, acceptance_sequence DESC`, and DESIGN section 3.1 \
-         fixes the order as greatest `window_end`, then greatest \
-         `accepted_at`, then greatest `id` in byte order. \
-         `acceptance_sequence` is monotonic per (tenant_id, gts_type_id) only",
     ),
 ];
 

@@ -823,9 +823,9 @@ impl<'a> RawEntry<'a> {
             "INSERT INTO usage_records (id, tenant_id, gts_type_id, type_key, quantity, \
                  window_start, window_end, resource_id, resource_type, subject_id, \
                  subject_type, idempotency_key, invalidates, reason_code, origin, \
-                 entry_type, acceptance_sequence, accepted_at, metadata) \
+                 entry_type, accepted_at, metadata) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11, $12, 'live', \
-                 $13::usage_entry_type, $14, $15, '{}'::jsonb)",
+                 $13::usage_entry_type, $14, '{}'::jsonb)",
         )
         .bind(self.id)
         .bind(RAW_ENTRY_TENANT)
@@ -840,7 +840,6 @@ impl<'a> RawEntry<'a> {
         .bind(self.invalidates)
         .bind(self.reason_code)
         .bind(self.entry_type)
-        .bind(1_i64)
         .bind(fixture_window_end())
         .execute(self.pool)
         .await

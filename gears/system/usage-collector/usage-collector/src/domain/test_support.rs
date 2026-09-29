@@ -1916,12 +1916,7 @@ use usage_collector_sdk::{AggregationBucket, Invalidation, ReasonCode, derive_us
 ///   `create_usage_records` refuse. At-most-one-invalidation is an
 ///   admission outcome (the dedup conflict of an invalidation), and
 ///   admitting nothing is how this double stays small.
-/// * **`acceptance_sequence`** — [`UsageRecord`] carries no such field, so
-///   `LATEST` here resolves on `window_end` alone and breaks a tie by
-///   insertion order. The declared tie-break is greatest `window_end`, then
-///   greatest `acceptance_sequence`; a conforming plugin owes the second
-///   half and this fixture cannot give it.
-///
+
 /// Empty-selection answers follow SQL: `COUNT` is zero and every other fold
 /// is absent.
 pub(crate) struct FoldingPlugin {
@@ -2058,11 +2053,17 @@ fn fold_over(fold: AggregationFold, entries: &[UsageRecord]) -> Option<BigDecima
         }),
         AggregationFold::Max => entries.iter().map(quantity_of).max(),
         AggregationFold::Min => entries.iter().map(quantity_of).min(),
-        // No `acceptance_sequence` exists to break a tie on, so insertion
-        // order stands in for it: `max_by` keeps the last of equal keys.
+        // The declared tie-break, all three keys: greatest `window_end`, then
+        // greatest `accepted_at`, then greatest `id` in byte order (DESIGN
+        // section 3.1). `Uuid`'s `Ord` is over the bytes, which is that order.
+        // Stated in full rather than resolved on `window_end` alone, because a
+        // fixture that broke a tie by insertion order would answer differently
+        // from every conforming plugin on exactly the population a tie-break
+        // exists for -- and `UsageRecord` carries all three keys, so there is
+        // nothing here it cannot express.
         AggregationFold::Latest => entries
             .iter()
-            .max_by(|left, right| left.window_end.cmp(&right.window_end))
+            .max_by_key(|entry| (entry.window_end, entry.accepted_at, entry.id))
             .map(quantity_of),
     }
 }

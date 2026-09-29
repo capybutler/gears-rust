@@ -9,8 +9,8 @@
 //! into the validated SDK model (and back where needed: the same module holds
 //! the model-to-SQL helpers the insert binds through). Column types match the
 //! DDL: `uuid` → [`Uuid`], `text` → [`String`], `int` → `i32`, `numeric` →
-//! [`Decimal`], `timestamptz` → [`OffsetDateTime`], `bigint` → `i64`, `jsonb`
-//! → [`serde_json::Value`], and a nullable `text` / `uuid` → `Option<…>`.
+//! [`Decimal`], `timestamptz` → [`OffsetDateTime`], `jsonb` →
+//! [`serde_json::Value`], and a nullable `text` / `uuid` → `Option<…>`.
 //! `xid8` and `usage_entry_type` are exceptions, and neither is a mapping at
 //! all: `sqlx` decodes neither into anything this struct could carry — it has
 //! no `xid8` implementation, and [`String`] declares itself `TEXT`, which
@@ -29,15 +29,18 @@ use uuid::Uuid;
 /// each column up by its own field name, so a `SELECT` list in another order
 /// still decodes correctly and one missing a column fails naming it.
 ///
-/// [`Self::acceptance_sequence`] and [`Self::xact_id`] have no counterpart on
-/// the SDK's `UsageRecord`: both are ordering values assigned where the entry
-/// is stored rather than values the gear submits. `acceptance_sequence` is
-/// assigned by this plugin — the gear's DESIGN §3.7
-/// (`gears/system/usage-collector/docs/DESIGN.md`) obliges the plugin to keep
-/// it strictly monotonic per `(tenant_id, gts_type_id)` — and orders reads
-/// here, never travelling back out through the SPI; `xact_id` is assigned by
-/// the database and orders the feed. Both are decoded rather than left out of
+/// [`Self::xact_id`] has no counterpart on the SDK's `UsageRecord`: it is an
+/// ordering value assigned where the entry is stored rather than one the gear
+/// submits. The database stamps it from the inserting transaction and it orders
+/// the feed (this plugin's DESIGN §3.6). It is decoded rather than left out of
 /// the struct so a row is a faithful picture of what was stored.
+///
+/// It is the only **ordering** column on this row, and the plugin assigns no
+/// order of its own: the `LATEST` fold orders on `window_end`, `accepted_at` and
+/// `id`, all three of them gear-supplied or gear-derived, and the feed orders on
+/// a value the database owns. [`Self::type_key`] is plugin-assigned and has no
+/// counterpart either, but it is a partition key rather than an order — it names
+/// the type, and nothing sorts on it.
 ///
 /// [`Self::entry_type`] has no counterpart on the SDK's `UsageRecord` either,
 /// for a different reason: the model projects an entry's kind from the
@@ -108,11 +111,8 @@ pub struct UsageRecordRow {
     /// `sqlx` refuses to decode one into a `TEXT`-declared Rust type, so the
     /// read list selects `entry_type::text`.
     pub entry_type: String,
-    /// `acceptance_sequence` — plugin-assigned, strictly monotonic per
-    /// `(tenant_id, gts_type_id)`. Not carried on the SDK model; see the
-    /// struct doc.
-    pub acceptance_sequence: i64,
-    /// `accepted_at` — gear-assigned acceptance instant.
+    /// `accepted_at` — gear-assigned acceptance instant, and the `LATEST`
+    /// fold's second ordering key (the gear's DESIGN §3.1).
     pub accepted_at: OffsetDateTime,
     /// `xact_id` — the inserting transaction's id, and the feed order's first
     /// key. Stamped by the column default and never bound by the Record Store,

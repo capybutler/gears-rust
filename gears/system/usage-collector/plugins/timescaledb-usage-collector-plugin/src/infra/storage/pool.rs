@@ -67,16 +67,28 @@ fn is_plaintext(mode: PgSslMode) -> bool {
 }
 
 /// Fixed upper bound on how long a request-path statement waits on a contended
-/// lock. Ingest waits on two: the `usage_acceptance_sequence` row for the
-/// entry's `(tenant_id, gts_type_id)` scope, which every write claims from, and
-/// the speculative tuple an `INSERT ... ON CONFLICT ... DO NOTHING` meets when
-/// a not-yet-committed duplicate of the same dedup 6-tuple is in flight. The
-/// wait then fails fast (`55P03 lock_not_available`) instead of blocking on —
-/// and pinning — a pooled connection.
+/// lock. Ingest's write transaction waits on **one**: the speculative tuple an
+/// `INSERT ... ON CONFLICT ... DO NOTHING` meets when a not-yet-committed
+/// duplicate of the same dedup 6-tuple is in flight. The wait then fails fast
+/// (`55P03 lock_not_available`) instead of blocking on — and pinning — a pooled
+/// connection.
 ///
-/// `55P03` is classified transient ([`super::error`]) precisely because these
-/// are ordinary contention outcomes on a hot scope, so a timed-out batch is
-/// retried rather than returned as a non-retryable failure.
+/// **One inside that transaction, and not two.** This plugin took a second lock
+/// on every write until the per-scope counter row it claimed from was retired, so
+/// a write contended with unrelated traffic on a busy tenant or meter. It no
+/// longer does: a write contends only with another writer of the very same entry.
+///
+/// One statement outside that transaction can still wait, and this bound covers
+/// it too: [`super::type_key::TypeKeyCache::resolve`] assigns a type's partition
+/// key with its own `INSERT ... ON CONFLICT`, in autocommit before the write
+/// transaction opens, so two first writes of one *type* meet on that tuple. It is
+/// once per type per process rather than once per write, and it is held for the
+/// statement rather than to a commit, which is why it is not the lock this
+/// constant is sized for.
+///
+/// `55P03` is classified transient ([`super::error`]) precisely because that is
+/// an ordinary contention outcome between two writers of one identity, so a
+/// timed-out batch is retried rather than returned as a non-retryable failure.
 const LOCK_TIMEOUT: &str = "5s";
 
 /// Session GUCs applied to every request-path pool connection at connect time:
@@ -259,7 +271,8 @@ async fn acquire_init_lock(lock_conn: &mut PgConnection) -> Result<(), sqlx::Err
 /// ends.
 ///
 /// The wait to *acquire* the lock is bounded by the connection-level
-/// `statement_timeout` (see [`acquire_init_lock`]) so a wedged peer cannot stall
+/// `statement_timeout` (see `acquire_init_lock`, named in plain backticks
+/// because it is private and this item is public) so a wedged peer cannot stall
 /// init forever.
 ///
 /// # Errors

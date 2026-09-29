@@ -98,7 +98,7 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 /// here rather than inherited from a server naming rule.
 const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
      window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
-     invalidates, reason_code, origin, entry_type::text AS entry_type, acceptance_sequence, \
+     invalidates, reason_code, origin, entry_type::text AS entry_type, \
      accepted_at, xact_id::text AS xact_id, metadata";
 
 /// The columns every insert writes: every ledger column but `xact_id`, which
@@ -118,7 +118,7 @@ const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, wi
 /// column after it.
 const INSERT_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
      window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
-     invalidates, reason_code, origin, entry_type, acceptance_sequence, accepted_at, metadata";
+     invalidates, reason_code, origin, entry_type, accepted_at, metadata";
 
 /// The `PostgreSQL` enum `entry_type` is declared as
 /// (`migrations/0001_init.sql`), and the cast every bind of that column
@@ -144,7 +144,7 @@ pub(crate) const ENTRY_TYPE_ENUM: &str = "usage_entry_type";
 /// batch insert's `UNNEST` needs them. A test pins its length equal to the
 /// number of names in [`INSERT_COLUMNS`], which is what fixes the `UNNEST`
 /// parameter count.
-const INSERT_COLUMN_ARRAY_TYPES: [&str; 19] = [
+const INSERT_COLUMN_ARRAY_TYPES: [&str; 18] = [
     "uuid",
     "uuid",
     "text",
@@ -161,7 +161,6 @@ const INSERT_COLUMN_ARRAY_TYPES: [&str; 19] = [
     "text",
     "text",
     ENTRY_TYPE_ENUM,
-    "bigint",
     "timestamptz",
     "text",
 ];
@@ -223,8 +222,8 @@ fn insert_placeholders() -> String {
 ///
 /// Built rather than inlined so a test can read the column list, the
 /// placeholder count and the conflict target back out of it — and built
-/// **once**, because every input to it is a constant and the alternative is
-/// eighteen `format!`s per write.
+/// **once**, because every input to it is a constant and the alternative is one
+/// `format!` per column of [`INSERT_COLUMNS`] on every write.
 static SINGLE_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "INSERT INTO usage_records ({INSERT_COLUMNS}) VALUES ({}) \
@@ -262,11 +261,13 @@ static BATCH_INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
 /// `sqlx`-backed implementation of [`RecordStore`] over the `usage_records`
 /// hypertable.
 ///
-/// Every operation acquires its connection through [`Self::timed_acquire`], so
+/// Every operation acquires its connection through `Self::timed_acquire`, so
 /// `uc_timescaledb_pool_acquire_duration_seconds` is recorded per acquire and
 /// `uc_timescaledb_tls_handshake_failures_total` is incremented when a fresh
 /// physical connection fails its TLS handshake (via
-/// [`Self::record_backend_error`]).
+/// `Self::record_backend_error`). Both are named in plain backticks rather than
+/// linked: they are private, and an intra-doc link from this public item's doc
+/// to either resolves only under `--document-private-items`.
 #[derive(Debug, Clone)]
 pub struct PgRecordStore {
     pool: PgPool,
@@ -274,8 +275,10 @@ pub struct PgRecordStore {
     cancel: CancellationToken,
     type_keys: Arc<TypeKeyCache>,
     /// Whether `aggregate` may serve an eligible query from `usage_rollup_1h`.
-    /// Always `true` outside tests; [`Self::without_rollup`] turns it off so
-    /// the integration suite can compare both reads over one database.
+    /// Always `true` outside tests; `Self::without_rollup` turns it off so
+    /// the integration suite can compare both reads over one database. Not
+    /// linked, because that constructor is `#[cfg(any(test, feature =
+    /// "postgres"))]` and so does not exist in a default-feature doc build.
     rollup_enabled: bool,
 }
 
@@ -370,12 +373,13 @@ impl PgRecordStore {
     /// every hypertable UNIQUE carries) via `INSERT … ON CONFLICT … DO
     /// NOTHING`, then lost-the-race absorb-vs-conflict resolution.
     ///
-    /// **One backend transaction.** The entry's `acceptance_sequence` is
-    /// claimed from `usage_acceptance_sequence` (the gear's DESIGN §3.7) and
-    /// inserted in the same transaction, so the two commit or roll back
-    /// together.
+    /// **One backend transaction**, holding the insert and — when the insert
+    /// wins no slot — the read that resolves the conflict against the committed
+    /// row, so the resolution cannot observe a ledger the insert never saw.
     ///
-    /// `ON CONFLICT DO NOTHING` remains the dedup serialization authority: a
+    /// `ON CONFLICT DO NOTHING` is the **only** serialization authority on this
+    /// path, and since the per-scope counter was retired it is the only lock the
+    /// write transaction takes: a
     /// concurrent same-key insert blocks on the in-progress speculative tuple
     /// until the winner commits — bounded by the connection's `lock_timeout`
     /// ([`crate::infra::storage::pool`]), so the wait cannot pin the connection
@@ -408,24 +412,7 @@ impl PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        // 1. Claim this entry's acceptance_sequence inside the transaction that
-        //    will insert it, so the two commit or roll back together.
-        let acceptance_sequence = match claim_acceptance_sequence(
-            &mut tx,
-            record.tenant_id,
-            record.gts_type_id.as_str(),
-            1,
-        )
-        .await
-        {
-            Ok(seq) => seq,
-            Err(e) => {
-                rollback(tx).await;
-                return Err(self.record_backend_error(&e));
-            }
-        };
-
-        // 2. Insert, deduplicated on the 6-tuple UNIQUE. `RETURNING` yields the
+        // 1. Insert, deduplicated on the 6-tuple UNIQUE. `RETURNING` yields the
         //    row only when we won the slot — `DO NOTHING` suppresses it on a
         //    conflict — so `Some` = fresh insert, `None` = a row with this
         //    6-tuple already exists. Every column [`INSERT_COLUMNS`] names is
@@ -463,7 +450,6 @@ impl PgRecordStore {
                 .bind(reason_code)
                 .bind(record.origin.as_str())
                 .bind(record.entry_type().as_str())
-                .bind(acceptance_sequence)
                 .bind(record.accepted_at)
                 .bind(metadata)
                 .fetch_optional(&mut *tx)
@@ -478,8 +464,7 @@ impl PgRecordStore {
         };
 
         if let Some(row) = inserted {
-            // 3a. Won the slot — fresh insert. Commit it together with the
-            //     sequence claim it was assigned.
+            // 2a. Won the slot — fresh insert. Commit it.
             tx.commit()
                 .await
                 .map_err(|e| self.record_backend_error(&e))?;
@@ -489,14 +474,13 @@ impl PgRecordStore {
             return record_row_to_model(row);
         }
 
-        // 3b. Lost the slot — a row with this 6-tuple already exists. Read it
+        // 2b. Lost the slot — a row with this 6-tuple already exists. Read it
         //     and resolve absorb-vs-conflict. `entry_type` is in the predicate
         //     for the reason [`DEDUP_MATCH_PREDICATE`] gives: without it, a
         //     retry of a withdrawn record could read the withdrawal back. The
-        //     read mutates nothing, and the rollback that follows releases the
-        //     sequence value claimed in step 1, which is why an absorbed
-        //     single-row retry leaves no gap (a batch's block claim does; see
-        //     [`claim_acceptance_sequence`]).
+        //     read mutates nothing and the rollback that follows discards
+        //     nothing the ledger kept, so an absorbed retry leaves the ledger
+        //     exactly as the winning insert left it.
         let select_sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records WHERE {}",
             DEDUP_MATCH_PREDICATE.as_str()
@@ -563,29 +547,22 @@ impl PgRecordStore {
     /// are exactly the slots we won — `DO NOTHING` suppresses any row whose
     /// `(tenant_id, gts_type_id, idempotency_key, window_start, window_end,
     /// entry_type)` already exists — so the result maps each won [`DedupKey`] to its stored
-    /// row. `reps` must be sorted by [`DedupKey`] so concurrent batches insert
-    /// in one global order (deadlock-free), and `sequences` must be the
-    /// acceptance-sequence values claimed for them, in the same order.
+    /// row. `reps` must be sorted by [`DedupKey`] so concurrent batches take the
+    /// speculative tuple locks in one global order (deadlock-free), and
     /// `type_keys` must be the partition keys resolved for `reps`, in the same
     /// order.
     ///
     /// Errors come back as the raw `sqlx::Error` rather than mapped: the caller
     /// holds the transaction that has to be rolled back first.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: `sequences` is produced from `reps` by
-    /// [`claim_batch_sequences`], one value per representative.
     async fn insert_records_on_conflict(
         tx: &mut sqlx::Transaction<'_, Postgres>,
         reps: &[&UsageRecord],
-        sequences: &[i64],
         type_keys: &[i32],
     ) -> Result<HashMap<DedupKey, UsageRecordRow>, sqlx::Error> {
         if reps.is_empty() {
             return Ok(HashMap::new());
         }
-        let cols = InsertColumns::build(reps, sequences, type_keys);
+        let cols = InsertColumns::build(reps, type_keys);
 
         let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(BATCH_INSERT_SQL.as_str()))
             .bind(&cols.ids)
@@ -604,7 +581,6 @@ impl PgRecordStore {
             .bind(&cols.reason_codes)
             .bind(&cols.origins)
             .bind(&cols.entry_types)
-            .bind(&cols.sequences)
             .bind(&cols.accepted_ats)
             .bind(&cols.metadata)
             .fetch_all(&mut **tx)
@@ -760,14 +736,17 @@ impl PgRecordStore {
         results
     }
 
-    /// Orchestrate one batch inside **one transaction**: claim an
-    /// acceptance-sequence block per scope → insert (dedup on the 6-tuple
-    /// UNIQUE) → read conflicts for the not-won keys → commit → resolve per row
-    /// in input order. The insert's `RETURNING` rows are themselves the set of
-    /// keys it claimed, so nothing else records that.
+    /// Orchestrate one batch inside **one transaction**: insert (dedup on the
+    /// 6-tuple UNIQUE) → read conflicts for the not-won keys → commit → resolve
+    /// per row in input order. The insert's `RETURNING` rows are themselves the
+    /// set of keys it claimed, so nothing else records that.
     ///
-    /// The transaction is not decoration. `acceptance_sequence` is claimed here
-    /// and inserted here, so the two must commit or roll back together.
+    /// The transaction is not decoration. The insert and the conflict read are
+    /// one unit of work: the read has to see the ledger the insert just met, and
+    /// every entry of the batch has to share one `xact_id` — which the column
+    /// default gives only because one `pg_current_xact_id()` covers the whole
+    /// transaction (this plugin's DESIGN §3.6). A per-row transaction would
+    /// scatter the batch across the feed order.
     async fn create_batch_inner(
         &self,
         records: &[UsageRecord],
@@ -795,24 +774,14 @@ impl PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        let sequences = match claim_batch_sequences(&mut tx, &plan.reps).await {
-            Ok(sequences) => sequences,
+        let inserted = match Self::insert_records_on_conflict(&mut tx, &plan.reps, &type_keys).await
+        {
+            Ok(rows) => rows,
             Err(e) => {
                 rollback(tx).await;
                 return Err(self.record_backend_error(&e));
             }
         };
-
-        let inserted =
-            match Self::insert_records_on_conflict(&mut tx, &plan.reps, &sequences, &type_keys)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    rollback(tx).await;
-                    return Err(self.record_backend_error(&e));
-                }
-            };
         // `inserted` is the won set; there is no second copy of it to drift.
         let not_won: Vec<&UsageRecord> = plan
             .reps
@@ -837,12 +806,15 @@ impl PgRecordStore {
     }
 }
 
-/// The eighteen per-column vectors one multi-row insert binds.
+/// One per-column vector per column of [`INSERT_COLUMNS`], which a multi-row
+/// insert binds.
 ///
 /// `sqlx` binds arrays, not rows, so the batch insert `UNNEST`s these back into
 /// rows. Keeping them in one struct built by one function keeps the column
 /// list, the `UNNEST` list and the bind order readable side by side instead of
-/// spread across eighteen locals in the middle of the query.
+/// spread across that many locals in the middle of the query. The count is not
+/// written out here: it moves whenever the ledger grows or loses a written
+/// column, and a stale number reads as an assertion about this struct.
 struct InsertColumns {
     ids: Vec<Uuid>,
     tenants: Vec<Uuid>,
@@ -862,14 +834,13 @@ struct InsertColumns {
     /// Borrowed rather than owned: `EntryType::as_str` hands back a
     /// `&'static str`, so there is nothing here to clone.
     entry_types: Vec<&'static str>,
-    sequences: Vec<i64>,
     accepted_ats: Vec<OffsetDateTime>,
     metadata: Vec<String>,
 }
 
 impl InsertColumns {
-    /// Pivot `reps` (plus the acceptance sequences claimed for them, in the
-    /// same order) into per-column vectors.
+    /// Pivot `reps` (plus the partition keys resolved for them, in the same
+    /// order) into per-column vectors.
     ///
     /// `metadata` is carried as `text[]` of JSON strings and cast `::jsonb`
     /// per-row in the query, to sidestep `jsonb[]` array encoding. The
@@ -878,17 +849,12 @@ impl InsertColumns {
     ///
     /// # Panics
     ///
-    /// Never in practice: `sequences` comes from [`claim_batch_sequences`] over
-    /// the same `reps`, so it is the same length; `type_keys` comes from a
-    /// resolve loop over the same `reps` too. A shorter one would be a caller
-    /// invariant break, and panicking beats silently writing a wrong
-    /// acceptance sequence or a wrong partition key.
-    fn build(reps: &[&UsageRecord], sequences: &[i64], type_keys: &[i32]) -> Self {
-        assert_eq!(
-            reps.len(),
-            sequences.len(),
-            "one acceptance sequence must be claimed per batch representative"
-        );
+    /// Never in practice: `type_keys` comes from a resolve loop over the same
+    /// `reps`, so it is the same length. A shorter one would be a caller
+    /// invariant break, and panicking beats silently writing a wrong partition
+    /// key — which would put the row in the wrong chunk and out of reach of the
+    /// unique constraints that carry it.
+    fn build(reps: &[&UsageRecord], type_keys: &[i32]) -> Self {
         assert_eq!(
             reps.len(),
             type_keys.len(),
@@ -911,7 +877,6 @@ impl InsertColumns {
             reason_codes: Vec::with_capacity(reps.len()),
             origins: Vec::with_capacity(reps.len()),
             entry_types: Vec::with_capacity(reps.len()),
-            sequences: sequences.to_vec(),
             accepted_ats: Vec::with_capacity(reps.len()),
             metadata: Vec::with_capacity(reps.len()),
         };
@@ -968,130 +933,11 @@ async fn rollback(tx: sqlx::Transaction<'_, Postgres>) {
     }
 }
 
-/// Claim a contiguous block of `count` `acceptance_sequence` values for
-/// `(tenant_id, gts_type_id)`, returning the block's **last** value — the block
-/// is `[returned - count + 1, returned]`.
-///
-/// Strictly monotonic per scope, which is the gear's DESIGN §3.7 obligation. It
-/// is **not** gapless and does not need to be: a batch claims one block per
-/// scope up front and then commits whatever the dedup `ON CONFLICT` let it win,
-/// so every value claimed for a slot it lost is spent without ever being
-/// stored. (A single-row insert that loses its slot rolls back instead, so that
-/// path leaves no gap.) Density is not the obligation and nothing reads the
-/// sequence expecting it.
-///
-/// Runs inside the caller's transaction so the claim and the insert commit or
-/// roll back together, and the counter row's lock is therefore held to commit.
-///
-/// **That lock is not the price of monotonicity — it is the price of ordered
-/// visibility, and the distinction matters.** A plain Postgres `SEQUENCE` would
-/// give strict monotonicity lock-free, with gaps this doc already declares
-/// permitted. What it would *not* give is that claim order equals commit order:
-/// the next claimer blocks on this row until the holder commits, so within a
-/// scope a lower `acceptance_sequence` is always visible before a higher one.
-/// The Feed Gateway serves pages "ordered by `acceptance_sequence` within each
-/// `(tenant, gts_type)` scope" (`cpt-cf-usage-collector-fr-billing-usage-feed`,
-/// the gear's `docs/DESIGN.md` §1.2 driver table), so a consumer that has read
-/// past N must never afterwards see an N-1 commit. Swap this for a sequence and
-/// the feed breaks silently. Scopes do not contend with each other.
-///
-/// That lock is also why `55P03 lock_not_available` belongs in the transient set
-/// ([`crate::infra::storage::error`]): ingest now waits on a per-scope row on
-/// every write, so timing out on a hot scope is an ordinary contention outcome
-/// rather than a defect.
-async fn claim_acceptance_sequence(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    tenant_id: Uuid,
-    gts_type_id: &str,
-    count: i64,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(
-        "INSERT INTO usage_acceptance_sequence (tenant_id, gts_type_id, next_value) \
-         VALUES ($1, $2, $3) \
-         ON CONFLICT (tenant_id, gts_type_id) \
-         DO UPDATE SET next_value = usage_acceptance_sequence.next_value + $3 \
-         RETURNING next_value",
-    )
-    .bind(tenant_id)
-    .bind(gts_type_id)
-    .bind(count)
-    .fetch_one(&mut **tx)
-    .await
-}
-
-/// Claim one `acceptance_sequence` per representative, aligned to `reps` order.
-///
-/// `reps` are sorted by [`DedupKey`], whose first two components are exactly
-/// the sequence's scope, so same-scope representatives are contiguous and the
-/// scopes are visited in one global order — the same discipline that keeps the
-/// dedup tuple locks deadlock-free, applied to the counter rows.
-///
-/// One statement per scope rather than one per entry: the block claim advances
-/// the counter by `count` and returns the block's last value, so a batch of `n`
-/// entries in one scope costs one round trip and takes the counter's row lock
-/// once.
-async fn claim_batch_sequences(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    reps: &[&UsageRecord],
-) -> Result<Vec<i64>, sqlx::Error> {
-    let mut out: Vec<i64> = Vec::with_capacity(reps.len());
-    for (start, end) in scope_runs(reps) {
-        // `end - start` is a slice length, so it fits an i64 on every target
-        // this builds for; saturating keeps the conversion total regardless.
-        let count = i64::try_from(end - start).unwrap_or(i64::MAX);
-        let last = claim_acceptance_sequence(
-            tx,
-            reps[start].tenant_id,
-            reps[start].gts_type_id.as_str(),
-            count,
-        )
-        .await?;
-        out.extend(sequence_block(last, count));
-    }
-    Ok(out)
-}
-
-/// The half-open `[start, end)` runs of `reps` that share one
-/// `(tenant_id, gts_type_id)` acceptance-sequence scope.
-///
-/// Split out of [`claim_batch_sequences`] because it is the half that can be
-/// wrong without a database noticing: it assumes `reps` is sorted by
-/// [`DedupKey`], whose first two components *are* the scope, so same-scope
-/// representatives are contiguous. A run that ended early would claim two
-/// blocks for one scope — still monotonic, so no constraint would object —
-/// and a run that ran on would hand one scope's values to another's entries.
-fn scope_runs(reps: &[&UsageRecord]) -> Vec<(usize, usize)> {
-    let mut runs = Vec::new();
-    let mut start = 0usize;
-    while start < reps.len() {
-        let scope = (reps[start].tenant_id, reps[start].gts_type_id.as_str());
-        let mut end = start + 1;
-        while end < reps.len() && (reps[end].tenant_id, reps[end].gts_type_id.as_str()) == scope {
-            end += 1;
-        }
-        runs.push((start, end));
-        start = end;
-    }
-    runs
-}
-
-/// Expand a claimed block into the values it covers.
-///
-/// [`claim_acceptance_sequence`] returns the block's **last** value, because
-/// that is what `RETURNING next_value` yields after adding `count`; the block
-/// is `[last - count + 1, last]`. Getting the off-by-one wrong here reuses one
-/// scope's sequence value or skips one, and nothing in the schema can object —
-/// the counter row is the sole authority and the ledger does not re-check what
-/// it hands out (`migrations/0001_init.sql`).
-fn sequence_block(last: i64, count: i64) -> Vec<i64> {
-    let first = last - count + 1;
-    (0..count).map(|offset| first + offset).collect()
-}
-
 /// Extract a single order-field value from a row as its cursor-key string.
 ///
 /// Inverse of [`cursor_key_to_bind`](crate::infra::storage::query::keyset::cursor_key_to_bind):
-/// the `uuid` columns render via [`Uuid::to_string`], the `timestamptz` bounds
+/// the `uuid` columns render via [`Uuid`]'s [`Display`](std::fmt::Display) — the
+/// canonical hyphenated lower-case form — the `timestamptz` bounds
 /// as RFC 3339, and the text columns as-is — each the spelling that helper
 /// parses back for the field's declared kind, so a minted boundary re-binds to
 /// the value it was read from.
@@ -1415,33 +1261,38 @@ fn build_list_page(
 /// never disagree about what one entry is.
 ///
 /// `entry_type` is the sixth component and the last, so the leading components
-/// still order the key by scope — [`scope_runs`] depends on the first two being
-/// the acceptance-sequence scope. It has to be in the key at all because a
-/// withdrawal repeats its target's other five: an in-batch map keyed on those
-/// alone would collapse a record and its withdrawal onto one slot and resolve
-/// the second against the first.
+/// still order the key by `(tenant_id, gts_type_id)`. It has to be in the key at
+/// all because a withdrawal repeats its target's other five: an in-batch map
+/// keyed on those alone would collapse a record and its withdrawal onto one slot
+/// and resolve the second against the first.
 ///
-/// It enters as [`entry_type_rank`] rather than as the wire literal, so a
-/// record sorts before its withdrawal; the literals would run the pair the
-/// other way round, since `invalidation` precedes `record` alphabetically.
-/// `reps` are sequenced in this order, so within one batch a record's
-/// `acceptance_sequence` is lower than its withdrawal's — which
-/// `records_ingest_integration_pg`'s bind-order test reads back off the two
-/// stored rows.
+/// **What the ordering is for is deadlock-freedom, and that is all it is for.**
+/// [`plan_batch`] sorts `reps` by this key, so every batch in the process takes
+/// the speculative tuple locks of the keys it shares with another batch in one
+/// global order. Any total order over the key would buy that; this one is the
+/// key's own field order, which costs nothing to derive and is stable across
+/// processes.
 ///
-/// **That is a plugin-local order, and no gear rule rests on it.** The gear's
-/// DESIGN §3.1 Feed order invariant does read "**Correction order**: an
-/// invalidation follows its target", but `acceptance_sequence` is not this
-/// plugin's `FeedPosition` and naming that invariant here would attribute the
-/// rank to a rule it does not satisfy — the same mis-attribution
-/// [`super::query::aggregate`] repudiated for the `LATEST` tie-break. This
-/// plugin's own DESIGN §3.6 (`cpt-cf-uc-plugin-seq-feed-page`) realizes feed
-/// order as `(xact_id, id)`, and `read_feed_page` is unimplemented
-/// (`domain::adapter`, which says why this column cannot serve as a position).
-/// A pair written in one batch shares one transaction, so `xact_id` ties there
-/// and `id` decides it; the rank reaches none of that. The gateway does not
-/// dispatch such a pair in any case — it admits an invalidation only once its
-/// target has converged (this plugin's DESIGN §3.6, Correction order).
+/// It enters as [`entry_type_rank`] rather than as the wire literal, so a record
+/// sorts before its withdrawal; the literals would run the pair the other way
+/// round, since `invalidation` precedes `record` alphabetically. **Nothing
+/// observable now depends on that direction**, and the honest statement of it is
+/// that the rank is a convention rather than a mechanism: the ledger records no
+/// per-scope order for the two rows to differ in, and a pair written in one
+/// batch shares one transaction, so the `xact_id` feed order ties across it and
+/// `id` decides it (this plugin's DESIGN §3.6, which states that feed order
+/// within a batch "falls back to `id`"). The rank reaches none of that. It is
+/// kept because a record preceding its withdrawal is the order a reader expects
+/// of the pair, and reversing it would buy nothing back.
+///
+/// **No gear rule rests on the rank.** The gear's DESIGN §3.1 Feed order
+/// invariant does read "**Correction order**: an invalidation follows its
+/// target", and this plugin realizes that on `xact_id`, not here: the gateway
+/// admits an invalidation only once its target has converged (this plugin's
+/// DESIGN §3.6, Correction order), so the withdrawal commits in a later
+/// transaction and takes a greater `xact_id`. Naming that invariant as the
+/// rank's justification would attribute it to a rule the rank does not
+/// implement.
 ///
 /// The two covered-period bounds enter as
 /// [`canonical_period_bound`](usage_collector_sdk::canonical_period_bound)
@@ -1539,8 +1390,10 @@ fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPlu
 ///
 /// `reps` are the first-occurrence representative records, one per distinct
 /// dedup key, **sorted** by [`DedupKey`] so concurrent batches take the
-/// 6-tuple-UNIQUE conflict locks — and the per-scope acceptance-sequence row
-/// locks — in one global order (deadlock-free). `first_index` maps each key to
+/// 6-tuple-UNIQUE speculative tuple locks in one global order (deadlock-free).
+/// Since the per-scope counter was retired those are the only locks a batch
+/// contends for, so the sort is the whole of this plugin's deadlock-freedom
+/// argument rather than one half of it. `first_index` maps each key to
 /// the input index of its first occurrence, the only row that can win the slot.
 /// Later same-key rows resolve against the winner's stored row, exactly as the
 /// single-row path resolves a same-key hit.
@@ -1583,7 +1436,7 @@ const MAX_BATCH_ATTEMPTS: u32 = 3;
 /// A short exponential — 5 ms, 10 ms, … — because a deadlock victim can retry
 /// almost immediately: the transaction that survived the deadlock has already
 /// committed or aborted by the time Postgres aborts the victim, so the
-/// contended dedup and acceptance-sequence locks are free. The shift is
+/// contended dedup locks are free. The shift is
 /// saturated so the schedule can never overflow regardless of how
 /// `MAX_BATCH_ATTEMPTS` grows.
 fn batch_retry_backoff_base(attempt: u32) -> Duration {
@@ -1618,8 +1471,9 @@ fn batch_retry_backoff(attempt: u32) -> Duration {
 /// The deadlock victim surfaces as an outer `Transient` — `create_batch_inner`
 /// runs the whole batch in one transaction, and that transaction rolled back,
 /// so the attempt left nothing behind. Serialization failures (`40001`), lock
-/// timeouts (`55P03`, which ingest can now hit on the per-scope
-/// acceptance-sequence row) and connection blips collapse to the same bucket
+/// timeouts (`55P03`, which a batch hits when it waits out `lock_timeout` on a
+/// speculative tuple another in-flight batch holds) and connection blips
+/// collapse to the same bucket
 /// inside the storage helpers, and all are safe to re-run for this idempotent
 /// batch. `Internal`,
 /// `IdempotencyConflict` and the other typed domain outcomes are non-retryable
@@ -1648,8 +1502,10 @@ fn is_retryable_batch_error(err: &UsageCollectorPluginError) -> bool {
 /// borrows the caller's input, so re-invocation is allocation-free), which is
 /// exactly the right unit of retry for `create_batch_inner`: every attempt
 /// acquires a fresh connection and opens a fresh transaction on it, so a failed
-/// attempt leaves neither a claimed acceptance sequence nor a half-written
-/// batch behind. There is zero happy-path cost — on success the loop runs the
+/// attempt leaves no half-written batch behind — and, because the row's
+/// `xact_id` comes from the transaction that wrote it, no attempt can leave a
+/// feed position a later one then contradicts. There is zero happy-path cost —
+/// on success the loop runs the
 /// operation once and neither sleeps, allocates a backoff, nor calls
 /// `on_retry`.
 async fn with_retry<T, E, Op, Fut>(
@@ -1891,10 +1747,12 @@ impl RecordStore for PgRecordStore {
     /// **This path deliberately does not retry, and the asymmetry with
     /// [`Self::create_batch`] is a decision rather than an omission.**
     ///
-    /// Task 9 made the wait structural — every single-row write now takes the
-    /// per-scope `usage_acceptance_sequence` row lock before it inserts — so a
-    /// `55P03` on a hot scope is an ordinary outcome here, not a rarity. It is
-    /// still returned unretried, because a `Transient` lifts to
+    /// A `55P03` is reachable here, on the one lock this path takes: a
+    /// concurrent same-key insert's speculative tuple, waited out to
+    /// `lock_timeout`. It needs a same-key write in flight, so it is a rarity
+    /// rather than an ordinary outcome on a merely busy scope — a single-row
+    /// write contends with nothing but an exact-duplicate racer. It is
+    /// returned unretried, because a `Transient` lifts to
     /// `ServiceUnavailable` at the dispatch boundary and reaches the caller as
     /// a 503 with a `Retry-After` slot: the client already holds the one record,
     /// and re-submitting it is cheap and exactly idempotent.
@@ -1942,12 +1800,12 @@ impl RecordStore for PgRecordStore {
         //
         // Wrap the whole call in a bounded retry: on an outer `Transient` (the
         // classic ABBA deadlock victim aborted as `40P01`, a serialization
-        // failure `40001`, a `55P03` lock timeout on a hot scope's
-        // acceptance-sequence row, or a connection blip) re-run the operation up
-        // to `MAX_BATCH_ATTEMPTS` times. Each attempt acquires a fresh
-        // connection and opens a fresh transaction on it (`create_batch_inner`
-        // does both), so a rolled-back attempt leaves no state behind — not even
-        // the acceptance-sequence block it had claimed. Re-running is safe: that
+        // failure `40001`, a `55P03` lock timeout waiting on a speculative tuple
+        // another in-flight batch holds, or a connection blip) re-run the
+        // operation up to `MAX_BATCH_ATTEMPTS` times. Each attempt acquires a
+        // fresh connection and opens a fresh transaction on it
+        // (`create_batch_inner` does both), so a rolled-back attempt leaves no
+        // state behind at all. Re-running is safe: that
         // transaction is atomic and the dedup keys make it idempotent, so a
         // re-run either re-claims the same slots or absorbs/conflicts against
         // the now-committed survivor. `Ok(vec)` is never retried — per-row

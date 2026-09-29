@@ -1,10 +1,16 @@
 -- TimescaleDB Usage Collector storage backend — base schema.
 --
--- One ledger table plus the small keyed tables it needs: per-scope sequence
--- counters, per-type partitioning keys, and per-type feed retention marks.
+-- One ledger table plus the small keyed tables it needs: per-type partitioning
+-- keys and per-type feed retention marks.
 -- There is no usage-type catalog: declarations live in types-registry and the
--- storage SPI never sees one (the gear's DESIGN §3.7; this plugin's own §3.7
--- states the target schema, which the migrations on this branch still trail).
+-- storage SPI never sees one (the gear's DESIGN §3.7).
+--
+-- This plugin's own DESIGN §3.7 states the target schema, and the ledger's
+-- columns, its indexes and the set of tables here are now that schema rather
+-- than trailing it. `migration_probe` parses this file so the crate's column
+-- constants are checked against it, and `schema_integration_pg` reads the live
+-- table and every index back; neither compares this file to §3.7, so that
+-- sentence is a statement about the last schema pass and not a tested invariant.
 --
 -- This file replaces the schema that preceded it and that schema's rename
 -- migration outright rather than migrating from them. Neither survives in this
@@ -68,27 +74,16 @@ CREATE TABLE IF NOT EXISTS usage_records (
     -- `$filter=entry_type eq 'invalidation'` compares against it directly, the
     -- literal casting to the enum.
     entry_type          usage_entry_type NOT NULL,
-    -- Strictly monotonic per (tenant_id, gts_type_id); assigned by this plugin,
-    -- never by the gear (the gear's DESIGN §3.7). Claimed from
-    -- `usage_acceptance_sequence` below. Gaps are permitted: the obligation is
-    -- monotonicity, not density, and an absorbed idempotent retry consumes a
-    -- value it does not store.
-    --
-    -- The counter row is the sole authority and the ledger does not re-check
-    -- what it hands out, because no constraint here could. A hypertable UNIQUE
-    -- must contain the partition column, and unlike the invalidation index
-    -- below there is no reason two entries in one scope would share a
-    -- `window_end` — so `UNIQUE (tenant_id, gts_type_id, acceptance_sequence,
-    -- window_end)` admits a repeated sequence instead of rejecting it, and the
-    -- form that would reject it is refused by the hypertable.
-    acceptance_sequence bigint      NOT NULL,
     -- Gear-assigned acceptance instant, stamped by the Ingestion Gateway and
-    -- written as given. An absorbed retry returns this stored value. `xact_id`
-    -- below is declared between this column and `metadata`, and it is the one
-    -- column in neither `INSERT_COLUMNS` (`record_store.rs`) nor the binds:
-    -- that constant is this declaration order with `xact_id` dropped out of it
-    -- — which still leaves `metadata` last, where the batch insert needs it
-    -- (see the constant's doc).
+    -- written as given. An absorbed retry returns this stored value. It is also
+    -- the `LATEST` fold's second key (the gear's DESIGN §3.1), which is why
+    -- `usage_records_watermark_idx` below is not the only read that reaches it.
+    --
+    -- `xact_id` below is declared between this column and `metadata`, and it is
+    -- the one column in neither `INSERT_COLUMNS` (`record_store.rs`) nor the
+    -- binds: that constant is this declaration order with `xact_id` dropped out
+    -- of it — which still leaves `metadata` last, where the batch insert needs
+    -- it (see the constant's doc).
     accepted_at         timestamptz NOT NULL,
     -- The inserting transaction's id, and the feed order's first key
     -- (this plugin's DESIGN §3.6 `cpt-cf-uc-plugin-seq-feed-page`). Stamped by
@@ -202,20 +197,6 @@ CREATE TABLE IF NOT EXISTS usage_feed_retention_marks (
     id          uuid NOT NULL
 );
 
--- Per-scope acceptance-sequence counters.
---
--- A Postgres SEQUENCE is global, and per-scope monotonicity would need one
--- sequence per (tenant, meter) — unbounded DDL driven by tenant data. A counter
--- row claimed with `ON CONFLICT DO UPDATE … RETURNING` is per-scope by
--- construction and serializes concurrent ingest for one scope on the row lock,
--- which is what strict monotonicity costs.
-CREATE TABLE IF NOT EXISTS usage_acceptance_sequence (
-    tenant_id   uuid   NOT NULL,
-    gts_type_id text   NOT NULL,
-    next_value  bigint NOT NULL,
-    PRIMARY KEY (tenant_id, gts_type_id)
-);
-
 -- Per-type partitioning keys.
 --
 -- One row per GTS type this plugin has written, mapping the type to a small
@@ -228,17 +209,16 @@ CREATE TABLE IF NOT EXISTS usage_type_key (
     type_key    int  GENERATED ALWAYS AS IDENTITY UNIQUE
 );
 
--- Read paths select on the period end within a (tenant, meter) scope. The
--- trailing `acceptance_sequence` carries the LATEST fold's declared tie-break,
--- which is greatest `window_end` *then* greatest `acceptance_sequence` — so the
--- tie-break column has to follow the period end in the same index to be usable.
+-- Time-windowed reads, per this plugin's DESIGN §3.7, which declares both of
+-- these over exactly these columns. Read paths select on the period end, within
+-- a (tenant, meter) scope or across one tenant's meters.
+--
+-- No tie-break column trails either of them: the `LATEST` fold breaks a
+-- `window_end` tie on `accepted_at` and then on `id` (the gear's DESIGN §3.1),
+-- and neither is a leading key here. The fold is an ordered pick over the rows
+-- a scope-and-range predicate already selected, so the tie-break keys are read
+-- off those rows rather than sought through an index.
 CREATE INDEX IF NOT EXISTS usage_records_tenant_type_window_idx
-    ON usage_records (tenant_id, gts_type_id, window_end DESC, acceptance_sequence DESC);
+    ON usage_records (tenant_id, gts_type_id, window_end DESC);
 CREATE INDEX IF NOT EXISTS usage_records_tenant_window_idx
     ON usage_records (tenant_id, window_end DESC);
--- Unreferenced. No read path on this branch orders on
--- `(tenant_id, gts_type_id, acceptance_sequence DESC)`, and this plugin's
--- DESIGN §3.7 does not list this index among the ledger's. It is kept only
--- until `acceptance_sequence` itself is retired.
-CREATE INDEX IF NOT EXISTS usage_records_acceptance_seq_idx
-    ON usage_records (tenant_id, gts_type_id, acceptance_sequence DESC);

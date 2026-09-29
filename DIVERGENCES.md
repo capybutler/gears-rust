@@ -765,13 +765,16 @@ untouched: it still spells `value`, and it will go red on the `quantity`
 rename. `accepted_at` and `acceptance_sequence` are still absent from both
 emitted key sets.
 
-`acceptance_sequence` now exists, and not where this entry needs it: the
-TimescaleDB plugin assigns it in its own `usage_records` table, strictly
-monotonic per `(tenant_id, gts_type_id)`, which discharges DESIGN §3.7's
-*storage* obligation and nothing else — the SDK's `UsageRecord` still carries
-no such field and the published response shape still cannot emit one, so this
-entry is open in exactly the terms it was written in. `accepted_at` has not
-moved at all.
+`acceptance_sequence` exists nowhere in this workspace. The TimescaleDB plugin
+did assign one in its own `usage_records` table, monotonic per
+`(tenant_id, gts_type_id)`, and has retired it: the column, the counter table and
+every reader are gone, feed order is the `xid8` of the inserting transaction, and
+the `LATEST` fold orders on `window_end`, `accepted_at` and `id`. **No document
+in this repository obliges a plugin to keep such a sequence** — the gear's
+`DESIGN.md` does not mention the name at all, so the §3.7 *storage* obligation
+this paragraph credited it with was a misreading of that document rather than a
+rule the retirement broke. The SDK's `UsageRecord` never carried the field and
+the published response shape cannot emit one. `accepted_at` has not moved at all.
 
 **Load-bearing**, more decisively than any other entry here: no generated
 client works at all, on either write path — ingestion or aggregate.
@@ -1315,12 +1318,16 @@ for exactly that reason, and this entry reproduces them verbatim: "no feed
 method" and the `acceptance_sequence` rule. They are history here and refused
 in the code.
 
-**What survives is not a blocked check.** The reference backend still breaks a
-`LATEST` tie on the greatest `id` and the TimescaleDB backend on its own
-`acceptance_sequence` column, so two conforming backends still answer a tie
-differently. That is a Stated limit of the reference backend and it is
-`latest-tie-break`'s to pin — a check now writable against the SPI as it
-stands, which is why it sits in `UNWRITTEN_CHECKS`. `feed-retention-refusal`
+**What survived was not a blocked check, and it no longer survives either.**
+The two backends did answer a tie differently — the reference backend on the
+greatest `id`, skipping the middle key, and the TimescaleDB backend on its own
+`acceptance_sequence` column. Both are now the §3.1 order:
+`reference.rs`'s fold is `max_by_key(|row| (row.window_end, row.accepted_at,
+row.id))`, corrected when `latest-tie-break` landed, and the TimescaleDB plugin's
+`LATEST_SELECT_EXPR` is `window_end DESC, accepted_at DESC, id DESC`, rewritten
+when that plugin retired the column. `acceptance_sequence` exists nowhere in this
+workspace. The check is in `IMPLEMENTED_CHECKS`, not `UNWRITTEN_CHECKS`, and both
+backends pass it. `feed-retention-refusal`
 is the one check that needs more than an author: reaching a purged state needs
 a retention input `run_all` does not take, which `UNWRITTEN_CHECKS`'s own doc
 records. The original entry follows unchanged as the record of what was wrong.

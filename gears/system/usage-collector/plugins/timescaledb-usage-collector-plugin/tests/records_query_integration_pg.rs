@@ -1005,45 +1005,36 @@ async fn an_orphan_invalidation_contributes_nothing() {
     );
 }
 
-/// The five folds over a known population, including this plugin's `LATEST`
-/// tie-break.
+/// The five folds over a known population, including the `LATEST` tie-break.
 ///
-/// This plugin's `LATEST` is greatest `window_end`, then greatest
-/// `acceptance_sequence`. The tie-break needs two entries sharing a
-/// `window_end`, and the fixture below has a pair at hour 1 — but sharing a
-/// `window_end` is only half of what the fixture has to do.
+/// `LATEST` is greatest `window_end`, then greatest `accepted_at`, then greatest
+/// `id` in byte order (the gear's DESIGN §3.1, and this plugin's own §3.6). The
+/// tie-break needs two entries sharing a `window_end`, and the fixture below has
+/// a pair at hour 1 — but sharing a `window_end` is only half of what the fixture
+/// has to do.
 ///
-/// **The other half is that the tie-break must disagree with the alternative.**
-/// The pair is arranged so the later-accepted entry is the one with the
-/// **lower** `id`, and the `assert!(later.id < earlier.id, …)` in the body
-/// below pins that before the fold is asked anything - an inline assertion
-/// rather than a test of its own, because it is a precondition of this fixture
-/// and has no meaning apart from it. The entry `id` is a `UUIDv5` over the
-/// 6-tuple, so which of two keys sorts higher is not something a fixture author
-/// can predict, and without the assertion the discrimination would be luck.
+/// **This fixture ties on the second key too, so it exercises the third.**
+/// `common::entry_over` stamps `fixture_window_end()` as `accepted_at` for every
+/// entry it builds, so the pair at hour 1 ties on `window_end`, ties again on
+/// `accepted_at`, and falls through to greatest `id`. The middle key is not
+/// exercised here at all; the SDK's `latest-tie-break` check is what covers it,
+/// over a pair whose `accepted_at` differs. What this test covers is the third
+/// key, and the answer below is the greatest-`id` entry.
 ///
-/// **What that discrimination now means has inverted, and this test pins an
-/// answer DESIGN §3.1 forbids.** §3.1's rule is greatest `window_end`, then
-/// greatest `accepted_at`, then greatest `id` in byte order;
-/// `acceptance_sequence` is this plugin's own column and appears nowhere in the
-/// gear's DESIGN. Every fixture entry here carries the *same* `accepted_at`
-/// (`common::entry_over` stamps `fixture_window_end()` for all of them), so on
-/// this very pair §3.1 ties on `window_end`, ties again on `accepted_at`, and
-/// falls through to greatest `id` — which the precondition pins as the
-/// **earlier**-accepted entry, value 5. This plugin answers 7. So the greatest
-/// `id` answer the SDK's reference backend gives is not a non-conforming
-/// substitute for a rule it cannot express: it is what §3.1 requires on this
-/// fixture, and 7 is the divergence.
-///
-/// The check that catches it, `latest-tie-break`, has landed: it is in the
-/// SDK's `IMPLEMENTED_CHECKS`, `contract::run_all` dispatches it, and
-/// `contract_conformance_pg`'s `NOT_YET_CONFORMING` row for it is what keeps
-/// that suite green while this backend still diverges. Read the expectation
-/// below as *what this plugin does*, not as conformance, and note that the
-/// precondition
-/// assertion now guards against an edit (ordering by `id` after the period end)
-/// that would move this backend **toward** §3.1 rather than away from it. See
-/// `fold_select_expr`'s docs for the three cases where the two orders part.
+/// **The precondition assertion is what makes the third key observable rather
+/// than coincidental**, and it is re-aimed rather than merely satisfied. It used
+/// to guard a plugin-local order against being replaced by `id`; that order is
+/// gone, and `id` is now the rule. What still needs guarding is that greatest-`id`
+/// **disagrees with arrival order** on this pair: the pair is arranged so the
+/// later-inserted entry carries the *lower* `id`, so a backend that ran out of
+/// keys and settled the tie on whatever the scan produced — or one that simply
+/// returned the most recently written row — answers 7 where the rule answers 5.
+/// Without that arrangement both would answer alike and this assertion would be
+/// luck rather than evidence. The entry `id` is a `UUIDv5` over the 6-tuple, so
+/// which of two keys sorts higher is not something a fixture author can predict,
+/// which is why it is asserted and not assumed. It is inline rather than a test
+/// of its own because it is a precondition of this fixture and has no meaning
+/// apart from it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_five_folds_answer_over_a_known_population() {
     let (_h, store) = setup().await;
@@ -1051,15 +1042,16 @@ async fn the_five_folds_answer_over_a_known_population() {
     let tenant = Uuid::from_u128(0x200D);
 
     // Two entries at hour 0 (values 2 and 8), and two sharing hour 1's period
-    // end. `idem-d` (5) is accepted first and `idem-c` (7) second, so 7 is the
-    // acceptance-order winner — and `idem-c` is the one with the lower id, which
-    // is what makes the greatest-id rule answer 5 here instead.
+    // end. `idem-c` (7) is written first and `idem-d` (5) second. `idem-d`
+    // carries the greater id, so the greatest-id rule answers 5 while the
+    // physical order the scan produces leads with 7 -- which is the whole reason
+    // the write order is this way round. See the precondition below.
     let mut hour_one: Vec<UsageRecord> = Vec::new();
     for (i, value, key) in [
         (0_i64, 2_i64, "idem-a"),
         (0, 8, "idem-b"),
-        (1, 5, "idem-d"),
         (1, 7, "idem-c"),
+        (1, 5, "idem-d"),
     ] {
         let rec = common::entry_over(
             &meter,
@@ -1075,19 +1067,32 @@ async fn the_five_folds_answer_over_a_known_population() {
         }
     }
 
-    let (earlier, later) = (&hour_one[0], &hour_one[1]);
+    let (first_written, last_written) = (&hour_one[0], &hour_one[1]);
     assert_eq!(
-        earlier.window_end, later.window_end,
+        first_written.window_end, last_written.window_end,
         "the pair ties on window_end"
     );
+    // The last-written entry must carry the *greater* id. This pair ties on
+    // `window_end` and on `accepted_at`, so `id` is the only key left to settle
+    // it -- and a fold that simply ran out of keys does not error, it takes
+    // whatever order the scan produced, which over a freshly written chunk is
+    // physical order and so leads with the entry written first. With the greater
+    // id on the entry written *last*, those two disagree: greatest-id answers 5
+    // and scan order answers 7. Written the other way round the two coincide and
+    // the expectation below would hold against a fold carrying no third key at
+    // all -- which was measured, not supposed: dropping `r.id DESC` from
+    // `LATEST_SELECT_EXPR` left the whole pg lane green until this assertion was
+    // turned around. The entry id is a UUIDv5 over the 6-tuple, so which of two
+    // keys sorts higher is not something a fixture author can choose, only
+    // check.
     assert!(
-        later.id < earlier.id,
-        "the fixture must pin acceptance order against id order, or this test cannot tell \
-         this plugin's rule (greatest window_end, then greatest acceptance_sequence) from \
-         the greatest-id order that DESIGN section 3.1 reaches on this fixture, every entry \
-         of which shares one accepted_at. later={} earlier={}",
-        later.id,
-        earlier.id
+        last_written.id > first_written.id,
+        "the fixture must put the greater id on the entry written last, or the LATEST \
+         expectation below holds even against a fold with no id key: the pair ties on \
+         window_end and accepted_at, so such a fold falls to the scan's physical order, \
+         which leads with the entry written first. last_written={} first_written={}",
+        last_written.id,
+        first_written.id
     );
 
     for (fold, expected) in [
@@ -1095,13 +1100,12 @@ async fn the_five_folds_answer_over_a_known_population() {
         (AggregationFold::Count, 4),
         (AggregationFold::Min, 2),
         (AggregationFold::Max, 8),
-        // Greatest window_end is hour 1; of the two there, `idem-c` (7) was
-        // accepted second and so carries the greater acceptance_sequence. Under
-        // greatest-id - which is what DESIGN 3.1 reaches here, since the pair
-        // also ties on accepted_at - the answer would be 5. This expectation is
-        // therefore what this plugin does, not what DESIGN declares; see the
-        // doc comment above.
-        (AggregationFold::Latest, 7),
+        // Greatest window_end is hour 1; of the two there, both share one
+        // accepted_at, so the fold falls to greatest id - which the precondition
+        // above pins as `idem-d` (5), the entry written *last*. A backend
+        // answering 7 here is one that never reached the third key and settled
+        // the tie on the scan's order instead.
+        (AggregationFold::Latest, 5),
     ] {
         let result = store
             .aggregate(

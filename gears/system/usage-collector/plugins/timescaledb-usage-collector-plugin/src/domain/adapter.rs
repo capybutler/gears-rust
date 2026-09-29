@@ -97,18 +97,16 @@ impl UsageCollectorPluginV1 for StorageAdapter {
     /// Not built yet: nothing reads the feed order or the retention marks, so
     /// this backend can issue no position and decide no retention refusal.
     ///
-    /// **Neither the ordering column nor the mark table is what is missing any
-    /// more.** `migrations/0001_init.sql` declares `xact_id`, the inserting
+    /// **What is missing is the read, not the schema.**
+    /// `migrations/0001_init.sql` declares `xact_id`, the inserting
     /// transaction's id, indexes it as
     /// `usage_records_feed_idx (gts_type_id, xact_id, id)`, and declares the
     /// `usage_feed_retention_marks` table. That order is comparable across a
-    /// whole subscription without its encoded size growing with that
-    /// subscription's breadth, which is the bound `acceptance_sequence` fails:
-    /// `usage_acceptance_sequence` keys its counter on
-    /// `(tenant_id, gts_type_id)`, so that sequence is monotonic per scope
-    /// only, and the gear DESIGN says outright that a position keyed per tenant
-    /// fails the bound. What is left is the page protocol that reads them, and
-    /// the sweep that raises a mark: slice 3.
+    /// whole subscription and its encoded size does not grow with that
+    /// subscription's breadth, which is the bound the gear's DESIGN places on a
+    /// position and the reason a position keyed per tenant cannot serve. What is
+    /// left is the page protocol that reads the order, and the sweep that raises
+    /// a mark for this method to refuse against: slice 3.
     ///
     /// `Internal` rather than `Transient` because there is nothing to retry:
     /// the method will answer once the page protocol and the sweep's
@@ -141,9 +139,11 @@ impl UsageCollectorPluginV1 for StorageAdapter {
     /// `0001_init.sql` rather than assumed:
     ///
     /// * The count and `MAX(window_end)` are served by
-    ///   `usage_records_tenant_type_window_idx`, whose leading columns are
-    ///   `(tenant_id, gts_type_id, window_end DESC)` — the range count is a
-    ///   scan of one index interval and the watermark is its leading edge.
+    ///   `usage_records_tenant_type_window_idx`, which is
+    ///   `(tenant_id, gts_type_id, window_end DESC)` exactly — the range count
+    ///   is a scan of one index interval and the watermark is its leading edge.
+    ///   No tie-break column trails the period end any more, which costs this
+    ///   read nothing: neither figure needs one.
     /// * `MAX(accepted_at)` is served by
     ///   `usage_records_watermark_idx (gts_type_id, tenant_id, accepted_at
     ///   DESC)`, which `0001_init.sql` declares for exactly this read. It
