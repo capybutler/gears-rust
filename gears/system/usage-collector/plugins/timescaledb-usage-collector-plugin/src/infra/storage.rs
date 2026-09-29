@@ -1,5 +1,6 @@
 pub mod entity;
 pub mod error;
+pub mod feed_position;
 pub mod mapper;
 // Test-only support: the shared parse of `migrations/0001_init.sql` that every
 // column-sequence constant in this crate is checked against. Gated on the
