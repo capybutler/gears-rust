@@ -2709,9 +2709,15 @@ impl RecordStore for PgRecordStore {
         // it. Short-circuiting on `page.marked` is what keeps this the
         // "opt page_after present, not marked" branch of DESIGN §3.6's
         // diagram: a mark the fast path already found is not re-read here.
+        //
+        // One shared return for both refusal reasons (step 3's fast-path find
+        // or step 6's live re-check), so one counter call here covers both:
+        // the counter counts refusals, not re-checks, and this method never
+        // returns `CursorBeyondRetention` from anywhere else.
         if let Some(position) = after
             && (page.marked || self.mark_stands_above(&mut conn, &types, position).await?)
         {
+            self.metrics.inc_feed_cursor_refusal();
             return Err(UsageCollectorPluginError::CursorBeyondRetention);
         }
 

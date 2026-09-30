@@ -134,10 +134,17 @@ pub struct TimescaleDbPluginConfig {
     /// "every feed position no older than this is served."
     ///
     /// Required, because the SPI does not carry it and configuration is its only
-    /// source. Nothing reads it until the feed read path exists; it is validated
-    /// here so a deployment cannot reach that point unconfigured. The retention
-    /// it obliges of every GTS type is §4.1 item 6, which is the deployer's rule
-    /// and not checked by this plugin.
+    /// source.
+    ///
+    /// **Nothing in this plugin reads it, and that is the design rather than an
+    /// unfinished edge** (ruling D2). The feed refuses a position after which
+    /// retention has deleted an entry of a subscribed type, decided against
+    /// `usage_feed_retention_marks` — and §3.6 states outright that **no cursor
+    /// is refused on its age**, so H reaches no predicate. It is an input to the
+    /// guarantee the sentence above publishes, and to the retention every GTS
+    /// type must declare under §4.1 item 6, which is the deployer's obligation
+    /// and one §4.1 item 6 says this plugin does not check. It is validated here
+    /// so a deployment cannot serve traffic without having stated its horizon.
     pub feed_replay_horizon_secs: u64,
     /// Seconds before now that the rollup's newest materialised bucket ends.
     /// Newer buckets are answered from the ledger by real-time aggregation, so

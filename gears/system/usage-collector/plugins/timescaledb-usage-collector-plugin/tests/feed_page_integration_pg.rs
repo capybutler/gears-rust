@@ -18,7 +18,13 @@
 
 mod common;
 
+use std::sync::Arc;
+
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 use rust_decimal::Decimal;
+use tokio_util::sync::CancellationToken;
 use toolkit_odata::ast;
 use uuid::Uuid;
 
@@ -26,9 +32,69 @@ use usage_collector_sdk::{
     FeedPosition, FeedStart, UsageCollectorPluginError, UsageCollectorPluginV1,
 };
 
+use timescaledb_usage_collector_plugin::domain::adapter::StorageAdapter;
+use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
+use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
+use timescaledb_usage_collector_plugin::infra::storage::feed_horizon::FeedHorizonMonitor;
 use timescaledb_usage_collector_plugin::infra::storage::feed_position::encode_position;
 use timescaledb_usage_collector_plugin::infra::storage::query::MAX_PAGE_SIZE;
+use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
 use timescaledb_usage_collector_plugin::infra::storage::retention_sweep::RAISE_MARKS_SQL;
+
+/// Like [`common::start_backend`], but the metric inventory writes to a
+/// **local** in-memory exporter instead of the process-global provider, so a
+/// test can read a counter back — the same reason `metrics_tests` and
+/// `records_ingest_integration_pg`'s `setup_metered` give: `Metrics::with_meter`
+/// takes the meter explicitly, so the assertion never depends on global state
+/// another test binary is also writing to.
+async fn start_backend_metered() -> (
+    common::TsHarness,
+    StorageAdapter,
+    SdkMeterProvider,
+    InMemoryMetricExporter,
+) {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    let metrics = Arc::new(Metrics::with_meter(
+        &provider.meter("uc.timescaledb"),
+        h.pool.clone(),
+    ));
+    let store: Arc<dyn RecordStore> = Arc::new(PgRecordStore::new(
+        h.pool.clone(),
+        metrics,
+        CancellationToken::new(),
+        h.cfg.feed_acceptance_slack_secs,
+    ));
+    (h, StorageAdapter::new(store), provider, exporter)
+}
+
+/// Total of the `u64` counter data points named `name`. 0 for an instrument
+/// that exists and was never recorded, and 0 for one that does not exist —
+/// the same ambiguity `records_ingest_integration_pg::counter_sum` documents;
+/// this file only ever reads a counter this task's own code drives.
+fn counter_sum(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+    let metrics = exporter.get_finished_metrics().expect("exported metrics");
+    for resource_metrics in &metrics {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data()
+                {
+                    return sum
+                        .data_points()
+                        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                        .sum();
+                }
+            }
+        }
+    }
+    0
+}
 
 /// Raise a retention mark directly, via the sweep's own [`RAISE_MARKS_SQL`]
 /// statement — the same "raise, never lower" write the production sweep
@@ -441,7 +507,12 @@ async fn the_scope_narrows_the_feed_to_the_tenants_it_admits() {
 
 // 10. A mark raised above a position refuses the page with
 //     `CursorBeyondRetention`, and a first read over the same meter is still
-//     served.
+//     served. Also the counter's own coverage: this test raises its mark
+//     before the page read starts, so step 3's fast path alone catches it
+//     (see the comment below the test raising step 6's counterpart) — the
+//     refusal counter is a single call site shared by both steps (whichever
+//     one returns the error), so one refusal here must move it by exactly
+//     one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mark_above_a_position_refuses_it_but_not_a_first_read() {
     // Ruling D7: this test's subject is the page's *read* of a mark, not the
@@ -450,7 +521,7 @@ async fn a_mark_above_a_position_refuses_it_but_not_a_first_read() {
     // two through a real chunk drop; here the mark is raised directly (via
     // the sweep's own [`RAISE_MARKS_SQL`]) so this test can land before that
     // drive exists. This is not coverage of the retention interlock itself.
-    let (h, adapter) = common::start_backend().await;
+    let (h, adapter, provider, exporter) = start_backend_metered().await;
     let meter = common::meter(common::VCPU_METER);
     let tenant = Uuid::from_u128(1);
     let scope = common::tenant_scope(tenant);
@@ -485,6 +556,12 @@ async fn a_mark_above_a_position_refuses_it_but_not_a_first_read() {
     assert!(
         matches!(err, UsageCollectorPluginError::CursorBeyondRetention),
         "refused as CursorBeyondRetention: {err}"
+    );
+    provider.force_flush().expect("flush metrics");
+    assert_eq!(
+        counter_sum(&exporter, "uc_timescaledb_feed_cursor_refusals_total"),
+        1,
+        "exactly one CursorBeyondRetention refusal must move the counter by one"
     );
 
     let first_read = adapter
@@ -768,4 +845,56 @@ async fn insert_raw_within(
     .execute(&mut **tx)
     .await
     .expect("insert writer A's row directly, within its own open transaction");
+}
+
+// The feed's settled-horizon lag sampler (`docs/DESIGN.md` §4.3): `Some`,
+// growing, while a write transaction is held open; `None` (not an error) once
+// none is. Uses the same "second connection holding an open write
+// transaction" shape as the gap test above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_horizon_monitor_samples_the_oldest_open_write_transaction() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let metrics = Arc::new(Metrics::new(h.pool.clone()));
+    let monitor = FeedHorizonMonitor::new(h.pool.clone(), metrics);
+
+    // Nothing else holds a write transaction open on a freshly migrated
+    // database, so the plugin role sees none: `None`, not an error.
+    let idle = monitor
+        .sample_once()
+        .await
+        .expect("sampling with nothing open must not error");
+    assert!(
+        idle.is_none(),
+        "no open write transaction should report no observation: {idle:?}"
+    );
+
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(1);
+    let entry = common::entry(&meter, tenant, "horizon-lag", Decimal::ONE);
+    let mut tx = h
+        .pool
+        .begin()
+        .await
+        .expect("begin a held write transaction");
+    insert_raw_within(&mut tx, &entry).await;
+
+    let first = monitor
+        .sample_once()
+        .await
+        .expect("sampling with the transaction open must not error")
+        .expect("an open write transaction is visible to the plugin role");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let second = monitor
+        .sample_once()
+        .await
+        .expect("sampling again must not error")
+        .expect("the transaction is still open");
+    assert!(
+        second >= first,
+        "the lag must not shrink while the transaction stays open: {first} -> {second}"
+    );
+
+    tx.commit().await.expect("release the held transaction");
 }

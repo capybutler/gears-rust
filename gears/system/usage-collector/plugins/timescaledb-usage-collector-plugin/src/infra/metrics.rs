@@ -280,6 +280,8 @@ pub struct Metrics {
     aggregate_path: Counter<u64>,
     /// `uc_timescaledb_rollup_rows_deleted_total`.
     rollup_rows_deleted: Counter<u64>,
+    /// `uc_timescaledb_feed_cursor_refusals_total`.
+    feed_cursor_refusals: Counter<u64>,
 
     // --- Synchronous gauges (set imperatively) ---
     /// `uc_timescaledb_ready` — plugin-local backend health (0/1).
@@ -289,6 +291,10 @@ pub struct Metrics {
     chunks: Gauge<u64>,
     /// `uc_timescaledb_rollup_refresh_age_seconds` — labelled by `policy`.
     rollup_refresh_age: Gauge<f64>,
+    /// `uc_timescaledb_feed_horizon_lag_seconds` — best-effort; left unset
+    /// (never zeroed) when the plugin role cannot see another session's open
+    /// write transaction.
+    feed_horizon_lag: Gauge<f64>,
     /// `uc_timescaledb_rollup_refresh_job_failing` — labelled by `policy`.
     rollup_refresh_job_failing: Gauge<u64>,
     /// `uc_timescaledb_rollup_refresh_policies` — the number of rollup refresh
@@ -300,6 +306,28 @@ pub struct Metrics {
     _pool_active: ObservableGauge<u64>,
     /// `uc_timescaledb_pool_connections_idle`.
     _pool_idle: ObservableGauge<u64>,
+}
+
+/// Build the feed's two instruments: `uc_timescaledb_feed_cursor_refusals_total`
+/// and `uc_timescaledb_feed_horizon_lag_seconds`. Split out of
+/// [`Metrics::with_meter`] to keep that constructor under `clippy::too_many_lines`
+/// — not a grouping the metric inventory itself gives any other significance to.
+fn build_feed_instruments(meter: &Meter) -> (Counter<u64>, Gauge<f64>) {
+    let feed_cursor_refusals = meter
+        .u64_counter("uc_timescaledb_feed_cursor_refusals_total")
+        .with_description(
+            "CursorBeyondRetention refusals: a retention mark stood above the presented \
+             position",
+        )
+        .build();
+    let feed_horizon_lag = meter
+        .f64_gauge("uc_timescaledb_feed_horizon_lag_seconds")
+        .with_description(
+            "Best-effort settled-horizon lag in seconds; left unset when the plugin role \
+             cannot see another session's open write transaction",
+        )
+        .build();
+    (feed_cursor_refusals, feed_horizon_lag)
 }
 
 impl Metrics {
@@ -455,6 +483,7 @@ impl Metrics {
                 "Rollup rows deleted with the ledger chunks the retention sweep dropped",
             )
             .build();
+        let (feed_cursor_refusals, feed_horizon_lag) = build_feed_instruments(meter);
 
         let ready = meter
             .u64_gauge("uc_timescaledb_ready")
@@ -522,9 +551,11 @@ impl Metrics {
             retention_drop_failures,
             aggregate_path,
             rollup_rows_deleted,
+            feed_cursor_refusals,
             ready,
             chunks,
             rollup_refresh_age,
+            feed_horizon_lag,
             rollup_refresh_job_failing,
             rollup_refresh_policies,
             _pool_active: pool_active,
@@ -674,6 +705,17 @@ impl Metrics {
         self.rollup_rows_deleted.add(n, &[]);
     }
 
+    /// Count one `CursorBeyondRetention` refusal.
+    ///
+    /// Raised when a retention mark stands above the presented position
+    /// (`docs/DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-feed-page`, Retention
+    /// refusal). A sustained rate means consumers are falling behind what the
+    /// deployment retains; a refusal of a consumer that polls at the head is
+    /// the long-transaction shortfall (§3.6, Known shortfall).
+    pub fn inc_feed_cursor_refusal(&self) {
+        self.feed_cursor_refusals.add(1, &[]);
+    }
+
     // --- Synchronous gauge setters ---
 
     /// Set the plugin-local readiness gauge (1 when `ready`, else 0).
@@ -704,6 +746,20 @@ impl Metrics {
     /// found, including zero.
     pub fn set_rollup_refresh_policies(&self, n: u64) {
         self.rollup_refresh_policies.record(n, &[]);
+    }
+
+    /// Set the settled-horizon lag, in seconds.
+    ///
+    /// `now()` minus the earliest `xact_start` among backends whose
+    /// `backend_xid` is not null, as visible to the plugin role — the lag
+    /// between acceptance and feed visibility the settled horizon imposes
+    /// (§4.1 item 2). **Left unset rather than zeroed** when the role sees no
+    /// such session: §4.3 makes the gauge best-effort, and a zero would read as
+    /// a healthy instance rather than as an unanswerable question. The 240 s
+    /// figure in §4.1 item 2 is an alert threshold on this series; nothing in
+    /// the plugin compares against it.
+    pub fn set_feed_horizon_lag(&self, seconds: f64) {
+        self.feed_horizon_lag.record(seconds, &[]);
     }
 
     /// Every instrument name this inventory declares.
@@ -758,9 +814,11 @@ impl Metrics {
             retention_drop_failures: _,
             aggregate_path: _,
             rollup_rows_deleted: _,
+            feed_cursor_refusals: _,
             ready: _,
             chunks: _,
             rollup_refresh_age: _,
+            feed_horizon_lag: _,
             rollup_refresh_job_failing: _,
             rollup_refresh_policies: _,
             _pool_active: _,
@@ -796,6 +854,8 @@ impl Metrics {
             "uc_timescaledb_rollup_refresh_age_seconds",
             "uc_timescaledb_rollup_refresh_job_failing",
             "uc_timescaledb_rollup_refresh_policies",
+            "uc_timescaledb_feed_cursor_refusals_total",
+            "uc_timescaledb_feed_horizon_lag_seconds",
         ]
     }
 }

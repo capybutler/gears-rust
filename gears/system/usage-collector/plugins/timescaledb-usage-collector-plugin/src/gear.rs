@@ -19,6 +19,7 @@ use crate::domain::adapter::StorageAdapter;
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
 use crate::infra::registry_retention::TypesRegistryRetentionSource;
+use crate::infra::storage::feed_horizon::FeedHorizonMonitor;
 use crate::infra::storage::pool::{MIGRATOR, apply_post_migration_setup, build_pool};
 use crate::infra::storage::record_store::PgRecordStore;
 use crate::infra::storage::retention_sweep::PgRetentionSweeper;
@@ -44,12 +45,14 @@ pub struct TimescaleDbUsageCollectorPlugin {
     sweep_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// What `start` needs from `init` to run the retention sweep and the rollup
-/// refresh-policy monitor.
+/// What `start` needs from `init` to run the retention sweep and the two
+/// health samplers (rollup refresh-policy health, and the feed's
+/// settled-horizon lag).
 struct SweepWiring {
     sweeper: Arc<PgRetentionSweeper>,
     interval: Duration,
     monitor: Arc<RollupMonitor>,
+    horizon_monitor: Arc<FeedHorizonMonitor>,
 }
 
 #[async_trait]
@@ -132,11 +135,13 @@ impl Gear for TimescaleDbUsageCollectorPlugin {
             Arc::clone(&metrics),
         ));
         let monitor = Arc::new(RollupMonitor::new(pool.clone(), Arc::clone(&metrics)));
+        let horizon_monitor = Arc::new(FeedHorizonMonitor::new(pool.clone(), Arc::clone(&metrics)));
         self.sweep
             .set(SweepWiring {
                 sweeper,
                 interval: Duration::from_secs(cfg.retention_sweep_interval_secs),
                 monitor,
+                horizon_monitor,
             })
             .map_err(|_| anyhow::anyhow!("timescaledb plugin init ran twice"))?;
 
@@ -179,6 +184,7 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
         let sweeper = Arc::clone(&wiring.sweeper);
         let interval = wiring.interval;
         let monitor = Arc::clone(&wiring.monitor);
+        let horizon_monitor = Arc::clone(&wiring.horizon_monitor);
         let token = cancel.child_token();
         {
             let mut guard = self
@@ -190,7 +196,13 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
             }
             *guard = Some(token.clone());
         }
-        let handle = toolkit::tokio::spawn(run_background(sweeper, interval, monitor, token));
+        let handle = toolkit::tokio::spawn(run_background(
+            sweeper,
+            interval,
+            monitor,
+            horizon_monitor,
+            token,
+        ));
         *self
             .sweep_handle
             .lock()
@@ -240,8 +252,10 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
     }
 }
 
-/// How often refresh-policy health is sampled.
-const ROLLUP_MONITOR_INTERVAL: Duration = Duration::from_mins(1);
+/// How often the rollup refresh-policy health and the feed's settled-horizon
+/// lag are sampled. One tick now drives both samplers, so the name states
+/// what it governs rather than naming just the first sampler that rode it.
+const SAMPLER_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Sweep and sample now, then each on its own interval, until `cancel` fires.
 ///
@@ -249,22 +263,29 @@ const ROLLUP_MONITOR_INTERVAL: Duration = Duration::from_mins(1);
 /// lock and may be part-way through a chunk drop; letting it finish is cheaper
 /// than reasoning about where it stopped, and its lock connection closes either
 /// way.
+///
+/// One loop does all three (`docs/DESIGN.md` §3.2): it sweeps retention,
+/// samples rollup health and samples the feed's settled-horizon lag.
 async fn run_background(
     sweeper: Arc<PgRetentionSweeper>,
     sweep_interval: Duration,
     monitor: Arc<RollupMonitor>,
+    horizon_monitor: Arc<FeedHorizonMonitor>,
     cancel: CancellationToken,
 ) {
     let mut sweep_tick = toolkit::tokio::time::interval(sweep_interval);
     sweep_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut monitor_tick = toolkit::tokio::time::interval(ROLLUP_MONITOR_INTERVAL);
-    monitor_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut sampler_tick = toolkit::tokio::time::interval(SAMPLER_INTERVAL);
+    sampler_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         toolkit::tokio::select! {
             biased;
             () = cancel.cancelled() => break,
             _ = sweep_tick.tick() => sweep_and_log(&sweeper).await,
-            _ = monitor_tick.tick() => sample_and_log(&monitor).await,
+            _ = sampler_tick.tick() => {
+                sample_rollup_and_log(&monitor).await;
+                sample_horizon_and_log(&horizon_monitor).await;
+            }
         }
     }
 }
@@ -278,11 +299,27 @@ async fn sweep_and_log(sweeper: &PgRetentionSweeper) {
 }
 
 /// Sample refresh-policy health once and log a failure.
-async fn sample_and_log(monitor: &RollupMonitor) {
+async fn sample_rollup_and_log(monitor: &RollupMonitor) {
     match monitor.sample_once().await {
         Ok(n) => tracing::debug!(policies = n, "rollup refresh health sampled"),
         Err(e) => {
             tracing::warn!(error = %e, "sampling rollup refresh health failed; retrying next interval");
+        }
+    }
+}
+
+/// Sample the feed's settled-horizon lag once and log a failure. A `None`
+/// sample (the plugin role sees no write transaction) is not a failure and is
+/// logged at the same level as a found one: the gauge is simply left unset for
+/// that tick (`docs/DESIGN.md` §4.3).
+async fn sample_horizon_and_log(horizon_monitor: &FeedHorizonMonitor) {
+    match horizon_monitor.sample_once().await {
+        Ok(lag) => tracing::debug!(?lag, "feed settled-horizon lag sampled"),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "sampling the feed's settled-horizon lag failed; retrying next interval"
+            );
         }
     }
 }

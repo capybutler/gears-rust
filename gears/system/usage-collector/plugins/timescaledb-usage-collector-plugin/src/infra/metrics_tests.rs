@@ -283,7 +283,7 @@ async fn recording_helpers_emit_expected_series() {
 /// merely reach some floor. A floor cannot notice an instrument disappearing,
 /// and it hid an untested belief: that the two observable pool gauges are
 /// collected by their callbacks on this path. Equality tests that belief
-/// instead of assuming it — it holds, at 24.
+/// instead of assuming it — it holds, at 26.
 ///
 /// Two mechanisms catch different halves of a new instrument, and neither is
 /// quite a guarantee on its own: `declared_instrument_names`' destructure has
@@ -333,6 +333,8 @@ async fn every_exported_instrument_obeys_the_naming_convention() {
         secs_since_success: Some(1.0),
     });
     metrics.set_rollup_refresh_policies(2);
+    metrics.inc_feed_cursor_refusal();
+    metrics.set_feed_horizon_lag(1.5);
 
     provider.force_flush().unwrap();
 
@@ -521,5 +523,24 @@ async fn the_late_convergence_counter_is_published_at_zero() {
     assert_eq!(
         counter_sum(&exporter, "uc_timescaledb_dedup_late_convergence_total"),
         0
+    );
+}
+
+#[tokio::test]
+async fn the_horizon_lag_gauge_is_absent_until_something_sets_it() {
+    // §4.3 makes this gauge best-effort and enumerates what it misses: it is
+    // "left unset when the plugin role cannot see other roles' sessions", and
+    // it misses a prepared transaction, which has no backend. **Unset means
+    // absent, not zero** — a zero would read as a healthy instance with no long
+    // transaction, which is exactly the condition the gauge exists to
+    // distinguish from "cannot tell".
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter("uc.timescaledb"), lazy_pool());
+    metrics.inc_feed_cursor_refusal();
+    provider.force_flush().expect("flush");
+    assert!(
+        !exported_names(&exporter).contains(&"uc_timescaledb_feed_horizon_lag_seconds".to_owned()),
+        "an instrument the plugin has built but never recorded on is not \
+         exported at all, which is what 'left unset' has to mean for a reader"
     );
 }
