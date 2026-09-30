@@ -56,11 +56,74 @@ fn the_page_statement_reads_the_feed_column_list_not_the_plain_one() {
     let (sql, _binds) =
         build_feed_page_sql(None, None, &tenant_scope(Uuid::nil()), 10).expect("the scope renders");
     assert!(
-        sql.starts_with(&format!(
+        sql.contains(&format!(
             "SELECT {columns} FROM usage_records ",
             columns = crate::infra::storage::record_store::FEED_COLUMNS
         )),
-        "the page statement must select FEED_COLUMNS, not RECORD_COLUMNS: {sql}"
+        "the lateral body must select FEED_COLUMNS, not RECORD_COLUMNS: {sql}"
+    );
+}
+
+#[test]
+fn the_page_statement_is_a_lateral_join_over_the_subscription_not_an_any_array() {
+    // The reshaping this task lands: `gts_type_id = ANY($1)` sorted the whole
+    // remaining range before `LIMIT` (`tests/feed_page_query_plan_pg.rs`'s
+    // finding, PostgreSQL derives no index pathkeys past a `ScalarArrayOpExpr`
+    // on a leading index column). A lateral join over `unnest($1::text[])`
+    // gives each subscribed type its own equality against
+    // `usage_records_feed_idx`'s leading column, which keeps the index's
+    // pathkeys and lets the inner `LIMIT` stop each type's walk early.
+    let (sql, _binds) =
+        build_feed_page_sql(None, None, &tenant_scope(Uuid::nil()), 10).expect("the scope renders");
+    assert!(
+        !sql.contains("gts_type_id = ANY($1)"),
+        "the single ANY($1) equality must be gone: {sql}"
+    );
+    assert!(
+        sql.contains("FROM unnest($1::text[]) AS t(gts) CROSS JOIN LATERAL"),
+        "the subscription drives one lateral iteration per type: {sql}"
+    );
+    assert!(
+        sql.contains("WHERE gts_type_id = t.gts"),
+        "each iteration is an equality against the lateral row, not an array test: {sql}"
+    );
+}
+
+#[test]
+fn the_inner_and_outer_limits_match_and_the_outer_sort_casts_back_to_xid8() {
+    // Ruling (spike candidate B, thing to get right #1): the inner LIMIT must
+    // equal the outer one -- a smaller inner limit could silently drop a row
+    // the outer merge needed, since a row in the global top `limit` has at
+    // most `limit - 1` rows ahead of it within its own type. And the outer
+    // ORDER BY must cast `xact_id_text` back to `xid8` rather than sort the
+    // text, or two ids of different digit lengths misorder -- the same
+    // digit-crossing hazard `CHUNK_HIGHEST_POSITIONS_SQL`'s own alias exists
+    // to avoid.
+    let (sql, _binds) =
+        build_feed_page_sql(None, None, &tenant_scope(Uuid::nil()), 7).expect("the scope renders");
+    assert_eq!(
+        sql.matches("LIMIT 7").count(),
+        2,
+        "the same limit must be rendered inner and outer: {sql}"
+    );
+    assert!(
+        sql.ends_with("ORDER BY s.xact_id_text::xid8, s.id LIMIT 7"),
+        "the outer sort casts the text alias back to xid8 for numeric order: {sql}"
+    );
+}
+
+#[test]
+fn the_outer_projection_is_the_lateral_alias_star() {
+    // The outer projection must preserve every alias the inner SELECT
+    // produces (thing to get right #3) -- `s.*` does this by construction,
+    // rather than by a second column list that could drift from
+    // `FEED_COLUMNS` and silently stop matching `FeedRecordRow`'s by-name
+    // decode.
+    let (sql, _binds) =
+        build_feed_page_sql(None, None, &tenant_scope(Uuid::nil()), 10).expect("the scope renders");
+    assert!(
+        sql.starts_with("SELECT s.* FROM unnest($1::text[])"),
+        "the outer projection must be s.*, not a restated column list: {sql}"
     );
 }
 
@@ -68,7 +131,9 @@ fn the_page_statement_reads_the_feed_column_list_not_the_plain_one() {
 fn a_continuation_bounds_position_from_below_as_one_row_value() {
     // Row-value comparison rather than the expanded disjunction, because it is
     // what `usage_records_feed_idx (gts_type_id, xact_id, id)` serves as a
-    // single index condition.
+    // single index condition **within one lateral iteration's equality on
+    // `gts_type_id`** — the per-type read `query/feed.rs`'s own module doc
+    // describes, not a single condition spanning the whole subscription.
     let (sql, _binds) = build_feed_page_sql(
         Some((41, Uuid::from_u128(7))),
         None,

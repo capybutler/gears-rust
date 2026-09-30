@@ -262,6 +262,50 @@ async fn an_empty_meter_named_beside_a_busy_one_changes_nothing() {
     );
 }
 
+// 3b. A wholly empty subscription array behaves as it does today: an empty
+// page, never an error. Thing to get right #4 of the lateral-join reshaping
+// -- `unnest($1::text[])` of an empty array joins to nothing, the same as
+// `gts_type_id = ANY('{}')` did before it, and this is the one behaviour the
+// per-type `UNION ALL` alternative would have needed an explicit guard for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wholly_empty_subscription_is_served_as_an_empty_page_not_an_error() {
+    let (_h, adapter) = common::start_backend().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(1);
+    let scope = common::tenant_scope(tenant);
+
+    // Something exists in the ledger, so an empty result is provably the
+    // subscription's own emptiness and not merely an empty database.
+    adapter
+        .create_usage_record(common::entry(
+            &meter,
+            tenant,
+            "feed-unsubscribed",
+            Decimal::ONE,
+        ))
+        .await
+        .expect("the entry is accepted");
+
+    let page = adapter
+        .read_feed_page(&[], &scope, FeedStart::Oldest, None, 10)
+        .await
+        .expect("an empty subscription is served, never refused or errored");
+
+    assert!(
+        page.entries.is_empty(),
+        "no type is subscribed, so nothing may be delivered: {:?}",
+        page.entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        page.next.is_some(),
+        "an empty page still carries a head cursor, never `None`, the same as any other \
+         empty page"
+    );
+}
+
 // 4. Two entries of one batch share an `xact_id` and are ordered by `id`.
 //
 // **Not built on `create_usage_records`.** `run_guarded_batch_write`'s own
@@ -317,6 +361,123 @@ async fn two_entries_sharing_a_transaction_id_are_ordered_by_id_not_insertion_or
         expected.to_vec(),
         "two entries sharing an xact_id are ordered by id, the feed order's tiebreak, \
          even though they were inserted in the opposite order"
+    );
+}
+
+// 4b. A cross-type `xact_id` tie, walked page by page to the head. The
+// whole-slice review's owner-authorised statement reshaping
+// (`query/feed.rs`'s lateral join, one iteration per subscribed type) merges
+// each type's own ordered stream through an outer sort -- and every tie test
+// before this one named exactly one meter, so none of them ever exercised
+// that outer merge across more than one lateral iteration. This is the
+// spike's own equivalence fixture (see
+// `.superpowers/sdd/2026-09-27-usage-collector-spec-complete/
+// spike-feed-page-index-order.md`, Finding 3), landed here since the suite
+// had no cross-type version of the same-type tie test above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_type_xact_id_tie_walks_to_the_head_in_id_order() {
+    let (h, adapter) = common::start_backend().await;
+    let vcpu = common::meter(common::VCPU_METER);
+    let gb = common::meter(common::GB_METER);
+    let tenant = Uuid::from_u128(1);
+    let scope = common::tenant_scope(tenant);
+    let subscription = [vcpu.clone(), gb.clone()];
+
+    // Uneven counts across the two types, each inserted through the
+    // production write path so every one gets its own committed xact_id.
+    let mut ids = Vec::new();
+    for i in 0..7 {
+        let e = adapter
+            .create_usage_record(common::entry(
+                &vcpu,
+                tenant,
+                &format!("cross-vcpu-{i}"),
+                Decimal::ONE,
+            ))
+            .await
+            .expect("vcpu entry accepted");
+        ids.push(e.id);
+    }
+    for i in 0..5 {
+        let e = adapter
+            .create_usage_record(common::entry(
+                &gb,
+                tenant,
+                &format!("cross-gb-{i}"),
+                Decimal::ONE,
+            ))
+            .await
+            .expect("gb entry accepted");
+        ids.push(e.id);
+    }
+
+    // The planted tie: one VCPU row and one GB row, committed together so
+    // they share one `xact_id`, with the *lesser* id inserted *second* -- the
+    // reverse of the order only the `(xact_id, id)` tiebreak can recover, and
+    // the two rows are of *different* types, which the same-type tie test
+    // above cannot exercise.
+    let t1 = common::entry(&vcpu, tenant, "cross-tie-vcpu", Decimal::ONE);
+    let t2 = common::entry(&gb, tenant, "cross-tie-gb", Decimal::ONE);
+    let (greater, lesser) = if t1.id > t2.id {
+        (&t1, &t2)
+    } else {
+        (&t2, &t1)
+    };
+    let mut tx = h.pool.begin().await.expect("begin the shared transaction");
+    insert_raw_within(&mut tx, greater).await;
+    insert_raw_within(&mut tx, lesser).await;
+    tx.commit()
+        .await
+        .expect("commit both cross-type rows under one transaction id");
+    ids.push(t1.id);
+    ids.push(t2.id);
+
+    let x1 = common::xact_id_of(&h.pool, t1.id).await;
+    let x2 = common::xact_id_of(&h.pool, t2.id).await;
+    assert_eq!(
+        x1, x2,
+        "the planted pair shares one transaction id across two different types"
+    );
+
+    // The canonical order: every entry's own `(xact_id, id)`, read back
+    // rather than assumed, since it is the database that stamps `xact_id`.
+    let mut with_positions = Vec::new();
+    for id in &ids {
+        let xact_id = common::xact_id_of(&h.pool, *id).await;
+        with_positions.push((xact_id, *id));
+    }
+    with_positions.sort_unstable();
+    let expected: Vec<Uuid> = with_positions.into_iter().map(|(_, id)| id).collect();
+
+    // Walked at a limit narrower than either type's own count, so the walk
+    // crosses several pages and the outer merge over both lateral iterations
+    // runs on every one of them, not just on one page wide enough to hide
+    // behind.
+    let mut delivered: Vec<Uuid> = Vec::new();
+    let mut start = FeedStart::Oldest;
+    for _ in 0..20 {
+        let page = adapter
+            .read_feed_page(&subscription, &scope, start.clone(), None, 3)
+            .await
+            .expect("a page is served");
+        delivered.extend(page.entries.iter().map(|r| r.id));
+        if page.entries.is_empty() || delivered.len() >= expected.len() {
+            break;
+        }
+        start = FeedStart::After(page.next.expect("a live page carries a continuation"));
+    }
+
+    assert!(
+        delivered.len() == expected.len(),
+        "the walk must terminate having delivered every planted entry exactly once: \
+         got {} of {}",
+        delivered.len(),
+        expected.len()
+    );
+    assert_eq!(
+        delivered, expected,
+        "a cross-type xact_id tie, and every other entry, arrives exactly once, in the \
+         (xact_id, id) order, walked page by page across both subscribed types"
     );
 }
 
@@ -541,6 +702,66 @@ async fn the_scope_narrows_the_feed_to_the_tenants_it_admits() {
         wide.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![a.id, b.id],
         "both tenants' entries are present under a scope admitting both"
+    );
+}
+
+// 9b. The compiled scope must filter *inside* the lateral-per-type read, not
+// on the outer merge's already-limited output. Thing to get right #2 of the
+// lateral-join reshaping: applying the scope outside would let many
+// off-scope rows of the same type consume the inner LIMIT before any
+// in-scope row is ever considered, truncating the page to nothing even
+// though in-scope entries exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrow_scope_still_finds_its_rows_behind_many_off_scope_rows_of_the_same_type() {
+    let (_h, adapter) = common::start_backend().await;
+    let meter = common::meter(common::VCPU_METER);
+    let off_scope_tenant = Uuid::from_u128(1);
+    let in_scope_tenant = Uuid::from_u128(2);
+    let subscription = [meter.clone()];
+    let scope = common::tenant_scope(in_scope_tenant);
+
+    // Twenty off-scope rows, inserted -- and therefore ordered -- ahead of
+    // the three in-scope ones: a per-type LIMIT applied before the scope
+    // filter would exhaust itself on these and never reach the rows the
+    // scope actually admits.
+    for i in 0..20 {
+        adapter
+            .create_usage_record(common::entry(
+                &meter,
+                off_scope_tenant,
+                &format!("feed-offscope-{i}"),
+                Decimal::ONE,
+            ))
+            .await
+            .expect("the off-scope entry is accepted");
+    }
+    let mut expected = Vec::new();
+    for i in 0..3 {
+        let e = adapter
+            .create_usage_record(common::entry(
+                &meter,
+                in_scope_tenant,
+                &format!("feed-inscope-{i}"),
+                Decimal::ONE,
+            ))
+            .await
+            .expect("the in-scope entry is accepted");
+        expected.push(e.id);
+    }
+
+    // A limit that exactly matches the in-scope count: any row of this page
+    // spent on an off-scope entry would starve the page of one it should
+    // have carried.
+    let page = adapter
+        .read_feed_page(&subscription, &scope, FeedStart::Oldest, None, 3)
+        .await
+        .expect("a first read under the narrow scope is served");
+
+    assert_eq!(
+        page.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        expected,
+        "the scope must filter inside the per-type read, so the twenty off-scope rows \
+         ahead of these three cost the page nothing"
     );
 }
 

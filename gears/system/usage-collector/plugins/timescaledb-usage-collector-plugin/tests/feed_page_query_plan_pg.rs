@@ -1,119 +1,155 @@
 #![cfg(feature = "postgres")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-//! `EXPLAIN`s the feed page's own statement over a live `TimescaleDB`, to
-//! check the claim DESIGN §3.7, §4.1 item 7, `query/feed.rs`'s own module
-//! doc, and `query/feed_tests.rs` all make: that the page is served by an
-//! **index-ordered merge** over `usage_records_feed_idx (gts_type_id,
-//! xact_id, id)`, with no sort in front of the `LIMIT`. Requires Docker.
+//! `EXPLAIN ANALYZE`s the feed page's own statement over a live
+//! `TimescaleDB`, to check the property the statement's reshaping bought.
+//! Requires Docker.
 //!
-//! **Finding (ruling A3): the claim does not hold, and nothing changes it
-//! here.** A `Sort` node sits above the index scan whether the subscription
-//! names one type or several. This module's own job is to keep that finding
-//! checkable, not to fix it — see the module doc below for why and the task
-//! report for the plan text and reading handed to the owner.
+//! **History.** This module originally checked the claim DESIGN §3.7, §4.1
+//! item 7, `query/feed.rs`'s own module doc, and `query/feed_tests.rs` all
+//! made: that the page was served by an index-ordered merge over
+//! `usage_records_feed_idx (gts_type_id, xact_id, id)`, with no sort in front
+//! of `LIMIT`. Ruling A3 found the claim did not hold — a `Sort` node sat
+//! above the index scan regardless of subscription width, because
+//! `PostgreSQL` derives no index pathkeys past a `ScalarArrayOpExpr` on a
+//! leading index column. That finding was real, and it was acted on: a spike
+//! (`.superpowers/sdd/2026-09-27-usage-collector-spec-complete/
+//! spike-feed-page-index-order.md`) evaluated two reshapings, and the owner
+//! chose the one `query/feed.rs`'s own doc now carries — a lateral join over
+//! `unnest($1::text[])`, one equality-driven, pathkey-preserving iteration
+//! per subscribed type, combined by an outer sort.
+//!
+//! **Why this module's old assertion is gone, not inverted.** Under the
+//! chosen reshaping **a `Sort` node still exists** — it sits above the
+//! lateral join rather than above a single scan. Asserting `plan.contains("Sort")`
+//! would still pass, but it would no longer be testing anything: a `Sort`
+//! over the whole backlog and a `Sort` over `width × limit` rows both contain
+//! the word "Sort". The property the reshaping actually bought — and the one
+//! the spike measured — is that the sort's own input is *bounded*, not that
+//! a sort node is present or absent. This module now asserts that bound
+//! directly, at more than one subscription width, so the bound is shown to
+//! scale with breadth rather than being a coincidence at one width.
 
 mod common;
 
 use rust_decimal::Decimal;
 use sqlx::Row as _;
 use toolkit_odata::ast;
+use usage_collector_sdk::MeterTypeId;
 use uuid::Uuid;
 
 use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
 use timescaledb_usage_collector_plugin::infra::storage::query::bind::bind_one_query;
 use timescaledb_usage_collector_plugin::infra::storage::query::feed::build_feed_page_sql;
 
-/// `EXPLAIN`s [`build_feed_page_sql`]'s statement over a two-chunk, two-type
-/// subscription, forced onto `usage_records_feed_idx`, and reports whether
-/// the plan needs a `Sort` in front of its `LIMIT`.
+/// The actual row count `EXPLAIN ANALYZE` reports flowing **into** the page
+/// statement's outer `Sort` node — its immediate child's own `actual rows=`,
+/// read off the plan text rather than the `Sort` node's own cost estimate or
+/// its (`LIMIT`-shortened) output count, since the property under test is
+/// what the sort had to process, not what it was asked to return or what the
+/// planner guessed beforehand.
+///
+/// # Panics
+///
+/// If no `Sort` node, or no child line beneath it carrying `actual time=` and
+/// `rows=`, can be found in `plan`. A parse failure here must be loud: a
+/// silently wrong number would make this oracle worthless.
+fn sort_child_actual_rows(plan: &str) -> f64 {
+    let lines: Vec<&str> = plan.lines().collect();
+    let sort_idx = lines
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim_start_matches(['-', '>', ' ']);
+            trimmed.starts_with("Sort") && line.contains("(cost=")
+        })
+        .unwrap_or_else(|| panic!("no Sort node found in plan:\n{plan}"));
+    let child = lines[sort_idx + 1..]
+        .iter()
+        .find(|line| line.contains("->"))
+        .unwrap_or_else(|| panic!("no child node found beneath Sort in plan:\n{plan}"));
+    let after_actual = child.split_once("actual time=").unwrap_or_else(|| {
+        panic!("Sort's child carries no actual time=, so this plan was not ANALYZEd:\n{plan}")
+    });
+    let after_rows = after_actual
+        .1
+        .split_once("rows=")
+        .unwrap_or_else(|| panic!("Sort's child carries no actual rows=:\n{plan}"));
+    let digits: String = after_rows
+        .1
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    digits
+        .parse()
+        .unwrap_or_else(|e| panic!("could not parse actual rows `{digits}`: {e}\n{plan}"))
+}
+
+/// `EXPLAIN ANALYZE`s [`build_feed_page_sql`]'s statement, forced onto
+/// `usage_records_feed_idx`, at subscription widths 1, 2 and 8 — the same
+/// widths the spike measured — and asserts the outer `Sort`'s own input never
+/// exceeds `width × limit` actual rows.
 ///
 /// # Why the plan has to be forced onto `usage_records_feed_idx`
 ///
 /// Left to its own cost model, `PostgreSQL` does not choose
 /// `usage_records_feed_idx` at all at the row counts an integration test can
-/// afford: with `gts_type_id = ANY($1)` bound as a parameter rather than a
-/// literal, the planner has no way to know the array's selectivity at plan
-/// time, so on a few hundred rows a sequential scan (or, with the other
-/// ledger indexes still in place, `usage_records_tenant_type_window_idx` or
+/// afford: with the subscribed types bound as parameters rather than
+/// literals, the planner has no way to know their selectivity at plan time,
+/// so on a few hundred rows a sequential scan (or, with the other ledger
+/// indexes still in place, `usage_records_tenant_type_window_idx` or
 /// `usage_records_watermark_idx`, each a genuine alternative match for part
-/// of the `WHERE`) costs less than an index scan every time. None of that
-/// answers the question this test asks, which is specifically **whether
-/// `usage_records_feed_idx` itself can produce `ORDER BY xact_id, id` for
-/// free**. So the other three ledger indexes that could serve any part of
-/// this statement's `WHERE` are dropped and `enable_seqscan` is turned off on
-/// this test's own container, leaving `usage_records_feed_idx` the only
-/// candidate — this is scan-shape isolation, not a claim about what a real
-/// deployment's planner picks at its own scale, which is a **separate**,
-/// unmeasured question (`docs/DESIGN.md` §4.1 item 7 already says so).
+/// of the `WHERE`) costs less than an index scan every time. So the other
+/// three ledger indexes that could serve any part of this statement's
+/// `WHERE` are dropped and `enable_seqscan` is turned off on this test's own
+/// container, leaving `usage_records_feed_idx` the only candidate — this is
+/// scan-shape isolation, not a claim about what a real deployment's planner
+/// picks at its own scale, which is a **separate**, unmeasured question
+/// (`docs/DESIGN.md` §4.1 item 7 already says so).
 ///
-/// # The finding
+/// # The bound
 ///
-/// **A `Sort` node sits above the index scan.** Verified twice here — once at
-/// a two-type subscription (asserted below) and once, during this
-/// investigation, at a one-type subscription (not landed as its own test,
-/// since the two-type case already answers the question and a third
-/// near-duplicate test buys nothing) — with the same result both times.
-/// `PostgreSQL`'s planner does not derive index pathkeys past a
-/// `ScalarArrayOpExpr` on a leading index column, regardless of how many
-/// elements the bound array turns out to hold at execution time: pathkey
-/// derivation is a property of the parsed expression shape
-/// (`Var = ANY($1)`), decided once for the query's static structure, not of
-/// the runtime cardinality a one-shot custom plan happens to see. A
-/// subscription naming even a single type gets the same `Sort`.
-///
-/// # What this does and does not mean
-///
-/// `usage_records_feed_idx` is still what prunes the `Append` to the chunks
-/// the type-key and time ranges the query names, and the `Sort` seen here
-/// sees only that pruned, filtered set — not the whole hypertable. What it
-/// costs is stated in `DESIGN.md` §4.1 item 7's own terms: the matching range
-/// (bounded by the settled horizon on one side, `after` on the other) sorts
-/// in full before `LIMIT` takes its slice, rather than the streaming,
-/// already-ordered read the index-ordered-merge claim describes.
-///
-/// **This test does not decide whether that is a defect worth fixing.** The
-/// fix would either restate four documents that currently claim otherwise
-/// (`DESIGN.md` §3.7, `DESIGN.md` §4.1 item 7, `query/feed.rs`'s own module
-/// doc, `query/feed_tests.rs`) or change the page statement's shape (for
-/// instance, a per-type `MergeAppend` the application builds instead of
-/// leaning on one `ScalarArrayOpExpr`) — a choice between those two is the
-/// owner's, not this test's. This test's job is narrower: keep the finding
-/// itself checkable, so a future change to the statement, the indexes, or
-/// `PostgreSQL`'s own SAOP-pathkey support is noticed rather than silently
-/// re-litigated. **If this assertion ever starts failing because the `Sort`
-/// is gone, that is good news — update it to assert absence instead, and
-/// `docs/features/usage-feed.md:672`'s acceptance line can be ticked.**
+/// **The correctness argument requires the inner, per-type `LIMIT` to equal
+/// the outer one** — a row in the global top `limit` has at most `limit − 1`
+/// rows ahead of it within its own type, so per-type top-`limit` then merge
+/// yields exactly the global top `limit`; a smaller inner limit could
+/// silently drop a row. That equality is also what keeps the outer sort
+/// bounded: each of `width` lateral iterations contributes at most `limit`
+/// rows, so the sort above them never sees more than `width × limit`,
+/// whatever the subscription's total backlog. This test's fixture (eight
+/// types, forty rows each, one chunk per type at the default slice width)
+/// makes the backlog per type large enough that an unbounded sort — the
+/// defect ruling A3 found — would visibly exceed the bound at every width
+/// tested.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_page_statement_still_sorts_after_usage_records_feed_idx() {
+async fn the_sort_above_usage_records_feed_idx_stays_bounded_by_width_times_limit() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
     let store = common::record_store(&h);
     let tenant = Uuid::from_u128(1);
+    let limit: u64 = 10;
 
-    // Enough rows per type that the planner's cost model reflects a real
-    // choice rather than tie-breaking among near-zero-cost plans, spread
-    // across two types -- which, under the default `type_key_slice_width` of
-    // 1, is also two chunks: each type gets its own type-key partition.
-    for i in 0..200 {
-        store
-            .create(common::entry(
-                &common::meter(common::VCPU_METER),
-                tenant,
-                &format!("plan-vcpu-{i}"),
-                Decimal::ONE,
+    // Eight distinct types, forty rows each -- one chunk per type at the
+    // default `type_key_slice_width` of 1, matching the spike's own fixture.
+    // Built once; each width below just names a narrower prefix of it.
+    let meters: Vec<MeterTypeId> = (0..8u32)
+        .map(|i| {
+            common::meter(&format!(
+                "gts.cf.core.uc.usage_record.v1~cf.meter{i}._.units{i}.v1~"
             ))
-            .await
-            .expect("vcpu entry stores");
-        store
-            .create(common::entry(
-                &common::meter(common::GB_METER),
-                tenant,
-                &format!("plan-gb-{i}"),
-                Decimal::ONE,
-            ))
-            .await
-            .expect("gb entry stores");
+        })
+        .collect();
+    for m in &meters {
+        for i in 0..40 {
+            store
+                .create(common::entry(
+                    m,
+                    tenant,
+                    &format!("{}-plan-{i}", m.as_str()),
+                    Decimal::ONE,
+                ))
+                .await
+                .expect("entry stores");
+        }
     }
     sqlx::query("ANALYZE usage_records")
         .execute(&h.pool)
@@ -123,7 +159,7 @@ async fn the_page_statement_still_sorts_after_usage_records_feed_idx() {
         .fetch_one(&h.pool)
         .await
         .expect("count chunks");
-    assert_eq!(chunks, 2, "one chunk per type at the default slice width");
+    assert_eq!(chunks, 8, "one chunk per type at the default slice width");
 
     // A scope every fixture satisfies and that touches no other ledger index,
     // so the only index left standing that could serve any part of the
@@ -135,7 +171,6 @@ async fn the_page_statement_still_sorts_after_usage_records_feed_idx() {
             "compute.vm".to_owned(),
         ))),
     );
-    let (sql, binds) = build_feed_page_sql(None, None, &scope, 10).expect("the scope renders");
     let horizon: String =
         sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text")
             .fetch_one(&h.pool)
@@ -158,33 +193,45 @@ async fn the_page_statement_still_sorts_after_usage_records_feed_idx() {
         .await
         .expect("disable seqscan, so feed_idx is the only remaining candidate");
 
-    let explain_sql = format!("EXPLAIN (FORMAT TEXT) {sql}");
-    let types: Vec<&str> = vec![common::VCPU_METER, common::GB_METER];
-    let mut q = sqlx::query(sqlx::AssertSqlSafe(explain_sql))
-        .bind(types)
-        .bind(&horizon);
-    for b in &binds {
-        q = bind_one_query(q, b);
-    }
-    let rows = q
-        .fetch_all(&mut *conn)
-        .await
-        .expect("explain the page statement");
-    let plan = rows
-        .iter()
-        .map(|row| row.get::<String, _>(0))
-        .collect::<Vec<_>>()
-        .join("\n");
+    for width in [1usize, 2, 8] {
+        let (sql, binds) =
+            build_feed_page_sql(None, None, &scope, limit).expect("the scope renders");
+        let explain_sql = format!("EXPLAIN (ANALYZE, FORMAT TEXT) {sql}");
+        let types: Vec<&str> = meters[..width].iter().map(MeterTypeId::as_str).collect();
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(explain_sql))
+            .bind(types)
+            .bind(&horizon);
+        for b in &binds {
+            q = bind_one_query(q, b);
+        }
+        let rows = q
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("explain analyze the page statement at width {width}: {e}"));
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-    assert!(
-        plan.contains("usage_records_feed_idx"),
-        "the isolation must have forced the scan onto the index this test is about; got:\n{plan}"
-    );
-    assert!(
-        plan.contains("Sort"),
-        "ruling A3: expected a Sort above the usage_records_feed_idx scan, matching the \
-         finding reported to the owner -- if this now fails, the claim in DESIGN.md §3.7, \
-         §4.1 item 7, query/feed.rs and query/feed_tests.rs has started holding, and this \
-         assertion should invert rather than this test being deleted; full plan:\n{plan}"
-    );
+        assert!(
+            plan.contains("usage_records_feed_idx"),
+            "width {width}: the isolation must have forced the scan onto the index this test \
+             is about; got:\n{plan}"
+        );
+
+        let bound = width as u64 * limit;
+        let actual = sort_child_actual_rows(&plan);
+        // `bound` is `width x limit`, at most 8 x 10 = 80 here -- nowhere near
+        // f64's 52-bit mantissa, so the cast loses nothing.
+        #[allow(clippy::cast_precision_loss)]
+        let bound_f64 = bound as f64;
+        assert!(
+            actual <= bound_f64,
+            "width {width}: the sort above usage_records_feed_idx was fed {actual} actual \
+             rows, which must stay at or below width x limit = {bound} -- if this fails, the \
+             lateral join's per-type LIMIT has stopped pushing down, or the inner and outer \
+             LIMITs have drifted apart; plan:\n{plan}"
+        );
+    }
 }
