@@ -2744,7 +2744,30 @@ impl RecordStore for PgRecordStore {
         // already keeps.
         let (sql, binds) = build_feed_page_sql(after, until, scope, limit)
             .map_err(UsageCollectorPluginError::internal)?;
-        let types: Vec<&str> = subscription.iter().map(MeterTypeId::as_str).collect();
+        // Deduplicated, order-preserving: `unnest($1::text[])` gives one
+        // lateral iteration per array *element*, so a repeated type would
+        // deliver every one of its rows twice — the old `gts_type_id =
+        // ANY($1)` was idempotent under a repeat, this statement is not. The
+        // SDK's `FeedSubscription::new` already sorts and dedups before this
+        // method ever sees `subscription`, but that invariant lives two
+        // crates away; deduplicating here as well is nearly free and keeps
+        // this statement's own correctness local rather than resting
+        // entirely on a caller elsewhere. A `sort_unstable` + `dedup` would
+        // also dedup, but it would erase the caller's subscription order,
+        // which is otherwise no accident to preserve: `unnest($1::text[])`
+        // walks the array in its own element order, so an outer tie with no
+        // `id` component left (there is none in the shipped statement, but a
+        // future change could introduce one) would resolve however this
+        // array is ordered. Keeping first-occurrence order instead costs one
+        // small loop over a subscription this crate already expects to be
+        // narrow.
+        let mut types: Vec<&str> = Vec::with_capacity(subscription.len());
+        for m in subscription {
+            let s = m.as_str();
+            if !types.contains(&s) {
+                types.push(s);
+            }
+        }
 
         let mut conn = self.timed_acquire().await?;
 

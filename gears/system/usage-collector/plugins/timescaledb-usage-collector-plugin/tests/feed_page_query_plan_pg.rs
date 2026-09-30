@@ -28,6 +28,15 @@
 //! a sort node is present or absent. This module now asserts that bound
 //! directly, at more than one subscription width, so the bound is shown to
 //! scale with breadth rather than being a coincidence at one width.
+//!
+//! **This is also why `docs/features/usage-feed.md:672` stays unticked.**
+//! That acceptance line asserts a *merge* verified by the query plan. The
+//! plan this module captures contains a real `Sort` node (a `top-N
+//! heapsort` at width 8, `quicksort` at narrower widths), never a `Merge
+//! Append`, so the literal claim does not hold under the chosen shape
+//! (candidate B) — only the rejected alternative (candidate A, the per-type
+//! `UNION ALL` this module's own history above did not choose) would have
+//! produced one. The box is left open on purpose, not by oversight.
 
 mod common;
 
@@ -109,7 +118,7 @@ fn sort_child_actual_rows(plan: &str) -> f64 {
 ///
 /// **The correctness argument requires the inner, per-type `LIMIT` to equal
 /// the outer one** — a row in the global top `limit` has at most `limit − 1`
-/// rows ahead of it within its own type, so per-type top-`limit` then merge
+/// rows ahead of it within its own type, so per-type top-`limit` then combine
 /// yields exactly the global top `limit`; a smaller inner limit could
 /// silently drop a row. That equality is also what keeps the outer sort
 /// bounded: each of `width` lateral iterations contributes at most `limit`
@@ -193,12 +202,14 @@ async fn the_sort_above_usage_records_feed_idx_stays_bounded_by_width_times_limi
         .await
         .expect("disable seqscan, so feed_idx is the only remaining candidate");
 
+    // Built once: `sql` and `binds` do not vary with `width`, only which
+    // prefix of `meters` is bound into `$1` below does.
+    let (sql, binds) = build_feed_page_sql(None, None, &scope, limit).expect("the scope renders");
+    let explain_sql = format!("EXPLAIN (ANALYZE, FORMAT TEXT) {sql}");
+
     for width in [1usize, 2, 8] {
-        let (sql, binds) =
-            build_feed_page_sql(None, None, &scope, limit).expect("the scope renders");
-        let explain_sql = format!("EXPLAIN (ANALYZE, FORMAT TEXT) {sql}");
         let types: Vec<&str> = meters[..width].iter().map(MeterTypeId::as_str).collect();
-        let mut q = sqlx::query(sqlx::AssertSqlSafe(explain_sql))
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(explain_sql.clone()))
             .bind(types)
             .bind(&horizon);
         for b in &binds {

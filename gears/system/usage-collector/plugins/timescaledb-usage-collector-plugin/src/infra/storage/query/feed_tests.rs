@@ -93,7 +93,7 @@ fn the_page_statement_is_a_lateral_join_over_the_subscription_not_an_any_array()
 fn the_inner_and_outer_limits_match_and_the_outer_sort_casts_back_to_xid8() {
     // Ruling (spike candidate B, thing to get right #1): the inner LIMIT must
     // equal the outer one -- a smaller inner limit could silently drop a row
-    // the outer merge needed, since a row in the global top `limit` has at
+    // the outer sort needed, since a row in the global top `limit` has at
     // most `limit - 1` rows ahead of it within its own type. And the outer
     // ORDER BY must cast `xact_id_text` back to `xid8` rather than sort the
     // text, or two ids of different digit lengths misorder -- the same

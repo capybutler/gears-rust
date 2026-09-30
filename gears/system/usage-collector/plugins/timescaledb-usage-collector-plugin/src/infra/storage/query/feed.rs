@@ -77,16 +77,16 @@ pub const MARK_ABOVE_SQL: &str = "SELECT 1 FROM usage_feed_retention_marks \
 /// **The inner `LIMIT` equals the outer one, and that equality is the whole
 /// correctness argument, not an optimisation.** A row in the global top
 /// `limit` has at most `limit − 1` rows ahead of it *within its own type*, so
-/// per-type top-`limit` then merge yields exactly the global top `limit`. A
-/// smaller inner limit could silently drop a row the outer merge needed.
+/// per-type top-`limit` then combine yields exactly the global top `limit`. A
+/// smaller inner limit could silently drop a row the outer sort needed.
 ///
 /// **The outer `ORDER BY` casts `xact_id_text` back to `xid8`, rather than
 /// sorting the text.** `s`, the lateral alias, exposes exactly
 /// `FEED_COLUMNS`'s columns — no bare `xact_id`, since `xid8` has no `sqlx`
 /// `Decode` and the inner select only ever casts it to `xact_id_text` (the
 /// same reason [`FeedRecordRow::xact_id`](crate::infra::storage::entity::FeedRecordRow)
-/// decodes from that name). Sorting the outer merge on `xact_id_text` bare
-/// would compare digit strings lexicographically, the same digit-crossing
+/// decodes from that name). Sorting on `xact_id_text` bare, instead of
+/// casting it back, would compare digit strings lexicographically, the same digit-crossing
 /// hazard `CHUNK_HIGHEST_POSITIONS_SQL`'s own `xact_id_text` alias exists to
 /// avoid; casting it back to `xid8` recovers the numeric comparison `xid8`'s
 /// own operators give, at the cost of one cast rather than a second raw
@@ -103,6 +103,16 @@ pub const MARK_ABOVE_SQL: &str = "SELECT 1 FROM usage_feed_retention_marks \
 /// array yields no rows for `t`, so the `CROSS JOIN LATERAL` yields none
 /// either — the same empty page `gts_type_id = ANY('{}')` already produced,
 /// with no special case needed.
+///
+/// **The caller must pass a subscription with no repeated type.**
+/// `unnest($1::text[])` yields one lateral iteration per array *element*,
+/// not per distinct value, so a type named twice delivers every one of its
+/// matching rows twice — unlike `gts_type_id = ANY($1)`, which was
+/// idempotent under a repeat. The one caller in this crate,
+/// `PgRecordStore::feed_page`, deduplicates before binding here, and the
+/// SDK's `FeedSubscription::new` sorts and dedups before that, so the
+/// sanctioned path never presents a repeat; this statement itself does not
+/// guard against one.
 ///
 /// Bind order is unchanged from the single-statement shape and does not
 /// multiply with the lateral: the subscription array is still `$1` — moved

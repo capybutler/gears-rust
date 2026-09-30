@@ -306,6 +306,42 @@ async fn a_wholly_empty_subscription_is_served_as_an_empty_page_not_an_error() {
     );
 }
 
+// 3c. A repeated type in the subscription does not double-deliver its
+// entries. Whole-slice re-review F1: `unnest($1::text[])` gives one lateral
+// iteration per array *element*, not per distinct value, so a repeat -- the
+// old `gts_type_id = ANY($1)` was idempotent under -- would otherwise
+// deliver every one of the repeated type's rows twice.
+// `PgRecordStore::feed_page` deduplicates the subscription before binding it
+// (`src/infra/storage/query/feed.rs`'s own doc states the precondition), and
+// this is that dedup's own coverage rather than trust in the SDK's
+// `FeedSubscription::new`, which sorts and dedups upstream of every
+// sanctioned caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_type_in_the_subscription_does_not_double_deliver_its_entries() {
+    let (_h, adapter) = common::start_backend().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(1);
+    let scope = common::tenant_scope(tenant);
+    let subscription = [meter.clone(), meter.clone(), meter.clone()];
+
+    let entry = common::entry(&meter, tenant, "feed-repeated-type", Decimal::ONE);
+    adapter
+        .create_usage_record(entry.clone())
+        .await
+        .expect("the entry is accepted");
+
+    let page = adapter
+        .read_feed_page(&subscription, &scope, FeedStart::Oldest, None, 10)
+        .await
+        .expect("a subscription naming one type three times is still served");
+
+    assert_eq!(
+        page.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![entry.id],
+        "the entry must be delivered exactly once, not once per repeated array element"
+    );
+}
+
 // 4. Two entries of one batch share an `xact_id` and are ordered by `id`.
 //
 // **Not built on `create_usage_records`.** `run_guarded_batch_write`'s own
@@ -366,14 +402,37 @@ async fn two_entries_sharing_a_transaction_id_are_ordered_by_id_not_insertion_or
 
 // 4b. A cross-type `xact_id` tie, walked page by page to the head. The
 // whole-slice review's owner-authorised statement reshaping
-// (`query/feed.rs`'s lateral join, one iteration per subscribed type) merges
-// each type's own ordered stream through an outer sort -- and every tie test
-// before this one named exactly one meter, so none of them ever exercised
-// that outer merge across more than one lateral iteration. This is the
-// spike's own equivalence fixture (see
+// (`query/feed.rs`'s lateral join, one iteration per subscribed type)
+// combines each type's own ordered stream through an outer sort -- and every
+// tie test before this one named exactly one meter, so none of them ever
+// exercised that outer sort across more than one lateral iteration. This is
+// the spike's own equivalence fixture (see
 // `.superpowers/sdd/2026-09-27-usage-collector-spec-complete/
 // spike-feed-page-index-order.md`, Finding 3), landed here since the suite
 // had no cross-type version of the same-type tie test above.
+//
+// **The subscription order matters here, and it is built from the planted
+// pair rather than fixed, on purpose.** The two tied rows come from
+// different lateral iterations over different chunks, so -- unlike the
+// same-type sibling test, where one index range already returns both rows
+// in `(xact_id, id)` order regardless of insertion order -- nothing here
+// forces the DB's own row order. If the outer `ORDER BY`'s `, s.id` tiebreak
+// were ever lost, ties would fall back to whatever order the rows entered
+// the sort in, which is `unnest($1::text[])`'s own array order: the
+// subscription's, preserved end to end by `PgRecordStore::feed_page`'s
+// order-preserving dedup (it does not sort). Naming the *lesser*-id type
+// first in the subscription would make that fallback order accidentally
+// agree with the correct one, so this test would stay green under the very
+// mutation it exists to catch. Naming the *greater*-id type first is what
+// makes the two disagree.
+//
+// **Measured, not assumed.** With these fixtures, `cross-tie-vcpu` derives
+// `35610373-...` and `cross-tie-gb` derives `8062b058-...`, so gb is the
+// greater and is named first below. Dropping `, s.id` from the outer
+// `ORDER BY` (leaving only `ORDER BY s.xact_id_text::xid8`) reds this test:
+// the tied pair is delivered as `[8062b058 (gb), 35610373 (vcpu)]` --
+// subscription-array order -- against an expected `[35610373 (vcpu),
+// 8062b058 (gb)]` -- id order. Restored and confirmed green again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cross_type_xact_id_tie_walks_to_the_head_in_id_order() {
     let (h, adapter) = common::start_backend().await;
@@ -381,7 +440,6 @@ async fn a_cross_type_xact_id_tie_walks_to_the_head_in_id_order() {
     let gb = common::meter(common::GB_METER);
     let tenant = Uuid::from_u128(1);
     let scope = common::tenant_scope(tenant);
-    let subscription = [vcpu.clone(), gb.clone()];
 
     // Uneven counts across the two types, each inserted through the
     // production write path so every one gets its own committed xact_id.
@@ -423,6 +481,10 @@ async fn a_cross_type_xact_id_tie_walks_to_the_head_in_id_order() {
     } else {
         (&t2, &t1)
     };
+    // The greater-id row's type first: see the test's own doc above for why
+    // the other order would let this test pass under the very mutation it
+    // exists to catch.
+    let subscription = [greater.gts_type_id.clone(), lesser.gts_type_id.clone()];
     let mut tx = h.pool.begin().await.expect("begin the shared transaction");
     insert_raw_within(&mut tx, greater).await;
     insert_raw_within(&mut tx, lesser).await;
@@ -450,7 +512,7 @@ async fn a_cross_type_xact_id_tie_walks_to_the_head_in_id_order() {
     let expected: Vec<Uuid> = with_positions.into_iter().map(|(_, id)| id).collect();
 
     // Walked at a limit narrower than either type's own count, so the walk
-    // crosses several pages and the outer merge over both lateral iterations
+    // crosses several pages and the outer sort over both lateral iterations
     // runs on every one of them, not just on one page wide enough to hide
     // behind.
     let mut delivered: Vec<Uuid> = Vec::new();
@@ -706,7 +768,7 @@ async fn the_scope_narrows_the_feed_to_the_tenants_it_admits() {
 }
 
 // 9b. The compiled scope must filter *inside* the lateral-per-type read, not
-// on the outer merge's already-limited output. Thing to get right #2 of the
+// on the outer sort's already-limited output. Thing to get right #2 of the
 // lateral-join reshaping: applying the scope outside would let many
 // off-scope rows of the same type consume the inner LIMIT before any
 // in-scope row is ever considered, truncating the page to nothing even
