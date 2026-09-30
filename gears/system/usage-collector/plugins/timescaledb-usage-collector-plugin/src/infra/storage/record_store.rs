@@ -1294,12 +1294,16 @@ impl PgRecordStore {
             return Ok(InTransactionPage::marked());
         }
 
-        // Step 4. `persistent(false)` so the statement is parsed and planned
-        // after step 2 and never served from the connection's statement
-        // cache. TimescaleDB excludes chunks at plan time against the
-        // catalog it then sees; a plan cached before a chunk existed could
-        // silently skip that chunk's rows, which is the failure §3.6's "Why"
-        // paragraph rules out.
+        // Step 4. `persistent(false)` so this call never *inserts* a plan
+        // into the connection's statement cache — `sqlx` 0.9.0's
+        // `get_or_prepare` still consults the cache unconditionally either
+        // way, but nothing else in this crate prepares this exact SQL text
+        // persistently, so there is never a stale entry there to find. The
+        // statement is parsed and planned fresh after step 2. TimescaleDB
+        // excludes chunks at plan time against the catalog it then sees; a
+        // plan cached before a chunk existed could silently skip that
+        // chunk's rows, which is the failure §3.6's "Why" paragraph rules
+        // out.
         let mut q = sqlx::query_as::<_, FeedRecordRow>(AssertSqlSafe(sql)).persistent(false);
         q = q.bind(types).bind(&horizon);
         if let Some((xact_id, id)) = after {
@@ -2697,10 +2701,11 @@ impl RecordStore for PgRecordStore {
     /// Without that tracking the connection would return to the pool still
     /// holding an open `REPEATABLE READ READ ONLY` transaction with no
     /// queued cleanup at all, and the next caller to acquire it would run
-    /// inside an abandoned snapshot. The other three multi-statement
-    /// transactions in this file ([`Self::create_inner`],
-    /// `create_batch_inner`, the retention sweep's drop transaction) already
-    /// use this idiom; the feed page now does too.
+    /// inside an abandoned snapshot. The other multi-statement write
+    /// transactions in this file ([`Self::create_inner`] and
+    /// `create_batch_inner`, both through `begin_durable_write`) already use
+    /// this idiom, and so does the retention sweep's drop transaction in
+    /// `retention_sweep.rs`; the feed page now does too.
     ///
     /// The transaction borrows `conn` only until [`sqlx::Transaction::commit`]
     /// consumes it, so step 6 — the authoritative autocommit mark re-check —

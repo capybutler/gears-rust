@@ -209,7 +209,7 @@ impl RunnableCapability for TimescaleDbUsageCollectorPlugin {
             .map_err(|e| anyhow::anyhow!("sweep_handle lock: {e}"))? = Some(handle);
         info!(
             interval_secs = interval.as_secs(),
-            "retention sweep and rollup monitor started"
+            "retention sweep, rollup monitor and feed horizon sampler started"
         );
         Ok(())
     }

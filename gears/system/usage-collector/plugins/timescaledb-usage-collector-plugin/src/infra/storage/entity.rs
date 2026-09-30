@@ -1,21 +1,27 @@
-//! `sqlx` row struct mirroring the `usage_records` hypertable (see
-//! `migrations/0001_init.sql`). It exists because [`super::mapper`] turns a
+//! `sqlx` row structs mirroring the `usage_records` hypertable (see
+//! `migrations/0001_init.sql`). They exist because [`super::mapper`] turns a
 //! whole ledger row into the validated SDK `UsageRecord`, and looking its
 //! columns up by field name is what keeps that mapping legible against the
 //! DDL. A query that needs only part of some table decodes just that part, at
 //! its own call site, and wants no struct here.
 //!
-//! It carries the raw storage-typed columns; [`super::mapper`] turns a row
-//! into the validated SDK model (and back where needed: the same module holds
-//! the model-to-SQL helpers the insert binds through). Column types match the
-//! DDL: `uuid` → [`Uuid`], `text` → [`String`], `int` → `i32`, `numeric` →
-//! [`Decimal`], `timestamptz` → [`OffsetDateTime`], `jsonb` →
-//! [`serde_json::Value`], and a nullable `text` / `uuid` → `Option<…>`.
-//! `xid8` and `usage_entry_type` are exceptions, and neither is a mapping at
-//! all: `sqlx` decodes neither into anything this struct could carry — it has
-//! no `xid8` implementation, and [`String`] declares itself `TEXT`, which
-//! `sqlx` holds incompatible with a `PostgreSQL` enum — so the read list casts
-//! both to `text` and both arrive as [`String`]s.
+//! There are two: [`UsageRecordRow`], over every column some insert writes
+//! (`RECORD_COLUMNS` in [`super::record_store`]), and [`FeedRecordRow`],
+//! which flattens it and adds the one column only a feed page read needs
+//! (`FEED_COLUMNS`). Each struct's own doc says why the split falls where it
+//! does. [`super::mapper`] turns a row into the validated SDK model (and back
+//! where needed: the same module holds the model-to-SQL helpers the insert
+//! binds through). Column types match the DDL: `uuid` → [`Uuid`], `text` →
+//! [`String`], `int` → `i32`, `numeric` → [`Decimal`], `timestamptz` →
+//! [`OffsetDateTime`], `jsonb` → [`serde_json::Value`], and a nullable
+//! `text` / `uuid` → `Option<…>`. `xid8` and `usage_entry_type` are
+//! exceptions, and neither is a mapping at all: `sqlx` decodes neither into
+//! anything either struct could carry — it has no `xid8` implementation, and
+//! [`String`] declares itself `TEXT`, which `sqlx` holds incompatible with a
+//! `PostgreSQL` enum — so a read list names each as a `::text` cast and both
+//! arrive as [`String`]s. `RECORD_COLUMNS` casts only `entry_type`, onto
+//! [`UsageRecordRow::entry_type`]; `FEED_COLUMNS` casts both, the second onto
+//! [`FeedRecordRow::xact_id`].
 
 use rust_decimal::Decimal;
 use time::OffsetDateTime;

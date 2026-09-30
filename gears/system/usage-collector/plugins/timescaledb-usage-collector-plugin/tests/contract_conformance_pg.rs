@@ -6,14 +6,16 @@
 //! **A green run here is not a conformance certificate**, and the assertion
 //! message says so rather than leaving it to this comment:
 //!
-//! * [`contract::run_all`] runs the DESIGN checks in
-//!   [`contract::IMPLEMENTED_CHECKS`] plus everything in
-//!   [`contract::ADDITIONAL_CHECKS`] (today one, which DESIGN obliges
-//!   without tabulating). What it does not run is in
-//!   [`contract::UNWRITTEN_CHECKS`] and [`contract::BLOCKED_CHECKS`], the
-//!   latter with what unblocks each. Deliberately no counts here: a check
-//!   moving from blocked to implemented would leave the assertion correct
-//!   and a tallied sentence stale.
+//! * The suite's checks are named by [`contract::IMPLEMENTED_CHECKS`] plus
+//!   everything in [`contract::ADDITIONAL_CHECKS`] (today one, which DESIGN
+//!   obliges without tabulating) — the set **either** entry point,
+//!   [`contract::run_all`] or [`contract::run_all_with_retention`], dispatches;
+//!   the two differ only in whether the driven quarter to three-quarters of
+//!   [`contract::RETENTION_DRIVEN_CHECKS`] runs (bullet below). What **neither**
+//!   runs is in [`contract::UNWRITTEN_CHECKS`] and [`contract::BLOCKED_CHECKS`],
+//!   the latter with what unblocks each. Deliberately no counts here: a check
+//!   moving from blocked to implemented would leave the assertion correct and
+//!   a tallied sentence stale.
 //! * Nothing in the suite exercises the SPI's keyset obligations: the
 //!   reference backend it was validated against serves the canonical order,
 //!   ignores `query.order` and mints no `next_cursor`, and this plugin owes

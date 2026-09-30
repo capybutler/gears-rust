@@ -283,7 +283,9 @@ async fn recording_helpers_emit_expected_series() {
 /// merely reach some floor. A floor cannot notice an instrument disappearing,
 /// and it hid an untested belief: that the two observable pool gauges are
 /// collected by their callbacks on this path. Equality tests that belief
-/// instead of assuming it — it holds, at 26.
+/// instead of assuming it — measured here, not counted in prose, because a
+/// written count of a moving population goes stale the next instrument this
+/// file adds.
 ///
 /// Two mechanisms catch different halves of a new instrument, and neither is
 /// quite a guarantee on its own: `declared_instrument_names`' destructure has

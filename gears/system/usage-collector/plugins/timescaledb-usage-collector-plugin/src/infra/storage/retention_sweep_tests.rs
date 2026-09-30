@@ -9,9 +9,19 @@ fn the_catalog_query_collapses_each_chunk_before_converting_its_time() {
     // convert the key range as a timestamp (`TIMESCALEDB-RETENTION.md` §8.1).
     assert!(LIST_CHUNKS_SQL.contains("FILTER (WHERE d.column_name = 'window_end')"));
     assert!(LIST_CHUNKS_SQL.contains("FILTER (WHERE d.column_name = 'type_key')"));
-    assert!(LIST_CHUNKS_SQL.ends_with("GROUP BY ch.relid"));
+    assert!(LIST_CHUNKS_SQL.contains("GROUP BY ch.relid"));
     assert!(LIST_CHUNKS_SQL.contains("WHERE h.table_name = 'usage_records'"));
     assert!(LIST_CHUNKS_SQL.contains("AND h.schema_name = current_schema()"));
+}
+
+#[test]
+fn the_catalog_query_orders_by_relid_so_visit_order_is_a_guarantee() {
+    // Ruling A8: no drop decision depends on visit order -- `RAISE_MARKS_SQL`'s
+    // own conjunct already makes the committed mark independent of it -- but
+    // `a_later_sweep_of_an_older_chunk_does_not_lower_the_mark` needs the
+    // higher-position chunk visited first, and this is what makes that a
+    // guarantee rather than an artifact of the catalog's own row order.
+    assert!(LIST_CHUNKS_SQL.ends_with("ORDER BY ch.relid"));
 }
 
 #[test]

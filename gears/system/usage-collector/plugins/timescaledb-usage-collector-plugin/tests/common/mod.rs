@@ -592,7 +592,7 @@ pub async fn start_backend() -> (TsHarness, StorageAdapter) {
 /// [`SweepDrive`] over its own pool, for `contract::run_all_with_retention`.
 ///
 /// A second function rather than a third element on [`start_backend`]'s
-/// tuple: that one is destructured at 11 call sites across
+/// tuple: that one is destructured at many call sites across
 /// `feed_page_integration_pg.rs`, none of which want a retention drive, and
 /// widening its return type would edit every one of them for nothing they
 /// asked for. Only the contract suite needs the drive, so only this function

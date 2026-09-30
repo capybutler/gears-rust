@@ -37,13 +37,27 @@ use crate::infra::storage::rollup_maintenance::{delete_rollup_rows_sql, material
 /// (`0x7563_7473` == ASCII `"ucts"`.)
 pub const SWEEP_ADVISORY_LOCK_KEY: i64 = 0x7563_7473;
 
-/// Every chunk of `usage_records` with its time range and type-key range.
+/// Every chunk of `usage_records` with its time range and type-key range, in
+/// `relid` order.
 ///
 /// Reads internal catalog tables, whose shape changed between `TimescaleDB`
 /// 2.17 and 2.29; `tests/schema_integration_pg.rs` pins it against the image
 /// the plugin is tested on. Each chunk collapses to one row **before** the
 /// time conversion, so no planner order can apply the conversion to the key
 /// dimension's range.
+///
+/// **`ORDER BY ch.relid` makes the sweep's own visit order a guarantee
+/// rather than an artifact of the catalog's incidental row order.** No drop
+/// decision depends on it — [`RAISE_MARKS_SQL`]'s own `WHERE (excluded…) >
+/// (…)` conjunct already makes the mark's committed value independent of
+/// which chunk a sweep visits first. What depends on it is one test's
+/// ability to red for the right reason:
+/// `retention_sweep_integration_pg::a_later_sweep_of_an_older_chunk_does_not_lower_the_mark`
+/// needs the higher-position chunk visited **first** so that the mark-raise
+/// conjunct is what keeps the later, lower-position chunk from lowering it —
+/// without a stated order, a catalog that happened to visit chunks the other
+/// way would make that test pass whether or not the conjunct did anything at
+/// all.
 pub const LIST_CHUNKS_SQL: &str = "SELECT ch.relid::text AS chunk, \
      _timescaledb_functions.to_timestamp(\
      max(ds.range_start) FILTER (WHERE d.column_name = 'window_end')) AS time_start, \
@@ -56,7 +70,8 @@ pub const LIST_CHUNKS_SQL: &str = "SELECT ch.relid::text AS chunk, \
      JOIN _timescaledb_catalog.dimension_slice ds ON ds.chunk_id = ch.id \
      JOIN _timescaledb_catalog.dimension d ON d.id = ds.dimension_id \
      WHERE h.table_name = 'usage_records' AND h.schema_name = current_schema() \
-     GROUP BY ch.relid";
+     GROUP BY ch.relid \
+     ORDER BY ch.relid";
 
 /// Drops one chunk by its schema-qualified name. `DROP TABLE <chunk>` is an
 /// equivalent fallback should this internal function change.
