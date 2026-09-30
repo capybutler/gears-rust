@@ -113,6 +113,28 @@ fn counter_sum(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
     0
 }
 
+/// Total observation count across the `f64` Histogram data points named
+/// `name`. Mirrors `metrics_tests::histogram_count`; duplicated here for the
+/// same reason `exported_names`/`counter_sum` above are.
+fn histogram_count(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+    let metrics = exporter.get_finished_metrics().expect("exported metrics");
+    for resource_metrics in &metrics {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::F64(MetricData::Histogram(h)) = metric.data()
+                {
+                    return h
+                        .data_points()
+                        .map(opentelemetry_sdk::metrics::data::HistogramDataPoint::count)
+                        .sum();
+                }
+            }
+        }
+    }
+    0
+}
+
 /// Raise a retention mark directly, via the sweep's own [`RAISE_MARKS_SQL`]
 /// statement — the same "raise, never lower" write the production sweep
 /// issues, bound over exactly one type.
@@ -1020,5 +1042,108 @@ async fn a_digit_length_crossing_in_xact_id_still_orders_the_page_numerically() 
          greater one (10), even though \"9\" sorts lexicographically above \"10\"; a bug \
          here means the page ordered by a text-cast output column instead of the xid8 \
          input column"
+    );
+}
+
+// 13. A bounded replay whose last row exactly fills its limit at `until`
+//     carries no continuation.
+//
+// Test 6 above only ever exercises the short-page arm of the disposition
+// (`until` set beyond a page shorter than its limit). This is the other
+// shape: the range `[Oldest, until]` holds exactly `limit` rows, so the page
+// both fills to its limit *and* reaches `until` on the very same last row.
+// `until.is_some() && row_count < limit_as_usize` alone cannot see that —
+// only `last_position == until` can — and mistaking it for the ordinary
+// filled-to-limit case mints a continuation for a replay that has already
+// closed. A consumer that then presents that continuation runs the mark
+// check on a position it should never have been handed, and a mark raised
+// in between turns a *completed* bounded replay into `CursorBeyondRetention`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bounded_replay_that_exactly_fills_its_limit_at_until_carries_no_continuation() {
+    let (_h, adapter) = common::start_backend().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(1);
+    let scope = common::tenant_scope(tenant);
+    let subscription = [meter.clone()];
+
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let entry = common::entry(
+            &meter,
+            tenant,
+            &format!("feed-exact-fill-{i}"),
+            Decimal::ONE,
+        );
+        adapter
+            .create_usage_record(entry.clone())
+            .await
+            .expect("the entry is accepted");
+        ids.push(entry.id);
+    }
+
+    let first = adapter
+        .read_feed_page(&subscription, &scope, FeedStart::Oldest, None, 2)
+        .await
+        .expect("the first page is served");
+    assert_eq!(
+        first.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        ids[..2].to_vec(),
+        "the first page fills to its limit with the first two entries"
+    );
+    let until = first
+        .next
+        .expect("a page filled to its limit carries a continuation");
+
+    let replay = adapter
+        .read_feed_page(&subscription, &scope, FeedStart::Oldest, Some(until), 2)
+        .await
+        .expect("the bounded replay is served");
+    assert_eq!(
+        replay.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        ids[..2].to_vec(),
+        "the replay delivers exactly the same two entries the range `[Oldest, until]` holds"
+    );
+    assert!(
+        replay.next.is_none(),
+        "a bounded replay whose last row exactly fills its limit at `until` has reached its \
+         bound and must carry no continuation, not the filled-to-limit arm's own position: \
+         {:?}",
+        replay.next
+    );
+}
+
+// 14. A feed read acquires its connection through the metered pool path, the
+//     same as every other operation.
+//
+// `feed_page` used to call `self.pool.acquire()` directly, bypassing
+// `Self::timed_acquire` and so `uc_timescaledb_pool_acquire_duration_seconds`,
+// the readiness contract, `uc_timescaledb_backend_errors_total` and
+// `uc_timescaledb_tls_handshake_failures_total` on the one path §4.1 item 7
+// sizes at the highest sustained read rate the plugin serves. This asserts
+// the histogram, since it is the most direct observable: a connection
+// acquired outside `Self::timed_acquire` records no observation on it at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_feed_read_acquires_through_the_metered_pool_path() {
+    let (_h, adapter, provider, exporter) = start_backend_metered().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(1);
+    let scope = common::tenant_scope(tenant);
+    let subscription = [meter.clone()];
+
+    provider.force_flush().expect("flush metrics");
+    let before = histogram_count(&exporter, "uc_timescaledb_pool_acquire_duration_seconds");
+
+    adapter
+        .read_feed_page(&subscription, &scope, FeedStart::Oldest, None, 10)
+        .await
+        .expect("a first read is served");
+
+    provider.force_flush().expect("flush metrics");
+    let after = histogram_count(&exporter, "uc_timescaledb_pool_acquire_duration_seconds");
+
+    assert!(
+        after > before,
+        "a feed read must acquire its connection through `Self::timed_acquire`, which is what \
+         records `uc_timescaledb_pool_acquire_duration_seconds`; before={before}, after={after}"
     );
 }

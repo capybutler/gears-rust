@@ -1278,7 +1278,7 @@ impl PgRecordStore {
             sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text")
                 .fetch_one(&mut *conn)
                 .await
-                .map_err(|e| map_sqlx_err(&e))?;
+                .map_err(|e| self.record_backend_error(&e))?;
         let horizon_num: u64 = horizon.parse().map_err(|_| {
             UsageCollectorPluginError::internal(format!(
                 "the settled horizon `{horizon}` read off pg_snapshot_xmin did not parse as a u64"
@@ -1314,7 +1314,7 @@ impl PgRecordStore {
         let rows = q
             .fetch_all(&mut *conn)
             .await
-            .map_err(|e| map_sqlx_err(&e))?;
+            .map_err(|e| self.record_backend_error(&e))?;
 
         let limit_as_usize = usize::try_from(limit).unwrap_or(usize::MAX);
         let row_count = rows.len();
@@ -1345,7 +1345,14 @@ impl PgRecordStore {
         // reached its `until` closes; a page filled to its limit continues
         // from its last entry's own position; a short page has reached the
         // horizon and continues from the head position.
-        let next = if until.is_some() && row_count < limit_as_usize {
+        //
+        // "Reached `until`" is not the same test as "short": a page can fill
+        // to exactly `limit` rows and have its last row's own position equal
+        // `until` — the range's last entry lands exactly on the limit
+        // boundary. Testing `row_count < limit_as_usize` alone would miss
+        // that case and fall through to the filled-to-limit arm, minting a
+        // continuation for a replay that has already closed.
+        let next = if until.is_some() && (row_count < limit_as_usize || last_position == until) {
             None
         } else if row_count >= limit_as_usize {
             Some(last_position.ok_or_else(|| {
@@ -1386,7 +1393,7 @@ impl PgRecordStore {
             .bind(position.1)
             .fetch_optional(&mut *conn)
             .await
-            .map_err(|e| map_sqlx_err(&e))?;
+            .map_err(|e| self.record_backend_error(&e))?;
         Ok(found.is_some())
     }
 }
@@ -2720,7 +2727,7 @@ impl RecordStore for PgRecordStore {
             .map_err(UsageCollectorPluginError::internal)?;
         let types: Vec<&str> = subscription.iter().map(MeterTypeId::as_str).collect();
 
-        let mut conn = self.pool.acquire().await.map_err(|e| map_sqlx_err(&e))?;
+        let mut conn = self.timed_acquire().await?;
 
         // Step 1. READ ONLY because nothing here writes, and REPEATABLE READ
         // because the horizon read must fix the snapshot the page statement
@@ -2729,7 +2736,7 @@ impl RecordStore for PgRecordStore {
         let mut tx = conn
             .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
-            .map_err(|e| map_sqlx_err(&e))?;
+            .map_err(|e| self.record_backend_error(&e))?;
 
         let page = self
             .feed_page_in_transaction(&mut tx, &sql, &binds, &types, after, until, limit)
@@ -2743,7 +2750,9 @@ impl RecordStore for PgRecordStore {
         // — strictly safer than this method's previous raw-SQL shape, which
         // sent `COMMIT` on both the success and the error path alike.
         let page = page?;
-        tx.commit().await.map_err(|e| map_sqlx_err(&e))?;
+        tx.commit()
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
 
         // Step 6. Authoritative, in autocommit, after the COMMIT: step 3 runs
         // under the page's snapshot and can miss a drop that commits after
