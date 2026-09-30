@@ -611,9 +611,11 @@ confirm the bound **MUST** be named rather than assumed.
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-replay-read-rate`
 
-The system **MUST** read the feed as an index-ordered merge over the ledger's
-feed index across the chunks retention keeps, with the compiled scope applied as
-a filter on that merge. It **MUST** be stated that a consumer whose scope admits
+The system **MUST** read each subscribed type as an index-ordered merge over
+the ledger's feed index across the chunks retention keeps, with the compiled
+scope applied as a filter on that merge, and **MUST** combine the per-type
+results with a bounded outer sort rather than reading the subscription as one
+unbroken merge. It **MUST** be stated that a consumer whose scope admits
 a small share of a subscription still reads the whole subscription's index range
 to fill a page, and the confirming test **MUST** measure a narrow scope as well
 as a full one. A first read **MUST** read the same index range as any other page,

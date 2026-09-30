@@ -654,8 +654,9 @@ setup only.
     position whose continuation is intact is served whatever its age.
   - The acceptance-order slack derivation that the refusal argument rests on.
   - Sustained bulk read rate sufficient for a consumer a day behind to reach
-    the head within the recovery window, via the index-ordered merge across
-    chunks with the scope applied as a filter.
+    the head within the recovery window, via a per-type index-ordered read
+    across chunks, combined by a bounded outer sort, with the scope applied
+    as a filter inside each per-type read.
   - Bounding acceptance-to-feed-visibility, which the oldest running write
     transaction in the instance determines, and the horizon-lag gauge that
     surfaces a long transaction.

@@ -625,7 +625,7 @@ sequenceDiagram
         DB-->>Rec: marked or not
     end
     opt not marked
-        Rec->>DB: unprepared SELECT … WHERE gts_type_id = ANY($subs) AND scope predicate AND (xact_id, id) > $after (predicate omitted on a first read) AND xact_id < $horizon [AND (xact_id, id) <= $until] ORDER BY xact_id, id LIMIT $limit
+        Rec->>DB: unprepared SELECT s.* FROM unnest($subs) AS t(gts) CROSS JOIN LATERAL (SELECT … WHERE gts_type_id = t.gts AND scope predicate AND (xact_id, id) > $after (predicate omitted on a first read) AND xact_id < $horizon [AND (xact_id, id) <= $until] ORDER BY xact_id, id LIMIT $limit) AS s ORDER BY s.xact_id_text::xid8, s.id LIMIT $limit
         DB-->>Rec: entries
     end
     Rec->>DB: COMMIT
@@ -887,7 +887,7 @@ Each type's **current** declared `retention` trait, read from `types-registry` a
 
 #### 7. Sustained bulk read rate
 
-The feed reads `usage_records_feed_idx (gts_type_id, xact_id, id)` (§3.7) as an index-ordered read **per subscribed type — one equality-driven lateral iteration each, combined by a bounded outer sort over at most `subscription width × page limit` rows, never the whole backlog** — across the chunks retention keeps. The scope predicate is applied as a filter inside each per-type read. A consumer whose scope admits a small share of a subscription reads the whole subscription's index range to fill a page, and the confirming test measures a narrow scope as well as a full one. **Target**: `cpt-cf-usage-collector-nfr-replay-throughput` requires a consumer 24 hours behind to catch up within 6 hours — at the launch planning assumption of ≤ 10,000,000 entries/hour/region for a charging subscription, ≥ 50,000,000 entries/hour/region. **Not measured**: the test that would produce the number replays a 24-hour backlog of a subscription at that arrival rate while ingestion runs at the throughput-profile envelope, and also times a first read's first page over that subscription (§3.6 First read). **Outside the documented posture** — a subscription arriving faster than the planning assumption, a replica read path, or a shared PostgreSQL instance — the deployer republishes items 1, 2, 5 and 7 against a measurement before the deployment feeds a charging consumer.
+The feed reads `usage_records_feed_idx (gts_type_id, xact_id, id)` (§3.7) as an index-ordered read **per subscribed type — one equality-driven lateral iteration each, combined by a bounded outer sort over at most `subscription width × page limit` rows; the sort never sees the whole backlog** — across the chunks retention keeps. The scope predicate is applied as a filter inside each per-type read. A consumer whose scope admits a small share of a subscription reads the whole subscription's index range to fill a page, and the confirming test measures a narrow scope as well as a full one. **Target**: `cpt-cf-usage-collector-nfr-replay-throughput` requires a consumer 24 hours behind to catch up within 6 hours — at the launch planning assumption of ≤ 10,000,000 entries/hour/region for a charging subscription, ≥ 50,000,000 entries/hour/region. **Not measured**: the test that would produce the number replays a 24-hour backlog of a subscription at that arrival rate while ingestion runs at the throughput-profile envelope, and also times a first read's first page over that subscription (§3.6 First read). **Outside the documented posture** — a subscription arriving faster than the planning assumption, a replica read path, or a shared PostgreSQL instance — the deployer republishes items 1, 2, 5 and 7 against a measurement before the deployment feeds a charging consumer.
 
 #### 8. Ingestion batching
 
@@ -1021,7 +1021,7 @@ Columnar compression is deferred; it is additive and does not change the SPI sur
 - The per-type ordered read on `usage_records_feed_idx`, combined by a bounded outer sort, across chunks, with and without a narrow scope predicate.
 - Plan-time chunk exclusion: a chunk committed just before a page's snapshot is in the page statement's plan.
 - Cached plans: a prepared plan cached before a chunk was created would skip that chunk, which the unprepared statements avoid.
-- A page statement with no position lower bound plans the ordered merge from the first chunk retention keeps.
+- A page statement with no position lower bound plans each per-type read from the first chunk retention keeps.
 - A refresh policy with `buckets_per_batch` commits each batch in its own transaction.
 - The `LATEST` memory bound of §4.2.
 - A narrow compiled scope over a busy subscription fills a feed page within `statement_timeout_secs` (§4.1 item 7).
