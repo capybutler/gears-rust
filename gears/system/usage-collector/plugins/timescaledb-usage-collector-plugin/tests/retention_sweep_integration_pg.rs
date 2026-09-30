@@ -1130,3 +1130,135 @@ async fn a_driven_purge_takes_the_entry_below_the_floor_and_leaves_the_one_at_it
         "no mark is raised for a type the drive never resolved"
     );
 }
+
+/// The drop transaction's six statements run in DESIGN §3.6's prescribed
+/// order — lock, then read positions, then raise marks, then drop the chunk,
+/// then cut the rollup rows — asserted by turning on cluster-wide statement
+/// logging and reading it back off the container.
+///
+/// **Why the order matters.** The lock freezes the chunk before anything
+/// reads it, so the position read that follows sees exactly the rows the drop
+/// is about to remove and the marks it raises cover all of them. Read the
+/// positions before taking the lock instead, and a row a concurrent writer
+/// commits into the gap is deleted without ever being covered by a mark: the
+/// feed has no way to know it is gone, and a later page silently serves a
+/// hole instead of refusing a truncated range.
+///
+/// **This is a statement-order oracle, not a semantic one, and ruling D9 is
+/// why it exists at all.** The semantic property — that no row committed
+/// between the lock and the read is missed — has no executable oracle in this
+/// suite: the two statement orderings only produce different *data* when a
+/// writer commits in the exact gap between two adjacent statements, and
+/// forcing that gap open would need a test-only pause inside production's own
+/// transaction, which does not exist and should not be added for a test. What
+/// this test asserts instead is the text of the statements `PostgreSQL` logged,
+/// in the order it logged them. It cannot catch a reordering that happens to
+/// still produce this same log text, and it says nothing about a production
+/// deployment, where `log_statement` is off and nothing is logged at all. It
+/// is, deliberately, the weaker thing that is actually checkable, mutation-
+/// verified below to still catch the one reordering ruling D9 named.
+///
+/// **Brittleness, named rather than hidden.** `log_statement = 'all'` is set
+/// cluster-wide via `ALTER SYSTEM` + `pg_reload_conf()`, not on one session —
+/// a session-scoped `SET` was tried first and does not work, because the
+/// sweep's drop transaction, its advisory lock and its catalog reads each run
+/// on a different pooled or detached connection, and a `SET` only reaches the
+/// one connection it was issued on. Logging cluster-wide is tolerable only
+/// because [`common::bring_up`] starts a fresh container per test — there is
+/// no other session's statement to confuse this one's. The test also depends
+/// on the image's default `log_destination = stderr`, which is where
+/// [`testcontainers::ContainerAsync::stderr_to_vec`] reads from.
+///
+/// **Matching, precisely.** Every assertion below matches on the SQL text
+/// alone, never on the `execute sqlx_s_<N>:` prefix `sqlx` logs a
+/// parameterized statement under — that counter is an incidental `sqlx`
+/// implementation detail that drifts between runs and `sqlx` versions. A bare
+/// `BEGIN`/`COMMIT` logs under a different prefix again, `statement: `, which
+/// is one more reason the match has to be on the SQL text and not the
+/// prefix. `_timescaledb_functions.drop_chunk` also raises an internal
+/// `NOTICE`, which makes `PostgreSQL` echo a bonus `STATEMENT:` line right
+/// after that statement's own log line, independent of `log_statement`; this
+/// test's sequential-offset search tolerates that extra line without
+/// depending on there being exactly one log line per SQL statement.
+///
+/// **One chunk, one drop.** The spike behind this test found that chunks
+/// drop sequentially and do not interleave with each other, but that
+/// asserting order robustly across more than one simultaneous drop would need
+/// PID-scoped matching rather than bare substring search. Every other test in
+/// this file already sticks to one chunk; so does this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drop_transactions_statements_run_in_design_order() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    // Cluster-wide, not session-scoped -- see the doc comment above for why
+    // a session-scoped `SET` does not reach the sweep's own connections.
+    sqlx::query("ALTER SYSTEM SET log_statement = 'all'")
+        .execute(&h.pool)
+        .await
+        .expect("ALTER SYSTEM");
+    sqlx::query("SELECT pg_reload_conf()")
+        .execute(&h.pool)
+        .await
+        .expect("reload");
+    common::await_setting(&h.pool, "log_statement", "all").await;
+
+    let store = common::record_store(&h);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    store
+        .create(aged(
+            common::VCPU_METER,
+            Uuid::from_u128(0x5E40),
+            "statement-order",
+            100,
+        ))
+        .await
+        .expect("create fixture");
+
+    // Read off the report and the catalog before the drop, so the two
+    // substrings that name identifiers rather than fixed SQL -- the chunk and
+    // the rollup's materialisation table -- are exact rather than guessed.
+    let chunk = list_chunks(&h.pool)
+        .await
+        .expect("list chunks")
+        .into_iter()
+        .next()
+        .expect("one chunk");
+    let rollup_table = materialization_table(&h.pool)
+        .await
+        .expect("materialisation table query")
+        .expect("the rollup has a materialisation table");
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+    assert_eq!(report.dropped, 1, "one chunk drops: {report:?}");
+
+    let log = String::from_utf8(
+        h.container()
+            .stderr_to_vec()
+            .await
+            .expect("read the container's stderr log"),
+    )
+    .expect("the container's log is valid utf8");
+
+    let needles = [
+        "SET LOCAL lock_timeout".to_owned(),
+        format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", chunk.chunk),
+        "DISTINCT ON (gts_type_id)".to_owned(),
+        "INSERT INTO usage_feed_retention_marks".to_owned(),
+        "_timescaledb_functions.drop_chunk(".to_owned(),
+        format!("DELETE FROM {rollup_table} WHERE type_key"),
+        "COMMIT".to_owned(),
+    ];
+    let mut cursor = 0;
+    for needle in &needles {
+        let found = log[cursor..].find(needle.as_str()).unwrap_or_else(|| {
+            panic!(
+                "expected to find {needle:?} at or after byte {cursor} of the drop \
+                 transaction's logged statements, in DESIGN's prescribed order; full log:\n{log}"
+            )
+        });
+        cursor += found + needle.len();
+    }
+}

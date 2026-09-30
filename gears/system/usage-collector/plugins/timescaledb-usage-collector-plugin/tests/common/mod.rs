@@ -48,7 +48,19 @@ use timescaledb_usage_collector_plugin::infra::storage::retention_sweep::PgReten
 pub struct TsHarness {
     pub pool: PgPool,
     pub cfg: TimescaleDbPluginConfig,
-    _container: ContainerAsync<GenericImage>,
+    container: ContainerAsync<GenericImage>,
+}
+
+impl TsHarness {
+    /// The container this harness started, for a test that needs to reach it
+    /// directly rather than through the pool — reading its log, for instance.
+    /// A method alongside the `pub` fields above rather than making the field
+    /// itself `pub`: a caller is meant to *read* the container, not replace or
+    /// drop it out from under the harness.
+    #[must_use]
+    pub fn container(&self) -> &ContainerAsync<GenericImage> {
+        &self.container
+    }
 }
 
 /// How many containers [`bring_up_with`] will burn through before giving up,
@@ -406,7 +418,7 @@ pub async fn bring_up_with(
     Ok(TsHarness {
         pool,
         cfg,
-        _container: container,
+        container,
     })
 }
 
