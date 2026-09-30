@@ -29,7 +29,8 @@
 //!   sweeps — `retention_sweep_integration_pg` drives it — so what is
 //!   missing is the `contract::retention::ContractRetention` impl beside
 //!   the SPI one, not the capability; that impl, and the switch to
-//!   `run_all_with_retention` it lets this test make, is slice 5's.
+//!   `run_all_with_retention` it lets this test make, is Task 5 of this
+//!   slice's.
 //!
 //!   **`NOT_YET_CONFORMING` being empty is not the same claim as "every
 //!   dispatched check fully conforms".** `feed-bootstrap-position` and

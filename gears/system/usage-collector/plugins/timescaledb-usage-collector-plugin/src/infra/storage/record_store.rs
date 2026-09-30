@@ -33,7 +33,7 @@ use rand::RngExt as _;
 use rust_decimal::Decimal;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnection, PgRow};
-use sqlx::{Acquire as _, AssertSqlSafe, FromRow as _, PgPool, Postgres, Row};
+use sqlx::{Acquire as _, AssertSqlSafe, Connection as _, FromRow as _, PgPool, Postgres, Row};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
@@ -107,9 +107,9 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 /// spelling rather than a second one — the same reason [`ENTRY_TYPE_ENUM`] is
 /// `pub(crate)` for `query::translate`. The split into a feed-specific column
 /// list is a later slice's change, not this one's.
-pub(crate) const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, window_start, \
-     window_end, resource_id, resource_type, subject_id, subject_type, idempotency_key, \
-     invalidates, reason_code, origin, entry_type::text AS entry_type, \
+pub(crate) const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, \
+     window_start, window_end, resource_id, resource_type, subject_id, subject_type, \
+     idempotency_key, invalidates, reason_code, origin, entry_type::text AS entry_type, \
      accepted_at, xact_id::text AS xact_id, metadata";
 
 /// The columns every insert writes: every ledger column but `xact_id`, which
@@ -2638,12 +2638,28 @@ impl RecordStore for PgRecordStore {
     /// One feed page, run as the six-step protocol this plugin's
     /// `docs/DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-feed-page` sets out.
     ///
-    /// Steps 1-5 run on one connection, moved into and out of a snapshot
-    /// transaction by hand with raw `BEGIN` / `COMMIT` statements rather than
-    /// through `sqlx::Transaction` — the same connection carries the page's
-    /// snapshot transaction (steps 1-5) and the authoritative autocommit
-    /// mark re-check (step 6), so both reach one [`Self::mark_stands_above`]
-    /// over the same `conn`.
+    /// Steps 1-5 run on one connection, inside a real [`sqlx::Transaction`]
+    /// opened with [`sqlx::Connection::begin_with`] rather than a raw `BEGIN`
+    /// statement sent over the bare connection. That is not cosmetic:
+    /// `sqlx` tracks an open `Transaction` and, if this `async fn`'s future
+    /// is ever dropped before [`sqlx::Transaction::commit`] runs — a
+    /// host-side timeout or a client disconnect, neither of which this
+    /// plugin controls or can observe — the drop queues a `ROLLBACK` sent
+    /// the next time the connection is used ([`rollback`]'s own doc
+    /// describes the same lazy-queued mechanism for the explicit case).
+    /// Without that tracking the connection would return to the pool still
+    /// holding an open `REPEATABLE READ READ ONLY` transaction with no
+    /// queued cleanup at all, and the next caller to acquire it would run
+    /// inside an abandoned snapshot. The other three multi-statement
+    /// transactions in this file ([`Self::create_inner`],
+    /// `create_batch_inner`, the retention sweep's drop transaction) already
+    /// use this idiom; the feed page now does too.
+    ///
+    /// The transaction borrows `conn` only until [`sqlx::Transaction::commit`]
+    /// consumes it, so step 6 — the authoritative autocommit mark re-check —
+    /// still runs on the very same pooled connection afterward, and both it
+    /// and step 3's fast-path check reach one [`Self::mark_stands_above`]
+    /// (ruling D8: one function, one connection, never two).
     ///
     /// # Errors
     ///
@@ -2667,22 +2683,26 @@ impl RecordStore for PgRecordStore {
 
         // Step 1. READ ONLY because nothing here writes, and REPEATABLE READ
         // because the horizon read must fix the snapshot the page statement
-        // then runs under.
-        sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *conn)
+        // then runs under. See this method's own doc for why `begin_with`
+        // rather than a raw `BEGIN` statement.
+        let mut tx = conn
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .map_err(|e| map_sqlx_err(&e))?;
 
         let page = self
-            .feed_page_in_transaction(&mut conn, &sql, &binds, &types, after, until, limit)
+            .feed_page_in_transaction(&mut tx, &sql, &binds, &types, after, until, limit)
             .await;
 
-        // COMMIT on both paths: this is step 5, and a transaction left open
-        // would return to the pool holding a snapshot that pins the settled
-        // horizon for every later page.
-        let committed = sqlx::query("COMMIT").execute(&mut *conn).await;
+        // Step 5, on the success path only. `?` below propagates a
+        // steps-2-4 error before `tx` is committed; dropping an uncommitted
+        // `Transaction` queues its `ROLLBACK` rather than committing it
+        // (`sqlx::Transaction`'s own contract), so an error here is rolled
+        // back rather than left for an unconditional `COMMIT` to paper over
+        // — strictly safer than this method's previous raw-SQL shape, which
+        // sent `COMMIT` on both the success and the error path alike.
         let page = page?;
-        committed.map_err(|e| map_sqlx_err(&e))?;
+        tx.commit().await.map_err(|e| map_sqlx_err(&e))?;
 
         // Step 6. Authoritative, in autocommit, after the COMMIT: step 3 runs
         // under the page's snapshot and can miss a drop that commits after
