@@ -125,12 +125,29 @@ pub const HARNESS_ACCEPTANCE_SLACK_SECS: u64 = 100 * 365 * 86_400;
 /// different number in the contract lane than elsewhere.** Nothing does today.
 pub const CONTRACT_CHUNK_INTERVAL_SECS: u64 = 3_600;
 
+/// [`bring_up_with`] at the shared harness's own pool bounds, statement
+/// timeout and acceptance slack (`30, 2, 16, HARNESS_ACCEPTANCE_SLACK_SECS`),
+/// varying only the chunk interval.
+///
+/// [`bring_up`] and [`start_backend_with_retention_drive`] both call this
+/// rather than each spelling those four literals out, so the two cannot
+/// silently diverge from one another the moment one of those defaults
+/// changes — which is exactly the risk a near-duplicate invites.
+async fn bring_up_at_chunk_interval(chunk_time_interval_secs: u64) -> anyhow::Result<TsHarness> {
+    bring_up_with(
+        30,
+        2,
+        16,
+        HARNESS_ACCEPTANCE_SLACK_SECS,
+        chunk_time_interval_secs,
+    )
+    .await
+}
+
 pub async fn bring_up() -> anyhow::Result<TsHarness> {
-    // Default pool bounds and statement timeout (mirrors the config defaults),
-    // the wide acceptance slack this lane's dated fixtures need, and the
-    // config default chunk interval (7 days) every suite but the contract one
-    // runs at.
-    bring_up_with(30, 2, 16, HARNESS_ACCEPTANCE_SLACK_SECS, 7 * 86_400).await
+    // The config default chunk interval (7 days), which every suite but the
+    // contract one runs at.
+    bring_up_at_chunk_interval(7 * 86_400).await
 }
 
 /// Like [`bring_up`] but with an explicit request-path `statement_timeout` (secs),
@@ -563,7 +580,7 @@ pub async fn start_backend() -> (TsHarness, StorageAdapter) {
 /// [`SweepDrive`] over its own pool, for `contract::run_all_with_retention`.
 ///
 /// A second function rather than a third element on [`start_backend`]'s
-/// tuple: that one is destructured at a dozen call sites across
+/// tuple: that one is destructured at 11 call sites across
 /// `feed_page_integration_pg.rs`, none of which want a retention drive, and
 /// widening its return type would edit every one of them for nothing they
 /// asked for. Only the contract suite needs the drive, so only this function
@@ -574,15 +591,9 @@ pub async fn start_backend() -> (TsHarness, StorageAdapter) {
 /// If the container or the migration fails; there is no test to run without
 /// a backend.
 pub async fn start_backend_with_retention_drive() -> (TsHarness, StorageAdapter, SweepDrive) {
-    let harness = bring_up_with(
-        30,
-        2,
-        16,
-        HARNESS_ACCEPTANCE_SLACK_SECS,
-        CONTRACT_CHUNK_INTERVAL_SECS,
-    )
-    .await
-    .expect("contract suite needs a migrated TimescaleDB container");
+    let harness = bring_up_at_chunk_interval(CONTRACT_CHUNK_INTERVAL_SECS)
+        .await
+        .expect("contract suite needs a migrated TimescaleDB container");
     let store: Arc<dyn RecordStore> = Arc::new(record_store(&harness));
     let drive = SweepDrive {
         pool: harness.pool.clone(),

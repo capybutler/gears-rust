@@ -945,3 +945,80 @@ async fn the_horizon_monitor_samples_the_oldest_open_write_transaction() {
 
     tx.commit().await.expect("release the held transaction");
 }
+
+// 12. A page's order survives a decimal-digit-length crossing in `xact_id`.
+//
+// The pin below is the same pattern `retention_sweep_integration_pg::
+// the_position_read_orders_xact_id_numerically_not_lexicographically`
+// established for the sweep's own read of `xact_id`: two consecutive inserts
+// through the ingest path always share a digit count, so no ordinary fixture
+// can straddle the boundary, and the test pins explicit `xid8` values by
+// direct SQL to force it.
+//
+// This is the read `FEED_COLUMNS`'s `xact_id_text` alias protects and the
+// earlier `retention_sweep_integration_pg` test does not reach: from Task 3's
+// head until this task's fix, `RECORD_COLUMNS` cast `xact_id` to `AS xact_id`
+// -- the same name as its own source column -- and `query/feed.rs`'s page
+// statement ran `ORDER BY xact_id, id` over that same read list. `PostgreSQL`
+// resolves a bare `ORDER BY` name matching both an output and an input column
+// to the *output* column, so that statement was silently ordering the feed
+// page lexicographically over the rendered digit string rather than
+// numerically over the `xid8`, for as long as that alias stood. No test
+// caught it, because within one short run every `xact_id` shares a digit
+// count. `FEED_COLUMNS`'s `xact_id_text` alias is the fix; this test is the
+// oracle against it recurring by some future edit reaching the same state a
+// different way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_digit_length_crossing_in_xact_id_still_orders_the_page_numerically() {
+    let (h, adapter) = common::start_backend().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(1);
+    let scope = common::tenant_scope(tenant);
+    let subscription = [meter.clone()];
+
+    let low = adapter
+        .create_usage_record(common::entry(
+            &meter,
+            tenant,
+            "digit-cross-low",
+            Decimal::ONE,
+        ))
+        .await
+        .expect("the low entry is accepted");
+    let high = adapter
+        .create_usage_record(common::entry(
+            &meter,
+            tenant,
+            "digit-cross-high",
+            Decimal::ONE,
+        ))
+        .await
+        .expect("the high entry is accepted");
+
+    // Pin xid8 values that straddle a digit-length boundary: under a
+    // lexicographic (text) comparison "9" sorts above "10".
+    sqlx::query("UPDATE usage_records SET xact_id = '9'::xid8 WHERE id = $1")
+        .bind(low.id)
+        .execute(&h.pool)
+        .await
+        .expect("pin the low entry's xact_id");
+    sqlx::query("UPDATE usage_records SET xact_id = '10'::xid8 WHERE id = $1")
+        .bind(high.id)
+        .execute(&h.pool)
+        .await
+        .expect("pin the high entry's xact_id");
+
+    let page = adapter
+        .read_feed_page(&subscription, &scope, FeedStart::Oldest, None, 10)
+        .await
+        .expect("a first read is served");
+
+    assert_eq!(
+        page.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![low.id, high.id],
+        "the numerically lesser xact_id (9) must be delivered before the numerically \
+         greater one (10), even though \"9\" sorts lexicographically above \"10\"; a bug \
+         here means the page ordered by a text-cast output column instead of the xid8 \
+         input column"
+    );
+}

@@ -1273,7 +1273,7 @@ impl PgRecordStore {
     ) -> Result<InTransactionPage, UsageCollectorPluginError> {
         // Step 2. Fixes the snapshot and yields the settled horizon. Read as
         // text because `xid8` has no `sqlx` Decode, which is the same reason
-        // `UsageRecordRow` holds `xact_id` as a String.
+        // `FeedRecordRow` holds `xact_id` as a String.
         let horizon: String =
             sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text")
                 .fetch_one(&mut *conn)
@@ -1318,9 +1318,11 @@ impl PgRecordStore {
 
         let limit_as_usize = usize::try_from(limit).unwrap_or(usize::MAX);
         let row_count = rows.len();
-        // Captured before `record_row_to_model` consumes each row: the SDK
-        // model carries no `xact_id` (`UsageRecordRow`'s own doc says why),
-        // so the last row's position has to be read off the raw row.
+        // Captured before `row.record` is moved into `record_row_to_model`
+        // below: the SDK model carries no `xact_id`, and `xact_id` lives on
+        // this `FeedRecordRow` alone (its own doc says why) rather than on
+        // the `UsageRecordRow` that function consumes, so the last row's
+        // position has to be read off the raw `FeedRecordRow` here.
         let last_position = rows
             .last()
             .map(|row| -> Result<(u64, Uuid), UsageCollectorPluginError> {
