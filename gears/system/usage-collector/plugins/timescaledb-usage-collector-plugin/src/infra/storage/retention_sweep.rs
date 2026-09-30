@@ -90,6 +90,7 @@ pub const DROP_CHUNK_SQL: &str = "SELECT _timescaledb_functions.drop_chunk($1::r
 /// weakens no acknowledgement — the next sweep retries the chunk, and the
 /// type-key row is transitively flushed by the first durable ledger commit
 /// after it.
+// @cpt-dod:cpt-cf-uc-plugin-dod-bounded-lock-waits:p1
 pub const SET_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
 
 /// The highest feed position of each GTS type in one chunk.
@@ -262,6 +263,8 @@ impl PgRetentionSweeper {
     /// sweep before any drop). A failed drop does not end the sweep; it is
     /// counted in the report.
     // @cpt-flow:cpt-cf-uc-plugin-seq-retention-sweep:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-sweep-expired-chunk:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-sweep-observability:p1
     pub async fn sweep_once(&self) -> Result<SweepReport, sqlx::Error> {
         let started = Instant::now();
         let result = self.sweep_under_lock().await;
@@ -281,6 +284,8 @@ impl PgRetentionSweeper {
     /// lives exactly as long as that connection: closing it releases the lock
     /// on every path, including a sweep abandoned mid-way, and a locked
     /// connection is never handed back to the pool.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-sweep-admission:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-sweep-admission:p1
     async fn sweep_under_lock(&self) -> Result<SweepReport, sqlx::Error> {
         let mut lock_conn = self.pool.acquire().await?.detach();
         let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
@@ -306,6 +311,7 @@ impl PgRetentionSweeper {
 
     /// One pass over every chunk, deciding each against the retentions of the
     /// types in its key range.
+    // @cpt-dod:cpt-cf-uc-plugin-dod-no-drop-without-materialisation-table:p1
     async fn sweep(&self, now: OffsetDateTime) -> Result<SweepReport, sqlx::Error> {
         let chunks = list_chunks(&self.pool).await?;
         // A ledger drop must take its rollup rows with it, so without the
@@ -350,6 +356,9 @@ impl PgRetentionSweeper {
     /// The retention of every type in `chunk`'s key range, resolved from
     /// `resolved` where already known this sweep and from the source
     /// otherwise.
+    // @cpt-flow:cpt-cf-uc-plugin-flow-declare-type-retention:p1
+    // @cpt-algo:cpt-cf-uc-plugin-algo-retention-resolution:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-retention-resolution-uncached:p1
     async fn resolve_chunk_retentions(
         &self,
         chunk: &ChunkSlice,
@@ -375,6 +384,7 @@ impl PgRetentionSweeper {
 
     /// Act on one chunk's [`Decision`]: drop it, or count and log a kept
     /// chunk whose retention could not be resolved.
+    // @cpt-dod:cpt-cf-uc-plugin-dod-unresolved-type-keeps-chunk:p1
     async fn apply_decision(
         &self,
         chunk: &ChunkSlice,
@@ -399,6 +409,7 @@ impl PgRetentionSweeper {
 
     /// Drop one expired chunk and its rollup rows, counting the outcome either
     /// way.
+    // @cpt-dod:cpt-cf-uc-plugin-dod-drop-failure-retry:p1
     async fn drop_chunk(&self, chunk: &ChunkSlice, rollup_table: &str, report: &mut SweepReport) {
         match self.drop_chunk_and_rollup_rows(chunk, rollup_table).await {
             Ok(deleted) => {
@@ -431,6 +442,8 @@ impl PgRetentionSweeper {
     /// running and none can start, so the read's own snapshot — taken after
     /// that — sees every row the drop removes. Reading positions before taking
     /// the lock satisfies every single-threaded test and loses that argument.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-drop-transaction:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-atomic-drop-transaction:p1
     async fn drop_chunk_and_rollup_rows(
         &self,
         chunk: &ChunkSlice,

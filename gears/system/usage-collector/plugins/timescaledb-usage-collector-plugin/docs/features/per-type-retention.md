@@ -215,12 +215,12 @@ flowchart TD
   type the sweep could not resolve.
 
 **Steps**:
-1. [ ] - `p1` - Operator declares or amends the retention trait on a GTS type in the registry - `inst-decl-set-retention`
-2. [ ] - `p1` - Operator sizes the sweep interval and the chunk width, knowing both bound how promptly and how precisely retention takes effect - `inst-decl-size-cadence`
-3. [ ] - `p1` - Operator accepts the deployer obligation that every type declares at least the backfill window plus the replay horizon plus the acceptance-order slack; the plugin does not verify it - `inst-decl-deployer-obligation`
-4. [ ] - `p1` - **ON** the next sweep, the plugin resolves the current value from the registry rather than a cached one - `inst-decl-next-sweep`
-5. [ ] - `p1` - Operator watches the chunks-kept-unresolved counter by reason, which is the signal that a type cannot be resolved and is holding storage - `inst-decl-watch-unresolved`
-6. [ ] - `p1` - **RETURN** retention enforced from the current declaration, without a plugin restart or a database policy change - `inst-decl-return`
+1. [x] - `p1` - Operator declares or amends the retention trait on a GTS type in the registry - `inst-decl-set-retention`
+2. [x] - `p1` - Operator sizes the sweep interval and the chunk width, knowing both bound how promptly and how precisely retention takes effect - `inst-decl-size-cadence`
+3. [x] - `p1` - Operator accepts the deployer obligation that every type declares at least the backfill window plus the replay horizon plus the acceptance-order slack; the plugin does not verify it - `inst-decl-deployer-obligation`
+4. [x] - `p1` - **ON** the next sweep, the plugin resolves the current value from the registry rather than a cached one - `inst-decl-next-sweep`
+5. [x] - `p1` - Operator watches the chunks-kept-unresolved counter by reason, which is the signal that a type cannot be resolved and is holding storage - `inst-decl-watch-unresolved`
+6. [x] - `p1` - **RETURN** retention enforced from the current declaration, without a plugin restart or a database policy change - `inst-decl-return`
 
 ### The Sweep Drops an Expired Chunk
 
@@ -249,16 +249,16 @@ flowchart TD
   drop is one transaction.
 
 **Steps**:
-1. [ ] - `p1` - Host's background task fires the sweep on its configured interval - `inst-swp-fire`
-2. [ ] - `p1` - Plugin admits one sweeper with `cpt-cf-uc-plugin-algo-sweep-admission`, skipping the cycle when another replica holds the lock - `inst-swp-admission`
-3. [ ] - `p1` - **DB**: resolve the rollup's materialisation table; **IF** it cannot be found, drop nothing this cycle - `inst-swp-materialization-table`
-4. [ ] - `p1` - **DB**: list every chunk of `cpt-cf-uc-plugin-dbtable-usage-records` with its covered-period and type-key ranges - `inst-swp-list-chunks`
-5. [ ] - `p1` - **FOR EACH** chunk, resolve every type in its key range with `cpt-cf-uc-plugin-algo-retention-resolution` and decide it with `cpt-cf-uc-plugin-algo-chunk-drop-decision` - `inst-swp-decide`
-6. [ ] - `p1` - **IF** the decision is to drop, run `cpt-cf-uc-plugin-algo-drop-transaction` - `inst-swp-drop`
-7. [ ] - `p1` - **ELSE** keep the chunk, and count it when the reason was an unresolvable type - `inst-swp-keep`
-8. [ ] - `p1` - Record the sweep's outcome and duration once per attempt, whatever that outcome was - `inst-swp-record-outcome`
-9. [ ] - `p1` - Release the advisory lock by closing the detached connection, whatever the outcome - `inst-swp-release`
-10. [ ] - `p1` - **RETURN** a completed cycle; every chunk it could not drop is reconsidered on the next one - `inst-swp-return`
+1. [x] - `p1` - Host's background task fires the sweep on its configured interval - `inst-swp-fire`
+2. [x] - `p1` - Plugin admits one sweeper with `cpt-cf-uc-plugin-algo-sweep-admission`, skipping the cycle when another replica holds the lock - `inst-swp-admission`
+3. [x] - `p1` - **DB**: resolve the rollup's materialisation table; **IF** it cannot be found, drop nothing this cycle - `inst-swp-materialization-table`
+4. [x] - `p1` - **DB**: list every chunk of `cpt-cf-uc-plugin-dbtable-usage-records` with its covered-period and type-key ranges - `inst-swp-list-chunks`
+5. [x] - `p1` - **FOR EACH** chunk, resolve every type in its key range with `cpt-cf-uc-plugin-algo-retention-resolution` and decide it with `cpt-cf-uc-plugin-algo-chunk-drop-decision` - `inst-swp-decide`
+6. [x] - `p1` - **IF** the decision is to drop, run `cpt-cf-uc-plugin-algo-drop-transaction` - `inst-swp-drop`
+7. [x] - `p1` - **ELSE** keep the chunk, and count it when the reason was an unresolvable type - `inst-swp-keep`
+8. [x] - `p1` - Record the sweep's outcome and duration once per attempt, whatever that outcome was - `inst-swp-record-outcome`
+9. [x] - `p1` - Release the advisory lock by closing the detached connection, whatever the outcome - `inst-swp-release`
+10. [x] - `p1` - **RETURN** a completed cycle; every chunk it could not drop is reconsidered on the next one - `inst-swp-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -274,12 +274,12 @@ transaction in which everything a drop changes commits together.
 **Output**: permission to sweep, or a skip.
 
 **Steps**:
-1. [ ] - `p1` - **DB**: attempt the sweep's advisory lock without waiting, so a replica that cannot have it proceeds immediately to skip rather than queueing - `inst-adm-try-lock`
-2. [ ] - `p1` - **IF** the lock is held elsewhere, skip this cycle and record the skip as its own outcome, distinct from a failure - `inst-adm-skip`
-3. [ ] - `p1` - Hold the lock on a connection detached from the request pool, so it releases when that connection closes whatever the sweep's outcome - `inst-adm-detached-connection`
-4. [ ] - `p1` - Keep that connection out of the request pool for the sweep's duration, which is why the deployment must budget one database connection beyond the pool maximum per replica - `inst-adm-extra-connection`
-5. [ ] - `p1` - Admit exactly one sweeper at a time across every replica, so two sweeps cannot decide the same chunk concurrently - `inst-adm-one-at-a-time`
-6. [ ] - `p1` - **RETURN** permission or the skip - `inst-adm-return`
+1. [x] - `p1` - **DB**: attempt the sweep's advisory lock without waiting, so a replica that cannot have it proceeds immediately to skip rather than queueing - `inst-adm-try-lock`
+2. [x] - `p1` - **IF** the lock is held elsewhere, skip this cycle and record the skip as its own outcome, distinct from a failure - `inst-adm-skip`
+3. [x] - `p1` - Hold the lock on a connection detached from the request pool, so it releases when that connection closes whatever the sweep's outcome - `inst-adm-detached-connection`
+4. [x] - `p1` - Keep that connection out of the request pool for the sweep's duration, which is why the deployment must budget one database connection beyond the pool maximum per replica - `inst-adm-extra-connection`
+5. [x] - `p1` - Admit exactly one sweeper at a time across every replica, so two sweeps cannot decide the same chunk concurrently - `inst-adm-one-at-a-time`
+6. [x] - `p1` - **RETURN** permission or the skip - `inst-adm-return`
 
 ### Retention Resolution
 
@@ -291,13 +291,13 @@ transaction in which everything a drop changes commits together.
 with a reason.
 
 **Steps**:
-1. [ ] - `p1` - Read each type's current declared retention trait from the registry on this sweep - `inst-res-read-registry`
-2. [ ] - `p1` - Cache nothing across sweeps, because retention is mutable and a cached value would delete entries the current declaration says to keep - `inst-res-never-cache`
-3. [ ] - `p1` - Treat an unreachable registry as leaving every type it was asked about unresolved, rather than as a reason to fall back on a previous answer - `inst-res-registry-down`
-4. [ ] - `p1` - Treat a type that is not registered as unresolved - `inst-res-unregistered`
-5. [ ] - `p1` - Treat a type whose retention trait is missing or invalid as unresolved - `inst-res-missing-trait`
-6. [ ] - `p1` - Carry a reason alongside each unresolved type, so the counter can distinguish the causes - `inst-res-carry-reason`
-7. [ ] - `p1` - **RETURN** the resolved retentions and the unresolved types with their reasons - `inst-res-return`
+1. [x] - `p1` - Read each type's current declared retention trait from the registry on this sweep - `inst-res-read-registry`
+2. [x] - `p1` - Cache nothing across sweeps, because retention is mutable and a cached value would delete entries the current declaration says to keep - `inst-res-never-cache`
+3. [x] - `p1` - Treat an unreachable registry as leaving every type it was asked about unresolved, rather than as a reason to fall back on a previous answer - `inst-res-registry-down`
+4. [x] - `p1` - Treat a type that is not registered as unresolved - `inst-res-unregistered`
+5. [x] - `p1` - Treat a type whose retention trait is missing or invalid as unresolved - `inst-res-missing-trait`
+6. [x] - `p1` - Carry a reason alongside each unresolved type, so the counter can distinguish the causes - `inst-res-carry-reason`
+7. [x] - `p1` - **RETURN** the resolved retentions and the unresolved types with their reasons - `inst-res-return`
 
 ### Chunk Drop Decision
 
@@ -309,15 +309,15 @@ every type in its key range.
 **Output**: drop, or keep with a reason.
 
 **Steps**:
-1. [ ] - `p1` - Decide each chunk from the values handed in and nothing else, with no database access and no clock read beyond the one instant the sweep passes in, so every case can be tested without a store - `inst-dec-pure`
-2. [ ] - `p1` - **IF** any type in the chunk's key range is unresolved, **RETURN** keep, and mark the chunk as kept for an unresolvable type - `inst-dec-unresolved-keeps`
-3. [ ] - `p1` - Treat that as the deliberate asymmetry: holding an entry too long is recoverable, deleting one early is not - `inst-dec-why-asymmetric`
-4. [ ] - `p1` - Measure each type's elapsed retention from the chunk's covered-period upper bound, never from an acceptance instant - `inst-dec-measure-from-window-end`
-5. [ ] - `p1` - **IF** any resolved type has not yet passed its retention, **RETURN** keep - `inst-dec-not-yet-expired`
-6. [ ] - `p1` - Accept whole-chunk granularity as the first permitted over-retention effect: a chunk drops as a unit, so an entry can be held up to one chunk width past its own retention - `inst-dec-granularity-effect`
-7. [ ] - `p1` - Accept a shared chunk held to the longest retention among its types as the second, which arises when the type-key slice width puts several types in one slice - `inst-dec-shared-slice-effect`
-8. [ ] - `p1` - Permit neither effect to drop an entry early; under-retention is never permitted in any configuration - `inst-dec-no-under-retention`
-9. [ ] - `p1` - **RETURN** drop only when every type in the chunk resolved and every one of them has passed its retention - `inst-dec-return`
+1. [x] - `p1` - Decide each chunk from the values handed in and nothing else, with no database access and no clock read beyond the one instant the sweep passes in, so every case can be tested without a store - `inst-dec-pure`
+2. [x] - `p1` - **IF** any type in the chunk's key range is unresolved, **RETURN** keep, and mark the chunk as kept for an unresolvable type - `inst-dec-unresolved-keeps`
+3. [x] - `p1` - Treat that as the deliberate asymmetry: holding an entry too long is recoverable, deleting one early is not - `inst-dec-why-asymmetric`
+4. [x] - `p1` - Measure each type's elapsed retention from the chunk's covered-period upper bound, never from an acceptance instant - `inst-dec-measure-from-window-end`
+5. [x] - `p1` - **IF** any resolved type has not yet passed its retention, **RETURN** keep - `inst-dec-not-yet-expired`
+6. [x] - `p1` - Accept whole-chunk granularity as the first permitted over-retention effect: a chunk drops as a unit, so an entry can be held up to one chunk width past its own retention - `inst-dec-granularity-effect`
+7. [x] - `p1` - Accept a shared chunk held to the longest retention among its types as the second, which arises when the type-key slice width puts several types in one slice - `inst-dec-shared-slice-effect`
+8. [x] - `p1` - Permit neither effect to drop an entry early; under-retention is never permitted in any configuration - `inst-dec-no-under-retention`
+9. [x] - `p1` - **RETURN** drop only when every type in the chunk resolved and every one of them has passed its retention - `inst-dec-return`
 
 ### Drop Transaction
 
@@ -330,20 +330,20 @@ materialisation table.
 next sweep retries.
 
 **Steps**:
-1. [ ] - `p1` - **DB**: open the drop transaction at read-committed isolation and set a short lock timeout on it - `inst-drp-begin`
-2. [ ] - `p1` - Fix that timeout in the design rather than in configuration, and apply it to every lock wait in the transaction rather than to the chunk lock alone, so a sweep waiting on a busy chunk does not hold feed pages and other reads queued behind its request - `inst-drp-lock-timeout`
-3. [ ] - `p1` - **DB**: lock the chunk in the mode that excludes every other access - `inst-drp-lock-chunk`
-4. [ ] - `p1` - Rely on a transaction writing into the chunk holding a lock on it until it ends, so once the lock returns no such transaction is running and none can start - `inst-drp-no-concurrent-writers`
-5. [ ] - `p1` - **DB**: read the highest feed position per GTS type in the chunk, from the chunk's feed index - `inst-drp-read-highest-positions`
-6. [ ] - `p1` - Take that read after the lock, so its snapshot sees every row the drop is about to remove - `inst-drp-read-after-lock`
-7. [ ] - `p1` - **DB**: raise each type's row in `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks` to the greater of the stored position and the one just read, never lowering a mark - `inst-drp-raise-marks`
-8. [ ] - `p1` - **DB**: drop the chunk and delete the rollup rows it fed, in this same transaction - `inst-drp-drop-and-cut`
-9. [ ] - `p1` - **DB**: commit, so the mark becomes visible exactly when the entries it covers are gone and never before or after - `inst-drp-commit`
-10. [ ] - `p1` - Keep the chunk's rollup rows in the same transaction as its drop, so the materialised aggregate never states more than the ledger entries that remain - `inst-drp-rollup-coupling`
-11. [ ] - `p1` - **IF** a lock wait times out or the transaction aborts as a deadlock victim, roll back, keep the chunk and count a drop failure - `inst-drp-failure`
-12. [ ] - `p1` - Treat a counted drop failure as an expired chunk the next sweep retries, rather than as a permanent condition - `inst-drp-retry-next-sweep`
-13. [ ] - `p1` - Count each dropped chunk and each deleted rollup row set, so disposal is observable - `inst-drp-count-success`
-14. [ ] - `p1` - **RETURN** the committed drop, or the rolled-back attempt - `inst-drp-return`
+1. [x] - `p1` - **DB**: open the drop transaction at read-committed isolation and set a short lock timeout on it - `inst-drp-begin`
+2. [x] - `p1` - Fix that timeout in the design rather than in configuration, and apply it to every lock wait in the transaction rather than to the chunk lock alone, so a sweep waiting on a busy chunk does not hold feed pages and other reads queued behind its request - `inst-drp-lock-timeout`
+3. [x] - `p1` - **DB**: lock the chunk in the mode that excludes every other access - `inst-drp-lock-chunk`
+4. [x] - `p1` - Rely on a transaction writing into the chunk holding a lock on it until it ends, so once the lock returns no such transaction is running and none can start - `inst-drp-no-concurrent-writers`
+5. [x] - `p1` - **DB**: read the highest feed position per GTS type in the chunk, from the chunk's feed index - `inst-drp-read-highest-positions`
+6. [x] - `p1` - Take that read after the lock, so its snapshot sees every row the drop is about to remove - `inst-drp-read-after-lock`
+7. [x] - `p1` - **DB**: raise each type's row in `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks` to the greater of the stored position and the one just read, never lowering a mark - `inst-drp-raise-marks`
+8. [x] - `p1` - **DB**: drop the chunk and delete the rollup rows it fed, in this same transaction - `inst-drp-drop-and-cut`
+9. [x] - `p1` - **DB**: commit, so the mark becomes visible exactly when the entries it covers are gone and never before or after - `inst-drp-commit`
+10. [x] - `p1` - Keep the chunk's rollup rows in the same transaction as its drop, so the materialised aggregate never states more than the ledger entries that remain - `inst-drp-rollup-coupling`
+11. [x] - `p1` - **IF** a lock wait times out or the transaction aborts as a deadlock victim, roll back, keep the chunk and count a drop failure - `inst-drp-failure`
+12. [x] - `p1` - Treat a counted drop failure as an expired chunk the next sweep retries, rather than as a permanent condition - `inst-drp-retry-next-sweep`
+13. [x] - `p1` - Count each dropped chunk and each deleted rollup row set, so disposal is observable - `inst-drp-count-success`
+14. [x] - `p1` - **RETURN** the committed drop, or the rolled-back attempt - `inst-drp-return`
 
 ## 4. States (CDSL)
 
@@ -362,16 +362,16 @@ still there -- while each means something different to an operator, and only one
 of them is terminal.
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Live **TO** Expired **WHEN** a sweep resolves every type in the chunk and finds all of their retentions elapsed, measured from the chunk's covered-period upper bound - `inst-crs-to-expired`
-2. [ ] - `p1` - **FROM** Live **TO** KeptUnresolved **WHEN** a sweep cannot resolve a type in the chunk's key range; the chunk is kept and counted under its reason - `inst-crs-to-unresolved`
-3. [ ] - `p1` - **FROM** KeptUnresolved **TO** Live **WHEN** a later sweep resolves every type and at least one retention has not elapsed - `inst-crs-unresolved-to-live`
-4. [ ] - `p1` - **FROM** KeptUnresolved **TO** Expired **WHEN** a later sweep resolves every type and all of their retentions have elapsed - `inst-crs-unresolved-to-expired`
-5. [ ] - `p1` - **FROM** Expired **TO** Dropped **WHEN** the drop transaction commits, taking the chunk, its rollup rows and the raised marks together - `inst-crs-to-dropped`
-6. [ ] - `p1` - **FROM** Expired **TO** DropFailed **WHEN** a lock wait times out or the transaction aborts; the chunk is kept and a drop failure is counted - `inst-crs-to-dropfailed`
-7. [ ] - `p1` - **FROM** DropFailed **TO** Expired **WHEN** the next sweep reconsiders it and the decision is still to drop - `inst-crs-dropfailed-retry`
-8. [ ] - `p1` - **FROM** DropFailed **TO** KeptUnresolved **WHEN** the next sweep cannot resolve a type it resolved before, for instance because the registry became unreachable - `inst-crs-dropfailed-to-unresolved`
-9. [ ] - `p1` - **FROM** Expired **TO** Expired **WHEN** the rollup's materialisation table cannot be resolved; the whole cycle drops nothing and the chunk waits - `inst-crs-no-materialization-table`
-10. [ ] - `p1` - **FROM** Dropped **TO** Dropped; the state is terminal, since no later sweep can recover a dropped chunk - `inst-crs-dropped-terminal`
+1. [x] - `p1` - **FROM** Live **TO** Expired **WHEN** a sweep resolves every type in the chunk and finds all of their retentions elapsed, measured from the chunk's covered-period upper bound - `inst-crs-to-expired`
+2. [x] - `p1` - **FROM** Live **TO** KeptUnresolved **WHEN** a sweep cannot resolve a type in the chunk's key range; the chunk is kept and counted under its reason - `inst-crs-to-unresolved`
+3. [x] - `p1` - **FROM** KeptUnresolved **TO** Live **WHEN** a later sweep resolves every type and at least one retention has not elapsed - `inst-crs-unresolved-to-live`
+4. [x] - `p1` - **FROM** KeptUnresolved **TO** Expired **WHEN** a later sweep resolves every type and all of their retentions have elapsed - `inst-crs-unresolved-to-expired`
+5. [x] - `p1` - **FROM** Expired **TO** Dropped **WHEN** the drop transaction commits, taking the chunk, its rollup rows and the raised marks together - `inst-crs-to-dropped`
+6. [x] - `p1` - **FROM** Expired **TO** DropFailed **WHEN** a lock wait times out or the transaction aborts; the chunk is kept and a drop failure is counted - `inst-crs-to-dropfailed`
+7. [x] - `p1` - **FROM** DropFailed **TO** Expired **WHEN** the next sweep reconsiders it and the decision is still to drop - `inst-crs-dropfailed-retry`
+8. [x] - `p1` - **FROM** DropFailed **TO** KeptUnresolved **WHEN** the next sweep cannot resolve a type it resolved before, for instance because the registry became unreachable - `inst-crs-dropfailed-to-unresolved`
+9. [x] - `p1` - **FROM** Expired **TO** Expired **WHEN** the rollup's materialisation table cannot be resolved; the whole cycle drops nothing and the chunk waits - `inst-crs-no-materialization-table`
+10. [x] - `p1` - **FROM** Dropped **TO** Dropped; the state is terminal, since no later sweep can recover a dropped chunk - `inst-crs-dropped-terminal`
 
 ## 5. Definitions of Done
 

@@ -118,6 +118,7 @@ pub struct TimescaleDbPluginConfig {
     /// feed's retention refusal rests on (`docs/DESIGN.md` §3.6,
     /// Acceptance-order slack). **Zero does not mean disabled** and is
     /// rejected: a slack of zero would refuse every entry.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-acceptance-order-slack:p2
     pub feed_acceptance_slack_secs: u64,
     /// Time width of a new ledger chunk, in seconds. Applied at startup to
     /// chunks created afterwards; existing chunks keep their range.

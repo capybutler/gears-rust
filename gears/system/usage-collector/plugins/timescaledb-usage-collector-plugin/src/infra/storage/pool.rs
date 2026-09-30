@@ -341,6 +341,7 @@ pub async fn apply_post_migration_setup(
 ///
 /// # Errors
 /// Returns `sqlx::Error` if any statement fails.
+// @cpt-dod:cpt-cf-uc-plugin-dod-disposal-is-chunk-drop-only:p1
 pub async fn apply_partitioning(
     pool: &PgPool,
     chunk_time_interval_secs: u64,

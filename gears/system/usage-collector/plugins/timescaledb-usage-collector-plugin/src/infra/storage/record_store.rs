@@ -1261,6 +1261,9 @@ impl PgRecordStore {
     /// into a struct for that alone would be a layer of indirection over
     /// values that are already named by the protocol steps' own docs.
     #[allow(clippy::too_many_arguments)]
+    // @cpt-algo:cpt-cf-uc-plugin-algo-next-position-selection:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-snapshot-and-bounded-replay:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-live-head-position:p1
     async fn feed_page_in_transaction(
         &self,
         conn: &mut PgConnection,
@@ -1385,6 +1388,9 @@ impl PgRecordStore {
     /// very same pooled connection, before and after its `COMMIT`, so one
     /// function serves both call sites rather than two statements of one SQL
     /// string under two names.
+    // @cpt-flow:cpt-cf-uc-plugin-flow-resume-after-retention:p2
+    // @cpt-algo:cpt-cf-uc-plugin-algo-retention-mark-check:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-retention-refusal:p1
     async fn mark_stands_above(
         &self,
         conn: &mut PgConnection,
@@ -2717,6 +2723,14 @@ impl RecordStore for PgRecordStore {
     ///
     /// See [`RecordStore::feed_page`].
     // @cpt-flow:cpt-cf-uc-plugin-seq-feed-page:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-read-feed-page:p1
+    // @cpt-algo:cpt-cf-uc-plugin-algo-feed-page-protocol:p1
+    // @cpt-state:cpt-cf-uc-plugin-state-feed-position:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-settled-page-protocol:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-feed-completeness:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-named-start:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-gateway-owned-position:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-feed-freshness-bound:p1
     async fn feed_page(
         &self,
         subscription: &[MeterTypeId],

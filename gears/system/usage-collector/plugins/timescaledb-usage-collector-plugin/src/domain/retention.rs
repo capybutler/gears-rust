@@ -85,6 +85,10 @@ pub enum Decision {
 /// The chunk is dropped only when every type resolved and the longest retention
 /// has passed: `time_end + longest < now`. Any failed resolution keeps it, under
 /// the first failure's reason.
+// @cpt-algo:cpt-cf-uc-plugin-algo-chunk-drop-decision:p1
+// @cpt-state:cpt-cf-uc-plugin-state-chunk-retention:p2
+// @cpt-dod:cpt-cf-uc-plugin-dod-pure-drop-decision:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-over-retention-only:p1
 #[must_use]
 pub fn drop_decision(
     time_end: OffsetDateTime,

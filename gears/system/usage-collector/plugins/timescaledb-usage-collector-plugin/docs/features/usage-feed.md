@@ -228,13 +228,13 @@ flowchart TD
   gauge surfaces it on a best-effort basis.
 
 **Steps**:
-1. [ ] - `p1` - Host compiles the scope, names the start, and passes the subscription, the scope, the start, any bounding position and the page limit - `inst-feed-host-params`
-2. [ ] - `p1` - Adapter matches the named start: a continuation supplies a position, the oldest start supplies none, and any other start mode returns internal - `inst-feed-match-start`
-3. [ ] - `p1` - Plugin runs the page protocol of `cpt-cf-uc-plugin-algo-feed-page-protocol` against `cpt-cf-uc-plugin-dbtable-usage-records` - `inst-feed-protocol`
-4. [ ] - `p1` - **IF** a position was supplied, run `cpt-cf-uc-plugin-algo-retention-mark-check` and refuse when a mark of a subscribed type stands above it - `inst-feed-mark-check`
-5. [ ] - `p1` - Choose the next position with `cpt-cf-uc-plugin-algo-next-position-selection` - `inst-feed-next-position`
-6. [ ] - `p1` - Issue only the plugin's own opaque position; never encode, decode, sign or validate a wire cursor - `inst-feed-opaque-position`
-7. [ ] - `p1` - **RETURN** the page's entries and its next position, or the refusal - `inst-feed-return`
+1. [x] - `p1` - Host compiles the scope, names the start, and passes the subscription, the scope, the start, any bounding position and the page limit - `inst-feed-host-params`
+2. [x] - `p1` - Adapter matches the named start: a continuation supplies a position, the oldest start supplies none, and any other start mode returns internal - `inst-feed-match-start`
+3. [x] - `p1` - Plugin runs the page protocol of `cpt-cf-uc-plugin-algo-feed-page-protocol` against `cpt-cf-uc-plugin-dbtable-usage-records` - `inst-feed-protocol`
+4. [x] - `p1` - **IF** a position was supplied, run `cpt-cf-uc-plugin-algo-retention-mark-check` and refuse when a mark of a subscribed type stands above it - `inst-feed-mark-check`
+5. [x] - `p1` - Choose the next position with `cpt-cf-uc-plugin-algo-next-position-selection` - `inst-feed-next-position`
+6. [x] - `p1` - Issue only the plugin's own opaque position; never encode, decode, sign or validate a wire cursor - `inst-feed-opaque-position`
+7. [x] - `p1` - **RETURN** the page's entries and its next position, or the refusal - `inst-feed-return`
 
 ### Consumer Resumes After Retention Removed an Entry
 
@@ -264,12 +264,12 @@ flowchart TD
   the known shortfall, recorded in PRD section 13.
 
 **Steps**:
-1. [ ] - `p2` - Consumer presents its position through the gear, which passes down the opaque position the plugin issued - `inst-res-present`
-2. [ ] - `p2` - **DB**: check `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks` for a mark of any subscribed type above the position - `inst-res-check-marks`
-3. [ ] - `p2` - **IF** a mark stands above it, **RETURN** the cursor-beyond-retention error and count the refusal; the page already read is discarded - `inst-res-refuse`
-4. [ ] - `p2` - Decide on the mark alone and never on the position's own age, so an intact continuation is served whatever its age - `inst-res-never-on-age`
-5. [ ] - `p2` - Consumer restarts from the oldest start, which carries no position and so cannot be refused - `inst-res-restart`
-6. [ ] - `p2` - **RETURN** a replay of the retained history; the consumer absorbs the overlap by the deduplication every replay already obliges - `inst-res-return`
+1. [x] - `p2` - Consumer presents its position through the gear, which passes down the opaque position the plugin issued - `inst-res-present`
+2. [x] - `p2` - **DB**: check `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks` for a mark of any subscribed type above the position - `inst-res-check-marks`
+3. [x] - `p2` - **IF** a mark stands above it, **RETURN** the cursor-beyond-retention error and count the refusal; the page already read is discarded - `inst-res-refuse`
+4. [x] - `p2` - Decide on the mark alone and never on the position's own age, so an intact continuation is served whatever its age - `inst-res-never-on-age`
+5. [x] - `p2` - Consumer restarts from the oldest start, which carries no position and so cannot be refused - `inst-res-restart`
+6. [x] - `p2` - **RETURN** a replay of the retained history; the consumer absorbs the overlap by the deduplication every replay already obliges - `inst-res-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -288,19 +288,19 @@ supplied, any bounding position, and the page limit.
 **Output**: the page's entries, or a refusal.
 
 **Steps**:
-1. [ ] - `p1` - **DB**: open a read-only repeatable-read transaction for the page - `inst-fpp-begin`
-2. [ ] - `p1` - **DB**: read the settled horizon inside that transaction, which also fixes its snapshot - `inst-fpp-read-horizon`
-3. [ ] - `p1` - Treat steps one and two as establishing the horizon before anything is planned; this ordering is the completeness argument and is not an optimisation - `inst-fpp-why-order`
-4. [ ] - `p1` - **DB**: with a position supplied, optionally check the retention marks under this snapshot as a fast path only, since it can miss a drop committing after the snapshot - `inst-fpp-early-check`
-5. [ ] - `p1` - **DB**: run the page statement selecting the subscribed types, applying the compiled scope as a bound predicate, above the position when one was supplied, below the horizon, and optionally at or below the bounding position, ordered by transaction identifier then entry identifier, limited to the page size - `inst-fpp-page-statement`
-6. [ ] - `p1` - Send the page statement unprepared, so its plan is built against a catalog no older than the snapshot and includes every chunk holding a settled entry that retention has not dropped - `inst-fpp-unprepared`
-7. [ ] - `p1` - Never reuse a cached generic plan on the pooled connection, which could have been built before a chunk existed and would silently skip that chunk's rows - `inst-fpp-no-cached-plan`
-8. [ ] - `p1` - Omit the position lower bound entirely on a first read, so the page begins at the oldest entry the subscription retains - `inst-fpp-first-read`
-9. [ ] - `p1` - **DB**: commit the page transaction - `inst-fpp-commit`
-10. [ ] - `p1` - **DB**: with a position supplied, run the authoritative mark re-check after the commit, in autocommit - `inst-fpp-recheck`
-11. [ ] - `p1` - Serve entries only below the horizon, so no entry can later become visible at or before a returned position, whatever the concurrency, the commit order or the number of gateway replicas - `inst-fpp-completeness`
-12. [ ] - `p1` - Hold completeness for an unchanged compiled scope; entries a widened scope admits behind a returned position are not delivered - `inst-fpp-scope-caveat`
-13. [ ] - `p1` - **RETURN** the entries, or the refusal the re-check produced - `inst-fpp-return`
+1. [x] - `p1` - **DB**: open a read-only repeatable-read transaction for the page - `inst-fpp-begin`
+2. [x] - `p1` - **DB**: read the settled horizon inside that transaction, which also fixes its snapshot - `inst-fpp-read-horizon`
+3. [x] - `p1` - Treat steps one and two as establishing the horizon before anything is planned; this ordering is the completeness argument and is not an optimisation - `inst-fpp-why-order`
+4. [x] - `p1` - **DB**: with a position supplied, optionally check the retention marks under this snapshot as a fast path only, since it can miss a drop committing after the snapshot - `inst-fpp-early-check`
+5. [x] - `p1` - **DB**: run the page statement selecting the subscribed types, applying the compiled scope as a bound predicate, above the position when one was supplied, below the horizon, and optionally at or below the bounding position, ordered by transaction identifier then entry identifier, limited to the page size - `inst-fpp-page-statement`
+6. [x] - `p1` - Send the page statement unprepared, so its plan is built against a catalog no older than the snapshot and includes every chunk holding a settled entry that retention has not dropped - `inst-fpp-unprepared`
+7. [x] - `p1` - Never reuse a cached generic plan on the pooled connection, which could have been built before a chunk existed and would silently skip that chunk's rows - `inst-fpp-no-cached-plan`
+8. [x] - `p1` - Omit the position lower bound entirely on a first read, so the page begins at the oldest entry the subscription retains - `inst-fpp-first-read`
+9. [x] - `p1` - **DB**: commit the page transaction - `inst-fpp-commit`
+10. [x] - `p1` - **DB**: with a position supplied, run the authoritative mark re-check after the commit, in autocommit - `inst-fpp-recheck`
+11. [x] - `p1` - Serve entries only below the horizon, so no entry can later become visible at or before a returned position, whatever the concurrency, the commit order or the number of gateway replicas - `inst-fpp-completeness`
+12. [x] - `p1` - Hold completeness for an unchanged compiled scope; entries a widened scope admits behind a returned position are not delivered - `inst-fpp-scope-caveat`
+13. [x] - `p1` - **RETURN** the entries, or the refusal the re-check produced - `inst-fpp-return`
 
 ### Retention Mark Check
 
@@ -311,19 +311,19 @@ supplied, any bounding position, and the page limit.
 **Output**: serve, or refuse with the cursor-beyond-retention error.
 
 **Steps**:
-1. [ ] - `p1` - **DB**: read the per-type marks, each holding the highest feed position retention has deleted for that type - `inst-mrk-read`
-2. [ ] - `p1` - Refuse when any subscribed type's mark is greater than the presented position, because a mark above it names a deleted entry after it and the range may therefore be incomplete - `inst-mrk-refuse-rule`
-3. [ ] - `p1` - Treat the post-commit re-check as authoritative and the pre-statement check as a fast path only - `inst-mrk-authoritative`
-4. [ ] - `p1` - Rely on the page statement holding a lock on every chunk it planned until commit, so no chunk the page read is dropped before then - `inst-mrk-locks-held`
-5. [ ] - `p1` - Rely on the sweep raising a type's marks in the same transaction that drops the chunk, so a chunk whose drop committed before planning has already left its marks visible to the re-check - `inst-mrk-marks-atomic`
-6. [ ] - `p1` - Treat a chunk excluded at plan time as holding no row the page's predicate admits, so its drop removes nothing the page could have read - `inst-mrk-excluded-chunk`
-7. [ ] - `p1` - Discard a page already read when the re-check refuses, rather than returning it with a warning - `inst-mrk-discard-page`
-8. [ ] - `p1` - Never refuse on the position's own age; a position whose continuation is intact is served however old it is - `inst-mrk-never-age`
-9. [ ] - `p1` - Keep the mark per GTS type and ignore the compiled scope, which is the granularity the gateway's rule names: removal and age are both read over the subscription's types - `inst-mrk-per-type-granularity`
-10. [ ] - `p1` - Accept that the refusal is therefore conservative -- it can refuse a position whose own scope lost nothing -- and never serves a truncated range - `inst-mrk-conservative`
-11. [ ] - `p1` - Skip the check entirely on a first read, which carries no position for a mark to stand above - `inst-mrk-first-read-never-refused`
-12. [ ] - `p1` - Count every refusal, so a sustained rate shows consumers falling behind what the deployment retains - `inst-mrk-count`
-13. [ ] - `p1` - **RETURN** serve or refuse - `inst-mrk-return`
+1. [x] - `p1` - **DB**: read the per-type marks, each holding the highest feed position retention has deleted for that type - `inst-mrk-read`
+2. [x] - `p1` - Refuse when any subscribed type's mark is greater than the presented position, because a mark above it names a deleted entry after it and the range may therefore be incomplete - `inst-mrk-refuse-rule`
+3. [x] - `p1` - Treat the post-commit re-check as authoritative and the pre-statement check as a fast path only - `inst-mrk-authoritative`
+4. [x] - `p1` - Rely on the page statement holding a lock on every chunk it planned until commit, so no chunk the page read is dropped before then - `inst-mrk-locks-held`
+5. [x] - `p1` - Rely on the sweep raising a type's marks in the same transaction that drops the chunk, so a chunk whose drop committed before planning has already left its marks visible to the re-check - `inst-mrk-marks-atomic`
+6. [x] - `p1` - Treat a chunk excluded at plan time as holding no row the page's predicate admits, so its drop removes nothing the page could have read - `inst-mrk-excluded-chunk`
+7. [x] - `p1` - Discard a page already read when the re-check refuses, rather than returning it with a warning - `inst-mrk-discard-page`
+8. [x] - `p1` - Never refuse on the position's own age; a position whose continuation is intact is served however old it is - `inst-mrk-never-age`
+9. [x] - `p1` - Keep the mark per GTS type and ignore the compiled scope, which is the granularity the gateway's rule names: removal and age are both read over the subscription's types - `inst-mrk-per-type-granularity`
+10. [x] - `p1` - Accept that the refusal is therefore conservative -- it can refuse a position whose own scope lost nothing -- and never serves a truncated range - `inst-mrk-conservative`
+11. [x] - `p1` - Skip the check entirely on a first read, which carries no position for a mark to stand above - `inst-mrk-first-read-never-refused`
+12. [x] - `p1` - Count every refusal, so a sustained rate shows consumers falling behind what the deployment retains - `inst-mrk-count`
+13. [x] - `p1` - **RETURN** serve or refuse - `inst-mrk-return`
 
 ### Next Position Selection
 
@@ -335,14 +335,14 @@ position.
 **Output**: the position the page hands back, or none.
 
 **Steps**:
-1. [ ] - `p1` - **IF** the page reached its bounding position, **RETURN** no next position; a bounded replay ends there - `inst-npos-bounded`
-2. [ ] - `p1` - **IF** the page filled to its limit, **RETURN** the last entry's position - `inst-npos-filled`
-3. [ ] - `p1` - **ELSE** the page is short, which means it read every settled, in-scope entry after the position, or every one the subscription retains on a first read - `inst-npos-short`
-4. [ ] - `p1` - Build the head position from the horizon, placing it just below the horizon so that every settled position is at or below it and a transaction at exactly the horizon sorts strictly after it - `inst-npos-head-construction`
-5. [ ] - `p1` - Return the head position even when the page carries no entries, so a regularly polled position stays current - `inst-npos-empty-page-head`
-6. [ ] - `p1` - Treat a head position as current when issued, since nothing settled follows it, and read no age for it - `inst-npos-head-current`
-7. [ ] - `p1` - Judge entries that settle after a head position only when that position is presented again - `inst-npos-later-arrivals`
-8. [ ] - `p1` - **RETURN** the position - `inst-npos-return`
+1. [x] - `p1` - **IF** the page reached its bounding position, **RETURN** no next position; a bounded replay ends there - `inst-npos-bounded`
+2. [x] - `p1` - **IF** the page filled to its limit, **RETURN** the last entry's position - `inst-npos-filled`
+3. [x] - `p1` - **ELSE** the page is short, which means it read every settled, in-scope entry after the position, or every one the subscription retains on a first read - `inst-npos-short`
+4. [x] - `p1` - Build the head position from the horizon, placing it just below the horizon so that every settled position is at or below it and a transaction at exactly the horizon sorts strictly after it - `inst-npos-head-construction`
+5. [x] - `p1` - Return the head position even when the page carries no entries, so a regularly polled position stays current - `inst-npos-empty-page-head`
+6. [x] - `p1` - Treat a head position as current when issued, since nothing settled follows it, and read no age for it - `inst-npos-head-current`
+7. [x] - `p1` - Judge entries that settle after a head position only when that position is presented again - `inst-npos-later-arrivals`
+8. [x] - `p1` - **RETURN** the position - `inst-npos-return`
 
 ### Acceptance-Order Slack Derivation
 
@@ -353,14 +353,14 @@ position.
 **Output**: the ordering bound the retention-refusal argument rests on.
 
 **Steps**:
-1. [ ] - `p2` - Take the write path's precondition: the admission guard bounds an entry's acceptance instant against its own insert statement's timestamp, and that insert is its transaction's first write because type keys resolve before the transaction opens - `inst-slk-precondition`
-2. [ ] - `p2` - Bound how far the transaction identifier's assignment can lag that statement's timestamp by the configured statement timeout, since assignment happens while the statement runs and can wait on a concurrent inserter - `inst-slk-assign-lag`
-3. [ ] - `p2` - Derive the slack as twice the acceptance slack plus the statement timeout - `inst-slk-compose`
-4. [ ] - `p2` - Conclude the ordering bound: for two entries where the second's position is at or after the first's, the second's acceptance instant is no earlier than the first's less the slack - `inst-slk-ordering-bound`
-5. [ ] - `p2` - Treat the acceptance slack as enforced at write time rather than merely budgeted, which is what makes the bound hold rather than merely be assumed - `inst-slk-enforced-not-budgeted`
-6. [ ] - `p2` - Use the bound to conclude that an entry retention deletes was accepted at least the replay horizon plus the slack before its drop, in a deployment whose types declare the required retention - `inst-slk-deletion-age`
-7. [ ] - `p2` - Conclude that a mark therefore never refuses a position within the replay horizon, outside the long-transaction shortfall - `inst-slk-within-horizon`
-8. [ ] - `p2` - **RETURN** the bound; it is an argument the design carries, not a value the plugin computes at runtime - `inst-slk-return`
+1. [x] - `p2` - Take the write path's precondition: the admission guard bounds an entry's acceptance instant against its own insert statement's timestamp, and that insert is its transaction's first write because type keys resolve before the transaction opens - `inst-slk-precondition`
+2. [x] - `p2` - Bound how far the transaction identifier's assignment can lag that statement's timestamp by the configured statement timeout, since assignment happens while the statement runs and can wait on a concurrent inserter - `inst-slk-assign-lag`
+3. [x] - `p2` - Derive the slack as twice the acceptance slack plus the statement timeout - `inst-slk-compose`
+4. [x] - `p2` - Conclude the ordering bound: for two entries where the second's position is at or after the first's, the second's acceptance instant is no earlier than the first's less the slack - `inst-slk-ordering-bound`
+5. [x] - `p2` - Treat the acceptance slack as enforced at write time rather than merely budgeted, which is what makes the bound hold rather than merely be assumed - `inst-slk-enforced-not-budgeted`
+6. [x] - `p2` - Use the bound to conclude that an entry retention deletes was accepted at least the replay horizon plus the slack before its drop, in a deployment whose types declare the required retention - `inst-slk-deletion-age`
+7. [x] - `p2` - Conclude that a mark therefore never refuses a position within the replay horizon, outside the long-transaction shortfall - `inst-slk-within-horizon`
+8. [x] - `p2` - **RETURN** the bound; it is an argument the design carries, not a value the plugin computes at runtime - `inst-slk-return`
 
 ## 4. States (CDSL)
 
@@ -380,12 +380,12 @@ what has happened in the store since, and because the transition into Refusable
 is the one the gateway's rule turns on.
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Current **TO** Continuable **WHEN** entries of a subscribed type settle after the position; the position now has a continuation to serve - `inst-fps-entries-arrive`
-2. [ ] - `p1` - **FROM** Continuable **TO** Current **WHEN** a page consumes every settled entry after it and returns a head position; the returned head is Current when issued - `inst-fps-caught-up`
-3. [ ] - `p1` - **FROM** Continuable **TO** Refusable **WHEN** retention deletes an entry of a subscribed type after the position and raises that type's mark above it - `inst-fps-to-refusable`
-4. [ ] - `p1` - **FROM** Current **TO** Refusable **WHEN** entries settle after the position unseen behind a long-running transaction and retention later deletes one of them; this is the known shortfall, and the position was never served a truncated range - `inst-fps-shortfall`
-5. [ ] - `p1` - **FROM** Refusable **TO** Refusable **WHEN** presented again; a mark is raised and never lowered, so the state does not recover - `inst-fps-terminal`
-6. [ ] - `p1` - **FROM** Refusable **TO** none **WHEN** the consumer restarts from the oldest start; that start carries no position, so it has no state here and cannot be refused - `inst-fps-restart-has-no-position`
+1. [x] - `p1` - **FROM** Current **TO** Continuable **WHEN** entries of a subscribed type settle after the position; the position now has a continuation to serve - `inst-fps-entries-arrive`
+2. [x] - `p1` - **FROM** Continuable **TO** Current **WHEN** a page consumes every settled entry after it and returns a head position; the returned head is Current when issued - `inst-fps-caught-up`
+3. [x] - `p1` - **FROM** Continuable **TO** Refusable **WHEN** retention deletes an entry of a subscribed type after the position and raises that type's mark above it - `inst-fps-to-refusable`
+4. [x] - `p1` - **FROM** Current **TO** Refusable **WHEN** entries settle after the position unseen behind a long-running transaction and retention later deletes one of them; this is the known shortfall, and the position was never served a truncated range - `inst-fps-shortfall`
+5. [x] - `p1` - **FROM** Refusable **TO** Refusable **WHEN** presented again; a mark is raised and never lowered, so the state does not recover - `inst-fps-terminal`
+6. [x] - `p1` - **FROM** Refusable **TO** none **WHEN** the consumer restarts from the oldest start; that start carries no position, so it has no state here and cannot be refused - `inst-fps-restart-has-no-position`
 
 ## 5. Definitions of Done
 

@@ -60,6 +60,7 @@ pub const MARK_ABOVE_SQL: &str = "SELECT 1 FROM usage_feed_retention_marks \
 /// The translator's own `String` when the compiled scope names a column outside
 /// the allowlist or a shape it cannot render. Returned before the caller takes
 /// a connection, so an unrenderable scope never opens a transaction.
+// @cpt-dod:cpt-cf-uc-plugin-dod-feed-order:p1
 pub fn build_feed_page_sql(
     after: Option<(u64, Uuid)>,
     until: Option<(u64, Uuid)>,
