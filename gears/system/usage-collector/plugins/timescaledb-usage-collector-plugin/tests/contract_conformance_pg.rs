@@ -83,11 +83,15 @@ mod common;
 /// `run_all`. No count of how many rows are in that state is given here,
 /// for the reason the module header gives for the coverage split: it would
 /// go stale one check before the assertion did.
-// Empty as of slice 3. `read_feed_page` answers, so every check `run_all`
-// dispatches passes what it dispatches — the module header above is where
-// this run's undriven residue (two checks whose driven quarter to
-// three-quarters `run_all` skips rather than fails) is recorded instead, since
-// neither is a failure this list could ever have named.
+// Empty as of slice 3. This run is driven (`run_all_with_retention`), and
+// `read_feed_page` answers, so every check it dispatches passes what it
+// dispatches. The module header's coverage-split bullet is not about this
+// run's residue — it describes what an *undriven* run (`contract::run_all`)
+// would still leave out even though `read_feed_page` answers, since that
+// entry point skips the driven quarter to three-quarters of
+// `feed-bootstrap-position` and `feed-retention-refusal` rather than failing
+// them. Neither omission is a failure this list could ever have named,
+// driven or not.
 const NOT_YET_CONFORMING: &[(&str, &str)] = &[];
 
 /// Run every implemented check against the `TimescaleDB` backend, driven, and
@@ -110,16 +114,16 @@ async fn the_timescale_backend_fails_exactly_the_declared_checks() {
 
     let failed: BTreeSet<&str> = violations.iter().map(|v| v.check).collect();
 
-    // What `run_all` dispatches today. `NOT_YET_CONFORMING` is intersected
-    // with it before the comparison: a row naming a check still in
-    // `contract::UNWRITTEN_CHECKS` names one `run_all` never runs, and a
-    // check that never runs cannot fail, so it must not be expected to.
-    // That intersection is what let the whole list land before any of the
-    // checks it names existed — without it the assertion would have been
-    // wrong at every commit until the last one. It is inert now that
-    // `contract::UNWRITTEN_CHECKS` is empty, and it is kept rather than
-    // simplified away: it costs nothing and it re-arms the moment DESIGN
-    // §3.3's table grows a row the suite has not written yet.
+    // What this run dispatches today, via `run_all_with_retention`.
+    // `NOT_YET_CONFORMING` is intersected with it before the comparison: a
+    // row naming a check still in `contract::UNWRITTEN_CHECKS` names one
+    // neither entry point runs yet, and a check that never runs cannot fail,
+    // so it must not be expected to. That intersection is what let the whole
+    // list land before any of the checks it names existed — without it the
+    // assertion would have been wrong at every commit until the last one. It
+    // is inert now that `contract::UNWRITTEN_CHECKS` is empty, and it is kept
+    // rather than simplified away: it costs nothing and it re-arms the moment
+    // DESIGN §3.3's table grows a row the suite has not written yet.
     let running: BTreeSet<&str> = contract::IMPLEMENTED_CHECKS
         .iter()
         .chain(contract::ADDITIONAL_CHECKS)
@@ -160,7 +164,7 @@ async fn the_timescale_backend_fails_exactly_the_declared_checks() {
         expected,
         "the failing checks are not the declared ones. Left is what failed; \
          right is `NOT_YET_CONFORMING` narrowed to the checks \
-         `contract::run_all` dispatches today.\n\
+         `contract::run_all_with_retention` dispatches today.\n\
          In the left set only: the check failed and no row claims it. That \
          is a regression in this plugin, not a row to add.\n\
          In the right set only: the check now passes, so its row has been \

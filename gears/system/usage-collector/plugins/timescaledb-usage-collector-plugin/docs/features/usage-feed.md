@@ -609,7 +609,7 @@ confirm the bound **MUST** be named rather than assumed.
 
 ### Sustained Replay Read Rate
 
-- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-replay-read-rate`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-replay-read-rate`
 
 The system **MUST** read the feed as an index-ordered merge over the ledger's
 feed index across the chunks retention keeps, with the compiled scope applied as
