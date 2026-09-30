@@ -73,6 +73,23 @@ async fn start_backend_metered() -> (
     (h, StorageAdapter::new(store), provider, exporter)
 }
 
+/// Every instrument name the meter exported, sorted. Mirrors
+/// `metrics_tests::exported_names`; duplicated here rather than shared
+/// because this file's exporter belongs to a separate integration-test
+/// crate, not a sibling of `metrics.rs`'s own unit tests.
+fn exported_names(exporter: &InMemoryMetricExporter) -> Vec<String> {
+    let metrics = exporter.get_finished_metrics().expect("exported metrics");
+    let mut names: Vec<String> = metrics
+        .iter()
+        .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .map(|m| m.name().to_owned())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Total of the `u64` counter data points named `name`. 0 for an instrument
 /// that exists and was never recorded, and 0 for one that does not exist —
 /// the same ambiguity `records_ingest_integration_pg::counter_sum` documents;
@@ -847,20 +864,33 @@ async fn insert_raw_within(
     .expect("insert writer A's row directly, within its own open transaction");
 }
 
-// The feed's settled-horizon lag sampler (`docs/DESIGN.md` §4.3): `Some`,
-// growing, while a write transaction is held open; `None` (not an error) once
-// none is. Uses the same "second connection holding an open write
-// transaction" shape as the gap test above.
+// The feed's settled-horizon lag sampler (`docs/DESIGN.md` §4.3): the gauge
+// is absent from the exported inventory (not zeroed) while idle -- the
+// decisive check, since a `sample_once` mutated to
+// `set_feed_horizon_lag(lag.unwrap_or(0.0))` still *returns* `None` while
+// idle and would pass a return-value-only assertion undetected -- and then
+// strictly grows while a write transaction is held open. Uses the same
+// "second connection holding an open write transaction" shape as the gap
+// test above, metered like `start_backend_metered` so the exported
+// inventory, not just the return value, is observable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_horizon_monitor_samples_the_oldest_open_write_transaction() {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let metrics = Arc::new(Metrics::new(h.pool.clone()));
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    let metrics = Arc::new(Metrics::with_meter(
+        &provider.meter("uc.timescaledb"),
+        h.pool.clone(),
+    ));
     let monitor = FeedHorizonMonitor::new(h.pool.clone(), metrics);
 
     // Nothing else holds a write transaction open on a freshly migrated
-    // database, so the plugin role sees none: `None`, not an error.
+    // database, so the plugin role sees none: `None`, not an error, and the
+    // gauge must not appear in the exported inventory at all.
     let idle = monitor
         .sample_once()
         .await
@@ -868,6 +898,13 @@ async fn the_horizon_monitor_samples_the_oldest_open_write_transaction() {
     assert!(
         idle.is_none(),
         "no open write transaction should report no observation: {idle:?}"
+    );
+    provider.force_flush().expect("flush metrics");
+    assert!(
+        !exported_names(&exporter).contains(&"uc_timescaledb_feed_horizon_lag_seconds".to_owned()),
+        "an instrument the sampler has built but never recorded on is not exported at all, \
+         which is what 'left unset' has to mean for a reader: {:?}",
+        exported_names(&exporter)
     );
 
     let meter = common::meter(common::VCPU_METER);
@@ -885,6 +922,10 @@ async fn the_horizon_monitor_samples_the_oldest_open_write_transaction() {
         .await
         .expect("sampling with the transaction open must not error")
         .expect("an open write transaction is visible to the plugin role");
+    // 50ms is ample separation next to a container-backed test's own
+    // baseline latency, and the SQL's `extract(epoch FROM ...)` carries
+    // sub-millisecond precision, so a strict increase discriminates a real
+    // sampler from a constant or stale-cached one -- `>=` would pass either.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let second = monitor
         .sample_once()
@@ -892,8 +933,14 @@ async fn the_horizon_monitor_samples_the_oldest_open_write_transaction() {
         .expect("sampling again must not error")
         .expect("the transaction is still open");
     assert!(
-        second >= first,
-        "the lag must not shrink while the transaction stays open: {first} -> {second}"
+        second > first,
+        "the lag must strictly grow across the 50ms gap while the transaction stays open: \
+         {first} -> {second}"
+    );
+    provider.force_flush().expect("flush metrics");
+    assert!(
+        exported_names(&exporter).contains(&"uc_timescaledb_feed_horizon_lag_seconds".to_owned()),
+        "the gauge must be exported once a write transaction has been observed"
     );
 
     tx.commit().await.expect("release the held transaction");
