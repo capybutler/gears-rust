@@ -19,6 +19,7 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use usage_collector_sdk::UsageRecord;
+use usage_collector_sdk::contract::retention::ContractRetention;
 
 use timescaledb_usage_collector_plugin::domain::ports::{
     RecordStore, RetentionError, RetentionSource,
@@ -1017,5 +1018,115 @@ async fn the_position_read_orders_xact_id_numerically_not_lexicographically() {
          lexicographically greater digit string (\"9\"); a bug here makes \
          the sweep raise a mark below the chunk's true highest deleted \
          position: {positions:?}"
+    );
+}
+
+/// §5.1's arithmetic, asserted rather than argued. This is the test that makes
+/// the drive trustworthy: without it, a `drop_before` that removed nothing
+/// would leave every driven assertion passing over an unswept ledger, which is
+/// precisely the failure `feed_bootstrap_position`'s unreachable drive-failure
+/// reports exist to catch and cannot.
+///
+/// **Measured, not merely argued, and the measurement corrects a claim.** The
+/// brief that asked for this test named the naive `now - floor` (no `delta`)
+/// as the formulation it catches. Manually mutating `SweepDrive::drop_before`
+/// to that value and running this test still passes it: `sweep_under_lock`
+/// takes its own `OffsetDateTime::now_utc()` strictly after the drive takes
+/// its, so the naive value's effective threshold is `floor` plus whatever
+/// positive, sub-millisecond drift separates the two reads — and for a chunk
+/// whose `time_end` sits exactly at the floor, any positive drift at all still
+/// pushes the decision to `Drop`. `delta` is not what a live single-assertion
+/// test can catch failing; it is what removes the dependence on that drift
+/// ever being positive, which is not guaranteed against a clock a later NTP
+/// step could move backward between the two reads. The exactness this test
+/// pins — below drops, at stays — holds under both formulations here, and is
+/// still the right thing to assert: it is `drop_before`'s contract, not an
+/// implementation strategy.
+///
+/// **What this test does catch, measured the same way**: a `DriveRetention`
+/// that answered every type's retention instead of only the one it was asked
+/// about. [`common::GB_METER`] is on its own chunk, below the same floor, and
+/// is not named in the [`ContractRetention::drop_before`] call below; a drive
+/// that resolved it anyway would sweep it too, and the assertion that it
+/// survives is what would catch that.
+///
+/// The two swept covered periods end on whole hours past the Unix epoch
+/// (`1_699_999_200 % 3600 == 0`), an hour apart, so under
+/// `common::CONTRACT_CHUNK_INTERVAL_SECS` each lands in its own chunk and the
+/// earlier entry's chunk `time_end` coincides exactly with the floor — the
+/// arithmetic `common::CONTRACT_CHUNK_INTERVAL_SECS`'s own doc states.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_driven_purge_takes_the_entry_below_the_floor_and_leaves_the_one_at_it() {
+    const BELOW_FLOOR_WINDOW_END_UNIX: i64 = 1_699_999_200;
+    const AT_FLOOR_WINDOW_END_UNIX: i64 = BELOW_FLOOR_WINDOW_END_UNIX + 3_600;
+
+    let (h, _backend, drive) = common::start_backend_with_retention_drive().await;
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E30);
+    let meter = common::meter(common::VCPU_METER);
+
+    let below = common::entry_over(
+        &meter,
+        tenant,
+        "exactness-below",
+        Decimal::ONE,
+        OffsetDateTime::from_unix_timestamp(BELOW_FLOOR_WINDOW_END_UNIX - 3_600).expect("valid ts"),
+        OffsetDateTime::from_unix_timestamp(BELOW_FLOOR_WINDOW_END_UNIX).expect("valid ts"),
+    );
+    let at = common::entry_over(
+        &meter,
+        tenant,
+        "exactness-at",
+        Decimal::ONE,
+        OffsetDateTime::from_unix_timestamp(AT_FLOOR_WINDOW_END_UNIX - 3_600).expect("valid ts"),
+        OffsetDateTime::from_unix_timestamp(AT_FLOOR_WINDOW_END_UNIX).expect("valid ts"),
+    );
+    // Named in no `drop_before` call below: proves the drive resolves only
+    // the type it was asked about, per ruling D3 (`DriveRetention` answers
+    // `Err(NotFound)` for anything else).
+    let other_type = common::entry_over(
+        &common::meter(common::GB_METER),
+        tenant,
+        "exactness-other-type",
+        Decimal::ONE,
+        OffsetDateTime::from_unix_timestamp(BELOW_FLOOR_WINDOW_END_UNIX - 3_600).expect("valid ts"),
+        OffsetDateTime::from_unix_timestamp(BELOW_FLOOR_WINDOW_END_UNIX).expect("valid ts"),
+    );
+    let below_stored = store.create(below).await.expect("the earlier entry stores");
+    let at_stored = store.create(at).await.expect("the later entry stores");
+    let other_type_stored = store
+        .create(other_type)
+        .await
+        .expect("the other-type entry stores");
+    let below_position = common::xact_id_of(&h.pool, below_stored.id).await;
+
+    let floor = OffsetDateTime::from_unix_timestamp(AT_FLOOR_WINDOW_END_UNIX).expect("valid ts");
+    drive
+        .drop_before(&meter, floor)
+        .await
+        .expect("the drive purges");
+
+    assert!(
+        !stored(&h.pool, below_stored.id).await,
+        "the entry an hour below the floor is dropped"
+    );
+    assert!(
+        stored(&h.pool, at_stored.id).await,
+        "the entry exactly at the floor stays: drop_before's bound is exclusive"
+    );
+    assert!(
+        stored(&h.pool, other_type_stored.id).await,
+        "a type the drive was never asked about is untouched, even though its \
+         chunk sits below the same floor: the drive is keyed on one GTS type"
+    );
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        Some((below_position, below_stored.id)),
+        "the mark names the dropped entry's own position"
+    );
+    assert_eq!(
+        mark_of(&h.pool, common::GB_METER).await,
+        None,
+        "no mark is raised for a type the drive never resolved"
     );
 }

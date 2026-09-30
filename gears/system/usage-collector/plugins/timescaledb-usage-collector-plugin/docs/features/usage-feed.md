@@ -196,7 +196,7 @@ flowchart TD
 
 ### Host Reads a Feed Page
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-read-feed-page`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-flow-read-feed-page`
 
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
@@ -238,7 +238,7 @@ flowchart TD
 
 ### Consumer Resumes After Retention Removed an Entry
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-flow-resume-after-retention`
+- [x] `p2` - **ID**: `cpt-cf-uc-plugin-flow-resume-after-retention`
 
 **Actor**: `cpt-cf-usage-collector-actor-usage-consumer`
 
@@ -280,7 +280,7 @@ on.
 
 ### Feed Page Protocol
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-feed-page-protocol`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-feed-page-protocol`
 
 **Input**: the subscription, the compiled scope, the position where one is
 supplied, any bounding position, and the page limit.
@@ -304,7 +304,7 @@ supplied, any bounding position, and the page limit.
 
 ### Retention Mark Check
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-retention-mark-check`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-retention-mark-check`
 
 **Input**: the presented position and the subscription's GTS types.
 
@@ -327,7 +327,7 @@ supplied, any bounding position, and the page limit.
 
 ### Next Position Selection
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-next-position-selection`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-next-position-selection`
 
 **Input**: the page's entries, the page limit, the horizon, and any bounding
 position.
@@ -346,7 +346,7 @@ position.
 
 ### Acceptance-Order Slack Derivation
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-algo-acceptance-order-slack`
+- [x] `p2` - **ID**: `cpt-cf-uc-plugin-algo-acceptance-order-slack`
 
 **Input**: the configured acceptance slack and statement timeout.
 
@@ -366,7 +366,7 @@ position.
 
 ### Feed Position State Machine
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-state-feed-position`
+- [x] `p2` - **ID**: `cpt-cf-uc-plugin-state-feed-position`
 
 **States**: Current, Continuable, Refusable
 
@@ -391,7 +391,7 @@ is the one the gateway's rule turns on.
 
 ### Feed Order Is Transaction Identifier Then Entry Identifier
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-feed-order`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-feed-order`
 
 The system **MUST** order feed pages by the inserting transaction's identifier
 and then by the entry identifier, served from the ledger's feed index, with the
@@ -416,7 +416,7 @@ identifier, and the entry identifier **MUST** break ties within it.
 
 ### The Settled Page Protocol Runs in Its Fixed Step Order
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-settled-page-protocol`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-settled-page-protocol`
 
 The system **MUST** run each page as a read-only repeatable-read transaction that
 reads the settled horizon before the page statement is planned, then runs the
@@ -440,7 +440,7 @@ and **MUST NOT** be rearranged.
 
 ### Completeness Under Any Concurrency
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-feed-completeness`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-feed-completeness`
 
 The system **MUST** guarantee that no entry becomes visible at or before a
 position it has returned, whatever the concurrency, the commit order or the
@@ -462,7 +462,7 @@ returned position are not delivered.
 
 ### Snapshot Consistency and Bounded Replay
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-snapshot-and-bounded-replay`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-snapshot-and-bounded-replay`
 
 The system **MUST** ensure a paginated scan observes no entry appearing,
 disappearing or changing, except arrivals ahead of its position. Positions
@@ -483,7 +483,7 @@ that bound is reached.
 
 ### A Live Head Position
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-live-head-position`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-live-head-position`
 
 The system **MUST** return a position at the settled head from any page that
 reaches it, including a page carrying no entries, so a regularly polled position
@@ -506,7 +506,7 @@ again.
 
 ### A Named Start, With the Oldest Start Beginning at the Oldest Retained Entry
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-named-start`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-named-start`
 
 The system **MUST** take the start as a named argument rather than inferring it
 from an absent position. The oldest start **MUST** begin at the oldest entry the
@@ -531,7 +531,7 @@ stand above.
 
 ### Retention Refusal Reads Marks, Never Age
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-retention-refusal`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-retention-refusal`
 
 The system **MUST** refuse a position after which retention has removed an entry
 of a subscribed type, with the cursor-beyond-retention error, rather than serving
@@ -560,7 +560,7 @@ Every refusal **MUST** be counted.
 
 ### The Plugin Issues Only Its Own Opaque Position
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-gateway-owned-position`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-gateway-owned-position`
 
 The system **MUST** issue and accept only its own opaque feed position, and
 **MUST NOT** encode, decode, sign or validate a wire cursor on this path. The
@@ -582,7 +582,7 @@ offset-based scan **MAY** be used on this path.
 
 ### Acceptance-to-Feed-Visibility Is Bounded and Its Deployment Rule Published
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-feed-freshness-bound`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-feed-freshness-bound`
 
 The system **MUST** publish that acceptance-to-feed-visibility is bounded by the
 longest-running write transaction in the whole database instance rather than by
@@ -609,7 +609,7 @@ confirm the bound **MUST** be named rather than assumed.
 
 ### Sustained Replay Read Rate
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-replay-read-rate`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-replay-read-rate`
 
 The system **MUST** read the feed as an index-ordered merge over the ledger's
 feed index across the chunks retention keeps, with the compiled scope applied as

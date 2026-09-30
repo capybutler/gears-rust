@@ -676,7 +676,7 @@ setup only.
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-usage-feed`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-usage-feed`
   - [ ] `p1` - `cpt-cf-uc-plugin-nfr-feed-freshness`
   - [ ] `p2` - `cpt-cf-uc-plugin-nfr-replay-throughput`
 
@@ -685,7 +685,7 @@ setup only.
 
 - **Design Constraints Covered**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-constraint-gateway-owned-cursors`
+  - [x] `p1` - `cpt-cf-uc-plugin-constraint-gateway-owned-cursors`
 
 - **Domain Model Entities**:
   - FeedPosition
@@ -702,14 +702,14 @@ setup only.
 
 - **Sequences**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-seq-feed-page`
+  - [x] `p1` - `cpt-cf-uc-plugin-seq-feed-page`
 
 - **Data**: None -- the ledger table, its feed index and the retention-marks
   table are provisioned by 2.1.
 
 ### 2.7 [Per-Type Retention](feature-per-type-retention/) - HIGH
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-per-type-retention`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-feature-per-type-retention`
 
 - **Purpose**: Enforces retention per GTS type from each type's current
   declared retention policy, measured from the end of the covered period, by a
@@ -762,7 +762,7 @@ setup only.
 
 - **Requirements Covered**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-fr-per-type-retention`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-per-type-retention`
 
 - **Design Principles Covered**: None -- the sweep is a lifecycle process
   rather than a request path, and no design principle in DESIGN section 2.1
@@ -770,7 +770,7 @@ setup only.
 
 - **Design Constraints Covered**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-constraint-retention`
+  - [x] `p1` - `cpt-cf-uc-plugin-constraint-retention`
 
 - **Domain Model Entities**:
   - Retention policy
@@ -779,7 +779,7 @@ setup only.
 
 - **Design Components**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-component-retention`
+  - [x] `p1` - `cpt-cf-uc-plugin-component-retention`
 
 - **API**:
   - Background retention sweep, started and stopped by the gear lifecycle
@@ -787,7 +787,7 @@ setup only.
 
 - **Sequences**:
 
-  - [ ] `p1` - `cpt-cf-uc-plugin-seq-retention-sweep`
+  - [x] `p1` - `cpt-cf-uc-plugin-seq-retention-sweep`
 
 - **Data**: None -- the ledger chunks, the rollup's materialisation table and
   the retention-marks table the sweep operates on are provisioned by 2.1.

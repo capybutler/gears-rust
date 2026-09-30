@@ -75,7 +75,7 @@ async fn pg_concurrent_post_migration_setup_is_serialized() {
 async fn pg_init_lock_does_not_leak_statement_timeout() {
     // The acceptance slack is the shared harness's: this test writes no entry,
     // so it is passed only because one builder owns the whole harness config.
-    let h = common::bring_up_with(17, 2, 2, common::HARNESS_ACCEPTANCE_SLACK_SECS)
+    let h = common::bring_up_with(17, 2, 2, common::HARNESS_ACCEPTANCE_SLACK_SECS, 7 * 86_400)
         .await
         .expect("timescaledb container (Docker required)");
 

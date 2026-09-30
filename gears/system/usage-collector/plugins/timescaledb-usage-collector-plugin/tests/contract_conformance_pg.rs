@@ -22,32 +22,27 @@
 //!   (`a_page_minted_without_a_fingerprint_is_refused_rather_than_shipped`,
 //!   `a_cursor_is_refused_when_the_query_carries_no_fingerprint`) and the
 //!   other pg suites. Not `keyset`, which carries no tests of its own.
-//! * This run is **undriven**: it calls [`contract::run_all`], not
-//!   `contract::run_all_with_retention`, so the checks in
-//!   [`contract::RETENTION_DRIVEN_CHECKS`] run here without the assertions
-//!   that need a retention sweep to have happened. This backend already
-//!   sweeps — `retention_sweep_integration_pg` drives it — so what is
-//!   missing is the `contract::retention::ContractRetention` impl beside
-//!   the SPI one, not the capability; that impl, and the switch to
-//!   `run_all_with_retention` it lets this test make, is Task 5 of this
-//!   slice's.
+//! * This run is **driven**: it calls
+//!   [`contract::run_all_with_retention`], not `contract::run_all`, passing a
+//!   `common::SweepDrive` over this same backend. Every check in
+//!   [`contract::RETENTION_DRIVEN_CHECKS`] — `feed-bootstrap-position` and
+//!   `feed-retention-refusal` — therefore runs **whole** rather than skipping
+//!   its `retention.is_some()` branch: `feed-bootstrap-position`'s
+//!   purge-then-resume assertion and three of `feed-retention-refusal`'s four
+//!   assertions run against this backend here, which no undriven run of this
+//!   suite has ever done.
 //!
-//!   **`NOT_YET_CONFORMING` being empty is not the same claim as "every
-//!   dispatched check fully conforms".** `feed-bootstrap-position` and
-//!   `feed-retention-refusal` are two checks whose coverage under `run_all`
-//!   is *partial by construction* — each skips a `retention.is_some()`
-//!   branch entirely rather than running it and failing — and their
-//!   undriven remainder now genuinely passes rather than merely going
-//!   undispatched: `feed-bootstrap-position` loses one assertion of four
-//!   here (its purge-then-resume assertion) and `feed-retention-refusal`
-//!   three of four (only "an intact continuation is served" runs, which is
-//!   the weakest of the four and evidence of almost nothing about the row
-//!   DESIGN states, which is a cursor whose continuation a sweep truncated
-//!   being refused). Neither omission earns a [`NOT_YET_CONFORMING`] row,
-//!   because neither is a failure this test can observe: a skipped
-//!   assertion is not a failed one, and the row that used to stand for that
-//!   distinction is what this paragraph now carries instead. The check's
-//!   own module says which assertions those are.
+//!   The drive is not a second deletion mechanism built for the suite. It
+//!   asks this plugin's own production `PgRetentionSweeper` to sweep, under a
+//!   stub `RetentionSource` that answers the one floor a check asks for
+//!   (`tests/common/mod.rs`'s `SweepDrive`) — ruling D3's point, and the
+//!   reason the mark a feed page then refuses a cursor against is written by
+//!   exactly the interlock a deployment's own timer would produce, not by a
+//!   shortcut that only resembles it. The chunk interval this container runs
+//!   at is `common::CONTRACT_CHUNK_INTERVAL_SECS` rather than the 7-day
+//!   default every other pg suite takes, for the reason that constant's own
+//!   doc gives: only at an hour do the fixtures' chunk boundaries land where
+//!   `drop_before`'s exclusive bound needs them to.
 //! * A green run no longer means "everything that ran passed". It means
 //!   exactly the non-conformances [`NOT_YET_CONFORMING`] declares failed,
 //!   no more and no fewer — that list names what this backend cannot pass
@@ -95,20 +90,23 @@ mod common;
 // neither is a failure this list could ever have named.
 const NOT_YET_CONFORMING: &[(&str, &str)] = &[];
 
-/// Run every implemented check against the `TimescaleDB` backend, and hold
-/// the set that failed to [`NOT_YET_CONFORMING`] exactly.
+/// Run every implemented check against the `TimescaleDB` backend, driven, and
+/// hold the set that failed to [`NOT_YET_CONFORMING`] exactly.
 ///
 /// One test rather than one per check: the checks write entries and read
-/// them back, [`contract::run_all`] runs them in sequence so one cannot
-/// observe another's rows, and it returns every violation rather than
-/// stopping at the first — so a single failure reports the whole run. The
-/// exact set wants that same whole run: it is a comparison over every
-/// check `run_all` dispatched, not a verdict reachable one check at a time.
+/// them back, [`contract::run_all_with_retention`] runs them in sequence so
+/// one cannot observe another's rows, and it returns every violation rather
+/// than stopping at the first — so a single failure reports the whole run.
+/// The exact set wants that same whole run: it is a comparison over every
+/// check the driven entry point dispatched, not a verdict reachable one
+/// check at a time.
 #[tokio::test]
 async fn the_timescale_backend_fails_exactly_the_declared_checks() {
-    let (_harness, backend) = common::start_backend().await;
+    let (_harness, backend, drive) = common::start_backend_with_retention_drive().await;
 
-    let violations = contract::run_all(&backend, contract::DedupLevel::Linearizable).await;
+    let violations =
+        contract::run_all_with_retention(&backend, contract::DedupLevel::Linearizable, &drive)
+            .await;
 
     let failed: BTreeSet<&str> = violations.iter().map(|v| v.check).collect();
 

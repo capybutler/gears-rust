@@ -9,13 +9,14 @@
 //! `docs/DESIGN.md` §3.7). The compiled scope is `AND`ed on and filters rows
 //! without changing the order, the horizon or the marks (§3.6, Scope).
 //!
-//! **`RECORD_COLUMNS`, not `FEED_COLUMNS`.** The task brief that introduced
-//! this module named `FEED_COLUMNS` in its statement-builder code block, but
-//! its own prose says the split lands in a later slice and that this module
-//! reads `RECORD_COLUMNS` until then; `RECORD_COLUMNS` is what this module
-//! actually names below, made `pub(crate)` for this reader alongside
-//! `ENTRY_TYPE_ENUM`, which is `pub(crate)` in the same file for the same
-//! reason.
+//! **`FEED_COLUMNS`, not `RECORD_COLUMNS`.** Task 3 of this slice pointed this
+//! builder at `RECORD_COLUMNS` because the split into a feed-specific column
+//! list had not landed yet; Task 5 is the split, and this module now names
+//! `FEED_COLUMNS`, which carries `xact_id` — the column this statement's own
+//! `ORDER BY` and every continuation this module mints need — beside
+//! everything `RECORD_COLUMNS` already read. Both constants are `pub(crate)`
+//! for this reader alongside `ENTRY_TYPE_ENUM`, which is `pub(crate)` in the
+//! same file for the same reason.
 
 use toolkit_odata::ast;
 use uuid::Uuid;
@@ -92,7 +93,7 @@ pub fn build_feed_page_sql(
         format!(
             "SELECT {columns} FROM usage_records WHERE {where_clause} \
              ORDER BY xact_id, id LIMIT {limit}",
-            columns = super::super::record_store::RECORD_COLUMNS,
+            columns = super::super::record_store::FEED_COLUMNS,
             where_clause = clauses.join(" AND "),
         ),
         ctx.binds,

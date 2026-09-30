@@ -22,11 +22,12 @@ use testcontainers::core::logs::LogSource;
 use testcontainers::core::wait::LogWaitStrategy;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
 use toolkit_odata::ast;
 use uuid::Uuid;
 
+use usage_collector_sdk::contract::retention::ContractRetention;
 use usage_collector_sdk::{
     EntryType, IdempotencyKey, Invalidation, MeterTypeId, ReasonCode, RecordOrigin, ResourceRef,
     UsageQuantity, UsageRecord, derive_usage_record_id,
@@ -34,12 +35,15 @@ use usage_collector_sdk::{
 
 use timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig;
 use timescaledb_usage_collector_plugin::domain::adapter::StorageAdapter;
-use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
+use timescaledb_usage_collector_plugin::domain::ports::{
+    RecordStore, RetentionError, RetentionSource,
+};
 use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
 use timescaledb_usage_collector_plugin::infra::storage::pool::{
     MIGRATOR, apply_post_migration_setup, build_pool,
 };
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
+use timescaledb_usage_collector_plugin::infra::storage::retention_sweep::PgRetentionSweeper;
 
 pub struct TsHarness {
     pub pool: PgPool,
@@ -96,24 +100,54 @@ const CONNECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5
 /// the ingestion path while the old period lives in the covered-period bounds.
 pub const HARNESS_ACCEPTANCE_SLACK_SECS: u64 = 100 * 365 * 86_400;
 
+/// The chunk interval the **contract** lane runs at, and only that lane.
+///
+/// One hour, where every other pg suite takes the 7-day default. The contract
+/// suite's `ContractRetention` drive purges by driving this plugin's own
+/// retention sweep, and the sweep decides a whole chunk against
+/// `chunk.time_end`; the suite's fixtures sit whole hours apart. At the default
+/// interval one chunk holds a whole check's entries, so a drive asked for two
+/// would take four and `feed-retention-refusal`'s guards would fail.
+///
+/// At an hour the boundary is exact rather than approximate, and the arithmetic
+/// is worth stating because it is the whole reason for the number.
+/// `drop_decision` drops a chunk iff `time_end + retention < now`, strictly, so
+/// a drive asking for a floor sets a retention of `now - floor - δ` and the
+/// sweep then drops iff `time_end < floor + δ`. Chunk boundaries and fixture
+/// covered-period ends are both whole hours from the Unix epoch, so for any
+/// `0 < δ ≤ 1 hour` that is exactly `time_end ≤ floor` — which is
+/// `ContractRetention::drop_before`'s own exclusive bound: an entry ending
+/// before the floor goes, and one ending at it stays.
+///
+/// The precedent for widening a shared harness setting rather than re-dating
+/// every fixture is [`HARNESS_ACCEPTANCE_SLACK_SECS`], and the cost is the
+/// same shape: **a suite that reads chunk counts or chunk geometry reads a
+/// different number in the contract lane than elsewhere.** Nothing does today.
+pub const CONTRACT_CHUNK_INTERVAL_SECS: u64 = 3_600;
+
 pub async fn bring_up() -> anyhow::Result<TsHarness> {
     // Default pool bounds and statement timeout (mirrors the config defaults),
-    // and the wide acceptance slack this lane's dated fixtures need.
-    bring_up_with(30, 2, 16, HARNESS_ACCEPTANCE_SLACK_SECS).await
+    // the wide acceptance slack this lane's dated fixtures need, and the
+    // config default chunk interval (7 days) every suite but the contract one
+    // runs at.
+    bring_up_with(30, 2, 16, HARNESS_ACCEPTANCE_SLACK_SECS, 7 * 86_400).await
 }
 
 /// Like [`bring_up`] but with an explicit request-path `statement_timeout` (secs),
-/// pool bounds, and acceptance slack. The first three are used to assert the
-/// init path does not leak a modified `statement_timeout` onto pooled
-/// connections: pass a value distinct from any the init path might set, and a
-/// small fixed pool so every connection can be inspected. The fourth is
+/// pool bounds, acceptance slack, and chunk interval. The first three are used
+/// to assert the init path does not leak a modified `statement_timeout` onto
+/// pooled connections: pass a value distinct from any the init path might set,
+/// and a small fixed pool so every connection can be inspected. The fourth is
 /// `acceptance_slack_pg`'s: it is a parameter here rather than a second builder
-/// so one function still owns the harness config.
+/// so one function still owns the harness config. The fifth is
+/// [`CONTRACT_CHUNK_INTERVAL_SECS`]'s: only `start_backend` passes it, every
+/// other caller passes the 7-day default `bring_up` does.
 pub async fn bring_up_with(
     statement_timeout_secs: u64,
     pool_size_min: u32,
     pool_size_max: u32,
     feed_acceptance_slack_secs: u64,
+    chunk_time_interval_secs: u64,
 ) -> anyhow::Result<TsHarness> {
     // The tag lives in `test_containers::TIMESCALEDB_TAG`; keep that constant
     // in sync with `TimescaleDbSidecar.IMAGE` in `testing/e2e/lib/sidecars.py`.
@@ -297,6 +331,7 @@ pub async fn bring_up_with(
                   "statement_timeout_secs": {statement_timeout_secs},
                   "feed_replay_horizon_secs": 3600,
                   "feed_acceptance_slack_secs": {feed_acceptance_slack_secs},
+                  "chunk_time_interval_secs": {chunk_time_interval_secs},
                   "pool_size_min": {pool_size_min}, "pool_size_max": {pool_size_max} }}"#
         ))
         .expect("valid test config json");
@@ -441,7 +476,7 @@ pub async fn refresh_rollup(pool: &PgPool) {
 /// The `xact_id` the ledger stamped on the stored entry `id`.
 ///
 /// Read as text and parsed, because `xid8` has no `sqlx` `Decode`
-/// implementation — the same reason `UsageRecordRow::xact_id` is a `String`.
+/// implementation — the same reason `FeedRecordRow::xact_id` is a `String`.
 /// The parse is not cosmetic: it is what makes `<` an order over transaction
 /// ids rather than over their digit strings, which disagree as soon as two
 /// ids differ in length.
@@ -521,6 +556,148 @@ pub async fn start_backend() -> (TsHarness, StorageAdapter) {
         .expect("contract suite needs a migrated TimescaleDB container");
     let store: Arc<dyn RecordStore> = Arc::new(record_store(&harness));
     (harness, StorageAdapter::new(store))
+}
+
+/// Like [`start_backend`], but the container runs at
+/// [`CONTRACT_CHUNK_INTERVAL_SECS`] and the harness comes back beside a
+/// [`SweepDrive`] over its own pool, for `contract::run_all_with_retention`.
+///
+/// A second function rather than a third element on [`start_backend`]'s
+/// tuple: that one is destructured at a dozen call sites across
+/// `feed_page_integration_pg.rs`, none of which want a retention drive, and
+/// widening its return type would edit every one of them for nothing they
+/// asked for. Only the contract suite needs the drive, so only this function
+/// carries it.
+///
+/// # Panics
+///
+/// If the container or the migration fails; there is no test to run without
+/// a backend.
+pub async fn start_backend_with_retention_drive() -> (TsHarness, StorageAdapter, SweepDrive) {
+    let harness = bring_up_with(
+        30,
+        2,
+        16,
+        HARNESS_ACCEPTANCE_SLACK_SECS,
+        CONTRACT_CHUNK_INTERVAL_SECS,
+    )
+    .await
+    .expect("contract suite needs a migrated TimescaleDB container");
+    let store: Arc<dyn RecordStore> = Arc::new(record_store(&harness));
+    let drive = SweepDrive {
+        pool: harness.pool.clone(),
+        metrics: metrics(&harness.pool),
+    };
+    (harness, StorageAdapter::new(store), drive)
+}
+
+/// Drives this backend's own retention sweep, as `ContractRetention` asks.
+///
+/// Not a test hook: the trait's own docs say a porter implements it against
+/// "whatever its storage engine already does on a timer", and what this does
+/// is ask for that sweep at a moment a check chooses instead of waiting for a
+/// deployment's timer to reach a fixture's covered period. The production
+/// `PgRetentionSweeper` runs, with a stub retention source in place of the
+/// registry — so the mark a feed page later refuses against is written by
+/// exactly the production interlock, which is the point of ruling D3.
+pub struct SweepDrive {
+    pool: PgPool,
+    metrics: Arc<Metrics>,
+}
+
+#[async_trait::async_trait]
+impl ContractRetention for SweepDrive {
+    /// Removes `gts_type_id`'s entries whose covered period ends before
+    /// `floor`, by running the production sweep with a retention of
+    /// `now - floor - delta` for that type alone.
+    ///
+    /// **Two `Duration`s, not one.** `RetentionSource::retention` answers
+    /// `std::time::Duration`; `now - floor` is `OffsetDateTime` subtraction,
+    /// which yields `time::Duration`. The comparison against zero and the
+    /// arithmetic with `delta` both stay in `time::Duration` — the type the
+    /// subtraction actually produces — and only the checked-positive result
+    /// crosses over to `std::time::Duration`, via `TryFrom`, for the one
+    /// caller that needs it.
+    async fn drop_before(
+        &self,
+        gts_type_id: &MeterTypeId,
+        floor: OffsetDateTime,
+    ) -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        // Half the chunk interval. Two bounds, and δ sits between them by three
+        // orders of magnitude: it must exceed the drift between this reading of
+        // the clock and the one `sweep_under_lock` takes (milliseconds), and it
+        // must stay inside one chunk so the boundary does not slide to the next.
+        //
+        // A right shift rather than `/ 2`: this workspace denies
+        // `clippy::integer_division`, and a shift halves an even interval
+        // exactly, which `CONTRACT_CHUNK_INTERVAL_SECS` (3,600) is.
+        let delta = Duration::seconds(
+            i64::try_from(CONTRACT_CHUNK_INTERVAL_SECS >> 1).expect("a small interval"),
+        );
+        let retention = now - floor - delta;
+        if retention <= Duration::ZERO {
+            // A floor at or after now has no representable retention, and
+            // saturating to zero would purge the whole meter silently. Every
+            // fixture period sits in 2020-2021, so this is unreachable from
+            // this suite — and `drop_before` returns a String precisely for a
+            // scenario the harness could not set up.
+            return Err(format!(
+                "a retention drive needs a floor in the past: {floor} is not \
+                 more than {delta} before {now}"
+            ));
+        }
+        let retention = std::time::Duration::try_from(retention).map_err(|e| {
+            format!(
+                "a retention drive computed a positive `time::Duration` that would not convert \
+                 to `std::time::Duration`: {e}"
+            )
+        })?;
+        let stub = Arc::new(DriveRetention::for_type(gts_type_id.as_str(), retention));
+        PgRetentionSweeper::new(
+            self.pool.clone(),
+            stub as Arc<dyn RetentionSource>,
+            Arc::clone(&self.metrics),
+        )
+        .sweep_once()
+        .await
+        .map_err(|e| format!("the retention sweep the drive runs failed: {e}"))?;
+        Ok(())
+    }
+}
+
+/// A [`RetentionSource`] that answers one type's retention and
+/// `Err(RetentionError::NotFound)` for every other — the pattern
+/// `retention_sweep_integration_pg.rs`'s `StubRetention` already uses.
+///
+/// **This is what keeps every other check's chunks in place.** `drop_decision`
+/// returns `Keep` on the first `Err` among a chunk's types, so a chunk holding
+/// a type this drive was never asked about is kept rather than swept, without
+/// this drive having to name a retention for it that would then have to stay
+/// plausible for every other check sharing the backend.
+struct DriveRetention {
+    gts_type_id: String,
+    retention: std::time::Duration,
+}
+
+impl DriveRetention {
+    fn for_type(gts_type_id: &str, retention: std::time::Duration) -> Self {
+        Self {
+            gts_type_id: gts_type_id.to_owned(),
+            retention,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RetentionSource for DriveRetention {
+    async fn retention(&self, gts_type_id: &str) -> Result<std::time::Duration, RetentionError> {
+        if gts_type_id == self.gts_type_id {
+            Ok(self.retention)
+        } else {
+            Err(RetentionError::NotFound)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

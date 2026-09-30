@@ -189,20 +189,26 @@ pub fn metadata_map_to_jsonb(map: &BTreeMap<MetadataKey, String>) -> JsonValue {
 
 /// Map a [`UsageRecordRow`] into a validated [`UsageRecord`].
 ///
-/// The row's `xact_id`, its `type_key` and its `entry_type` are read and
-/// deliberately dropped, because the model has no field for any of them.
-/// `xact_id` is assigned where the entry is stored — by the database, from the
-/// inserting transaction — and does not travel back out through the SPI as a
-/// record field; it reaches a caller only inside a `FeedPosition`. `type_key`
-/// is assigned where the entry is stored too and is this plugin's own: it is
-/// the ledger's second partition dimension, a function of the `gts_type_id`
-/// the model already carries, so there is nothing in it a caller could not
-/// already read. `entry_type` is dropped for the opposite reason: the model
-/// already answers what it holds, projecting an entry's kind from the
-/// `Invalidation` it carries, and
-/// `cpt-cf-usage-collector-adr-append-only-invalidation` is explicit that no
-/// discriminator may sit beside that projection. None of this is an oversight;
-/// see [`UsageRecordRow`]'s own doc for why they are decoded at all.
+/// The row's `type_key` and `entry_type` are read and deliberately dropped,
+/// because the model has no field for either. `type_key` is assigned where
+/// the entry is stored and is this plugin's own: it is the ledger's second
+/// partition dimension, a function of the `gts_type_id` the model already
+/// carries, so there is nothing in it a caller could not already read.
+/// `entry_type` is dropped for the opposite reason: the model already answers
+/// what it holds, projecting an entry's kind from the `Invalidation` it
+/// carries, and `cpt-cf-usage-collector-adr-append-only-invalidation` is
+/// explicit that no discriminator may sit beside that projection. Neither is
+/// an oversight; see [`UsageRecordRow`]'s own doc for why `entry_type` is
+/// decoded at all despite it.
+///
+/// **`xact_id` never reaches this function.** It is assigned where the entry
+/// is stored — by the database, from the inserting transaction — and does
+/// not travel back out through the SPI as a record field; it reaches a
+/// caller only inside a `FeedPosition`. `UsageRecordRow` carries no such
+/// field at all, so there is nothing here to drop: only a feed page read
+/// decodes it, off `super::entity::FeedRecordRow`, and only
+/// `feed_page_in_transaction` reads it, off the raw row rather than through
+/// this function.
 ///
 /// The two stored pairs are treated asymmetrically, deliberately. A
 /// half-populated invalidation pair is *refused*, because [`Invalidation`] has

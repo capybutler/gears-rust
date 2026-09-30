@@ -44,7 +44,11 @@ pub trait RecordStore: Send + Sync + 'static {
         scope: &ast::Expr,
     ) -> Result<UsageRecord, UsageCollectorPluginError>;
     /// One snapshot-consistent feed page in feed order, over the subscribed
-    /// GTS types and inside the caller's compiled PDP scope.
+    /// GTS types and inside the caller's compiled PDP scope. This is what
+    /// realizes `cpt-cf-uc-plugin-fr-usage-feed`: everything the requirement
+    /// asks of the feed — deterministic order, replay safety under the
+    /// settled horizon, and the retention refusal below — is this method's
+    /// contract.
     ///
     /// `after` is the position to continue from; `None` is a first read, which
     /// begins at the oldest entry the subscription retains and places no lower

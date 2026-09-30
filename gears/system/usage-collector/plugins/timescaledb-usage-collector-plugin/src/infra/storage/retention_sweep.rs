@@ -7,6 +7,13 @@
 //! current retention of every type in that key range, and decides the chunk
 //! through [`drop_decision`] — which never drops without a definite retention
 //! for every type the chunk may hold.
+//!
+//! [`PgRetentionSweeper`] is DESIGN §3.2's Retention component
+//! (`cpt-cf-uc-plugin-component-retention`) and realizes
+//! `cpt-cf-uc-plugin-fr-per-type-retention`: enforcing retention per GTS type
+//! from each type's current declared policy, by a background sweep that drops
+//! whole storage chunks and raises the feed's retention marks in the same
+//! transaction, is this module's whole subject.
 
 // Vendored TimescaleDB raw-SQL backend: `sqlx` is required infra (see
 // `record_store.rs`).
@@ -105,7 +112,7 @@ pub const SET_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
 /// carries no decode meaning; it exists only to keep `ORDER BY` unambiguous.
 ///
 /// `xact_id::text` because `xid8` has no `sqlx` `Decode` — the same reason
-/// `UsageRecordRow` holds it as a `String`.
+/// `FeedRecordRow` holds it as a `String`.
 pub const CHUNK_HIGHEST_POSITIONS_SQL: &str = "SELECT DISTINCT ON (gts_type_id) \
      gts_type_id, xact_id::text AS xact_id_text, id \
      FROM {chunk} ORDER BY gts_type_id, xact_id DESC, id DESC";
@@ -113,8 +120,9 @@ pub const CHUNK_HIGHEST_POSITIONS_SQL: &str = "SELECT DISTINCT ON (gts_type_id) 
 /// Raise each type's mark to the greater of the stored and the read position.
 ///
 /// One row per GTS type that has lost an entry to retention (§3.7
-/// `usage_feed_retention_marks`). `gts_type_id` is the table's `PRIMARY KEY`,
-/// so it is a usable conflict target.
+/// `usage_feed_retention_marks`, `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`).
+/// `gts_type_id` is the table's `PRIMARY KEY`, so it is a usable conflict
+/// target.
 ///
 /// **The `WHERE` on the `DO UPDATE` is the whole of "raises a row, never lowers
 /// it"** (§3.7). Chunks are swept in catalog order rather than in time order,
@@ -238,6 +246,7 @@ impl PgRetentionSweeper {
     /// resolving the rollup's materialisation table (a missing rollup ends the
     /// sweep before any drop). A failed drop does not end the sweep; it is
     /// counted in the report.
+    // @cpt-flow:cpt-cf-uc-plugin-seq-retention-sweep:p2
     pub async fn sweep_once(&self) -> Result<SweepReport, sqlx::Error> {
         let started = Instant::now();
         let result = self.sweep_under_lock().await;

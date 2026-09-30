@@ -246,11 +246,12 @@ flowchart TD
 
 ### Plugin Provisions Its Schema and Publishes Itself at Startup
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-startup-provision-register`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-flow-startup-provision-register`
 
-Open on `inst-start-background` alone, which is slice 3's: the loop sweeps
-retention and samples rollup health, and samples no feed horizon because no feed
-read path exists to have one.
+The loop started at `inst-start-background` sweeps retention, samples rollup
+health, and samples the feed's settled-horizon lag: the usage feed landed
+earlier in slice 3, and the horizon sampler that watches it is what closed
+this flow's one remaining step.
 
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
@@ -286,7 +287,7 @@ read path exists to have one.
 5. [x] - `p1` - **DB**: apply the configuration-driven post-migration setup with `cpt-cf-uc-plugin-algo-post-migration-setup` on `cpt-cf-uc-plugin-dbtable-usage-records` - `inst-start-post-migration`
 6. [x] - `p1` - Plugin performs the GTS handshake with `cpt-cf-uc-plugin-algo-gts-registration`, carrying its configured vendor and priority - `inst-start-register`
 7. [x] - `p1` - **IF** any step above fails, abort startup without registering; a partially provisioned backend is never published - `inst-start-fail-closed`
-8. [ ] - `p1` - Host invokes `start`, which runs the single background loop that sweeps retention, samples rollup health and samples the feed's settled-horizon lag - `inst-start-background`
+8. [x] - `p1` - Host invokes `start`, which runs the single background loop that sweeps retention, samples rollup health and samples the feed's settled-horizon lag - `inst-start-background`
 9. [x] - `p1` - **ON** `stop`, cancel the background loop and let the pool close; no flush call and no readiness probe is offered to the host - `inst-start-stop`
 10. [x] - `p1` - **RETURN** a registered, dispatchable plugin whose schema matches the target design - `inst-start-return`
 

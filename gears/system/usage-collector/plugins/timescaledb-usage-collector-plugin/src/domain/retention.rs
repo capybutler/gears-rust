@@ -2,6 +2,14 @@
 //!
 //! Pure: no database, no registry, no clock. The sweep supplies the chunk's
 //! time range end, the retention of every type in its key range, and `now`.
+//!
+//! [`drop_decision`] is where `cpt-cf-uc-plugin-constraint-retention` lives in
+//! code: the two permitted over-retention effects the constraint states —
+//! whole-chunk granularity, and a shared chunk held to the longest retention
+//! among the types sharing it — and the one it forbids, under-retention, are
+//! exactly this function's arithmetic (`longest = longest.max(*duration)`,
+//! `deadline < now`) and its `Err`-on-first-unresolved fold, which never lets
+//! a chunk drop without a definite retention for every type it may hold.
 
 use std::time::Duration;
 

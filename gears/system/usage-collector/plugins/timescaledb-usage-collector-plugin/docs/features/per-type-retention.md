@@ -3,9 +3,9 @@ Updated:  2026-09-26 by Virtuozzo International GmbH
 
 # Feature: Per-Type Retention
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-featstatus-per-type-retention-implemented`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-featstatus-per-type-retention-implemented`
 
-- [ ] `p1` - `cpt-cf-uc-plugin-feature-per-type-retention`
+- [x] `p1` - `cpt-cf-uc-plugin-feature-per-type-retention`
 
 Enforces retention per GTS type from each type's current declared retention
 policy, measured from the end of the covered period, by a background sweep that
@@ -191,7 +191,7 @@ flowchart TD
 
 ### Operator Declares a Type's Retention
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-declare-type-retention`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-flow-declare-type-retention`
 
 **Actor**: `cpt-cf-usage-collector-actor-platform-operator`
 
@@ -224,7 +224,7 @@ flowchart TD
 
 ### The Sweep Drops an Expired Chunk
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-flow-sweep-expired-chunk`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-flow-sweep-expired-chunk`
 
 **Actor**: `cpt-cf-uc-plugin-actor-plugin-host`
 
@@ -267,7 +267,7 @@ transaction in which everything a drop changes commits together.
 
 ### Sweep Admission
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-sweep-admission`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-sweep-admission`
 
 **Input**: a sweep cycle beginning on a replica.
 
@@ -283,7 +283,7 @@ transaction in which everything a drop changes commits together.
 
 ### Retention Resolution
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-retention-resolution`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-retention-resolution`
 
 **Input**: the GTS types whose keys fall in a chunk's type-key range.
 
@@ -301,7 +301,7 @@ with a reason.
 
 ### Chunk Drop Decision
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-chunk-drop-decision`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-chunk-drop-decision`
 
 **Input**: a chunk's covered-period upper bound, and the resolution outcome for
 every type in its key range.
@@ -321,7 +321,7 @@ every type in its key range.
 
 ### Drop Transaction
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-algo-drop-transaction`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-algo-drop-transaction`
 
 **Input**: a chunk decided for dropping, and the rollup's resolved
 materialisation table.
@@ -349,7 +349,7 @@ next sweep retries.
 
 ### Ledger Chunk Retention State Machine
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-state-chunk-retention`
+- [x] `p2` - **ID**: `cpt-cf-uc-plugin-state-chunk-retention`
 
 **States**: Live, Expired, KeptUnresolved, DropFailed, Dropped
 
@@ -377,7 +377,7 @@ of them is terminal.
 
 ### One Sweeper at a Time, on a Detached Connection
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-sweep-admission`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-sweep-admission`
 
 The system **MUST** admit exactly one sweeper at a time across every replica,
 through an advisory lock attempted without waiting, so a replica that cannot have
@@ -401,7 +401,7 @@ lifecycle, and **MUST NOT** be reachable through any SPI method.
 
 ### Retention Is Resolved From the Registry on Every Sweep
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-retention-resolution-uncached`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-retention-resolution-uncached`
 
 The system **MUST** resolve each type's current declared retention from the
 registry on every sweep and **MUST NOT** cache a retention value across sweeps,
@@ -427,7 +427,7 @@ registry, an unregistered type, and a missing or invalid retention trait
 
 ### The Drop Decision Is Pure and Measured From the Covered-Period End
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-pure-drop-decision`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-pure-drop-decision`
 
 The system **MUST** decide each chunk from three inputs and nothing else: the
 chunk's covered-period upper bound, the resolution outcome for every type in its
@@ -453,7 +453,7 @@ resolved and every one of those retentions elapsed.
 
 ### An Unresolvable Type Keeps Its Chunk and Is Counted
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-unresolved-type-keeps-chunk`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-unresolved-type-keeps-chunk`
 
 The system **MUST** keep every chunk holding a type whose retention could not be
 resolved, and **MUST** count it under the reason resolution failed. It **MUST
@@ -477,7 +477,7 @@ investigate rather than as normal.
 
 ### Two Permitted Over-Retention Effects, No Under-Retention
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-over-retention-only`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-over-retention-only`
 
 The system **MAY** hold an entry longer than its own retention for exactly two
 reasons: whole-chunk granularity, so an entry can be held up to one chunk width
@@ -501,7 +501,7 @@ width, **MAY** drop an entry before its own retention elapses. Under-retention
 
 ### The Mark, the Drop and the Rollup Cut Commit Together
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-atomic-drop-transaction`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-atomic-drop-transaction`
 
 The system **MUST** run each chunk's drop as one read-committed transaction that
 locks the chunk in the mode excluding every other access, reads the highest feed
@@ -532,7 +532,7 @@ remain.
 
 ### Every Lock Wait in the Drop Is Bounded
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-bounded-lock-waits`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-bounded-lock-waits`
 
 The system **MUST** set a short lock timeout on the drop transaction, fixed in
 the design rather than exposed as configuration, and **MUST** apply it to every
@@ -553,7 +553,7 @@ settled horizon back indefinitely.
 
 ### A Failed Drop Keeps the Chunk and Is Retried
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-drop-failure-retry`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-drop-failure-retry`
 
 The system **MUST** roll back, keep the chunk and count a drop failure when a
 lock wait times out or the drop transaction aborts as a deadlock victim, and the
@@ -577,7 +577,7 @@ ledger.
 
 ### Nothing Drops Without the Rollup's Materialisation Table
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-no-drop-without-materialisation-table`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-no-drop-without-materialisation-table`
 
 The system **MUST** resolve the rollup's materialisation table before dropping
 anything in a cycle, and **MUST** drop nothing at all that cycle when it cannot
@@ -601,7 +601,7 @@ for a later cycle.
 
 ### Disposal Is the Chunk Drop Alone
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-disposal-is-chunk-drop-only`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-disposal-is-chunk-drop-only`
 
 The system **MUST** treat the chunk drop as the whole of its disposal mechanism
 and **MUST NOT** offer a per-entry purge or erasure, on the SPI or anywhere else.
@@ -628,7 +628,7 @@ than enforced.
 
 ### Every Sweep Attempt Is Observable
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dod-sweep-observability`
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-dod-sweep-observability`
 
 The system **MUST** record the sweep's outcome and its duration once per attempt,
 whatever that outcome was, distinguishing a completed sweep from one skipped for

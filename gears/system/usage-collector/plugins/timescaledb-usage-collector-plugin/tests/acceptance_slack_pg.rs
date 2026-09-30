@@ -61,7 +61,7 @@ const STALE_ACCEPTANCE_MESSAGE: &str = "acceptance instant outside the configure
 /// `common::record_store` reads it back off the harness rather than being told
 /// it a second time.
 async fn setup() -> (common::TsHarness, PgRecordStore) {
-    let h = common::bring_up_with(30, 2, 16, NARROW_SLACK_SECS)
+    let h = common::bring_up_with(30, 2, 16, NARROW_SLACK_SECS, 7 * 86_400)
         .await
         .expect("timescaledb container (Docker required)");
     let store = common::record_store(&h);
@@ -81,7 +81,7 @@ async fn setup_metered() -> (
     SdkMeterProvider,
     InMemoryMetricExporter,
 ) {
-    let h = common::bring_up_with(30, 2, 16, NARROW_SLACK_SECS)
+    let h = common::bring_up_with(30, 2, 16, NARROW_SLACK_SECS, 7 * 86_400)
         .await
         .expect("timescaledb container (Docker required)");
     let exporter = InMemoryMetricExporter::default();

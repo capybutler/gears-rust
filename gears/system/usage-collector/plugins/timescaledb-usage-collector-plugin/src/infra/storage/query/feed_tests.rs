@@ -46,6 +46,25 @@ fn a_first_read_places_no_lower_bound_on_position() {
 }
 
 #[test]
+fn the_page_statement_reads_the_feed_column_list_not_the_plain_one() {
+    // Task 3 of this slice pointed this builder at `RECORD_COLUMNS` because
+    // the split had not landed; this pins the switch this task makes, and it
+    // pins the switch by content rather than by trusting the format string,
+    // since a `RECORD_COLUMNS`-shaped read here would decode with
+    // `FeedRecordRow` failing to find `xact_id_text` — a compile-time-invisible
+    // mismatch a live read would still catch, but only behind Docker.
+    let (sql, _binds) =
+        build_feed_page_sql(None, None, &tenant_scope(Uuid::nil()), 10).expect("the scope renders");
+    assert!(
+        sql.starts_with(&format!(
+            "SELECT {columns} FROM usage_records ",
+            columns = crate::infra::storage::record_store::FEED_COLUMNS
+        )),
+        "the page statement must select FEED_COLUMNS, not RECORD_COLUMNS: {sql}"
+    );
+}
+
+#[test]
 fn a_continuation_bounds_position_from_below_as_one_row_value() {
     // Row-value comparison rather than the expanded disjunction, because it is
     // what `usage_records_feed_idx (gts_type_id, xact_id, id)` serves as a

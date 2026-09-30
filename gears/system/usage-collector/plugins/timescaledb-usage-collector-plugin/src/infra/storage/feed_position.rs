@@ -5,6 +5,12 @@
 //! why the SDK models it as a byte sequence, bounds its size and claims nothing
 //! about its meaning. This module is that choice for the `TimescaleDB` backend.
 //!
+//! It is where `cpt-cf-uc-plugin-constraint-gateway-owned-cursors` holds on
+//! the feed side: this plugin issues and interprets only its own opaque
+//! `FeedPosition`, minted and read here and nowhere else, and never encodes,
+//! decodes, signs or validates a `toolkit_odata::CursorV1` — that wire cursor
+//! is the gateway's alone, on both paginated paths.
+//!
 //! It is the feed order of this plugin's `docs/DESIGN.md` §4.1 item 3 — the
 //! inserting transaction's `xid8`, then the entry `id` breaking ties inside one
 //! transaction — and nothing else. **Its width does not grow with a

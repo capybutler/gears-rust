@@ -17,10 +17,11 @@ use usage_collector_sdk::{
 
 use super::{
     Admission, AggregateStatement, BATCH_CONFLICT_READ_SQL, BATCH_GUARDED_SQL, ConflictRead,
-    INSERT_COLUMN_TYPES, INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS, PgRecordStore,
-    RECORD_COLUMNS, SINGLE_CONFLICT_READ_SQL, SINGLE_GUARDED_SQL, batch_retry_backoff,
-    batch_retry_backoff_base, build_aggregate_sql, build_get_sql, build_list_page, build_list_sql,
-    entry_identity, is_retryable_batch_error, plan_batch, record_row_key, with_retry,
+    FEED_COLUMNS, INSERT_COLUMN_TYPES, INSERT_COLUMNS, InsertColumns, MAX_BATCH_ATTEMPTS,
+    PgRecordStore, RECORD_COLUMNS, SINGLE_CONFLICT_READ_SQL, SINGLE_GUARDED_SQL,
+    batch_retry_backoff, batch_retry_backoff_base, build_aggregate_sql, build_get_sql,
+    build_list_page, build_list_sql, entry_identity, is_retryable_batch_error, plan_batch,
+    record_row_key, with_retry,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::metrics::Metrics;
@@ -178,7 +179,6 @@ fn row_matching(
         origin: record.origin.as_str().to_owned(),
         entry_type: record.entry_type().as_str().to_owned(),
         accepted_at: record.window_end,
-        xact_id: "1001".to_owned(),
         metadata,
     }
 }
@@ -382,44 +382,38 @@ fn each_inserted_column_is_bound_as_the_type_the_migration_declares() {
 }
 
 #[test]
-fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
-    // The read list is a *superset* of the write list, not the same set
-    // reordered. `accepted_at` is bound on every insert, so it is in both;
-    // `xact_id` is bound by no insert at all — `migrations/0001_init.sql`
-    // stamps it from `pg_current_xact_id()` — so it is read and never
-    // written, and it is the whole of the difference.
+fn the_plain_read_list_names_exactly_the_written_columns() {
+    // `RECORD_COLUMNS` is the *same* column set as `INSERT_COLUMNS`, cast
+    // where decoding needs it, not a superset of it: since the split into
+    // `RECORD_COLUMNS` / `FEED_COLUMNS`, `xact_id` lives only on the latter,
+    // and every plain reader of `RECORD_COLUMNS` (get, list, both conflict
+    // read-backs, both `RETURNING` clauses) has no use for it.
     //
-    // The comparison is over the name each entry *decodes as*, because two of
-    // the read list's entries are select expressions rather than bare names:
-    // `xact_id::text AS xact_id` and `entry_type::text AS entry_type`. Both
-    // casts are load-bearing and neither alias is. `xid8` has no `sqlx` decode
-    // at all and `usage_entry_type` is a Postgres enum, which `sqlx` refuses to
-    // decode into the `String` the row carries -- so without either cast every
-    // read of the ledger fails, and much of the pg lane says so. Dropping
-    // either alias and running the whole `--features postgres` lane reds this
-    // test and nothing else - measured for both, one alias at a time - because
-    // `PostgreSQL` names the output of a bare column cast after the column
-    // anyway. They are pinned below because that is a naming rule of the server
-    // and `UsageRecordRow`'s fields are looked up by name: the alias says which
-    // name is meant instead of inheriting one, and this is the only thing that
-    // would notice one going away.
+    // The comparison is over the name each entry *decodes as*, because one of
+    // the read list's entries is a select expression rather than a bare name:
+    // `entry_type::text AS entry_type`. The cast is load-bearing and the alias
+    // is not: `usage_entry_type` is a Postgres enum, which `sqlx` refuses to
+    // decode into the `String` the row carries, so without the cast every read
+    // of the ledger fails, and much of the pg lane says so. Dropping the
+    // alias and running the whole `--features postgres` lane reds this test
+    // and nothing else - measured - because `PostgreSQL` names the output of
+    // a bare column cast after the column anyway. It is pinned below because
+    // that is a naming rule of the server and `UsageRecordRow`'s fields are
+    // looked up by name: the alias says which name is meant instead of
+    // inheriting one, and this is the only thing that would notice it going
+    // away.
     let insert_names: BTreeSet<&str> = names(INSERT_COLUMNS).into_iter().collect();
     let record_names: BTreeSet<&str> = decoded_names(RECORD_COLUMNS).into_iter().collect();
-    assert!(
-        insert_names.is_subset(&record_names),
-        "every written column must also be read back: missing {:?}",
-        insert_names.difference(&record_names).collect::<Vec<_>>()
-    );
     assert_eq!(
-        record_names.difference(&insert_names).collect::<Vec<_>>(),
-        vec![&"xact_id"],
-        "the read list may add only the columns the ledger writes itself, and \
-         xact_id is the only column the ledger writes itself"
+        record_names, insert_names,
+        "RECORD_COLUMNS must name exactly the columns INSERT_COLUMNS writes, \
+         no more and no fewer: left is what RECORD_COLUMNS decodes as, right \
+         is what every insert writes"
     );
-    // The two comparisons above are over sets, which de-duplicate before they
-    // compare: a repeated entry would pass both. The sorted-vector form this
-    // test used to have caught that for free and the set form does not, so the
-    // multiplicity is asserted directly rather than lost with the re-aim.
+    // The comparison above is over sets, which de-duplicate before they
+    // compare: a repeated entry would pass it. The sorted-vector form this
+    // test used to have caught that for free and the set form does not, so
+    // the multiplicity is asserted directly rather than lost with the re-aim.
     assert_eq!(
         decoded_names(RECORD_COLUMNS).len(),
         record_names.len(),
@@ -430,20 +424,57 @@ fn the_read_list_is_the_write_list_plus_what_the_database_stamps() {
         INSERT_COLUMN_TYPES.len(),
         "one type per inserted column, in the same order"
     );
-    // The two casts, pinned as the literal select expressions they are --
-    // `decoded_names` above deliberately cannot see them.
-    let record_exprs = names(RECORD_COLUMNS);
-    for expr in ["entry_type::text AS entry_type", "xact_id::text AS xact_id"] {
-        assert!(
-            record_exprs.contains(&expr),
-            "`{expr}` must be read back exactly so, cast and alias: {RECORD_COLUMNS}"
-        );
-    }
+    // The cast, pinned as the literal select expression it is --
+    // `decoded_names` above deliberately cannot see it.
+    assert!(
+        names(RECORD_COLUMNS).contains(&"entry_type::text AS entry_type"),
+        "`entry_type::text AS entry_type` must be read back exactly so, cast \
+         and alias: {RECORD_COLUMNS}"
+    );
     assert_eq!(
         names(INSERT_COLUMNS).last(),
         Some(&"metadata"),
         "each path's `input` CTE appends ::jsonb to the whole column list, so \
          the cast lands on metadata only while metadata is last"
+    );
+}
+
+#[test]
+fn the_feed_read_list_is_the_plain_one_plus_the_feed_orders_own_key() {
+    // `xact_id` is the whole of the difference between `FEED_COLUMNS` and
+    // `RECORD_COLUMNS`, the way it used to be the whole of the difference
+    // between `RECORD_COLUMNS` and `INSERT_COLUMNS` before this split.
+    let record_names: BTreeSet<&str> = decoded_names(RECORD_COLUMNS).into_iter().collect();
+    let feed_names: BTreeSet<&str> = decoded_names(FEED_COLUMNS).into_iter().collect();
+    assert!(
+        record_names.is_subset(&feed_names),
+        "every plain-read column must also be in the feed read list: missing {:?}",
+        record_names.difference(&feed_names).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        feed_names.difference(&record_names).collect::<Vec<_>>(),
+        vec![&"xact_id_text"],
+        "the feed read list may add only the one column the feed order needs, \
+         decoded under its own alias"
+    );
+    assert_eq!(
+        decoded_names(FEED_COLUMNS).len(),
+        feed_names.len(),
+        "FEED_COLUMNS must name each column exactly once"
+    );
+
+    // Pinned as the literal select expression it is, for the reason the
+    // plain read list's own cast is pinned: `decoded_names` cannot see it,
+    // and reusing `xact_id` as this cast's own alias is a real bug rather
+    // than a cosmetic one -- it would make `query/feed.rs`'s
+    // `ORDER BY xact_id, id` resolve to this *output* column and sort
+    // lexicographically over digit strings rather than numerically over the
+    // `xid8` one, per `PostgreSQL`'s own rule that a bare `ORDER BY` name
+    // matching both an output and an input column binds to the output.
+    assert!(
+        names(FEED_COLUMNS).contains(&"xact_id::text AS xact_id_text"),
+        "`xact_id::text AS xact_id_text` must be read back exactly so, cast \
+         and aliased to a name distinct from its own source column: {FEED_COLUMNS}"
     );
 }
 
@@ -1713,7 +1744,6 @@ fn keyed_row() -> UsageRecordRow {
         origin: "backfill".to_owned(),
         entry_type: "record".to_owned(),
         accepted_at: time::OffsetDateTime::from_unix_timestamp(WINDOW_END_UNIX).expect("valid ts"),
-        xact_id: "9042".to_owned(),
         metadata: serde_json::json!({}),
     }
 }

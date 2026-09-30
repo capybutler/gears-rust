@@ -21,19 +21,21 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// One row of the `usage_records` hypertable.
+/// One row of the `usage_records` hypertable, over the read list every plain
+/// read path shares
+/// (`RECORD_COLUMNS` in [`super::record_store`]).
+///
+/// **It does not carry `xact_id`.** [`FeedRecordRow`] does, and its own doc
+/// says why a feed page read needs a second row type rather than an
+/// `Option<String>` field here. Every column this struct's read list names is
+/// also a column some insert writes — see [`Self::entry_type`]'s doc, which is
+/// where that ground now lives.
 ///
 /// Fields are listed in DDL order so this struct and the migration can be read
 /// side by side. That is a reading convenience, not a correctness requirement:
 /// `sqlx`'s derived [`FromRow`](sqlx::FromRow) for a named-field struct looks
 /// each column up by its own field name, so a `SELECT` list in another order
 /// still decodes correctly and one missing a column fails naming it.
-///
-/// [`Self::xact_id`] has no counterpart on the SDK's `UsageRecord`: it is an
-/// ordering value assigned where the entry is stored rather than one the gear
-/// submits. The database stamps it from the inserting transaction and it orders
-/// the feed (this plugin's DESIGN §3.6). It is decoded rather than left out of
-/// the struct so a row is a faithful picture of what was stored.
 ///
 /// The plugin assigns no order of its own: the `LATEST` fold orders on
 /// `window_end`, `accepted_at` and `id`, all three of them gear-supplied or
@@ -110,10 +112,14 @@ pub struct UsageRecordRow {
     /// declared it, and not carried on the SDK model (see the struct doc).
     ///
     /// **Nothing in production reads it off this struct**, and it is decoded
-    /// anyway for the reason [`Self::xact_id`] is: a row is a faithful picture
-    /// of what was stored, and the read list names every written column. It had
-    /// one reader while the write path kept an in-process dedup key built from
-    /// a stored row's columns; that key is now the entry `id`, which the row
+    /// anyway on this ground: a row is a faithful picture of what was
+    /// written, and this struct's read list
+    /// (`RECORD_COLUMNS` in [`super::record_store`]) names every column some
+    /// insert writes — `entry_type` among them, unlike `xact_id`, which no
+    /// insert writes at all and which is why that one lives on
+    /// [`FeedRecordRow`] instead rather than on this struct. It had one
+    /// reader while the write path kept an in-process dedup key built from a
+    /// stored row's columns; that key is now the entry `id`, which the row
     /// already carries, so the column is read and dropped exactly as
     /// [`super::mapper::record_row_to_model`] drops it.
     ///
@@ -124,19 +130,65 @@ pub struct UsageRecordRow {
     /// `accepted_at` — gear-assigned acceptance instant, and the `LATEST`
     /// fold's second ordering key (the gear's DESIGN §3.1).
     pub accepted_at: OffsetDateTime,
+    /// `metadata` — `jsonb` object of declared metadata keys → string values.
+    pub metadata: serde_json::Value,
+}
+
+/// One row of a feed page read: [`UsageRecordRow`]'s columns, flattened, plus
+/// `xact_id`, the feed order's own key
+/// (`FEED_COLUMNS` in [`super::record_store`]).
+///
+/// **A second row type, not an `Option<String>` field on [`UsageRecordRow`],
+/// and the choice is stated here because [`UsageRecordRow`]'s own doc leans
+/// on it.** That struct decodes a column with no SDK-model counterpart at all
+/// — `entry_type` — on the ground that a row is a faithful picture of what
+/// was written and its read list names every written column. `xact_id` is not
+/// written by any insert; the column default stamps it from the transaction
+/// that inserts the row, so a plain read of [`UsageRecordRow`]'s columns is
+/// already a faithful picture of what was written without it. Adding
+/// `xact_id: Option<String>` there would not preserve that: `None` would then
+/// have to mean "this read did not select the column", which is a different
+/// claim from what the same struct already lets `None` mean on `subject_id`
+/// — "the database holds no such value". A second row type keeps both
+/// readings intact: [`UsageRecordRow`] is silent about `xact_id` because it
+/// is not a written column at all, and this struct's `xact_id` is never
+/// `None` because every row it decodes was read off
+/// `FEED_COLUMNS` (in [`super::record_store`]), which always selects it.
+///
+/// `#[sqlx(flatten)]` decodes [`UsageRecordRow`]'s fields off the very same
+/// row rather than off a nested value — `sqlx`'s `FromRow` derive reads a
+/// flattened field's whole struct from the columns already in scope, which is
+/// what a `RECORD_COLUMNS`-shaped read list needs, since it is not a separate
+/// result set to decode.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FeedRecordRow {
+    /// Every column [`UsageRecordRow`] carries, decoded off the same row.
+    #[sqlx(flatten)]
+    pub record: UsageRecordRow,
     /// `xact_id` — the inserting transaction's id, and the feed order's first
-    /// key. Stamped by the column default and never bound by the Record Store,
-    /// so it appears in [`super::record_store`]'s read column list and not in
-    /// its insert column list. Not carried on the SDK model: it reaches a
-    /// caller only inside a `FeedPosition`, which
+    /// key. Stamped by the column default and never bound by the Record
+    /// Store, so it appears only here and not on [`UsageRecordRow`]'s insert
+    /// or plain-read paths. Not carried on the SDK model: it reaches a caller
+    /// only inside a `FeedPosition`, which
     /// [`super::feed_position::encode_position`] builds from this and the
     /// row's own `id`.
     ///
-    /// A `String` because `xid8` has no `sqlx` decode implementation, so the
-    /// read list selects `xact_id::text`; a reader wanting the order parses
-    /// it, and comparing the rendered digits instead would misorder two ids of
-    /// different lengths.
+    /// A `String` because `xid8` has no `sqlx` decode implementation, so
+    /// `FEED_COLUMNS` (in [`super::record_store`]) selects `xact_id::text`; a
+    /// reader wanting the order parses it, and comparing the rendered digits
+    /// instead would misorder two ids of different lengths.
+    ///
+    /// **Decoded from the column `xact_id_text`, not `xact_id`.** The feed
+    /// page statement orders by the bare name `xact_id`
+    /// (`query/feed.rs`'s `ORDER BY xact_id, id`, over
+    /// `usage_records_feed_idx`), and `PostgreSQL` resolves a bare `ORDER BY`
+    /// name that matches both an output column and an input column to the
+    /// *output* column — so aliasing this cast back to `xact_id`, its own
+    /// source column's name, would make that `ORDER BY` bind to this `text`
+    /// column and sort lexicographically over digit strings instead of
+    /// numerically over the `xid8` one. `#[sqlx(rename)]` is what lets the
+    /// field keep the name every reader of it expects while the column it
+    /// decodes from carries a different one.
+    #[sqlx(rename = "xact_id_text")]
     pub xact_id: String,
-    /// `metadata` — `jsonb` object of declared metadata keys → string values.
-    pub metadata: serde_json::Value,
 }

@@ -49,7 +49,7 @@ use usage_collector_sdk::{
 
 use crate::domain::ports::{FeedPageRows, RecordStore};
 use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
-use crate::infra::storage::entity::UsageRecordRow;
+use crate::infra::storage::entity::{FeedRecordRow, UsageRecordRow};
 use crate::infra::storage::error::{
     acquire_error_clears_readiness, is_ledger_pk_violation, map_sqlx_err,
 };
@@ -78,39 +78,75 @@ use crate::infra::storage::type_key::TypeKeyCache;
 /// Default page size when the caller omits `$top` (`query.limit`).
 const DEFAULT_PAGE_SIZE: u64 = 100;
 
-/// Column list for every `usage_records` SELECT / RETURNING, in
-/// [`UsageRecordRow`] field order. A static const (never caller input), so
-/// there is no risk of SQL injection.
+/// Column list for `get`, `list`, and every write path's conflict read-back
+/// and `RETURNING`, in [`UsageRecordRow`] field order. A static const (never
+/// caller input), so there is no risk of SQL injection.
 ///
 /// `sqlx`'s derived `FromRow` looks each column up by the struct's own field
 /// name, so the order here is a reading convenience — matching the struct and
 /// the DDL — rather than a decode requirement. **Omission is the hazard**: a
 /// missing column fails the decode with `no column found for name: <field>`.
 ///
-/// This is a **superset** of [`INSERT_COLUMNS`], not the same set reordered:
-/// `xact_id` is stamped by its column default and bound by no insert, so it is
-/// read and never written, and it is the whole of the difference.
+/// **This is the same column set as [`INSERT_COLUMNS`], cast where decoding
+/// needs it, not a superset of it.** `xact_id` — stamped by its column
+/// default and bound by no insert — used to be read back here too, which was
+/// the one difference from [`INSERT_COLUMNS`]; [`FEED_COLUMNS`] carries it
+/// now, because the feed page is the one reader that needs it and every
+/// other reader of this constant does not.
 ///
-/// **Two entries are cast rather than named bare**, and each one's cast is
-/// what makes the column decodable at all. `xid8` has no `sqlx` decode
-/// implementation; `usage_entry_type` is a `PostgreSQL` enum, and the
-/// [`String`] [`UsageRecordRow`] carries declares itself `TEXT`, which `sqlx`
-/// holds incompatible with an enum. Both therefore read as `… ::text AS …`.
-/// The casts are required; the aliases are not, since `PostgreSQL` names the
-/// output of a bare column cast after the column anyway. They are written out
-/// so the decoded name each [`UsageRecordRow`] field is looked up by is stated
-/// here rather than inherited from a server naming rule — and
-/// [`ins_record_columns`] reads exactly those decoded names back out of this
-/// constant, to qualify each one with the guarded statement's `ins` relation.
-///
-/// `pub(crate)` so `query::feed`'s page-statement builder can read the same
-/// spelling rather than a second one — the same reason [`ENTRY_TYPE_ENUM`] is
-/// `pub(crate)` for `query::translate`. The split into a feed-specific column
-/// list is a later slice's change, not this one's.
+/// **One entry is cast rather than named bare**, and the cast is what makes
+/// the column decodable at all: `usage_entry_type` is a `PostgreSQL` enum,
+/// and the [`String`] [`UsageRecordRow`] carries declares itself `TEXT`,
+/// which `sqlx` holds incompatible with an enum. It therefore reads as
+/// `entry_type::text AS entry_type`. The cast is required; the alias is not,
+/// since `PostgreSQL` names the output of a bare column cast after the
+/// column anyway. It is written out so the decoded name
+/// [`UsageRecordRow::entry_type`] is looked up by is stated here rather than
+/// inherited from a server naming rule — and [`ins_record_columns`] reads
+/// exactly that decoded name back out of this constant, to qualify it with
+/// the guarded statement's `ins` relation.
 pub(crate) const RECORD_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, \
      window_start, window_end, resource_id, resource_type, subject_id, subject_type, \
      idempotency_key, invalidates, reason_code, origin, entry_type::text AS entry_type, \
-     accepted_at, xact_id::text AS xact_id, metadata";
+     accepted_at, metadata";
+
+/// [`RECORD_COLUMNS`] plus `xact_id`, for the one reader that needs the feed
+/// order's own key: `query/feed.rs`'s page statement.
+///
+/// **`xact_id` is the whole of the difference between this and
+/// [`RECORD_COLUMNS`]**, the way it used to be the whole of the difference
+/// between [`RECORD_COLUMNS`] and [`INSERT_COLUMNS`] before this split. There
+/// are now two read column lists rather than one, and this sentence is the
+/// account of both: [`RECORD_COLUMNS`] names exactly what every insert
+/// writes, and this constant adds the one column the database stamps that
+/// [`RECORD_COLUMNS`]' own readers never needed.
+///
+/// **The cast is aliased `xact_id_text`, not `xact_id`, and that is
+/// load-bearing rather than decorative.** `query/feed.rs`'s statement orders
+/// by the bare name `xact_id` (`ORDER BY xact_id, id`, over
+/// `usage_records_feed_idx`), and `PostgreSQL` resolves a bare `ORDER BY`
+/// name that matches both an output column and an input column to the
+/// *output* column. Aliasing this cast back to `xact_id` — its own source
+/// column's name — would make that `ORDER BY` bind to this `text` column and
+/// sort lexicographically over digit strings rather than numerically over
+/// the `xid8` one, exactly the hazard
+/// [`crate::infra::storage::retention_sweep::CHUNK_HIGHEST_POSITIONS_SQL`]'s
+/// own `xact_id_text` alias avoids in the retention sweep's own read.
+/// [`FeedRecordRow::xact_id`]'s `#[sqlx(rename)]` is what lets the field keep
+/// the name every reader of it expects while decoding from the differently
+/// named column.
+///
+/// `xid8` has no `sqlx` `Decode` implementation, which is why the column is
+/// cast to `text` at all — the same reason [`FeedRecordRow::xact_id`] is a
+/// [`String`].
+///
+/// `pub(crate)` so `query::feed`'s page-statement builder can read the same
+/// spelling rather than a second one — the same reason [`ENTRY_TYPE_ENUM`] is
+/// `pub(crate)` for `query::translate`.
+pub(crate) const FEED_COLUMNS: &str = "id, tenant_id, gts_type_id, type_key, quantity, \
+     window_start, window_end, resource_id, resource_type, subject_id, subject_type, \
+     idempotency_key, invalidates, reason_code, origin, entry_type::text AS entry_type, \
+     accepted_at, metadata, xact_id::text AS xact_id_text";
 
 /// The columns every insert writes: every ledger column but `xact_id`, which
 /// the database stamps.
@@ -290,14 +326,14 @@ fn admitted_expr() -> String {
 
 /// [`RECORD_COLUMNS`] as the outer select reads it back off `ins`.
 ///
-/// The read list's two cast entries were already cast inside `ins`'
-/// `RETURNING`, so what `ins` exposes is the **decoded** name of each entry —
-/// `entry_type` and `xact_id` are `text` columns there. Qualifying every name
-/// with `ins.` is what makes the not-won row's columns `NULL` rather than
-/// silently picking `input`'s like-named ones up, and it is what `USING (id)`
-/// would otherwise decide for `id` on its own: the merged `id` of a left join
-/// is the left side's and is never null, so `won` computed off it would be
-/// true for every row.
+/// The read list's one cast entry was already cast inside `ins`'
+/// `RETURNING`, so what `ins` exposes is the **decoded** name of that entry —
+/// `entry_type` is a `text` column there. Qualifying every name with `ins.`
+/// is what makes the not-won row's columns `NULL` rather than silently
+/// picking `input`'s like-named ones up, and it is what `USING (id)` would
+/// otherwise decide for `id` on its own: the merged `id` of a left join is
+/// the left side's and is never null, so `won` computed off it would be true
+/// for every row.
 fn ins_record_columns() -> String {
     RECORD_COLUMNS
         .split(',')
@@ -334,9 +370,11 @@ fn ins_record_columns() -> String {
 /// and cannot do that job. The single-row path returns exactly one row and
 /// ignores it.
 ///
-/// **`xact_id` is bound nowhere.** [`INSERT_COLUMNS`] does not name it, so the
-/// column default stamps it from the inserting transaction, and
-/// [`RECORD_COLUMNS`] reads it back.
+/// **`xact_id` is bound nowhere, and this statement never reads it back
+/// either.** [`INSERT_COLUMNS`] does not name it, so the column default
+/// stamps it from the inserting transaction; [`RECORD_COLUMNS`] does not name
+/// it either, since nothing on the write path needs the feed order's own key
+/// — only [`FEED_COLUMNS`]' one reader does.
 ///
 /// The `SELECT` list of `input` is [`INSERT_COLUMNS`] with a trailing
 /// `::jsonb AS metadata`, which lands on `metadata` alone because `metadata` is
@@ -1262,7 +1300,7 @@ impl PgRecordStore {
         // catalog it then sees; a plan cached before a chunk existed could
         // silently skip that chunk's rows, which is the failure §3.6's "Why"
         // paragraph rules out.
-        let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).persistent(false);
+        let mut q = sqlx::query_as::<_, FeedRecordRow>(AssertSqlSafe(sql)).persistent(false);
         q = q.bind(types).bind(&horizon);
         if let Some((xact_id, id)) = after {
             q = q.bind(xact_id.to_string()).bind(id);
@@ -1292,13 +1330,13 @@ impl PgRecordStore {
                         row.xact_id
                     ))
                 })?;
-                Ok((xact_id, row.id))
+                Ok((xact_id, row.record.id))
             })
             .transpose()?;
 
         let mut entries = Vec::with_capacity(row_count);
         for row in rows {
-            entries.push(record_row_to_model(row)?);
+            entries.push(record_row_to_model(row.record)?);
         }
 
         // The disposition, in DESIGN §3.6's own order: a bounded replay that
@@ -2664,6 +2702,7 @@ impl RecordStore for PgRecordStore {
     /// # Errors
     ///
     /// See [`RecordStore::feed_page`].
+    // @cpt-flow:cpt-cf-uc-plugin-seq-feed-page:p2
     async fn feed_page(
         &self,
         subscription: &[MeterTypeId],
